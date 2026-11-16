@@ -97,6 +97,12 @@ def capability_gap(command: Sequence[str], env: Dict[str, str], cwd) -> Optional
     command = list(command)
     if not command or command[0] != "targo":
         return None
+    prefix = env.get("PYTHONPYCACHEPREFIX")
+    if prefix and not os.path.isabs(prefix):
+        # Python would read and write compiled modules under `cwd`/<prefix>, a
+        # cache inside the checkout that outlives this probe and is shared.
+        return (f"the command's environment names its compiled Python directory {prefix!r}, which is not an "
+                f"absolute path, so any Python the probe starts would cache under {cwd}; no test ran")
     exe = shutil.which("targo", path=env.get("PATH"))
     if exe is None:
         return f"no `targo` on the command's PATH, so `{' '.join(command)}` cannot run here; no test ran"
@@ -515,6 +521,15 @@ def resource_fds(env: Dict[str, str]) -> Tuple[int, ...]:
                  "TRUST_CPU_IMPLICIT_FD"):
         if name in env:
             add(env[name], name)
+    fixed_name = "TRUST_FIXED_ADMISSION_FD_V1"
+    if fixed_name in env:
+        if env[fixed_name] == "requires-live-ancestor-v1":
+            # Nested native owners advertise an opaque ancestor courier, not
+            # a direct descriptor. Keep authentication with the native reader.
+            if not env.get("TRUST_FIXED_CLAIM_HANDOFF_V1"):
+                raise RuntimeError("row custody: fixed marker needs its original ancestor advertisement")
+        else:
+            add(env[fixed_name], fixed_name)
     for name in ("ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS"):
         if name in env:
             words = env[name].split(",")

@@ -452,6 +452,19 @@ impl CleanIslandSession {
         self.model_checks = true;
     }
 
+    /// Whether this session both checks the finite models its islands declare
+    /// ([`Self::enable_model_checks`]) and hands back their bindings and seals
+    /// ([`Self::enable_binding_reads`]): only then do an outcome's
+    /// `model_checks`, `bindings` and `seals` list everything the islands
+    /// declare (`clean_island_rows::CrateIslandFacts::models_and_bindings_read`).
+    /// Either alone is not enough: model checks alone read no binding of an
+    /// island that imports `Trust.Binding` without `Trust.FiniteModel`, and
+    /// binding reads alone check no model.
+    #[must_use]
+    pub fn models_and_bindings_read(&self) -> bool {
+        self.model_checks && self.binding_reads
+    }
+
     /// Hand back the bindings this session's islands declare
     /// ([`CleanIslandBinding`]) without checking any model: for a session
     /// that needs the bindings early (the resolver's, which must know before

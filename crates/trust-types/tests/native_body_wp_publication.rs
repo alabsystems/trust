@@ -1,9 +1,10 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use trust_types::*;
 
-fn actual() -> TransportObligationResult {
+fn historical_scoped() -> TransportObligationResult {
     serde_json::from_str::<Vec<TransportObligationResult>>(include_str!(
         "fixtures/native_body_wp_current_v2_transport.json"
     ))
@@ -11,18 +12,122 @@ fn actual() -> TransportObligationResult {
     .remove(0)
 }
 
+fn current_capture() -> TransportObligationResult {
+    // Exact original rustc transport row from source5751. Its native objects
+    // were path-backed at capture; these copies are their exact original bytes,
+    // independently matched to the raw row and the compiler's inline report.
+    let bytes = include_bytes!("fixtures/native_body_wp_full_input_5751/transport.json");
+    assert_eq!(
+        digest::lowercase_hex(&Sha256::digest(bytes)),
+        "6f93deb370fba4a5895ad88272c275cb42e76c7abb6b1b020e710d5c9af7d1a6"
+    );
+    let mut row: TransportObligationResult = serde_json::from_slice(bytes).unwrap();
+    let objects: &[(&str, &[u8])] = &[
+        (
+            "3e4827751c3bd21db0af466455c631df382cefad2c0cdcfcb2019d6a7a85458b",
+            include_bytes!(
+                "fixtures/native_body_wp_full_input_5751/objects/3e4827751c3bd21db0af466455c631df382cefad2c0cdcfcb2019d6a7a85458b"
+            ),
+        ),
+        (
+            "c5f492681b135653c8572c1a95fd060697c06c74452fa38dbc5c306762128a46",
+            include_bytes!(
+                "fixtures/native_body_wp_full_input_5751/objects/c5f492681b135653c8572c1a95fd060697c06c74452fa38dbc5c306762128a46"
+            ),
+        ),
+        (
+            "f3baef600714a8a38aaa1009de210e45bb2c62081706a363238eabdc9893e292",
+            include_bytes!(
+                "fixtures/native_body_wp_full_input_5751/objects/f3baef600714a8a38aaa1009de210e45bb2c62081706a363238eabdc9893e292"
+            ),
+        ),
+    ];
+    let native = row.native_trust_ir.as_mut().unwrap();
+    assert_eq!(native.artifacts.len(), objects.len());
+    for artifact in &mut native.artifacts {
+        let sha = &artifact.digest.as_ref().unwrap().value;
+        let (_, bytes) = objects.iter().find(|(expected, _)| *expected == sha.as_str()).unwrap();
+        assert_eq!(digest::lowercase_hex(&Sha256::digest(bytes)), *sha);
+        let materialization = artifact.materialization.as_ref().unwrap();
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), materialization.byte_len);
+        artifact.materialization = TransportArtifactMaterialization::from_exact_bytes(
+            bytes,
+            materialization.proof_binding_id.clone(),
+            materialization.referenced_artifacts.clone(),
+        );
+    }
+    row
+}
+
+fn actual() -> TransportObligationResult {
+    static VERIFIED: OnceLock<TransportObligationResult> = OnceLock::new();
+    VERIFIED
+        .get_or_init(|| {
+            use trust_ir::ValidatedNativeBundle;
+            use trust_wp_lib::trust_ir_body::{
+                replay_trust_ir_body_request_validated, verify_trust_ir_body_request_validated,
+            };
+
+            // Reuse the complete current compiler input. Generate a new proof
+            // from the actual verifier, never normalize a stale schema or
+            // relabel a historical proof's question/result.
+            let mut row = current_capture();
+            let original = row.clone();
+            let native = decoded_native_bundle(&row);
+            let native_before = native.clone();
+            let request = row.proof_evidence.as_ref().unwrap().request_id.as_ref().unwrap();
+            let request = trust_ir::NativeRequestId::new(request.parse().unwrap());
+            let admitted = ValidatedNativeBundle::new(&native).unwrap();
+            let verified = verify_trust_ir_body_request_validated(&admitted, request).unwrap();
+            assert_eq!(verified.result().status, trust_wp_lib::VerifyBundleStatus::Verified);
+            replay_trust_ir_body_request_validated(
+                &admitted,
+                request,
+                verified.result(),
+                Some(verified.witness()),
+            )
+            .unwrap();
+            assert_eq!(verified.witness().native_bundle_digest, native.stable_digest());
+            rewrite_payload(&mut row, |certificate| {
+                certificate["statement"]["results"] = serde_json::json!([verified.result()]);
+                certificate["statement"]["translation_witness"] =
+                    serde_json::to_value(verified.witness()).unwrap();
+            });
+            assert_eq!(native, native_before);
+            assert_eq!(row.native_trust_ir, original.native_trust_ir);
+            assert_eq!(current_capture(), original, "current captured input stays immutable");
+            assert_eq!(defect(&row, None), None);
+            row
+        })
+        .clone()
+}
+
+#[test]
+fn historical_scoped_certificate_with_stale_schema_is_refused_without_normalization() {
+    let row = historical_scoped();
+    let original = row.clone();
+    assert_eq!(
+        defect(&row, None).as_deref(),
+        Some(
+            "modern body-WP native input identity cannot be decoded: native bundle transport loses fields during typed decoding"
+        ),
+    );
+    assert_eq!(row, original);
+}
+
 // Exact source64c failed-unit export, retained solely as a transport-codec
 // reproducer. It is not a qualified positive fixture or proof authority.
 #[test]
-fn failed_unit_forensic_native_input_uses_the_shared_lossless_codec() {
-    use trust_ir::request::{NativeVerificationBundle, NativeVerificationRequest, transport};
+fn historical_inputs_preserve_the_exact_lossless_schema_refusal() {
+    use trust_ir::request::{NativeVerificationBundle, transport};
 
     let bytes = include_bytes!("fixtures/native_body_wp_failed_unit_forensic.json");
     assert_eq!(
         digest::lowercase_hex(&Sha256::digest(bytes)),
         "a030619d5e963e579a64e992737df75edc90018d14a3ac7eafa1a60acc1348f2"
     );
-    let rows: Vec<TransportObligationResult> = serde_json::from_slice(bytes).unwrap();
+    let mut rows: Vec<TransportObligationResult> = serde_json::from_slice(bytes).unwrap();
+    rows.push(historical_scoped());
     let original = rows.clone();
     let mut bundles = 0;
     for row in &rows {
@@ -42,35 +147,52 @@ fn failed_unit_forensic_native_input_uses_the_shared_lossless_codec() {
                     .is_err(),
                 "the original missing-formula failure must remain reproduced"
             );
-            let restored = transport::rehydrate_native_bundle_transport_payload(payload).unwrap();
-            // A native MC row also carries the complete bundle. Scope the
-            // codec comparison to its actual WP request, independently of the
-            // outer row's primary request identity; this grants no proof credit.
-            let wp_requests: Vec<_> = restored
-                .requests
-                .iter()
-                .filter_map(|request| match request {
-                    NativeVerificationRequest::TrustWp(wp) => Some(wp.id.index()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(wp_requests.len(), 1, "forensic bundle has one actual WP request");
-            let selected = wp_requests[0];
-            let mut inline = payload.clone();
-            inline["bundle"] = serde_json::to_value(&restored).unwrap();
-            let inline_restored =
-                transport::rehydrate_native_bundle_transport_payload(&inline).unwrap();
-            assert_eq!(restored, inline_restored);
-            assert_eq!(restored.stable_digest(), inline_restored.stable_digest());
-            let scoped = |mut bundle: NativeVerificationBundle| {
-                bundle.requests.retain(|request| {
-                    matches!(request, NativeVerificationRequest::TrustWp(wp)
-                        if wp.id.index() == selected)
-                });
-                assert_eq!(bundle.requests.len(), 1);
-                bundle.stable_digest()
-            };
-            assert_eq!(scoped(restored), scoped(inline_restored));
+            assert_eq!(
+                transport::rehydrate_native_bundle_transport_payload(payload).unwrap_err(),
+                "native bundle transport loses fields during typed decoding"
+            );
+            // Test-only diagnostic expansion explains the exact refusal; it
+            // never feeds normalized input to production or earns proof credit.
+            let mut inline = payload["bundle"].clone();
+            let formulas: std::collections::BTreeMap<u64, serde_json::Value> =
+                inline["module"]["proof_obligations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|proof| (proof["id"].as_u64().unwrap(), proof["formula"].clone()))
+                    .collect();
+            for request in inline["requests"].as_array_mut().unwrap() {
+                for request in request.as_object_mut().unwrap().values_mut() {
+                    let Some(atoms) = request
+                        .pointer_mut("/provenance/replay_context/atoms")
+                        .and_then(serde_json::Value::as_array_mut)
+                    else {
+                        continue;
+                    };
+                    for atom in atoms {
+                        if let Some(reference) = atom.as_object_mut().unwrap().remove("formula_ref")
+                        {
+                            let id = reference["obligation"].as_u64().unwrap();
+                            assert_eq!(atom["obligation"].as_u64(), Some(id));
+                            assert!(
+                                atom.as_object_mut()
+                                    .unwrap()
+                                    .insert("formula".into(), formulas[&id].clone())
+                                    .is_none()
+                            );
+                        }
+                    }
+                }
+            }
+            let typed: NativeVerificationBundle = serde_json::from_value(inline.clone()).unwrap();
+            let restored = serde_json::to_value(&typed).unwrap();
+            assert!(inline["module"].get("closure_layouts").is_none());
+            let mut expected = inline;
+            expected["module"]["closure_layouts"] = serde_json::json!([]);
+            assert_eq!(
+                restored, expected,
+                "the ONLY round-trip delta is /module/closure_layouts: absent → []"
+            );
         }
     }
     assert_eq!(bundles, rows.len());
@@ -135,7 +257,7 @@ fn rewrite_payload(
 }
 
 #[test]
-fn actual_compiler_certificate_is_structurally_publishable_without_rebinding() {
+fn actual_full_input_verifier_certificate_is_structurally_publishable() {
     let row = actual();
     let original = row.clone();
     assert_eq!(defect(&row, None), None);
@@ -188,9 +310,10 @@ fn changed_content_digest_uri_and_owner_binding_are_rejected() {
                     "trust_ir-native-trust-wp-request-3-proof-0".into()
             }
             _ => {
-                artifact.uri = Some(
-                    artifact.uri.as_ref().unwrap().replace("wp_query_source", "different_source"),
-                )
+                artifact.uri = Some(format!(
+                    "trust-wp-body://different_source/certificate/sha256/{}",
+                    artifact.digest.as_ref().unwrap().value,
+                ))
             }
         }
         assert_ne!(row, original, "mutation {mutation} must change its input");
@@ -236,7 +359,7 @@ fn independently_rehashed_wrong_headers_still_refuse() {
 }
 
 #[test]
-fn a_digest_shaped_result_id_does_not_replace_the_exact_scoped_input() {
+fn a_digest_shaped_result_id_does_not_replace_the_complete_original_input() {
     let original = actual();
     assert_eq!(defect(&original, None), None);
     for digit in 0..64 {
@@ -252,7 +375,7 @@ fn a_digest_shaped_result_id_does_not_replace_the_exact_scoped_input() {
         });
         assert_eq!(
             defect(&row, None).as_deref(),
-            Some("modern body-WP result does not bind the original scoped native input"),
+            Some("modern body-WP result does not bind the complete original native input"),
             "digest digit {digit}"
         );
     }
@@ -268,8 +391,45 @@ fn independently_rehashed_native_provenance_still_needs_its_own_wp_input_identit
     });
     assert_eq!(
         defect(&row, None).as_deref(),
-        Some("modern body-WP result does not bind the original scoped native input")
+        Some("modern body-WP result does not bind the complete original native input")
     );
+}
+
+#[test]
+fn independently_rehashed_unselected_request_still_changes_the_full_wp_input() {
+    let mut row = actual();
+    assert_eq!(defect(&row, None), None);
+    let selected_before = row.proof_evidence.clone();
+    rewrite_native_bundle(&mut row, |bundle| {
+        let request = bundle["requests"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find_map(|request| request.get_mut("TrustMc"))
+            .unwrap();
+        let old = request["diagnostics"]["emit_counterexamples"].as_bool().unwrap();
+        request["diagnostics"]["emit_counterexamples"] = (!old).into();
+    });
+    assert_eq!(row.proof_evidence, selected_before, "the genuine selected proof is unchanged");
+    assert_eq!(
+        defect(&row, None).as_deref(),
+        Some("modern body-WP result does not bind the complete original native input"),
+    );
+}
+
+#[test]
+fn optional_diagnostic_witness_is_not_required_for_native_publication() {
+    let mut row = actual();
+    rewrite_payload(&mut row, |certificate| {
+        assert!(
+            certificate["statement"]
+                .as_object_mut()
+                .unwrap()
+                .remove("translation_witness")
+                .is_some()
+        );
+    });
+    assert_eq!(defect(&row, None), None);
 }
 
 fn rewrite_native_bundle(
@@ -326,18 +486,12 @@ fn independently_rehashed_native_body_must_match_its_recorded_module_digest() {
     let original = actual();
     assert_eq!(defect(&original, None), None);
     let original_bundle = decoded_native_bundle(&original);
-    assert_eq!(
-        original_bundle.module.stable_digest(),
-        original_bundle.trust_ir_module_digest
-    );
+    assert_eq!(original_bundle.module.stable_digest(), original_bundle.trust_ir_module_digest);
     let mut row = original.clone();
     rewrite_native_bundle(&mut row, |bundle| {
         let instruction = &mut bundle["module"]["functions"][0]["blocks"][0]["body"][0]["inst"];
-        assert_eq!(
-            *instruction,
-            serde_json::json!({"Copy": {"operand": 0, "ty": "Bool"}})
-        );
-        *instruction = serde_json::json!({"Const": {"ty": "Bool", "value": {"Bool": false}}});
+        assert_eq!(*instruction, serde_json::json!({"Const": {"ty": "U32", "value": {"Int": 0}}}));
+        *instruction = serde_json::json!({"Const": {"ty": "U32", "value": {"Int": 1}}});
     });
     let changed = decoded_native_bundle(&row);
     assert!(changed.module.wire_image_refusals().is_empty());
@@ -360,9 +514,9 @@ fn independently_rehashed_native_module_without_wire_identity_refuses() {
     let original_bundle = decoded_native_bundle(&original);
     let mut row = original.clone();
     rewrite_native_bundle(&mut row, |bundle| {
-        let ty = &mut bundle["module"]["functions"][0]["blocks"][0]["body"][0]["inst"]["Copy"]
-            ["ty"];
-        assert_eq!(*ty, "Bool");
+        let ty =
+            &mut bundle["module"]["functions"][0]["blocks"][0]["body"][0]["inst"]["Const"]["ty"];
+        assert_eq!(*ty, "U32");
         *ty = "Error".into();
     });
     let changed = decoded_native_bundle(&row);

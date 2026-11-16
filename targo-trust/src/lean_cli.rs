@@ -230,7 +230,7 @@ fn parse(args: &[String]) -> Result<LeanRequest, String> {
             }
             _ if arg.starts_with("--target-dir=") => {
                 let value = arg.strip_prefix("--target-dir=").expect("matched prefix");
-                if value.is_empty() || target_dir.is_some() {
+                if value.is_empty() || value.starts_with('-') || target_dir.is_some() {
                     return Err("--target-dir requires exactly one directory".into());
                 }
                 target_dir = Some(PathBuf::from(value));
@@ -1290,12 +1290,14 @@ pub(crate) fn run_check(args: &[String]) -> ExitCode {
     // Live-edit-loop step 2: one `trust.obligations.v1` record per file (a row
     // for the file's verdict and one per declaration Clean parsed), written and
     // snapshotted for the changed-only view only when the caller asked for it:
-    // a caller session, `--since` or `--target-dir`. Observational: no verdict
-    // or exit status reads it.
+    // a caller session, `--since`, `--all-rows` or `--target-dir`.
+    // Observational: no verdict or exit status reads it.
     let caller = crate::agent_delta::caller_session_from_env();
     let mut delta = crate::agent_delta::DeltaView::default();
-    let wants_delta =
-        caller.is_some() || request.delta.since.is_some() || request.target_dir.is_some();
+    let wants_delta = caller.is_some()
+        || request.delta.since.is_some()
+        || request.delta.all_rows
+        || request.target_dir.is_some();
     match &target_dir {
         Ok(target_dir) if wants_delta => {
             let file_records = records::file_records(&checked);
@@ -1323,9 +1325,13 @@ pub(crate) fn run_check(args: &[String]) -> ExitCode {
         }
         Ok(_) => {}
         // The one note for both records: with the changed-only view it is
-        // the view's own note, printed with it; otherwise on stderr, so the
-        // verdict lines a caller reads are what they were.
-        Err(why) if wants_delta => delta.notes.push(why.clone()),
+        // the view's own note, printed with it, and the view still lists the
+        // rows not plainly proved, with nothing stored; otherwise on stderr,
+        // so the verdict lines a caller reads are what they were.
+        Err(why) if wants_delta => {
+            delta = crate::agent_delta::unstored(&records::file_records(&checked), &request.delta);
+            delta.notes.insert(0, why.clone());
+        }
         Err(why) => eprintln!("note: {why}"),
     }
 
@@ -1333,6 +1339,9 @@ pub(crate) fn run_check(args: &[String]) -> ExitCode {
         println!("{}", render_json(&checked));
         for line in delta.lines() {
             eprintln!("{line}");
+        }
+        for note in delta.commit_pointers() {
+            eprintln!("note: {note}");
         }
     } else {
         for verdict in verdicts {
@@ -1361,6 +1370,9 @@ pub(crate) fn run_check(args: &[String]) -> ExitCode {
         }
         for line in delta.lines() {
             println!("{line}");
+        }
+        for note in delta.commit_pointers() {
+            println!("note: {note}");
         }
         // The import surface is a capability boundary, not a footnote: this
         // lane checks local source imports, not external .olean libraries.

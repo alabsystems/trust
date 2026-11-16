@@ -32,9 +32,9 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     def axis_within_isl (p : BitVec 64) (lo : BitVec 64) (hi : BitVec 64) : Bool :=
-        Bool.and (Decidable.decide (Nat.le (key64 lo) (key64 p))
+        Bool.and (@Decidable.decide (Nat.le (key64 lo) (key64 p))
                                    (Nat.decLe (key64 lo) (key64 p)))
-                 (Decidable.decide (Nat.le (key64 p) (key64 hi))
+                 (@Decidable.decide (Nat.le (key64 p) (key64 hi))
                                    (Nat.decLe (key64 p) (key64 hi)))
 }
 

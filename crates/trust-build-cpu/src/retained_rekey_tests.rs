@@ -20,7 +20,7 @@ enum Failure {
 #[test]
 fn original_rekey_retries_only_its_own_partial_or_lost_ack_and_never_frees() {
     for failure in [Failure::Prefix, Failure::LostAck] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::tests::private_tempdir();
         let pool =
             RetainedPool::create_private(&root.path().join("pool"), NonZeroU32::new(1).unwrap())
                 .unwrap();
@@ -76,7 +76,7 @@ fn original_rekey_retries_only_its_own_partial_or_lost_ack_and_never_frees() {
 
 #[test]
 fn original_rekey_refuses_fixed_v1_and_foreign_domain_before_consuming_keys() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::tests::private_tempdir();
     let pool = RetainedPool::create_private(&root.path().join("pool"), NonZeroU32::new(1).unwrap())
         .unwrap();
     let mut legacy = pool.try_acquire(Owner::current(None)).unwrap().unwrap();

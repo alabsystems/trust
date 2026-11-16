@@ -30,6 +30,11 @@ What it does:
   * --wait-timeout bounds a fresh ordinary, native or exclusive admission. Timeout
     releases this unlaunched request; it never cancels another job or a running child.
     Nested, adopted and coordinated shared-memory requests cannot select this option.
+  * --execution-start-fd takes one original nonblocking pipe writer for lifecycle
+    observation, not admission. After the real child is created it reports `S`,
+    its eight-byte big-endian PID, and the pre-spawn CLOCK_MONOTONIC microseconds
+    as eight big-endian bytes, then closes. The payload never receives the pipe.
+    Adoption and coordinated shared-memory wrappers cannot select this option.
   * Inside a git worktree, only one build-slot job runs at a time per worktree, so two
     agents that land in the same worktree queue instead of killing each other's builds.
   * Shared commands using Clean's structured `heavy_gate.sh run GB LABEL -- ...`
@@ -1944,6 +1949,45 @@ def usage():
     print("usage: build-slot [--exclusive] [--wait-timeout S] [--cpus N] [--slots N] [--mem-gb G] [--no-worktree-lock] -- <command> [args...]\n       build-slot [options] adopt PID\n       build-slot status", file=sys.stderr)
 
 
+class ExecutionStart:
+    """One original private pipe reports dispatch DATA, never CPU authority.
+
+    The admitted payload never inherits this writer. The receiver can separate
+    a finite queue wait from its execution budget without inspecting markers,
+    stderr, ledger counts or another process's claimed readiness.
+    """
+    def __init__(self, raw):
+        try:
+            if (not raw.isascii() or not raw.isdigit()
+                    or not 3 <= int(raw) <= 2147483647):
+                raise ValueError
+            self.fd = int(raw)
+            held = os.fstat(self.fd)
+            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+            if (not stat.S_ISFIFO(held.st_mode)
+                    or flags & os.O_ACCMODE != os.O_WRONLY
+                    or not flags & os.O_NONBLOCK):
+                raise ValueError
+            self.identity = (held.st_dev, held.st_ino, held.st_mode)
+            os.set_inheritable(self.fd, False)
+        except (OSError, ValueError) as error:
+            raise NamespaceError("execution-start requires an original nonblocking writable pipe") from error
+
+    def notify(self, pid, started_us):
+        fd, self.fd = self.fd, None
+        try:
+            held = os.fstat(fd)
+            if (held.st_dev, held.st_ino, held.st_mode) != self.identity:
+                raise ValueError("execution-start pipe changed")
+            message = b"S" + pid.to_bytes(8, "big") + started_us.to_bytes(8, "big")
+            if os.write(fd, message) != len(message):
+                raise ValueError("incomplete execution-start notification")
+        except (OSError, ValueError) as error:
+            raise NamespaceError(f"execution-start notification refused: {error}") from error
+        finally:
+            os.close(fd)
+
+
 def main(argv):
     # Close only descriptors transferred to this invocation. A child keeps its
     # inherited descriptions until actual exit; never explicitly unlock them.
@@ -1962,6 +2006,7 @@ def _main(argv, owned):
     per_worktree = True
     exclusive = False
     wait_timeout = None
+    execution_start = None
     cpus = None
     memory_attempt = None
     memory_arrival = None
@@ -2011,6 +2056,10 @@ def _main(argv, owned):
             per_worktree = False
         elif a == "--exclusive":
             exclusive = True
+        elif a == "--execution-start-fd":
+            if execution_start is not None or not args:
+                raise NamespaceError("execution-start requires one original pipe")
+            execution_start = ExecutionStart(args.pop(0))
         elif a == "--wait-timeout":
             try:
                 wait_timeout = float(args.pop(0))
@@ -2041,7 +2090,12 @@ def _main(argv, owned):
     if not cmd:
         usage()
         return 2
-    inherited_resource_fds(os.environ)
+    original_resources = inherited_resource_fds(os.environ)
+    if execution_start is not None:
+        for fd in original_resources:
+            original = os.fstat(fd)
+            if (original.st_dev, original.st_ino, original.st_mode) == execution_start.identity:
+                raise NamespaceError("execution-start pipe aliases original scheduling transport")
     if "BUILD_SLOT_FENCE_FDS" in os.environ and not (
             os.environ.get("BUILD_SLOT_HELD") == "1"
             and os.environ.get("BUILD_SLOT_CPU_PROTOCOL") == "2"):
@@ -2057,6 +2111,9 @@ def _main(argv, owned):
         print("build-slot: --cpus cannot change an already running adopted job", file=sys.stderr)
         return 2
     wrapper = memory_wrapper(cmd)
+    if execution_start is not None and (adopt_pid is not None
+            or (wrapper is not None and not exclusive)):
+        raise NamespaceError("execution-start does not observe adoption or coordinated memory wrappers")
     if wait_timeout is not None and wrapper is not None and not exclusive:
         print("build-slot: --wait-timeout requires a new --exclusive command for a shared memory wrapper; no command was started", file=sys.stderr)
         return 2
@@ -2100,6 +2157,8 @@ def _main(argv, owned):
                 return 2
         if native_epoch:
             cmd = worker_command(cmd)
+        if execution_start is not None:
+            execution_start.notify(os.getpid(), time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000)
         os.execvp(cmd[0], cmd)
     DIR = slot_directory()
     if os.environ.get("BUILD_SLOT_CPU_PROTOCOL") == "2":
@@ -2382,6 +2441,7 @@ def _main(argv, owned):
     if memory_attempt is not None:
         os.write(memory_attempt, b"R")
         os.close(memory_attempt)
+    execution_started_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000 if execution_start else None
     child = subprocess.Popen(
         launch, env=env, start_new_session=True,
         pass_fds=sorted({*held_fds, *fence_fds, *inherited_resource_fds(env)}))
@@ -2403,7 +2463,17 @@ def _main(argv, owned):
 
     previous = {sig: signal.signal(sig, forward)
                 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    notification_failed = False
     try:
+        if execution_start is not None:
+            try:
+                execution_start.notify(child.pid, execution_started_us)
+            except Exception as error:
+                # The original child/group still belongs to us. A closed
+                # receiver must not strand it or retire its claims early.
+                notification_failed = True
+                print(f"build-slot: {error}", file=sys.stderr)
+                resource_transport_owner().signal_owned_group(child.pid, signal.SIGKILL)
         observe_exit(child.pid)
         forwardable = None
         rc = child.wait()
@@ -2411,7 +2481,7 @@ def _main(argv, owned):
         forwardable = None
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    return 128 - rc if rc < 0 else rc
+    return 2 if notification_failed else (128 - rc if rc < 0 else rc)
 
 
 if __name__ == "__main__":

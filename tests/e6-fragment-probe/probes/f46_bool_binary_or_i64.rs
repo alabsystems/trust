@@ -10,9 +10,9 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     def outside_isl (x : BitVec 64) : Bool :=
-        Bool.or (Decidable.decide (Nat.lt (key64 x) (key64 (BitVec.ofNat 64 18446744073709551488)))
+        Bool.or (@Decidable.decide (Nat.lt (key64 x) (key64 (BitVec.ofNat 64 18446744073709551488)))
                                   (Nat.decLt (key64 x) (key64 (BitVec.ofNat 64 18446744073709551488))))
-                (Decidable.decide (Nat.lt (key64 (BitVec.ofNat 64 127)) (key64 x))
+                (@Decidable.decide (Nat.lt (key64 (BitVec.ofNat 64 127)) (key64 x))
                                   (Nat.decLt (key64 (BitVec.ofNat 64 127)) (key64 x)))
 }
 pub fn outside_range(x: i64) -> bool

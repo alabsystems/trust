@@ -916,6 +916,7 @@ pub fn core_u64_wrapping_add_model_v1<'tcx>(
 mod join_provenance;
 mod source_provenance;
 pub mod calling_convention;
+pub mod source_word64;
 mod foreign_signature;
 mod source_static_readback;
 // Trust (2026-09-17): the one definition of "the production section" the source-scan
@@ -5524,6 +5525,7 @@ fn lower_body<'tcx>(
     // Only the main hook owns this registry, never query/census duplicates.
     if register_direct_obligations && !collect_all {
         source_static_readback::record(tcx, def, thir);
+        rmeta_entry::record_original_source(tcx, def);
     }
     let mut module = Module::new(tcx.crate_name(def.to_def_id().krate).to_string());
 
@@ -26646,6 +26648,52 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
                     && !self.lower_fn_item_callee_effects(*fun)
                 {
                     return None;
+                }
+                // Compiler-classified wrapping intrinsics have no linkable body.
+                // Their integer operation is modular even when overflow checks
+                // are enabled. Ordinary functions with these names stay calls.
+                if let ty::FnDef(def, generic_args) =
+                    *self.monomorphize(self.thir.exprs[*fun].ty).kind()
+                {
+                    if let Some(intrinsic) = self.tcx.intrinsic(def) {
+                        let operation = match intrinsic.name.as_str() {
+                            "wrapping_add" => Some(BinOp::Add),
+                            "wrapping_sub" => Some(BinOp::Sub),
+                            "wrapping_mul" => Some(BinOp::Mul),
+                            _ => None,
+                        };
+                        if let Some(op) = operation.filter(|_| intrinsic.must_be_overridden) {
+                            let signature = self.tcx.fn_sig(def)
+                                .instantiate(self.tcx, generic_args.skip_binder())
+                                .skip_normalization().skip_binder();
+                            let output = self.monomorphize(expr_ty);
+                            if args.len() != 2
+                                || !matches!(output.kind(), ty::Int(_) | ty::Uint(_))
+                                || signature.inputs() != [output, output]
+                                || signature.output() != output
+                                || signature.c_variadic()
+                                || args.iter().any(|id|
+                                    self.monomorphize(self.thir.exprs[*id].ty) != output)
+                            {
+                                self.unsupported.push((
+                                    format!("{expr_span:?}"),
+                                    "Call(wrapping intrinsic signature)",
+                                ));
+                                return None;
+                            }
+                            // The common path evaluated the callee already;
+                            // consume each argument once, left to right. Failure
+                            // cannot retry through the generic call path.
+                            let lhs = self.lower_expr(args[0])?;
+                            let rhs = self.lower_expr(args[1])?;
+                            let ty = self.map_ty(output);
+                            let result = self.fresh();
+                            self.push_node(InstrNode::new(Inst::BinOp {
+                                op, ty, lhs, rhs,
+                            }).with_result(result));
+                            return Some(result);
+                        }
+                    }
                 }
                 // Trust: only an authenticated, exact-version core u64 wrapping-add model
                 // owns this call. Once recognized, argument failure cannot retry/evaluate it.

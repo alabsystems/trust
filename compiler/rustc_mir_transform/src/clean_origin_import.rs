@@ -35,6 +35,7 @@
 // these runs into the exporter's would trade independence for compile time;
 // do not.
 
+use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_middle::mir::Body;
 use rustc_middle::ty::{Ty, TyCtxt};
@@ -42,6 +43,29 @@ use rustc_span::bug;
 use trust_clean_origin::VerdictDigest;
 
 use crate::clean_origin_mir;
+
+/// Only the completed readmission provider writes this Session-local map.
+/// Neither encoded metadata nor an unchecked reconstructed plan can install a row.
+#[derive(Default)]
+struct SessionReadmittedPlans {
+    plans: FxHashMap<DefId, trust_clean_origin::CleanOriginPlan>,
+}
+
+/// Reuse the existing caller model only after this Session has rechecked the
+/// imported declaration, Rust signature and every decodable body. This adds no
+/// semantic model and transfers no serialized proof grade or codegen license.
+pub(crate) fn readmitted_plan(
+    tcx: TyCtxt<'_>,
+    def: DefId,
+) -> Option<trust_clean_origin::CleanOriginPlan> {
+    if def.is_local() || !tcx.trust_clean_origin_exports(def.krate).contains(&def.index) {
+        return None;
+    }
+    tcx.ensure_done().trust_clean_extern_readmission(def);
+    tcx.sess.with_trust_compiler_state::<SessionReadmittedPlans, _>(|state| {
+        state.plans.get(&def).cloned()
+    })
+}
 
 /// Provider of `trust_clean_extern_readmission` — BOTH halves (the query is
 /// deliberately not `separate_provide_extern`; one function owns the
@@ -464,7 +488,11 @@ pub(crate) fn trust_clean_extern_readmission(tcx: TyCtxt<'_>, def: DefId) {
     // Reaching here means every available body row independently produced a
     // sealed local check, matched the preflighted wire, and agreed on method.
     // Completing this query is the compiler-side authority consumed by the
-    // metadata chokepoints; no transferable token or wire claim escapes it.
+    // metadata chokepoints. Retain its checked plan for this Session's existing
+    // caller-model reader; no transferable token or wire claim escapes it.
+    tcx.sess.with_trust_compiler_state::<SessionReadmittedPlans, _>(|state| {
+        state.plans.insert(def, plan);
+    });
 }
 
 /// The note for "`krate`'s islands cannot elaborate HERE because one of its

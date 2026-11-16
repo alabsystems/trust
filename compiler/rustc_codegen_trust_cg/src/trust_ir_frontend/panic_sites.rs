@@ -52,7 +52,7 @@ use trust_cg_bridge::global_image::type_flat_image;
 use trust_ir::ty::FuncTy;
 use trust_ir::value::{BlockId, FuncId, FuncTyId, GlobalId, SourceSpan, ValueId};
 use trust_ir::{
-    AssertKind, AssertOverflowOp, BinOp, Constant, Function, Global, ICmpOp, Inst, Linkage,
+    AssertKind, AssertOverflowOp, BinOp, CallingConv, Constant, Function, Global, ICmpOp, Inst, Linkage,
     Module, PanicLocation, PanicSite, Producer, Ty, Visibility,
 };
 
@@ -446,12 +446,14 @@ pub(crate) fn site(m_cg: &mut Module, resolver: &mut dyn Resolver) -> SitingRepo
 }
 
 /// Intern the entry `symbol` for `kind`: an existing bodyless declaration signed exactly
-/// [`entry_signature`] is reused; any other function of that name refuses.
+/// [`entry_signature`] under Rust's calling convention is reused; any other
+/// function of that name refuses. The rustc resolver confirms this convention.
 fn intern_entry(m: &mut Module, symbol: &str, kind: &AssertKind) -> Result<FuncId, String> {
     let signature = entry_signature(kind);
     if let Some(existing) = m.functions.iter().find(|f| f.name == symbol) {
         let same = existing.is_declaration()
             && existing.linkage == Linkage::External
+            && existing.calling_conv == CallingConv::Rust
             && m.func_type(existing.ty) == Some(&signature);
         return if same {
             Ok(existing.id)
@@ -470,6 +472,7 @@ fn intern_entry(m: &mut Module, symbol: &str, kind: &AssertKind) -> Result<FuncI
     };
     let id = FuncId::new(m.functions.len() as u32);
     let mut declaration = Function::new(id, symbol, ty, BlockId::new(0));
+    declaration.calling_conv = CallingConv::Rust;
     declaration.linkage = Linkage::External;
     declaration.producer = Some(Producer::TRust);
     m.functions.push(declaration);
@@ -685,8 +688,9 @@ pub(crate) fn check_postcondition(
         if f.id.as_usize() != before.functions.len() + offset
             || !f.is_declaration()
             || f.linkage != Linkage::External
+            || f.calling_conv != CallingConv::Rust
         {
-            return Err(format!("the new function `{}` is not an External declaration", f.name));
+            return Err(format!("the new function `{}` is not an External Rust declaration", f.name));
         }
         let signed = after.func_type(f.ty).is_some_and(|t| {
             t.returns.is_empty()
@@ -756,6 +760,7 @@ pub(crate) fn check_postcondition(
                         let entry_ok = after.function_by_id(new_site.entry).is_some_and(|f| {
                             f.is_declaration()
                                 && f.linkage == Linkage::External
+                                && f.calling_conv == CallingConv::Rust
                                 && after.func_type(f.ty) == Some(&entry_signature(kind))
                                 && kind
                                     .rust_panic_lang_item()

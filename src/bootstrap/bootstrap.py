@@ -599,6 +599,17 @@ def run(args, verbose=0, exception=False, is_bootstrap=False, **kwargs):
     # compiled in the same directory.
     if os.name == "nt" and not args[0].endswith(".exe"):
         args[0] += ".exe"
+    # Trust: keep the original native resource descriptions and their matching
+    # environment across both the metatool and Rust driver launch. The shared
+    # parser validates transport only; native owners still authenticate it.
+    environment = kwargs.get("env")
+    if environment is None:
+        environment = os.environ
+    descriptors = bootstrap_serial_owner().landing_targo.resource_fds(environment)
+    if platform_is_win32() and descriptors:
+        raise RuntimeError("Windows bootstrap child cannot inherit native POSIX custody")
+    if descriptors:
+        kwargs["pass_fds"] = tuple(sorted(set(kwargs.get("pass_fds", ())) | set(descriptors)))
     # Use Popen here instead of call() as it apparently allows powershell on
     # Windows to not lock up waiting for input presumably.
     ret = subprocess.Popen(args, **kwargs)

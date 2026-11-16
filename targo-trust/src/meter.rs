@@ -6,17 +6,24 @@
 //
 //  * `trust.package.v1` (`<target-dir>/trust/packages/*.json`, written by every
 //    crate-mode `targo trust check`): the package's `cost.wall_clock_ms`, the
-//    sum of the `time_ms` the compiler reported on the package's rows. The
-//    obligation lines of `trust.obligations.v1` carry no time (they are a
+//    sum of the `time_ms` the compiler reported on the package's rows. A
+//    row's `time_ms` is the time the engine that decided it reported for that
+//    one obligation (a solver's, a kernel replay's, or a timeout's budget), so
+//    the sum holds no load, standard-library decode or obligation generation.
+//    The obligation lines of `trust.obligations.v1` carry no time (they are a
 //    function of the inputs alone), so this sum is the only Rust proof time a
-//    record holds. The compiler's internal phases (load, standard-library
-//    decode, obligation generation, solving, kernel check) have no timer yet:
-//    each package names them as not measured.
-//  * `trust.lean-run.v1` (`<target-dir>/trust/lean/*.json`, written by every
-//    `targo trust check <file.lean>` for which a target directory resolves,
-//    `lean_cli::run_record`): the fresh
-//    session's start (the kernel prelude), Clean's per-declaration records
-//    (elaboration with its kernel check, one span), and the whole batch.
+//    record holds. No timer spans a compiler phase (load, standard-library
+//    decode, obligation generation, solving, kernel check): each package
+//    names them as not measured, so its total is not the whole of its wait.
+//  * `trust.lean-run.v1` (`<target-dir>/trust/lean/*.json`, written by a
+//    `targo trust check <file.lean>` that runs its batch, whenever a target
+//    directory resolves, `lean_cli::records::record_target_dir`; outside
+//    every workspace with no `--target-dir`, `CARGO_TARGET_DIR` or
+//    `CARGO_BUILD_TARGET_DIR` it writes none, and a failed write is only a
+//    warning; `lean_cli::run_record`): the fresh session's start (the kernel
+//    prelude), Clean's per-command records (an import's or lexical
+//    command's time, or a declaration's elaboration with its kernel check as
+//    one span), and the whole batch.
 //    Per-declaration time is measured only when every declaration the batch
 //    registered (the record names them) is timed; otherwise the phase is not
 //    measured, naming the untimed ones, and the derived remainder
@@ -24,43 +31,77 @@
 //    which the lane runs, records no declaration through that timer yet, so
 //    today every run names the phase.
 //  * The landing gate's run records (`<git-common-dir>/trust-land/runs/*/
-//    record.json`, `scripts/land_gate.py`): each leg that ran, the checkout
-//    worker start-up, the checkout reads between legs, the Git-state guard
-//    read at each checkout boundary that reads one (`guard_seconds`; a `land`
-//    run's own passes around its push read none), and the rest of the run's
-//    total. A checkout read is a pass the gate ran at a boundary (a row with
-//    no `reused`): every tracked file of the checkout and its populated
-//    submodules on an ordinary run, fewer on an IR-cohort diagnostic run or
-//    when the pass refused early; a boundary the last complete pass answered
-//    (`reused`, no file read) is counted apart as a reused boundary, never as
-//    a read. The gate writes record.json only when a run ends, so a run
-//    directory without one (interrupted, cancelled or still running; judged
+//    record.json`, `scripts/land_gate.py`): the run's total (`seconds`), each
+//    leg that ran, the checkout reads the run made (before and between legs,
+//    and around the push), the Git-state guard read at each checkout boundary
+//    that reads one (`guard_seconds`; a `land` run's own passes around its
+//    push read none), and the checkout worker start-up, which runs before the
+//    run's clock starts and so is not inside `seconds`; the meter adds it to
+//    the run's wait. A checkout read is a pass the gate ran at a boundary (a
+//    row with no `reused`): every tracked file of the checkout and its
+//    populated submodules on an ordinary run, fewer on an IR-cohort diagnostic
+//    run or when the pass refused early; a boundary the last complete pass
+//    answered (`reused`, no file read) is counted apart as a reused boundary,
+//    never as a read. The gate's other waits before its clock starts, such as
+//    build-slot admission, are in no record and are listed as not recorded
+//    ([`NOT_RECORDED`]). A `seconds` longer than any run since gate records
+//    began ([`GATE_RECORDS_SINCE_UNIX_S`]) is not a wall time and is named as
+//    not measured. The gate makes a run's directory after planning, so a run
+//    that ends before that leaves nothing under `runs/` and is listed as not
+//    recorded. It writes record.json only at the end of a run that does not
+//    stop on an error, so a run directory without one (interrupted,
+//    cancelled, still running, or stopped by an error; judged
 //    against `--window` by its newest file) is named as not measured. A leg
-//    that did not run waited for nothing and has no row. A leg that runs
-//    several rows (push-rows' push-profile rows, a suite's targets or
-//    members) has only its total in the record, so its per-row time is named
-//    as not measured; only a leg that is one check (`SINGLE_CHECK_LEGS`) has
-//    its row's time. The record keeps an ordinary push's exit and not its
-//    time.
+//    with no exit did not run in the gate and has no row: one that did not
+//    run waited for nothing, and the `targo-trust` leg `land` handed to a
+//    push that ran ([`PUSHED_LEG`]) names its time as not measured. A leg
+//    that runs several rows (push-rows' push-profile rows, a suite's targets
+//    or members) has only its total in the record, so its per-row time is
+//    named as not measured; only a leg that is one check
+//    (`SINGLE_CHECK_LEGS`) has its row's time. The record keeps the ordinary
+//    push step's exit (and its reason when the gate refused or failed the
+//    push) and not its time.
 //  * The pre-push hook's `TIMING:` lines (`scripts/hooks/pre-push`), from a
-//    log the caller names: each phase, each lane marked with the phase that
-//    contains it (a lane's line precedes its phase's), and
-//    `hook-before-verdict` as the hook's total. A lane's time is part of its
-//    phase's, so lane rows and phase rows do not add up to the hook's total.
+//    log the caller names: each phase, and each lane and each replay of an
+//    inherited red marked with the phase that contains it (its line precedes
+//    its phase's line), and `hook-before-verdict` as the hook's total up to
+//    its verdict. A log may hold several hook runs. A run's first `TIMING:`
+//    line is its `phase=prepare` line, written after the hook's refusals
+//    before any lane, so a run refused there writes none, and the steps
+//    after `hook-before-verdict` have no line: both are listed as not
+//    recorded ([`NOT_RECORDED`]). A run whose lines end without
+//    `hook-before-verdict`, at the next run's `prepare` line or at the log's
+//    end, stopped before its verdict: its total is named as not measured,
+//    and a lane or replay line it left with no phase line after it is marked
+//    `(in an unfinished phase)`. A lane's or replay's time is part of its
+//    phase's, so those rows and phase rows do not add up to the hook's total.
 //
 // A row the meter derives says so: `gate other (derived)` is the run's total
-// less its legs, checkout start-up, checkout reads and guard (selection, build-graph
-// discovery, the rest of start-up and any push), and `lean other (derived)`
-// the batch's total less its session start and timed records (reading
-// operands, the import closure, binding). While Clean's module batch times no
-// declaration, that remainder also holds every declaration's elaboration and
+// less its legs, checkout reads and guard (the rest of the run, such as host
+// measurement, selection, discovery and planning, hashing the toolchain and
+// the stage 1 for cache keys, cache lookups and stores, judging leg logs,
+// and any push less the checkout reads made during it), and
+// `lean other (derived)` the batch's total less its session start and timed
+// records (reading operands, the import closure, binding). While a
+// declaration the batch registered is untimed, the batch registered and timed
+// none after a recorded session start, or the record does not name what it
+// registered, that remainder may also hold declarations' elaboration and
 // kernel check, and the row is named `lean other incl. elaboration+kernel
-// check (derived)` so nobody reads it as overhead. A phase a source cannot
-// supply is listed under "not measured" with the reason, never filled in: `--check` exits 0 only when every source it read
-// yields a measured value for every phase it knows, and 1 naming each missing
-// phase otherwise. Landed changes are counted from gate records whose
-// ordinary push exited 0; per agent-hour and per processor-hour, and the work
-// nobody read, are not derivable from any record yet and are reported absent.
+// check (derived)` (`incl. untimed …` when the record names what it
+// registered and some declaration is timed) so nobody reads
+// it as overhead; a batch that registered and timed nothing with no recorded
+// session start elaborated nothing and keeps the plain name. Coverage is
+// judged only against the record's `registered` names: a declaration the
+// batch elaborated but neither registered nor timed stays in the plain-named
+// remainder, unnamed, and `--check` can still exit 0 (docs/PLAN.md
+// PKG-LIVE-1, not on yet; no record a check writes today reaches this, since
+// Clean's module batch times no declaration). A phase a source cannot supply
+// is listed under "not measured" with the reason, never filled in: `--check`
+// exits 0 only when every source it read yields a measured value for every
+// phase it knows, and 1 naming each missing phase otherwise. Landed changes
+// are counted from gate records whose ordinary push exited 0; per agent-hour
+// and per processor-hour, and the work nobody read, are not derivable from
+// any record yet and are reported absent.
 //
 // `--json` is one canonical JSON object (keys sorted, one LF at the end),
 // schema `trust.meter.v1`, with `{"absent":…,"until":…}` for what no record
@@ -82,7 +123,11 @@ pub(crate) const METER_SCHEMA: &str = "trust.meter.v1";
 /// The gate record schema this meter reads (`scripts/land_gate.py` `SCHEMA`).
 const GATE_RECORD_SCHEMA: &str = "trust-land-gate/2";
 
-/// A verifying compile's internal phases. No compiler timer measures them.
+/// A verifying compile's internal phases. No timer spans any of them: solving
+/// and kernel check are timed only per obligation (a row's `time_ms` is the
+/// deciding engine's time for it: a solver's, a kernel replay's, or a
+/// timeout's budget; `rust proof (row time_ms sum)` adds them up), and the
+/// other phases not at all.
 const COMPILER_PHASES: [&str; 5] =
     ["load", "std-decode", "obligation-generation", "solving", "kernel-check"];
 
@@ -96,12 +141,12 @@ const LEAN_DECLARATIONS_UNTIMED: &str = "not measured: Clean's module batch, whi
      per-declaration registration entry the batch uses only for lexical commands); needs a \
      timer in clean's module_batch (PKG-LIVE-1 remaining)";
 
-/// The reason when the record times some of the registered declarations but
-/// not all: not "times no declaration", which would contradict the timed rows.
-const LEAN_DECLARATIONS_PARTLY_TIMED: &str = "not measured: Clean's module batch timed only \
-     some of the declarations it registered (clean_elab::DeclTiming reaches a declaration only \
-     through the per-declaration registration entry); needs a timer in clean's module_batch for \
-     every declaration (PKG-LIVE-1 remaining)";
+/// The reason when the record times a declaration but not every registered
+/// one: not "times no declaration", which would contradict the timed rows.
+const LEAN_DECLARATIONS_PARTLY_TIMED: &str = "not measured: Clean's module batch did not time \
+     every declaration it registered (clean_elab::DeclTiming reaches a declaration only through \
+     the per-declaration registration entry); needs a timer in clean's module_batch for every \
+     declaration (PKG-LIVE-1 remaining)";
 
 /// Untimed declaration names a reason lists before it counts the rest.
 const NAMES_LISTED: usize = 5;
@@ -115,10 +160,11 @@ fn name_list(names: &[&str]) -> String {
     listed
 }
 
-/// Gate legs that are one check, so the leg's time is that row's time. Every
-/// other leg that ran (push-rows, a suite of test targets, a member set, and
-/// any leg this list does not name) runs several rows, and record.json keeps
-/// only the leg's total.
+/// Gate legs the meter knows to be one check, so the leg's time is that
+/// row's time. Any other leg that ran (push-rows, a suite of test targets, a
+/// member set, and any leg this list does not name) may run several rows, and
+/// record.json keeps only the leg's total; a development leg that runs a
+/// single test is not on this list, so its row time is named not measured.
 const SINGLE_CHECK_LEGS: [&str; 5] =
     ["compiler-check", "tidy", "tcb-panic-ratchet", "ir-cohort", "olean-audit"];
 
@@ -126,12 +172,50 @@ const SINGLE_CHECK_LEGS: [&str; 5] =
 const GATE_ROWS_UNTIMED: &str = "record.json keeps only the leg's total `seconds`; needs \
      per-row time in scripts/land_gate.py's run record (PKG-LIVE-1 remaining)";
 
-/// Why a gate run directory without a record.json has no time.
-const RUN_WITHOUT_RECORD: &str =
-    "run left no record.json (interrupted or still running); its time is not measured";
+/// The leg `land` hands to the ordinary push instead of running it
+/// (`scripts/land_gate.py` `defer_targo`): its entry has no exit or time, and
+/// a record whose push ran carries `live_targo`, the push coordinator's
+/// receipt, which has no time either.
+const PUSHED_LEG: &str = "targo-trust";
 
-/// Waits no source the meter reads records yet.
-const NOT_RECORDED: [&str; 3] = ["compile", "tests", "tool rebuilds"];
+/// Why [`PUSHED_LEG`] has no time when `land` handed it to the push.
+const PUSHED_LEG_UNTIMED: &str = "`land` handed the leg to the ordinary push (`live_targo`), \
+     whose pre-push hook runs it; record.json keeps no exit or time for it, so any time it took \
+     is inside the push's, in `gate other`";
+
+/// Why a gate run directory without a record.json has no time.
+const RUN_WITHOUT_RECORD: &str = "run left no record.json (interrupted, still running, or \
+     stopped by an error before writing it); its time is not measured";
+
+/// No landing-gate run record was written before this time (2026-01-01
+/// 00:00 UTC), so a record's `seconds` longer than the time from it to the
+/// record's write is not the run's wall time. Before land_gate.py's clock fix
+/// the gate's development and source-diagnostic runs wrote epoch minus uptime
+/// there (about 1.79e9 s).
+const GATE_RECORDS_SINCE_UNIX_S: u64 = 1_767_225_600;
+
+/// Waits no source the meter reads records yet: an agent's own builds and
+/// tests run outside the gate and the hook (the gate's and the hook's own
+/// compile and test legs are rows); the gate's waits before its run clock
+/// starts other than the checkout worker start-up (in `scripts/land_gate.py`,
+/// among them `enter_admission` and `publication_lease`); a gate run that
+/// ends before `_cmd_run_in_scope` makes its run directory, which leaves
+/// nothing under `runs/`; and the pre-push hook's time outside its `TIMING:`
+/// lines (`scripts/hooks/pre-push` writes its first, `phase=prepare`, after
+/// its refusals before any lane, and none after `hook-before-verdict`, where
+/// `launch_shadow` and, for the leg `land` hands it, `landing-hook-finish`'s
+/// `checkout_problem` run).
+const NOT_RECORDED: [&str; 6] = [
+    "compiles outside the gate and the hook",
+    "test runs outside the gate and the hook",
+    "tool rebuilds",
+    "the gate's waits before its run clock starts (such as build-slot admission and `land`'s \
+     publication lease, but not its checkout start-up)",
+    "gate runs that end before making their run directory",
+    "the pre-push hook's time outside its `TIMING:` lines (a run refused before its \
+     `phase=prepare` line, and the steps after `hook-before-verdict`: the shadow launch and, when \
+     `land` hands the hook its `targo-trust` leg, `landing-hook-finish`'s checkout read)",
+];
 
 /// Rows the terminal table prints by default; `--top 0` prints every row.
 const DEFAULT_TOP: usize = 20;
@@ -141,35 +225,44 @@ const MAX_SOURCE_BYTES: usize = crate::input_limits::MAX_RELEASE_TRANSCRIPT_REPO
 
 const USAGE: &str = "\
 Usage: targo trust meter [--target-dir DIR]... [--gate-runs DIR]... [--gate-record FILE]...
-                         [--hook-log FILE]... [--window <N>h|<N>d] [--top N] [--json] [--check]
+                         [--hook-log FILE]... [--window <N>h|<N>d] [--top N]
+                         [--json | --format terminal|json] [--check]
 
 Where an agent's time went, largest wait first, from the timing the toolchain
 already records:
   --target-dir DIR    trust.package.v1 records (DIR/trust/packages/*.json, Rust proof time)
                       and trust.lean-run.v1 records (DIR/trust/lean/*.json, Lean session
-                      start and batch total; per-declaration time is not measured until
-                      Clean's module batch records it)
+                      start, import and command times, and the batch's remainder;
+                      per-declaration time is not measured until Clean's module batch
+                      records it)
   --gate-runs DIR     the landing gate's run records (DIR/*/record.json): per leg, checkout
-                      start-up, reads (complete passes; reused boundaries counted apart)
-                      and Git-state guard, the rest of the run, and landed changes; a leg
-                      of several rows names its per-row time as not measured, and so does
-                      a run directory with no record.json (interrupted or still running)
+                      reads (complete passes; reused boundaries counted apart) and
+                      Git-state guard, the rest of the run, the checkout start-up before
+                      it, and landed changes; a leg of several rows names its per-row
+                      time as not measured, and so does a run directory with no
+                      record.json
   --gate-record FILE  one gate run record
-  --hook-log FILE     a pre-push hook log: its `TIMING:` lines, per lane and phase
+  --hook-log FILE     a pre-push hook log: its `TIMING:` lines, per phase, lane and
+                      inherited-red replay; a hook run in it that stopped after its
+                      `phase=prepare` line and before its verdict names its total as not
+                      measured (a run refused before that line writes no `TIMING:` line)
   --window SPAN       only records written in the last SPAN (`12h`, `2d`); a hook log is
                       read whole
   --top N             table rows to print (default 20; 0 prints all)
   --json              one trust.meter.v1 JSON object instead of the table
+  --format F          terminal (the default) or json; the last of --json and --format applies
   --check             exit 0 only when every source read yields a measured value for
                       every phase it knows; exit 1 naming each missing phase
+  -h, --help          print this text
 
-With no source named, the meter reads the target directory a check would write
-(CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR, else target/ in the workspace root
-that governs the current directory; none outside every workspace) when it holds
-a trust/ directory, and this repository's <git-common-dir>/trust-land/runs when
-that exists.
-Exit: 0 table or JSON printed (with --check: everything measured), 1 --check
-found a phase not measured, 2 usage error, or no source named and none found.";
+With no source named, the meter reads CARGO_TARGET_DIR, else CARGO_BUILD_TARGET_DIR,
+else target/ in the workspace root that governs the current directory (none outside
+every workspace), when it holds a trust/ directory, and this repository's
+<git-common-dir>/trust-land/runs when it exists. A `build.target-dir` in a Cargo
+config file is not read: name --target-dir for the records a check wrote there.
+Exit: 1 --check found a phase not measured (a named source that is missing or empty
+is one); 2 usage error, no source named and none found, or the default target
+directory cannot be resolved (the gate runs are then not read either); else 0.";
 
 /// One measured (or derived) wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +301,9 @@ struct SourceSummary {
     /// boundaries, counted apart; None when the record has no
     /// `checkout_checks` array.
     checkout: Option<(usize, usize)>,
+    /// The source names a wait of its own that `total_us` leaves out, so its
+    /// total is not the whole of it.
+    total_partial: bool,
 }
 
 /// Landed changes, from gate records.
@@ -227,6 +323,11 @@ struct Meter {
     rows: Vec<Row>,
     missing: Vec<Missing>,
     sources: Vec<SourceSummary>,
+    /// Categories with a source whose total the meter could not read: a
+    /// record or hook log that cannot be read or names another schema, and a
+    /// gate run directory that left no record.json. No [`SourceSummary`]
+    /// stands for them, and their wait is in no total.
+    unread: std::collections::BTreeSet<&'static str>,
     landed: Landed,
 }
 
@@ -342,8 +443,8 @@ pub(crate) fn run_subcommand(args: &[String]) -> ExitCode {
         }
         if request.target_dirs.is_empty() && request.gate_runs.is_empty() {
             eprintln!(
-                "targo trust meter: no source: no target directory with Trust records and no \
-                 gate run records here; name --target-dir, --gate-runs, --gate-record or \
+                "targo trust meter: no source: no target directory holding a trust/ directory \
+                 and no gate run records here; name --target-dir, --gate-runs, --gate-record or \
                  --hook-log\n{USAGE}"
             );
             return ExitCode::from(2);
@@ -375,9 +476,12 @@ pub(crate) fn run_subcommand(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The sources a bare `targo trust meter` reads: the target directory a check
-/// would write, when it holds a `trust/` directory, and this repository's gate
-/// run records, when their directory exists.
+/// The sources a bare `targo trust meter` reads: the target directory a `.lean`
+/// check would write (`lean_cli::records::record_target_dir`, which reads no
+/// Cargo config file) when it holds a `trust/` directory, and this
+/// repository's gate run records when their directory exists. An error
+/// resolving that target directory is returned before the gate runs are looked
+/// for, and the meter exits 2 on it.
 fn default_sources(request: &mut Request) -> Result<(), String> {
     // Outside every workspace with no target directory named, no check wrote
     // a record this could read (`lean_cli::records::record_target_dir`).
@@ -501,15 +605,17 @@ impl Meter {
                     }
                     continue;
                 }
-                // `scripts/land_gate.py` writes record.json only when a run
-                // ends, so an interrupted, cancelled or still-running run
-                // leaves logs and no record. Its wait is real and unread:
+                // `scripts/land_gate.py` writes record.json only at the end
+                // of a run that does not stop on an error, so an interrupted,
+                // cancelled, failed or still-running run leaves logs and no
+                // record. Its wait is real and unread:
                 // name it, judged by its newest file's time (one whose time
                 // cannot be read is named too).
                 if since.is_some_and(|since| newest_mtime(&run).is_some_and(|time| time < since)) {
                     continue;
                 }
                 unrecorded += 1;
+                meter.unread.insert("gate");
                 meter.miss("gate", "records", "-", &run, RUN_WITHOUT_RECORD);
             }
             meter.landed.runs_without_record += unrecorded;
@@ -605,34 +711,28 @@ impl Meter {
     }
 
     /// Read one JSON record; a record that cannot be read or is not the named
-    /// schema is a missing phase of its own.
+    /// schema is a missing phase of its own, and its category's wait is not
+    /// totalled.
     fn read_json(&mut self, path: &Path, category: &'static str, schema: &str) -> Option<Value> {
-        let text = match crate::input_limits::read_bounded_utf8_file(path, MAX_SOURCE_BYTES) {
-            Ok(text) => text,
-            Err(error) => {
-                self.miss(category, "records", "-", path, &format!("cannot read it: {error}"));
-                return None;
-            }
+        let value = match crate::input_limits::read_bounded_utf8_file(path, MAX_SOURCE_BYTES) {
+            Err(error) => Err(format!("cannot read it: {error}")),
+            Ok(text) => serde_json::from_str::<Value>(&text)
+                .map_err(|error| format!("not JSON: {error}"))
+                .and_then(|value| {
+                    let found = value.get("schema").and_then(Value::as_str).unwrap_or("");
+                    if found == schema {
+                        Ok(value)
+                    } else {
+                        Err(format!("names schema `{found}`, not `{schema}`"))
+                    }
+                }),
         };
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(error) => {
-                self.miss(category, "records", "-", path, &format!("not JSON: {error}"));
-                return None;
-            }
-        };
-        let found = value.get("schema").and_then(Value::as_str).unwrap_or("");
-        if found != schema {
-            self.miss(
-                category,
-                "records",
-                "-",
-                path,
-                &format!("names schema `{found}`, not `{schema}`"),
-            );
-            return None;
-        }
-        Some(value)
+        value
+            .map_err(|why| {
+                self.unread.insert(category);
+                self.miss(category, "records", "-", path, &why);
+            })
+            .ok()
     }
 
     fn read_package_record(&mut self, path: &Path) {
@@ -642,38 +742,34 @@ impl Meter {
             return;
         };
         let package = record.get("package").and_then(Value::as_str).unwrap_or("?").to_string();
-        let cost = record.pointer("/cost/wall_clock_ms").and_then(Value::as_u64);
-        match cost {
-            Some(ms) => {
-                let us = ms.saturating_mul(1000);
-                self.add("proof", "rust proof (row time_ms sum)", &package, path, us, false);
-                self.sources.push(SourceSummary {
-                    kind: "rust-package",
-                    path: path.display().to_string(),
-                    category: "proof",
-                    records: 1,
-                    total_us: Some(us),
-                    checkout: None,
-                });
+        let total_us = record
+            .pointer("/cost/wall_clock_ms")
+            .and_then(Value::as_u64)
+            .map(|ms| ms.saturating_mul(1000));
+        match total_us {
+            Some(us) => {
+                self.add("proof", "rust proof (row time_ms sum)", &package, path, us, false)
             }
-            None => {
-                self.miss(
-                    "proof",
-                    "rust proof (row time_ms sum)",
-                    &package,
-                    path,
-                    "the record has no `cost.wall_clock_ms`",
-                );
-                self.sources.push(SourceSummary {
-                    kind: "rust-package",
-                    path: path.display().to_string(),
-                    category: "proof",
-                    records: 1,
-                    total_us: None,
-                    checkout: None,
-                });
-            }
+            None => self.miss(
+                "proof",
+                "rust proof (row time_ms sum)",
+                &package,
+                path,
+                "the record has no `cost.wall_clock_ms`",
+            ),
         }
+        // The row `time_ms` sum holds no load, std-decode or obligation
+        // generation, which the compiler-phase rows below name as not
+        // measured for this package: its total is never the whole of it.
+        self.sources.push(SourceSummary {
+            kind: "rust-package",
+            path: path.display().to_string(),
+            category: "proof",
+            records: 1,
+            total_us,
+            checkout: None,
+            total_partial: true,
+        });
         for phase in COMPILER_PHASES {
             self.miss("proof", &format!("rust {phase}"), &package, path, COMPILER_PHASES_WHY);
         }
@@ -759,18 +855,33 @@ impl Meter {
             .and_then(|names| names.iter().map(Value::as_str).collect::<Option<_>>());
         let mut other_phase = "lean other (derived)";
         let why = match registered {
-            Some(registered) if registered.is_empty() && timed.is_empty() => Some(
-                "the batch registered no declaration (it was refused before elaboration, \
-                 registered none of those it elaborated, or holds none)"
-                    .to_string(),
-            ),
+            Some(registered) if registered.is_empty() && timed.is_empty() => {
+                Some(if session_us.is_some() {
+                    // A session start is recorded, so the batch may have
+                    // elaborated and refused every declaration: that time is
+                    // in the remainder. `trust-certify`'s source batch also
+                    // records the time of a session that failed to start.
+                    other_phase = "lean other incl. elaboration+kernel check (derived)";
+                    "the batch registered no declaration after its recorded session start (it \
+                     refused each one or had none, or the session failed to start), so any \
+                     declaration's elaboration and kernel check is untimed and inside the `lean \
+                     other incl. elaboration+kernel check (derived)` row"
+                        .to_string()
+                } else {
+                    "the batch registered no declaration: no attempt started a session, so it \
+                     was refused before elaboration and elaborated none"
+                        .to_string()
+                })
+            }
             Some(registered) => {
                 let untimed: Vec<&str> =
                     registered.iter().copied().filter(|name| !timed.contains(*name)).collect();
                 if untimed.is_empty() {
                     None
                 } else {
-                    let (phase, reason) = if untimed.len() == registered.len() {
+                    // "Times no declaration" only when none was timed: a
+                    // timed declaration the batch did not register is a row.
+                    let (phase, reason) = if timed.is_empty() {
                         (
                             "lean other incl. elaboration+kernel check (derived)",
                             LEAN_DECLARATIONS_UNTIMED,
@@ -821,6 +932,7 @@ impl Meter {
             records: 1,
             total_us: total,
             checkout: None,
+            total_partial: false,
         });
     }
 
@@ -839,13 +951,50 @@ impl Meter {
             self.landed.to_unix_s =
                 Some(self.landed.to_unix_s.map_or(written, |to| to.max(written)));
         }
-        let total = record.get("seconds").and_then(Value::as_f64).and_then(micros_of_seconds);
+        // The run's total, or the one reason it has none: an absent
+        // `seconds`, one that is no non-negative number, or one too long to
+        // be a wall time each name `gate total` once.
+        let written_unix_s = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(unix_seconds)
+            .or_else(|| unix_seconds(SystemTime::now()));
+        let total: Result<u64, String> = match record.get("seconds") {
+            None => Err("the record has no `seconds`".to_string()),
+            Some(seconds) => seconds.as_f64().and_then(micros_of_seconds).ok_or_else(|| {
+                format!(
+                    "the record's `seconds` is `{seconds}`, not a non-negative number of seconds"
+                )
+            }),
+        }
+        .and_then(|us| {
+            // No run since gate records began lasted longer than the time
+            // from then to this record's write: such a `seconds` is not a
+            // wall time.
+            let Some(written) = written_unix_s else { return Ok(us) };
+            let longest_s = written.saturating_sub(GATE_RECORDS_SINCE_UNIX_S);
+            if us / 1_000_000 > longest_s {
+                return Err(format!(
+                    "`seconds` is {} s, longer than any run since gate records began ({} UTC); \
+                     not a wall time (scripts/land_gate.py before its run-clock fix wrote epoch \
+                     minus uptime there in development and source-diagnostic runs)",
+                    us / 1_000_000,
+                    utc(GATE_RECORDS_SINCE_UNIX_S)
+                ));
+            }
+            Ok(us)
+        });
         let mut parts_us = 0u64;
         if let Some(legs) = record.get("legs").and_then(Value::as_object) {
             for (leg, entry) in legs {
-                // A leg that ran has an exit; one that did not run waited for
-                // nothing and has no row.
+                // A leg that ran in the gate has an exit. Without one, the
+                // leg `land` handed to a push that then ran (`live_targo`)
+                // ran inside that push or not at all, with no time of its
+                // own; any other leg did not run and waited for nothing.
                 if entry.get("rc").is_none() {
+                    if leg == PUSHED_LEG && record.get("live_targo").is_some() {
+                        self.miss("gate", "gate leg", leg, path, PUSHED_LEG_UNTIMED);
+                    }
                     continue;
                 }
                 match entry.get("seconds").and_then(Value::as_f64).and_then(micros_of_seconds) {
@@ -956,47 +1105,65 @@ impl Meter {
             }
             checkout = Some((reads, reused));
         }
-        // The checkout worker pool starts once, before any read, timed apart
-        // from the reads (`_CheckoutWorkers.start`); `{}` means no pool ran.
-        if let Some(startup) = record.get("checkout_startup").and_then(Value::as_object) {
-            let mut startup_us: Option<u64> = None;
-            let mut unreadable = false;
-            for key in ["python_seconds", "native_seconds"] {
-                let Some(value) = startup.get(key) else { continue };
-                match value.as_f64().and_then(micros_of_seconds) {
-                    Some(us) => startup_us = Some(startup_us.unwrap_or(0).saturating_add(us)),
-                    None => unreadable = true,
+        // The checkout worker pool starts before the run's clock
+        // (`_checkout_workers_scope`), so its start-up is not inside
+        // `seconds` and is added to the run's wait. `{}` is a run with no
+        // pool. A record with no `checkout_startup` object may come from a
+        // gate that started a pool and did not time it (0f70876a10a until
+        // ac0bd4793de).
+        let mut startup_total_us: Option<u64> = None;
+        let startup_unread = match record.get("checkout_startup") {
+            Some(Value::Object(startup)) => {
+                let mut startup_us: Option<u64> = None;
+                let mut unreadable = false;
+                for key in ["python_seconds", "native_seconds"] {
+                    let Some(value) = startup.get(key) else { continue };
+                    match value.as_f64().and_then(micros_of_seconds) {
+                        Some(us) => startup_us = Some(startup_us.unwrap_or(0).saturating_add(us)),
+                        None => unreadable = true,
+                    }
+                }
+                match startup_us {
+                    Some(us) if !unreadable => {
+                        startup_total_us = Some(us);
+                        self.add("gate", "gate checkout start-up", "-", path, us, false);
+                        None
+                    }
+                    None if startup.is_empty() => None,
+                    _ => Some(
+                        "`checkout_startup` has no finite `python_seconds` and `native_seconds`",
+                    ),
                 }
             }
-            match startup_us {
-                Some(us) if !unreadable => {
-                    parts_us = parts_us.saturating_add(us);
-                    self.add("gate", "gate checkout start-up", "-", path, us, false);
-                }
-                None if startup.is_empty() => {}
-                _ => self.miss(
-                    "gate",
-                    "gate checkout start-up",
-                    "-",
-                    path,
-                    "`checkout_startup` has no finite `python_seconds` and `native_seconds`",
-                ),
-            }
+            _ => Some(
+                "the record has no `checkout_startup` object, so any checkout start-up is untimed",
+            ),
+        };
+        // Outside `seconds`, so the run's wait lacks it.
+        if let Some(why) = startup_unread {
+            self.miss("gate", "gate checkout start-up", "-", path, why);
         }
         if let Some(push) = record.get("ordinary_push") {
             if push.get("rc").and_then(Value::as_i64) == Some(0) {
                 self.landed.through_gate += 1;
             }
+            // `scripts/land_gate.py` writes `ordinary_push` once the push step
+            // passes its source check (`source_refusal("before ordinary
+            // push")`, which leaves `source_refusal` and no `ordinary_push`),
+            // a later refusal before any push included; the push's checkout
+            // reads are in `checkout_checks`.
             self.miss(
                 "gate",
                 "gate ordinary push",
                 "-",
                 path,
-                "record.json keeps the push's exit, not its time; the time is inside `gate other`",
+                "record.json keeps the ordinary push step's exit (and its reason when the gate \
+                 refused or failed the push), not its time; that time, less the checkout reads \
+                 made during it, is inside `gate other`",
             );
         }
-        match total {
-            Some(total) => self.add(
+        match &total {
+            Ok(total) => self.add(
                 "gate",
                 "gate other (derived)",
                 "-",
@@ -1004,15 +1171,16 @@ impl Meter {
                 total.saturating_sub(parts_us),
                 true,
             ),
-            None => self.miss("gate", "gate total", "-", path, "the record has no `seconds`"),
+            Err(why) => self.miss("gate", "gate total", "-", path, why),
         }
         self.sources.push(SourceSummary {
             kind: "gate-run",
             path: path.display().to_string(),
             category: "gate",
             records: 1,
-            total_us: total,
+            total_us: total.ok().map(|us| us.saturating_add(startup_total_us.unwrap_or(0))),
             checkout,
+            total_partial: startup_unread.is_some(),
         });
     }
 
@@ -1020,6 +1188,7 @@ impl Meter {
         let bytes = match crate::input_limits::read_bounded_file(path, MAX_SOURCE_BYTES) {
             Ok(bytes) => bytes,
             Err(error) => {
+                self.unread.insert("push");
                 self.miss("push", "records", "-", path, &format!("cannot read it: {error}"));
                 return;
             }
@@ -1028,14 +1197,33 @@ impl Meter {
         let mut lines = 0usize;
         let mut total: Option<u64> = None;
         let mut saw_total = false;
+        // A wait of this log's that `total` leaves out: a run that stopped
+        // before its verdict, or a verdict line with no elapsed time.
+        let mut total_partial = false;
+        // `TIMING:` lines of the current hook run: since the last
+        // `hook-before-verdict`, or since the log's start or the current
+        // run's `prepare` line. Above 0 at the end, the last run stopped
+        // before its verdict.
+        let mut after_total = 0usize;
+        // Earlier runs that stopped before their verdict. `scripts/hooks/
+        // pre-push` writes `phase=prepare` once per run, as its first
+        // `TIMING:` line, so a `prepare` line while the current run has
+        // lines starts a new run: the one before it ended with no verdict.
+        let mut stopped_earlier = 0usize;
         // Lane and replay lines precede the line of the phase that ran them
         // (`run_fast_lanes`, `judge_inherited`, the scoped lanes): they wait
         // here until that phase names itself.
         let mut nested: Vec<(&'static str, String, Result<u64, String>)> = Vec::new();
         for line in text.lines() {
             let Some(fields) = parse_timing_line(line) else { continue };
-            lines += 1;
             let phase = fields.get("phase").map(String::as_str).unwrap_or("?");
+            if phase == "prepare" && after_total > 0 {
+                self.add_nested(path, std::mem::take(&mut nested), "an unfinished phase");
+                stopped_earlier += 1;
+                after_total = 0;
+            }
+            lines += 1;
+            after_total += 1;
             let lane = fields.get("lane").map(String::as_str).unwrap_or("-");
             let elapsed = match fields.get("elapsed_s").and_then(|value| value.parse::<u64>().ok())
             {
@@ -1053,9 +1241,13 @@ impl Meter {
                 "hook-before-verdict" => {
                     self.add_nested(path, std::mem::take(&mut nested), "an unnamed phase");
                     saw_total = true;
+                    after_total = 0;
                     match elapsed {
                         Ok(us) => total = Some(total.unwrap_or(0).saturating_add(us)),
-                        Err(why) => self.miss("push", "push hook total", "-", path, &why),
+                        Err(why) => {
+                            total_partial = true;
+                            self.miss("push", "push hook total", "-", path, &why);
+                        }
                     }
                 }
                 other => {
@@ -1069,16 +1261,41 @@ impl Meter {
             }
         }
         self.add_nested(path, nested, "an unfinished phase");
-        if lines == 0 {
+        let stopped_last = after_total > 0;
+        let stopped = stopped_earlier + usize::from(stopped_last);
+        total_partial |= stopped > 0;
+        let why = if lines == 0 {
             self.miss("push", "push hook", "-", path, "the log holds no `TIMING:` line");
+            None
+        } else if stopped_earlier > 0 {
+            let last = if stopped_last {
+                format!(
+                    ", and the last run, {after_total} `TIMING:` line(s), ends the log without one"
+                )
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "{stopped} hook run(s) stopped before their verdict, so their totals are not in the \
+                 hook total: {stopped_earlier} run(s) end at the next run's `phase=prepare` line \
+                 with no `phase=hook-before-verdict` before it{last}"
+            ))
         } else if !saw_total {
-            self.miss(
-                "push",
-                "push hook total",
-                "-",
-                path,
-                "no `TIMING: phase=hook-before-verdict` line (the hook stopped before its verdict)",
-            );
+            Some(
+                "no `TIMING: phase=hook-before-verdict` line (the hook stopped before its verdict)"
+                    .to_string(),
+            )
+        } else if stopped_last {
+            Some(format!(
+                "the last hook run stopped before its verdict: {after_total} `TIMING:` line(s) \
+                 follow the last `phase=hook-before-verdict`, and its total is not in the hook \
+                 total"
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.miss("push", "push hook total", "-", path, &why);
         }
         self.sources.push(SourceSummary {
             kind: "hook-log",
@@ -1087,6 +1304,7 @@ impl Meter {
             records: lines,
             total_us: total,
             checkout: None,
+            total_partial,
         });
     }
 
@@ -1113,7 +1331,8 @@ impl Meter {
     }
 
     /// Per category: the sum of its sources' own totals, and whether a source
-    /// of it recorded none.
+    /// of it recorded none or only part of its own, or could not be read
+    /// ([`Meter::unread`]).
     fn waited(&self) -> BTreeMap<&'static str, (u64, bool)> {
         let mut waited: BTreeMap<&'static str, (u64, bool)> = BTreeMap::new();
         for source in &self.sources {
@@ -1122,6 +1341,12 @@ impl Meter {
                 Some(us) => entry.0 = entry.0.saturating_add(us),
                 None => entry.1 = true,
             }
+            if source.total_partial {
+                entry.1 = true;
+            }
+        }
+        for &category in &self.unread {
+            waited.entry(category).or_insert((0, false)).1 = true;
         }
         waited
     }
@@ -1320,13 +1545,31 @@ fn leg_rows(leg: &str, entry: &Value) -> Option<String> {
         return None;
     }
     Some(match (leg, entry.get("targets").and_then(Value::as_array)) {
-        ("push-rows", _) => {
-            "it runs every push-profile row (`bash tests/run_trust_comprehensive_harness.sh \
-             --list push`) and its log has no per-row time"
-                .to_string()
+        // Which rows depends on the profile (those no other leg covers, or
+        // every fresh one with `--all-rows`); the reason names neither.
+        ("push-rows", _) => "it runs push-profile rows (`bash \
+                             tests/run_trust_comprehensive_harness.sh --list push`), and its log \
+                             has no per-row time"
+            .to_string(),
+        // `targets` is the leg's plan (`scripts/land_gate.py` writes it before
+        // any cache lookup or narrowing), not a count of what ran; the
+        // members a cached PASS answered for are `cached_members`.
+        (_, Some(targets)) => {
+            let planned: std::collections::BTreeSet<&str> =
+                targets.iter().filter_map(Value::as_str).collect();
+            let cached =
+                entry.get("cached_members").and_then(Value::as_array).map_or(0, |cached| {
+                    cached.iter().filter_map(Value::as_str).filter(|m| planned.contains(m)).count()
+                });
+            let cached = match cached {
+                0 => String::new(),
+                cached => format!(", {cached} of them answered by a cached PASS"),
+            };
+            format!("its plan names {} target(s){cached}, each one row or more", targets.len())
         }
-        (_, Some(targets)) => format!("it runs {} target(s), each one row or more", targets.len()),
-        _ => "it is not one check: it runs a suite or a set of rows".to_string(),
+        _ => "it is not a leg the meter knows to be one check (compiler-check, tidy, \
+              tcb-panic-ratchet, ir-cohort, olean-audit), so it may run several rows"
+            .to_string(),
     })
 }
 
@@ -1386,8 +1629,9 @@ fn parse_timing_line(line: &str) -> Option<BTreeMap<String, String>> {
 }
 
 /// Split Bash `printf %q` output into words, removing its quoting: a
-/// backslash escapes the next character, `'…'` is literal, and `$'…'` takes
-/// C escapes (`\n`, `\t`, `\\`, `\'`, `\xHH`).
+/// backslash escapes the next character, `'…'` is literal, and `$'…'` is
+/// decoded as bytes, so a UTF-8 character `printf %q` wrote as octal bytes
+/// reads back as that character.
 fn split_shell_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -1419,26 +1663,7 @@ fn split_shell_words(text: &str) -> Vec<String> {
             '$' if chars.peek() == Some(&'\'') => {
                 in_word = true;
                 chars.next();
-                while let Some(inner) = chars.next() {
-                    match inner {
-                        '\'' => break,
-                        '\\' => match chars.next() {
-                            Some('n') => word.push('\n'),
-                            Some('t') => word.push('\t'),
-                            Some('r') => word.push('\r'),
-                            Some('x') => {
-                                let hex: String =
-                                    [chars.next(), chars.next()].into_iter().flatten().collect();
-                                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                                    word.push(char::from(byte));
-                                }
-                            }
-                            Some(other) => word.push(other),
-                            None => {}
-                        },
-                        other => word.push(other),
-                    }
-                }
+                word.push_str(&ansi_c_quoted(&mut chars));
             }
             other => {
                 in_word = true;
@@ -1450,6 +1675,67 @@ fn split_shell_words(text: &str) -> Vec<String> {
         words.push(word);
     }
     words
+}
+
+/// The body of a Bash `$'…'` word, read after its opening quote through its
+/// closing one, decoded as bytes ([`split_shell_words`]).
+fn ansi_c_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    fn push(bytes: &mut Vec<u8>, c: char) {
+        bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    // Up to `max` more digits of `radix` onto `value`, and how many were read.
+    fn more_digits(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max: usize,
+        mut value: u32,
+    ) -> (u32, usize) {
+        let mut read = 0;
+        while read < max {
+            let Some(digit) = chars.peek().and_then(|c| c.to_digit(radix)) else { break };
+            value = value * radix + digit;
+            chars.next();
+            read += 1;
+        }
+        (value, read)
+    }
+    let mut bytes = Vec::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => break,
+            '\\' => match chars.next() {
+                Some('a') => bytes.push(0x07),
+                Some('b') => bytes.push(0x08),
+                Some('e' | 'E') => bytes.push(0x1b),
+                Some('f') => bytes.push(0x0c),
+                Some('n') => bytes.push(b'\n'),
+                Some('r') => bytes.push(b'\r'),
+                Some('t') => bytes.push(b'\t'),
+                Some('v') => bytes.push(0x0b),
+                // At most three octal digits, one byte, as Bash reads them.
+                Some(digit @ '0'..='7') => {
+                    let (value, _) = more_digits(chars, 8, 2, digit.to_digit(8).unwrap_or(0));
+                    bytes.push((value & 0xff) as u8);
+                }
+                Some('x') => match more_digits(chars, 16, 2, 0) {
+                    (value, 1..) => bytes.push((value & 0xff) as u8),
+                    _ => bytes.extend_from_slice(b"\\x"),
+                },
+                Some('c') => match chars.next() {
+                    Some(control) => bytes.push((u32::from(control) & 0x1f) as u8),
+                    None => bytes.extend_from_slice(b"\\c"),
+                },
+                Some(other @ ('\\' | '\'' | '"' | '?')) => push(&mut bytes, other),
+                Some(other) => {
+                    bytes.push(b'\\');
+                    push(&mut bytes, other);
+                }
+                None => bytes.push(b'\\'),
+            },
+            other => push(&mut bytes, other),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -1476,6 +1762,28 @@ mod tests {
             .expect("a TIMING line");
         assert_eq!(fields["lane"], "a\tb");
         assert!(parse_timing_line("PASS fast.seed-freshness").is_none());
+    }
+
+    /// `$'…'` decodes to bytes, so the octal bytes `printf %q` writes for a
+    /// UTF-8 character read back as that character, and an escape the decoder
+    /// does not know stays as written.
+    #[test]
+    fn ansi_c_quoting_decodes_bytes_not_latin_1() {
+        let words = split_shell_words(
+            "a=$'caf\\303\\251' b=$'\\xc3\\xa9' c=$'\\E[0m\\a\\v\\f\\b' d=$'\\cA\\0\\101x' \
+             e=$'\\q\\?\\\"' f=$'\\x'",
+        );
+        assert_eq!(
+            words,
+            [
+                "a=café",
+                "b=é",
+                "c=\u{1b}[0m\u{7}\u{b}\u{c}\u{8}",
+                "d=\u{1}\u{0}Ax",
+                "e=\\q?\"",
+                "f=\\x",
+            ]
+        );
     }
 
     #[test]

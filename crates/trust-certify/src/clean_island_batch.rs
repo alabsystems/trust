@@ -1141,7 +1141,7 @@ mod tests {
     /// proposition with a real kernel term registers, with no error.
     #[test]
     fn test_check_all_axiom_free_proof_registers() {
-        let island = "theorem le_self (n : Nat) : Nat.le n n := Nat.le.refl n\n";
+        let island = "theorem le_self (n : Nat) : Nat.le n n := @Nat.le.refl n\n";
         let mut session = CleanIslandSession::new();
         let batch = session.check_all(&[island]);
 

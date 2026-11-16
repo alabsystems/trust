@@ -19,15 +19,19 @@ pub struct CheckedNativeWpProof {
     accepted_evidence_digest: [u8; 32],
     native_request_id: u32,
     native_proof_id: u32,
+    #[cfg(feature = "trust-build")]
+    translation_witness: Option<trust_wp_lib::trust_ir_body::NativeBodyWpTranslationWitness>,
 }
 
 impl CheckedNativeWpProof {
+    #[cfg(feature = "trust-build")]
     pub(super) fn new(
         native: Arc<NativeVerificationBundle>,
         public_semantic_digest: String,
         accepted_evidence: &ObligationEvidence,
         native_request_id: u32,
         native_proof_id: u32,
+        translation_witness: Option<trust_wp_lib::trust_ir_body::NativeBodyWpTranslationWitness>,
     ) -> Option<Self> {
         Some(Self {
             native,
@@ -35,6 +39,7 @@ impl CheckedNativeWpProof {
             accepted_evidence_digest: evidence_digest(accepted_evidence)?,
             native_request_id,
             native_proof_id,
+            translation_witness,
         })
     }
 
@@ -92,6 +97,18 @@ impl CheckedNativeWpProof {
     #[must_use]
     pub fn native_proof_id(&self) -> u32 {
         self.native_proof_id
+    }
+
+    /// Diagnostic translation data checked against this fact's exact native
+    /// input and accepted certificate. A present witness is correspondence,
+    /// not a translation theorem, source authority or stronger proof grade.
+    /// Native-only certificates may have no witness.
+    #[cfg(feature = "trust-build")]
+    #[must_use]
+    pub fn translation_witness(
+        &self,
+    ) -> Option<&trust_wp_lib::trust_ir_body::NativeBodyWpTranslationWitness> {
+        self.translation_witness.as_ref()
     }
 }
 

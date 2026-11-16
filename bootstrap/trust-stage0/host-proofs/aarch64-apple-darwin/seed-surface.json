@@ -1,36 +1,36 @@
 {
   "entrypoint_sha256": {
-    "cargo": "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc",
-    "rustc": "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e",
-    "targo": "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc",
-    "trustc": "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e",
-    "trustdoc": "0be5a5a83f9e2711e2aa3727a192b237388b49fc66ccd6ebed882ccf5ef316fb",
-    "trustfmt": "6b7e6b843296a9dc87eb557dcda4eb1e9014285b2b308d2aaa3e61ba8f7a0f41"
+    "cargo": "e052036773580276deaad0192650a3e4d853f6a9c5f2ea8278038a8ef5d7d765",
+    "rustc": "8c321463ee4bc5161f5b61a9d63f931e726cb0f442652f5ac495e8c9b6fb8ac4",
+    "targo": "e052036773580276deaad0192650a3e4d853f6a9c5f2ea8278038a8ef5d7d765",
+    "trustc": "8c321463ee4bc5161f5b61a9d63f931e726cb0f442652f5ac495e8c9b6fb8ac4",
+    "trustdoc": "146b1af8a7048c86a83794bd129936cd9acfd97e2752b6101330b82b89d22750",
+    "trustfmt": "927bffd5d9a3cc193e0d5f087454bc4a87f7e98d818394811bace009522ec026"
   },
   "host": "aarch64-apple-darwin",
   "loader_evidence": {
-    "targo": "{seed}/bin/targo:\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.1.8)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 62460.40.78)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices (compatibility version 1.0.0, current version 1226.0.0)\n\t/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration (compatibility version 1.0.0, current version 1453.40.1)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)",
-    "trustc": "{seed}/bin/trustc:\n\t@rpath/librustc_driver-01267cadd5734df2.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.32.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)",
-    "trustfmt": "{seed}/bin/trustfmt:\n\t@rpath/librustc_driver-01267cadd5734df2.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.32.0)"
+    "targo": "{seed}/bin/targo:\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.1.8)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 62460.40.78)\n\t/usr/lib/libsandbox.1.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices (compatibility version 1.0.0, current version 1226.0.0)\n\t/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration (compatibility version 1.0.0, current version 1453.40.1)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)",
+    "trustc": "{seed}/bin/trustc:\n\t@rpath/librustc_driver-f17e15adb4d2646c.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.32.0)\n\t/usr/lib/libsandbox.1.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.1.8)\n\t/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 62460.40.78)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)",
+    "trustfmt": "{seed}/bin/trustfmt:\n\t@rpath/librustc_driver-f17e15adb4d2646c.dylib (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5027.1.8)\n\t/usr/lib/libz.1.dylib (compatibility version 1.0.0, current version 1.2.12)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.32.0)\n\t/usr/lib/libsandbox.1.dylib (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5027.1.8)\n\t/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 62460.40.78)"
   },
   "native_tool_pair": {
     "host": "aarch64-apple-darwin",
-    "source_commit": "82bb867eddb94599f68194f701c766f2b6f5a02f",
-    "trust_version": "0.13.0+g82bb867ed"
+    "source_commit": "5062eed55c0bc9df8a79eba1368d88ffde76c741",
+    "trust_version": "0.14.0+g5062eed55"
   },
   "schema": "trust-self-host-seed-surface-v1",
-  "source_version": "0.13.0",
+  "source_version": "0.14.0",
   "tool_versions": {
-    "targo": "targo 1.101.0-dev (82bb867ed 2026-11-07) (targo 0.13.0+g82bb867ed)\nencoded-dep-info-version: 3\nfreshness: rust-and-build-input-content-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\nanalysis-session: build-json-v1\nrelease: 1.101.0-dev\ntrust: 0.13.0+g82bb867ed\ncommit-hash: 82bb867eddb94599f68194f701c766f2b6f5a02f\ncommit-date: 2026-11-07\ntrust-repo-commit-hash: 82bb867eddb94599f68194f701c766f2b6f5a02f\nhost: aarch64-apple-darwin\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nos: Mac OS 27.2.0 [64-bit]",
-    "trustc": "rustc 1.101.0-dev (82bb867ed 2026-11-07) (trustc 0.13.0+g82bb867ed)",
-    "trustfmt": "trustfmt 1.12.0-trust (82bb867edd 2026-11-07)"
+    "targo": "targo 1.101.0-dev (5062eed55 2026-11-15) (targo 0.14.0+g5062eed55)\nencoded-dep-info-version: 7\nfreshness: rust-and-build-input-content-v1\nfreshness: compiler-filename-inventory-v1\ncache-integrity: build-script-control-output-v1\ncache-integrity: compiled-build-script-executable-v1\ncache-integrity: build-script-generated-tree-v1\nanalysis-session: build-json-v1\nrelease: 1.101.0-dev\ntrust: 0.14.0+g5062eed55\ncommit-hash: 5062eed55c0bc9df8a79eba1368d88ffde76c741\ncommit-date: 2026-11-15\ntrust-repo-commit-hash: 5062eed55c0bc9df8a79eba1368d88ffde76c741\nhost: aarch64-apple-darwin\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nos: Mac OS 27.2.0 [64-bit]",
+    "trustc": "rustc 1.101.0-dev (5062eed55 2026-11-15) (trustc 0.14.0+g5062eed55)",
+    "trustfmt": "trustfmt 1.12.0-trust (5062eed55c 2026-11-15)"
   },
   "tree": {
-    "directories": 505,
-    "entries": 4040,
-    "regular_file_bytes": 4058531185,
-    "regular_files": 3535,
-    "sha256": "9cecd9e090205ec55a7a4184cb68183701138a6b246b2474972bf67aa6f1c5a2",
+    "directories": 525,
+    "entries": 4122,
+    "regular_file_bytes": 4405921799,
+    "regular_files": 3597,
+    "sha256": "ef60d57e3cab4bc5c21b8bdb1422b7b7b84a519f1200aeecbafb6b9ef4185d7e",
     "symlinks": 0
   }
 }

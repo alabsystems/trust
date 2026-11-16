@@ -223,6 +223,9 @@ pub struct Layout {
     artifact_lock: Option<FileLock>,
     build_lock: Option<FileLock>,
     _lock: Option<FileLock>,
+    // Trust: DC-12b. Whether this Layout took its build directory's lock
+    // exclusively itself (`excludes_other_builds`).
+    build_lock_exclusive: bool,
 }
 
 /// Output location DATA only. This owns no directory leases and cannot be
@@ -319,6 +322,7 @@ impl Layout {
             artifact_lock: Some(artifact_lock),
             build_lock: Some(build_lock),
             _lock: Some(lock),
+            build_lock_exclusive: true,
         })
     }
 
@@ -385,9 +389,22 @@ impl Layout {
     /// finish. Execution keeps the owned paths without preventing a nested
     /// build from acquiring the same output directory.
     pub(super) fn release_compile_leases(&mut self) {
+        self.build_lock_exclusive = false;
         drop(self.artifact_lock.take());
         drop(self.build_lock.take());
         drop(self._lock.take());
+    }
+
+    /// Trust: DC-12b. Whether no other build can be using this Layout's build
+    /// directory profile: this Layout took its `.cargo-build-lock` exclusively
+    /// itself and its compilation still holds it (in the Layout, or in the
+    /// workload capsule `take_compile_leases` moved it to, which outlives
+    /// `finish_compilation`'s use of this). False where the lock is shared
+    /// (`-Zfine-grain-locking`), borrowed from a retained original (a
+    /// continued build), not taken (a file system without locking) or
+    /// released.
+    pub(crate) fn excludes_other_builds(&self) -> bool {
+        self.build_lock_exclusive
     }
 
     /// Calculate the paths for build output, lock the build directory, and return as a Layout.
@@ -481,6 +498,9 @@ impl Layout {
         // actual destination (sub)subdirectory.
         paths::create_dir_all(dest.as_path_unlocked())?;
 
+        // Trust: DC-12b records whether the lock is this Layout's own and
+        // exclusive (`excludes_other_builds`).
+        let mut build_lock_exclusive = false;
         let build_dir_lock = if is_on_nfs_mount(build_root.as_path_unlocked()) {
             None
         } else {
@@ -496,6 +516,7 @@ impl Layout {
                     "build directory",
                 )?)
             } else {
+                build_lock_exclusive = true;
                 Some(build_dest.open_rw_exclusive_create(
                     ".cargo-build-lock",
                     ws.gctx(),
@@ -545,6 +566,7 @@ impl Layout {
             artifact_lock,
             build_lock: build_dir_lock,
             _lock: lock,
+            build_lock_exclusive,
         })
     }
 

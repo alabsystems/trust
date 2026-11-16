@@ -1312,7 +1312,7 @@ fast.asl1-reference-custody|fast|supply-chain|true|never|python3 scripts/trust_c
 fast.cargo-lock-hygiene|fast|supply-chain|true|2026-11-06|scripts/check_cargo_lock_hygiene.py
 fast.cargo-lock-hygiene-selftest|fast|supply-chain|true|2026-11-06|scripts/check_cargo_lock_hygiene.py --selftest
 slow.cargo-lock-hygiene-mutants|slow|supply-chain|true|2026-11-06|python3 scripts/tests/check_cargo_lock_hygiene_mutants.py
-fast.cargo-manifest-alignment|fast|supply-chain|true|2026-09-30|python3 scripts/check_cargo_manifest_alignment.py
+fast.cargo-manifest-alignment|fast,push|supply-chain|true|2026-09-30|python3 scripts/check_cargo_manifest_alignment.py
 fast.corpus-membership|fast,push|drift|true|2026-11-10|python3 scripts/check_corpus_membership.py
 fast.ledger-pins|fast,push|drift|true|2026-11-10|python3 scripts/check_ledger_pins.py
 fast.land-rows-coverage|fast,push|drift|true|never|python3 -B scripts/land_gate.py rows --check

@@ -7,23 +7,26 @@
 //! nothing compared the two before it went out.
 //!
 //! The corpora are rows of `tests/corpora.toml` ([`table`]). The verb compiles
-//! every case once with each of two compilers ([`run`]) and ranks each verdict
-//! against the case's pin ([`rank`]):
+//! every case with each of two compilers ([`run`], [`judge`]) and ranks each
+//! verdict against the case's pin ([`rank`]):
 //!
 //! * `2`: the verdict the case is pinned to, or `verifies` where nothing is
 //!   pinned;
 //! * `1`: a clean miss;
 //! * `0`: a crash, below a clean miss;
-//! * `-1`: `verifies` where the pin says `refuses`, a possible false proof and
-//!   worse than a crash.
+//! * `-1`: an exit 0 the pin does not allow (`verifies` where the pin says
+//!   `refuses`, or where it says `conditional` and the condition is not
+//!   shown), a possible false proof and worse than a crash.
 //!
 //! A case whose rank fell is a LOSS, and so is one the old compiler had as
 //! pinned and the new compiler did not record. A rank that rose is a GAIN. A
 //! case with no verdict inside its bound is not judged: it has no rank, and a
 //! run that holds one compares nothing.
 //!
-//! A verdict here is a compiler's exit status. It is a release-gate input,
-//! never a proof, and it grants nothing by itself.
+//! A verdict here is a compiler's exit status, and for the cases that say so
+//! in the table also a text its output must hold, a second compile that must
+//! refuse, or a dependency that must build first ([`judge`]). It is a
+//! release-gate input, never a proof, and it grants nothing by itself.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -33,9 +36,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::gate_args;
+
 mod cli;
-mod gate_args;
+mod headers;
 mod identity;
+mod judge;
 mod run;
 mod table;
 
@@ -53,15 +59,19 @@ pub(crate) const EXIT_COULD_NOT_RUN: u8 = 3;
 
 /// The rank of a verdict that is the one its case is pinned to.
 const AS_PINNED: i8 = 2;
-/// The rank of `verifies` where the pin says `refuses`.
+/// The rank of an exit 0 the pin does not allow.
 const FALSE_PROOF: i8 = -1;
 
-/// What a corpus requires of one compile.
+/// What a corpus requires of one case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Pin {
     Verifies,
     Refuses,
+    /// Exit 0 only because an obligation was admitted as a disclosed
+    /// assumption: the disclosure is in the output, and the same compile
+    /// under the corpus's certify arguments refuses ([`Verdict::Conditional`]).
+    Conditional,
 }
 
 impl Pin {
@@ -69,11 +79,14 @@ impl Pin {
         match self {
             Self::Verifies => "verifies",
             Self::Refuses => "refuses",
+            Self::Conditional => "conditional",
         }
     }
 }
 
-/// What one compiler did with one case: its own exit status.
+/// What one compiler did with one case. The first four are the exit status
+/// of the case's compile; the rest are what [`judge`] makes of the compiles
+/// of a case whose row asks for more than an exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub(crate) enum Verdict {
@@ -86,6 +99,18 @@ pub(crate) enum Verdict {
     Crash(i32),
     /// No verdict inside the case's bound. Never ranked.
     NotJudged,
+    /// Exit 0 with the disclosure in the output, and the certify compile
+    /// exited non-zero with its refusal in its output. Only a case pinned
+    /// `conditional` is asked this, so only one has this verdict.
+    Conditional,
+    /// Exit 0 where `verifies` is pinned, without the text the case's row
+    /// says its output holds.
+    VerifiesOtherwise,
+    /// Exit 1 where `refuses` is pinned, without the text the case's row says
+    /// its output holds: refused, and not for the pinned reason.
+    RefusesOtherwise,
+    /// Not compiled: the dependency it is built against refused.
+    Blocked,
 }
 
 impl Verdict {
@@ -105,6 +130,10 @@ impl fmt::Display for Verdict {
             Self::Refuses => formatter.write_str("refuses"),
             Self::Crash(status) => write!(formatter, "crash:{status}"),
             Self::NotJudged => formatter.write_str("not-judged"),
+            Self::Conditional => formatter.write_str("conditional"),
+            Self::VerifiesOtherwise => formatter.write_str("verifies-otherwise"),
+            Self::RefusesOtherwise => formatter.write_str("refuses-otherwise"),
+            Self::Blocked => formatter.write_str("blocked"),
         }
     }
 }
@@ -123,6 +152,10 @@ impl TryFrom<String> for Verdict {
             "verifies" => Ok(Self::Verifies),
             "refuses" => Ok(Self::Refuses),
             "not-judged" => Ok(Self::NotJudged),
+            "conditional" => Ok(Self::Conditional),
+            "verifies-otherwise" => Ok(Self::VerifiesOtherwise),
+            "refuses-otherwise" => Ok(Self::RefusesOtherwise),
+            "blocked" => Ok(Self::Blocked),
             other => other
                 .strip_prefix("crash:")
                 .and_then(|status| status.parse::<i32>().ok())
@@ -142,7 +175,9 @@ pub(crate) struct CaseRecord {
     pub(crate) case: String,
     pub(crate) verdict: Verdict,
     /// The first `error` line of the compiler's output, where it did not
-    /// verify; why there is no verdict, where it was not judged.
+    /// verify; why there is no verdict, where it was not judged; which part of
+    /// its row a case did not meet, where the verdict says it met less than
+    /// its exit status (`judge`).
     pub(crate) cause: String,
     pub(crate) pin: Option<Pin>,
 }
@@ -151,14 +186,28 @@ pub(crate) struct CaseRecord {
 pub(crate) type RankFn = fn(Verdict, Option<Pin>) -> Option<i8>;
 
 /// The rank of `verdict` against `pin` (the module comment has the scale).
+///
+/// One run gives both sides one table, so a verdict meets the pin it was
+/// judged under. Two records compared across tables may not; a verdict its
+/// pin could not have produced (`conditional` under any other pin) is ranked
+/// as the exit 0 it was.
 pub(crate) fn rank(verdict: Verdict, pin: Option<Pin>) -> Option<i8> {
+    use Verdict::{
+        Blocked, Conditional, Crash, NotJudged, Refuses, RefusesOtherwise, Verifies,
+        VerifiesOtherwise,
+    };
     Some(match (verdict, pin) {
-        (Verdict::NotJudged, _) => return None,
-        (Verdict::Crash(_), _) => 0,
-        (Verdict::Verifies, None | Some(Pin::Verifies)) => AS_PINNED,
-        (Verdict::Refuses, Some(Pin::Refuses)) => AS_PINNED,
-        (Verdict::Verifies, Some(Pin::Refuses)) => FALSE_PROOF,
-        (Verdict::Refuses, None | Some(Pin::Verifies)) => 1,
+        (NotJudged, _) => return None,
+        (Crash(_), _) => 0,
+        (Verifies | Conditional, None | Some(Pin::Verifies)) => AS_PINNED,
+        (Refuses, Some(Pin::Refuses)) => AS_PINNED,
+        (Conditional, Some(Pin::Conditional)) => AS_PINNED,
+        // An exit 0 the pin does not allow.
+        (Verifies | VerifiesOtherwise | Conditional, Some(Pin::Refuses)) => FALSE_PROOF,
+        (Verifies | VerifiesOtherwise, Some(Pin::Conditional)) => FALSE_PROOF,
+        (Refuses, None | Some(Pin::Verifies | Pin::Conditional)) => 1,
+        (VerifiesOtherwise, None | Some(Pin::Verifies)) => 1,
+        (RefusesOtherwise | Blocked, _) => 1,
     })
 }
 
@@ -292,12 +341,16 @@ pub(crate) fn compare_with(
             continue;
         };
         if after < before {
-            let why = if after == FALSE_PROOF {
+            // A case pinned `conditional` that exits 0 without its condition
+            // says in its cause which half is missing.
+            let why = if after == FALSE_PROOF && pin != Some(Pin::Conditional) {
                 "a case pinned refuses now verifies"
-            } else if now.cause.is_empty() {
-                "no `error` line in its output"
-            } else {
+            } else if !now.cause.is_empty() {
                 now.cause.as_str()
+            } else if after == FALSE_PROOF {
+                "a case pinned conditional now verifies without its condition"
+            } else {
+                "no `error` line in its output"
             };
             comparison.losses += 1;
             comparison.flips.push(flip(

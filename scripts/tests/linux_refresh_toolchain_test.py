@@ -49,8 +49,9 @@ HOST = "aarch64-unknown-linux-gnu"
 
 
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", *args],
-                          check=True, capture_output=True, text=True, env=GIT_ENV).stdout.strip()
+    command = refresh.git_command(repo, "-c", "protocol.file.allow=always", *args)
+    return subprocess.run(command, check=True, capture_output=True,
+                          text=True, env=GIT_ENV).stdout.strip()
 
 
 def commit_file(repo: Path, name: str, text: str) -> str:

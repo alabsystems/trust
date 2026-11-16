@@ -10,7 +10,7 @@ use crate::f1_compile::{
 };
 use crate::verify_output::EmitPolicy;
 
-const INPUT: &[u8] = include_bytes!("actual-b8-caller-input.json");
+const INPUT: &[u8] = include_bytes!("current-e76-caller/actual-input.json");
 const CALLER: &str = "source_memory_caller";
 
 fn config(data: &crate::compiler_input_capture::DecodedCompilerInputs) -> F1CompileConfig {
@@ -38,7 +38,7 @@ fn bound(data: &crate::compiler_input_capture::DecodedCompilerInputs) -> ObjectL
 }
 
 #[test]
-fn actual_b8_caller_retains_frame_inputs_without_claiming_the_missing_semantics() {
+fn actual_e76_reconstructed_caller_retains_frame_inputs_without_claiming_the_missing_semantics() {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(32 << 20)
@@ -50,10 +50,23 @@ fn actual_b8_caller_retains_frame_inputs_without_claiming_the_missing_semantics(
 }
 
 fn check_actual() {
+    assert_eq!(
+        artifact_digest(INPUT),
+        "e4b0e9030c002ebfa9d3a6395e6322197dffe6f96d5b524e913ddb7eea67cd38"
+    );
     let data = CompilerInputCapture::from_bytes(INPUT).unwrap().decode_inputs().unwrap();
     assert_eq!(
         artifact_digest(&data.object),
-        "c4b9e1fcbc611f998c791cacd906ae735a5371528725829739995fe92c24e941"
+        "b20aa8af874f0bc71b54e3144632d0df1c1d17dc4b821f9d402b50d23f17d01b"
+    );
+    assert!(data.m_cg.closure_layouts.is_empty());
+    assert!(
+        data.m_cg
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.body)
+            .all(|n| !matches!(n.inst, trust_ir::Inst::Alloca { .. }))
     );
     let config = config(&data);
     let compiler = Compiler::new_for_target_spec(
@@ -90,7 +103,9 @@ fn check_actual() {
             .collect::<Vec<_>>()
     );
     let caller = report.certificates.iter().find(|row| row.symbol == CALLER).unwrap();
-    assert!(!caller.verdict.is_proven());
+    assert!(matches!(caller.verdict, OutputVerdict::Unknown { .. }));
+    assert_eq!(caller.obligations.o5_frame.grade, Grade::Unknown);
+    assert!(caller.obligations.o5_frame.detail.contains("M5 memory-call premises are unproved"));
     let request = caller.frame_inputs.as_ref().unwrap();
     assert_eq!(request.producer_frame_bytes, Some(16));
     assert!(request.producer_slots.is_empty());
@@ -247,7 +262,7 @@ fn untagged_quotes_exactly_what_the_ladder_reads_as_a_class() {
 }
 
 /// The blockers no single obligation names, and a refutation graded after an Unknown. Grades are
-/// set by hand on the actual b8 report, so this pins only the refusal text: a [VALIDATED] row is
+/// set by hand on the actual e76 reconstructed-subject report, so this pins only the refusal text: a [VALIDATED] row is
 /// "Proven without kernel evidence", a kernel-proved row left unclosed names its unclosed callees,
 /// a Refuted function is named by its refuting obligation even when an earlier-numbered one is
 /// Unknown, and a refutation is the only cause named under either policy.
@@ -275,7 +290,7 @@ fn check_unproved_blockers() {
             crate::call_event::Assumption::CoEmitted(callee) => Some(callee.clone()),
             crate::call_event::Assumption::External(_) => None,
         })
-        .expect("the b8 caller calls a co-emitted callee");
+        .expect("the current caller calls a co-emitted callee");
     for row in &mut report.certificates {
         let (verdict, grade) = if row.symbol == CALLER {
             (

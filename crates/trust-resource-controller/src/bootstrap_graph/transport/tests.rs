@@ -62,6 +62,100 @@ fn actual_eof(read: OwnedFd) {
     }
 }
 
+fn early_writer_delivery(count: usize) -> (PreparationOutputDelivery, OwnedFd) {
+    let [read, write] = pipe();
+    let (mut sender, mut receiver) = channels();
+    let rights = (0..count).map(|_| write.as_fd()).collect::<Vec<_>>();
+    sender
+        .send_bootstrap_descriptions(
+            &rights,
+            super::super::offline_preparation::PREPARATION_OUTPUT_RIGHTS_MARKER,
+            deadline(),
+        )
+        .unwrap();
+    drop(rights);
+    let delivered = receive_preparation_output_delivery(&mut receiver, deadline()).unwrap();
+    drop(write);
+    (delivered, read)
+}
+
+fn no_eof(read: BorrowedFd<'_>) {
+    let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut byte = 0u8;
+    assert_eq!(
+        unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+        -1
+    );
+    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn unconsumed_actual_delivery_drop_unwind_and_successful_queue_drop_retain_all_writers() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    for count in [1, 2] {
+        for scenario in 0..3 {
+            let (delivery, read) = early_writer_delivery(count);
+            assert_eq!(delivery.descriptions.as_ref().unwrap().len(), count);
+            match scenario {
+                0 => drop(delivery),
+                1 => {
+                    assert!(
+                        catch_unwind(AssertUnwindSafe(|| {
+                            let _held = delivery;
+                            panic!("caller unwound before native State takeover");
+                        }))
+                        .is_err()
+                    );
+                }
+                _ => {
+                    let (send, receive) = std::sync::mpsc::channel();
+                    assert!(send.send(delivery).is_ok());
+                    // The actual message was accepted, then discarded without
+                    // dispatch. Its unconsumed delivery must still retain FDs.
+                    drop(receive);
+                }
+            }
+            no_eof(read.as_fd());
+            // These bounded uncertain writers deliberately remain until this
+            // private test process exits. A saved number supplies no release.
+        }
+    }
+}
+
+#[test]
+fn explicit_state_takeover_moves_exact_fds_once_and_then_obeys_state_lifetime() {
+    for count in [1, 2] {
+        let (delivery, read) = early_writer_delivery(count);
+        let numbers = delivery
+            .descriptions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        let mut state = Vec::new();
+        let valid = delivery.into_parts(&mut state);
+        assert_eq!(valid, count == 2);
+        assert_eq!(
+            state.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+            numbers
+        );
+        assert_eq!(
+            state.len(),
+            count,
+            "unique consumption adds no duplicate descriptions"
+        );
+        no_eof(read.as_fd());
+        drop(state);
+        actual_eof(read);
+    }
+}
+
 #[test]
 fn actual_numeric_pair_conserves_one_inventory_and_preserves_source_configuration() {
     let originals = pipe();

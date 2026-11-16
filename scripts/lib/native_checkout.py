@@ -151,6 +151,27 @@ class OriginalProgram:
         self.file.close()
 
 
+def selected_executable(env):
+    """The managed Targo image `managed_program` would admit, by path only,
+    from the one cheap package lookup (`atpkg which`): no verification and
+    no digest. It names what a remembered "unavailable" answer is keyed on
+    (land_gate.native_reader_key); it admits nothing. Unavailable when the
+    lookup does not name a ready managed image."""
+    activation = Path.home() / ".local/bin/atpkg"
+    try:
+        done = subprocess.run([str(activation), "which", "--json", "targo"], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30,
+                              pass_fds=landing_targo.resource_fds(env))
+        value = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        raise Unavailable(f"native reader lookup failed ({error.__class__.__name__})") from error
+    if (not isinstance(value, dict) or value.get("status") != "ready" or value.get("managed") is not True
+            or not isinstance(value.get("physical_executable"), str)
+            or not os.path.isabs(value["physical_executable"])):
+        raise Unavailable("native reader lookup names no ready managed Targo image")
+    return Path(value["physical_executable"])
+
+
 def managed_program(env):
     """The existing offline local package verifier is disclosed trusted input.
 

@@ -42,7 +42,10 @@ impl HeldSystemCommand {
             let root = program.parent().ok_or_else(|| refused("native command has no parent"))?;
             let mut directories = BTreeMap::new();
             let (executable, header) = file(&mut directories, program, true, root, deadline)?;
-            let commands = macho::commands(&header, true)?;
+            let commands = match imports {
+                SystemImports::NoSearchPaths => macho::commands(&header, true)?,
+                SystemImports::AbsoluteOnly => macho::absolute_system_commands(&header)?,
+            };
             if (matches!(imports, SystemImports::NoSearchPaths) && !commands.rpaths.is_empty())
                 || commands.loads.iter().any(|load| !macho::system(load))
             {
@@ -124,3 +127,7 @@ impl HeldSystemCommand {
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests;
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "system_command/absolute_system_tests.rs"]
+mod absolute_system_tests;

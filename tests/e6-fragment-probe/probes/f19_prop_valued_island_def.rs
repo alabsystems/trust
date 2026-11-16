@@ -11,7 +11,7 @@
 clean {
     def le_isl (a : UInt64) (b : UInt64) : Prop := Nat.le (UInt64.toNat a) (UInt64.toNat b)
     theorem le_isl_refl : forall (x : UInt64), le_isl x x :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 pub fn keep(x: u64) -> u64
     ensures le_isl(result, x) by le_isl_refl

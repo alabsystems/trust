@@ -80,7 +80,7 @@ clean {
                 Nat.le (cap (UInt64.toNat (Decidable.casesOn (motive := fun _ => UInt64)
                     d (fun _ => a) (fun _ => b)))) (UInt64.toNat a))
             (instDecidableUInt64Lt a b)
-            (fun _ => Nat.le.refl (UInt64.toNat a))
+            (fun _ => @Nat.le.refl (UInt64.toNat a))
             (fun _ => h)
     theorem rmax_le_left : forall (a : UInt64) (b : UInt64),
         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
@@ -90,7 +90,7 @@ clean {
                 Nat.le (UInt64.toNat (Decidable.casesOn (motive := fun _ => UInt64)
                     d (fun _ => a) (fun _ => b))) (UInt64.toNat a))
             (instDecidableUInt64Lt a b)
-            (fun _ => Nat.le.refl (UInt64.toNat a))
+            (fun _ => @Nat.le.refl (UInt64.toNat a))
             (fun _ => h)
 }
 
@@ -132,10 +132,17 @@ pub fn use_inside_sub_nc(a: u64) -> u64 {
     }
 }
 
+// RE-PIN 2026-11-15: 1 failed / 2 unknown -> 2 failed / 1 unknown. The clause `result < 1` is
+// FALSE of this body: `rmax(0, 5)` returns 5. The 2026-11-14 trust-wp pins decide unsigned
+// Select on the body path, so the body-aware WP lane, which reads `rmax`'s own body, refutes
+// the source clause row. `use_outside` declares no `requires`, so the bare clause IS its public
+// claim (WP-BODY-NO-REQUIRES-1 withholds only where one is declared). Measured on a stage 1 of
+// main 3f5d1e29d27 and of the landing tree.
 pub fn use_outside() -> u64
 //~^ ERROR Trust strict verification failed for
-//~| NOTE 1 proved, 1 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+//~| NOTE 1 proved, 2 failed, 1 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
 //~| NOTE [precond] FAILED
+//~| NOTE [postcond] FAILED
     ensures result < 1
 {
     rmax(0, 5)

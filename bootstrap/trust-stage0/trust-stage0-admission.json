@@ -1,46 +1,46 @@
 {
   "admission": "internal",
-  "date": "2026-11-07",
+  "date": "2026-11-15",
   "dist_payload_mode": "full",
-  "git_commit_hash": "82bb867eddb94599f68194f701c766f2b6f5a02f",
-  "manifest_hash": "1d845790968a3cacb2f960cd3681c263360e7393459833034cc10bbf48ff4c99",
+  "git_commit_hash": "5062eed55c0bc9df8a79eba1368d88ffde76c741",
+  "manifest_hash": "5bf59951b5b6dc34b13c32692f820721ada9d38f04dab06b0b04331cfa6fcd2d",
   "owned_channel": "trust",
   "payloads": [
     {
-      "relative_path": "dist/2026-11-07/targo-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "9daef404105f86603cb670e9c885cf68289dd494e3ab15cf607593772eab4514"
+      "relative_path": "dist/2026-11-15/targo-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "8964a289ed4408bf4083b57e1089fece518b28e252b63c1720b693bb23c502cb"
     },
     {
-      "relative_path": "dist/2026-11-07/targo-trust-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "148fd4fe60a96545addf6192eb5b1913878b5a4b80993a92616c8cc4f36e35ce"
+      "relative_path": "dist/2026-11-15/targo-trust-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "80db4a8118c2e205f3db6f7d5391ffdaa1f98e20f73510394fe1fc2fa9e1ab16"
     },
     {
-      "relative_path": "dist/2026-11-07/tippy-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "0c0ef8f7929855f66f56e8f7548be362ba035ae71ebbe57eaedb7b72a17a0724"
+      "relative_path": "dist/2026-11-15/tippy-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "79811ac5959ba9c0f49a96d688d6ee93b8539ae07499fcefb45a4825ae222f78"
     },
     {
-      "relative_path": "dist/2026-11-07/trust-analyzer-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "6070ceaaefdc81e84a25b440308ef34452de678f088a3a32d83a69f0066e8d31"
+      "relative_path": "dist/2026-11-15/trust-analyzer-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "d43761eba39f6b6877cfe0f00ae458428852a56bae6bf5e82d6c2f9ed98bc5fb"
     },
     {
-      "relative_path": "dist/2026-11-07/trust-src-0.13.0-trust.tar.xz",
-      "sha256": "17a4c26ef376dc739db147263e82b04bd0e290fd1e3cd6e219d0e7b40edc7689"
+      "relative_path": "dist/2026-11-15/trust-src-0.14.0-trust.tar.xz",
+      "sha256": "3132a403c6464454ee1392a7988c69b545bdaeb3c7900455b4e542a8321fe0e2"
     },
     {
-      "relative_path": "dist/2026-11-07/trust-std-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "9ed1059a7bbb2914da06b3d9fa5d4faecede52362560659123c5ab6c792120eb"
+      "relative_path": "dist/2026-11-15/trust-std-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "7aa8cf7fc719582465d53b2b495a6dcbaec68143e5169f61c3e7aeb433cfc174"
     },
     {
-      "relative_path": "dist/2026-11-07/trustc-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "c81028808506a0c9b4fdca33ceaabf4ffdab45b23c4169de44596209ac573505"
+      "relative_path": "dist/2026-11-15/trustc-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "80ab3947374ef9ca61fe4562c6c8a7da90ee840f739889f8afa88c47eac4c69c"
     },
     {
-      "relative_path": "dist/2026-11-07/trustc-dev-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "12fd22868dfe622d40d5a9a4ded9ec35dc96dbbfe51d3d5db027de2ad4847e7f"
+      "relative_path": "dist/2026-11-15/trustc-dev-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "50060e6d160a32a402a43b82d731e16f1a3dcffe1eb1bafacafec6d2a31b271e"
     },
     {
-      "relative_path": "dist/2026-11-07/trustfmt-0.13.0-trust-aarch64-apple-darwin.tar.xz",
-      "sha256": "04a7bed03547504084235b7a294d9bf7834e35e7f2fea35245e1a6da5824262d"
+      "relative_path": "dist/2026-11-15/trustfmt-0.14.0-trust-aarch64-apple-darwin.tar.xz",
+      "sha256": "8cc2827f2324e378384d9686c83564588785140a3efb8bd790184249a3b7d28f"
     }
   ],
   "promotion_decision": "admit-internal",

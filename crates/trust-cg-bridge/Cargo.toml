@@ -38,6 +38,9 @@ ay-proofs = ["trust-ir/binary", "dep:trust-ir-build", "dep:ay", "dep:ay-proof", 
 # are dev-deps only (see crates/Cargo.toml: clean-auto already consumed by
 # trust-clean). Behind a feature so default builds don't pull the clean kernel.
 kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel", "dep:stacker"]
+# In-memory, kernel-bound Clean admission on the Compiler consumer. The
+# ordinary consumer still refuses Clean bodies without explicit admissions.
+clean-codegen = ["kernel-recheck", "dep:trust-clean-ir-gate", "dep:trust-certify"]
 # Conditional per-instruction SemR4.30 reference evidence; no function grade.
 frame-step-reference = ["kernel-recheck", "dep:clean-olean", "trust-ir/clean-expr"]
 # Data-only canonical SemR scalar claims over independently selected original
@@ -95,6 +98,8 @@ trust-types = { workspace = true }
 # (module_to_lir.rs); its reference interpreter is used by the test
 # value-differential. The trust-ir core crate is zero-required-dep.
 trust-ir = { workspace = true, features = ["serde"] }
+trust-clean-ir-gate = { workspace = true, optional = true }
+trust-certify = { workspace = true, optional = true }
 # Validate the complete original input before deriving diagnostic observations.
 trust-ir-build = { workspace = true, optional = true }
 trust-cg-lower = { workspace = true }
@@ -132,6 +137,9 @@ clean-olean = { workspace = true, optional = true }
 stacker = { version = "0.1.25", optional = true }
 
 [dev-dependencies]
+trust-certify = { workspace = true }
+trust-clean-origin = { workspace = true }
+trust-clean-ir = { workspace = true }
 ar_archive_writer = "0.5"
 tempfile = { workspace = true }
 # Trust (R-5 census): the in-crate census test decodes the production-driver
@@ -153,6 +161,13 @@ trust-wp-lib = { workspace = true, features = ["trust-ir-native"] }
 # compiler and the same WP typed codec, only in the test graph.
 clean-olean = { workspace = true, features = ["test-support"] }
 trust-wp-vc = { package = "trust-wp-core", path = "../../first-party/trust-wp/crates/trust-wp-core" }
+
+# Trust: `spec_local_slots` reads `verify_output_trust_ir`, which exists only
+# under `ay-proofs`. Auto-discovered with default features it is E0432, which
+# fails every `test -p trust-cg-bridge` that names no feature.
+[[test]]
+name = "spec_local_slots"
+required-features = ["ay-proofs"]
 
 [[test]]
 name = "native_wp_translation_semr"

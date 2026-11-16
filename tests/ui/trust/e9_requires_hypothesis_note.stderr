@@ -6,7 +6,7 @@ LL | |         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
 LL | |         Nat.le (UInt64.toNat (if a < b then b else a)) (UInt64.toNat a) :=
 LL | |         fun a b h => Decidable.casesOn
 ...  |
-LL | |             (fun _ => Nat.le.refl (UInt64.toNat a))
+LL | |             (fun _ => @Nat.le.refl (UInt64.toNat a))
 LL | |             (fun _ => h)
    | |________________________^
 

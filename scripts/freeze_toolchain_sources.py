@@ -129,7 +129,13 @@ def freeze(repository: Path, commit: str, destination: Path, *, writer=None) -> 
         owner = Path(__file__).resolve().parents[1] / "src/tools/trust-stage0-dist/prepare.py"
         if owner.is_symlink() or not owner.is_file():
             raise Refused(f"stage0 TOML writer is not a regular file: {owner}")
-        writer = runpy.run_path(str(owner), run_name="frozen_std_source_toml_owner")["dump_toml"]
+        # Reading the serializer must not dirty the source checkout with .pyc files.
+        previous_bytecode = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            writer = runpy.run_path(str(owner), run_name="frozen_std_source_toml_owner")["dump_toml"]
+        finally:
+            sys.dont_write_bytecode = previous_bytecode
     normalized = {}
     for name in LEAVES:
         path = destination / "crates" / name / "Cargo.toml"

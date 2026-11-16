@@ -1848,15 +1848,15 @@ NOTE: Please add `--stage 2` to your command line, or if you're sure you want to
             miri_info,
             musl_root: rust_musl_root.map(PathBuf::from),
             native_repo_config_inputs: Vec::new(),
-            original_preparation_configuration: Err(
-                "original x.py configuration parser input was not captured".into(),
-            ),
             ninja_in_file: llvm_ninja.unwrap_or(true),
             nodejs: build_nodejs.map(PathBuf::from),
             offload_clang_dir: offload_clang_dir.map(PathBuf::from),
             omit_git_hash,
             on_fail: flags_on_fail,
             optimized_compiler_builtins,
+            original_preparation_configuration: Err(
+                "original x.py configuration parser input was not captured".into(),
+            ),
             out,
             patch_binaries_for_nix: build_patch_binaries_for_nix,
             path_modification_cache,

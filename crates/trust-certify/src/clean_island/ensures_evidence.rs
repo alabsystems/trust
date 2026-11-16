@@ -660,8 +660,8 @@ mod tests {
          def same_dq (x : UInt64) : UInt64 := x\n\n\
          def diff_dq (x : UInt64) : UInt64 := UInt64.add x 1\n\n\
          theorem ge_refl : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-             fun x => Nat.le.refl (UInt64.toNat x)\n\n\
-         theorem nat_refl : forall (n : Nat), Nat.le n n := fun n => Nat.le.refl n";
+             fun x => @Nat.le.refl (UInt64.toNat x)\n\n\
+         theorem nat_refl : forall (n : Nat), Nat.le n n := fun n => @Nat.le.refl n";
 
     const PARAMS: &[(&str, &str)] = &[("x", "u64")];
 

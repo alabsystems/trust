@@ -8,6 +8,8 @@
 
 #[cfg(feature = "native-trust-ir-claims")]
 pub mod native_contract_claim;
+#[cfg(feature = "native-trust-ir-claims")]
+pub mod native_public_question;
 pub mod native_routing_identity;
 pub mod trust_spec_native_formula;
 
@@ -31,7 +33,7 @@ pub use trust_ir_contract::{
     AssuranceLevel, ProofStrength, ReasoningKind, TrustSpecVariableOrigin,
 };
 use trust_types::digest::{
-    canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex, stable_sha256_hex_parts,
+    canonicalize_json_in_place, is_stable_sha256_hex, stable_sha256_hex_parts,
 };
 
 mod native_stop;
@@ -2485,22 +2487,16 @@ fn native_structural_domain_is_valid(artifacts: &[EvidenceArtifact]) -> bool {
         && bundle_materialization.referenced_artifacts().is_empty()
         && artifact_references_exactly(request, &[bundle])
         && artifact_references_exactly(proof, &[request])
+        && native_structural_envelope_matches(bundle_materialization, "bundle", None, None, None)
         && native_structural_envelope_matches(
-            bundle_materialization.bytes(),
-            "bundle",
-            None,
-            None,
-            None,
-        )
-        && native_structural_envelope_matches(
-            request_materialization.bytes(),
+            request_materialization,
             "request",
             Some(suite),
             Some(request_id),
             None,
         )
         && native_structural_envelope_matches(
-            proof_materialization.bytes(),
+            proof_materialization,
             "normalized_obligation",
             Some(suite),
             Some(request_id),
@@ -2508,32 +2504,61 @@ fn native_structural_domain_is_valid(artifacts: &[EvidenceArtifact]) -> bool {
         )
 }
 
+/// Whether `materialization` is a canonical native trust-ir envelope with
+/// exactly this role, suite, request and proof. The envelope is parsed once
+/// per artifact ([`DigestedBytes::native_envelope`]); this compares its fields.
 fn native_structural_envelope_matches(
-    bytes: &[u8],
+    materialization: &EvidenceArtifactMaterialization,
     role: &str,
     suite: Option<&str>,
     request_id: Option<&str>,
     proof_id: Option<&str>,
 ) -> bool {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
+    materialization.bytes.native_envelope().is_some_and(|envelope| {
+        envelope.role == role
+            && envelope.suite.as_deref() == suite
+            && envelope.request_id.as_deref() == request_id
+            && envelope.proof_id.as_deref() == proof_id
+    })
+}
+
+/// The identifying fields of a canonical native trust-ir materialization
+/// envelope: a six-key object with this schema, a string role, null-or-string
+/// suite, request and proof ids and a non-null payload, whose canonical JSON
+/// is byte for byte the artifact.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NativeEnvelope {
+    role: String,
+    suite: Option<String>,
+    request_id: Option<String>,
+    proof_id: Option<String>,
+}
+
+/// Parse `bytes` as a [`NativeEnvelope`], or `None` when they are not one.
+/// The only function [`DigestedBytes::native_envelope`] caches.
+fn parse_native_envelope(bytes: &[u8]) -> Option<NativeEnvelope> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let envelope = {
+        let object = value.as_object()?;
+        if object.len() != 6
+            || object.get("schema").and_then(serde_json::Value::as_str)
+                != Some("trust.native-trust-ir-materialization.v1")
+            || object.get("payload").is_none_or(serde_json::Value::is_null)
+        {
+            return None;
+        }
+        let owned = |key: &str| {
+            api_json_optional_string(object.get(key)).map(|value| value.map(str::to_owned))
+        };
+        NativeEnvelope {
+            role: object.get("role").and_then(serde_json::Value::as_str)?.to_owned(),
+            suite: owned("suite")?,
+            request_id: owned("request_id")?,
+            proof_id: owned("proof_id")?,
+        }
     };
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    if object.len() != 6
-        || object.get("schema").and_then(serde_json::Value::as_str)
-            != Some("trust.native-trust-ir-materialization.v1")
-        || object.get("role").and_then(serde_json::Value::as_str) != Some(role)
-        || api_json_optional_string(object.get("suite")) != Some(suite)
-        || api_json_optional_string(object.get("request_id")) != Some(request_id)
-        || api_json_optional_string(object.get("proof_id")) != Some(proof_id)
-        || object.get("payload").is_none_or(serde_json::Value::is_null)
-    {
-        return false;
-    }
     canonicalize_json_in_place(&mut value);
-    serde_json::to_vec(&value).is_ok_and(|canonical| canonical == bytes)
+    serde_json::to_vec(&value).is_ok_and(|canonical| canonical == bytes).then_some(envelope)
 }
 
 fn api_json_optional_string(value: Option<&serde_json::Value>) -> Option<Option<&str>> {
@@ -5496,13 +5521,99 @@ where
 pub struct EvidenceArtifactMaterialization {
     /// Exact artifact bytes. Empty and oversized payloads are rejected by the
     /// compiler transport boundary and downstream consumers.
-    bytes: Arc<[u8]>,
+    bytes: Arc<DigestedBytes>,
     /// Stable identity of the proof set that produced this artifact.
     proof_binding_id: String,
     /// Digests of other materialized artifacts this artifact explicitly checks
     /// or incorporates. This prevents independently selected A/B artifact
     /// mixtures from being treated as a replayed proof.
     referenced_artifacts: Vec<EvidenceArtifactReference>,
+}
+
+use digested_bytes::DigestedBytes;
+
+/// Immutable artifact bytes and their SHA-256 digest, computed at most once.
+///
+/// Every consumer that admits an artifact checks its bytes against the
+/// artifact's public hash, and a function's evidence is re-checked at every
+/// aggregation and summary boundary, so the same multi-kilobyte bundle was
+/// re-hashed dozens of times per function (PKG-C5d). The digest is a pure
+/// function of the bytes, and the bytes cannot change after construction:
+/// the fields are private to this module, which hands out only `&[u8]`, and
+/// the type is not `Clone`, so neither `Arc::make_mut` nor any other path can
+/// produce a mutable copy that carries the old digest. Replacing an artifact's
+/// bytes means building a new value, whose digest is computed afresh. Every
+/// hash check is therefore answered with the value a fresh SHA-256 of these
+/// exact bytes would give; the check itself (canonical claimed hash, equal to
+/// the digest) is unchanged.
+///
+/// Equality, hashing and `Debug` are those of the bytes alone; the cache is
+/// not part of the value. The same holds for the bytes' reading as a native
+/// trust-ir envelope (`native_envelope`): a JSON parse, canonicalization and
+/// re-serialization that each validation boundary repeated for every native
+/// artifact, now done once per artifact.
+mod digested_bytes {
+    use std::sync::OnceLock;
+
+    use trust_types::digest::stable_sha256_hex;
+
+    use super::{NativeEnvelope, parse_native_envelope};
+
+    pub(crate) struct DigestedBytes {
+        bytes: Box<[u8]>,
+        sha256: OnceLock<String>,
+        native_envelope: OnceLock<Option<NativeEnvelope>>,
+    }
+
+    impl DigestedBytes {
+        pub(crate) fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: bytes.into_boxed_slice(),
+                sha256: OnceLock::new(),
+                native_envelope: OnceLock::new(),
+            }
+        }
+
+        /// Lowercase hex SHA-256 of the bytes.
+        pub(crate) fn sha256_hex(&self) -> &str {
+            self.sha256.get_or_init(|| stable_sha256_hex(&self.bytes))
+        }
+
+        /// The bytes read as a canonical native trust-ir envelope, parsed at
+        /// most once: like the digest, a pure function of immutable bytes,
+        /// and always `parse_native_envelope`'s, the only function cached here.
+        pub(crate) fn native_envelope(&self) -> Option<&NativeEnvelope> {
+            self.native_envelope.get_or_init(|| parse_native_envelope(&self.bytes)).as_ref()
+        }
+    }
+
+    impl std::ops::Deref for DigestedBytes {
+        type Target = [u8];
+
+        fn deref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl std::fmt::Debug for DigestedBytes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.bytes.fmt(f)
+        }
+    }
+
+    impl PartialEq for DigestedBytes {
+        fn eq(&self, other: &Self) -> bool {
+            self.bytes == other.bytes
+        }
+    }
+
+    impl Eq for DigestedBytes {}
+
+    impl std::hash::Hash for DigestedBytes {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.bytes.hash(state);
+        }
+    }
 }
 
 /// Typed edge from one materialized proof artifact to another.
@@ -5541,7 +5652,11 @@ impl EvidenceArtifactMaterialization {
         {
             return None;
         }
-        Some(Self { bytes: bytes.into(), proof_binding_id, referenced_artifacts })
+        Some(Self {
+            bytes: Arc::new(DigestedBytes::new(bytes)),
+            proof_binding_id,
+            referenced_artifacts,
+        })
     }
 
     /// Wrap exact producer bytes in a canonical, hash-addressed owner/role
@@ -5598,7 +5713,7 @@ impl EvidenceArtifactMaterialization {
         let materialization = Self::new(bytes, proof_binding_id, referenced_artifacts)?;
         let hash = ArtifactHash {
             algorithm: "sha256".to_string(),
-            value: stable_sha256_hex(materialization.bytes()),
+            value: materialization.bytes.sha256_hex().to_string(),
         };
         Some((materialization, hash))
     }
@@ -5628,7 +5743,7 @@ impl EvidenceArtifactMaterialization {
         if !canonical_sha256_artifact_hash(hash) {
             return false;
         }
-        stable_sha256_hex(&self.bytes) == hash.value
+        self.bytes.sha256_hex() == hash.value
     }
 
     /// Validate and return the exact producer payload from a canonical binding
@@ -6686,6 +6801,8 @@ pub enum EvidenceDisposition {
 
 #[cfg(test)]
 mod tests {
+    use trust_types::digest::stable_sha256_hex;
+
     use super::*;
 
     /// Stack for a test that builds, clones, compares or drops a value near
@@ -9621,6 +9738,43 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize evidence");
 
         assert_eq!(decoded, evidence);
+    }
+
+    /// The cached digest answers exactly what a fresh SHA-256 of the bytes
+    /// answers: the true hash matches every time, a different canonical hash or
+    /// a non-canonical spelling of the true one never does, and the cache is
+    /// not part of the value (a copy whose digest was never computed is equal).
+    #[test]
+    fn artifact_hash_check_is_cached_and_still_exact() {
+        let (materialization, hash) = EvidenceArtifactMaterialization::new_bound(
+            EvidenceArtifactKind::SolverTranscript,
+            b"(proof)",
+            "digest-cache-proof",
+            "obligation::digest",
+            Vec::new(),
+        )
+        .expect("bound materialization");
+        assert_eq!(hash.value, stable_sha256_hex(materialization.bytes()));
+        let fresh = EvidenceArtifactMaterialization::new(
+            materialization.bytes().to_vec(),
+            "digest-cache-proof",
+            Vec::new(),
+        )
+        .expect("same bytes");
+        assert_eq!(fresh, materialization);
+        for _ in 0..2 {
+            assert!(materialization.matches_hash(&hash));
+            assert!(fresh.matches_hash(&hash));
+        }
+        let mut other = hash.clone();
+        other.value = stable_sha256_hex(b"other bytes");
+        assert!(!materialization.matches_hash(&other));
+        let mut upper = hash.clone();
+        upper.value = hash.value.to_ascii_uppercase();
+        assert!(!materialization.matches_hash(&upper));
+        let mut algorithm = hash.clone();
+        algorithm.algorithm = "SHA256".to_string();
+        assert!(!materialization.matches_hash(&algorithm));
     }
 
     #[test]

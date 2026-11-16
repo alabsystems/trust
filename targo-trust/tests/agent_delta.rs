@@ -212,6 +212,13 @@ fn rust_records_print_only_the_edited_function_and_one_line_when_unchanged() {
     let nobody = delta(None, &target, &before, &[]);
     assert_eq!(nobody, [format!("delta-fixture  {total} obligation(s)  (now {base})")]);
 
+    // With no base the refuted row still prints, on its own line before the
+    // count: a first run never reduces a failure to a number.
+    let fresh = delta(Some("session-d"), &target, &after, &[]);
+    assert_eq!(fresh.len(), 2, "{fresh:#?}");
+    assert!(fresh[0].starts_with("[FAILED]  delta_fixture::f17#"), "{fresh:#?}");
+    assert_eq!(fresh[1], format!("delta-fixture  {total} obligation(s)  (now {now})"));
+
     // `--all-rows` lists every row as well.
     let all = delta(Some("session-c"), &target, &before, &["--all-rows"]);
     assert_eq!(all.len(), total + 1);
@@ -328,6 +335,541 @@ fn a_compile_error_prints_until_it_is_fixed_and_its_key_survives_unrelated_edits
     );
 }
 
+// --- Rust: a crate's `clean { … }` island declarations --------------------------
+
+const ISLAND_DECLARATIONS: usize = 50;
+const ISLAND_CRATE: &str = "delta_fixture";
+
+/// How an island declaration of the fixture reads in one run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Decl {
+    /// `proved`/`solved`.
+    Proved,
+    /// `failed`/`solver-incomplete`, basis `unproved_fail_closed`.
+    Refused,
+    /// `unknown`/`not-dispatched`.
+    NotDispatched,
+    /// No row: its island was not enumerated.
+    Absent,
+}
+
+/// The island section a crate check writes for the fixture's fifty island
+/// declarations `Fixture.t00` … `Fixture.t49`, in the format of
+/// `targo-trust`'s `obligations` (CLEAN ISLANDS). `statement` is the
+/// declaration whose statement was edited (a new key), `proof` the one whose
+/// proof was edited (the same key, a new source digest), and `decl` says how
+/// each one reads.
+fn island_section(
+    phase: &str,
+    problems: &[&str],
+    statement: Option<usize>,
+    proof: Option<usize>,
+    decl: impl Fn(usize) -> Decl,
+) -> String {
+    let mut out = format!(
+        "{{\"clean_islands\":\"{ISLAND_CRATE}\",\"phase\":\"{phase}\",\"islands\":10,\
+         \"complete\":{},\"problems\":{}}}\n",
+        problems.is_empty(),
+        serde_json::to_string(problems).unwrap()
+    );
+    for n in 0..ISLAND_DECLARATIONS {
+        let (status, stop, basis) = match decl(n) {
+            Decl::Proved => ("proved", "solved", ""),
+            Decl::Refused => ("failed", "solver-incomplete", ",\"basis\":\"unproved_fail_closed\""),
+            Decl::NotDispatched => ("unknown", "not-dispatched", ""),
+            Decl::Absent => continue,
+        };
+        let id = format!("{:016x}", n * 104_729 + 1 + usize::from(statement == Some(n)));
+        let source = format!("{:064x}", n * 7919 + 1 + usize::from(proof == Some(n)));
+        out.push_str(&format!(
+            "{{\"clean_decl\":\"{ISLAND_CRATE}::Fixture.t{n:02}#{id}\",\"kind\":\"lean:theorem\",\
+             \"status\":\"{status}\",\"stop\":\"{stop}\",\"file\":\"src/lib.rs\",\"line\":{},\
+             \"col\":3,\"source\":\"{source}\"{basis}}}\n",
+            400 + n * 3
+        ));
+    }
+    out
+}
+
+/// `record` with `islands` after its compile-error lines and before its first
+/// function line, where a check writes them, behind the line saying its one
+/// proof unit published them.
+fn with_islands(record: &str, islands: &str) -> String {
+    with_units(record, 1, Some(1), islands)
+}
+
+/// `record` with `islands` behind the line saying `published` of the
+/// package's `proof_units` compilation units published island rows.
+fn with_units(record: &str, published: u32, proof_units: Option<u32>, islands: &str) -> String {
+    let units = format!(
+        "{{\"clean_island_units\":{published},\"proof_units\":{}}}\n",
+        proof_units.map_or("null".to_string(), |units| units.to_string())
+    );
+    let at = record.find("{\"fn\"").unwrap_or(record.len());
+    format!("{}{units}{islands}{}", &record[..at], &record[at..])
+}
+
+/// The record a crate check writes when the build broke on a refused island
+/// proof: the resolver's batch is the only check that ran, and its refusal is
+/// a compile error.
+const ISLAND_ERROR: &str = "Clean island rejected: `sorry` reaches `Fixture.t08`";
+
+fn island_error_record() -> String {
+    format!(
+        concat!(
+            r#"{{"schema":"trust.obligations.v1","package":"delta-fixture","lane":"strict","#,
+            r#""policy":"strict","selection":"default","seal":{{"absent":"A8"}},"#,
+            r#""targo_trust_commit":"0123456789abcdef0123456789abcdef01234567","#,
+            r#""profile":"c870797a6939da587fae99d7b0aa4c5e64be43e1e0798966417b011f955f05f9","#,
+            r#""outcome":"could-not-run","vector":"00","coverage_complete":false,"#,
+            r#""concluded":false,"degraded_anchors":0}}"#,
+            "\n",
+            r#"{{"compile_error":"{key}","code":null,"message":"{message}","#,
+            r#""file":"src/lib.rs","line":424,"col":3}}"#,
+            "\n"
+        ),
+        key = compile_error_key("src/lib.rs", "error", ISLAND_ERROR),
+        message = ISLAND_ERROR,
+    )
+}
+
+/// PKG-LIVE-2's exit, for the island declarations of a crate (the
+/// 200-obligation crate record with fifty island declarations beside it):
+/// a rerun with no edit is one line; a statement edit is that declaration's
+/// two rows; a proof edit that is still accepted is no row; a broken proof
+/// that stopped the Rust front end is its own row and one count line, never
+/// fifty rows; an island that did not parse is `NOT MEASURED`, never
+/// `VANISHED`; a Rust error that published no island row leaves the islands'
+/// base where it was. The records are in the format a crate check writes;
+/// the compiler's emitter of the rows (not yet built) is not driven here.
+#[test]
+fn island_declarations_print_only_the_edited_declaration_and_one_line_when_unchanged() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("record.ndjson");
+    let total = FUNCTIONS * PER_FUNCTION;
+    let run = |text: String| {
+        std::fs::write(&record, text).expect("write record");
+        delta(Some("s"), &target, &record, &[])
+    };
+    let measured = |statement, proof| {
+        with_islands(
+            &crate_record(None),
+            &island_section("verified", &[], statement, proof, |_| Decl::Proved),
+        )
+    };
+
+    // First run: one line naming both counts.
+    let first = run(measured(None, None));
+    assert_eq!(first.len(), 1, "{first:#?}");
+    let base = now_token(&first[0]);
+    assert_eq!(
+        first[0],
+        format!(
+            "delta-fixture  {total} obligation(s); {ISLAND_DECLARATIONS} island declaration(s)  \
+             (now {base})"
+        )
+    );
+
+    // A rerun with no edit: one line.
+    let again = run(measured(None, None));
+    assert_eq!(
+        again,
+        [format!(
+            "delta-fixture  0 of {total} changed since {base}; 0 of {ISLAND_DECLARATIONS} island \
+             declaration(s) changed  (now {base})"
+        )]
+    );
+
+    // t08's statement edited: its new key proved, its old key gone, nothing
+    // else.
+    let edited = run(measured(Some(8), None));
+    assert_eq!(edited.len(), 3, "{edited:#?}");
+    assert!(
+        edited[0].starts_with("GAINED      [PROVED]  delta_fixture::Fixture.t08#"),
+        "{edited:#?}"
+    );
+    assert!(
+        edited[0].contains("lean:theorem  proved (new)  solved  src/lib.rs:424:3"),
+        "{edited:#?}"
+    );
+    assert!(edited[1].starts_with("VANISHED    delta_fixture::Fixture.t08#"), "{edited:#?}");
+    assert!(edited[1].contains("lean:theorem  (was proved)  src/lib.rs:424:3"), "{edited:#?}");
+    let statement = now_token(&edited[2]);
+    assert_eq!(
+        edited[2],
+        format!(
+            "delta-fixture  0 of {total} changed since {base}; 2 of {ISLAND_DECLARATIONS} island \
+             declaration(s) changed  (now {statement})"
+        )
+    );
+
+    // t08's proof edited and still accepted: no row (the same key and
+    // status), and the token moves (the record carries its source digest).
+    let proof = run(measured(Some(8), Some(8)));
+    assert_eq!(proof.len(), 1, "{proof:#?}");
+    let accepted = now_token(&proof[0]);
+    assert_ne!(accepted, statement);
+    assert!(
+        proof[0].contains(&format!("; 0 of {ISLAND_DECLARATIONS} island declaration(s) changed")),
+        "{proof:#?}"
+    );
+
+    // t08's proof broken: the resolver refused it, a Rust front-end error
+    // stopped the crate, and no other declaration was checked. The view is
+    // the compile error, t08's row, one count line, and the header facts the
+    // failed build moved; never fifty island rows.
+    let broken_islands = island_section("front-end-error", &[], Some(8), Some(8), |n| {
+        if n == 8 { Decl::Refused } else { Decl::NotDispatched }
+    });
+    let broken = run(with_islands(&island_error_record(), &broken_islands));
+    let error_key = compile_error_key("src/lib.rs", "error", ISLAND_ERROR);
+    assert_eq!(broken.len(), 6, "{broken:#?}");
+    assert_eq!(
+        broken[0],
+        format!("NEW ERROR   [ERROR]  {error_key}  {ISLAND_ERROR}  src/lib.rs:424:3")
+    );
+    assert!(
+        broken[1].starts_with(
+            "LOST        [FAILED: unproved, no counterexample; failed closed]  \
+             delta_fixture::Fixture.t08#"
+        ),
+        "{broken:#?}"
+    );
+    assert!(broken[1].contains("failed (was proved)  solver-incomplete"), "{broken:#?}");
+    assert_eq!(
+        broken[2],
+        "NOT CHECKED  49 island declaration(s) of `delta_fixture` not checked: a Rust front-end \
+         error stopped the crate before verification (`--all-rows` lists them)"
+    );
+    assert_eq!(broken[3], "RUN         coverage_complete true -> false");
+    assert_eq!(broken[4], "RUN         outcome measured -> could-not-run");
+    let stopped = now_token(&broken[5]);
+    assert_eq!(
+        broken[5],
+        format!(
+            "delta-fixture  1 compiler error(s); obligations not compared since {accepted}; 1 of \
+             {ISLAND_DECLARATIONS} island declaration(s) changed  (now {stopped})"
+        )
+    );
+    // The same broken build again: the error is `STILL`, and the island lines
+    // are the same, still against the last run that measured the islands.
+    let mut still = broken.clone();
+    still[0] = still[0].replacen("NEW ERROR   ", "STILL       ", 1);
+    assert_eq!(run(with_islands(&island_error_record(), &broken_islands)), still);
+
+    // An island that did not parse (t10 … t14 are in it): its rows were not
+    // measured, never deleted claims.
+    let unparsed = island_section(
+        "front-end-error",
+        &[
+            "island 3 was not enumerated: it did not parse, or its unit was refused before elaboration",
+        ],
+        Some(8),
+        Some(8),
+        |n| if (10..15).contains(&n) { Decl::Absent } else { Decl::NotDispatched },
+    );
+    let lines = run(with_islands(&island_error_record(), &unparsed));
+    assert!(lines.iter().all(|line| !line.starts_with("VANISHED")), "{lines:#?}");
+    let not_measured: Vec<&String> =
+        lines.iter().filter(|line| line.starts_with("NOT MEASURED  ")).collect();
+    assert_eq!(not_measured.len(), 5, "{lines:#?}");
+    assert!(not_measured[0].contains("delta_fixture::Fixture.t10#"), "{lines:#?}");
+    assert!(not_measured[0].contains("not measured this run (was proved)"), "{lines:#?}");
+    assert!(lines.iter().any(|line| line.starts_with("NOT CHECKED  45 island declaration(s)")));
+    assert!(
+        lines.last().unwrap().contains(
+            "; 5 of 45 island declaration(s) changed; islands incomplete: delta_fixture: island 3 \
+             was not enumerated"
+        ),
+        "{lines:#?}"
+    );
+
+    // A Rust parse error published no island row and the package did not
+    // conclude: one count line standing for the base's unfailed rows, one
+    // clause, and the base stays.
+    let unparsed_rust = run(island_error_record());
+    assert_eq!(unparsed_rust.len(), 5, "{unparsed_rust:#?}");
+    assert_eq!(
+        unparsed_rust[1],
+        format!(
+            "NOT MEASURED  {ISLAND_DECLARATIONS} island declaration(s) of `delta_fixture` not \
+             measured this run: no compilation unit of the package published island rows"
+        ),
+        "{unparsed_rust:#?}"
+    );
+    assert!(unparsed_rust[4].contains("obligations not compared since"), "{unparsed_rust:#?}");
+    assert!(
+        unparsed_rust[4].contains(
+            "; islands not measured this run: no compilation unit of the package published \
+             island rows  (now "
+        ),
+        "{unparsed_rust:#?}"
+    );
+
+    // Fixed: the error clears, and nothing changed since the last run that
+    // measured the obligations and the islands.
+    let fixed = run(measured(Some(8), Some(8)));
+    assert_eq!(
+        fixed,
+        [
+            format!("CLEARED     [ERROR]  {error_key}  {ISLAND_ERROR}  src/lib.rs:424:3"),
+            format!(
+                "delta-fixture  0 of {total} changed since {accepted}; 0 of \
+                 {ISLAND_DECLARATIONS} island declaration(s) changed  (now {accepted})"
+            ),
+        ]
+    );
+
+    // `--all-rows` lists every island row too.
+    let all = delta(Some("other"), &target, &record, &["--all-rows"]);
+    assert_eq!(all.len(), total + ISLAND_DECLARATIONS + 1, "{all:#?}");
+}
+
+/// The island section of a binary crate `delta_fixture_cli` of the same
+/// package, with a failed declaration and a proved one.
+fn cli_section(proved: bool) -> String {
+    let good = if proved {
+        r#""status":"proved","stop":"solved""#
+    } else {
+        r#""status":"unknown","stop":"not-dispatched""#
+    };
+    format!(
+        concat!(
+            r#"{{"clean_islands":"delta_fixture_cli","phase":"verified","islands":1,"#,
+            r#""complete":true,"problems":[]}}"#,
+            "\n",
+            r#"{{"clean_decl":"delta_fixture_cli::Cli.bad#00000000000000aa","kind":"lean:theorem","#,
+            r#""status":"failed","stop":"solver-incomplete","file":"src/main.rs","line":10,"#,
+            r#""col":3,"source":null,"basis":"unproved_fail_closed"}}"#,
+            "\n",
+            r#"{{"clean_decl":"delta_fixture_cli::Cli.good#00000000000000bb","kind":"lean:theorem","#,
+            r#"{good},"file":"src/main.rs","line":12,"col":3,"source":null}}"#,
+            "\n",
+        ),
+        good = good
+    )
+}
+
+/// A package whose library and binary both carry islands: the binary stops
+/// on a Rust parse error before its islands are read, so it publishes no
+/// island row, while the library concludes. The binary's declarations are not
+/// deleted claims (no `VANISHED`), its failed one stays in sight, the
+/// library's rows (which the record states unproved: they are no measurement
+/// of the package) are one count line, and the islands' base stays where it
+/// was until every unit publishes again.
+#[test]
+fn a_unit_that_published_no_island_row_is_not_measured_and_keeps_the_base() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("record.ndjson");
+    let run = |text: String| {
+        std::fs::write(&record, text).expect("write record");
+        delta(Some("s"), &target, &record, &[])
+    };
+    let lib = |decl: Decl| island_section("verified", &[], None, None, |_| decl);
+    let both =
+        || with_units(&crate_record(None), 2, Some(2), &(lib(Decl::Proved) + &cli_section(true)));
+    let first = run(both());
+    // Only the failed binary declaration prints, with no base.
+    assert_eq!(first.len(), 2, "{first:#?}");
+    assert!(first[0].contains("delta_fixture_cli::Cli.bad#"), "{first:#?}");
+    let base = now_token(&first[1]);
+
+    let lib_only = || with_units(&crate_record(None), 1, Some(2), &lib(Decl::NotDispatched));
+    for _ in 0..2 {
+        let lines = run(lib_only());
+        assert!(lines.iter().all(|line| !line.starts_with("VANISHED")), "{lines:#?}");
+        assert!(lines.iter().all(|line| !line.starts_with("LOST")), "{lines:#?}");
+        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert_eq!(
+            lines[0],
+            "NOT MEASURED  1 island declaration(s) of `delta_fixture_cli` not measured this run: \
+             1 of 2 compilation unit(s) of the package published no island rows"
+        );
+        assert!(
+            lines[1].starts_with("NOT MEASURED  delta_fixture_cli::Cli.bad#00000000000000aa"),
+            "{lines:#?}"
+        );
+        assert!(lines[1].contains("not measured this run (was failed)"), "{lines:#?}");
+        assert_eq!(
+            lines[2],
+            format!(
+                "NOT CHECKED  {ISLAND_DECLARATIONS} island declaration(s) of `delta_fixture` not \
+                 checked: 1 of 2 compilation unit(s) of the package published no island rows \
+                 (`--all-rows` lists them)"
+            )
+        );
+        assert!(
+            lines[3]
+                .contains(&format!("; 1 of {ISLAND_DECLARATIONS} island declaration(s) changed")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[3].contains(
+                "; islands not measured: 1 of 2 compilation unit(s) of the package published no \
+                 island rows  (now "
+            ),
+            "{lines:#?}"
+        );
+    }
+    // Every unit published again: compared with the first run, nothing
+    // changed.
+    let again = run(both());
+    assert_eq!(again.len(), 2, "{again:#?}");
+    assert!(again[0].starts_with("STILL       "), "{again:#?}");
+    assert!(again[0].contains("delta_fixture_cli::Cli.bad#"), "{again:#?}");
+    assert!(
+        again[1].contains(&format!(
+            "; 0 of {} island declaration(s) changed since {base}  (now {base})",
+            ISLAND_DECLARATIONS + 2
+        )),
+        "{again:#?}"
+    );
+}
+
+/// A verified section that is not a measurement (the session was tainted:
+/// every sibling of the refused declaration is not dispatched) is the refused
+/// row and one count line, on the run it broke and on every rerun, never a
+/// `LOST` line per declaration.
+#[test]
+fn a_verified_section_that_is_incomplete_is_one_count_line_not_a_row_per_declaration() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("record.ndjson");
+    let run = |text: String| {
+        std::fs::write(&record, text).expect("write record");
+        delta(Some("s"), &target, &record, &[])
+    };
+    let measured = with_islands(
+        &crate_record(None),
+        &island_section("verified", &[], None, None, |_| Decl::Proved),
+    );
+    let first = run(measured.clone());
+    assert_eq!(first.len(), 1, "{first:#?}");
+    let tainted = with_islands(
+        &crate_record(None),
+        &island_section("verified", &["the crate's Clean session was tainted"], None, None, |n| {
+            if n == 3 { Decl::Refused } else { Decl::NotDispatched }
+        }),
+    );
+    for _ in 0..2 {
+        let lines = run(tainted.clone());
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(
+                "LOST        [FAILED: unproved, no counterexample; failed closed]  \
+                 delta_fixture::Fixture.t03#"
+            ),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "NOT CHECKED  {} island declaration(s) of `delta_fixture` not checked: its island \
+                 rows are incomplete (`--all-rows` lists them)",
+                ISLAND_DECLARATIONS - 1
+            )
+        );
+        assert!(
+            lines[2]
+                .contains(&format!("; 1 of {ISLAND_DECLARATIONS} island declaration(s) changed")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[2].contains(
+                "; islands incomplete: delta_fixture: the crate's Clean session was tainted  (now "
+            ),
+            "{lines:#?}"
+        );
+    }
+    // Repaired: nothing changed since the last measurement.
+    let fixed = run(measured);
+    assert_eq!(fixed.len(), 1, "{fixed:#?}");
+    assert!(
+        fixed[0].contains(&format!("; 0 of {ISLAND_DECLARATIONS} island declaration(s) changed"))
+    );
+}
+
+/// `--since` names the islands' base too: a snapshot it names that is not
+/// alike gives the islands no base, as it gives the obligations none, rather
+/// than the caller's last measured snapshot.
+#[test]
+fn since_a_snapshot_that_is_not_alike_gives_the_islands_no_base() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("record.ndjson");
+    let run = |text: String, session: &str, extra: &[&str]| {
+        std::fs::write(&record, text).expect("write record");
+        delta(Some(session), &target, &record, extra)
+    };
+    let islands = |decl: fn(usize) -> Decl| {
+        with_islands(&crate_record(None), &island_section("verified", &[], None, None, decl))
+    };
+    // Another selection's snapshot, by another session.
+    let other = run(
+        islands(|_| Decl::Proved).replace(r#""selection":"default""#, r#""selection":"other""#),
+        "t",
+        &[],
+    );
+    let other = now_token(&other[0]);
+    // This session's measured base, then t03 refused, compared with `other`.
+    run(islands(|_| Decl::Proved), "s", &[]);
+    let lines = run(
+        islands(|n| if n == 3 { Decl::Refused } else { Decl::Proved }),
+        "s",
+        &["--since", &other],
+    );
+    assert!(lines.iter().all(|line| !line.starts_with("LOST")), "{lines:#?}");
+    let summary = lines.last().unwrap();
+    assert!(
+        summary.contains(&format!("; {ISLAND_DECLARATIONS} island declaration(s)  (now ")),
+        "{lines:#?}"
+    );
+}
+
+/// The island clause names its base when it is not the obligations' base: a
+/// run whose islands were not measured compares them with an earlier run than
+/// its obligations.
+#[test]
+fn the_island_clause_names_its_base_when_it_is_not_the_obligations_base() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("record.ndjson");
+    let run = |text: String| {
+        std::fs::write(&record, text).expect("write record");
+        delta(Some("s"), &target, &record, &[])
+    };
+    let measured = |decl: fn(usize) -> Decl| {
+        with_islands(&crate_record(None), &island_section("verified", &[], None, None, decl))
+    };
+    let first = run(measured(|_| Decl::Proved));
+    let base = now_token(&first[0]);
+    // The obligations concluded; the islands were incomplete.
+    let incomplete = with_islands(
+        &crate_record(None),
+        &island_section("verified", &["the crate's Clean session was tainted"], None, None, |_| {
+            Decl::NotDispatched
+        }),
+    );
+    let second = run(incomplete.clone());
+    let second_token = now_token(second.last().unwrap());
+    let third = run(incomplete);
+    let summary = third.last().unwrap();
+    assert!(summary.contains(&format!("changed since {second_token};")), "{third:#?}");
+    assert!(
+        summary.contains(&format!(
+            "; 0 of {ISLAND_DECLARATIONS} island declaration(s) changed since {base}"
+        )),
+        "{third:#?}"
+    );
+}
+
 /// The records a crate check writes when a dependency of the fixture crate
 /// did not compile: the fixture crate was never built (no unit of it
 /// published coverage, so its record did not conclude and holds no function),
@@ -405,6 +947,117 @@ fn a_dependency_that_did_not_compile_neither_empties_nor_rebases_the_crate() {
     assert_eq!(fixed, [format!("delta-fixture  0 of {total} changed since {base}  (now {base})")]);
 }
 
+/// Without `--target-dir`, snapshots are kept under the target directory whose
+/// `trust/obligations/` holds the record, however the path is spelled and
+/// wherever delta runs from; a record held anywhere else names none, and a
+/// note says where they go instead (the `.lean` lane's directory), or, with
+/// none here, delta refuses. `--target-dir` takes exactly one directory, not
+/// empty and not starting with `-`, in either spelling, as the `.lean` lane's
+/// does; a package named twice, or a record whose key cannot be matched, is
+/// refused.
+#[test]
+fn snapshots_are_kept_under_the_records_own_target_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("ws/target");
+    let records = target.join("trust/obligations");
+    std::fs::create_dir_all(&records).expect("records dir");
+    let record = records.join("delta-fixture.ndjson");
+    std::fs::write(&record, crate_record(None)).expect("write record");
+    let member = root.path().join("ws/member");
+    std::fs::create_dir_all(&member).expect("member dir");
+    // `CARGO_TARGET_DIR` names another directory, and delta runs in a member.
+    let elsewhere = root.path().join("elsewhere");
+    let run = |record: &Path| {
+        let output = command(Some("s"), &elsewhere, &member)
+            .arg("trust")
+            .arg("delta")
+            .arg(record)
+            .output()
+            .expect("run targo-trust delta");
+        let (stdout, stderr) = text(&output);
+        assert!(output.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    let first = run(&record);
+    assert_eq!(first.len(), 1, "{first:#?}");
+    let token = now_token(&first[0]);
+    assert!(target.join("trust/snapshots").join(&token).is_file());
+    assert!(!elsewhere.exists(), "nothing is kept under CARGO_TARGET_DIR");
+    // The rerun finds its base there, by another spelling of the same path.
+    let total = FUNCTIONS * PER_FUNCTION;
+    let unchanged = [format!("delta-fixture  0 of {total} changed since {token}  (now {token})")];
+    assert_eq!(run(&record), unchanged);
+    assert_eq!(run(&records.join("../obligations/delta-fixture.ndjson")), unchanged);
+
+    let loose = root.path().join("loose.ndjson");
+    std::fs::copy(&record, &loose).expect("copy the record");
+    let lines = run(&loose);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(lines[0].starts_with("note: the records named are not all under one"), "{lines:#?}");
+    let kept = elsewhere.join("trust/snapshots");
+    assert!(lines[0].contains(&kept.display().to_string()), "{lines:#?}");
+    assert!(kept.join(&token).is_file());
+
+    // Outside every workspace, with no target directory in the environment,
+    // there is nowhere to keep them: refused, and nothing written here.
+    let output = command(Some("s"), &elsewhere, root.path())
+        .env_remove("CARGO_TARGET_DIR")
+        .arg("trust")
+        .arg("delta")
+        .arg(&loose)
+        .output()
+        .expect("run targo-trust delta");
+    assert_eq!(output.status.code(), Some(2), "{:?}", text(&output));
+    assert!(text(&output).1.contains("pass --target-dir <dir>"), "{:?}", text(&output));
+    assert!(!root.path().join("target").exists());
+
+    // The same refusals in both spellings, from delta and from a `.lean`
+    // check, which share the rule.
+    let lean = root.path().join("K.lean");
+    std::fs::write(&lean, "theorem k : 1 = 1 := rfl\n").expect("write");
+    let dir = target.display().to_string();
+    for bad in [
+        &["--target-dir="][..],
+        &["--target-dir=-x"][..],
+        &["--target-dir", ""][..],
+        &["--target-dir", "-x"][..],
+        &["--target-dir", &dir, "--target-dir", &dir][..],
+    ] {
+        for (verb, operand) in [("delta", &record), ("check", &lean)] {
+            let output = command(None, &elsewhere, &member)
+                .arg("trust")
+                .arg(verb)
+                .args(bad)
+                .arg(operand)
+                .output()
+                .expect("run targo-trust");
+            let stderr = text(&output).1;
+            assert_eq!(output.status.code(), Some(2), "{verb} {bad:?}: {stderr}");
+            assert!(
+                stderr.contains("--target-dir requires exactly one directory"),
+                "{verb} {bad:?}: {stderr}"
+            );
+        }
+    }
+
+    let refused = |paths: &[&Path], why: &str| {
+        let output = command(None, &elsewhere, &member)
+            .arg("trust")
+            .arg("delta")
+            .args(paths)
+            .output()
+            .expect("run targo-trust delta");
+        assert_eq!(output.status.code(), Some(2), "{paths:?}: {:?}", text(&output));
+        assert!(text(&output).1.contains(why), "{paths:?}: {:?}", text(&output));
+    };
+    refused(&[record.as_path(), loose.as_path()], "name one record per package");
+    let unkeyed = root.path().join("unkeyed.ndjson");
+    let key = format!("delta_fixture::f00#{}", local_id(0, 0));
+    std::fs::write(&unkeyed, crate_record(None).replacen(&key, "delta_fixture::f00#zz", 1))
+        .expect("write record");
+    refused(&[unkeyed.as_path()], "obligation key `delta_fixture::f00#zz` is not");
+}
+
 #[test]
 fn a_snapshot_unused_for_a_week_is_removed_when_another_is_written() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -429,6 +1082,228 @@ fn a_snapshot_unused_for_a_week_is_removed_when_another_is_written() {
     let lines = delta(Some("a"), &target, &before, &[]);
     assert!(lines[0].starts_with("note: your previous snapshot"), "{lines:#?}");
     assert!(lines[1].contains("obligation(s)"), "{lines:#?}");
+}
+
+// --- Rust: a test run's record, with each case's outcome ---------------------------
+//
+// The path from a real libtest harness (passing, failing, ignored and aborting
+// cases, a case that forges result lines on stdout, a missing or truncated
+// result file) to these lines is `test_results::tests`; here the record a test
+// run writes goes through `targo-trust delta` as a crate check's does.
+
+const UNIT_CASES: usize = 20;
+const INTEGRATION_CASES: usize = 5;
+const UNIT_HARNESS: &str = "lib/delta_fixture";
+const INTEGRATION_HARNESS: &str = "test/integration";
+
+/// How the unit-test harness of the test-run fixture ended.
+#[derive(Clone, Copy)]
+enum UnitHarness {
+    /// Ran to its end; the case of this index, if any, failed.
+    Concluded(Option<usize>),
+    /// Aborted after its first ten cases; the case of this index, if any, of
+    /// those ten failed.
+    Aborted(Option<usize>),
+}
+
+/// The record of a `targo trust test` run of `delta-fixture`: the crate
+/// record's obligations, a unit-test harness of twenty cases and an
+/// integration-test harness of five, one of them ignored.
+fn test_run_record(unit: UnitHarness) -> String {
+    let body = crate_record(None);
+    let (header, obligations) = body.split_once('\n').expect("a header line");
+    let mut out =
+        header.replacen("\"degraded_anchors\":0}", "\"degraded_anchors\":0,\"tests\":[]}", 1);
+    out.push('\n');
+    let mut harnesses = vec![(INTEGRATION_HARNESS.to_string(), None)];
+    let (ran, failed) = match unit {
+        UnitHarness::Concluded(failed) => {
+            harnesses.push((UNIT_HARNESS.to_string(), None));
+            (UNIT_CASES, failed)
+        }
+        UnitHarness::Aborted(failed) => {
+            harnesses.push((UNIT_HARNESS.to_string(), Some("ended by signal 6")));
+            (10, failed)
+        }
+    };
+    harnesses.sort();
+    for (key, reason) in &harnesses {
+        out.push_str(&match reason {
+            None => format!("{{\"test_harness\":\"{key}\",\"concluded\":true,\"reason\":null}}\n"),
+            Some(reason) => format!(
+                "{{\"test_harness\":\"{key}\",\"concluded\":false,\"reason\":\"{reason}\"}}\n"
+            ),
+        });
+    }
+    let mut cases: Vec<(String, &str)> = (0..INTEGRATION_CASES)
+        .map(|index| {
+            let outcome = if index == 4 { "ignored" } else { "passed" };
+            (format!("{INTEGRATION_HARNESS}::case_{index}"), outcome)
+        })
+        .collect();
+    cases.extend((0..ran).map(|index| {
+        let outcome = if failed == Some(index) {
+            "failed"
+        } else if matches!(unit, UnitHarness::Aborted(_)) {
+            "not concluded"
+        } else {
+            "passed"
+        };
+        (format!("{UNIT_HARNESS}::tests::case_{index:02}"), outcome)
+    }));
+    cases.sort();
+    for (key, outcome) in cases {
+        out.push_str(&format!("{{\"test\":\"{key}\",\"outcome\":\"{outcome}\"}}\n"));
+    }
+    out.push_str(obligations);
+    out
+}
+
+#[test]
+fn a_test_run_prints_only_the_edited_test_and_one_line_when_unchanged() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let record = root.path().join("tests.ndjson");
+    let run = |unit: UnitHarness| {
+        std::fs::write(&record, test_run_record(unit)).expect("write record");
+        delta(Some("session-t"), &target, &record, &[])
+    };
+    let total = FUNCTIONS * PER_FUNCTION;
+    let cases = UNIT_CASES + INTEGRATION_CASES;
+    let truth = "(reported by each test binary's own harness)";
+
+    // First run: no base, nothing failed: one line.
+    let first = run(UnitHarness::Concluded(None));
+    assert_eq!(first.len(), 1, "{first:#?}");
+    let base = now_token(&first[0]);
+    assert_eq!(
+        first[0],
+        format!(
+            "delta-fixture  {total} obligation(s); {cases} test case(s): 24 passed, 0 failed, 1 \
+             ignored, 0 not concluded {truth}  (now {base})"
+        )
+    );
+
+    // A rerun with no edit: one line.
+    let again = run(UnitHarness::Concluded(None));
+    assert_eq!(
+        again,
+        [format!(
+            "delta-fixture  0 of {total} changed since {base}; 0 of {cases} test case(s) changed: \
+             24 passed, 0 failed, 1 ignored, 0 not concluded {truth}  (now {base})"
+        )]
+    );
+
+    // One test edited so that it fails: only its row and the summary.
+    let edited = run(UnitHarness::Concluded(Some(7)));
+    assert_eq!(edited.len(), 2, "{edited:#?}");
+    assert_eq!(
+        edited[0],
+        format!(
+            "NEW FAILED  [TEST failed]  {UNIT_HARNESS}::tests::case_07  test  failed (was passed)  \
+             reported by its harness  -"
+        )
+    );
+    let now = now_token(&edited[1]);
+    assert!(
+        edited[1].starts_with(&format!(
+            "delta-fixture  0 of {total} changed since {base}; 1 of {cases} test case(s) changed: \
+             23 passed, 1 failed"
+        )),
+        "{edited:#?}"
+    );
+
+    // A failing case prints on every run, as a failing obligation does.
+    let still = run(UnitHarness::Concluded(Some(7)));
+    assert_eq!(
+        still,
+        [
+            format!(
+                "STILL       [TEST failed]  {UNIT_HARNESS}::tests::case_07  test  failed  \
+                 reported by its harness  -"
+            ),
+            format!(
+                "delta-fixture  0 of {total} changed since {now}; 0 of {cases} test case(s) \
+                 changed: 23 passed, 1 failed, 1 ignored, 0 not concluded {truth}  (now {now})"
+            ),
+        ]
+    );
+
+    // The harness aborts: its row prints, and no case of it is a pass; the
+    // cases it never reached are under its row, not rows of their own.
+    let crashed = run(UnitHarness::Aborted(Some(7)));
+    assert!(
+        crashed.contains(&format!(
+            "CHANGED     [TEST HARNESS not concluded]  {UNIT_HARNESS}  harness  not concluded: \
+             ended by signal 6 (was concluded)  reported by its harness  -"
+        )),
+        "{crashed:#?}"
+    );
+    assert!(
+        crashed.contains(&format!(
+            "STILL       [TEST failed]  {UNIT_HARNESS}::tests::case_07  test  failed  reported by \
+             its harness  -"
+        )),
+        "{crashed:#?}"
+    );
+    assert!(crashed.iter().all(|line| !line.contains("[TEST passed]")), "{crashed:#?}");
+    assert!(crashed.iter().all(|line| !line.contains("case_15")), "{crashed:#?}");
+    assert!(crashed.last().unwrap().contains("1 harness(es) not concluded"), "{crashed:#?}");
+    // The harness that ran to its end and did not change prints nothing.
+    assert!(crashed.iter().all(|line| !line.contains(INTEGRATION_HARNESS)), "{crashed:#?}");
+    for line in first.iter().chain(&again).chain(&edited).chain(&still).chain(&crashed) {
+        for word in ["PROVED", "proved", "proof", "verified", "certified"] {
+            assert!(!line.contains(word), "`{word}` in {line}");
+        }
+    }
+}
+
+#[test]
+fn a_record_that_claims_a_test_result_it_cannot_have_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    let refuse = |name: &str, record: String, why: &str| {
+        let path = root.path().join(name);
+        std::fs::write(&path, record).expect("write record");
+        let output = command(Some("s"), &target, &target)
+            .args(["trust", "delta", "--target-dir"])
+            .arg(&target)
+            .arg(&path)
+            .output()
+            .expect("run targo-trust delta");
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{name}\n{stdout}\n{stderr}");
+        assert!(stderr.contains(why), "{name}: {stderr}");
+    };
+    let good = test_run_record(UnitHarness::Aborted(None));
+    // A case of a harness that did not conclude is never a pass.
+    refuse(
+        "passed.ndjson",
+        good.replacen(
+            &format!("\"test\":\"{UNIT_HARNESS}::tests::case_00\",\"outcome\":\"not concluded\""),
+            &format!("\"test\":\"{UNIT_HARNESS}::tests::case_00\",\"outcome\":\"passed\""),
+            1,
+        ),
+        "a `passed` case of a harness that did not conclude",
+    );
+    // A check's record carries no test line.
+    refuse(
+        "check.ndjson",
+        good.replacen(",\"tests\":[]}", "}", 1),
+        "in a record that is not a test run's",
+    );
+    // A harness that did not conclude says why; one that did says nothing.
+    refuse(
+        "reason.ndjson",
+        good.replacen(
+            "\"concluded\":false,\"reason\":\"ended by signal 6\"",
+            "\"concluded\":false,\"reason\":null",
+            1,
+        ),
+        "whose reason does not match",
+    );
 }
 
 // --- Lean: a real check of a `.lean` file ------------------------------------------
@@ -533,7 +1408,11 @@ fn lean_declarations_print_only_the_edited_declaration_and_one_line_when_unchang
     assert_eq!(stdout.len(), 5, "{stdout:#?}");
     assert!(stdout[1].starts_with("GAINED      [PROVED]  Fixture.t08#"), "{stdout:#?}");
     assert!(stdout[2].starts_with("VANISHED    Fixture.t08#"), "{stdout:#?}");
-    assert!(stdout[3].starts_with(&format!("{package}  2 of {rows} changed since {reformatted}")));
+    // `M` counts the vanished row as well as this run's.
+    let compared = rows + 1;
+    assert!(
+        stdout[3].starts_with(&format!("{package}  2 of {compared} changed since {reformatted}"))
+    );
     assert_eq!(stdout[4], CAPABILITY);
     let edited = now_token(&stdout[3]);
 
@@ -755,7 +1634,9 @@ fn a_file_beside_a_rejected_sibling_is_never_printed_proved() {
 /// named writes no record (neither its obligation records nor its timing
 /// record) and prints what it printed before this slice, plus one `note:` on
 /// stderr saying why. With a caller session the note is the changed-only
-/// view's own, printed with it on stdout, and still the only one.
+/// view's own, printed with it on stdout, and still the only one; the view
+/// still lists every row that is not plainly proved, then a summary line that
+/// names no token.
 #[test]
 fn a_bare_lean_check_writes_nothing_where_it_runs() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -787,29 +1668,179 @@ fn a_bare_lean_check_writes_nothing_where_it_runs() {
     let notes: Vec<&str> = stderr.lines().filter(|line| line.starts_with("note:")).collect();
     assert_eq!(notes, [NO_RECORD_NOTE], "{stderr}");
 
-    let mut command = Command::new(binary());
-    for name in SESSION_ENV {
-        command.env_remove(name);
-    }
-    let output = command
-        .env("ATERM_SESSION_ID", "bare-session")
+    let in_session = || {
+        let mut command = Command::new(binary());
+        for name in SESSION_ENV {
+            command.env_remove(name);
+        }
+        let output = command
+            .env("ATERM_SESSION_ID", "bare-session")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .current_dir(&dir)
+            .arg("check")
+            .arg("K.lean")
+            .output()
+            .expect("run");
+        let (stdout, stderr) = text(&output);
+        assert!(!stderr.contains("note:"), "{stderr}");
+        let entries: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(entries, [std::ffi::OsString::from("K.lean")], "nothing written beside it");
+        (output.status.success(), stdout.lines().map(str::to_string).collect::<Vec<_>>())
+    };
+    let package = std::fs::canonicalize(&file).expect("canonical").display().to_string();
+    let summary = format!("{package}  2 obligation(s)  (now not stored)");
+    let (success, stdout) = in_session();
+    assert!(success, "{stdout:#?}");
+    assert_eq!(
+        stdout,
+        ["PROVED K.lean — 1 declaration(s) kernel-checked", NO_RECORD_NOTE, &summary, CAPABILITY]
+    );
+
+    // A rejected file: the file row and the refused declaration print, as
+    // they do with a target directory and no base.
+    std::fs::write(&file, "theorem k : 1 = 2 := rfl\n").expect("write");
+    let (success, stdout) = in_session();
+    assert!(!success, "{stdout:#?}");
+    assert_eq!(stdout.len(), 6, "{stdout:#?}");
+    assert_eq!(stdout[..2], ["REJECTED K.lean", NO_RECORD_NOTE]);
+    let failed = |key: &str| {
+        stdout[2..4].iter().any(|line| line.starts_with(&format!("[{FAILED_CLOSED}]  {key}#")))
+    };
+    assert!(failed("<file>") && failed("k"), "{stdout:#?}");
+    assert_eq!(stdout[4..], [summary, CAPABILITY.to_string()]);
+}
+
+/// `--all-rows` alone asks a `.lean` check for the changed-only view, as a
+/// caller session, `--since` or `--target-dir` does: with no caller session it
+/// prints every row and the summary line and writes the record, rather than
+/// take the flag and print nothing of it. With nowhere to keep the record, the
+/// view still lists every row, after the one note saying why.
+#[test]
+fn all_rows_alone_asks_a_lean_check_for_the_view() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    let dir = root.path().join("bare");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let file = dir.join("K.lean");
+    std::fs::write(&file, "theorem k : 1 = 1 := rfl\n").expect("write");
+    let package = std::fs::canonicalize(&file).expect("canonical").display().to_string();
+    let verdict = "PROVED K.lean — 1 declaration(s) kernel-checked";
+    let rows = |lines: &[&str]| {
+        assert!(lines[0].starts_with("[PROVED]  <file>#"), "{lines:#?}");
+        assert!(lines[1].starts_with("[PROVED]  k#"), "{lines:#?}");
+    };
+
+    let output =
+        command(None, &target, &dir).args(["check", "K.lean", "--all-rows"]).output().expect("run");
+    let (stdout, stderr) = text(&output);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{lines:#?}");
+    assert_eq!(lines[0], verdict);
+    rows(&lines[1..3]);
+    assert!(lines[3].starts_with(&format!("{package}  2 obligation(s)  (now ")), "{lines:#?}");
+    assert_eq!(lines[4], CAPABILITY);
+    assert!(target.join("trust/snapshots").join(now_token(lines[3])).is_file());
+    let records = std::fs::read_dir(target.join("trust/obligations")).expect("records").count();
+    assert_eq!(records, 1, "the record is written");
+
+    let output = command(None, &target, &dir)
         .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET_DIR")
-        .current_dir(&dir)
-        .arg("check")
-        .arg("K.lean")
+        .args(["check", "K.lean", "--all-rows"])
         .output()
         .expect("run");
     let (stdout, stderr) = text(&output);
     assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert_eq!(
-        stdout.lines().collect::<Vec<_>>(),
-        ["PROVED K.lean — 1 declaration(s) kernel-checked", NO_RECORD_NOTE, CAPABILITY]
-    );
     assert!(!stderr.contains("note:"), "{stderr}");
-    let entries: Vec<_> =
-        std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
-    assert_eq!(entries, [std::ffi::OsString::from("K.lean")], "nothing written beside the file");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "{lines:#?}");
+    assert_eq!(lines[..2], [verdict, NO_RECORD_NOTE]);
+    rows(&lines[2..4]);
+    let summary = format!("{package}  2 obligation(s)  (now not stored)");
+    assert_eq!(lines[4..], [summary.as_str(), CAPABILITY]);
+}
+
+/// A `.lean` declaration's source digest and local ids leave its name out, so
+/// one renamed with no other token changed is paired by its source digest (a
+/// `MOVED` line) and its rows by their unchanged ids: nothing is `REMOVED` and
+/// no row prints as new.
+#[test]
+fn a_renamed_lean_declaration_is_paired_by_its_source() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    let dir = root.path().join("src");
+    std::fs::create_dir_all(&dir).expect("source dir");
+    let file = dir.join("Fixture.lean");
+    std::fs::write(&file, lean_source(None)).expect("write fixture");
+    let package = std::fs::canonicalize(&file).expect("canonical").display().to_string();
+    let proved =
+        format!("PROVED {} — {DECLARATIONS} declaration(s) kernel-checked", file.display());
+    let rows = DECLARATIONS + 1;
+    let (_, stdout) = lean_check("rename", &target, &dir, &file);
+    let base = now_token(&stdout[1]);
+
+    std::fs::write(&file, lean_source(Some("theorem t08r : 8 = 8 := rfl"))).expect("rename");
+    let (output, stdout) = lean_check("rename", &target, &dir, &file);
+    assert!(output.status.success(), "{stdout:#?}");
+    assert_eq!(stdout.len(), 4, "{stdout:#?}");
+    let now = now_token(&stdout[2]);
+    assert_ne!(now, base, "the record names the new name");
+    assert_eq!(
+        stdout,
+        whole(
+            &proved,
+            &[
+                "MOVED       Fixture.t08 -> Fixture.t08r  (paired by source)".to_string(),
+                format!("{package}  0 of {rows} changed since {base}  (now {now})"),
+            ]
+        )
+    );
+}
+
+/// A Rust `check` that writes no obligation records (a standalone audit, the
+/// rewrite loop, a single `.rs` file) prints no changed-only view, so it
+/// refuses `--since` and `--all-rows` (exit 2) before it reads a manifest or
+/// looks for a compiler, rather than run without the view and say nothing.
+#[test]
+fn a_check_that_prints_no_view_refuses_the_view_flags() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let target = root.path().join("target");
+    let since = "0123456789abcdef";
+    for (args, refusal) in [
+        (
+            vec!["check", "--standalone", "--since", since],
+            "targo trust: --since does not combine with --standalone: a standalone audit \
+             writes no obligation records and prints no changed-only view",
+        ),
+        (
+            vec!["check", "--rewrite", "--all-rows"],
+            "targo trust: --all-rows does not combine with --rewrite: the rewrite loop writes \
+             no obligation records and prints no changed-only view",
+        ),
+        (
+            vec!["check", "lib.rs", "--since", since, "--all-rows"],
+            "targo trust: --since and --all-rows do not combine with a single `.rs` file: a \
+             single-file check writes no obligation records and prints no changed-only view",
+        ),
+        // Focused too: refused, not noted as ignored.
+        (
+            vec!["check", "--function", "midpoint", "lib.rs", "--all-rows"],
+            "targo trust: --all-rows does not combine with a single `.rs` file: a single-file \
+             check writes no obligation records and prints no changed-only view",
+        ),
+    ] {
+        let output = command(Some("refusing-session"), &target, root.path())
+            .args(&args)
+            .output()
+            .expect("run");
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{args:?}\n{stdout}\n{stderr}");
+        assert_eq!(stderr.lines().collect::<Vec<_>>(), [refusal], "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+    assert!(!target.exists(), "a refused check writes nothing");
 }
 
 /// The one note a `.lean` check prints when no target directory resolves.
@@ -879,4 +1910,37 @@ fn every_script_that_reads_the_listing_asks_for_every_row() {
         missing.is_empty(),
         "checks whose listing a script reads without --all-rows:\n{missing:#?}"
     );
+}
+
+/// `targo trust help` names `delta` with `delta --help`'s own synopsis, and
+/// both state the base as the code chooses it: one measured on the same lane,
+/// policy and selection, never "this agent session's last run" (a run measured
+/// another way neither reads nor moves that base).
+#[test]
+fn the_help_index_carries_the_deltas_own_synopsis_and_base() {
+    let run = |args: &[&str]| {
+        let output = Command::new(binary()).arg("trust").args(args).output().expect("run");
+        let (stdout, stderr) = text(&output);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        stdout
+    };
+    let own = run(&["delta", "--help"]);
+    let synopsis = own.lines().next().and_then(|line| line.strip_prefix("usage: "));
+    let synopsis = synopsis.expect("delta's help opens with its usage");
+    let index = run(&["help"]);
+    let line = index
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("targo trust delta "))
+        .expect("the help index names delta");
+    let (named, summary) = line.split_once("  ").expect("a synopsis, then the summary");
+    assert_eq!(named, synopsis);
+    for text in [own.as_str(), summary] {
+        assert!(text.contains("on the same lane, policy and selection"), "{text}");
+        assert!(!text.contains("last run"), "{text}");
+    }
+    // A pointer nobody wrote for 30 days is not read, and it is kept under
+    // the target directory, so `--help` names both.
+    assert!(own.contains("within 30 days"), "{own}");
+    assert!(own.contains("session pointers are kept under --target-dir"), "{own}");
 }

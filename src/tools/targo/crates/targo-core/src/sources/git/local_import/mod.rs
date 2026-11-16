@@ -4,6 +4,8 @@
 //! Normal locked/offline resolution still consumes and validates the result. The
 //! full-revision profile retains complete parent/tree/blob DATA and recursively
 //! imports selected-tree submodules. Donor refs/configuration are not copied.
+//! Ordinary exact Git sources can also recover an absent database from retained
+//! checkout objects; their normal resolution and checkout semantics remain.
 
 use crate::util::CargoResult;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -21,6 +23,8 @@ use std::time::Instant;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod custody;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) use custody::recover_missing_database;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod pack_stream;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -352,14 +356,20 @@ fn inspect_sources(
                 used_objects.insert(source.id.canonical_url().clone());
                 (
                     custody::ObjectSource::capture_objects(path)
-                        .context("explicit Git object DATA unavailable")?,
+                        .context("explicit Git object DATA unavailable")
+                        .with_context(|| {
+                            super::source::object_source_context(source.id, revision)
+                        })?,
                     (*path).clone(),
                 )
             } else {
                 let repository = donor.context("selected Git source has no object-directory selector or Cargo cache fallback")?.join("git/db").join(&ident);
                 (
                     custody::ObjectSource::capture(&repository)
-                        .context("locked Git source-data database unavailable")?,
+                        .context("locked Git source-data database unavailable")
+                        .with_context(|| {
+                            super::source::object_source_context(source.id, revision)
+                        })?,
                     repository.join("objects"),
                 )
             };
@@ -367,12 +377,14 @@ fn inspect_sources(
             // relative to their actual retained directory handles; no donor config,
             // alternate, graft, ref or path-selected backend reaches libgit2.
             let mut view = stage.create_view(&ident)?;
-            let view_stats = snapshot.materialize_view(
-                &object_path,
-                &mut view,
-                MAX_TOTAL_BYTES - stats.view_bytes,
-                &mut copy_budget,
-            )?;
+            let view_stats = snapshot
+                .materialize_view(
+                    &object_path,
+                    &mut view,
+                    MAX_TOTAL_BYTES - stats.view_bytes,
+                    &mut copy_budget,
+                )
+                .with_context(|| super::source::object_source_context(source.id, revision))?;
             stats.view_bytes += view_stats.bytes;
             stats.cloned_files += view_stats.cloned_files;
             stats.cloned_bytes += view_stats.cloned_bytes;
@@ -420,7 +432,8 @@ fn inspect_sources(
         stage.validate_namespace()?;
         database.original.check_current()?;
         database.view.check_current()?;
-        inspect_closure(database, revision, &mut stats, &mut pack_reads)?;
+        inspect_closure(database, revision, &mut stats, &mut pack_reads)
+            .with_context(|| super::source::object_source_context(source.id, revision))?;
         if let Some(output) = &database.output
             && output
                 .find_reference(&format!("refs/commit/{revision}"))
@@ -434,7 +447,8 @@ fn inspect_sources(
                 "locked source data import",
             )?;
         }
-        let children = submodules::selected(&database.input, revision, &source.parent_url)?;
+        let children = submodules::selected(&database.input, revision, &source.parent_url)
+            .with_context(|| super::source::object_source_context(source.id, revision))?;
         requirements.push(serde_json::json!({
             "cache_ident":ident,
             "display_url":display_url(source.id.url())?,
@@ -561,6 +575,19 @@ fn inspect_closure(
     stats: &mut Stats,
     pack_reads: &mut pack_stream::ReadBudget,
 ) -> CargoResult<()> {
+    inspect_closure_scope(database, revision, stats, pack_reads, true)
+}
+
+// Trust: recovery retains original ancestry metadata and the selected tree,
+// without promoting selected source DATA to complete historical source.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inspect_closure_scope(
+    database: &mut Database,
+    revision: git2::Oid,
+    stats: &mut Stats,
+    pack_reads: &mut pack_stream::ReadBudget,
+    historical_trees: bool,
+) -> CargoResult<()> {
     let input = &database.input;
     let source = input.odb()?;
     let sink = database
@@ -633,7 +660,9 @@ fn inspect_closure(
                     pending.len() < MAX_OBJECTS,
                     "Git source edge bound exceeded"
                 );
-                pending.push((commit.tree_id(), git2::ObjectType::Tree));
+                if historical_trees || oid == revision {
+                    pending.push((commit.tree_id(), git2::ObjectType::Tree));
+                }
                 for parent in commit.parent_ids() {
                     ensure!(
                         pending.len() < MAX_OBJECTS,

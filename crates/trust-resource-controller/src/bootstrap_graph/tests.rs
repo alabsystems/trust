@@ -26,7 +26,7 @@ pub(super) fn enrollment() -> Enrollment {
         gnu: GnuIdentity::NumericPipe { read: fid(10), write: fid(11) },
     }
 }
-pub(super) fn context() -> ContextReply {
+pub(crate) fn context() -> ContextReply {
     let identity = Identity { pid: 42, birth: 77, birth_kind: BirthKind::MacosWallMicroseconds };
     ContextReply {
         call_attempt: key().query.call_attempt,

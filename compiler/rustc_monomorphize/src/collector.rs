@@ -1360,6 +1360,11 @@ fn codegen_locally_or_unbuilt<'tcx>(
     }
 
     if tcx.is_reachable_non_generic(def_id) || instance.upstream_monomorphization(tcx).is_some() {
+        // Linking an emitted Clean symbol must not bypass the importer's
+        // kernel/readmission chokepoint merely because no MIR is codegenerated.
+        if tcx.trust_clean_origin_exports(def_id.krate).contains(&def_id.index) {
+            tcx.ensure_done().trust_clean_extern_readmission(def_id);
+        }
         // We can link to the item in question, no instance needed in this crate.
         return Ok(false);
     }
@@ -1972,6 +1977,26 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionStrategy) -> RootColle
 
         for id in crate_items.nested_bodies() {
             collector.process_nested_body(id);
+        }
+
+        // Trust: callable Clean definitions are synthetic `DefKind::Fn`s, not HIR
+        // free items. A public library definition must reach F1 even when no Rust
+        // body calls it: otherwise an island-only rlib emits no code and an LLVM
+        // consumer can reconstruct the body from metadata, hiding the missing F1
+        // compilation. Private helpers remain dependency-reached, as before.
+        // This chooses inventory only; the Clean ledger and codegen admission
+        // checks still decide whether each collected body may be emitted.
+        if tcx.sess.trust_cg_frontend_is_trust_ir()
+            && tcx.crate_types().contains(&rustc_structures::CrateType::Rlib)
+        {
+            for &(def_id, _, span) in &tcx.resolutions(()).clean_origin_defs {
+                if tcx.visibility(def_id).is_public()
+                    && !tcx.generics_of(def_id).requires_monomorphization(tcx)
+                {
+                    let instance = Instance::mono(tcx, def_id.to_def_id());
+                    collector.output.push(create_fn_mono_item(tcx, instance, span));
+                }
+            }
         }
 
         collector.push_extra_entry_roots();

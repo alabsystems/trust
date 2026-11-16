@@ -155,6 +155,8 @@ pub struct UnitOutput {
 
 /// A structure returning the result of a compilation.
 pub struct Compilation<'gctx> {
+    /// The unit queue's original selection; no scheduler is reconstructed here.
+    pub(super) post_build_compiler: Option<super::post_build_compiler::Scheduler>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     candidate_preparation: Option<Arc<super::candidate_commands::Preparation>>,
     /// Trust: actual test actions already run by the compilation's queue.
@@ -360,6 +362,7 @@ impl<'gctx> Compilation<'gctx> {
             linkers.insert(kind, target_linker(bcx, kind)?);
         }
         Ok(Compilation {
+            post_build_compiler: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             candidate_preparation: None,
             native_dirs: BTreeSet::new(),
@@ -620,6 +623,29 @@ impl<'gctx> Compilation<'gctx> {
             command,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.fixed_target_jobserver()?,
+        )
+    }
+
+    /// Compiler work after the unit queue has joined still owes that queue's
+    /// actual scheduler and native admission, unlike ordinary test executables.
+    pub(crate) fn prepare_doc_test_execution(
+        &self,
+        command: ProcessBuilder,
+    ) -> CargoResult<super::post_build_compiler::Execution> {
+        let selected = self
+            .post_build_compiler
+            .as_ref()
+            .context("doctest execution has no retained original compiler scheduler")?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let fixed = if matches!(selected, super::post_build_compiler::Scheduler::Fixed) {
+            self.fixed_target_jobserver()?
+        } else {
+            None
+        };
+        selected.prepare(
+            command,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            fixed,
         )
     }
 

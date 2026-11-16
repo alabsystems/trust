@@ -28,7 +28,7 @@ clean {
                     d (fun _ => y) (fun _ => x))) (key64 x))
             (Nat.decLt (key64 x) (key64 y))
             (fun h => Iff.mp (Nat.not_lt (key64 x) (key64 y)) h)
-            (fun h => Nat.le.refl (key64 x))
+            (fun h => @Nat.le.refl (key64 x))
 }
 pub fn min2_i64(a: i64, b: i64) -> i64
     ensures result <= a by min2_i64_le_left

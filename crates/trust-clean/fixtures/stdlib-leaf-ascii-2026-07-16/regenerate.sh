@@ -195,7 +195,7 @@ CARGO_TARGET_DIR="$VALIDATION_TARGET_DIR" CARGO_NET_OFFLINE=${CARGO_NET_OFFLINE:
   RUSTC_BOOTSTRAP=1 \
   targo --unverified build --release --locked -p trust-clean \
   --manifest-path "$REPO/crates/Cargo.toml" \
-  --bin ff-gate-diagnose-2026-07-10 --bin census-2026-07-06
+  --features diagnostic-tools --bin ff-gate-diagnose-2026-07-10 --bin census-2026-07-06
 TOOLS="$VALIDATION_TARGET_DIR/release"
 "$TOOLS/ff-gate-diagnose-2026-07-10" "$CANDIDATE_ROOT/dumps" \
   > "$TMP/ff-gate.tsv" 2> "$TMP/ff-gate.stderr"

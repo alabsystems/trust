@@ -1,6 +1,6 @@
 //! PKG-C5c S2a unit pins (docs/DECISION_QUEUE.md PKG-C5c-DEAD-TAIL-1): the reader's trap-tail
 //! set (`FunctionWindow::trap_tail`) and the executor's (`CerExec::new`) are one set, and
-//! `DeadTails::read` admits exactly the lowered pair of a sited division check.
+//! page-half records retain Unknowns and confer no admission authority.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 //! Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -25,9 +25,8 @@ fn bound(guarded: bool, triple: &str, opt: OptLevel) -> (Module, Vec<u8>, Object
 
 /// The two trap-tail sets, computed twice (compiled_object.rs `walk_window` and
 /// `CerExec::new`), agree on every window of the dead and the live s21 shape, both triples, O0
-/// and O2, and are non-empty where a tail was emitted. If they diverged, the admission would
-/// still fail closed (an admitted `adrp` the executor does not treat as tail reaches `decode`,
-/// which refuses it), but this pins that they do not.
+/// and O2, and are non-empty where a tail was emitted. Equality of these DATA sets
+/// does not discharge any semantic or ABI obligation.
 #[test]
 fn the_reader_and_the_executor_read_one_trap_tail_set() {
     let mut tails = 0;
@@ -48,34 +47,25 @@ fn the_reader_and_the_executor_read_one_trap_tail_set() {
     assert_eq!(tails, 6);
 }
 
-/// `DeadTails::read` on s21 at O0: one pair, the `adrp` at the run's first word, the record
-/// `rung_location`, the entry `panic_const_div_by_zero`, both lines the walk's own; the tail's
-/// `bl` is admitted with that run. An `M_cg` whose `Assert` is unsited admits nothing.
+/// Reader DATA does not license even the exact lowered Location pair.
 #[test]
-fn the_lowered_pair_of_a_sited_check_is_the_one_admitted() {
+fn the_lowered_pair_of_a_sited_check_remains_unknown() {
     for triple in BOTH {
         let (m_cg, object, layout) = bound(true, triple, OptLevel::O0);
         let window = &layout.windows["rung"];
-        let (bodies, places) = (BTreeMap::new(), BTreeMap::new());
-        let input = CerInput {
-            m_cg: &m_cg,
-            producers: &[],
-            bodies: &bodies,
-            placements: &places,
-            object: &object,
-            relocation_model: RelocationModel::Static,
+        assert_eq!(window.page_halves.len(), 2, "{triple}");
+        assert_eq!(window.unknown.len(), 2, "{triple}");
+        let fx = Fixture::with_object(m_cg.clone(), object.clone(), triple);
+        let assert_unknown = |fx: &Fixture| {
+            let report = fx.report();
+            let c = report.certificate("rung").unwrap();
+            assert_eq!(c.obligations.o1_binding.grade, Grade::Unknown);
+            assert_eq!(c.obligations.o1_binding.detail, window.unknown.join("; "));
+            assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err());
+            assert!(report.ships(EmitPolicy::AllowUnknown).is_ok());
         };
-        let dead = DeadTails::read(&input, &layout, window);
-        let [pair] = &dead.pairs[..] else { panic!("{triple}: {:?}", dead.pairs) };
-        assert_eq!(pair.symbol, DIV_LOCATION, "{triple}");
-        assert_eq!(pair.entries, BTreeSet::from([DIV_ENTRY.to_string()]), "{triple}");
-        assert_eq!(pair.tail.0, pair.adrp, "{triple}");
-        let lines: BTreeSet<&str> = window.unknown.iter().map(String::as_str).collect();
-        assert_eq!(dead.lines(), lines, "{triple}");
-        let site = window.sites.iter().find(|s| s.in_trap_tail).expect("the tail's `bl`");
-        assert_eq!(dead.admit_call(window, site), Some(pair.tail), "{triple}");
-
-        let mut unsited = m_cg.clone();
+        assert_unknown(&fx);
+        let mut unsited = m_cg;
         for node in
             unsited.functions.iter_mut().flat_map(|f| &mut f.blocks).flat_map(|b| &mut b.body)
         {
@@ -83,22 +73,18 @@ fn the_lowered_pair_of_a_sited_check_is_the_one_admitted() {
                 *site = None;
             }
         }
-        let input = CerInput { m_cg: &unsited, ..input };
-        assert!(DeadTails::read(&input, &layout, window).pairs.is_empty(), "{triple}");
+        assert_unknown(&Fixture::with_object(unsited, object, triple));
     }
 }
 
-/// The admission is the whole run or nothing (`DeadTails::read`, `entry_call`): on s21's O0
-/// window, each edit of the RECORD the walk produced keeps the pair's shape and drops it, so
-/// its two lines stay in O1's account: the run's `bl` removed (a run with no call); made a
-/// `b` (tail jump); naming `rung`; moved one word back (not followed by the trap); a second
-/// site in the run; a second shaped pair in the run (copies of both halves at the `mov` and
-/// the `bl`). The unedited window admits the one pair.
+/// Raw window DATA mutations preserve the original Unknown account. None of these
+/// six historical shape controls can confer authority. Every raw window is sent
+/// through the actual private function gate; byte mutations additionally exercise
+/// the public gate in tests/call_event_gate.rs.
 #[test]
-fn a_run_is_admitted_whole_or_not_at_all() {
+fn raw_tail_records_preserve_the_unknown_account() {
     for triple in BOTH {
         let (m_cg, object, layout) = bound(true, triple, OptLevel::O0);
-        let base = &layout.windows["rung"];
         let (bodies, places) = (BTreeMap::new(), BTreeMap::new());
         let input = CerInput {
             m_cg: &m_cg,
@@ -108,8 +94,29 @@ fn a_run_is_admitted_whole_or_not_at_all() {
             object: &object,
             relocation_model: RelocationModel::Static,
         };
-        let admitted = |w: &FunctionWindow| DeadTails::read(&input, &layout, w).pairs.len();
-        assert_eq!(admitted(base), 1, "{triple}: the twin");
+        let splits = SplitIndex::new(&input);
+        let check = |window: &FunctionWindow| {
+            let cert = verify_function(
+                &input,
+                &splits,
+                &layout,
+                window,
+                triple == DARWIN,
+                &Err("observer must not license the O1 Unknown".into()),
+                &mut BTreeSet::new(),
+                &Err("unwind inventory must not license the O1 Unknown".into()),
+                &mut Vec::new(),
+                None,
+                false,
+                None,
+                false,
+            );
+            assert_eq!(cert.obligations.o1_binding.grade, Grade::Unknown);
+            assert_eq!(cert.obligations.o1_binding.detail, window.unknown.join("; "));
+            assert!(matches!(cert.verdict, OutputVerdict::Unknown { .. }));
+        };
+        let base = &layout.windows["rung"];
+        check(base);
         let bl = base.sites.iter().position(|s| s.in_trap_tail).expect("the tail's `bl`");
         let at = base.sites[bl].offset;
         let edit = |f: &dyn Fn(&mut FunctionWindow)| {
@@ -153,7 +160,8 @@ fn a_run_is_admitted_whole_or_not_at_all() {
             ),
         ];
         for (what, w) in &cells {
-            assert_eq!(admitted(w), 0, "{triple}: {what}");
+            assert_eq!(w.unknown, base.unknown, "{triple}: {what}");
+            check(w);
         }
     }
 }

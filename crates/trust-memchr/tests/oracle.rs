@@ -435,47 +435,259 @@ fn prefilter_defaults_to_auto() {
     );
 }
 
-/// The lint expectations in Rust source `text`: each `expect(` outside a
-/// string in an outer `#[..]` or inner `#![..]` attribute, so an `expect`
-/// attribute and each `expect` a `cfg_attr(..)` applies, nested or not, however
-/// it is spaced, and commented too unless the comment has an unbalanced quote
-/// or bracket. Too high a count only asks for Rust 1.81 where it was not
-/// needed; too low a one lets `rust-version` name a compiler that rejects the
-/// crate.
+/// The lint expectations in Rust source `text`: each `expect` followed by `(`
+/// in an outer `#[..]` or inner `#![..]` attribute, so an `expect` attribute
+/// and each `expect` a `cfg_attr(..)` applies, nested or not. The text is read
+/// as rustc reads edition 2021 (this crate's), as tokens, after the byte order
+/// mark and shebang line rustc strips, so spacing and comments anywhere in an
+/// attribute are allowed, and no `expect(`, quote, bracket or `#` inside a
+/// comment or literal counts or ends it. An `expect` a macro assembles from
+/// fragments (`#[$lint(..)]`) is not seen. Too high a count only asks for Rust
+/// 1.81 where it was not needed; too low a one lets `rust-version` name a
+/// compiler that rejects the crate.
 fn lint_expectations(text: &str) -> usize {
-    let text: String = text.chars().filter(|character| !character.is_whitespace()).collect();
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let text = match text.strip_prefix("#!") {
+        Some(tail) if !shebang_is_code(tail) => tail.find('\n').map_or("", |end| &tail[end..]),
+        _ => text,
+    };
+    let tokens = tokens(text);
     let mut found = 0;
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find('#') {
-        rest = &rest[at + 1..];
-        let inner = rest.strip_prefix('!').unwrap_or(rest);
-        if let Some(attribute) = inner.strip_prefix('[') {
-            found += attribute_expectations(attribute);
+    for (at, token) in tokens.iter().enumerate() {
+        if *token != Token::Mark('#') {
+            continue;
+        }
+        let mut next = at + 1;
+        if tokens.get(next) == Some(&Token::Mark('!')) {
+            next += 1;
+        }
+        if tokens.get(next) == Some(&Token::Mark('[')) {
+            found += attribute_expectations(&tokens[next + 1..]);
         }
     }
     found
 }
 
-/// Each `expect(` outside a string in the attribute at the start of
-/// `attribute`, up to the bracket that closes it. With whitespace gone, a
-/// comment before an applied `expect` runs into it (`all(),//alwaysexpect(`),
-/// so this counts the text wherever it starts, not only after a comma.
-fn attribute_expectations(attribute: &str) -> usize {
-    let (mut found, mut depth, mut string, mut escaped) = (0, 0usize, false, false);
-    for (at, character) in attribute.char_indices() {
-        match character {
-            _ if escaped => escaped = false,
-            '\\' if string => escaped = true,
-            '"' => string = !string,
-            _ if string => {}
-            'e' if attribute[at..].starts_with("expect(") => found += 1,
-            '(' | '[' => depth += 1,
-            ')' | ']' if depth == 0 => break,
-            ')' | ']' => depth -= 1,
+/// Whether rustc reads a first line `#!` then `tail` as code, not as a shebang
+/// it drops: whether the first token of `tail` past whitespace and comments
+/// that are not doc comments is `[`, as in `#![expect(..)]`. A doc comment
+/// (`//!`, `///` but not `////`, `/*!`, `/**` but not `/***` or `/**/`) is such
+/// a token, so it makes the line a shebang, as `rustc_lexer::strip_shebang`
+/// decides.
+fn shebang_is_code(tail: &str) -> bool {
+    let chars: Vec<char> = tail.chars().collect();
+    let at = |index: usize| chars.get(index).copied();
+    let mut index = 0;
+    loop {
+        match (at(index), at(index + 1), at(index + 2), at(index + 3)) {
+            (Some(character), ..) if blank(character) => index += 1,
+            (Some('/'), Some('/'), Some('!'), _) | (Some('/'), Some('*'), Some('!'), _) => {
+                return false;
+            }
+            (Some('/'), Some('/'), Some('/'), fourth) if fourth != Some('/') => return false,
+            (Some('/'), Some('*'), Some('*'), fourth) if !matches!(fourth, Some('*' | '/')) => {
+                return false;
+            }
+            (Some('/'), Some('/'), ..) => {
+                while at(index).is_some_and(|character| character != '\n') {
+                    index += 1;
+                }
+            }
+            (Some('/'), Some('*'), ..) => index = block_comment_end(&chars, index),
+            (first, ..) => return first == Some('['),
+        }
+    }
+}
+
+/// Each `expect` followed by `(` in the attribute at the start of `attribute`,
+/// up to the bracket that closes it.
+fn attribute_expectations(attribute: &[Token]) -> usize {
+    let (mut found, mut depth) = (0, 0usize);
+    for (at, token) in attribute.iter().enumerate() {
+        match token {
+            Token::Word(word)
+                if word == "expect" && attribute.get(at + 1) == Some(&Token::Mark('(')) =>
+            {
+                found += 1;
+            }
+            Token::Mark('(' | '[' | '{') => depth += 1,
+            Token::Mark(')' | ']' | '}') if depth == 0 => break,
+            Token::Mark(')' | ']' | '}') => depth -= 1,
             _ => {}
         }
     }
     found
+}
+
+/// One token of Rust source as `tokens` reads it.
+#[derive(Debug, PartialEq)]
+enum Token {
+    /// An identifier or keyword; a raw `r#name` by its name.
+    Word(String),
+    /// Any other character: punctuation.
+    Mark(char),
+    /// A literal with its suffix, or a lifetime, its content unread.
+    Opaque,
+}
+
+/// Whether rustc reads `character` as whitespace (Pattern_White_Space).
+fn blank(character: char) -> bool {
+    matches!(
+        character,
+        '\t' | '\n'
+            | '\u{B}'
+            | '\u{C}'
+            | '\r'
+            | ' '
+            | '\u{85}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Whether `character` continues an identifier, a number or a literal's
+/// suffix. Outside comments and literals rustc accepts a non-ASCII character
+/// that is not whitespace only in an identifier, so every such one counts.
+fn word(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || character == '_'
+        || !(character.is_ascii() || blank(character))
+}
+
+/// Where the identifier characters starting at `index` end.
+fn word_end(chars: &[char], mut index: usize) -> usize {
+    while chars.get(index).is_some_and(|&character| word(character)) {
+        index += 1;
+    }
+    index
+}
+
+/// The tokens of edition 2021 Rust source `text` as far as an attribute scan
+/// needs them, with whitespace and comments (block comments nest) dropped. A
+/// string, raw string (`r`, `br` or `cr`, N `#` and `"`, ended by `"` and N
+/// `#`) or character literal is one opaque token together with the suffix
+/// rustc reads after it, so a suffix `r` (`1r"x"`) opens no raw string; so is
+/// a lifetime, raw (`'r#a`) or not, and a run of a number's digits, letters and
+/// `_` (a float's `.` or an exponent's sign is a mark between two such runs). A raw identifier `r#name` is a word.
+/// The `b` or `c` of a byte or C string or byte literal is a word before it,
+/// which counts the same. An unclosed comment or literal runs to the end.
+fn tokens(text: &str) -> Vec<Token> {
+    let chars: Vec<char> = text.chars().collect();
+    let at = |index: usize| chars.get(index).copied();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while let Some(character) = at(index) {
+        match (character, at(index + 1)) {
+            (character, _) if blank(character) => index += 1,
+            ('/', Some('/')) => {
+                while at(index).is_some_and(|character| character != '\n') {
+                    index += 1;
+                }
+            }
+            ('/', Some('*')) => index = block_comment_end(&chars, index),
+            ('"', _) => {
+                index = word_end(&chars, string_end(&chars, index + 1));
+                tokens.push(Token::Opaque);
+            }
+            ('\'', _) => {
+                index = word_end(&chars, quote_end(&chars, index));
+                tokens.push(Token::Opaque);
+            }
+            ('0'..='9', _) => {
+                index = word_end(&chars, index);
+                tokens.push(Token::Opaque);
+            }
+            (character, _) if word(character) => {
+                let start = index;
+                index = word_end(&chars, index);
+                let name: String = chars[start..index].iter().collect();
+                let hashes =
+                    chars[index..].iter().take_while(|&&character| character == '#').count();
+                if matches!(name.as_str(), "r" | "br" | "cr") && at(index + hashes) == Some('"') {
+                    index = word_end(&chars, raw_string_end(&chars, index + hashes + 1, hashes));
+                    tokens.push(Token::Opaque);
+                } else if name == "r" && hashes == 1 && at(index + 1).is_some_and(word) {
+                    let start = index + 1;
+                    index = word_end(&chars, start);
+                    tokens.push(Token::Word(chars[start..index].iter().collect()));
+                } else {
+                    tokens.push(Token::Word(name));
+                }
+            }
+            (character, _) => {
+                tokens.push(Token::Mark(character));
+                index += 1;
+            }
+        }
+    }
+    tokens
+}
+
+/// Where the block comment whose `/*` is at `index` ends: after the `*/` that
+/// closes it (block comments nest), or at the end.
+fn block_comment_end(chars: &[char], mut index: usize) -> usize {
+    let mut depth = 0usize;
+    while let Some(&character) = chars.get(index) {
+        match (character, chars.get(index + 1)) {
+            ('/', Some('*')) => (depth, index) = (depth + 1, index + 2),
+            ('*', Some('/')) => (depth, index) = (depth - 1, index + 2),
+            _ => index += 1,
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    index
+}
+
+/// Where a string whose content starts at `index` ends: after its closing
+/// `"`. A `\` escapes the character after it, a newline included.
+fn string_end(chars: &[char], mut index: usize) -> usize {
+    while let Some(&character) = chars.get(index) {
+        match character {
+            '\\' => index += 2,
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    chars.len()
+}
+
+/// Where a raw string whose content starts at `index` and that opened with
+/// `hashes` `#` ends: after the first `"` followed by as many `#`.
+fn raw_string_end(chars: &[char], mut index: usize, hashes: usize) -> usize {
+    while let Some(&character) = chars.get(index) {
+        let closes = || chars[index + 1..].iter().take(hashes).filter(|&&next| next == '#').count();
+        if character == '"' && closes() == hashes {
+            return index + 1 + hashes;
+        }
+        index += 1;
+    }
+    chars.len()
+}
+
+/// Where the character literal or lifetime whose `'` is at `index` ends,
+/// before any suffix. As rustc reads it, `'` then `\` opens an escaped
+/// character; `'`, one character and `'` is a character; `'r#` then an
+/// identifier is a raw lifetime; and anything else is a lifetime or label.
+fn quote_end(chars: &[char], index: usize) -> usize {
+    let at = |index: usize| chars.get(index).copied();
+    if at(index + 1) == Some('\\') {
+        let mut end = index + 3;
+        while at(end).is_some_and(|character| character != '\'') {
+            end += 1;
+        }
+        return (end + 1).min(chars.len());
+    }
+    if at(index + 2) == Some('\'') {
+        return index + 3;
+    }
+    if at(index + 1) == Some('r') && at(index + 2) == Some('#') && at(index + 3).is_some_and(word) {
+        return word_end(chars, index + 3);
+    }
+    word_end(chars, index + 1)
 }
 
 /// The `(major, minor)` a `rust-version` names, spelled as Cargo accepts it:
@@ -508,9 +720,11 @@ fn rust_version(declared: &str) -> Result<(u32, u32), String> {
 
 /// The spellings `src/` does not carry today: an inner `#![expect]`, an
 /// `expect` that a `cfg_attr` applies (nested, spaced, commented, beside
-/// others), and what is no expectation, an `expect(` in a string included; and
-/// a `rust-version` that is empty or no version refused with what it is, not a
-/// parse panic.
+/// others), one after a literal, suffix, raw identifier, lifetime or shebang
+/// line whose quotes, brackets or `#` would end a scan that did not lex them,
+/// and what is no expectation, an `expect(` in a string or comment included;
+/// and a `rust-version` that is empty or no version refused with what it is,
+/// not a parse panic.
 #[test]
 fn lint_expectations_and_rust_version_are_read_in_every_spelling() {
     for (text, count) in [
@@ -525,10 +739,52 @@ fn lint_expectations_and_rust_version_are_read_in_every_spelling() {
         ("#[cfg_attr(\n    all(), // always\n    expect(dead_code),\n)]", 1),
         ("#[cfg_attr(test, /* why */ expect(dead_code))]", 1),
         ("#[/* why */ expect(dead_code)]", 1),
-        ("#[expect(a)] fn f() {} #![expect(b)] #[cfg_attr(test, expect(c))]", 3),
+        ("#![expect(b)] #[expect(a)] fn f() {} #[cfg_attr(test, expect(c))] fn g() {}", 3),
         ("#[allow(dead_code)] fn f(x: Option<u8>) -> u8 { x.expect(\"a byte\") }", 0),
         ("#[cfg_attr(test, allow(dead_code))] #[cfg_attr(expect, allow(x))] #[must_use]", 0),
         ("#[doc = \"expect(x)\"] #[must_use = \"a\\\"expect(\"]", 0),
+        (r#"#[cfg_attr(all(), doc = r"C:\", expect(dead_code))]"#, 1),
+        (r##"#[cfg_attr(all(), doc = r#"5" wide"#, expect(dead_code))]"##, 1),
+        (r##"#[doc = r#"expect(x)"#] #[must_use = r"expect("]"##, 0),
+        (r#"#[cfg_attr(all(), doc = br"\", expect(dead_code))]"#, 1),
+        (r#"#[cfg_attr(feature = "r", expect(dead_code))] #[cfg_attr(for_r, expect(x))]"#, 2),
+        (r##"#[cfg_attr(all(), doc = r#"say "hi" #1"#, expect(dead_code))]"##, 1),
+        (r##"#[cfg_attr(all(), doc = r#"a" #"#, expect(dead_code))]"##, 1),
+        ("#[cfg_attr(all(), doc = \"abc\\\n\", expect(dead_code))]", 1),
+        ("#[cfg_attr(all(), doc = \"a\\\n    \\\"b\", expect(dead_code))]", 1),
+        (r##"#[cfg_attr(all(), /* r#"x" */ expect(dead_code))]"##, 1),
+        ("#[cfg_attr(\n    all(), // r#\"x\"\n    expect(dead_code),\n)]", 1),
+        (r#"#[cfg_attr(all(), /* "C:\" */ expect(dead_code))]"#, 1),
+        ("#[cfg_attr(all(), /* a /* nested */ \" */ expect(dead_code))]", 1),
+        ("#[expect /* why */ (dead_code)]", 1),
+        ("# /* why */ [expect(dead_code)]", 1),
+        ("#[cfg_attr(all(), doc = concat!('\"'), expect(dead_code))]", 1),
+        ("#[cfg_attr(all(), doc = concat!(')', ')'), expect(dead_code))]", 1),
+        ("#[cfg_attr(all(), doc = stringify!('\\\"', b'\\'', '\\u{22}'), expect(dead_code))]", 1),
+        ("#[cfg_attr(all(), doc = stringify!('a), expect(dead_code), doc = stringify!('b))]", 1),
+        (r##"#[cfg_attr(all(), doc = stringify!(r#type, cr"\"), expect(dead_code))]"##, 1),
+        ("#[doc = \"x\"] // #[expect(dead_code)]\n/* #![expect(dead_code)] */", 0),
+        (r#"#[cfg_attr(all(), doc = stringify!(1r"\")]"), expect(dead_code))]"#, 1),
+        (r#"#[cfg_attr(all(), doc = stringify!("a"r"\")]"), expect(dead_code))]"#, 1),
+        (r#"#[cfg_attr(all(), doc = stringify!('x'br"\")]"), expect(dead_code))]"#, 1),
+        (r#"#[cfg_attr(all(), doc = stringify!(r"x"r"\")]"), expect(dead_code))]"#, 1),
+        (r#"#[cfg_attr(all(), doc = stringify!(1.5cr"\"", 1e-5r"\""), expect(dead_code))]"#, 1),
+        ("m!(1r\"\\\"\");\n#[expect(dead_code)]", 1),
+        ("m!(r#r\"\\\"\");\n#[expect(dead_code)]", 1),
+        ("m!('r#r\"\\\"\");\n#[expect(dead_code)]", 1),
+        ("m!('a\u{B7}r\"\\\"\");\n#[expect(dead_code)]", 1),
+        ("#\u{200E}[expect\u{200F}(dead_code)]", 1),
+        ("#!/usr/bin/env -S echo \"\n#[expect(dead_code)]", 1),
+        ("\u{FEFF}#!/bin/sh /*\n#![expect(dead_code)]", 1),
+        ("#! /* why */ [expect(dead_code)]", 1),
+        ("#!/**\n#[expect(dead_code)]\nfn f() {}\n// */ [", 1),
+        ("#!/*!\n#[expect(dead_code)]\nfn f() {}\n// */ [", 1),
+        ("#!/*! */[/*\n#[expect(dead_code)]\nfn f() {}\n", 1),
+        ("#!/// */[/*\n#[expect(dead_code)]\nfn f() {}\n", 1),
+        ("#!//! */[/*\n#[expect(dead_code)]\nfn f() {}\n", 1),
+        ("#!/**/[expect(dead_code)]", 1),
+        ("#!/***/[expect(dead_code)]", 1),
+        ("#! //// x\n[expect(dead_code)]", 1),
     ] {
         assert_eq!(lint_expectations(text), count, "{text}");
     }
@@ -545,8 +801,10 @@ fn lint_expectations_and_rust_version_are_read_in_every_spelling() {
     }
 }
 
-/// `#[expect]` and its `reason` need Rust 1.81. While `src/` carries one, in
-/// any spelling, the manifest's `rust-version` must not name an older compiler.
+/// `#[expect]` and its `reason` need Rust 1.81. While a file under `src/`
+/// carries one, in any spelling, the manifest's `rust-version` must not name an
+/// older compiler. One that `include!` or a `#[path]` module brings from
+/// outside `src/` is not seen.
 #[test]
 fn declared_rust_version_covers_lint_expectations() {
     fn expectations(dir: &std::path::Path) -> usize {
@@ -555,8 +813,10 @@ fn declared_rust_version_covers_lint_expectations() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 found += expectations(&path);
-            } else if path.extension().is_some_and(|extension| extension == "rs") {
-                found += lint_expectations(&std::fs::read_to_string(&path).unwrap());
+            } else {
+                // Every file, not only `.rs`: `include!` can bring in any.
+                let bytes = std::fs::read(&path).unwrap();
+                found += lint_expectations(&String::from_utf8_lossy(&bytes));
             }
         }
         found

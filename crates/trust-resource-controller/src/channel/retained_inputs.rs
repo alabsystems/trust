@@ -143,6 +143,57 @@ impl Channel {
         Ok(())
     }
     fn retained_message(&self, deadline: Instant) -> io::Result<(u8, isize, bool, Vec<OwnedFd>)> {
+        let (byte, read, valid, rights, error) = self.retained_message_custodied(deadline)?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok((byte, read, valid, rights))
+    }
+
+    /// The distinct preparation receiver transfers ALL actual delivered
+    /// descriptions to its native State even when marker/count/CLOEXEC fails.
+    /// This is no validated output, lock owner or configured completion.
+    pub(crate) fn receive_preparation_output_delivery(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<crate::bootstrap_graph::transport::PreparationOutputDelivery> {
+        self.begin()?;
+        let (byte, read, valid, rights, error) = self.retained_message_custodied(deadline)?;
+        let valid = read == 1
+            && valid
+            && error.is_none()
+            && rights.len() == 2
+            && byte
+                == crate::bootstrap_graph::offline_preparation::PREPARATION_OUTPUT_RIGHTS_MARKER;
+        // A malformed carrier remains poisoned; its actual FD population must
+        // nevertheless reach the real native quarantine before error reporting.
+        self.poisoned = !valid;
+        Ok(crate::bootstrap_graph::transport::PreparationOutputDelivery::received(rights, valid))
+    }
+
+    pub(crate) fn receive_preparation_cache_directory(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<crate::bootstrap_graph::transport::PreparationCacheDirectoryDelivery> {
+        self.begin()?;
+        let (byte, read, valid, rights, error) = self.retained_message_custodied(deadline)?;
+        let valid = read == 1
+            && valid
+            && error.is_none()
+            && rights.len() == 1
+            && byte == crate::bootstrap_graph::transport::PREPARATION_CACHE_DIRECTORY_RIGHTS_MARKER;
+        self.poisoned = !valid;
+        Ok(
+            crate::bootstrap_graph::transport::PreparationCacheDirectoryDelivery::received(
+                rights, valid,
+            ),
+        )
+    }
+
+    fn retained_message_custodied(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<(u8, isize, bool, Vec<OwnedFd>, Option<io::Error>)> {
         let mut byte = [0u8];
         // Adopt every kernel-permitted rights population, even on malformed tails.
         let mut control = [0usize; 4096 / size_of::<usize>()];
@@ -209,6 +260,7 @@ impl Channel {
                     h = libc::CMSG_NXTHDR(&message, h);
                 }
             }
+            let mut error = None;
             for fd in &rights {
                 // CLOEXEC changes only fresh receiver descriptor flags, never
                 // the shared OFD's status flags or caller inheritance flags.
@@ -217,10 +269,12 @@ impl Channel {
                     || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, old | libc::FD_CLOEXEC) }
                         < 0
                 {
-                    return Err(io::Error::last_os_error());
+                    if error.is_none() {
+                        error = Some(io::Error::last_os_error());
+                    }
                 }
             }
-            return Ok((byte[0], read, valid, rights));
+            return Ok((byte[0], read, valid, rights, error));
         }
     }
 }

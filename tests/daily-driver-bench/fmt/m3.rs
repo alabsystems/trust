@@ -1,0 +1,1 @@
+use std::fmt; pub struct W(pub u32); impl fmt::Display for W { fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) } }

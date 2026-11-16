@@ -2,6 +2,8 @@
 """Observe a shipped Targo's admission protocol; never compile or grant resources."""
 import argparse
 import base64
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -57,6 +59,32 @@ def qualifier_identity():
                          here.with_name('lib') / 'landing_targo.py')}
 
 
+@contextmanager
+def scratch_directory():
+    parent = Path(tempfile.gettempdir()) / '.ubd'
+    created = False
+    try:
+        parent.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError('scratch parent is not an ordinary directory')
+    original = parent.stat()
+    try:
+        with tempfile.TemporaryDirectory(prefix='shipped-targo-resource-', dir=parent) as temporary:
+            yield temporary
+    finally:
+        if created:
+            try:
+                current = parent.lstat()
+                if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                    parent.rmdir()  # Empty only: never remove another job's scratch.
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+                    raise
+
+
 def qualify(root):
     record = dict(schema=SCHEMA, scope='read-only admission discovery; no compile, resource or SDK readiness authority',
                   sysroot=str(root), passed=False, observations=[])
@@ -68,11 +96,7 @@ def qualify(root):
         record['opening_qualifier'] = qualifier_identity()
         owner = gate_owner()
         original_env, original_cwd = os.environ.copy(), Path.cwd()
-        scratch_parent = Path(tempfile.gettempdir()) / '.ubd'
-        scratch_parent.mkdir(mode=0o700, exist_ok=True)
-        if scratch_parent.is_symlink() or not scratch_parent.is_dir():
-            raise ValueError('scratch parent is not an ordinary directory')
-        with tempfile.TemporaryDirectory(prefix='shipped-targo-resource-', dir=scratch_parent) as temporary:
+        with scratch_directory() as temporary:
             work = Path(temporary).resolve()
             for name in ('home', 'cargo', 'rustup', 'tmp', 'project/src'):
                 (work / name).mkdir(parents=True, exist_ok=True)

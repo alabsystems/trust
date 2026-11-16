@@ -1,4 +1,4 @@
-//! Read-only actual crate-store observer for the schema-5 overflow-mode matrix.
+//! Read-only actual crate-store observer for the schema-6 overflow-mode matrix.
 //! Expected invocation modes are assertions only. The consuming mode passed to
 //! both decoder routes comes exclusively from the actual Rustc session.
 #![feature(rustc_private)]
@@ -31,7 +31,7 @@ impl rustc_driver::Callbacks for Observer {
         _: &rustc_interface::interface::Compiler,
         tcx: TyCtxt<'tcx>,
     ) -> rustc_driver::Compilation {
-        assert_eq!(entry::ENTRY_SCHEMA, 5, "a schema-4 SDK cannot qualify this fixture");
+        assert_eq!(entry::ENTRY_SCHEMA, 6, "a schema-4 SDK cannot qualify this fixture");
         let actual_consumer = tcx.sess.overflow_checks();
         assert_eq!(actual_consumer, declared("MODE_MATRIX_CONSUMER"));
         let declared_producer = declared("MODE_MATRIX_PRODUCER");
@@ -52,7 +52,7 @@ impl rustc_driver::Callbacks for Observer {
                 let header = tcx.trust_ir_crate_header(definition.krate)
                     .expect("real canonical producer header is mandatory");
                 assert!(header.crate_refusal.is_none());
-                assert_eq!(header.entry_schema, 5);
+                assert_eq!(header.entry_schema, 6);
                 assert_eq!(header.trust_ir_version, trust_ir::binary::VERSION);
                 let (class, column) = entry::upstream_entry_column(tcx, definition);
                 if name == "inherited" {
@@ -70,7 +70,7 @@ impl rustc_driver::Callbacks for Observer {
                 let blob = tcx.trust_ir_entry(definition)
                     .expect("a missing/refused producer row cannot count as a mode positive");
                 std::fs::write(out.join(format!("{name}.entry")), &blob.0).unwrap();
-                let decoded = entry::decode_entry(&blob.0).expect("actual schema-5 producer bytes");
+                let decoded = entry::decode_entry(&blob.0).expect("actual schema-6 producer bytes");
                 assert_eq!(decoded.overflow_checks, declared_producer,
                     "compare actual writer field with independent producing invocation, never body inference");
                 let hash = tcx.def_path_hash(definition);

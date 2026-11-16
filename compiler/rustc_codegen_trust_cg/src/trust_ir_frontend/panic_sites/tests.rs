@@ -206,6 +206,7 @@ fn a_constant_check_is_folded_and_a_run_time_one_is_sited() {
     let entry = m.function_by_id(site.entry).expect("the entry");
     assert_eq!(entry.name, ENTRY);
     assert!(entry.is_declaration() && entry.linkage == Linkage::External);
+    assert_eq!(entry.calling_conv, trust_ir::CallingConv::Rust);
     assert_eq!(
         m.func_type(entry.ty).expect("signed"),
         &FuncTy { params: vec![Ty::Usize, Ty::Usize, Ty::Ptr], returns: vec![], is_vararg: false, abi: None }
@@ -398,6 +399,7 @@ fn an_entry_m_cg_already_declares_is_reused() {
     let id = FuncId::new(m.functions.len() as u32);
     let mut declaration = trust_ir::Function::new(id, ENTRY, ty, trust_ir::value::BlockId::new(0));
     declaration.linkage = Linkage::External;
+    declaration.calling_conv = trust_ir::CallingConv::Rust;
     m.functions.push(declaration);
     let before = m.clone();
     let report = site(&mut m, &mut Fake::default());
@@ -409,6 +411,45 @@ fn an_entry_m_cg_already_declares_is_reused() {
         panic!("one sited check: {kept:?}")
     };
     assert_eq!(site.entry, id);
+}
+
+#[test]
+fn an_entry_with_another_calling_convention_is_refused() {
+    for convention in [
+        trust_ir::CallingConv::C, trust_ir::CallingConv::Fast,
+        trust_ir::CallingConv::Cold, trust_ir::CallingConv::RustCold,
+        trust_ir::CallingConv::CUnwind,
+    ] {
+        let mut m = rung();
+        let kind = AssertKind::BoundsCheck { index: ValueId::new(0), len: ValueId::new(1) };
+        let id = intern_entry(&mut m, ENTRY, &kind).expect("initial declaration");
+        m.functions[id.as_usize()].calling_conv = convention;
+        let before = m.clone();
+        let report = site(&mut m, &mut Fake::default());
+        assert!(!report.refusals.is_empty(), "accepted {convention:?}");
+        assert_eq!((report.folded, report.sited), (0, 0));
+        assert_eq!(m, before, "a refused convention must not mutate M_cg");
+    }
+}
+
+#[test]
+fn the_postcondition_refuses_a_reused_entry_with_another_calling_convention() {
+    let mut before = rung();
+    let kind = AssertKind::BoundsCheck { index: ValueId::new(0), len: ValueId::new(1) };
+    let id = intern_entry(&mut before, ENTRY, &kind).expect("Rust declaration");
+    let mut after = before.clone();
+    assert!(site(&mut after, &mut Fake::default()).refusals.is_empty());
+    check_postcondition(&before, &after, 64).expect("honest reuse");
+    for convention in [trust_ir::CallingConv::C, trust_ir::CallingConv::Fast,
+                       trust_ir::CallingConv::Cold, trust_ir::CallingConv::CUnwind] {
+        let mut old = before.clone();
+        let mut new = after.clone();
+        // Keep the pre-existing declaration's header identical in both inputs;
+        // this must fail the used-entry ABI check, not the header mutation check.
+        old.functions[id.as_usize()].calling_conv = convention;
+        new.functions[id.as_usize()].calling_conv = convention;
+        assert!(check_postcondition(&old, &new, 64).is_err(), "accepted {convention:?}");
+    }
 }
 
 #[test]
@@ -459,6 +500,10 @@ fn the_postcondition_refuses_every_other_change() {
         ("a defined entry", Box::new(|m| {
             let last = m.functions.len() - 1;
             m.functions[last].linkage = Linkage::Internal;
+        })),
+        ("a new entry with another convention", Box::new(|m| {
+            let last = m.functions.len() - 1;
+            m.functions[last].calling_conv = trust_ir::CallingConv::C;
         })),
         ("a node added", Box::new(|m| {
             m.functions[1].blocks[0].body.insert(0, trust_ir::InstrNode::new(Inst::Unreachable));

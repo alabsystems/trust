@@ -40,7 +40,8 @@
 //! applied: a misaligned or null pointer dereference, an invalid enum
 //! construction), `mir_for_ctfe` and `promoted_mir`; external bodies come from
 //! metadata (`optimized_mir`, `mir_for_ctfe`, `promoted_mir`, the evaluated
-//! static allocation). The census never reads a LOCAL `optimized_mir`,
+//! static allocation, and for the sysroot scan only each body's
+//! `trust_mentioned_items`). The census never reads a LOCAL `optimized_mir`,
 //! `mir_shims` or a fresh const evaluation, and never asks rustc's resolver
 //! for drop glue (for a coroutine it demands `optimized_mir`).
 //!
@@ -2294,11 +2295,14 @@ impl<'h, 'tcx> Walker<'h, 'tcx> {
                 {
                     continue;
                 }
-                let body = tcx.optimized_mir(def);
-                let Some(mentioned) = body.mentioned_items.as_deref() else { continue };
+                // The body's `mentioned_items` alone, read from the producer's
+                // `trust_mentioned_items` table: the field itself, unfiltered, so
+                // every filter here is this reader's. Decoding each body whole for
+                // this one field cost about 0.4 s and 250 MB per crate (PKG-C5d).
+                let Some(mentioned) = tcx.trust_mentioned_items(def) else { continue };
                 index.bodies += 1;
                 for item in mentioned {
-                    let MentionedItem::UnsizeCast { source_ty, target_ty } = item.node else {
+                    let MentionedItem::UnsizeCast { source_ty, target_ty } = *item else {
                         continue;
                     };
                     if source_ty.has_param() || target_ty.has_param() || source_ty.has_aliases() {

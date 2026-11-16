@@ -124,6 +124,10 @@ impl Env {
             normalized_env,
         }
     }
+    #[cfg(unix)]
+    pub(super) fn matches_selected(&self, variables: &cargo_util::EnvironmentInputs) -> bool {
+        self.env == Self::from_selected(variables).env
+    }
     /// Closed measurement override in this ONE owned Cargo configuration
     /// snapshot. Preserve every native key/value; never mutate process-global
     /// environment or silently discard a competing caller's policy override.
@@ -467,5 +471,38 @@ mod frontend_namespace_tests {
             );
             assert_eq!(env.get_env_os(format!("CARGO_{key}")), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod original_home_tests {
+    use super::Env;
+    use std::path::{Path, PathBuf};
+    #[test]
+    fn original_home_keeps_explicit_empty_compatibility_selection_and_lazy_fallback() {
+        let env = Env::from_map_for_frontend([
+            ("TARGO_HOME".to_string(), "/native-home".to_string()),
+            ("CARGO_HOME".to_string(), "".to_string()),
+        ].into_iter().collect(), true);
+        assert_eq!(super::super::homedir_with_environment(Path::new("/source"), &env,
+            || Some(PathBuf::from("/original-os-home"))),
+            Some(PathBuf::from("/original-os-home/.cargo")));
+        let env = Env::from_map_for_frontend([
+            ("TARGO_HOME".to_string(), "relative-native-home".to_string()),
+        ].into_iter().collect(), true);
+        assert_eq!(super::super::homedir_with_environment(Path::new("/source"), &env,
+            || panic!("explicit native home must not consult the OS fallback")),
+            Some(PathBuf::from("/source/relative-native-home")));
+    }
+    #[test]
+    fn original_home_keeps_explicit_compatibility_precedence_without_mutating_environment() {
+        let env = Env::from_map_for_frontend([
+            ("TARGO_HOME".to_string(), "/native-home".to_string()),
+            ("CARGO_HOME".to_string(), "/compatibility-home".to_string()),
+        ].into_iter().collect(), true);
+        assert_eq!(super::super::homedir_with_environment(Path::new("/source"), &env,
+            || panic!("explicit compatibility home must not consult fallback")),
+            Some(PathBuf::from("/compatibility-home")));
+        assert_eq!(env.get_env_os("TARGO_HOME"), Some(std::ffi::OsStr::new("/native-home")));
     }
 }

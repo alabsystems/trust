@@ -103,6 +103,8 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_query_swap_rejected!(trust_def_has_user_unsafe_source);
     // Trust: CB3 (2026-09-28) — the per-def island marker.
     assert_query_swap_rejected!(trust_def_is_clean_island);
+    // Trust: PKG-C5d — the census's sysroot-scan input.
+    assert_query_swap_rejected!(trust_mentioned_items);
 
     macro_rules! assert_extern_query_swap_rejected {
         ($field:ident) => {{
@@ -138,6 +140,8 @@ fn adversarial_callback_cannot_replace_trust_critical_providers() {
     assert_extern_query_swap_rejected!(trust_def_has_user_unsafe_source);
     // Trust: CB3 (2026-09-28) — the extern half of the island marker.
     assert_extern_query_swap_rejected!(trust_def_is_clean_island);
+    // Trust: PKG-C5d — the extern half of the census's sysroot-scan input.
+    assert_extern_query_swap_rejected!(trust_mentioned_items);
 
     let mut changed = canonical;
     changed.hooks.build_mir_inner_impl = |_, _| panic!("adversarial MIR builder");

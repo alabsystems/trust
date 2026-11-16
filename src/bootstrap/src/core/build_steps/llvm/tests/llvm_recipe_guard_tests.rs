@@ -70,7 +70,7 @@ fn resolved_host_recipe(
 
 #[cfg(unix)]
 #[test]
-#[ignore = "run only under maintained owned-process CMake qualification lane"]
+#[ignore = "requires owned CMake lane without ambient CC/CXX/CFLAGS/CXXFLAGS selectors; x.py injects opaque selectors"]
 fn real_fixed_source_recipe_changes_reset_and_apply_the_same_prepared_request() {
     use crate::core::session::Session;
     use crate::utils::tests::TestCtx;
@@ -111,6 +111,14 @@ install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION lib)
         crate::utils::trust_preparation::PreparationScope::RequestSources
     );
     let mut session = Session::new(config);
+    // x.py's Cargo producer injects target-qualified CC/CXX and flags even for
+    // its own tests. The unchanged conservative cleanup judge correctly treats
+    // those consumed operands as opaque. This positive NONE observation needs
+    // the maintained direct owning lane, not an ambient selector waiver.
+    assert!(
+        session.opaque_cc_operands.is_empty(),
+        "positive CMake observation requires the direct owning lane; ambient compiler selectors intentionally refuse cleanup"
+    );
     let target = session.config.host_target.to_string();
     let digest = observe_cmake_sources(&source, &output).unwrap().unwrap();
 
@@ -162,10 +170,13 @@ install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION lib)
             "independent request change: {name}"
         );
     }
-    // Exercise the actual LLD constructor's requested bytes without inventing
-    // an LLVM provider/Ready object or executing an LLD build. The exports path
-    // is input DATA for the NONE fixture and is never loaded by that project.
+    // Exercise the actual LLD constructor's recipe with the same NONE project,
+    // without inventing an LLVM provider/Ready object or executing an LLD build.
+    // The exports path is input DATA and is never loaded by that project.
     let selected_exports = evidence.join("unexecuted LLVM exports data");
+    fs::create_dir(&selected_exports).unwrap();
+    let selected_exports = selected_exports.canonicalize().unwrap();
+    let lld_output = evidence.join("lld-output");
     let lld_request = |session: &Session| {
         let builder = Builder::new(session);
         let config = lld_cmake_config(
@@ -173,7 +184,7 @@ install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION lib)
             builder.host_target,
             LldCmakeRequest {
                 source: &source,
-                output: &output,
+                output: &lld_output,
                 llvm_cmake: &selected_exports,
                 link_shared: false,
                 host_tablegen: None,
@@ -189,6 +200,31 @@ install(FILES "${CMAKE_BINARY_DIR}/payload.txt" DESTINATION lib)
     session.config.llvm_cflags = Some("-DLLD_REQUEST_ONLY=1".into());
     assert_ne!(lld_base, lld_request(&session).key.unwrap().request);
     session.config.llvm_cflags = None;
+
+    // Execute that SAME prepared LLD constructor recipe, still only on NONE.
+    // Actual cache spelling must satisfy the unchanged strict provider reader;
+    // this observation establishes no LLVM/provider or LLD readiness.
+    let recipe = lld_request(&session);
+    let key = recipe.key.as_ref().expect("actual native LLD fixture recipe must be reusable");
+    let lld_owner = OwnSourceGeneration {
+        source: source.clone(),
+        anchor: evidence.clone(),
+        output: lld_output.clone(),
+        observed: Some(digest.clone()),
+    };
+    let stamp = lld_owner.stamp("lld", &target, Some(key));
+    // NONE loads no LLVM provider: a known LLD dependency is deliberately absent.
+    // Preserve the real known-generation refusal, then execute the ordinary
+    // fresh unknown-generation path without publishing readiness or completion.
+    assert_eq!(key.dependency, "none");
+    assert!(lld_owner.begin(&stamp, &recipe.prepared, CmakeGeneration::Known, &[]).is_err());
+    lld_owner.begin(&stamp, &recipe.prepared, CmakeGeneration::Unknown, &[]).unwrap();
+    assert!(!lld_cached_provider(&lld_output, &selected_exports));
+    recipe.prepared.build();
+    let cache = fs::read_to_string(lld_output.join("build/CMakeCache.txt")).unwrap();
+    let provider = format!("LLVM_DIR:PATH={}", selected_exports.display());
+    assert!(cache.lines().any(|line| line == provider), "typed provider absent from actual cache");
+    assert!(lld_cached_provider(&lld_output, &selected_exports));
 
     // A successful but opaque preparation is not replaced by raw Config.build.
     // The real selected commands exist, but this request has no reusable key or

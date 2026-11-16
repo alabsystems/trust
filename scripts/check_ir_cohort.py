@@ -142,6 +142,7 @@ import argparse
 import math
 import datetime as _dt
 import hashlib
+import base64
 import json
 import os
 import re
@@ -199,6 +200,10 @@ UNGATED_BY_DECISION: dict[str, str] = {
     "ty": "model checker; consumes IR, does not define it",
 }
 
+# The repository every DEP_RE declaration names, which cargo builds from
+# (store_identity_problem holds the judging remote to it).
+DECLARED_REPOSITORY = "alabsystems/{repo}"
+
 DEP_RE = re.compile(
     r'git\s*=\s*"https://github\.com/alabsystems/(?P<repo>[a-z0-9-]+?)(?:\.git)?"'
     r"[^\n]*?"
@@ -232,7 +237,10 @@ class Waiver(NamedTuple):
     line_no: int
 
 
-def run(args: list[str], cwd: Path, *, env: Optional[dict[str, str]] = None) -> tuple[int, str]:
+def run(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run `args` in `cwd`; a git command runs under git_environment, so the
+    repository it reads is the one `cwd` and its arguments name."""
+    env = git_environment() if args and args[0] == "git" else None
     p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, env=env)
     return p.returncode, p.stdout
 
@@ -281,30 +289,36 @@ class InventoryError(RuntimeError):
     """A required tracked inventory or manifest could not be read."""
 
 
-def inventory_environment(root: Path) -> dict[str, str]:
-    """Explicit roots must not inherit another repository/index from a hook."""
-    try:
-        code, names = run(["git", "rev-parse", "--local-env-vars"], root)
-    except OSError as error:
-        raise InventoryError(f"cannot inspect Git inventory environment: {error}") from error
-    local = set(names.splitlines())
-    if code != 0 or not {"GIT_DIR", "GIT_INDEX_FILE"} <= local:
-        raise InventoryError("cannot identify repository-local Git environment")
-    env = {key: value for key, value in os.environ.items()
-           if key not in local and not key.startswith("GIT_CONFIG_")}
-    env["GIT_NO_REPLACE_OBJECTS"] = "1"
-    return env
+def git_environment() -> dict[str, str]:
+    """The environment every git process of this module runs under:
+    remote_tips._env(), the one policy RemoteTips' own git runs under.
+
+    It removes every inherited GIT_* variable, not a list of dangerous ones.
+    A hook inherits whatever git exports to it: GIT_DIR, GIT_INDEX_FILE,
+    GIT_OBJECT_DIRECTORY, GIT_COMMON_DIR (honoured over `-C`, the cwd and,
+    except GIT_DIR, `--git-dir`, so they choose the repository a read
+    answers for), GIT_CONFIG_* (`-c`), and GIT_GLOB_PATHSPECS /
+    GIT_ICASE_PATHSPECS (`git --glob-pathspecs push`), with which every
+    `--literal-pathspecs ls-tree` here dies (exit 128) and the gate refused a
+    push it should judge. git's own `rev-parse --local-env-vars` names only
+    the first kind, so a deny list missed the rest. Then the fixed profile:
+    replace objects and grafts off, no terminal prompt, only `file` transport,
+    and no lazy fetch, so a read in a partial-clone store never fetches a
+    missing object from the store's configured remote, unbounded and outside
+    Agh; it fails, and semantic_digest_with_source acquires the bytes through
+    materialize_semantic_objects. Other variables (PATH, HOME, ...) pass
+    through unchanged."""
+    return rt._env()
 
 
 def ancestry_memory_dir(root: Path) -> Optional[Path]:
     """`<git common dir>/trust-land/commit-ancestry`, as
     check_submodule_remote_reachability.ancestry_memory_dir computes it, but
-    under inventory_environment so a hook's exported GIT_DIR cannot choose it.
+    under git_environment so a hook's exported GIT_DIR cannot choose it.
     None (nothing remembered, everything asked) when Git cannot say."""
     try:
-        code, out = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], root,
-                        env=inventory_environment(root))
-    except (OSError, InventoryError):
+        code, out = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], root)
+    except OSError:
         return None
     common = out.strip()
     return Path(common) / "trust-land" / "commit-ancestry" if code == 0 and common else None
@@ -352,7 +366,6 @@ def tracked_manifest_paths(root: Path) -> list[str]:
     explicitly instead. A missing repository is unknown, never an empty set.
     """
     root = root.resolve()
-    env = inventory_environment(root)
     pending = [(root, "")]
     seen: set[Path] = set()
     manifests: list[str] = []
@@ -367,16 +380,16 @@ def tracked_manifest_paths(root: Path) -> list[str]:
             raise InventoryError(f"repeated or excessive tracked repository at {prefix or '.'}")
         seen.add(actual)
         try:
-            code, top = run(["git", "rev-parse", "--show-toplevel"], actual, env=env)
+            code, top = run(["git", "rev-parse", "--show-toplevel"], actual)
             if code != 0 or not top.strip() or Path(top.strip()).resolve() != actual:
                 raise InventoryError(f"tracked gitlink {prefix or '.'} has no independent worktree index")
-            code, head = run(["git", "rev-parse", "--verify", "HEAD^{commit}"], actual, env=env)
+            code, head = run(["git", "rev-parse", "--verify", "HEAD^{commit}"], actual)
             if code != 0 or not head.strip():
                 raise InventoryError(f"tracked repository {prefix or '.'} has no resolvable HEAD")
-            code, index = run(["git", "rev-parse", "--path-format=absolute", "--git-path", "index"], actual, env=env)
+            code, index = run(["git", "rev-parse", "--path-format=absolute", "--git-path", "index"], actual)
             if code != 0 or not index.strip() or not stat.S_ISREG(Path(index.strip()).lstat().st_mode):
                 raise InventoryError(f"tracked repository {prefix or '.'} has no regular index")
-            code, out = run(["git", "ls-files", "--cached", "--stage", "-z"], actual, env=env)
+            code, out = run(["git", "ls-files", "--cached", "--stage", "-z"], actual)
         except OSError as error:
             raise InventoryError(f"cannot inspect tracked repository {prefix or '.'}: {error}") from error
         if code != 0:
@@ -548,12 +561,213 @@ def semantic_digest(store: Path, rev: str, surface: tuple[str, ...]) -> str | No
             return None
         content = subprocess.run(
             ["git", "--no-replace-objects", "cat-file", "blob", fields[2]], cwd=store, capture_output=True,
+            env=git_environment(),
         )
         if content.returncode != 0:
             return None
         h.update(b"\x00FILE\x00" + path.encode() + b"\x00")
         h.update(content.stdout)
     return h.hexdigest()[:12]
+
+
+class SurfaceUnavailable(RuntimeError):
+    """Exact source bytes could not be read; never semantic absence."""
+
+
+def materialize_semantic_objects(
+    store: Path, rev: str, surface: tuple[str, ...], tips: rt.RemoteTips,
+) -> None:
+    """Acquire only the original trees/blobs needed by the unchanged surface.
+
+    This is NOT parent ancestry: RemoteTips' native verdict still owns that.
+    Git reads the pinned commit/tree relationships, authenticated Agh reads exact
+    object metadata, and Git must hash reconstructed bytes to the original OID
+    before caching them. No ref/index/worktree or semantic population moves.
+    """
+    remote = tips.remote(store)
+    repository = rt.github_repository(remote.url)
+    if repository is None:
+        acquired = rt.fetch_exact_source(remote.url, store, rev)
+        if acquired.returncode:
+            raise SurfaceUnavailable(
+                "local semantic source intake unavailable: " + rt._message(acquired)
+            )
+        return
+    deadline = time.monotonic() + rt.FETCH_TIMEOUT_S
+    environment = rt._env(isolate_git_config=True)
+
+    def git_bytes(arguments, data=None):
+        done = subprocess.run(["git", "--no-replace-objects", *arguments], cwd=store,
+                              input=data, capture_output=True, env=environment)
+        if done.returncode or done.stderr:
+            raise SurfaceUnavailable(
+                "local semantic object read failed: " + done.stderr.decode(errors="replace").strip()
+            )
+        return done.stdout
+
+    def ensure(oid: str, kind: str):
+        if re.fullmatch(r"[0-9a-f]{40}", oid) is None or kind not in {"tree", "blob"}:
+            raise SurfaceUnavailable("semantic source names an unsupported object")
+        observed = git_bytes(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"], (oid + "\n").encode(),
+        ).strip()
+        if observed == f"{oid} {kind}".encode():
+            return
+        if observed != f"{oid} missing".encode():
+            raise SurfaceUnavailable("semantic source object has a different type")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SurfaceUnavailable("semantic object intake exhausted its original deadline")
+        endpoint = "trees" if kind == "tree" else "blobs"
+        done = rt._agh(
+            repository, ["api", f"repos/{repository}/git/{endpoint}/{oid}"], timeout=remaining,
+        )
+        if done.returncode:
+            raise SurfaceUnavailable(
+                "authenticated semantic object intake unavailable: " + rt._message(done)
+            )
+        try:
+            body = json.loads(done.stdout)
+            if not isinstance(body, dict) or body.get("sha") != oid:
+                raise ValueError("different exact object identity")
+            if kind == "blob":
+                if body.get("encoding") != "base64" or not isinstance(body.get("content"), str):
+                    raise ValueError("blob is not complete base64 content")
+                raw = base64.b64decode("".join(body["content"].split()), validate=True)
+                if type(body.get("size")) is not int or body["size"] != len(raw):
+                    raise ValueError("blob size differs")
+            else:
+                if body.get("truncated") is not False or not isinstance(body.get("tree"), list):
+                    raise ValueError("tree population is incomplete")
+                entries = []
+                names = set()
+                kinds = {
+                    "040000": "tree", "100644": "blob", "100755": "blob",
+                    "120000": "blob", "160000": "commit",
+                }
+                for entry in body["tree"]:
+                    name = entry.get("path") if isinstance(entry, dict) else None
+                    mode = entry.get("mode") if isinstance(entry, dict) else None
+                    target = entry.get("sha") if isinstance(entry, dict) else None
+                    if (not isinstance(name, str) or not name or "/" in name or "\x00" in name
+                            or name in names or mode not in kinds
+                            or entry.get("type") != kinds[mode]
+                            or not isinstance(target, str)
+                            or re.fullmatch(r"[0-9a-f]{40}", target) is None):
+                        raise ValueError("invalid or duplicate original tree entry")
+                    names.add(name)
+                    encoded = name.encode("utf-8")
+                    key = encoded + (b"/" if mode == "040000" else b"")
+                    value = (
+                        mode.lstrip("0").encode() + b" " + encoded + b"\x00" + bytes.fromhex(target)
+                    )
+                    entries.append((key, value))
+                raw = b"".join(value for _, value in sorted(entries))
+        except (ValueError, TypeError, UnicodeError) as error:
+            raise SurfaceUnavailable(
+                "unreadable original semantic object: " + str(error)
+            ) from error
+        actual = git_bytes(["hash-object", "-t", kind, "--stdin"], raw).decode().strip()
+        if actual != oid:
+            raise SurfaceUnavailable(
+                "semantic object bytes do not match their original Git identity"
+            )
+        written = git_bytes(["hash-object", "-w", "-t", kind, "--stdin"], raw).decode().strip()
+        if written != oid:
+            raise SurfaceUnavailable("cached semantic object has a different identity")
+
+    # cat-file reads this commit alone; pretty/log walks may demand parents
+    # which a valid commit-only receipt intentionally did not acquire.
+    original = git_bytes(["cat-file", "commit", rev])
+    first = original.split(b"\n", 1)[0]
+    root = re.fullmatch(rb"tree ([0-9a-f]{40})", first)
+    if root is None:
+        raise SurfaceUnavailable("original semantic commit has no exact tree identity")
+    root_tree = root.group(1).decode()
+    trees = {}
+
+    def entries(oid):
+        if oid not in trees:
+            ensure(oid, "tree")
+            found = {}
+            for record in git_bytes(["ls-tree", "-z", oid]).split(b"\x00"):
+                if not record:
+                    continue
+                header, name = record.split(b"\t", 1)
+                _, kind, target = header.split()
+                found[name] = (kind.decode(), target.decode())
+            trees[oid] = found
+        return trees[oid]
+
+    def lookup(path):
+        parts = path.encode().split(b"/")
+        if any(part in {b"", b".", b".."} for part in parts):
+            raise SurfaceUnavailable("semantic surface path is not an original relative path")
+        current = root_tree
+        for part in parts[:-1]:
+            selected = entries(current).get(part)
+            if selected is None or selected[0] != "tree":
+                return None
+            current = selected[1]
+        return entries(current).get(parts[-1])
+
+    blobs = set()
+    pending = []
+    for path in surface:
+        selected = lookup(path)
+        if selected is not None:
+            if selected[0] != "blob":
+                raise SurfaceUnavailable("semantic root is not an original source blob")
+            blobs.add(selected[1])
+        if path.endswith(".rs"):
+            split = lookup(path[:-3])
+            if split is not None and split[0] == "tree":
+                pending.append(split[1])
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for kind, oid in entries(current).values():
+            if kind == "tree":
+                pending.append(oid)
+            elif kind == "blob":
+                blobs.add(oid)
+            else:
+                raise SurfaceUnavailable("semantic split directory contains an unreadable gitlink")
+    for oid in sorted(blobs):
+        ensure(oid, "blob")
+
+
+def semantic_digest_with_source(
+    store: Path, rev: str, surface: tuple[str, ...], tips: rt.RemoteTips,
+) -> tuple[str | None, str | None]:
+    """Read exact semantic bytes, not a commit-only ancestry receipt.
+
+    Agh owns authenticated network reads; Git validates original tree/blob
+    identities before caching source objects. No caller ref/index/worktree
+    moves. Intake success or a present commit never substitutes for reading
+    every byte in the unchanged semantic surface.
+    """
+    code, resolved = run(
+        ["git", "--no-replace-objects", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+        cwd=store,
+    )
+    resolved = resolved.strip()
+    if code or re.fullmatch(r"[0-9a-f]{40}", resolved) is None:
+        return None, "the semantic source has no exact immutable commit identity"
+    digest = semantic_digest(store, resolved, surface)
+    if digest is not None:
+        return digest, None
+    try:
+        materialize_semantic_objects(store, resolved, surface, tips)
+    except (SurfaceUnavailable, OSError, ValueError) as error:
+        return None, "exact semantic source intake unavailable: " + str(error)
+    digest = semantic_digest(store, resolved, surface)
+    if digest is None:
+        return None, "exact semantic source is still unreadable after original snapshot intake"
+    return digest, None
 
 
 class Unjudged:
@@ -656,8 +870,85 @@ def gitlink_rev(root: Path, store_rel: str) -> Optional[str]:
     return fields[2]
 
 
-def has_store(store: Path) -> bool:
-    return (store / ".git").exists() or (store / "HEAD").exists()
+def has_store(root: Path, store_rel: str) -> bool:
+    """Whether `store_rel` holds a checkout to serve as the dependency's object
+    store: the path is a directory that is its own worktree's top level (git
+    did not find it by walking up into the superproject, and it is no bare
+    repository), whose HEAD resolves to a commit and whose index is not
+    empty, with a Git common directory of its own (no gitfile naming the
+    superproject's), at a path where the superproject's HEAD records a
+    gitlink. Nothing here ties the checkout's history to that gitlink, and
+    nothing needs to: the store is read only for the objects of the revisions
+    judged, which their ids name whatever repository holds them, and for the
+    remote that judges them, which store_identity_problem ties to the
+    declared repository. The checkout's HEAD need not be the gitlink: a
+    worktree away from its gitlink is check_pin_coherence.sh's business (see
+    find_declarations). Every query runs under git_environment, so a
+    hook's exported GIT_DIR cannot answer for the path; InventoryError when
+    the superproject's own HEAD tree or Git directory cannot be read.
+    (LAND-IR-READER-GAPS-1: any path holding a `.git` or a `HEAD` counted, so
+    a gitfile naming the superproject's Git directory made the superproject's
+    objects and remote judge the pins.)"""
+    store = root / store_rel
+    try:
+        actual = store.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if not actual.is_dir():
+        return False
+    def ask(*args: str) -> Optional[str]:
+        try:
+            code, out = run(["git", *args], actual)
+        except OSError:
+            return None
+        return out if code == 0 else None
+
+    top = ask("rev-parse", "--show-toplevel")
+    if not top or not top.strip() or Path(top.strip()).resolve() != actual:
+        return False
+    head = ask("rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    if not head or not head.strip():
+        return False
+    common = ask("rev-parse", "--path-format=absolute", "--git-common-dir")
+    try:
+        code, own = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], root)
+    except OSError as error:
+        raise InventoryError(f"cannot read the superproject's Git directory: {error}") from error
+    if code != 0 or not own.strip():
+        raise InventoryError("cannot read the superproject's Git directory")
+    if not common or not common.strip() or Path(common.strip()).resolve() == Path(own.strip()).resolve():
+        return False
+    if not ask("ls-files", "-z", "--cached"):
+        return False
+    return gitlink_rev(root, store_rel) is not None
+
+
+def store_identity_problem(repo: str, remote: rt.Remote) -> Optional[str]:
+    """Why `remote`, the remote RemoteTips judges `repo`'s revisions against
+    (the store's `origin`, else its first), is not the declared dependency's,
+    or None. Every declaration DEP_RE reads names the GitHub repository
+    DECLARED_REPOSITORY, which cargo builds from; a GitHub remote must name
+    that repository (GitHub compares the names without case), so a store
+    whose origin is a fork, whose main may contain a pin the dependency's
+    does not, is refused rather than judged. A URL that is neither a literal
+    GitHub repository nor a literal local path is refused as RemoteTips
+    refuses it. A literal local path (a mirror, and every test fixture) names
+    no repository and is taken as given (docs/OPEN_ISSUES.md
+    IR-COHORT-LOCAL-REMOTE-1). A remote that cannot be resolved is left to
+    the judgment, which calls it COULD NOT RUN. (LAND-IR-READER-GAPS-1
+    review: any store's origin judged, so a fork's main could contain the
+    pins.)"""
+    if remote.error:
+        return None
+    declared = DECLARED_REPOSITORY.format(repo=repo)
+    try:
+        named = rt.github_repository(remote.url)
+    except ValueError as error:
+        return f"its remote `{remote.name}` ({remote.url}) is not the declared {declared}: {error}"
+    if named is not None and named.lower() != declared.lower():
+        return (f"its remote `{remote.name}` names the GitHub repository {named}, not {declared}, "
+                f"which every declaration names; its main is no evidence about the dependency's")
+    return None
 
 
 def load_waivers(root: Path) -> tuple[list[Waiver], list[str]]:
@@ -717,10 +1008,9 @@ def main() -> int:
 
     anchor_dir = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent
     try:
-        code, out = run(["git", "rev-parse", "--show-toplevel"], anchor_dir,
-                        env=inventory_environment(anchor_dir))
-    except InventoryError as error:
-        print(f"IR COHORT COULD NOT RUN: manifest inventory: {error}", file=sys.stderr)
+        code, out = run(["git", "rev-parse", "--show-toplevel"], anchor_dir)
+    except OSError as error:
+        print(f"IR COHORT COULD NOT RUN: cannot run git: {error}", file=sys.stderr)
         return 2
     if code != 0:
         print("not inside a git repository", file=sys.stderr)
@@ -743,6 +1033,10 @@ def main() -> int:
     # read). Kept apart from `problems` so the exit says COULD NOT RUN (2)
     # rather than a finding (1); either one refuses.
     unjudged: list[str] = []
+    # Gated repositories with an unjudged revision the local store could not
+    # digest: a waiver for one of them may cover that revision, so it is not
+    # called stale (the run already exits COULD NOT RUN).
+    undigested: set[str] = set()
     used_waivers: set[int] = set()
     ungated_repos: list[str] = []
     ungated_drift: list[str] = []
@@ -759,17 +1053,31 @@ def main() -> int:
     tips = rt.RemoteTips(memory=ancestry_memory_dir(root), time_bound=args.time_bound)
     warm: list[tuple[Path, list[str]]] = []
     ratified_anchors: dict[str, str] = {}
+    # Whether each repository's store is a populated checkout (has_store),
+    # and why its remote is not the declared repository's
+    # (store_identity_problem), asked once, before any remote read, and used
+    # by the report below.
+    stores: dict[str, bool] = {}
+    misidentified: dict[str, str] = {}
     try:
         for repo, rows in by_repo.items():
             rel = OBJECT_STORE.get(repo) or f"first-party/{repo}"
-            if not has_store(root / rel):
-                continue
-            shas = sorted({d.rev for d in rows})
             gl = None
             if repo in SEMANTIC_SURFACE:
+                # Asked before the store: a missing anchor refuses whatever
+                # the path holds (has_store counts no store without one).
                 gl = gitlink_rev(root, rel)
                 if gl is None:
                     raise InventoryError(f"RATIFIED ANCHOR MISSING: HEAD records no gitlink for {rel}")
+            stores[repo] = has_store(root, rel)
+            if not stores[repo]:
+                continue
+            identity = store_identity_problem(repo, tips.remote(root / rel))
+            if identity is not None:
+                misidentified[repo] = identity
+                continue
+            shas = sorted({d.rev for d in rows})
+            if gl is not None:
                 ratified_anchors[repo] = gl
             warm.append((root / rel, shas + ([gl] if gl else [])))
     except InventoryError as error:
@@ -828,10 +1136,17 @@ def main() -> int:
         # whatever the dependency is. Only the digest comparison is deferred.
         store_rel = store_rel or f"first-party/{repo}"
         store = root / store_rel
-        if not has_store(store):
+        if not stores.get(repo, False):
             problems.append(
-                f"{repo}: object store {store_rel} is not checked out, so its "
-                f"{len(revs)} pinned revision(s) cannot be resolved at all"
+                f"{repo}: object store {store_rel} is not checked out (no populated checkout of a "
+                f"gitlink HEAD records there), so its {len(revs)} pinned revision(s) cannot be resolved at all"
+            )
+            continue
+        if repo in misidentified:
+            problems.append(
+                f"{repo}: STORE IDENTITY --- object store {store_rel}: {misidentified[repo]}. "
+                f"Its {len(revs)} pinned revision(s) were not judged; point the store's "
+                f"remote at the declared repository."
             )
             continue
 
@@ -850,6 +1165,17 @@ def main() -> int:
                     f"Not a finding about the pin, and not a pass; check the network and "
                     f"`git -C {store_rel} ls-remote origin`, then re-run."
                 )
+                # The digest is read from the local store, not the remote, so
+                # an unread remote leaves it judgeable, as NO_BASIS does below.
+                # Skipping it turned every live waiver into a false "STALE
+                # waiver ... Delete the row" (measured 2026-11-13: agh rate
+                # limited every remote read). A revision the store does not
+                # hold has no digest either; its waiver is then unjudged.
+                digest = semantic_digest(store, rev, surface) if surface is not None else None
+                if digest is not None:
+                    groups.setdefault(digest, []).append(rev)
+                elif surface is not None:
+                    undigested.add(repo)
                 continue
             if main_state is None:
                 problems.append(
@@ -883,9 +1209,9 @@ def main() -> int:
                 continue
             if surface is None:
                 continue  # resolvability/containment checked; digest deferred
-            digest = semantic_digest(store, rev, surface)
+            digest, source_error = semantic_digest_with_source(store, rev, surface, tips)
             if digest is None:
-                problems.append(f"{repo}@{rev[:8]}: revision resolved but surface unreadable")
+                unjudged.append(f"{repo}@{rev[:8]}: semantic surface unreadable: {source_error}")
                 continue
             groups.setdefault(digest, []).append(rev)
 
@@ -914,7 +1240,7 @@ def main() -> int:
             # how the ratified pin becomes a fiction that nothing builds against.
             centre = None
             anchor = ""
-            anchor_unreadable = False
+            anchor_readable = True
             gl_rev = ratified_anchors[repo]
             if gl_rev:
                 # THE ANCHOR IS SUBJECT TO THE FORK RULE TOO.
@@ -977,15 +1303,16 @@ def main() -> int:
                         f"gitlink to a main revision. Waiving a consumer here would be "
                         f"keying a waiver on a repository that is correctly on main."
                     )
-                gl_digest = semantic_digest(store, gl_rev, surface)
+                gl_digest, source_error = semantic_digest_with_source(store, gl_rev, surface, tips)
                 if gl_digest is None:
-                    anchor_unreadable = True
+                    anchor_readable = False
                     problems.append(
                         f"{repo}@{gl_rev[:8]}: RATIFIED SURFACE UNREADABLE --- restore the "
                         f"gitlink's real semantic trees and blobs before judging the cohort; "
-                        f"a most-declared group is diagnostic only and cannot replace the anchor."
+                        f"a most-declared group is diagnostic only and cannot replace the anchor. "
+                        f"Original source acquisition: {source_error}"
                     )
-                else:
+                if gl_digest is not None:
                     centre = gl_digest
                     anchor = f"superproject gitlink {gl_rev[:8]}"
                     if gl_digest not in groups:
@@ -997,7 +1324,7 @@ def main() -> int:
             if centre is None:
                 centre = max(groups, key=lambda d: (len(groups[d]), d))
                 anchor = "most-declared group (gitlink unreadable)"
-            label = "diagnostic group" if anchor_unreadable else "ratified"
+            label = "diagnostic group" if not anchor_readable else "ratified"
             print(f"   {label}: {centre}  [{anchor}]")
             diverged = 0
             for digest in sorted(groups):
@@ -1030,15 +1357,24 @@ def main() -> int:
                     print(
                         f"   waived  {digest} until {w.expires} ({w.owner}): {w.reason}"
                     )
-            if diverged == 0 and not anchor_unreadable:
-                print(
-                    f"   COHERENT: {len(rows)} declaration(s), all on the ratified surface."
-                )
+            if diverged == 0:
+                readable_revs = {rev for members in groups.values() for rev in members}
+                readable_count = sum(row.rev in readable_revs for row in rows)
+                if readable_count == len(rows) and anchor_readable:
+                    print(
+                        f"   COHERENT: {len(rows)} declaration(s), all on the ratified surface."
+                    )
+                else:
+                    print(
+                        f"   INCOMPLETE: {readable_count}/{len(rows)} declaration(s) have "
+                        f"readable semantic sources; ratified source readable={anchor_readable}. "
+                        "No complete semantic-coherence result."
+                    )
 
     # A waiver that no longer applies must be deleted, not left to rot --- the
     # same rule pin-waivers.txt enforces.
     for w in waivers:
-        if w.line_no not in used_waivers:
+        if w.line_no not in used_waivers and w.repo not in undigested:
             problems.append(
                 f"{WAIVER_PATH}:{w.line_no}: STALE waiver for {w.repo} schema "
                 f"{w.digest} --- the divergence it covers is gone. Delete the row."
@@ -1086,7 +1422,8 @@ def main() -> int:
     if unjudged:
         print(
             f"IR COHORT COULD NOT RUN --- {len(unjudged)} revision(s) not judged, because "
-            f"a remote could not be read (not a pass, and not a finding):"
+            f"a remote or original semantic source could not be read "
+            f"(not a pass, and not a finding):"
         )
         for p in unjudged:
             print(f"  * {p}")

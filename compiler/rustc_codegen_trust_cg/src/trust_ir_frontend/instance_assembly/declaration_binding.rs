@@ -21,6 +21,27 @@ pub(crate) struct BoundDeclaration {
 }
 
 impl BoundDeclaration {
+    /// Recheck the retained installation premise against the actual immutable
+    /// handoff and the sealed upstream module after installation. This is data
+    /// custody only: it grants no exception to codegen's closure equality rule.
+    pub(super) fn check_retained(
+        &self,
+        base: &Module,
+        guest: &Module,
+        installed: FuncId,
+    ) -> Result<(), String> {
+        if !std::ptr::eq(self.base.as_ref(), base)
+            || self.original.id != installed
+            || !self.original.is_declaration()
+            || base.function_by_id(installed) != Some(&self.original)
+            || base.func_type(self.original.ty) != Some(&self.signature)
+            || guest != &self.guest
+        {
+            return Err("retained declaration installation premise differs from its original handoff or admitted body".into());
+        }
+        Ok(())
+    }
+
     /// Recheck the exact content immediately at the existing sole appender.
     pub(super) fn slot(&self, host: &Module, guest: &Module) -> Result<FuncId, String> {
         if guest != &self.guest {

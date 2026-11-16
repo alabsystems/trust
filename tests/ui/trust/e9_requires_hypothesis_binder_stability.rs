@@ -48,7 +48,7 @@ clean {
                 Nat.le (UInt64.toNat (Decidable.casesOn (motive := fun _ => UInt64)
                     d (fun _ => a) (fun _ => b))) (UInt64.toNat a))
             (instDecidableUInt64Lt a b)
-            (fun _ => Nat.le.refl (UInt64.toNat a))
+            (fun _ => @Nat.le.refl (UInt64.toNat a))
             (fun _ => h)
 }
 

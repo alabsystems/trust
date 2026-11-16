@@ -4,6 +4,9 @@
 use super::*;
 use crate::bootstrap_graph::offline_preparation::{Intent, IntentQuery, IntentReply};
 
+mod staged;
+pub(super) use staged::StagedAttempt;
+
 pub(super) struct IntentAttempt {
     query: IntentQuery,
     started: Instant,
@@ -150,6 +153,17 @@ impl Client {
 }
 
 impl BootstrapGraphSupport {
+    /// Negative routing observation only; it grants no original input owner.
+    pub fn offline_preparation_selected(&self, deadline: Instant) -> io::Result<bool> {
+        bounded(self.deadline, deadline)?;
+        if let Some(attempt) = &self.offline_intent {
+            attempt.ready(&self.key, &self.queries, deadline)?;
+        }
+        if let Some(attempt) = &self.offline_staged {
+            attempt.ready(&self.key, &self.queries, deadline)?;
+        }
+        Ok(self.offline_intent.is_some() || self.offline_staged.is_some())
+    }
     /// Retained original selectors only after their carrier finished. Still
     /// DATA: actual Managers and source/config/materialization offers are owed.
     pub fn offline_preparation_intent(&self, deadline: Instant) -> io::Result<Option<&Intent>> {
@@ -159,13 +173,35 @@ impl BootstrapGraphSupport {
     }
 }
 
+impl EnrolledBootstrapGraph {
+    /// Negative routing observation only, never configuration/native custody.
+    pub fn offline_preparation_selected(&self, deadline: Instant) -> io::Result<bool> {
+        let original = self.original.as_ref().ok_or_else(crate::wire::invalid)?;
+        original.check(deadline)?;
+        Ok(original.offline_intent.is_some() || original.offline_staged.is_some())
+    }
+}
+impl SourceBoundBootstrapGraph {
+    pub fn offline_preparation_selected(&self, deadline: Instant) -> io::Result<bool> {
+        let original = self.original.as_ref().ok_or_else(crate::wire::invalid)?;
+        original.check(deadline)?;
+        Ok(original.offline_intent.is_some() || original.offline_staged.is_some())
+    }
+}
+
 impl OutputBoundBootstrapGraph {
+    pub fn offline_preparation_selected(&self, deadline: Instant) -> io::Result<bool> {
+        let original = self.original.as_ref().ok_or_else(crate::wire::invalid)?;
+        original.check(deadline)?;
+        Ok(original.offline_intent.is_some() || original.offline_staged.is_some())
+    }
     /// Same initial DATA carried through genuine source/output enrollment.
     /// This does not supply the still-required actual materialization owner.
     pub fn offline_preparation_intent(&self, deadline: Instant) -> io::Result<Option<&Intent>> {
         let original = self.original.as_ref().ok_or_else(crate::wire::invalid)?;
         original.check(deadline)?;
-        Ok(original.offline_intent.as_ref().and_then(|attempt| attempt.intent.as_ref()))
+        Ok(original.offline_intent.as_ref().and_then(|attempt| attempt.intent.as_ref())
+            .or_else(|| original.offline_staged.as_ref().and_then(|attempt| attempt.complete())))
     }
 }
 

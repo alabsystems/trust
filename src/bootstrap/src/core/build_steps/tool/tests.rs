@@ -1891,6 +1891,7 @@ fn vf5_resource_preparer_is_the_source_built_host_snapshot_example() {
     assert_eq!(recipe.target, builder.host_target);
     assert_eq!(recipe.path, "crates/trust-certify");
     assert_eq!(recipe.tool, "prepare_vf5_inputs");
+    assert_eq!(recipe.allow_features, VF5_RESOURCE_ALLOW_FEATURES);
     assert_eq!(recipe.cargo_args, ["--example", "prepare_vf5_inputs"]);
     assert_eq!(recipe.artifact_kind, ToolArtifactKind::Example);
     assert!(recipe.extra_features.is_empty());

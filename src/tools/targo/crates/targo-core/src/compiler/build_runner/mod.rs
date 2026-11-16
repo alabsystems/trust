@@ -18,8 +18,12 @@ use filetime::FileTime;
 use itertools::Itertools;
 
 use super::RustdocFingerprint;
+// Trust: DC-12a, the end-of-build receipt.
+use super::build_receipt::{self, Ledger, Receipt, Root, Selection, UnitUsed};
 use super::custom_build::{self, BuildDeps, BuildScriptOutputs, BuildScripts};
 use super::fingerprint::{Checksum, Fingerprint, VerifiedRustdocLauncherIdentity};
+// Trust: DC-12b, the incremental folders a build directory keeps.
+use super::incremental_trim;
 use super::job_queue::JobQueue;
 use super::layout::Layout;
 use super::lto::Lto;
@@ -136,6 +140,9 @@ pub struct BuildRunner<'a, 'gctx> {
     // owners and jobserver that continue to live in this runner.
     compilation_cache_lease: Option<CacheLock<'gctx>>,
     compilation_lease_state: CompilationLeaseState,
+    // Trust: DC-12a. What the job queue ran, handed over just before it
+    // finishes compilation, which keeps the build's receipt from it.
+    pub(super) units_ran: Option<Ledger<Unit>>,
     workload_outputs: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) native_job: Option<Arc<super::native_job::Options>>,
@@ -206,7 +213,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             Arc<super::resource_runtime::ResourceRuntime>,
         >,
     ) -> CargoResult<Self> {
-        let compilation = Compilation::new(bcx)?;
+        let mut compilation = Compilation::new(bcx)?;
         let verified_rustdoc_launcher = compilation.verified_rustdoc_launcher();
 
         // Load up the jobserver that we'll use to manage our parallelism. This
@@ -271,6 +278,25 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             ))?;
         }
 
+        compilation.post_build_compiler = Some({
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                if let Some(runtime) = &resource_runtime {
+                    super::post_build_compiler::Scheduler::Native(Arc::clone(runtime))
+                } else if fixed_gnu.is_some() {
+                    // The build's temporary bridge retires normally. Later work
+                    // borrows from the SAME original ancestor, at the same ceiling.
+                    super::post_build_compiler::Scheduler::Fixed
+                } else {
+                    super::post_build_compiler::Scheduler::Ordinary(jobserver.clone())
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                super::post_build_compiler::Scheduler::Ordinary(jobserver.clone())
+            }
+        });
+
         Ok(Self {
             bcx,
             exact_unit_graph: std::cell::OnceCell::new(),
@@ -302,6 +328,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             lease_forces: None,
             compilation_cache_lease: None,
             compilation_lease_state: CompilationLeaseState::Active,
+            // Trust: DC-12a, set by the job queue as it finishes compilation.
+            units_ran: None,
             workload_outputs: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             native_job: None,
@@ -701,6 +729,37 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                 Ok(None)
             }
         })();
+        // Trust: DC-12a. Keep the receipt of what this graph used while its
+        // leases still hold the build directory. Only a graph that succeeded
+        // keeps one; where it cannot, it withdraws its selection's receipt
+        // before, which names another build's units. A receipt that cannot be
+        // named, written or withdrawn changes nothing else: `result` and every
+        // output stay as they are. The command can still fail after this (a
+        // test, a verification verdict, a late cancellation), and the receipt
+        // stands: every unit it names is finalized by now. The queue's
+        // dispatch already asked whether this is targo, so a ledger with a
+        // unit in it means that asking again cannot panic.
+        if let Some(ran) = self.units_ran.take().filter(|ran| !ran.is_empty())
+            && crate::is_targo_invocation()
+        {
+            let succeeded = compile_succeeded && result.is_ok();
+            let build_dir = self.bcx.ws.build_dir().into_path_unlocked();
+            let receipted =
+                build_receipt::at_finish(succeeded, &build_dir, || self.receipt_of(&ran));
+            tracing::debug!("build receipt: {receipted}");
+            // Trust: DC-12b. With its receipt kept, remove the incremental
+            // folders no kept receipt's unit uses, in each profile whose
+            // build directory lock this build still holds exclusively (its
+            // leases are released below). Like the receipt, this never
+            // changes the build's result.
+            let exclusive = self
+                .files
+                .as_ref()
+                .map(|files| files.exclusive_incremental_dirs())
+                .unwrap_or_default();
+            let trimmed = incremental_trim::at_finish(&receipted, &build_dir, &exclusive);
+            tracing::debug!("incremental trim: {trimmed}");
+        }
         // Even an output-finalization error must release its owned leases:
         // an already-running test may be waiting for a nested same-target build.
         self.lock_manager.release_all();
@@ -713,6 +772,171 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             self.compilation_lease_state = CompilationLeaseState::Finalized;
         }
         result
+    }
+
+    /// Trust: DC-12a. What this build can say of the units the queue `ran`
+    /// (`build_receipt`): its receipt; `Told::Untold` where the receipt
+    /// cannot name them all (a unit whose outputs cannot be listed, or a unit
+    /// in the build directory with no plain profile or hash, `Receipt::new`);
+    /// `Told::Unnamed` where a path in its selection is not UTF-8. It reads
+    /// the maps the graph's own jobs read, keyed by the same units, through
+    /// `self.files` without unwrapping it, and never panics.
+    /// `src/tools/targo/tests/build_receipt.rs` holds it to a real build.
+    fn receipt_of(&self, ran: &Ledger<Unit>) -> build_receipt::Told {
+        let Some(selection) = self.receipt_selection() else {
+            return build_receipt::Told::Unnamed;
+        };
+        match self.units_used(ran) {
+            Some((began_ms, units)) => Receipt::new(began_ms, selection, units).into(),
+            None => build_receipt::Told::Untold(selection),
+        }
+    }
+
+    /// Trust: DC-12a. When this build began and each unit the queue `ran`, as
+    /// its receipt names them, or `None` where one cannot be named.
+    fn units_used(&self, ran: &Ledger<Unit>) -> Option<(u64, Vec<UnitUsed>)> {
+        let bcx = self.bcx;
+        let files = self.files.as_ref()?;
+        let build_root = bcx.ws.build_dir().into_path_unlocked();
+        let began_ms = u64::try_from(bcx.gctx.invocation_time().as_millisecond()).ok()?;
+        // Trust: DC-12b. What the kept receipts say of the incremental
+        // folders, read before this build's receipt replaces its selection's.
+        let kept = incremental_trim::Kept::read(&build_root);
+        let mut units = Vec::new();
+        for (unit, how) in ran.iter() {
+            // A doctest has no unit in the build directory.
+            let Some(built) = build_receipt::compiled(unit.mode, how) else {
+                continue;
+            };
+            // A unit in a shared store lies outside the build directory.
+            let profile = if files.build_root(unit) == build_root {
+                let profile_dir = files.layout(unit.kind).build_dir().build().parent()?;
+                Some(build_receipt::profile_of(&build_root, profile_dir)?)
+            } else {
+                None
+            };
+            // The files `link_targets` names in a compiled unit's
+            // `compiler-artifact` message: each output that is there, by its
+            // link where it has one.
+            let outputs: Vec<PathBuf> = if built {
+                files
+                    .outputs(unit, bcx)
+                    .ok()?
+                    .iter()
+                    .filter(|output| output.path.exists())
+                    .map(|output| output.hardlink.as_ref().unwrap_or(&output.path).clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let hash = files.unit_hash(unit);
+            // Trust: DC-12b. The folders a unit compiled incrementally into
+            // its profile's `incremental/` uses.
+            let incremental = match &profile {
+                Some(profile) if self.profile_incremental_dir(unit).is_some() => {
+                    Some(incremental_trim::folders_of(
+                        how,
+                        ran.folders_written(unit),
+                        kept.as_ref(),
+                        profile,
+                        &hash,
+                        &unit.target.crate_name(),
+                    ))
+                }
+                _ => None,
+            };
+            units.push(UnitUsed {
+                profile,
+                hash,
+                package: unit.pkg.name().to_string(),
+                member: bcx.ws.is_member(&unit.pkg),
+                built,
+                outputs,
+                incremental,
+            });
+        }
+        Some((began_ms, units))
+    }
+
+    /// Trust: DC-12b. The profile's `incremental/` folder
+    /// (`BuildDirLayout::incremental`), where `unit` is a compiler unit of the
+    /// build directory compiled incrementally into it (`add_codegen_incremental`
+    /// passes it as `-C incremental`); `None` for any other unit: one whose
+    /// profile has incremental compilation off, a build script's run or a
+    /// rustdoc unit, a confined unit and a candidate lane's private unit (each
+    /// with a folder of its own), and a unit in a shared store.
+    pub(super) fn profile_incremental_dir(&self, unit: &Unit) -> Option<PathBuf> {
+        let compiler = matches!(
+            unit.mode,
+            CompileMode::Build | CompileMode::Test | CompileMode::Check { .. }
+        );
+        if !unit.profile.incremental || !compiler || self.bcx.confines(unit) {
+            return None;
+        }
+        let files = self.files.as_ref()?;
+        if files.build_root(unit) != self.bcx.ws.build_dir().into_path_unlocked() {
+            return None;
+        }
+        let dir = files.layout(unit.kind).build_dir().incremental();
+        (files.incremental_dir(unit) == dir).then(|| dir.to_path_buf())
+    }
+
+    /// Trust: DC-12a. What this build was asked to build, its receipt's
+    /// `Selection`, or `None` where a path in it is not UTF-8.
+    fn receipt_selection(&self) -> Option<Selection> {
+        let bcx = self.bcx;
+        // What `compute_metadata` hashes into a unit's id, without the run's
+        // own transport, so every verified run of a selection shares a name.
+        let without_transport = |args: &[String]| -> Vec<String> {
+            super::trust_unit_id::without_per_run_transport(args).unwrap_or_else(|| args.to_vec())
+        };
+        let roots = bcx
+            .roots
+            .iter()
+            .map(|unit| {
+                let mut features: Vec<String> =
+                    unit.features.iter().map(|feature| feature.to_string()).collect();
+                features.sort();
+                features.dedup();
+                let flags: &[String] = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                    &*unit.rustdocflags
+                } else {
+                    &*unit.rustflags
+                };
+                Root {
+                    args: without_transport(
+                        bcx.extra_args_for(unit)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    ),
+                    features,
+                    kind: match unit.kind {
+                        CompileKind::Host => "host".to_owned(),
+                        CompileKind::Target(target) => target.short_name().to_owned(),
+                    },
+                    mode: super::exact_unit_compile_mode(unit.mode).to_owned(),
+                    package: unit.pkg.name().to_string(),
+                    rustflags: without_transport(flags),
+                    target: format!(
+                        "{}:{}",
+                        unit.target.kind().description(),
+                        unit.target.name()
+                    ),
+                }
+            })
+            .collect();
+        // The wrapper by its file name: a new toolchain is the same selection.
+        let wrapper = match &bcx.rustc().workspace_wrapper {
+            Some(wrapper) => Some(wrapper.file_name()?.to_str()?.to_owned()),
+            None => None,
+        };
+        Some(Selection {
+            compile_time_deps_only: bcx.build_config.compile_time_deps_only,
+            profile: bcx.build_config.requested_profile.to_string(),
+            roots,
+            workspace: bcx.ws.root().to_str()?.to_owned(),
+            wrapper,
+        })
     }
 
     /// Borrow the one original precompile guard owner for an intermediate

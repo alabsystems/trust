@@ -7,7 +7,8 @@
 // positive may be [VALIDATED], and says so. MUTANTS: each must be Refuted or
 // Unknown (or refuse the object), never Proven; every mutant has an unmutated
 // twin in the same test that is Proven, so a mutant cannot pass by the
-// harness being broken.
+// harness being broken. The withdrawn panic-tail roster below instead requires
+// both the original and mutated objects to retain their complete Unknown account.
 //
 // Callees are External on Darwin: trust-cg refuses Internal/Private direct
 // edges off AArch64 ELF until step 5.3 (design fact V4).
@@ -2745,11 +2746,9 @@ fn aggregate_enum_mutants_are_not_proven() {
 // drops the dead tail. The unguarded twin (`1000 / x`) keeps its check live, and keeps its tail
 // at O0 and O2.
 //
-// The gate admits such a tail UNEXECUTED (call_event.rs `DeadTails`), and only as a whole run:
-// the pair, the one `bl` to the entry, the trap. O1 sets the pair's two recorded lines aside,
-// O2 admits the one `bl`, and the function still needs O4 reach and (4b), which together say
-// that no execution on which the IR returns enters the tail. Every cell here is Static (the
-// F1 consumer's Pic legs are in tests/f1_compile.rs; they cover the admitted positive only).
+// The Rust-only S2a allowance is withdrawn. Every reader Unknown remains in O1;
+// neither the exact tail shape nor any mutant gets a semantic exception. Static
+// byte-mutation cells below and the F1 Pic legs pin strict refusal/Unknown disclosure.
 
 /// [`sited_div`] compiled for `triple` at `opt`: the bytes from `M_cg`, the gate reading the
 /// producer's unsited check.
@@ -2801,133 +2800,60 @@ fn div_tail(fx: &Fixture) -> DivTail {
     DivTail { adrp, add, bl, r_adrp, r_add, r_bl }
 }
 
-const ADMITTED_O1: &str = "dead panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a)";
-/// Every O2 account of an admitted tail ends so.
-const ADMITTED_O2: &str = "entry and Location unverified (PKG-C5c S2)";
-/// O2's account where O4 is Proven: the tail is unreachable wherever the IR returns.
-const DEAD_O2: &str = "are unreachable wherever the IR returns (O4 reach + (4b), decided by ay; \
-kernel-checked only at [PROVED]); entry and Location unverified (PKG-C5c S2)";
-/// O2's account where O4 is not Proven: the claim is conditional, never asserted.
-const CONDITIONAL_O2: &str = "admitted unexecuted on the condition that O4 reach + (4b) hold, \
-which this certificate does not establish";
-
-/// `rung`'s tail is admitted: O1 and O2 Proven and saying so (O2 asserting the tail dead only
-/// where O4 is Proven, and conditionally otherwise). Returns the report.
+/// Every object-reader Unknown remains in O1 verbatim; DATA cannot license a tail.
 #[track_caller]
-fn assert_tail_admitted(fx: &Fixture, what: &str) -> CerReport {
+fn assert_o1_location_unknown(fx: &Fixture, what: &str) -> CerReport {
+    use trust_cg_bridge::compiled_object::{CompiledObject, ObjectExpectations, ObjectLayout};
+    let object = CompiledObject::parse(&fx.object).expect("parses");
+    let expected = ObjectExpectations::from_module(
+        &fx.m_cg,
+        object.format,
+        trust_cg_bridge::compiled_object::RelocationModel::Static,
+    )
+    .expect("expectations");
+    let layout = ObjectLayout::bind(object, &expected).expect("binds");
+    let window = &layout.windows["rung"];
+    assert!(!window.unknown.is_empty(), "{what}: no reader Unknowns");
     let report = fx.report();
     let c = report.certificate("rung").expect("rung");
-    let (o1, o2) = (&c.obligations.o1_binding, &c.obligations.o2_pairing);
-    assert!(
-        o1.grade == Grade::Proven
-            && o1.detail.contains(ADMITTED_O1)
-            && o2.grade == Grade::Proven
-            && o2.detail.contains("panic tails at [")
-            && o2.detail.contains(ADMITTED_O2)
-            && o2.detail.contains(DEAD_O2) == (c.obligations.o4_return.grade == Grade::Proven)
-            && o2.detail.contains(CONDITIONAL_O2)
-                != (c.obligations.o4_return.grade == Grade::Proven),
-        "{} {what}: the tail is not admitted\n{}\n{}",
-        fx.triple,
-        explain(&report),
-        disassemble(&fx.object)
-    );
+    assert_eq!(c.obligations.o1_binding.grade, Grade::Unknown, "{what}: {}", explain(&report));
+    assert_eq!(c.obligations.o1_binding.detail, window.unknown.join("; "), "{what}");
+    assert!(matches!(c.verdict, OutputVerdict::Unknown { .. }), "{what}: {}", explain(&report));
+    assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err(), "{what}: strict shipped");
+    assert!(report.ships(EmitPolicy::AllowUnknown).is_ok(), "{what}: {}", explain(&report));
     report
 }
 
-/// `rung` is Unknown at O1 on the walk's own account of the pair (the needle every earlier
-/// test of an address materialization reads), never Proven.
-#[track_caller]
-fn assert_o1_location_unknown(fx: &Fixture, what: &str) {
-    let report = fx.report();
-    let c = report.certificate("rung").expect("rung");
-    let o1 = &c.obligations.o1_binding;
-    assert!(
-        o1.grade == Grade::Unknown
-            && o1.detail.contains("address materialization")
-            && o1.detail.contains("symbol addresses are bound at steps 5.7/5.9")
-            && matches!(c.verdict, OutputVerdict::Unknown { .. }),
-        "{} {what}: not Unknown at O1 on the pair\n{}\n{}",
-        fx.triple,
-        explain(&report),
-        disassemble(&fx.object)
-    );
-}
-
-/// POSITIVE. s21 at O0, both triples: the tail is admitted and the function grades
-/// [VALIDATED] (`AyValidated`), where without S2a it was Unknown at O1 (the ladder's
-/// certificate: "address materialization (ARM64_RELOC_PAGE21) at 0x34 ..."). MEASURED
-/// 2026-11-15: not [PROVED]. The step-(5) routes decline (`TRUST_GATE_TRACE=1`): the branch
-/// split "a side is outside the width walk", the division split (DIV-SPLIT-1) "the arms of a
-/// case differ": the machine's value repeats the guard (`ite(x != 0, ite(x != 0, 1000 / x,
-/// 0_tail), 0)`, the inner else the dead tail's placeholder) where the producer's is one `ite`.
-/// Flip this pin when a route proves it. At O2 trust-cg drops the dead tail: no relocation,
-/// kernel-[PROVED] by the division split as before. FAILS without the O1 subtraction or
-/// without the O2 trap-site admission. (Whether it fails with the executor decoding the tail's
-/// `adrp` is NOT RUN: the battery's raw-`Rd` mutant keeps the decode skipped; that mutant is
-/// killed by `s2a_x18_written_in_a_tail`.) The step-(5) trace above was taken on this Static
-/// fixture at O0 (both triples), not on the F1 Pic legs.
+/// O0 retains the entire unlicensed panic tail; O2's tail-free kernel proof is unchanged.
 #[test]
-fn s2a_a_dead_sited_division_tail_is_admitted_unexecuted() {
+fn s2a_a_dead_sited_division_tail_remains_unknown() {
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
         let tail = div_tail(&fx);
-        let report = assert_tail_admitted(&fx, "s21 O0");
-        let c = report.certificate("rung").unwrap();
-        assert!(
-            matches!(c.verdict, OutputVerdict::Proven { evidence: ProvenEvidence::AyValidated }),
-            "{triple}: {}",
-            explain(&report)
-        );
-        for o in [
-            &c.obligations.o0_abi,
-            &c.obligations.o1_binding,
-            &c.obligations.o2_pairing,
-            &c.obligations.o3_events,
-            &c.obligations.o4_return,
-            &c.obligations.o5_frame,
-        ] {
-            assert_eq!(o.grade, Grade::Proven, "{triple}: {}", explain(&report));
-        }
-        let o2 = &c.obligations.o2_pairing.detail;
-        assert!(
-            o2.contains(&format!("panic tails at [{:#x}..={:#x}]", tail.adrp, tail.bl + 4))
-                && o2.contains(DEAD_O2),
-            "{triple}: {o2}"
-        );
-        assert!(c.call_sites.is_empty(), "{triple}: the tail call is paired: {:?}", c.call_sites);
-
+        let report = assert_o1_location_unknown(&fx, "s21 O0");
+        let detail = &report.certificate("rung").unwrap().obligations.o1_binding.detail;
+        assert!(detail.contains(&format!("{:#x}", tail.adrp)));
+        assert!(detail.contains(&format!("{:#x}", tail.add)));
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O2);
-        let object =
-            trust_cg_bridge::compiled_object::CompiledObject::parse(&fx.object).expect("parses");
-        assert!(
-            object
-                .sections
-                .iter()
-                .all(|s| s.class != trust_cg_bridge::compiled_object::SectionClass::Code
-                    || s.relocations.is_empty()),
-            "{triple} O2: {}",
-            disassemble(&fx.object)
-        );
         assert_kernel_proved(&fx, &fx.report(), "rung");
     }
 }
 
 /// The record's identity and shape. Each mutant keeps the tail and changes one thing the
-/// admission reads; each stays Unknown at O1 on the walk's unchanged account: the `add`
+/// withdrawn admission read; each stays Unknown at O1 on the walk's unchanged account: the `add`
 /// relocated against the record's file name (`adrp` S1, `add` S2); both halves against the
 /// file name (a verified immutable global that no `Assert` names: not the Location); the
 /// `add` reading x2 (`Rd != Rn`); `add #8`; `add #0, lsl #12` (shift 1); `adrp` with `immlo =
 /// 1`; an ELF addend of 8 on either half; Mach-O: the `adrp` relocated as GOT_LOAD_PAGE21, not
 /// pc-relative, or with length 1; the `add`'s PAGEOFF12 made pc-relative or length 1; the `add`
 /// made `str x1, [x0]` (a load/store page half, shift 0, Rn the `adrp`'s Rd). The unmutated
-/// twin is admitted. (The `add` relocated GOT_LOAD_PAGEOFF12, or the `adrp` made an `add`, is
+/// twin also remains Unknown. (The `add` relocated GOT_LOAD_PAGEOFF12, or the `adrp` made an `add`, is
 /// refused whole by the reader, UnconsumedRelocation: MEASURED, not a gate cell.)
 #[test]
 fn s2a_a_pair_that_is_not_the_location_s_exact_address_stays_unknown() {
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
-        assert_tail_admitted(&fx, "twin");
+        assert_o1_location_unknown(&fx, "twin");
         let t = div_tail(&fx);
         let file = symbol_index(&fx.object, DIV_LOCATION_FILE);
         let (wa, wd) = (word_at(&fx.object, t.adrp), word_at(&fx.object, t.add));
@@ -2986,12 +2912,12 @@ fn macho_reloc_word1(o: &mut [u8], record: usize, f: impl FnOnce(u32) -> u32) {
 /// A pair against a section, not a symbol: ELF both halves against `.text`'s section symbol
 /// (trust-cg's ELF object gives the record's own section none; MEASURED); Mach-O both halves
 /// non-extern against the record's section ordinal. Each binds and stays Unknown at O1
-/// (MEASURED). The twin is admitted.
+/// (MEASURED). The twin also remains Unknown.
 #[test]
 fn s2a_a_section_relative_pair_stays_unknown() {
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
-        assert_tail_admitted(&fx, "twin");
+        assert_o1_location_unknown(&fx, "twin");
         let t = div_tail(&fx);
         let m = if triple == LINUX {
             let (section, _) = elf_section_symbol_of(&fx.object, "rung");
@@ -3019,26 +2945,15 @@ fn s2a_a_section_relative_pair_stays_unknown() {
     }
 }
 
-/// The tail's shape. The admission is the whole run or nothing, so every cell stays Unknown at
-/// O1 on the walk's unchanged account of the pair: the pair outside a tail (the `brk` made
-/// `ret`: the run is no trap tail); the halves made non-adjacent (the `add` and the `mov x0,
-/// x1` after it exchanged, the PAGEOFF12 moved with the `add`); the run's call relocated
-/// against `rung` instead of the entry; not followed by the trap (the `bl` and the `mov x0, x1`
-/// before it exchanged); a second `bl` in the run (the `mov x0, x1` made an unrelocated `bl
-/// rung`). Before the whole-run rule the three call cells passed O1 and stopped at O2. A run
-/// with no call is not built as bytes (the `mov x0, x1` made `brk #1` leaves the `bl`
-/// unreachable, and the object is refused: MEASURED); `call_event/dead_tail_tests.rs` pins the
-/// rule on the window record itself (no site, a tail jump, another callee, off the trap, two
-/// sites, two pairs). The O2 refusal of a trap-tail call outside an
-/// admitted run stays pinned by tests/f1_compile.rs
-/// `a_sited_overflow_check_is_unknown_strict_refuses_and_allow_unknown_ships`. The twin is
-/// admitted.
+/// Each historical tail-shape mutation retains the entire reader Unknown account:
+/// a non-trap end, nonadjacent halves, another callee, a call off the trap and
+/// a second call. No shape, including the unmodified twin, grants admission.
 #[test]
 fn s2a_a_tail_not_of_the_one_lowered_shape_stays_unknown() {
     const RET_X30: u32 = 0xd65f_03c0;
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
-        assert_tail_admitted(&fx, "twin");
+        assert_o1_location_unknown(&fx, "twin");
         let t = div_tail(&fx);
         let mov = word_at(&fx.object, t.bl - 4);
         assert_eq!(mov, enc_mov(0, 1), "{triple}: no `mov x0, x1` before the `bl`");
@@ -3072,14 +2987,13 @@ fn s2a_a_tail_not_of_the_one_lowered_shape_stays_unknown() {
 /// MEASURED both triples), so the gate's own condition is reached only by reading an object
 /// compiled from the immutable plain-bytes record against an `M_cg` that declares it mutable,
 /// or thread-local: the object binds (the reader checks no mutability for a plain image) and
-/// `rung` stays Unknown at O1 (MEASURED). The immutable twin is admitted (S2a reads the
-/// `M_cg` global, not a pointer-record image).
+/// `rung` stays Unknown at O1 (MEASURED). The immutable twin also remains Unknown.
 #[test]
 fn s2a_a_mutable_or_thread_local_record_is_never_admitted() {
     for triple in BOTH {
         let immutable = DivRecord::Bytes { mutable: false, tls: false };
         let twin = sited_div_fixture(true, immutable, triple, OptLevel::O0);
-        assert_tail_admitted(&twin, "immutable plain-bytes twin");
+        assert_o1_location_unknown(&twin, "immutable plain-bytes twin");
         for (what, record) in [
             ("mutable", DivRecord::Bytes { mutable: true, tls: false }),
             ("thread-local", DivRecord::Bytes { mutable: false, tls: true }),
@@ -3099,84 +3013,30 @@ fn s2a_a_mutable_or_thread_local_record_is_never_admitted() {
     }
 }
 
-/// A LIVE check (`1000 / x`, no guard): the tail is admitted at O1/O2 and the function is
-/// Unknown at (4b), "the unsited check ... can fail on a reached path" (MEASURED 2026-11-15,
-/// both triples at O0 and O2; the O0 ABI residue is structural, so not Refuted there). The
-/// tail being admitted grants nothing a live check can use, and O2 claims its deadness only
-/// conditionally (`CONDITIONAL_O2`), never as established.
+/// Live and guarded tails, including raw ADRP X18 mutations, remain unlicensed.
 #[test]
-fn s2a_a_live_sited_check_is_unknown_at_4b() {
-    for triple in BOTH {
-        for opt in [OptLevel::O0, OptLevel::O2] {
-            let fx = sited_div_fixture(false, DivRecord::Pointer, triple, opt);
-            div_tail(&fx);
-            let report = assert_tail_admitted(&fx, "live");
-            let c = report.certificate("rung").unwrap();
-            let o4 = &c.obligations.o4_return;
-            assert!(
-                o4.grade == Grade::Unknown
-                    && o4.detail.contains("can fail on a reached path")
-                    && c.obligations.o2_pairing.detail.contains(CONDITIONAL_O2)
-                    && !c.obligations.o2_pairing.detail.contains(DEAD_O2)
-                    && matches!(c.verdict, OutputVerdict::Unknown { .. }),
-                "{triple} {opt:?}: {}",
-                explain(&report)
-            );
-        }
-    }
-}
-
-/// X18 in a tail. The admitted `adrp` is not decoded; the executor reads its raw `Rd`.
-/// `adrp x18` (with `add x1, x18, #0`) in a LIVE check's tail on Darwin, where X18 is
-/// reserved, is Refuted at O0 (the residue's counterexample is the failing input). The same
-/// write in the DEAD s21 tail is sound to accept: the path into it is infeasible, so `X18 is
-/// never written` holds, and O0 is Proven (Darwin: "1 residual conjunct(s) discharged by ay";
-/// ELF, where X18 is not reserved: structural). On ELF the live tail stays Unknown at (4b).
-/// All MEASURED 2026-11-15.
-#[test]
-fn s2a_x18_written_in_a_tail() {
+fn s2a_a_live_sited_check_and_x18_tail_remain_unknown() {
     for triple in BOTH {
         for (guarded, opt) in [(false, OptLevel::O0), (false, OptLevel::O2), (true, OptLevel::O0)] {
             let fx = sited_div_fixture(guarded, DivRecord::Pointer, triple, opt);
+            assert_o1_location_unknown(&fx, "unmodified tail");
             let t = div_tail(&fx);
             let (wa, wd) = (word_at(&fx.object, t.adrp), word_at(&fx.object, t.add));
             let m = fx.patched(|o| {
                 patch_word(o, t.adrp, (wa & !0x1f) | 18);
                 patch_word(o, t.add, (wd & !(0x1f << 5)) | (18 << 5));
             });
-            let report = m.report();
-            let c = report.certificate("rung").unwrap();
-            match (triple, guarded) {
-                (DARWIN, false) => assert!(
-                    c.obligations.o0_abi.grade == Grade::Refuted
-                        && matches!(c.verdict, OutputVerdict::Refuted { .. }),
-                    "{triple} {opt:?}: live x18 tail not Refuted\n{}",
-                    explain(&report)
-                ),
-                (_, true) => {
-                    assert_tail_admitted(&m, "x18 in the dead tail");
-                    assert_eq!(c.obligations.o0_abi.grade, Grade::Proven, "{}", explain(&report));
-                }
-                _ => assert!(
-                    c.obligations.o0_abi.grade == Grade::Proven
-                        && c.obligations.o4_return.detail.contains("can fail on a reached path")
-                        && matches!(c.verdict, OutputVerdict::Unknown { .. }),
-                    "{triple} {opt:?}: {}",
-                    explain(&report)
-                ),
-            }
+            assert_o1_location_unknown(&m, "raw ADRP X18 does not supply semantics");
         }
     }
 }
 
-/// The tail reached where the IR returns: the sited check's `b.ne` (the repeated guard) made
-/// `b.eq`, so every `x != 0` runs into the tail while the IR returns `1000 / x`. O4 reach is
-/// Refuted: the admission rests on it. O2's account does not call the reached tail dead.
+/// A reached-tail mutation still cannot bypass the earlier complete O1 refusal.
 #[test]
-fn s2a_a_tail_reached_where_the_ir_returns_is_refuted() {
+fn s2a_a_tail_reached_where_the_ir_returns_remains_unlicensed() {
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
-        assert_tail_admitted(&fx, "twin");
+        assert_o1_location_unknown(&fx, "twin");
         let t = div_tail(&fx);
         let words = function_words(&fx.object, "rung");
         let into_tail: Vec<u64> = words
@@ -3184,42 +3044,21 @@ fn s2a_a_tail_reached_where_the_ir_returns_is_refuted() {
             .filter(|(at, w)| is_b(*w) && *at + u64::from((w & 0x03ff_ffff) * 4) == t.adrp)
             .map(|(at, _)| *at)
             .collect();
-        let [b] = into_tail[..] else {
-            panic!("{triple}: {into_tail:?}\n{}", disassemble(&fx.object))
-        };
+        let [b] = into_tail[..] else { panic!("{triple}: {into_tail:?}") };
         let cond = word_at(&fx.object, b - 4);
-        assert_eq!(
-            cond & 0xff00_001f,
-            0x5400_0001,
-            "{triple}: no `b.ne` before the `b` into the tail"
-        );
+        assert_eq!(cond & 0xff00_001f, 0x5400_0001);
         let m = fx.patched(|o| patch_word(o, b - 4, cond ^ 1));
-        let report = m.report();
-        let c = report.certificate("rung").unwrap();
-        assert!(
-            c.obligations.o4_return.grade == Grade::Refuted
-                && c.obligations.o2_pairing.detail.contains(CONDITIONAL_O2)
-                && !c.obligations.o2_pairing.detail.contains(DEAD_O2)
-                && matches!(c.verdict, OutputVerdict::Refuted { .. }),
-            "{triple}: {}\n{}",
-            explain(&report),
-            disassemble(&m.object)
-        );
+        assert_o1_location_unknown(&m, "reached tail");
     }
 }
 
-/// O1 sets aside ONLY the admitted pair's two lines. The s21 twin with one more reason in
-/// LIVE code (its first word made an unrelocated `bl` to the word after next, which opens no
-/// extent: "unrelocated `bl` ... is not the start of a non-preemptible local extent") keeps the
-/// tail's run untouched, so the pair is still the admitted shape, yet O1 is Unknown with the
-/// walk's whole account joined: the new line and both of the pair's lines, in the walk's
-/// order. FAILS if the subtraction drops any line but the pair's (O1 Proven with the unrelated
-/// reason silently set aside), or if it rewords or drops the pair's lines from the account.
+/// An additional live unknown retains its own line and both Location lines,
+/// word for word in the reader's order; no line is subtracted.
 #[test]
 fn s2a_another_unknown_line_keeps_o1_unknown_with_the_whole_account() {
     for triple in BOTH {
         let fx = sited_div_fixture(true, DivRecord::Pointer, triple, OptLevel::O0);
-        assert_tail_admitted(&fx, "twin");
+        assert_o1_location_unknown(&fx, "twin");
         let t = div_tail(&fx);
         let start = symbol_offset(&fx.object, "rung");
         assert!(start + 8 < t.adrp, "{triple}: the tail is not after the first two words");
@@ -3256,5 +3095,642 @@ fn s2a_another_unknown_line_keeps_o1_unknown_with_the_whole_account() {
             explain(&report),
             disassemble(&m.object)
         );
+    }
+}
+
+// ===========================================================================
+// PKG-C5c-L0: loop cut-point segments MEASURED (test-hooks only); every loop
+// stays Unknown with the spec side's reason byte for byte
+// ===========================================================================
+
+#[cfg(feature = "test-hooks")]
+mod l0 {
+    use trust_cg_bridge::call_event::{
+        CerInput, ItemOutcome, LoopOutcome, LoopRecord, Measurement, record_loop_segments,
+        verify_compiled_module,
+    };
+
+    use super::*;
+
+    /// The suffix every measured text ends with.
+    const SUFFIX: &str = "; cut-point induction not kernel-checked (fail-closed)";
+
+    fn backedge(block: u32) -> String {
+        format!("spec side: loop/backedge at bb{block} (fail-closed)")
+    }
+
+    /// One gate run on the 8 MiB gate thread, the recorder installed THERE (it is
+    /// thread-local, so installing it on the test thread would record nothing).
+    fn measured(fx: &Fixture) -> (CerReport, Vec<LoopRecord>) {
+        let (report, records) = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 << 20)
+                .spawn_scoped(scope, || {
+                    record_loop_segments(|| {
+                        verify_compiled_module(&CerInput {
+                            m_cg: &fx.m_cg,
+                            producers: &fx.producers,
+                            bodies: &fx.bodies,
+                            placements: &fx.placements,
+                            object: &fx.object,
+                            relocation_model: fx.model,
+                        })
+                    })
+                })
+                .expect("spawn the gate thread")
+                .join()
+                .expect("the gate thread panicked")
+        });
+        let report = report.unwrap_or_else(|e| {
+            panic!("{}: object refused: {e}\n{}", fx.triple, disassemble(&fx.object))
+        });
+        (report, records)
+    }
+
+    /// The one record, which must be a measurement.
+    #[track_caller]
+    fn one(fx: &Fixture, records: &[LoopRecord]) -> Measurement {
+        let [record] = records else {
+            panic!("{}: {} records, not one: {records:#?}", fx.triple, records.len())
+        };
+        assert_eq!(record.symbol, "rung");
+        match &record.outcome {
+            LoopOutcome::Measured(m) => (**m).clone(),
+            LoopOutcome::Declined(why) => {
+                panic!("{}: declined: {why}\n{}", fx.triple, disassemble(&fx.object))
+            }
+        }
+    }
+
+    /// Unknown with the spec side's backedge reason, byte for byte; strict refuses and
+    /// allow-unknown ships.
+    #[track_caller]
+    fn assert_backedge_unknown(fx: &Fixture, report: &CerReport, symbol: &str, block: u32) {
+        let c = report.certificate(symbol).expect("certificate");
+        assert!(
+            matches!(c.verdict, OutputVerdict::Unknown { .. }),
+            "{}: {symbol} is not Unknown\n{}",
+            fx.triple,
+            explain(report)
+        );
+        assert_eq!(c.obligations.o4_return.detail, backedge(block), "{}", fx.triple);
+        assert!(report.ships(EmitPolicy::StrictProvenOnly).is_err());
+        report.ships(EmitPolicy::AllowUnknown).unwrap();
+    }
+
+    fn print(fx: &Fixture, m: &Measurement) {
+        println!(
+            "{}: {} | cut {:?} live-ins {:?} pinned {:?} items {} refl {} queries {} steps {} \
+             arrivals ir {} m {} | {} ms",
+            fx.triple,
+            m.text,
+            m.cut,
+            m.live_ins,
+            m.pinned,
+            m.items.len(),
+            m.refl,
+            m.queries,
+            m.machine_steps,
+            m.ir_loop_arrivals,
+            m.machine_loop_arrivals,
+            m.ms
+        );
+    }
+
+    /// One loop rung compiled at `opt` for `triple`.
+    fn rung(r: LoopRung, triple: &str, opt: OptLevel) -> Fixture {
+        Fixture::new(loop_rung_module(r, Linkage::External), triple, opt)
+    }
+
+    /// The reported pair's (entry, loop) item counts: 27 and 48 fixed items (cover, reach,
+    /// return, frame, model and exit items), one `couple`/`step` item per live-in, and on Darwin
+    /// (X18 reserved) `entry.x18` and `x18`. MEASURED on every rung at O0 and O2.
+    fn item_counts(r: LoopRung, triple: &str) -> (usize, usize) {
+        let x18 = usize::from(triple == DARWIN);
+        let live = if r == LoopRung::S24 { 2 } else { 3 };
+        (27 + live + x18, 48 + live + x18)
+    }
+
+    /// Every item discharged, with the text naming the cut and its per-segment counts, and the
+    /// x18 and cover items present (or, off Darwin, the x18 items absent).
+    #[track_caller]
+    fn assert_discharged(fx: &Fixture, m: &Measurement, block: u32, r: LoopRung) {
+        print(fx, m);
+        assert!(m.all_discharged(), "{}: {}\n{:#?}", fx.triple, m.text, m.items);
+        assert_eq!(m.cut.map(|c| c.0), Some(block), "{}: {}", fx.triple, m.text);
+        assert!(m.text.starts_with(&format!("loop cut points: IR bb{block}")), "{}", m.text);
+        let (e, l) = item_counts(r, &fx.triple);
+        assert!(
+            m.text.contains(&format!(
+                ": entry segment {e}/{e} and loop segment {l}/{l} items discharged ("
+            )),
+            "{r:?} {}: {}",
+            fx.triple,
+            m.text
+        );
+        assert_eq!(m.items.len(), e + l, "{r:?} {}", fx.triple);
+        let named = |n: &str| m.items.iter().any(|(k, _)| k == n);
+        for n in ["cover.ir(or)", "cover.ir(and)", "cover.m(or)", "cover.m(and)", "exit.cond"] {
+            assert!(named(n), "{r:?} {}: no {n}", fx.triple);
+        }
+        let darwin = fx.triple == DARWIN;
+        assert_eq!((named("entry.x18"), named("x18")), (darwin, darwin), "{r:?} {}", fx.triple);
+        assert!(m.text.ends_with(SUFFIX), "{}", m.text);
+        assert!(m.queries > 0 && m.queries <= 256, "{}: {} queries", fx.triple, m.queries);
+        assert!(m.machine_steps <= 65_536);
+        assert!(m.pinned.is_empty(), "{}: {:?}", fx.triple, m.pinned);
+        let segs = m.segments.as_ref().expect("segments");
+        assert_eq!(segs.ir_vars.len(), m.live_ins.len());
+    }
+
+    /// PKG-C5c-L0, the O0 loop rungs: r03 (`s + (i ^ (s >> 3))`), s06 (`s += i`) and s24 (the
+    /// Collatz diamond with a 64-bit multiply), each `rung(x: u64) -> u64` compiled by trust-cg
+    /// at O0. The cut is the loop header bb1 at the bytes' one backward-branch target; every
+    /// entry-segment and loop-segment item discharges within the deterministic caps, by refl
+    /// or by ay. MEASURED: each copies `x` out of X0 (`mov x3, x0` or `mov x4, x0`) because the
+    /// loop reuses X0 as a temporary, so the live-in `%0` sits in that copy (the first
+    /// assignment tried, `%0 in X0`, fails first-fail and the copy's is reported). The reported
+    /// pair pins nothing. The grade stays Unknown with the spec side's reason byte for byte.
+    #[test]
+    fn l0_o0_loop_rungs_discharge_every_item_at_the_header() {
+        for r in LOOP_RUNGS {
+            for triple in BOTH {
+                let fx = rung(r, triple, OptLevel::O0);
+                let (report, records) = measured(&fx);
+                let m = one(&fx, &records);
+                assert_discharged(&fx, &m, 1, r);
+                assert_eq!(m.header, 1);
+                assert_eq!(m.backward_targets.len(), 1, "{}", fx.triple);
+                let want_regs: &[(u32, u8)] = match r {
+                    LoopRung::R03 => &[(1, 2), (2, 3), (0, 4)],
+                    LoopRung::S06 => &[(1, 1), (2, 2), (0, 3)],
+                    LoopRung::S24 => &[(1, 3), (2, 4)],
+                };
+                assert_eq!(m.live_ins, want_regs, "{r:?} {}", fx.triple);
+                assert_backedge_unknown(&fx, &report, "rung", 1);
+            }
+        }
+    }
+
+    /// PKG-C5c-L0, the O2 loop rungs. r03 and s24 are ROTATED (the bytes test the exit once
+    /// before the loop and again at the latch), so the cut the measurement finds is the BODY
+    /// block, not the header: r03 at bb2 and s24 at bb3 (s24's parity test), at the bytes'
+    /// one backward-branch target, every item discharged. MEASURED: these ModBuilder modules
+    /// do not reproduce the ladder's hoisted shift amount (r03's body is one
+    /// `eor x0, x1, x2, lsr #3`), so no REPORTED pair here pins a register, and no fixture
+    /// reproduces a hoisted ground-constant pin. The pinned-register path itself runs on every
+    /// O0 rung (the first pair tried, `%0 in X0`, pins the copy of `x`); its items are asserted
+    /// by `l0_machine_mutants_record_a_counterexample` (stale latch, wrong exit) and
+    /// loop_cut/tests.rs `l0_exhaustive_pairs_pin_the_pinned_path_and_the_exit_condition`.
+    #[test]
+    fn l0_o2_rotated_loops_cut_at_the_body_block() {
+        for (r, block) in [(LoopRung::R03, 2), (LoopRung::S24, 3)] {
+            for triple in BOTH {
+                let fx = rung(r, triple, OptLevel::O2);
+                let (report, records) = measured(&fx);
+                let m = one(&fx, &records);
+                assert_discharged(&fx, &m, block, r);
+                assert_eq!(m.header, 1, "{r:?}");
+                assert!(
+                    m.text.starts_with(&format!(
+                        "loop cut points: IR bb{block} (loop header bb1) at "
+                    )),
+                    "{}",
+                    m.text
+                );
+                // The header was tried first and failed: the entry reaches the body only when
+                // the loop runs at least once.
+                assert!(m.tried.first().is_some_and(|t| t.starts_with("bb1 [")), "{:?}", m.tried);
+                assert_backedge_unknown(&fx, &report, "rung", 1);
+            }
+        }
+    }
+
+    /// PKG-C5c-L0, s06 at O2: trust-cg replaced the loop by a closed form, so the bytes have
+    /// no backward branch and no cut-point method applies (PKG-C5c-L5). MEASURED here as on
+    /// the ladder.
+    #[test]
+    fn l0_s06_at_o2_has_no_machine_loop() {
+        for triple in BOTH {
+            let fx = rung(LoopRung::S06, triple, OptLevel::O2);
+            let (report, records) = measured(&fx);
+            let m = one(&fx, &records);
+            print(&fx, &m);
+            assert_eq!(
+                m.text,
+                format!(
+                    "loop cut points: IR loop header bb1: the bytes have 0 backward-branch \
+                     target(s) [], not one{SUFFIX}"
+                )
+            );
+            assert!(m.backward_targets.is_empty() && m.items.is_empty() && m.queries == 0);
+            assert_backedge_unknown(&fx, &report, "rung", 1);
+        }
+    }
+
+    /// The offset of the one word of `rung` equal to `word`.
+    #[track_caller]
+    fn the_word(fx: &Fixture, word: u32) -> u64 {
+        let hits: Vec<u64> = function_words(&fx.object, "rung")
+            .into_iter()
+            .filter(|(_, w)| *w == word)
+            .map(|(off, _)| off)
+            .collect();
+        let [off] = hits.as_slice() else {
+            panic!("{}: {word:#010x} is at {hits:x?}\n{}", fx.triple, disassemble(&fx.object))
+        };
+        *off
+    }
+
+    /// Machine mutants of s06 at O0 (`mov x3, x0; mov x2, #0; mov x1, x2; b head; head:
+    /// cmp x1, x3; b.lo body; b exit; body: add x2, x2, x1; add x0, x1, #1; mov x1, x0; b head;
+    /// exit: mov x0, x2; ret`), each found by its word(s). Each records counterexamples and
+    /// discharges no pair: the measurement is not a rubber stamp. For each, the reported pair
+    /// (its live-ins and pins) and its EXACT set of undischarged items are pinned, every one a
+    /// counterexample, so a dropped or self-compared item is caught:
+    ///
+    /// - forged step, clobbered live-in, callee-saved x19 (entry), wrong return (two) and x19
+    ///   written in the body fail only their own items on the correct assignment;
+    /// - stale latch and wrong exit are reported on the FIRST pair tried, `%0 in X0` with X3 (the
+    ///   copy of `x`) pinned to its entry-arrival value: its `step.pinned(X3)` item discharges and
+    ///   its counterexamples include the wrong assignment's own. That the wrong exit's
+    ///   `exit.cond` is a counterexample on the CORRECT assignment too is pinned in
+    ///   loop_cut/tests.rs (`l0_exhaustive_pairs_pin_the_pinned_path_and_the_exit_condition`).
+    ///
+    /// The grade is the same Unknown as the clean object's, byte for byte.
+    #[test]
+    fn l0_machine_mutants_record_a_counterexample() {
+        let correct: &[(u32, u8)] = &[(1, 1), (2, 2), (0, 3)];
+        let first: &[(u32, u8)] = &[(1, 1), (2, 2), (0, 0)];
+        let wrong_pair: &[&str] =
+            &["step(%1 in X1)", "step(%2 in X2)", "step(%0 in X0)", "exit.cond", "exit.return"];
+        // (name, [(clean word, mutant word)], reported live-ins, pinned, undischarged items)
+        let mutants: [(&str, &[(u32, u32)], &[(u32, u8)], &[u8], &[&str]); 8] = [
+            // the latch does not advance: `add x0, x1, #1` -> `add x0, x1, #0`
+            ("stale latch", &[(0x9100_0420, 0x9100_0020)], first, &[3], wrong_pair),
+            // the sum lands in x's register: `add x2, x2, x1` -> `add x3, x2, x1`
+            (
+                "clobbered live-in",
+                &[(0x8b01_0042, 0x8b01_0043)],
+                correct,
+                &[],
+                &["step(%2 in X2)", "step(%0 in X3)"],
+            ),
+            // one iteration too many: `b.lo` -> `b.ls`
+            ("wrong exit", &[(0x5400_0043, 0x5400_0049)], first, &[3], wrong_pair),
+            // the body subtracts: `add x2, x2, x1` -> `sub x2, x2, x1`
+            ("forged step", &[(0x8b01_0042, 0xcb01_0042)], correct, &[], &["step(%2 in X2)"]),
+            // the entry's `b head` -> `mov x19, x0`
+            ("callee-saved x19", &[(0x1400_0001, 0xaa00_03f3)], correct, &[], &["exit.frame(X19)"]),
+            // the exit returns i: `mov x0, x2` -> `mov x0, x1`
+            ("wrong return i", &[(0xaa02_03e0, 0xaa01_03e0)], correct, &[], &["exit.return"]),
+            // the exit returns x: `mov x0, x2` -> `mov x0, x3`
+            ("wrong return x", &[(0xaa02_03e0, 0xaa03_03e0)], correct, &[], &["exit.return"]),
+            // the body writes x19: `add x0, x1, #1; mov x1, x0` -> `add x1, x1, #1; mov x19, x0`
+            (
+                "x19 in the body",
+                &[(0x9100_0420, 0x9100_0421), (0xaa00_03e1, 0xaa00_03f3)],
+                correct,
+                &[],
+                &["step.frame(X19)"],
+            ),
+        ];
+        for triple in BOTH {
+            let clean = rung(LoopRung::S06, triple, OptLevel::O0);
+            let (clean_report, clean_records) = measured(&clean);
+            assert!(one(&clean, &clean_records).all_discharged());
+            let clean_o4 = clean_report.certificate("rung").unwrap().obligations.o4_return.clone();
+            for (name, patches, live_ins, pinned, failing) in mutants {
+                let at: Vec<(u64, u32)> =
+                    patches.iter().map(|(from, to)| (the_word(&clean, *from), *to)).collect();
+                let fx = clean.patched(|o| {
+                    for (off, to) in &at {
+                        patch_word(o, *off, *to);
+                    }
+                });
+                let (report, records) = measured(&fx);
+                let m = one(&fx, &records);
+                print(&fx, &m);
+                assert!(!m.all_discharged(), "{triple} {name}: {}", m.text);
+                assert!(
+                    m.text.contains("has a counterexample (not evidence against the bytes"),
+                    "{triple} {name}: {}",
+                    m.text
+                );
+                assert!(!m.text.contains(" items discharged ("), "{triple} {name}: {}", m.text);
+                let undischarged: Vec<&str> = m
+                    .items
+                    .iter()
+                    .filter(|(_, o)| !o.discharged())
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                println!(
+                    "{triple} {name}: live-ins {:?} pinned {:?}: {undischarged:?}",
+                    m.live_ins, m.pinned
+                );
+                assert_eq!(undischarged, failing, "{triple} {name}: {:#?}", m.items);
+                assert!(
+                    m.items
+                        .iter()
+                        .filter(|(_, o)| !o.discharged())
+                        .all(|(_, o)| *o == ItemOutcome::CounterExample),
+                    "{triple} {name}: {:#?}",
+                    m.items
+                );
+                assert_eq!(
+                    (m.live_ins.as_slice(), m.pinned.as_slice()),
+                    (live_ins, pinned),
+                    "{triple} {name}"
+                );
+                for r in pinned {
+                    let item = format!("step.pinned(X{r})");
+                    let o = m.items.iter().find(|(n, _)| *n == item).map(|i| &i.1);
+                    assert!(o.is_some_and(ItemOutcome::discharged), "{triple} {name}: {item}");
+                }
+                let c = report.certificate("rung").unwrap();
+                assert_eq!(c.obligations.o4_return, clean_o4, "{triple} {name}");
+                assert_backedge_unknown(&fx, &report, "rung", 1);
+            }
+        }
+    }
+
+    /// The recorder changes nothing the gate reports: for every loop rung at O0 and O2 the
+    /// report's JSON is byte-identical with and without it, and every O4 is the spec side's
+    /// backedge text.
+    #[test]
+    fn l0_the_recorder_leaves_the_report_byte_identical() {
+        for r in LOOP_RUNGS {
+            for opt in [OptLevel::O0, OptLevel::O2] {
+                for triple in BOTH {
+                    let fx = rung(r, triple, opt);
+                    let plain = fx.report();
+                    let (recorded, records) = measured(&fx);
+                    assert_eq!(records.len(), 1, "{r:?} {opt:?} {triple}");
+                    assert_eq!(
+                        serde_json::to_string(&plain).unwrap(),
+                        serde_json::to_string(&recorded).unwrap(),
+                        "{r:?} {opt:?} {triple}"
+                    );
+                    assert_backedge_unknown(&fx, &plain, "rung", 1);
+                }
+            }
+        }
+    }
+
+    /// The declined record of `fx`'s one function (or `symbol`).
+    #[track_caller]
+    fn declined(fx: &Fixture, symbol: &str) -> String {
+        let (_, records) = measured(fx);
+        let hits: Vec<&LoopRecord> = records.iter().filter(|r| r.symbol == symbol).collect();
+        let [record] = hits.as_slice() else { panic!("{}: {records:#?}", fx.triple) };
+        match &record.outcome {
+            LoopOutcome::Declined(why) => why.clone(),
+            LoopOutcome::Measured(m) => panic!("{}: measured: {}", fx.triple, m.text),
+        }
+    }
+
+    /// s06 with the body's add routed through a call to an external `g`.
+    fn s06_with_call() -> Module {
+        let mut mb = ModBuilder::new("loop_rung");
+        let s = mb.sig(&[Ty::U64], Some(Ty::U64));
+        let g = mb.declare("g", s);
+        mb.define("rung", s, Linkage::External, |fb| {
+            let x = fb.p(0);
+            let (head, hv) = fb.block(&[Ty::U64, Ty::U64]);
+            let (body, _) = fb.block(&[]);
+            let (exit, _) = fb.block(&[]);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.br(head, &[zero, zero]);
+            fb.switch_to(head);
+            let (i, s) = (hv[0], hv[1]);
+            let go = fb.icmp(ICmpOp::Ult, Ty::U64, i, x);
+            fb.cond_br(go, body, &[], exit, &[]);
+            fb.switch_to(body);
+            let gi = fb.call(g, &[i]);
+            let s2 = fb.bin(BinOp::Add, Ty::U64, s, gi);
+            let one = fb.konst(Ty::U64, 1);
+            let i2 = fb.bin(BinOp::Add, Ty::U64, i, one);
+            fb.br(head, &[i2, s2]);
+            fb.switch_to(exit);
+            fb.ret(s);
+        });
+        mb.finish()
+    }
+
+    /// Two nested counting loops: `for i in 0..x { for j in 0..i { s += j } }`.
+    fn nested() -> Module {
+        let mut mb = ModBuilder::new("loop_rung");
+        let s = mb.sig(&[Ty::U64], Some(Ty::U64));
+        mb.define("rung", s, Linkage::External, |fb| {
+            let x = fb.p(0);
+            let (outer, ov) = fb.block(&[Ty::U64, Ty::U64]);
+            let (inner, iv) = fb.block(&[Ty::U64, Ty::U64, Ty::U64]);
+            let (body, _) = fb.block(&[]);
+            let (next, _) = fb.block(&[]);
+            let (exit, _) = fb.block(&[]);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.br(outer, &[zero, zero]);
+            fb.switch_to(outer);
+            let go = fb.icmp(ICmpOp::Ult, Ty::U64, ov[0], x);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.cond_br(go, inner, &[ov[0], zero, ov[1]], exit, &[]);
+            fb.switch_to(inner);
+            let more = fb.icmp(ICmpOp::Ult, Ty::U64, iv[1], iv[0]);
+            fb.cond_br(more, body, &[], next, &[]);
+            fb.switch_to(body);
+            let s2 = fb.bin(BinOp::Add, Ty::U64, iv[2], iv[1]);
+            let one = fb.konst(Ty::U64, 1);
+            let j2 = fb.bin(BinOp::Add, Ty::U64, iv[1], one);
+            fb.br(inner, &[iv[0], j2, s2]);
+            fb.switch_to(next);
+            let one = fb.konst(Ty::U64, 1);
+            let i2 = fb.bin(BinOp::Add, Ty::U64, iv[0], one);
+            fb.br(outer, &[i2, iv[2]]);
+            fb.switch_to(exit);
+            fb.ret(ov[1]);
+        });
+        mb.finish()
+    }
+
+    /// s06 over `u32`.
+    fn s06_u32() -> Module {
+        let mut mb = ModBuilder::new("loop_rung");
+        let s = mb.sig(&[Ty::U32], Some(Ty::U32));
+        mb.define("rung", s, Linkage::External, |fb| {
+            let x = fb.p(0);
+            let (head, hv) = fb.block(&[Ty::U32, Ty::U32]);
+            let (body, _) = fb.block(&[]);
+            let (exit, _) = fb.block(&[]);
+            let zero = fb.konst(Ty::U32, 0);
+            fb.br(head, &[zero, zero]);
+            fb.switch_to(head);
+            let go = fb.icmp(ICmpOp::Ult, Ty::U32, hv[0], x);
+            fb.cond_br(go, body, &[], exit, &[]);
+            fb.switch_to(body);
+            let s2 = fb.bin(BinOp::Add, Ty::U32, hv[1], hv[0]);
+            let one = fb.konst(Ty::U32, 1);
+            let i2 = fb.bin(BinOp::Add, Ty::U32, hv[0], one);
+            fb.br(head, &[i2, s2]);
+            fb.switch_to(exit);
+            fb.ret(hv[1]);
+        });
+        mb.finish()
+    }
+
+    /// s06 whose body carries an unsited check `i != 7` (the producer's shape; the codegen
+    /// twin has none).
+    fn s06_checked(check: bool) -> Module {
+        let mut mb = ModBuilder::new("loop_rung");
+        let s = mb.sig(&[Ty::U64], Some(Ty::U64));
+        mb.define("rung", s, Linkage::External, |fb| {
+            let x = fb.p(0);
+            let (head, hv) = fb.block(&[Ty::U64, Ty::U64]);
+            let (body, _) = fb.block(&[]);
+            let (exit, _) = fb.block(&[]);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.br(head, &[zero, zero]);
+            fb.switch_to(head);
+            let (i, s) = (hv[0], hv[1]);
+            let go = fb.icmp(ICmpOp::Ult, Ty::U64, i, x);
+            fb.cond_br(go, body, &[], exit, &[]);
+            fb.switch_to(body);
+            if check {
+                let seven = fb.konst(Ty::U64, 7);
+                let ok = fb.icmp(ICmpOp::Ne, Ty::U64, i, seven);
+                fb.push_inst_void(Inst::Assert {
+                    cond: ok,
+                    kind: trust_ir::AssertKind::DivByZero,
+                    site: None,
+                });
+            }
+            let s2 = fb.bin(BinOp::Add, Ty::U64, s, i);
+            let one = fb.konst(Ty::U64, 1);
+            let i2 = fb.bin(BinOp::Add, Ty::U64, i, one);
+            fb.br(head, &[i2, s2]);
+            fb.switch_to(exit);
+            fb.ret(s);
+        });
+        mb.finish()
+    }
+
+    /// Outside L0's fragment the record is a decline naming why, and the grade is unchanged:
+    /// a call in the loop, two nested loops, 32-bit values, and an unsited check in the loop
+    /// (the producer body against its check-free twin's bytes).
+    #[test]
+    fn l0_out_of_fragment_loops_are_declined() {
+        for triple in BOTH {
+            let fx = Fixture::new(s06_with_call(), triple, OptLevel::O0);
+            let why = declined(&fx, "rung");
+            assert!(why.starts_with("call-free: "), "{triple}: {why}");
+            assert_backedge_unknown(&fx, &fx.report(), "rung", 1);
+
+            let fx = Fixture::new(nested(), triple, OptLevel::O0);
+            let why = declined(&fx, "rung");
+            assert_eq!(why, "headers: 2 loop header(s), not one", "{triple}");
+            // The spec side meets the inner loop's backedge first.
+            assert_backedge_unknown(&fx, &fx.report(), "rung", 2);
+
+            let fx = Fixture::new(s06_u32(), triple, OptLevel::O0);
+            let why = declined(&fx, "rung");
+            assert_eq!(why, "width: the result is not a 64-bit X0 scalar", "{triple}");
+            assert_backedge_unknown(&fx, &fx.report(), "rung", 1);
+
+            let object = Fixture::new(s06_checked(false), triple, OptLevel::O0).object;
+            let fx = Fixture::with_object(s06_checked(true), object, triple);
+            let why = declined(&fx, "rung");
+            // bb1 and bb2: the check is in the loop segment (`shape_guard`'s `checks:`); bb3, the
+            // exit, cuts no cycle, so its entry segment meets the backedge.
+            let checks = "checks: the loop segment has side conditions, checks, events, results \
+                          or memory accesses (0, 1, 0, 0, 0)";
+            assert_eq!(
+                why,
+                format!(
+                    "segments: no candidate cut block yields both segments: bb1: {checks}; bb2: \
+                     {checks}; bb3: loop/backedge at bb1 (fail-closed)"
+                ),
+                "{triple}"
+            );
+            assert_backedge_unknown(&fx, &fx.report(), "rung", 1);
+        }
+    }
+
+    /// Straight-line functions around two loop functions (s24's and r03's bodies) in ONE
+    /// module, graded on one gate thread: the report's JSON is byte-identical with the recorder
+    /// installed and without it, and a plain run on the SAME thread after the recorded one is
+    /// byte-identical too, so nothing the recorder's ay queries or machine runs leave behind
+    /// reaches a later function's grade. Both loops are measured; both stay Unknown with the
+    /// spec side's backedge reason.
+    #[test]
+    fn l0_the_recorder_leaves_a_mixed_module_byte_identical() {
+        fn mixed() -> Module {
+            let mut mb = ModBuilder::new("mixed");
+            let s = mb.sig(&[Ty::U64], Some(Ty::U64));
+            mb.define("a_inc", s, Linkage::External, |fb| {
+                let x = fb.p(0);
+                let one = fb.konst(Ty::U64, 1);
+                let r = fb.bin(BinOp::Add, Ty::U64, x, one);
+                fb.ret(r);
+            });
+            mb.define("m_rung", s, Linkage::External, |fb| loop_rung_body(LoopRung::S24, fb));
+            mb.define("n_mid", s, Linkage::External, |fb| {
+                let x = fb.p(0);
+                let three = fb.konst(Ty::U64, 3);
+                let m = fb.bin(BinOp::Mul, Ty::U64, x, three);
+                let one = fb.konst(Ty::U64, 1);
+                let r = fb.bin(BinOp::Add, Ty::U64, m, one);
+                fb.ret(r);
+            });
+            mb.define("r_rung", s, Linkage::External, |fb| loop_rung_body(LoopRung::R03, fb));
+            mb.define("z_xor", s, Linkage::External, |fb| {
+                let x = fb.p(0);
+                let three = fb.konst(Ty::U64, 3);
+                let sh = fb.bin(BinOp::LShr, Ty::U64, x, three);
+                let r = fb.bin(BinOp::Xor, Ty::U64, x, sh);
+                fb.ret(r);
+            });
+            mb.finish()
+        }
+        let json = |r: &CerReport| serde_json::to_string(r).unwrap();
+        for opt in [OptLevel::O0, OptLevel::O2] {
+            for triple in BOTH {
+                let fx = Fixture::new(mixed(), triple, opt);
+                let plain = fx.report();
+                let input = CerInput {
+                    m_cg: &fx.m_cg,
+                    producers: &fx.producers,
+                    bodies: &fx.bodies,
+                    placements: &fx.placements,
+                    object: &fx.object,
+                    relocation_model: fx.model,
+                };
+                let (recorded, records, after) = std::thread::scope(|scope| {
+                    std::thread::Builder::new()
+                        .stack_size(8 << 20)
+                        .spawn_scoped(scope, || {
+                            let (recorded, records) =
+                                record_loop_segments(|| verify_compiled_module(&input));
+                            (recorded, records, verify_compiled_module(&input))
+                        })
+                        .expect("spawn the gate thread")
+                        .join()
+                        .expect("the gate thread panicked")
+                });
+                let (recorded, after) = (recorded.unwrap(), after.unwrap());
+                let symbols: Vec<&str> = records.iter().map(|r| r.symbol.as_str()).collect();
+                assert_eq!(symbols, ["m_rung", "r_rung"], "{triple} {opt:?}");
+                assert!(
+                    records.iter().all(|r| matches!(r.outcome, LoopOutcome::Measured(_))),
+                    "{triple} {opt:?}: {records:#?}"
+                );
+                assert_eq!(json(&plain), json(&recorded), "{triple} {opt:?}");
+                assert_eq!(json(&plain), json(&after), "{triple} {opt:?} (plain after recorded)");
+                assert_backedge_unknown(&fx, &plain, "m_rung", 1);
+                assert_backedge_unknown(&fx, &plain, "r_rung", 1);
+                for sym in ["a_inc", "n_mid", "z_xor"] {
+                    let c = plain.certificate(sym).expect("certificate");
+                    println!("{triple} {opt:?} {sym}: {:?}", c.verdict);
+                }
+            }
+        }
     }
 }

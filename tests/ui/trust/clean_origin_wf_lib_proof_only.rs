@@ -40,7 +40,7 @@ mod proofs {
         theorem u64_ge_self : forall (x : UInt64), Nat.le (UInt64.toNat x) (cnt 0 (UInt64.toNat x)) := by
           intro x
           rw [cnt_zero]
-          exact Nat.le.refl _
+          exact @Nat.le.refl _
     }
 }
 

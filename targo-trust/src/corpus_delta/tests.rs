@@ -17,6 +17,10 @@ use super::run::{CaseExit, CaseRunner, CaseSpec};
 use super::{CaseRecord, FlipKind, Pin, RankFn, Verdict, compare_with, gate_args, rank, table};
 use crate::durable_io;
 
+/// What a row asks beyond an exit status (a text in the output, a `conditional`
+/// pin, a dependency), the three corpora that ask it, and their scripts.
+mod cases;
+
 /// The fixture checkout's HEAD, as the probe reports it.
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// The sweep file the `*-one` compilers single out.
@@ -1251,10 +1255,11 @@ fn checkout() -> PathBuf {
 fn the_checked_in_table_loads() {
     let table = table::load(&checkout()).unwrap();
     let ids: Vec<&str> = table.corpora.iter().map(|corpus| corpus.id.as_str()).collect();
-    assert_eq!(ids, ["sweep", "battery", "idiomatic"]);
+    assert_eq!(ids, ["sweep", "battery", "idiomatic", "bench", "probes", "ladder"]);
     let absent: Vec<&str> = table.not_on_yet.iter().map(|absent| absent.id.as_str()).collect();
-    assert_eq!(absent, ["bench", "probes", "ladder"]);
-    for corpus in &table.corpora {
+    assert!(absent.is_empty(), "all six daily-driver corpora are rows: {absent:?}");
+    // The first three, as they were; `cases` has the three that joined them.
+    for corpus in &table.corpora[..3] {
         assert!(!corpus.cases.is_empty());
         for case in &corpus.cases {
             let pin = match (corpus.id.as_str(), case.id.as_str()) {

@@ -63,12 +63,18 @@ mod examples_cli;
 mod exploit_find;
 mod external_checker;
 mod gap;
+// A gate verb's arguments: `--name value`, `--name=value`, bare flags.
+mod gate_args;
 mod hardened_lab;
 mod init;
 mod input_limits;
 mod intent;
+// The landing gate's validation rows, selected by a change: `targo trust land --check`.
+mod land;
 mod lean_build;
 mod lean_cli;
+// One child of a gate verb: bounded, no stdin, its output in a log.
+mod logged_child;
 mod meter;
 mod obligations;
 mod package_record;
@@ -83,6 +89,7 @@ mod repo_cli;
 mod report;
 mod report_query;
 mod rewrite_loop;
+mod rival_bench;
 mod rust_vs_trust;
 mod saved_report;
 mod script_cli;
@@ -99,10 +106,12 @@ mod stability;
 mod stage2_tools;
 mod store_cli;
 mod temporal_cli;
+mod test_results;
 mod test_target_panics;
 mod trust_added;
 mod types;
 mod verify_binary_evidence;
+mod verify_cost;
 mod verify_examples_cli;
 
 // Process environment is shared by Rust's parallel test threads. Every
@@ -528,6 +537,9 @@ fn run_main() -> ExitCode {
         // Live-edit-loop step 2 (DELTA): the rows that changed since a
         // snapshot token, read from the records a check already wrote.
         Some("delta") => agent_delta::run_subcommand(&args[start + 1..]),
+        // Live-edit-loop step 4 (PKG-LIVE-4), first slice: the row table's
+        // validation rows, selected by a change and run. Not the landing.
+        Some(land::SUBCOMMAND) => land::run_subcommand(&args[start + 1..]),
         Some("init") => run_init_subcommand(&args[start + 1..]),
         Some("temporal") => temporal_cli::run_temporal_subcommand(&args[start + 1..]),
         Some("solvers") => run_subcommand(Subcommand::Solvers, &args[start + 1..]),
@@ -14508,6 +14520,60 @@ fn rewrite_request_error(
     None
 }
 
+/// The changed-only view's flags a request names (`--since`, `--all-rows`),
+/// spelled for a message, and whether they are more than one.
+fn delta_flags_named(request: &agent_delta::DeltaRequest) -> Option<(&'static str, bool)> {
+    match (request.since.is_some(), request.all_rows) {
+        (true, true) => Some(("--since and --all-rows", true)),
+        (true, false) => Some(("--since", false)),
+        (false, true) => Some(("--all-rows", false)),
+        (false, false) => None,
+    }
+}
+
+/// `--since` and `--all-rows` print the changed-only view, which a crate-mode
+/// `check` builds from the obligation records it writes (`pipeline::run`).
+/// A standalone audit, the rewrite loop and a check of a single `.rs` file
+/// write no obligation records, so a `check` in one of those modes refuses the
+/// flags rather than drop them without a word.
+fn delta_request_error(
+    request: &agent_delta::DeltaRequest,
+    sub_args: &SubcommandArgs,
+) -> Option<String> {
+    let (flags, plural) = delta_flags_named(request)?;
+    let (mode, what) = if sub_args.standalone {
+        ("--standalone", "a standalone audit")
+    } else if sub_args.rewrite {
+        ("--rewrite", "the rewrite loop")
+    } else if sub_args.is_single_file {
+        ("a single `.rs` file", "a single-file check")
+    } else {
+        return None;
+    };
+    let verb = if plural { "do" } else { "does" };
+    Some(format!(
+        "{flags} {verb} not combine with {mode}: {what} writes no obligation records and \
+         prints no changed-only view"
+    ))
+}
+
+/// A focused check prints that function's rows, not the changed-only view
+/// (`run_compiler` gets no delta request with `--function`), so it names the
+/// view's flags it ignores rather than drop them without a word.
+fn focused_delta_note(function: &str, request: &agent_delta::DeltaRequest) -> Option<String> {
+    let (_, plural) = delta_flags_named(request)?;
+    let flags = match request.since.as_deref() {
+        Some(token) if request.all_rows => format!("--since {token} and --all-rows"),
+        Some(token) => format!("--since {token}"),
+        None => "--all-rows".to_string(),
+    };
+    let verb = if plural { "are" } else { "is" };
+    Some(format!(
+        "{flags} {verb} ignored with --function `{function}`: a focused check prints that \
+         function's rows, not the changed-only view"
+    ))
+}
+
 fn is_exact_unsafe_memory_report_command(subcommand: Subcommand, args: &[String]) -> bool {
     subcommand == Subcommand::Report
         && args.len() == 1
@@ -14704,12 +14770,13 @@ pub(crate) fn run_subcommand_with_diagnostics(
         print_usage_stdout();
         return ExitCode::SUCCESS;
     }
-    // Live-edit-loop step 2 (DELTA): an agent's own `check` (no in-process
-    // consumer reading the run, the report on stdout) snapshots its records
-    // and prints what changed since the base; `--since` and `--all-rows` are
-    // its options, never Cargo's.
+    // Live-edit-loop step 2 (DELTA): an agent's own `check` or `test` (no
+    // in-process consumer reading the run, the report on stdout) snapshots its
+    // records (a test run's with each case's outcome, `test_results`) and
+    // prints what changed since the base; `--since` and `--all-rows` are its
+    // options, never Cargo's.
     let delta_args;
-    let (args, agent_delta) = if subcommand == Subcommand::Check
+    let (args, agent_delta) = if matches!(subcommand, Subcommand::Check | Subcommand::Test)
         && live_report_consumer.is_none()
         && render_output == pipeline::run::ReportRendering::Stdout
     {
@@ -14779,6 +14846,15 @@ pub(crate) fn run_subcommand_with_diagnostics(
             "targo trust: --save-baseline is a plain `check` option: it records a whole verified \
              run, so it does not combine with another subcommand, --standalone, --rewrite or \
              --function"
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(error) =
+        agent_delta.as_ref().and_then(|request| delta_request_error(request, &sub_args))
+    {
+        pipeline::run::report_setup_failure(
+            &mut diagnostic_observer,
+            format_args!("targo trust: {error}"),
         );
         return ExitCode::from(2);
     }
@@ -15110,15 +15186,11 @@ pub(crate) fn run_subcommand_with_diagnostics(
             || save_baseline.is_some();
         let has_diagnostic_observer = diagnostic_observer.is_some();
         // A focused check prints that function's rows, not the changed-only
-        // view: say so rather than drop `--since` silently.
-        if let (Some(function), Some(token)) = (
-            focused_function.as_deref(),
-            agent_delta.as_ref().and_then(|request| request.since.as_deref()),
+        // view: say so rather than drop `--since` or `--all-rows` silently.
+        if let Some(note) = focused_function.as_deref().zip(agent_delta.as_ref()).and_then(
+            |(function, request)| focused_delta_note(function, request),
         ) {
-            eprintln!(
-                "targo trust: note: --since {token} is ignored with --function `{function}`: a \
-                 focused check prints that function's rows, not the changed-only view"
-            );
+            eprintln!("targo trust: note: {note}");
         }
         let exit_code = {
             let mut dispatch_diagnostics = |batch: &pipeline::run::CompilerRunDiagnostics| {
@@ -15905,5 +15977,78 @@ lto = true
         .expect_err("malformed safety policy must fail closed");
         assert!(out.is_empty());
         assert!(error.contains("could not parse safety-check profile"), "{error}");
+    }
+
+    /// `--since` and `--all-rows` are refused on each `check` mode that
+    /// writes no obligation records (and so prints no changed-only view), and
+    /// pass on a crate-mode check, with or without a view flag.
+    #[test]
+    fn the_changed_only_view_flags_are_refused_where_no_view_prints() {
+        let parse = |args: &[&str]| {
+            let mut owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            let request = agent_delta::DeltaRequest::take_from(&mut owned).expect("view flags");
+            (request, parse_subcommand_args(&owned).expect("check arguments"))
+        };
+        let since = "0123456789abcdef";
+        for (args, expected) in [
+            (
+                vec!["--standalone", "--since", since],
+                "--since does not combine with --standalone: a standalone audit writes no \
+                 obligation records and prints no changed-only view",
+            ),
+            (
+                vec!["--rewrite", "--all-rows"],
+                "--all-rows does not combine with --rewrite: the rewrite loop writes no \
+                 obligation records and prints no changed-only view",
+            ),
+            (
+                vec!["src/lib.rs", "--since", since, "--all-rows"],
+                "--since and --all-rows do not combine with a single `.rs` file: a single-file \
+                 check writes no obligation records and prints no changed-only view",
+            ),
+        ] {
+            let (request, sub_args) = parse(&args);
+            assert_eq!(
+                delta_request_error(&request, &sub_args).as_deref(),
+                Some(expected),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["--lib", "--since", since, "--all-rows"],
+            vec!["--standalone"],
+            vec!["--rewrite"],
+            vec!["src/lib.rs"],
+        ] {
+            let (request, sub_args) = parse(&args);
+            assert_eq!(delta_request_error(&request, &sub_args), None, "{args:?}");
+        }
+    }
+
+    /// A focused check names each view flag it ignores, `--all-rows` as well
+    /// as `--since`, and says nothing when neither was given.
+    #[test]
+    fn a_focused_check_names_every_view_flag_it_ignores() {
+        let request = |since: Option<&str>, all_rows: bool| agent_delta::DeltaRequest {
+            since: since.map(str::to_string),
+            all_rows,
+        };
+        let since = "0123456789abcdef";
+        let tail = "a focused check prints that function's rows, not the changed-only view";
+        assert_eq!(
+            focused_delta_note("midpoint", &request(Some(since), false)),
+            Some(format!("--since {since} is ignored with --function `midpoint`: {tail}"))
+        );
+        assert_eq!(
+            focused_delta_note("midpoint", &request(None, true)),
+            Some(format!("--all-rows is ignored with --function `midpoint`: {tail}"))
+        );
+        assert_eq!(
+            focused_delta_note("midpoint", &request(Some(since), true)),
+            Some(format!(
+                "--since {since} and --all-rows are ignored with --function `midpoint`: {tail}"
+            ))
+        );
+        assert_eq!(focused_delta_note("midpoint", &request(None, false)), None);
     }
 }

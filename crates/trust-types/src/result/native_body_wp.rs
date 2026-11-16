@@ -26,6 +26,11 @@ struct Statement {
     module_digest: NativeDigest,
     source_digest: NativeDigest,
     results: Vec<ResultIdentity>,
+    // This structural publication reader grants no authority from diagnostic
+    // witness data. The native verifier independently checks its typed schema
+    // and correspondence before minting the compiler's private proof fact.
+    #[serde(default, rename = "translation_witness")]
+    _translation_witness: Option<IgnoredAny>,
 }
 
 // Only the selected identity is interpreted here. The native engine owns the
@@ -279,7 +284,7 @@ fn native_statement_defect(
     // Decode the complete self-describing transport through the same IR-owned
     // codec as the producer. Replay atoms may reference module formulas; the
     // codec restores only exact references and verifies their payload digests.
-    let mut scoped =
+    let original =
         match trust_ir::request::transport::rehydrate_native_bundle_transport_payload(&bundle) {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -289,16 +294,16 @@ fn native_statement_defect(
             }
         };
     // Bundle::stable_digest represents the module by its recorded digest. Bind
-    // that field to the actual module before it can authorize a scoped input.
+    // that field to the actual module before it can bind the full input.
     // Use the writer's own refusal check before its infallible digest, as native
     // bundle validation does; a producer-internal type has no wire identity.
-    if !scoped.module.wire_image_refusals().is_empty() {
+    if !original.module.wire_image_refusals().is_empty() {
         return Some("modern body-WP native module has no wire identity".into());
     }
-    if scoped.module.stable_digest() != scoped.trust_ir_module_digest {
+    if original.module.stable_digest() != original.trust_ir_module_digest {
         return Some("modern body-WP native module differs from its recorded digest".into());
     }
-    let Ok(bundle) = serde_json::to_value(&scoped) else {
+    let Ok(bundle) = serde_json::to_value(&original) else {
         return Some("modern body-WP native input identity could not be encoded".into());
     };
     let Ok(certificate_request) = serde_json::to_value(&statement.request) else {
@@ -360,21 +365,17 @@ fn native_statement_defect(
     }
     // The v2 producer binds the complete canonical native-input identity, not
     // just its displayed module name and request number. Use the same owner
-    // and exact request scoping as native TrustWP; a digest-shaped suffix is
-    // insufficient. This recomputes identity only, never admission or replay.
-    scoped.requests.retain(|request| {
-        matches!(request, trust_ir::request::NativeVerificationRequest::TrustWp(wp)
-            if wp.id.index() == statement.request.id)
-    });
-    if scoped.requests.len() != 1 {
-        return Some("modern body-WP native input does not select exactly one WP request".into());
-    }
-    let input = scoped.stable_digest();
+    // and complete original input as native TrustWP; work selection above
+    // must not prune unselected requests from its identity. A digest-shaped
+    // suffix is insufficient. This checks identity, never admission or replay.
+    let input = original.stable_digest();
     if input.algorithm != trust_ir::proof::ProofDigestAlgorithm::Sha256
         || statement.results[0].bundle_id
             != native_body_wp_bundle_id(&module_name, statement.request.id, &input.bytes)
     {
-        return Some("modern body-WP result does not bind the original scoped native input".into());
+        return Some(
+            "modern body-WP result does not bind the complete original native input".into(),
+        );
     }
     None
 }

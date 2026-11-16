@@ -2289,6 +2289,15 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 if tcx.sess.opts.unstable_opts.meta_stats {
                     self.trust_ir_mir_bytes.push((def_id, self.position() - trust_mir_start));
                 }
+                // Trust: PKG-C5d — the same body's `mentioned_items`, spans dropped and
+                // nothing filtered, so `trust_mentioned_items` reads back exactly that
+                // field (see the table's comment in `rmeta/mod.rs`).
+                if let Some(items) = &tcx.optimized_mir(def_id).mentioned_items {
+                    self.table_writer().trust_mentioned_items(
+                        def_id,
+                        items.iter().map(|item| item.node).collect::<Vec<_>>(),
+                    );
+                }
 
                 self.table_writer()
                     .cross_crate_inlinable(def_id, tcx.cross_crate_inlinable(def_id));
@@ -2367,9 +2376,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         }
     }
 
-    // Trust: step 2 increment 6 (6.2) — one opaque trust-ir entry per definition rustc
-    // encodes `optimized_mir` for and the producer encoded, and the crate header naming why
-    // every other one carries none. Nothing when the producer did not run: no row, no header.
+    // Trust: one opaque entry per retained producer definition, independent of
+    // optimized-MIR export. Preserve the legacy optimized-MIR refusal inventory
+    // as well, so widening transport never erases a previous denominator. Nothing when the producer did not run: no row, no header.
     // Called only when `Session::trust_ir_lower_enabled` (see the call site). A proc-macro
     // crate built with the producer writes its header too (its crate-wide refusal, no row), so
     // the header a consumer reads is the one the local `trust_ir_crate_header` reports and a
@@ -3292,9 +3301,10 @@ fn encode_crate_hash(mut file: &File, hash: Svh) -> Result<(), std::io::Error> {
 }
 
 // Trust: step 2 increment 6 (6.2) — the local crate's trust-ir header and entry rows, over
-// exactly the definitions `should_encode_mir` encodes `optimized_mir` for (design §2.1: the
-// set mirrors rustc's). One function for the encoder and the local `trust_ir_crate_header`
-// provider, so the header a consumer reads and the one this crate reports cannot differ.
+// the complete retained producer inventory plus the legacy optimized-MIR refusal
+// inventory. A non-inline Rust body needs its entry even though Rust exports no
+// optimized MIR for it. Transport expands; all producer validation/refusals remain.
+// One function serves the encoder and local header provider, so they cannot differ.
 fn trust_ir_rows<'a>(
     tcx: TyCtxt<'_>,
     local: &'a TrustIrLocalEntries,
@@ -3312,11 +3322,17 @@ fn trust_ir_rows<'a>(
     }
     let reachable_set = tcx.reachable_set(());
     let clean_origin_defs = &tcx.resolutions(()).clean_origin_defs[..];
-    for &def_id in tcx.mir_keys(()) {
-        if !should_encode_mir(tcx, reachable_set, clean_origin_defs, def_id).1 {
-            continue;
-        }
-        let def_index = def_id.local_def_index.as_u32();
+    let mut definitions: std::collections::BTreeSet<u32> = tcx.mir_keys(())
+        .iter()
+        .copied()
+        .filter(|&def| should_encode_mir(tcx, reachable_set, clean_origin_defs, def).1)
+        .map(|def| def.local_def_index.as_u32())
+        .collect();
+    definitions.extend(local.entries.keys().copied());
+    for def_index in definitions {
+        let def_id = LocalDefId {
+            local_def_index: rustc_hir::def_id::DefIndex::from_u32(def_index),
+        };
         match local.entries.get(&def_index) {
             Some(Ok(blob)) => rows.push((def_id, blob)),
             Some(Err(reason)) => {

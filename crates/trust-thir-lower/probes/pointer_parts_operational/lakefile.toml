@@ -1,0 +1,12 @@
+name = "pointerPartsOperational"
+defaultTargets = ["PointerPartsOperational"]
+
+[leanOptions]
+autoImplicit = false
+
+[[require]]
+name = "trust_irSemantics"
+path = "../../../../first-party/trust-ir/lean/trust_ir-semantics"
+
+[[lean_lib]]
+name = "PointerPartsOperational"

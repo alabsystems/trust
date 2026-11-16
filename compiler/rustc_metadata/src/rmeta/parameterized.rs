@@ -176,6 +176,8 @@ parameterized_over_tcx! {
     rustc_middle::middle::exported_symbols::ExportedSymbol,
     rustc_middle::mir::Body,
     rustc_middle::mir::CoroutineLayout,
+    // Trust: PKG-C5d `trust_mentioned_items` table row.
+    rustc_middle::mir::MentionedItem,
     rustc_middle::mir::interpret::ConstAllocation,
     rustc_middle::mir::trust_contract::TrustContract,
     rustc_middle::mir::trust_contract::TrustContractBundle,
@@ -302,6 +304,8 @@ lazy_encode_from! {
     std::option::Option<rustc_middle::ty::EarlyBinder<'static, rustc_middle::ty::Const<'static>>>,
     std::string::String,
     std::vec::Vec<(usize, rustc_index::bit_set::DenseBitSet<u32>)>,
+    // Trust: PKG-C5d `trust_mentioned_items` table row (table_writer API).
+    std::vec::Vec<rustc_middle::mir::MentionedItem<'static>>,
     // Trust: `trust_clean_verdict_digest` table row (table_writer API, fe2b43dd2127).
     std::vec::Vec<u8>,
     // tidy-alphabetical-end

@@ -537,6 +537,8 @@ fn a_tampered_entry_is_refused_by_its_digest_magic_schema_or_version() {
     assert_eq!(decode_entry(&bad).unwrap_err(), EntryDecodeError::Schema(3));
     bad[8..12].copy_from_slice(&4u32.to_le_bytes());
     assert_eq!(decode_entry(&bad).unwrap_err(), EntryDecodeError::Schema(4));
+    bad[8..12].copy_from_slice(&5u32.to_le_bytes());
+    assert_eq!(decode_entry(&bad).unwrap_err(), EntryDecodeError::Schema(5));
     let mut bad = good.clone();
     bad[12..16].copy_from_slice(&(trust_ir::binary::VERSION + 1).to_le_bytes());
     assert!(matches!(decode_entry(&bad), Err(EntryDecodeError::TrustIrVersion { .. })));
@@ -1412,59 +1414,110 @@ fn evidence_exact_store_arguments_roundtrip_and_reject_malformed_facts() {
 
 struct ExactAbiNames(crate::calling_convention::FunctionAbi);
 impl EntryNames for ExactAbiNames {
-    fn body_symbol(&self) -> Result<String, String> { names().body_symbol() }
-    fn body_abi(&self) -> crate::calling_convention::FunctionAbi { self.0 }
-    fn body_requires_caller_location(&self) -> bool { false }
+    fn body_symbol(&self) -> Result<String, String> {
+        names().body_symbol()
+    }
+    fn body_abi(&self) -> crate::calling_convention::FunctionAbi {
+        self.0
+    }
+    fn body_requires_caller_location(&self) -> bool {
+        false
+    }
     fn callee_symbol(&self, k: usize, c: &CalleeRef) -> Result<String, CalleeNameRefusal> {
         names().callee_symbol(k, c)
     }
-    fn static_symbol(&self, d: DefId) -> Result<String, String> { names().static_symbol(d) }
-    fn file_name(&self, p: &str) -> Result<String, String> { names().file_name(p) }
-    fn target_info(&self) -> trust_ir::TargetInfo { names().target_info() }
+    fn static_symbol(&self, d: DefId) -> Result<String, String> {
+        names().static_symbol(d)
+    }
+    fn file_name(&self, p: &str) -> Result<String, String> {
+        names().file_name(p)
+    }
+    fn target_info(&self) -> trust_ir::TargetInfo {
+        names().target_info()
+    }
 }
 
 struct ForeignPrototypeNames(FuncTy);
 impl EntryNames for ForeignPrototypeNames {
-    fn body_symbol(&self) -> Result<String, String> { names().body_symbol() }
-    fn body_abi(&self) -> crate::calling_convention::FunctionAbi { crate::calling_convention::FunctionAbi::RUST }
-    fn body_requires_caller_location(&self) -> bool { false }
+    fn body_symbol(&self) -> Result<String, String> {
+        names().body_symbol()
+    }
+    fn body_abi(&self) -> crate::calling_convention::FunctionAbi {
+        crate::calling_convention::FunctionAbi::RUST
+    }
+    fn body_requires_caller_location(&self) -> bool {
+        false
+    }
     fn callee_symbol(&self, k: usize, c: &CalleeRef) -> Result<String, CalleeNameRefusal> {
         names().callee_symbol(k, c)
     }
-    fn foreign_signature(&self, _: &CalleeRef) -> Option<FuncTy> { Some(self.0.clone()) }
-    fn static_symbol(&self, d: DefId) -> Result<String, String> { names().static_symbol(d) }
-    fn file_name(&self, p: &str) -> Result<String, String> { names().file_name(p) }
-    fn target_info(&self) -> trust_ir::TargetInfo { names().target_info() }
+    fn foreign_signature(&self, _: &CalleeRef) -> Option<FuncTy> {
+        Some(self.0.clone())
+    }
+    fn static_symbol(&self, d: DefId) -> Result<String, String> {
+        names().static_symbol(d)
+    }
+    fn file_name(&self, p: &str) -> Result<String, String> {
+        names().file_name(p)
+    }
+    fn target_info(&self) -> trust_ir::TargetInfo {
+        names().target_info()
+    }
 }
 
 #[test]
 fn metadata_entry_preserves_exact_variadic_prototype_without_claiming_a_foreign_body() {
     use trust_ir::signature_abi::*;
     let scalar = |place| AbiArgument {
-        size: 4, align: 4,
+        size: 4,
+        align: 4,
         mode: AbiPassMode::Direct(AbiScalar {
             register: AbiRegister { class: AbiRegisterClass::Integer, bytes: 4 },
-            source_offset: 0, source_bytes: 4, value_bits: 32, attributes: AbiAttributes::default(),
+            source_offset: 0,
+            source_bytes: 4,
+            value_bits: 32,
+            attributes: AbiAttributes::default(),
         }),
-        bindings: vec![AbiBinding { place, source_offset: 0, source_bytes: 4,
-            carrier_offset: 0, carrier_bytes: 4 }],
+        bindings: vec![AbiBinding {
+            place,
+            source_offset: 0,
+            source_bytes: 4,
+            carrier_offset: 0,
+            carrier_bytes: 4,
+        }],
     };
     let signature = FuncTy {
-        params: vec![Ty::I32], returns: vec![Ty::I32], is_vararg: true,
+        params: vec![Ty::I32],
+        returns: vec![Ty::I32],
+        is_vararg: true,
         abi: Some(SignatureAbi {
-            target: AbiTarget { triple: target().triple, data_layout: "e-p:64:64".into(), abi: String::new(),
-                cpu: "generic".into(), features: vec![], target_spec: "source-target-fixture".into(),
-                pointer_bytes: 8, little_endian: true },
+            target: AbiTarget {
+                triple: target().triple,
+                data_layout: "e-p:64:64".into(),
+                abi: String::new(),
+                cpu: "generic".into(),
+                features: vec![],
+                target_spec: "source-target-fixture".into(),
+                pointer_bytes: 8,
+                little_endian: true,
+            },
             frontend: AbiFrontend { name: "source-fixture".into(), revision: "1".into() },
-            convention: "C".into(), lowered_convention: trust_ir::CallingConv::C, source_abi: "C".into(),
-            can_unwind: false, variadic: true, fixed_count: 1,
-            arguments: vec![scalar(AbiBindingPlace::Parameter(0))], result: scalar(AbiBindingPlace::Result(0)),
+            convention: "C".into(),
+            lowered_convention: trust_ir::CallingConv::C,
+            source_abi: "C".into(),
+            can_unwind: false,
+            variadic: true,
+            fixed_count: 1,
+            arguments: vec![scalar(AbiBindingPlace::Parameter(0))],
+            result: scalar(AbiBindingPlace::Result(0)),
         }),
     };
     let mut c = candidate(per_body_module(calling_body()), vec![callee(1, 9)]);
     c.callees[0].params = crate::ParamSignature::Unsigned;
     c.callees[0].abi = crate::calling_convention::FunctionAbi::test_only_variadic(
-        rustc_abi::ExternAbi::C { unwind: false }, Some(rustc_abi::CanonAbi::C));
+        rustc_abi::ExternAbi::C { unwind: false },
+        Some(rustc_abi::CanonAbi::C),
+    );
     let entry = assemble_entry(&c, &ForeignPrototypeNames(signature.clone())).unwrap();
     let foreign = &entry.functions[1];
     assert!(foreign.is_declaration());
@@ -1478,15 +1531,18 @@ fn metadata_entry_preserves_exact_variadic_prototype_without_claiming_a_foreign_
     assert!(assemble_entry(&c, &ForeignPrototypeNames(signature.clone())).is_err());
     c.callees[0].params = crate::ParamSignature::Unsigned;
     c.callees[0].abi = crate::calling_convention::FunctionAbi::C;
-    assert!(assemble_entry(&c, &ForeignPrototypeNames(signature)).is_err(),
-        "a typed variadic prototype cannot contradict the original source's fixed signature");
+    assert!(
+        assemble_entry(&c, &ForeignPrototypeNames(signature)).is_err(),
+        "a typed variadic prototype cannot contradict the original source's fixed signature"
+    );
 }
 
 #[test]
 fn exact_source_conventions_survive_body_and_metadata_declaration_extraction() {
-    use crate::calling_convention::FunctionAbi;
     use rustc_abi::{CanonAbi, ExternAbi, X86Call};
     use trust_ir::CallingConv;
+
+    use crate::calling_convention::FunctionAbi;
     for (source, canonical, expected) in [
         (ExternAbi::Rust, CanonAbi::Rust, CallingConv::Rust),
         (ExternAbi::C { unwind: false }, CanonAbi::C, CallingConv::C),
@@ -1512,43 +1568,106 @@ fn exact_source_conventions_survive_body_and_metadata_declaration_extraction() {
 
 #[test]
 fn metadata_refuses_same_shaped_wrong_abi_and_unsupported_source_protocols() {
-    use crate::calling_convention::FunctionAbi;
     use rustc_abi::{CanonAbi, ExternAbi};
+
+    use crate::calling_convention::FunctionAbi;
     let mut c = candidate(per_body_module(calling_body()), vec![callee(1, 9)]);
-    assert_eq!(assemble_entry(&c, &ExactAbiNames(FunctionAbi::C)).unwrap_err(),
-        EntryRefusal::Invalid("judged body and source calling convention disagree".into()));
+    assert_eq!(
+        assemble_entry(&c, &ExactAbiNames(FunctionAbi::C)).unwrap_err(),
+        EntryRefusal::Invalid("judged body and source calling convention disagree".into())
+    );
     let rust_call = FunctionAbi::test_only(ExternAbi::RustCall, Some(CanonAbi::Rust));
     assert!(assemble_entry(&c, &ExactAbiNames(rust_call)).is_err());
     for abi in [FunctionAbi::UNKNOWN, FunctionAbi::CONFLICT, rust_call] {
         c.callees[0].abi = abi;
-        assert_eq!(assemble_entry(&c, &ExactAbiNames(FunctionAbi::RUST)).unwrap_err(),
-            EntryRefusal::Invalid("unsupported, absent or conflicting source calling convention".into()));
+        assert_eq!(
+            assemble_entry(&c, &ExactAbiNames(FunctionAbi::RUST)).unwrap_err(),
+            EntryRefusal::Invalid(
+                "unsupported, absent or conflicting source calling convention".into()
+            )
+        );
     }
 }
 
 #[test]
 fn a_template_hole_cannot_hide_an_unsupported_or_different_source_protocol() {
+    use rustc_abi::{CanonAbi, ExternAbi};
+
     use crate::calling_convention::FunctionAbi;
     use crate::template_key::{HoleKey, KeyArg, KeyTy};
-    use rustc_abi::{CanonAbi, ExternAbi};
     let mut c = template_candidate(calling_template_module(), vec![callee(1, 9)]);
     c.facts.owner = Some((7, 8));
     c.facts.parameter_indices = vec![0];
     c.facts.callee_holes.push(crate::template_lowering::CalleeHole {
-        id: trust_ir::HoleId::new(0), decl: FuncId::new(1),
+        id: trust_ir::HoleId::new(0),
+        decl: FuncId::new(1),
         key: HoleKey::Callee { item: (1, 9), args: vec![KeyArg::Type(KeyTy::Param(0))] },
-        signature: FuncTy { params: vec![Ty::I32], returns: vec![Ty::I32], is_vararg: false, abi: None },
-        dependencies: vec![(0, trust_ir::template::TemplateArg::Type(
-            trust_ir::TyG::Ext(trust_ir::TemplateRef::Param(trust_ir::ParamId::new(0)))))],
+        signature: FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+            abi: None,
+        },
+        dependencies: vec![(
+            0,
+            trust_ir::template::TemplateArg::Type(trust_ir::TyG::Ext(
+                trust_ir::TemplateRef::Param(trust_ir::ParamId::new(0)),
+            )),
+        )],
     });
     crate::template_lowering::pending::assemble(&c, &names(), "abi-hole".into())
         .expect("complete plain-Rust hole control");
-    for abi in [FunctionAbi::C, FunctionAbi::UNKNOWN, FunctionAbi::CONFLICT,
-        FunctionAbi::test_only(ExternAbi::RustCall, Some(CanonAbi::Rust))] {
+    for abi in [
+        FunctionAbi::C,
+        FunctionAbi::UNKNOWN,
+        FunctionAbi::CONFLICT,
+        FunctionAbi::test_only(ExternAbi::RustCall, Some(CanonAbi::Rust)),
+    ] {
         c.callees[0].abi = abi;
         let error = crate::template_lowering::pending::assemble(&c, &names(), "abi-hole".into())
-            .err().expect("a neutral hole is not an ABI adapter");
-        assert_eq!(error, EntryRefusal::Invalid(
-            "callee hole source calling convention requires an adapter".into()));
+            .err()
+            .expect("a neutral hole is not an ABI adapter");
+        assert_eq!(
+            error,
+            EntryRefusal::Invalid(
+                "callee hole source calling convention requires an adapter".into()
+            )
+        );
     }
+}
+
+#[test]
+fn source_entry_requires_the_original_owner_and_checks_the_complete_source_section() {
+    use crate::source_word64::{Operand, record};
+    let module =
+        assemble_entry(&candidate(per_body_module(mix_body()), Vec::new()), &names()).unwrap();
+    let binding = EntryBinding { stable_crate_id: 1, local_hash: 2 };
+    let source = record::Record {
+        owner: record::Definition { stable_crate_id: 1, local_hash: 2 },
+        parameters: vec![4],
+        expressions: 3,
+        source_hash: "actual-source-claim".into(),
+        body: record::Body::Operand { node: 0, value: Operand::Parameter(0) },
+    };
+    let good = frame_entry_with_source(&module, binding, true, &[], Some(&source)).unwrap();
+    assert_eq!(decode_entry(&good).unwrap().source, Some(source.clone()));
+    assert!(
+        decode_entry(&frame_entry(&module, binding, true, &[]).unwrap()).unwrap().source.is_none()
+    );
+    let mut wrong = source.clone();
+    wrong.owner.local_hash += 1;
+    assert!(frame_entry_with_source(&module, binding, true, &[], Some(&wrong)).is_err());
+    // Replace the source bytes with a canonical record for the wrong owner and
+    // recompute the envelope digest: semantic owner checking must still refuse.
+    let source_wire = record::encode(&wrong).unwrap();
+    let mut bad = good.clone();
+    let start = bad.len() - source_wire.len();
+    bad[start..].copy_from_slice(&source_wire);
+    let digest = entry_content_digest(&bad[..16], &bad[56..]).unwrap();
+    bad[16..48].copy_from_slice(&digest);
+    assert!(matches!(decode_entry(&bad), Err(EntryDecodeError::Source(_))));
+    // No recomputation: changing source bytes must fail the complete digest.
+    let mut bad = good;
+    *bad.last_mut().unwrap() ^= 1;
+    assert_eq!(decode_entry(&bad).unwrap_err(), EntryDecodeError::EnvelopeDigest);
 }

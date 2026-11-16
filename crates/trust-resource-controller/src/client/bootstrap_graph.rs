@@ -28,6 +28,9 @@ pub use compilation::{
 mod object;
 mod offline_preparation;
 mod preparation;
+mod preparation_cache;
+mod preparation_output;
+mod preparation_source;
 mod query;
 pub use preparation::{InputWorkClosed, ResidentDependencyInputs};
 mod store;
@@ -82,6 +85,7 @@ pub struct BootstrapGraphSupport {
     pin: Arc<PinnedHelper>,
     queries: QueryState,
     offline_intent: Option<offline_preparation::IntentAttempt>,
+    offline_staged: Option<offline_preparation::StagedAttempt>,
 }
 // Restriction only: no counter or branch grants the Host a borrower. Set the
 // active state BEFORE connect; only a genuine same-operation opaque completion
@@ -160,6 +164,7 @@ struct Connection {
     deadline: Instant,
     queries: QueryState,
     offline_intent: Option<offline_preparation::IntentAttempt>,
+    offline_staged: Option<offline_preparation::StagedAttempt>,
     // Preserve the actual accepted boundary even on an unwind between typed
     // wrappers. Only a future consuming native closure path may dispose it.
     channel: ManuallyDrop<Channel>,
@@ -170,6 +175,9 @@ impl Connection {
     fn check(&self, deadline: Instant) -> io::Result<()> {
         bounded(self.deadline, deadline)?;
         if let Some(intent) = &self.offline_intent {
+            intent.enrolled(&self.request, &self.queries, deadline)?;
+        }
+        if let Some(intent) = &self.offline_staged {
             intent.enrolled(&self.request, &self.queries, deadline)?;
         }
         finish(deadline, || {
@@ -236,6 +244,10 @@ pub struct SourceBoundBootstrapGraph {
     configuration: Vec<crate::bootstrap_graph::ConfigurationAttachment>,
     configuration_budget: crate::bootstrap_graph::configuration::ConfigurationBudget,
     materialization: Option<materialization::PreparedContents>,
+    preparation_output: Option<preparation_output::Attempt>,
+    preparation_output_started: bool,
+    preparation_cache: Option<preparation_cache::Attempt>,
+    preparation_source: Option<preparation_source::Attempt>,
 }
 pub struct OutputBoundBootstrapGraph {
     original: Option<Connection>,
@@ -283,6 +295,11 @@ impl SourceBoundBootstrapGraph {
         &self.original.as_ref().expect("private original source-bound graph").request
     }
     pub fn revalidate(&self, deadline: Instant) -> io::Result<()> {
+        if self.preparation_output_started {
+            self.preparation_output.as_ref().ok_or_else(crate::wire::invalid)?.check(deadline)?;
+        }
+        if let Some(cache) = &self.preparation_cache { cache.check(deadline)?; }
+        if let Some(source) = &self.preparation_source { source.check(deadline)?; }
         let original =
             self.original.as_ref().ok_or_else(|| io::Error::other("original graph consumed"))?;
         original.queries.enrollment_allowed()?;
@@ -323,6 +340,9 @@ impl Client {
         bounded(support.deadline, deadline)?;
         support.queries.enrollment_allowed()?;
         if let Some(intent) = &support.offline_intent {
+            intent.ready(&support.key, &support.queries, deadline)?;
+        }
+        if let Some(intent) = &support.offline_staged {
             intent.ready(&support.key, &support.queries, deadline)?;
         }
         if !Arc::ptr_eq(&support.pin, &self.host) {
@@ -368,6 +388,7 @@ impl Client {
                         pin: Arc::clone(&self.host),
                         queries: QueryState::new(),
                         offline_intent: None,
+                        offline_staged: None,
                     };
                     time(supported.deadline)?;
                     Ok(supported)
@@ -405,6 +426,9 @@ impl Client {
             if let Some(intent) = &support.offline_intent {
                 intent.enrolled(&request, &support.queries, deadline)?;
             }
+            if let Some(intent) = &support.offline_staged {
+                intent.enrolled(&request, &support.queries, deadline)?;
+            }
             if support.key != request.key || !Arc::ptr_eq(&support.pin, &self.host) {
                 return Err(crate::wire::invalid());
             }
@@ -428,6 +452,7 @@ impl Client {
             deadline: support.deadline,
             queries: support.queries,
             offline_intent: support.offline_intent,
+            offline_staged: support.offline_staged,
             original: ManuallyDrop::new(original),
             channel: ManuallyDrop::new(channel),
             pin: ManuallyDrop::new(Arc::clone(&self.host)),
@@ -557,6 +582,10 @@ impl EnrolledBootstrapGraph {
             configuration: Vec::new(),
             configuration_budget: Default::default(),
             materialization: None,
+            preparation_output: None,
+            preparation_output_started: false,
+            preparation_cache: None,
+            preparation_source: None,
         };
         if let Err(error) = time(deadline) {
             return Err(GraphFailure::retaining(
@@ -591,6 +620,11 @@ impl SourceBoundBootstrapGraph {
             original.queries.enrollment_allowed()?;
             if request.key != original.request.key {
                 return Err(crate::wire::invalid());
+            }
+            if self.preparation_output_started {
+                return Err(io::Error::other(
+                    "same-OFD configured output transition after early custody is unimplemented",
+                ));
             }
             if let Some(materialization) = &self.materialization {
                 materialization.check(self.source.source_directory, Some(&request))?;

@@ -33,7 +33,9 @@
 //!
 //! Lines below pin the fixed wire: the charged revisions publish the entry row as
 //! `runtime_checked` and as `main`'s only row (one pin, because compiletest lets one
-//! output line satisfy only one `RAW` annotation), the function is not counted
+//! output line satisfy only one `RAW` annotation; it starts inside the row's location,
+//! which is `main`'s own span, so each `main` has its own line), the row states its
+//! stop (`not-dispatched`, RUNTIME-CHECKED-NO-STOP-CAUSE-1), the function is not counted
 //! verified, and the synthetic
 //! `no_obligations` row is never minted beside it (the forbid-output above). The
 //! `string_control` revision (`Result<(), String>` mints no entry row) still publishes
@@ -62,7 +64,9 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-//[box_dyn_error,box_dyn_error_strict,dep_type,io_error_advisory]~? RAW "outcome":"runtime_checked","solver":"trust-classifier","time_ms":0,"reason":"entry `Termination::report` dispatch: reported gap (policy B) — a panic in the returned value's `Debug`/`Drop` is a defined abort during error reporting; return `()`, `ExitCode`, or an error type whose `Debug`/`Drop` this crate verifies to close it"}],"proved":0,"failed":0,"unknown":0,"timed_out":0,"skipped":0,"runtime_checked":1,"cached":0,"total":1}
+//[box_dyn_error,box_dyn_error_strict]~? RAW ","line_start":48,"col_start":0,"line_end":50,"col_end":1},"outcome":"runtime_checked","solver":"trust-classifier","time_ms":0,"reason":"entry `Termination::report` dispatch: reported gap (policy B) — a panic in the returned value's `Debug`/`Drop` is a defined abort during error reporting; return `()`, `ExitCode`, or an error type whose `Debug`/`Drop` this crate verifies to close it [stop:not-dispatched]"}],"proved":0,"failed":0,"unknown":0,"timed_out":0,"skipped":0,"runtime_checked":1,"cached":0,"total":1}
+//[dep_type]~? RAW ","line_start":53,"col_start":0,"line_end":55,"col_end":1},"outcome":"runtime_checked","solver":"trust-classifier","time_ms":0,"reason":"entry `Termination::report` dispatch: reported gap (policy B) — a panic in the returned value's `Debug`/`Drop` is a defined abort during error reporting; return `()`, `ExitCode`, or an error type whose `Debug`/`Drop` this crate verifies to close it [stop:not-dispatched]"}],"proved":0,"failed":0,"unknown":0,"timed_out":0,"skipped":0,"runtime_checked":1,"cached":0,"total":1}
+//[io_error_advisory]~? RAW ","line_start":58,"col_start":0,"line_end":60,"col_end":1},"outcome":"runtime_checked","solver":"trust-classifier","time_ms":0,"reason":"entry `Termination::report` dispatch: reported gap (policy B) — a panic in the returned value's `Debug`/`Drop` is a defined abort during error reporting; return `()`, `ExitCode`, or an error type whose `Debug`/`Drop` this crate verifies to close it [stop:not-dispatched]"}],"proved":0,"failed":0,"unknown":0,"timed_out":0,"skipped":0,"runtime_checked":1,"cached":0,"total":1}
 //[box_dyn_error,box_dyn_error_strict,dep_type,io_error_advisory]~? RAW TRUST_JSON:{"type":"crate_summary","crate_name":"entry_termination_row_on_zero_obligation_main","functions_analyzed":1,"functions_verified":0,"total_proved":0,"total_failed":0,"total_unknown":0,"total_timed_out":0,"total_skipped":0,"total_runtime_checked":1,"total_obligations":1}
 //[string_control]~? RAW {"kind":"no_obligations","description":"function has no panic obligations (trivially panic-free)","outcome":"proved"
 //[string_control]~? RAW TRUST_JSON:{"type":"crate_summary","crate_name":"entry_termination_row_on_zero_obligation_main","functions_analyzed":1,"functions_verified":1,"total_proved":1,"total_failed":0,"total_unknown":0,"total_timed_out":0,"total_skipped":0,"total_runtime_checked":0,"total_obligations":1}

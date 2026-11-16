@@ -2,10 +2,15 @@
 //!
 //! A source scalar value alone imposes NO condition on the rest of an incoming
 //! register. Only a C boundary, qualified target and exact P(width8-or16,Zext-or-Sext)
-//! authorize the 32-bit contract below. Rust AbiExt::None is never restricted.
+//! authorize the 32-bit contract below. This small-integer contract does not
+//! restrict Rust AbiExt::None; Bool call results are refused independently of P.
 //! No helper here grants a grade: the caller must connect every entry/call/
 //! return boundary, include the model equations in the kernel conjunction,
 //! retain the memory Unknown guard and close all ordinary CER obligations.
+//! A Rust `bool` result (P {Gpr0,32,Zext}) is not part of that contract: its
+//! definition's own certificate must prove its 0/1 range (BOOL-RET-EDGE-1 C2).
+//! Bool call-edge transport remains refused pending a Lean-owned relation;
+//! no constructed post-call state is substituted for that missing relation.
 
 use std::collections::BTreeSet;
 
@@ -120,6 +125,14 @@ impl Plan {
                 placement.params.len()
             ));
         }
+        // Refusal-only: generic AbiExt::None transport supplies no Lean-owned
+        // relation from a Bool callee's C1/C2 to its caller. Check the logical
+        // result before reading P so stripping an extension cannot reopen it.
+        if !is_definition && returns.contains(&Ty::Bool) {
+            return Err("Bool call results require a Lean-owned callee-to-caller relation \
+                 (BOOL-RET-EDGE-1 withdrawn)"
+                .into());
+        }
         let qualified = qualified_target(module);
         let mut slots = Vec::new();
         let mut parameters = Vec::new();
@@ -146,7 +159,8 @@ impl Plan {
             if scalar.ext == AbiExt::None {
                 return Ok(());
             }
-            // Existing own Bool return treatment is deliberately unchanged.
+            // Legacy own-definition Bool result only, with its C2 obligation.
+            // Call edges never receive this exemption.
             if is_definition
                 && parameter.is_none()
                 && *ty == Ty::Bool
@@ -421,6 +435,15 @@ pub(super) fn post_call_signed(
     ))
 }
 
+/// The own-definition Bool result shape that requires the C2 range item.
+/// Recognizing this shape grants no call-edge transport.
+pub(super) fn is_bool_result(ret: &ReturnPlace) -> bool {
+    matches!(
+        ret,
+        ReturnPlace::Scalar(ScalarPlace { slot: Slot::Gpr(0), width: 32, ext: AbiExt::Zext })
+    )
+}
+
 #[cfg(test)]
 #[path = "abi_extensions/tests.rs"]
 mod tests;
@@ -448,6 +471,11 @@ pub(super) fn post_call_unextended_small(
 /// A bare tail branch cannot repair unspecified padding from a weaker return
 /// contract. Refuse this abstraction rather than invent an extension guarantee.
 pub(super) fn check_tail_transport(own: &ReturnPlace, callee: &ReturnPlace) -> Result<(), String> {
+    if is_bool_result(own) && !is_bool_result(callee) {
+        return Err("bool tail return cannot inherit its 0/1 zero extension from an unspecified \
+                    callee result"
+            .into());
+    }
     if let ReturnPlace::Scalar(own) = own {
         if matches!(own.width, 8 | 16) && matches!(own.ext, AbiExt::Zext | AbiExt::Sext) {
             let ReturnPlace::Scalar(callee) = callee else {
@@ -485,3 +513,7 @@ mod u16_tests;
 #[cfg(test)]
 #[path = "abi_extensions/signed_tests.rs"]
 mod signed_tests;
+
+#[cfg(test)]
+#[path = "abi_extensions/bool_edge_tests.rs"]
+mod bool_edge_tests;

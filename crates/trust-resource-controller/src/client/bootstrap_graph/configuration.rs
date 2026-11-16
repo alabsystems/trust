@@ -68,6 +68,18 @@ impl SourceBoundBootstrapGraph {
             if self.materialization.is_none() || request.key != original.request.key {
                 return Err(crate::wire::invalid());
             }
+            if original.offline_staged.as_ref().is_some_and(|attempt| attempt.complete().is_none()) {
+                return Err(io::Error::other("staged programs must close before configuration capture"));
+            }
+            if original.offline_staged.is_some() {
+                //139 accepts pending work only. No result/native barrier exists
+                // yet that could authorize Config after starting that work.
+                if let Some(source) = &self.preparation_source {
+                    source.configuration_ready()?;
+                }
+                self.preparation_output.as_ref().ok_or_else(crate::wire::invalid)?.check(deadline)?;
+                self.preparation_cache.as_ref().ok_or_else(crate::wire::invalid)?.check(deadline)?;
+            }
             self.configuration_budget.reserve(&request)?;
             transport::check_source(&self.source, source, deadline)?;
             transport::check_configuration(&request, source[0], configuration, deadline)?;

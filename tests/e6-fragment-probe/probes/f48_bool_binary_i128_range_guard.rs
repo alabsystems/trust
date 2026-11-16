@@ -14,9 +14,9 @@ clean {
     def key128 (v : BitVec 128) : Nat :=
         Nat.xor (BitVec.toNat v) 170141183460469231731687303715884105728
     def fits_isl (x : BitVec 128) : Bool :=
-        Bool.and (Decidable.decide (Nat.le (key128 (BitVec.ofNat 128 340282366920938463454151235394913435648)) (key128 x))
+        Bool.and (@Decidable.decide (Nat.le (key128 (BitVec.ofNat 128 340282366920938463454151235394913435648)) (key128 x))
                                    (Nat.decLe (key128 (BitVec.ofNat 128 340282366920938463454151235394913435648)) (key128 x)))
-                 (Decidable.decide (Nat.le (key128 x) (key128 (BitVec.ofNat 128 9223372036854775807)))
+                 (@Decidable.decide (Nat.le (key128 x) (key128 (BitVec.ofNat 128 9223372036854775807)))
                                    (Nat.decLe (key128 x) (key128 (BitVec.ofNat 128 9223372036854775807))))
 }
 pub fn in_i64_range(x: i128) -> bool

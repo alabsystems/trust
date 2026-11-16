@@ -1,0 +1,7 @@
+[package]
+name="rust-source-word64-capture"
+version="0.0.0"
+edition="2021"
+[workspace]
+[lib]
+path="@TRUST_ROOT@/crates/trust-thir-lower/probes/source_word64_capture_component.rs"

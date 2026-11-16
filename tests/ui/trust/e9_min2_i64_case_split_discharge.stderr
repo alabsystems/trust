@@ -7,8 +7,8 @@ LL | |     theorem min2_i64_le_left : forall (x : BitVec 64) (y : BitVec 64),
 LL | |         Nat.le (key64 (if Nat.lt (key64 x) (key64 y) then x else y)) (key64 x) :=
 ...  |
 LL | |             (fun h => Iff.mp (Nat.not_lt (key64 x) (key64 y)) h)
-LL | |             (fun h => Nat.le.refl (key64 x))
-   | |____________________________________________^
+LL | |             (fun h => @Nat.le.refl (key64 x))
+   | |_____________________________________________^
 
 
 === Trust Verification Report (e9_min2_i64_case_split_discharge) ===

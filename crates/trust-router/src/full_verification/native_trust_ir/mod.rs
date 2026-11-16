@@ -3,8 +3,12 @@
 
 mod bundle_evidence;
 mod checked_wp;
+#[cfg(feature = "native-wp-mathematics")]
+mod execution_mathematics;
 mod index;
 mod public_claim;
+#[cfg(feature = "native-wp-mathematics")]
+mod translation_mathematics;
 #[cfg(feature = "trust-build")]
 mod wp_replay;
 
@@ -23,10 +27,19 @@ pub use bundle_evidence::{
     NativeSourceReferenceParameterFact, NativeSourceReferenceValueFact,
 };
 pub use checked_wp::CheckedNativeWpProof;
+#[cfg(feature = "native-wp-mathematics")]
+pub use execution_mathematics::{
+    CheckedNativeWpInputMathematics, check_native_wp_input_mathematics, native_wp_execution_subject,
+};
 pub(crate) use index::{
     NativeTrustIrEvidenceIndex, NativeTrustIrObligationIdentity, native_trust_ir_artifact_match,
 };
 pub(crate) use public_claim::validate_public_claim;
+#[cfg(feature = "native-wp-mathematics")]
+pub use translation_mathematics::{
+    CheckedNativeWpTranslationMathematics, check_native_wp_translation_mathematics,
+    native_wp_translation_subject,
+};
 pub use trust_ir::request::transport::{
     NATIVE_BUNDLE_REPLAY_FORMULA_REF_ENCODING, rehydrate_native_bundle_transport_payload,
 };
@@ -75,3 +88,6 @@ impl NativeTrustIrBindingIndex {
             .map(|matched| matched.map(|matched| matched.artifacts))
     }
 }
+
+#[cfg(feature = "trust-build")]
+pub(crate) use wp_replay::native_wp_certificate_is_decodable;

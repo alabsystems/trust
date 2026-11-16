@@ -129,6 +129,12 @@ try:
    # This synthetic root has no Git inputs. Exercise the real outer stdout
    # cancellation scope after the separately tested checkout boundary.
    land_gate.checkout_problem=lambda *args,**kwargs:None
+   # The native reader's admission is that boundary too (native_checkout_test):
+   # on Darwin arm64 it verifies the host's installed Trust package, seconds of
+   # child processes before any plan line. Refuse it, as a host without the
+   # package does, so the run reaches the plan output on every host.
+   def no_native_reader(*args,**kwargs):raise land_gate.native_checkout.Unavailable('fixture: no native reader')
+   land_gate.native_checkout.managed_program=no_native_reader
    land_gate.host_budget.measure=lambda:types.SimpleNamespace()
    land_gate.host_budget.plan=lambda *args,**kwargs:types.SimpleNamespace(admitted=True)
    land_gate.host_budget.describe_plan=lambda *args:'buffered-looking plan prefix '*4096

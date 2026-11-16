@@ -35,7 +35,7 @@ use trust_spec_elab::FacetTable;
 
 const ISLAND: &str = "def self_id (x : UInt64) : UInt64 := x\n\n\
      theorem t : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-         fun x => Nat.le.refl (UInt64.toNat x)";
+         fun x => @Nat.le.refl (UInt64.toNat x)";
 
 const CLAUSE: &str = "result >= x";
 const PARAMS: &[(&str, &str)] = &[("x", "u64")];

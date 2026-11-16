@@ -692,7 +692,27 @@ fn run_test(
             return (instant.elapsed(), Err(TestFailure::CompileError));
         }
     };
+    // Trust: each child borrows the waiting rustdoc caller's execution. A single
+    // loan at a time prevents concurrent doctest compilers from each claiming
+    // the same implicit GNU token. Keep the original transport through both
+    // merged-bundle and runner compilation, then release before test execution.
+    static COMPILER_EXECUTION: Mutex<()> = Mutex::new(());
+    let compiler_execution = match COMPILER_EXECUTION.lock() {
+        Ok(execution) => execution,
+        Err(error) => {
+            eprintln!("doctest compiler execution is poisoned: {error}");
+            return (instant.elapsed(), Err(TestFailure::CompileError));
+        }
+    };
+    let scheduler = match rustc_data_structures::jobserver::for_compiler_descendant() {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            eprintln!("cannot retain doctest compiler scheduler: {error}");
+            return (instant.elapsed(), Err(TestFailure::CompileError));
+        }
+    };
     let mut compiler = wrapped_rustc_command(&rustdoc_options.test_builder_wrappers, rustc_binary);
+    scheduler.configure_make(&mut compiler);
 
     compiler.args(&compiler_args);
 
@@ -750,6 +770,7 @@ fn run_test(
 
         let mut runner_compiler =
             wrapped_rustc_command(&rustdoc_options.test_builder_wrappers, rustc_binary);
+        scheduler.configure_make(&mut runner_compiler);
         // the test runner does not contain any user-written code, so this doesn't allow
         // the user to exploit nightly-only features on stable
         runner_compiler.env("RUSTC_BOOTSTRAP", "1");
@@ -819,6 +840,10 @@ fn run_test(
         stdin.write_all(doctest.full_test_code.as_bytes()).expect("could write out test sources");
         child.wait_with_output().expect("Failed to read stdout")
     };
+    // Trust: both compiler waits are complete; runtime tests do not borrow this
+    // compiler execution and keep their configured test-runner concurrency.
+    drop(scheduler);
+    drop(compiler_execution);
 
     struct Bomb<'a>(&'a str);
     impl Drop for Bomb<'_> {
@@ -853,6 +878,12 @@ fn run_test(
         }
         (true, false) => {}
         (false, true) => {
+            // Trust: a custody refusal, compiler crash or signal is not the
+            // expected source rejection of a compile_fail doctest. Only the
+            // compiler's ordinary diagnostic exit can satisfy that contract.
+            if output.status.code() != Some(1) {
+                return (instant.elapsed(), Err(TestFailure::CompileError));
+            }
             if !langstr.error_codes.is_empty() {
                 // We used to check if the output contained "error[{}]: " but since we added the
                 // colored output, we can't anymore because of the color escape characters before

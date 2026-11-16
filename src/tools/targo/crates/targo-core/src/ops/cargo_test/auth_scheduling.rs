@@ -380,6 +380,7 @@ mod tests {
                             (key.into_string().unwrap(), value.into_string().unwrap())
                         })
                         .collect(),
+                    results: None,
                 }],
             };
             plan.validate(

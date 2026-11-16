@@ -39,9 +39,13 @@ class SourceOwnership(owner_controls.SelectorOwnership):
         "scripts.tests.remote_tips_agh_test", "scripts.tests.remote_tips_shallow_test",
         "scripts.tests.remote_tips_process_test", "scripts.tests.remote_tips_advertisement_test",
     )
+    # Rows gates/land.toml lists after this module for remote_tips.py (the
+    # owner-routed source transport control, registered 2026-11-15).
+    trailing_modules = ("scripts.tests.github_source_transport_test",)
 
     def expected_modules(self, paths):
-        return sorted({self.module, *(self.shared_modules if "scripts/lib/remote_tips.py" in paths else ())})
+        shared = (*self.shared_modules, *self.trailing_modules) if "scripts/lib/remote_tips.py" in paths else ()
+        return sorted({self.module, *shared})
 
     def test_each_exact_reader_input_selects_the_fresh_control_module(self):
         for paths in [(path,) for path in self.paths] + [self.paths]:
@@ -70,7 +74,7 @@ class SourceOwnership(owner_controls.SelectorOwnership):
                 if path == "scripts/lib/remote_tips.py":
                     self.assertNotIn(path, self.selection.VALIDATION_TEST_SUBJECTS)
                     self.assertEqual(self.selection.VALIDATION_PROGRAM_TESTS[path],
-                                     (*self.shared_modules, self.module))
+                                     (*self.shared_modules, self.module, *self.trailing_modules))
                     self.assertEqual(ordinary[0], "validation")
                 else:
                     self.assertEqual(self.selection.VALIDATION_TEST_SUBJECTS[path], (self.module,))

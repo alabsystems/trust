@@ -416,6 +416,39 @@ fn strict_ships_only_a_closed_object() {
     }
 }
 
+/// PKG-C5c-L0: the ladder's three loop rungs (r03, s06, s24 as trust-ir) on the compiler
+/// lane, licensed, every leg, O0 and O2. Strict refuses with `[f1-output-gate:policy]` naming
+/// `rung`; allow-unknown ships with `rung` disclosed Unknown and its O4 the spec side's
+/// backedge reason, byte for byte (L0 measures in test-hooks builds only, and only where a
+/// test installs the recorder on the gate thread; this test installs none, and f1_compile's
+/// gate runs on its own thread).
+#[test]
+fn l0_loop_rungs_keep_the_spec_side_reason_and_ship_only_under_allow_unknown() {
+    for rung in LOOP_RUNGS {
+        let case = Case::new(licensed(loop_rung_module(rung, Linkage::External)));
+        for (target, relocation) in LEGS {
+            for opt in [F1OptLevel::O0, F1OptLevel::O2] {
+                let what = format!("{rung:?} {target:?} {relocation:?} {opt:?}");
+                let cfg = config(target, opt, relocation);
+                let e = refused(case.run(&cfg, EmitPolicy::StrictProvenOnly), &what);
+                let F1Refusal::Policy(why) = &e else {
+                    panic!("{what}: not a policy refusal: {e}")
+                };
+                assert!(why.contains("rung"), "{what}: {why}");
+                assert!(e.to_string().starts_with("[f1-output-gate:policy]"), "{what}: {e}");
+                let s = shipped(case.run(&cfg, EmitPolicy::AllowUnknown), &what);
+                assert_eq!(s.unclosed, vec!["rung: Unknown; blocked by []".to_string()], "{what}");
+                let c = s.report.certificate("rung").expect("rung");
+                assert!(matches!(c.verdict, OutputVerdict::Unknown { .. }), "{what}");
+                assert_eq!(
+                    c.obligations.o4_return.detail, "spec side: loop/backedge at bb1 (fail-closed)",
+                    "{what}"
+                );
+            }
+        }
+    }
+}
+
 /// An Internal `g` (never inlined) and an External `f(x) = g(x) + 1` ship
 /// under strict on Darwin, Linux `Static` and Linux `Pic`; `f`'s certificate
 /// pairs its one call site with a real `bl` (or a tail `b`).
@@ -741,6 +774,8 @@ fn a_sited_overflow_check_is_unknown_strict_refuses_and_allow_unknown_ships() {
             assert_eq!(s.unclosed, vec!["rung: Unknown; blocked by []".to_string()], "{what}");
             let c = s.report.certificate("rung").expect("rung");
             assert!(matches!(c.verdict, OutputVerdict::Unknown { .. }), "{what}");
+            assert_eq!(c.obligations.o1_binding.grade, Grade::Proven, "{what}");
+            assert_eq!(c.obligations.o2_pairing.grade, Grade::Unknown, "{what}");
             let o2 = &c.obligations.o2_pairing.detail;
             assert!(
                 o2.contains("lies in an assert's failure tail: a divergent call event")
@@ -881,17 +916,8 @@ fn data_relocation_refusal(target: F1Target) -> String {
 ///   and trust-cg's compile accept the module;
 /// * NOW the object binds. STRICT REFUSES with `F1Refusal::Policy` naming
 ///   `rung`, never `F1Refusal::Object`, and ALLOW-UNKNOWN SHIPS with `rung`
-///   disclosed as unclosed. Until PKG-C5c S2a the grade was Unknown at O1: the
-///   failure path materializes the record's address (`adrp`/`add` relocated
-///   against `rung_location`), and the gate bound no symbol address. Since S2a
-///   (MEASURED 2026-11-15, all four legs at O0 and O2) that pair and the entry
-///   call are the tail S2a admits unexecuted, so O1 is Proven and lists the
-///   walk's two lines, word for word, as set aside, and the first blocker is O4:
-///   this fixture's producer is `M_cg` itself, and the spec side refuses its
-///   sited `Assert` (`instruction \`Assert\` is outside the modeled fragment`).
-///   Were the producer's check unsited, it would be the live check (4b) keeps
-///   Unknown (`x + 1` overflows at `u64::MAX`). The strict lane still does not
-///   carry a checked function: that is the gate work the plan owes, not policy;
+///   disclosed as unclosed. The failure path materializes the Location address;
+///   neither page half has semantic authority, so the first blocker remains O1.
 /// * the shipped object leaves exactly one symbol undefined, the entry, and
 ///   carries exactly one data relocation: the record's first word, against the
 ///   object's own local `rung_location_file`, in the kind and addend spelling
@@ -922,35 +948,22 @@ fn a_located_overflow_check_ships_its_location_record_and_strict_refuses() {
                 why.starts_with("strict: not closed-[PROVED]: rung (Unknown; blocked by [])"),
                 "{what}: {why}"
             );
-            // The refusal names the real blocker, `rung`'s first undecided obligation (O4 since
-            // PKG-C5c S2a: the spec side refuses the producer's sited `Assert`), not only its
-            // grade.
-            assert!(
-                why.contains(
-                    "rung o4: Unknown: spec side: instruction `Assert` is outside the modeled \
-                     fragment (fail-closed)"
-                ),
-                "{what}: {why}"
-            );
+            assert!(why.contains("rung o1: Unknown: address materialization"), "{what}: {why}");
             assert!(e.to_string().starts_with("[f1-output-gate:policy]"), "{what}: {e}");
 
             let s = shipped(case.run(&cfg, EmitPolicy::AllowUnknown), &what);
             assert_eq!(s.unclosed, vec!["rung: Unknown; blocked by []".to_string()], "{what}");
             let c = s.report.certificate("rung").expect("rung");
             assert!(matches!(c.verdict, OutputVerdict::Unknown { .. }), "{what}");
-            // O1 admits the record's address pair as a dead tail's (PKG-C5c S2a) and lists the
-            // walk's own two lines, unchanged, as set aside.
             let o1 = &c.obligations.o1_binding;
-            assert!(
-                o1.grade == Grade::Proven
-                    && o1.detail.contains(
-                        "1 dead panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a)"
-                    )
-                    && o1.detail.contains("address materialization")
-                    && o1.detail.contains("symbol addresses are bound at steps 5.7/5.9"),
+            assert_eq!(o1.grade, Grade::Unknown, "{what}: {}", explain(&s.report));
+            assert_eq!(
+                o1.detail.matches("address materialization").count(),
+                2,
                 "{what}: {}",
-                explain(&s.report)
+                o1.detail
             );
+            assert_eq!(o1.detail.matches("symbol addresses are bound at steps 5.7/5.9").count(), 2);
 
             // The object: one undefined symbol, one data relocation.
             let object = CompiledObject::parse(&s.object).expect("the shipped object parses");
@@ -1027,23 +1040,10 @@ fn a_located_overflow_check_ships_its_location_record_and_strict_refuses() {
     }
 }
 
-/// PKG-C5c S2a (docs/DECISION_QUEUE.md PKG-C5c-DEAD-TAIL-1), MEASURED 2026-11-15: ladder rung
-/// s21 (`if x != 0 { 1000 / x } else { 0 }`) through the whole consumer, `M_cg` siting the
-/// division's check at `panic_const_div_by_zero` and an immutable Internal Location record, the
-/// producer keeping it unsited (`cer_common::sited_div`), on all four legs:
-///
-/// * at O0 the bytes keep the dead check's failure tail (`adrp/add` of the record, `bl` the
-///   entry, `brk`). Before S2a `rung` was Unknown at O1 (the ladder's certificate). Now the
-///   tail is admitted unexecuted and `rung` grades [VALIDATED]: ALLOW-UNKNOWN SHIPS it
-///   disclosed as `[VALIDATED]`, STRICT REFUSES it as "Proven without kernel evidence" (the
-///   step-(5) division split declines the repeated guard: tests/call_event_gate.rs
-///   `s2a_a_dead_sited_division_tail_is_admitted_unexecuted`);
-/// * at O2 trust-cg drops the dead tail and STRICT SHIPS `rung` kernel-[PROVED], as before.
-///
-/// FAILS if the O0 tail stops being admitted (Unknown again), if strict ships a function with a
-/// tail on ay's word alone, or if the O2 cell stops shipping under strict.
+/// The complete consumer keeps the O0 Location pair Unknown and strict refuses.
+/// AllowUnknown discloses it as Unknown. O2 drops the tail and still ships kernel-[PROVED].
 #[test]
-fn a_dead_sited_division_check_ships_validated_at_o0_and_proved_at_o2() {
+fn a_dead_sited_division_check_stays_unknown_at_o0_and_proved_at_o2() {
     for (target, relocation) in DECLARATION_LEGS {
         let triple = if target.is_elf() { LINUX } else { DARWIN };
         let (mut m_cg, producer) = sited_div(true, DivRecord::Pointer);
@@ -1061,19 +1061,17 @@ fn a_dead_sited_division_check_ships_validated_at_o0_and_proved_at_o2() {
                     panic!("{what}: not a policy refusal: {e}")
                 };
                 assert!(
-                    why.starts_with(
-                        "strict: not closed-[PROVED]: rung ([VALIDATED]; blocked by [])"
-                    ) && why.contains("rung: Proven without kernel evidence"),
+                    why.starts_with("strict: not closed-[PROVED]: rung (Unknown; blocked by [])")
+                        && why.contains("rung o1: Unknown: address materialization"),
                     "{what}: {why}"
                 );
-                assert_eq!(s.unclosed, vec!["rung: [VALIDATED]; blocked by []".to_string()]);
-                assert!(
-                    c.obligations.o1_binding.detail.contains(
-                        "1 dead panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a)"
-                    ) && c.obligations.o2_pairing.detail.contains("entry and Location unverified"),
-                    "{what}: {}",
-                    explain(&s.report)
+                assert_eq!(s.unclosed, vec!["rung: Unknown; blocked by []".to_string()]);
+                assert_eq!(c.obligations.o1_binding.grade, Grade::Unknown, "{what}");
+                assert_eq!(
+                    c.obligations.o1_binding.detail.matches("address materialization").count(),
+                    2
                 );
+                assert!(matches!(c.verdict, OutputVerdict::Unknown { .. }), "{what}");
                 assert_eq!(bl_offsets(&s.object, "rung").len(), 1, "{what}: the tail's `bl`");
             } else {
                 let strict = shipped(strict, &what);
@@ -3340,7 +3338,7 @@ fn mul_then_sub_module(k: i128, k_first: bool) -> Module {
 /// commutation theorem the kernel checked.
 /// FAILS without the Add-commutation retry in `try_o1_instantiation_discharge`:
 /// each grades [VALIDATED] (the wide-multiply citation) and strict refuses it
-/// with `[f1-output-gate:policy] strict: not closed-[PROVED]: rung ([VALIDATED]; blocked by [])`.
+/// with `[f1-output-gate:policy] strict: not closed-[PROVED]: rung (Unknown; blocked by [])`.
 #[test]
 fn mul_then_add_ships_strict_kernel_proved() {
     let cases = [

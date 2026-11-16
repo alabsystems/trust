@@ -68,7 +68,8 @@ tracing = "0.1"
 # verdict is graded AyValidated, which `-Ztrust-cg-output-gate=strict`
 # (EmitPolicy::StrictProvenOnly) refuses — i.e. strict mode would fatal on 100%
 # of functions. Grade-only change: verdicts and emitted bytes are unaffected.
-trust-cg-bridge = { path = "../../crates/trust-cg-bridge", features = ["ay-proofs", "kernel-recheck"] }
+trust-cg-bridge = { path = "../../crates/trust-cg-bridge", features = ["ay-proofs", "kernel-recheck", "clean-codegen"] }
+trust-clean-ir-gate = { path = "../../crates/trust-clean-ir-gate" }
 # Trust (F1): NOT optional. `-Ztrust-cg-frontend=trust-ir` is a runtime option,
 # not a build-time feature, so the `trust_ir_of` consumer must be compiled in
 # unconditionally. This adds NOTHING to the compiler's link closure:

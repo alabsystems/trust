@@ -22,7 +22,7 @@ ay-certify = ["ay-backend", "trust-router/ay-certify"]
 
 [package]
 name = "targo-trust"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -69,6 +69,8 @@ clean-olean = { path = "../first-party/clean/crates/clean-olean" }
 trust-clean-origin = { path = "../crates/trust-clean-origin" }
 trust-clean-ir = { path = "../crates/trust-clean-ir" }
 trust-clean-ir-gate = { path = "../crates/trust-clean-ir-gate" }
+# Standalone object transport uses the existing strict machine-output consumer.
+trust-cg-bridge = { path = "../crates/trust-cg-bridge", features = ["clean-codegen"] }
 trust-proof-cert = { path = "../crates/trust-proof-cert" }
 trust-release = { path = "../crates/trust-release" }
 trust-router = { path = "../crates/trust-router" }

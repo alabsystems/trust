@@ -23,7 +23,7 @@ use crate::odt_e6::FaceInput;
 const ISLAND: &str = "\
 theorem degree_le_self : forall (d : UInt64) (k : UInt64),\n\
     Nat.le (UInt64.toNat d) (UInt64.toNat d) :=\n\
-    fun d k => Nat.le.refl (UInt64.toNat d)\n\
+    fun d k => @Nat.le.refl (UInt64.toNat d)\n\
 theorem first_refl : forall (x : UInt64) (y : UInt64), x = x := fun x y => rfl\n\
 theorem third_of_four : forall (a0 : UInt64) (a1 : UInt64) (b0 : UInt64) (b1 : UInt64),\n\
     b0 = b0 := fun a0 a1 b0 b1 => rfl\n\

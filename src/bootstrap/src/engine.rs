@@ -43,8 +43,8 @@ pub use crate::utils::metadata_scheduler::host_graph::{
     CommittedEntry, CommittedLookup, CommittedRepository, CommittedSourceReadSet,
     DependencySourceRefusal, DependencySourceSnapshot, OriginalBootstrapCompilation,
     OriginalBootstrapMember, OriginalBootstrapMemberFailure, OriginalDependencyInputs,
-    OriginalHostGraph, OriginalPreparationInputs, RetiredOriginalBootstrapMember,
-    RetiredOriginalDependencyInputs, SourceRead,
+    OriginalHostGraph, OriginalPreparationInputs, OriginalPreparationSource,
+    RetiredOriginalBootstrapMember, RetiredOriginalDependencyInputs, SourceRead,
 };
 pub use crate::utils::trust_preparation::PreparationScope;
 

@@ -418,6 +418,82 @@ fn explicit_object_input_never_falls_back_for_missing_history_or_bad_bytes() {
 }
 
 #[test]
+fn missing_original_objects_keep_source_revision_and_typed_cause_without_url_secrets() {
+    for selected in [false, true] {
+        for missing in ["commit", "blob", "parent"] {
+            if selected && missing == "parent" {
+                continue; // Stored selected DATA does not claim full history.
+            }
+            let fixture = Fixture::new();
+            let url = url::Url::parse(
+                "https://user-fixture:password-fixture@github.com/Source-Fixture/Dependency.git?token=query-fixture#fragment-fixture",
+            )
+            .unwrap();
+            let source = SourceId::for_git(&url, GitReference::Rev(fixture.last.to_string()))
+                .unwrap()
+                .with_git_precise(Some(fixture.last.to_string()));
+            let earlier = SourceId::for_git(&url, GitReference::Rev(fixture.first.to_string()))
+                .unwrap()
+                .with_git_precise(Some(fixture.first.to_string()));
+            let oid = match missing {
+                "commit" => fixture.last,
+                "blob" => fixture.blob,
+                _ => fixture.first,
+            };
+            let objects = fixture.repository.path().join("objects");
+            let hex = oid.to_string();
+            std::fs::remove_file(objects.join(&hex[..2]).join(&hex[2..])).unwrap();
+            // The same provider serves multiple original revisions. Attribution
+            // must use the failing selected request, not its representative.
+            let sources = if missing == "commit" {
+                vec![earlier, source]
+            } else {
+                vec![source]
+            };
+            let selectors = [(url, objects)];
+            let error = if selected {
+                custody::snapshot::import_selected(
+                    &fixture.donor,
+                    &fixture.destination(),
+                    None,
+                    None,
+                    sources,
+                    &selectors,
+                )
+                .unwrap_err()
+            } else {
+                import_sources(None, &selectors, &fixture.destination(), sources).unwrap_err()
+            };
+            let displayed = format!("{error:#}");
+            assert!(
+                displayed.contains("Git source `https://github.com/source-fixture/dependency`"),
+                "{displayed}"
+            );
+            assert!(
+                displayed.contains(&format!("selected commit {}", fixture.last)),
+                "{displayed}"
+            );
+            assert!(displayed.contains(&hex), "{displayed}");
+            for secret in [
+                "user-fixture",
+                "password-fixture",
+                "token",
+                "query-fixture",
+                "fragment-fixture",
+            ] {
+                assert!(!displayed.contains(secret), "{displayed}");
+            }
+            let cause = error
+                .downcast_ref::<git2::Error>()
+                .expect("original typed Git cause");
+            assert_eq!(cause.class(), git2::ErrorClass::Odb, "{displayed}");
+            assert_eq!(cause.code(), git2::ErrorCode::NotFound, "{displayed}");
+            assert!(!fixture.destination().exists());
+        }
+    }
+}
+
+#[test]
 fn duplicate_unused_and_indirect_object_selectors_refuse_publication() {
     for case in ["duplicate", "unused", "alternates", "http-alternates"] {
         let fixture = Fixture::new();
@@ -537,12 +613,21 @@ fn missing_selected_child_database_refuses_before_home_publication() {
     fixture.source = SourceId::for_git(&url, GitReference::Rev(commit.to_string()))
         .unwrap()
         .with_git_precise(Some(commit.to_string()));
+    let error = fixture.import().unwrap_err();
+    let displayed = format!("{error:#}");
     assert!(
-        fixture
-            .import()
-            .unwrap_err()
-            .to_string()
-            .contains("source-data database unavailable")
+        displayed.contains("source-data database unavailable"),
+        "{displayed}"
+    );
+    assert!(
+        displayed.contains(&format!(
+            "Git source `https://github.com/source-data-fixture/nested` at selected commit {nested}"
+        )),
+        "{displayed}"
+    );
+    assert!(
+        !displayed.contains(&format!("selected commit {commit}")),
+        "{displayed}"
     );
     assert!(!fixture.destination().exists());
 }

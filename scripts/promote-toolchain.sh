@@ -39,6 +39,13 @@
 set -euo pipefail
 umask 022
 
+# BSD mktemp ignores TMPDIR unless the template names it explicitly. Resolve
+# caller-relative scratch once, before any gate changes its working directory.
+if [[ -n "${TMPDIR:-}" && "$TMPDIR" != /* ]]; then
+    TMPDIR="$(pwd -P)/$TMPDIR"
+    export TMPDIR
+fi
+
 PROMOTER_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$PROMOTER_ROOT"
 
@@ -330,6 +337,14 @@ RUSTUP_LINK="${RUSTUP_HOME:-$HOME/.rustup}/toolchains/trust"
 
 die() { printf '\npromote: %s\n' "$*" >&2; exit 1; }
 say() { printf '==> %s\n' "$*"; }
+# scratch [-d]: a scratch file (with -d, a directory) under TMPDIR, relative or
+# not, named tmp.* as mktemp names its own. The template is explicit because
+# macOS's mktemp ignores a relative TMPDIR and falls back to the user temp
+# directory; BSD and GNU mktemp both honor a template.
+scratch() {
+	local parent="${TMPDIR:-/tmp}"
+	mktemp "$@" "${parent%/}/tmp.XXXXXXXXXX"
+}
 
 # The caller pins this independently packaged native executor before promotion.
 # It owns real GNU transport under the existing outer admission, adds no credits,
@@ -395,7 +410,7 @@ $how"
 
 # scratch_precondition: asked ONCE, beside serial_precondition and for the same
 # reason. Two UI rows, the rustc-dev probe and the hello world of step 6 each
-# build a program in a `mktemp -d` directory and run it. Where that directory
+# build a program in a `scratch -d` directory and run it. Where that directory
 # is on a filesystem mounted noexec the compiler writes every one of them and
 # none may be executed: the rows printed FAIL, --gate-only read "UI gate
 # FAILED ... native rustc-dev gate FAILED" and the seal was refused as "FAILS
@@ -408,7 +423,7 @@ $how"
 # in the rows: a filesystem can be remounted while a run is under way.
 scratch_precondition() {
 	local dir said
-	dir="$(mktemp -d)" || die "REFUSED before any gate: could not create a scratch directory under ${TMPDIR:-/tmp} (what \`mktemp -d\` said is above).
+	dir="$(scratch -d)" || die "REFUSED before any gate: could not create a scratch directory under ${TMPDIR:-/tmp} (what \`mktemp -d\` said is above).
     No gate ran. This says nothing about the toolchain."
 	if ! said="$( { printf '#!/bin/sh\n' > "$dir/program" && chmod 700 "$dir/program"; } 2>&1)"; then
 		rm -rf "${dir:?}"
@@ -561,7 +576,7 @@ said_block() {
 # on that line with no output at all (exit 127, nothing printed).
 trustc_answer() {
 	local err out rc=0
-	err="$(mktemp)" || die "could not create a scratch file for $1 $2"
+	err="$(scratch)" || die "could not create a scratch file for $1 $2"
 	out="$("$1" "$2" 2>"$err")" || rc=$?
 	if [[ "$rc" -ne 0 ]]; then
 		printf '%s\n' "$out" >> "$err"
@@ -589,7 +604,7 @@ rustc_dev_probe() (
 	toolchain="$(cd "$1" && pwd -P)" \
 		|| { printf 'rustc-dev probe: cannot resolve the toolchain directory %s\n' "$1" >&2; return 1; }
 	# The scratch directory too: the consumer built in it is started through the
-	# executor, and `mktemp -d` under a relative TMPDIR names a relative one.
+	# executor, and `scratch -d` under a relative TMPDIR names a relative one.
 	[[ "$scratch" == /* ]] || scratch="$PWD/$scratch"
 	# The probe must use this prefix's libraries, not a caller's loader or
 	# linker overlay. Keep the caller's environment unchanged outside this run.
@@ -657,7 +672,7 @@ verify_surface() {
 	command -v "$python" >/dev/null 2>&1 \
 		&& "$python" -c 'import pathlib, sys; assert sys.version_info.major == 3' >/dev/null 2>&1 \
 		|| die "toolchain surface validation requires a working Python 3: $python"
-	resource_work="$(mktemp -d)" || die "cannot retain native Targo discovery"
+	resource_work="$(mktemp -d "${TMPDIR:-/tmp}/trust-promote.XXXXXXXXXX")" || die "cannot retain native Targo discovery"
 	[[ "$resource_work" == /* ]] || resource_work="$PWD/$resource_work"
 	TRUST_VERIFY_ALLOW_MISSING= TRUST_VERIFY_ALLOW_MISSING_BACKEND= \
 		sh "$REPO/tools/verify-toolchain.sh" "$candidate" --resource-receipt="$resource_work/targo-resource.json" \
@@ -719,20 +734,6 @@ ${said:-        | (it printed nothing)}"
 	if [[ ! -e "$candidate/bin/rust-lld" && ! -L "$candidate/bin/rust-lld" \
 			&& ! -e "$candidate/bin/dsymutil" && ! -L "$candidate/bin/dsymutil" ]]; then
 		printf '    RECORDED  %s publishes no paired bin/rust-lld and bin/dsymutil: native elastic linking (--resource-worker-v2, --resource-worker-v3) is unavailable in it and refuses when asked; ordinary builds use the host linker. Not checked, not passed (DARWIN-NATIVE-TOOLS-PRODUCER-1).\n' "$label" >&2
-		return 0
-	fi
-	# bin/rust-lld with no bin/dsymutil is what every cut with LLD enabled
-	# produces (copy_lld_artifacts places the root executable; nothing in the
-	# tree produces dsymutil), so it is the same known gap, half filled: the
-	# linker must be a regular executable that starts, and the debug half is
-	# recorded. trustc refuses the elastic debug mode by itself without it
-	# ("native elastic debug linking needs the paired SDK's bin/dsymutil",
-	# rustc_codegen_ssa back/link.rs); ordinary builds use the host dsymutil.
-	if [[ -f "$candidate/bin/rust-lld" && -x "$candidate/bin/rust-lld" && ! -L "$candidate/bin/rust-lld" \
-			&& ! -e "$candidate/bin/dsymutil" && ! -L "$candidate/bin/dsymutil" ]]; then
-		"$candidate/bin/rust-lld" -flavor darwin --version >/dev/null \
-			|| die "$label paired rust-lld cannot start"
-		printf '    RECORDED  %s publishes bin/rust-lld (it starts) and no bin/dsymutil: native elastic debug linking is unavailable in it and refuses when asked; ordinary builds use the host dsymutil. The pair is not passed (DARWIN-NATIVE-TOOLS-PRODUCER-1).\n' "$label" >&2
 		return 0
 	fi
 	[[ -f "$candidate/bin/rust-lld" && -x "$candidate/bin/rust-lld" \
@@ -898,7 +899,7 @@ ui_gate() {
 	# executor starts an absolute program only, so a toolchain named by a
 	# relative path had every row refused (`--gate-only build/host/stage2`).
 	tc="$(cd "$1" && pwd -P)" || die "UI gate: cannot resolve the toolchain directory $1"
-	work="$(mktemp -d)" || die "UI gate: could not create a scratch directory"
+	work="$(scratch -d)" || die "UI gate: could not create a scratch directory"
 
 	say "UI gate: ${#UI_GATE_ROWS[@]} named tests through $tc/bin/trustc"
 	for row in "${UI_GATE_ROWS[@]}"; do
@@ -1265,7 +1266,7 @@ tool_start_gate() {
 	# package: `--gate-only build/host/stage2` names the toolchain relative to
 	# the caller's directory, and a relative path would not resolve from there.
 	tc="$(cd "$1" && pwd -P)" || die "tool-start gate: cannot resolve the toolchain directory $1"
-	work="$(mktemp -d)" || die "tool-start gate: could not create a scratch directory"
+	work="$(scratch -d)" || die "tool-start gate: could not create a scratch directory"
 	work="$(cd "$work" && pwd -P)"
 	mkdir -p "$work/home" "$work/tmp" "$work/cargo-home" "$work/pkg/src" "$work/pkg-lint/src"
 	# The clean crate is the UI gate's ICE row: nothing in it to lint or prove.
@@ -1692,7 +1693,7 @@ if [[ "$GATE_ONLY" -eq 1 ]]; then
 		GATE_NATIVE='PARTIAL (recorded, not refused: bin/rust-lld starts, this SDK has no bin/dsymutil)'
 		GATE_NATIVE_PASS='(the paired native-tool surface is PARTIAL and recorded: bin/rust-lld starts and there is no bin/dsymutil, so native elastic debug linking is unavailable in it)'
 	fi
-	PROBE_DIR="$(mktemp -d)" || die "rustc-dev gate: could not create a scratch directory"
+	PROBE_DIR="$(scratch -d)" || die "rustc-dev gate: could not create a scratch directory"
 	GATE_RC=0; rustc_dev_probe "$SRC" "$PROBE_DIR" || GATE_RC=$?
 	case "$GATE_RC" in
 		0) rm -rf "${PROBE_DIR:?}" ;;
@@ -1802,7 +1803,7 @@ verify_surface "$SRC" stage2
 #    one that goes away under it, is refused here, before the first `cp`. (This
 #    was a pipeline under pipefail in a plain assignment: it stopped the run at
 #    the same place, without a word.)
-STD_ERR="$(mktemp)" || die "could not create a scratch file to list the stdlib rlibs"
+STD_ERR="$(scratch)" || die "could not create a scratch file to list the stdlib rlibs"
 STD_RC=0
 STD_LIST="$(find "$SRC/lib/rustlib" -name 'libstd-*.rlib' 2>"$STD_ERR")" || STD_RC=$?
 if [[ "$STD_RC" -ne 0 ]]; then
@@ -2054,7 +2055,7 @@ GATE_RC=0; ui_gate "$SRC" || GATE_RC=$?
 #     after the copy leaves `$DEST` sealed on disk and every re-run then stops
 #     at "artifacts are IMMUTABLE". Step 6 asks again of the sealed copy.
 #     Why the closure is required: see step 6.
-PROBE_DIR="$(mktemp -d)" || die "rustc-dev gate: could not create a scratch directory"
+PROBE_DIR="$(scratch -d)" || die "rustc-dev gate: could not create a scratch directory"
 GATE_RC=0; rustc_dev_probe "$SRC" "$PROBE_DIR" || GATE_RC=$?
 [[ "$GATE_RC" -ne 2 ]] || printf '    the rustc-dev probe: its source and everything it printed are kept in %s\n' "$PROBE_DIR" >&2
 [[ "$GATE_RC" -ne 2 ]] || gate_not_run "the rustc-dev gate on the stage2 at $SRC" "refusing to seal it; nothing was copied"
@@ -2116,7 +2117,7 @@ DRIVER_FILE="$(basename "$DRIVER")"
 #    Started by its absolute path (the serial executor starts no other), with
 #    what it printed kept: under `set -e` a failure here used to end the script
 #    with no line at all.
-LIBDIR_SAID="$(mktemp)" || die "could not create a scratch file"
+LIBDIR_SAID="$(scratch)" || die "could not create a scratch file"
 TARGET_LIBDIR="$(serial_command "$(cd "$SRC" && pwd -P)/bin/trustc" --print target-libdir 2>"$LIBDIR_SAID")" \
 	|| { LIBDIR_RC=$?
 		LIBDIR_REFUSED="$(serial_refusal "$LIBDIR_RC" "$LIBDIR_SAID")" || LIBDIR_REFUSED=""
@@ -2290,8 +2291,8 @@ verify_surface "$DEST" 'sealed toolchain'
 #    directory went into the interrupted call's output file, inside that
 #    directory. So each redirected function call that step 6 reaches (the three
 #    below and the tool-start gate's row) runs in a subshell.
-HELLO="$(mktemp -d)" || die "could not create a scratch directory for the checks of the sealed copy"
-#    Absolute: under a relative TMPDIR `mktemp -d` names a relative directory,
+HELLO="$(scratch -d)" || die "could not create a scratch directory for the checks of the sealed copy"
+#    Absolute: under a relative TMPDIR `scratch -d` names a relative directory,
 #    and this one is named to the caller and recorded as the doctor's CARGO_HOME.
 [[ "$HELLO" == /* ]] || HELLO="$PWD/$HELLO"
 PROMOTE_FINISHED=0

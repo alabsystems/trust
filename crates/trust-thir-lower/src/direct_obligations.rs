@@ -22,12 +22,14 @@
 //!
 //! ```text
 //! source_id    trust-thir-lower/direct-assert@1
-//! assertion_id {crate}::{def_path}#L{line}C{col}#{slug}#o{occ}
+//! assertion_id {crate}::{def_path}#d{def_index}#f{file_key}#L{line}C{col}#{slug}#o{occ}
 //! ```
 //!
-//! * `{crate}::{def_path}` — definition-site, pre-mono (no `Instance` exists
-//!   on this lane); the same non-injectivity residual trust-mir-extract
-//!   documents, disclosed rather than hidden.
+//! * `{crate}::{def_path}` — a human-readable definition-site label, pre-mono.
+//!   Pretty paths are not injective and can be clamped. The protected suffix
+//!   therefore includes the original source registry's `def_index` and the
+//!   emission-time file key (`-1` for an absent location). These are source
+//!   disambiguators, never assembly FuncIds or instruction positions.
 //! * `L{line}C{col}` — the LO line/col of the trust-ir `SourceSpan` stamped
 //!   on the `Assert` node by `push_node` (`cur_span` at the push), i.e. the
 //!   artifact's own `#loc` clause and the LO triple the cross-lane pin
@@ -288,17 +290,21 @@ fn clamp_proof_description(value: &str) -> String {
 /// Build the direct-lane `assertion_id`, clamped WITHOUT losing the suffix
 /// that makes it unique — a suffix-preserving replica of the frontend's
 /// `assert_assertion_id`: the `{crate}::{def_path}` head is clamped to the
-/// byte cap, the `#L..C..#{slug}#o{occ}` tail is ALWAYS kept.
+/// byte cap, the `#d..#f..#L..C..#{slug}#o{occ}` tail is ALWAYS kept.
 pub fn direct_assertion_id(
     crate_name: &str,
     def_path: &str,
-    line: u32,
-    col: u32,
+    def_index: u32,
+    location: Option<SourceSpan>,
     slug: &str,
     occ: u32,
 ) -> String {
+    let (line, col, file_key) = match location {
+        Some(loc) => (loc.line, loc.col, i64::from(loc.file)),
+        None => (0, 0, -1),
+    };
     let max = PROOF_OBLIGATION_SOURCE_TEXT_ID_MAX_BYTES;
-    let suffix = format!("#L{line}C{col}#{slug}#o{occ}");
+    let suffix = format!("#d{def_index}#f{file_key}#L{line}C{col}#{slug}#o{occ}");
     if suffix.len() >= max {
         return clamp_proof_text_id(&suffix, "direct-assert");
     }
@@ -408,8 +414,8 @@ pub fn install_direct_obligations(
     }
 
     // Belt: (source_id, assertion_id) uniqueness across the whole module.
-    // Unreachable while `occ` is part of the identity — which is exactly why
-    // it is checked: this is the mutation tripwire for an occ removal.
+    // Source owner, source file and occurrence all participate in identity.
+    // Retain this belt: a missing axis or a repeated installation must refuse.
     let mut seen_identities: BTreeMap<(String, String), ()> = module
         .proof_obligations
         .iter()
@@ -462,8 +468,9 @@ pub fn install_direct_obligations(
             // the dump row below and the obligation row share ONE minted
             // identity (`direct_assertion_id` is pure; the belt that consumes
             // it stays exactly where it was).
-            let assertion_id =
-                direct_assertion_id(crate_name, &body.def_path, line, col, record.slug, occ);
+            let assertion_id = direct_assertion_id(
+                crate_name, &body.def_path, *def_index, record.loc, record.slug, occ,
+            );
 
             // Dump hook — immediately after the occ computation, at the same
             // point the disclosure counters fired and BEFORE any withhold
@@ -568,8 +575,7 @@ pub fn install_direct_obligations(
             if seen_identities.insert(identity_key, ()).is_some() {
                 errors.push(format!(
                     "direct-obligation install: duplicate obligation identity \
-                     ({DIRECT_ASSERT_SOURCE_ID}, {assertion_id}); the occ ordinal makes this \
-                     unreachable, so its appearance means the identity scheme regressed — \
+                     ({DIRECT_ASSERT_SOURCE_ID}, {assertion_id}); a source identity was reused — \
                      row withheld (fail closed)"
                 ));
                 continue;
@@ -1328,10 +1334,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "fixture::arith::checked#L15C4#div_by_zero#o0",
-                "fixture::arith::checked#L15C4#overflow#o0",
-                "fixture::arith::checked#L15C4#overflow#o1",
-                "fixture::arith::checked#L15C4#bounds_check#o0",
+                "fixture::arith::checked#d7#f0#L15C4#div_by_zero#o0",
+                "fixture::arith::checked#d7#f0#L15C4#overflow#o0",
+                "fixture::arith::checked#d7#f0#L15C4#overflow#o1",
+                "fixture::arith::checked#d7#f0#L15C4#bounds_check#o0",
             ],
         );
 
@@ -1512,6 +1518,48 @@ mod tests {
         deduped.dedup();
         assert_eq!(deduped.len(), ids.len(), "same-line checks must not collide: {ids:?}");
         assert!(ids[1].ends_with("#o0") && ids[2].ends_with("#o1"));
+    }
+
+    #[test]
+    fn different_definitions_with_the_same_display_path_have_distinct_identities() {
+        let (mut module, mut registry, mut assigned) = fixture_module();
+        let mut second = module.functions[0].clone();
+        second.id = FuncId::new(1);
+        second.name = "second_link_symbol".to_string();
+        module.try_add_function(second).expect("second source definition");
+        let mut body = registry.bodies[&7].clone();
+        body.def_index = 8;
+        registry.insert(body);
+        assigned.push((8, FuncId::new(1)));
+        let mut errors = Vec::new();
+        let result = install_direct_obligations(
+            &mut module, FIXTURE_CRATE, &assigned, registry, &mut errors,
+        );
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(result.installed, 8);
+        let mut ids: Vec<_> = module.proof_obligations.iter()
+            .map(|row| row.source.as_ref().unwrap().assertion_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "pretty definition paths are not source identities");
+    }
+
+    #[test]
+    fn same_coordinates_in_different_source_files_have_distinct_identities() {
+        let (mut module, mut registry, assigned) = fixture_module();
+        module.files.push("second_source.rs".to_string());
+        let span = SourceSpan { file: 1, line: 15, col: 4 };
+        module.functions[0].blocks[0].body[4].span = Some(span);
+        registry.bodies.get_mut(&7).unwrap().records[2].loc = Some(span);
+        let mut errors = Vec::new();
+        let result = install_direct_obligations(
+            &mut module, FIXTURE_CRATE, &assigned, registry, &mut errors,
+        );
+        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(result.installed, 4);
+        let ids: Vec<_> = module.proof_obligations.iter()
+            .map(|row| &row.source.as_ref().unwrap().assertion_id).collect();
+        assert_ne!(ids[1], ids[2], "different source files cannot share an identity");
     }
 
     /// Re-running the install over an already-installed module must refuse
@@ -1883,8 +1931,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "fixture::arith::checked#L0C0#overflow#o0",
-                "fixture::arith::checked#L0C0#overflow#o1",
+                "fixture::arith::checked#d7#f-1#L0C0#overflow#o0",
+                "fixture::arith::checked#d7#f-1#L0C0#overflow#o1",
             ],
         );
         assert!(module.proof_obligations.iter().all(|o| o
@@ -1915,10 +1963,18 @@ mod tests {
     #[test]
     fn assertion_id_clamp_preserves_the_identity_suffix() {
         let long_path = "segment::".repeat(400);
-        let id = direct_assertion_id("fixture", &long_path, 15, 4, SLUG_OVERFLOW, 1);
+        let location = Some(SourceSpan { file: 0, line: 15, col: 4 });
+        let id = direct_assertion_id("fixture", &long_path, 7, location, SLUG_OVERFLOW, 1);
         assert!(id.len() <= PROOF_OBLIGATION_SOURCE_TEXT_ID_MAX_BYTES);
-        assert!(id.ends_with("#L15C4#overflow#o1"), "suffix must survive the clamp: {id}");
+        assert!(id.ends_with("#d7#f0#L15C4#overflow#o1"), "source suffix must survive the clamp: {id}");
         assert!(trust_ir::is_valid_proof_obligation_source_text_id(&id));
+        assert_ne!(id, direct_assertion_id(
+            "fixture", &long_path, 8, location, SLUG_OVERFLOW, 1,
+        ));
+        assert_ne!(id, direct_assertion_id(
+            "fixture", &long_path, 7, Some(SourceSpan { file: 1, line: 15, col: 4 }),
+            SLUG_OVERFLOW, 1,
+        ));
     }
 
     /// Correlation instrument — the measured shapes from the divergence pin:
@@ -2457,7 +2513,7 @@ mod tests {
         assert_eq!(row.kind, ObligationKind::BoundsCheck);
         assert_eq!(
             row.source.as_ref().unwrap().assertion_id,
-            "cidx::read3#L2C35#bounds_check#o0"
+            "cidx::read3#d3#f0#L2C35#bounds_check#o0"
         );
         let (k, n) = resolve_bounds_operands(&module).expect("the designed train must resolve");
         assert_eq!((k, n), (K, N), "the assert must compare the RIGHT index against the RIGHT len");

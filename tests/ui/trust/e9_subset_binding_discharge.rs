@@ -12,10 +12,10 @@
 clean {
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
     theorem all_ge_self : forall (i : UInt64),
         Nat.le (UInt64.toNat i) (UInt64.toNat i) :=
-        fun i => Nat.le.refl (UInt64.toNat i)
+        fun i => @Nat.le.refl (UInt64.toNat i)
 }
 
 pub fn p(x: u64, y: u64) -> u64 ensures x >= x by u64_ge_refl { x }

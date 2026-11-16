@@ -238,8 +238,12 @@ fn source_mutations_and_manifest_mutations_get_fresh_validation() {
     let valid = result.clone();
     // Preserve the public hash while corrupting bytes: input validation must
     // refuse before any cached policy or derived-summary comparison.
-    Arc::make_mut(&mut result.evidence[0].artifacts[0].materialization.as_mut().unwrap().bytes)
-        [0] ^= 1;
+    // The bytes are immutable once built (their digest is cached beside
+    // them), so a forger replaces them with a new buffer of corrupted bytes.
+    let materialization = result.evidence[0].artifacts[0].materialization.as_mut().unwrap();
+    let mut forged = materialization.bytes().to_vec();
+    forged[0] ^= 1;
+    materialization.bytes = Arc::new(crate::DigestedBytes::new(forged));
     let corrupted = result.clone();
     assert!(result.try_to_manifest().unwrap_err().contains("materialization does not match"));
     assert!(result.try_reconcile_derived_state().is_err());
@@ -383,4 +387,153 @@ fn native_structural_timing_artifacts() -> Vec<EvidenceArtifact> {
         });
     }
     artifacts
+}
+
+/// The check before the envelope was parsed once per artifact, kept verbatim
+/// as the reference the memoized check must agree with.
+fn reference_native_structural_envelope_matches(
+    bytes: &[u8],
+    role: &str,
+    suite: Option<&str>,
+    request_id: Option<&str>,
+    proof_id: Option<&str>,
+) -> bool {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 6
+        || object.get("schema").and_then(serde_json::Value::as_str)
+            != Some("trust.native-trust-ir-materialization.v1")
+        || object.get("role").and_then(serde_json::Value::as_str) != Some(role)
+        || api_json_optional_string(object.get("suite")) != Some(suite)
+        || api_json_optional_string(object.get("request_id")) != Some(request_id)
+        || api_json_optional_string(object.get("proof_id")) != Some(proof_id)
+        || object.get("payload").is_none_or(serde_json::Value::is_null)
+    {
+        return false;
+    }
+    canonicalize_json_in_place(&mut value);
+    serde_json::to_vec(&value).is_ok_and(|canonical| canonical == bytes)
+}
+
+/// The memoized envelope check answers exactly what parsing afresh answered,
+/// for canonical envelopes, every way of not being one, and every argument
+/// that does not match, on the first call and on every later one.
+#[test]
+fn memoized_native_envelope_check_agrees_with_parsing_afresh() {
+    let canonical = |value: serde_json::Value| {
+        let mut value = value;
+        canonicalize_json_in_place(&mut value);
+        serde_json::to_vec(&value).expect("fixture JSON")
+    };
+    let envelope = |role: serde_json::Value,
+                    suite: serde_json::Value,
+                    request_id: serde_json::Value,
+                    proof_id: serde_json::Value| {
+        serde_json::json!({
+            "schema": "trust.native-trust-ir-materialization.v1",
+            "role": role, "suite": suite, "request_id": request_id,
+            "proof_id": proof_id, "payload": { "fixture": [1, 2, 3] },
+        })
+    };
+    let proof = envelope("normalized_obligation".into(), "trust-mc".into(), "0".into(), "7".into());
+    let request =
+        envelope("request".into(), "trust-mc".into(), "0".into(), serde_json::Value::Null);
+    let bundle = envelope(
+        "bundle".into(),
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
+    let mut inputs: Vec<Vec<u8>> =
+        vec![canonical(proof.clone()), canonical(request.clone()), canonical(bundle.clone())];
+    // Not canonical: pretty-printed, and a trailing newline.
+    inputs.push(serde_json::to_vec_pretty(&proof).unwrap());
+    let mut newline = canonical(proof.clone());
+    newline.push(b'\n');
+    inputs.push(newline);
+    // Wrong shape, each still canonical JSON.
+    let edit = |key: &str, value: Option<serde_json::Value>| {
+        let mut changed = proof.clone();
+        let object = changed.as_object_mut().unwrap();
+        match value {
+            Some(value) => {
+                object.insert(key.to_string(), value);
+            }
+            None => {
+                object.remove(key);
+            }
+        }
+        canonical(changed)
+    };
+    inputs.push(edit("schema", Some("trust.native-trust-ir-materialization.v2".into())));
+    inputs.push(edit("role", Some(serde_json::json!(7))));
+    inputs.push(edit("suite", Some(serde_json::json!(["trust-mc"]))));
+    inputs.push(edit("request_id", Some(serde_json::json!(0))));
+    inputs.push(edit("proof_id", Some(serde_json::json!(true))));
+    inputs.push(edit("payload", Some(serde_json::Value::Null)));
+    // Five keys and seven keys: refused on the key count alone.
+    inputs.push(edit("payload", None));
+    inputs.push(edit("suite", None));
+    inputs.push(edit("extra", Some("x".into())));
+    // Six keys with one required key absent (renamed), so the key count
+    // passes and the absent key itself decides. Against the bundle, whose
+    // ids are explicit nulls, this is the absent-is-not-null rule: an
+    // absent id must not read as the null the `None` argument asks for.
+    let rename = |envelope: &serde_json::Value, key: &str| {
+        let mut changed = envelope.clone();
+        let object = changed.as_object_mut().unwrap();
+        let value = object.remove(key).expect("fixture key");
+        object.insert(format!("{key}_"), value);
+        canonical(changed)
+    };
+    for key in ["role", "suite", "request_id", "proof_id", "payload"] {
+        inputs.push(rename(&proof, key));
+    }
+    for key in ["suite", "request_id", "proof_id"] {
+        inputs.push(rename(&bundle, key));
+    }
+    inputs.push(canonical(serde_json::json!(["not", "an", "object"])));
+    inputs.push(b"{not json".to_vec());
+
+    let mut matched = 0;
+    for bytes in inputs {
+        let materialization = EvidenceArtifactMaterialization::new(
+            bytes.clone(),
+            "trust_ir-native-trust-mc-request-0-proof-7",
+            Vec::new(),
+        )
+        .expect("a bounded, non-empty fixture");
+        for role in ["normalized_obligation", "request", "bundle", "other"] {
+            for suite in [Some("trust-mc"), Some("trust-vc"), None] {
+                for request_id in [Some("0"), Some("1"), None] {
+                    for proof_id in [Some("7"), Some("8"), None] {
+                        let expected = reference_native_structural_envelope_matches(
+                            &bytes, role, suite, request_id, proof_id,
+                        );
+                        for _ in 0..2 {
+                            assert_eq!(
+                                native_structural_envelope_matches(
+                                    &materialization,
+                                    role,
+                                    suite,
+                                    request_id,
+                                    proof_id,
+                                ),
+                                expected,
+                                "{} as {role} {suite:?} {request_id:?} {proof_id:?}",
+                                String::from_utf8_lossy(&bytes),
+                            );
+                        }
+                        matched += usize::from(expected);
+                    }
+                }
+            }
+        }
+    }
+    // Exactly the three canonical envelopes, each under its own arguments.
+    assert_eq!(matched, 3);
 }

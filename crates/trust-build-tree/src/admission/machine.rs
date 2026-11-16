@@ -70,15 +70,46 @@ impl Coordinator {
         pool: &Pool,
         budget: impl FnOnce(&Reservation) -> io::Result<NonZeroU32>,
     ) -> io::Result<Attempt<FixedClaim>> {
+        self.attempt_fixed_with_pool(memory, maximum, |_| Ok(pool.clone()), |_| Ok(()), budget)
+    }
+
+    /// The pool opener runs only after the original legacy reservation is
+    /// held. It creates backing at most; the same manifest transaction below
+    /// must still admit the complete fixed claim before anything can run.
+    fn attempt_fixed_with_pool(
+        &mut self,
+        memory: Option<u64>,
+        maximum: u32,
+        open_pool: impl FnOnce(&Reservation) -> io::Result<Pool>,
+        before_publish: impl FnOnce(&Reservation) -> io::Result<()>,
+        budget: impl FnOnce(&Reservation) -> io::Result<NonZeroU32>,
+    ) -> io::Result<Attempt<FixedClaim>> {
         let mut native_wait = None;
         let result = self.attempt_with(memory, maximum, |mut reservation| {
             if reservation.exclusive && !reservation.try_drain_exclusive()? {
                 return Ok(None);
             }
+            reservation.check_current()?;
+            if reservation.slots.is_empty() {
+                return Err(invalid(
+                    "machine initialization requires original legacy exclusion",
+                ));
+            }
+            let pool = match open_pool(&reservation) {
+                Ok(pool) => pool,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    native_wait = Some(LegacyFixedRoom::Busy);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let Some(transaction) = pool.try_legacy_fixed_transaction()? else {
                 native_wait = Some(LegacyFixedRoom::Busy);
                 return Ok(None);
             };
+            // Retiring the legacy domain needs the same held legacy guards;
+            // a prepared intent observed here must still refuse publication.
+            before_publish(&reservation)?;
             let selected = budget(&reservation)?;
             let claim = reservation.publish_fixed(pool.slots(), selected)?;
             let original_admission = claim.original_exclusive_admission()?;

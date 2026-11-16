@@ -6729,7 +6729,11 @@ fn replay_zero_obligation_transport_gate(transport: &str, lane: GateLane) -> Gat
 /// keeps it. `zero_obligation_entry_termination_after.jsonl`'s is the summary the stage 1 of
 /// the T3 L4 merge `fd4cee44ece` publishes for `box.rs` (captured 2026-10-21, the flags
 /// above); `zero_obligation_global_alloc_premise_after.jsonl` keeps the hand edit, since
-/// `q5.rs` is not in the tree.
+/// `q5.rs` is not in the tree. RUNTIME-CHECKED-NO-STOP-CAUSE-1 (2026-11-15):
+/// `zero_obligation_entry_termination_after.jsonl` is recaptured whole from the stage 1
+/// that first states the entry row's stop (`[stop:not-dispatched]`), same source and
+/// flags; its first line also gained the `source_sha256` and `stable_ids` fields that
+/// compiler writes.
 #[test]
 fn zero_obligation_rows_the_compiler_dropped_now_reach_the_gate() {
     use GateDecision::*;
@@ -6743,6 +6747,45 @@ fn zero_obligation_rows_the_compiler_dropped_now_reach_the_gate() {
     assert!(entry_before.contains("\"kind\":\"no_obligations\""), "control: the pre-fix wire");
     assert!(!entry_after.contains("\"kind\":\"no_obligations\""));
     assert!(entry_after.contains("entry `Termination::report` dispatch: reported gap (policy B)"));
+    // The entry row states its stop, so targo reads a cause that is the same on every
+    // host. Control: the same wire without the token reads as `unclassified`, the
+    // cause that made a clean unit COULD NOT RUN (RUNTIME-CHECKED-NO-STOP-CAUSE-1).
+    let stop_causes = |transport: &str| -> Vec<trust_types::determinism::StopCause> {
+        transport
+            .lines()
+            .filter_map(trust_types::parse_transport_line)
+            .filter_map(|message| match message {
+                trust_types::TransportMessage::FunctionResult(function) => Some(function),
+                _ => None,
+            })
+            .flat_map(|function| {
+                let identities = crate::types::envelope_identities(&function);
+                function
+                    .results
+                    .iter()
+                    .zip(identities)
+                    .map(|(row, identity)| {
+                        crate::determinism_report::row_stop_cause(
+                            &crate::types::transport_to_verification_result(
+                                &function.function,
+                                row,
+                                function.runtime_checks,
+                                identity,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    const ENTRY_STOP: &str = " [stop:not-dispatched]";
+    assert_eq!(entry_after.matches(ENTRY_STOP).count(), 1, "the entry row states its stop");
+    assert_eq!(stop_causes(entry_after), [trust_types::determinism::StopCause::NotDispatched]);
+    assert_eq!(
+        stop_causes(&entry_after.replace(ENTRY_STOP, "")),
+        [trust_types::determinism::StopCause::Unclassified],
+        "control: with no token the row is no measurement"
+    );
     assert!(!premise_before.contains("native-verification-gap"), "control: the pre-fix wire");
     assert!(premise_after.contains("native-verification-gap"));
 

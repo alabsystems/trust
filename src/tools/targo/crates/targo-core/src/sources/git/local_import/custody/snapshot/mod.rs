@@ -6,6 +6,7 @@ use super::*;
 use std::os::unix::ffi::OsStrExt as _;
 
 mod checkout;
+pub(super) use checkout::capture_original_checkout;
 mod selected;
 pub(in super::super) use selected::import_selected;
 

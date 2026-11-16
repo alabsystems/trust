@@ -474,23 +474,34 @@ fn static_zstd_with(
     if libraries.len() != 1 || libraries[0] != "-lzstd" {
         return Err("libzstd static metadata has additional or missing libraries".to_owned());
     }
-    if !query(&["--libs-only-other", "--static", "libzstd"])?.trim().is_empty() {
-        return Err("libzstd static metadata has additional linker flags".to_owned());
-    }
-    let search = query(&["--libs-only-L", "--static", "libzstd"])?;
-    let search = search.trim();
-    let mut flags = if search == format!("-L{}", declared_libdir.display())
-        || search == format!("-L{}", libdir.display())
-    {
-        vec![search.to_owned()]
-    } else {
-        shlex::split(search).ok_or("malformed libzstd native search metadata")?
-    };
-    flags.push("-lzstd".to_owned());
+    // Ask for the complete flags before splitting them. Providers can split a
+    // raw path containing spaces incorrectly in their --libs-only-L/other
+    // views. The declared whole libdir remains the boundary; every remaining
+    // token still passes the same strict dependency/flag validation below.
+    let flags =
+        zstd_link_flags(&query(&["--libs", "--static", "libzstd"])?, &declared_libdir, &libdir)?;
     validate_zstd_flags(&flags, &libdir)?;
     let library = library_file(&libdir.join("libzstd.a"), target, false)?;
     watch_paths.extend([library.path.clone(), metadata.clone(), provider.to_owned()]);
     Ok(StaticZstd { library, metadata, provider: provider.to_owned(), version, watch_paths })
+}
+
+fn zstd_link_flags(raw: &str, declared: &Path, canonical: &Path) -> Result<Vec<String>, String> {
+    let raw = raw.trim();
+    // A declared symlink can prefix its longer canonical pathname. Try the
+    // longest known whole operand before interpreting its remainder as flags.
+    let mut searches = [declared, canonical].map(|directory| format!("-L{}", directory.display()));
+    searches.sort_by_key(|search| std::cmp::Reverse(search.len()));
+    for search in searches {
+        if let Some(tail) = raw.strip_prefix(&search) {
+            if tail.starts_with(char::is_whitespace) {
+                let mut flags = vec![search];
+                flags.extend(shlex::split(tail).ok_or("malformed libzstd linker metadata")?);
+                return Ok(flags);
+            }
+        }
+    }
+    shlex::split(raw).ok_or_else(|| "malformed libzstd linker metadata".to_owned())
 }
 
 fn validate_zstd_flags(flags: &[String], libdir: &Path) -> Result<(), String> {

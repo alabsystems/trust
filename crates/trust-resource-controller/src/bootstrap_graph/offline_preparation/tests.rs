@@ -1,7 +1,7 @@
 //! DATA-only codec controls; none creates a native owner or availability claim.
 use super::*;
 
-pub(super) fn request() -> Request {
+pub(crate) fn request() -> Request {
     let query = super::super::query::tests::request();
     Request {
         key: query.key,

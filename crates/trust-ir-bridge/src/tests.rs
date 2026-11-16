@@ -13568,6 +13568,45 @@ fn test_lower_borrow_of_compacted_field_fail_softs_to_pointer_havoc() {
         !body.iter().any(|node| matches!(&node.inst, Inst::Assume { .. })),
         "no fact may be emitted about the compacted contents"
     );
+
+    // A thin borrow copy must not launder the opaque address into a defined
+    // source for pointer construction at a later trait-object coercion.
+    let mut coerced = func.clone();
+    let dyn_ref = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Dynamic {
+            trait_name: "Shape".into(),
+            principal_key: Some("Shape".into()),
+        }),
+    };
+    coerced.body.locals.push(LocalDecl { index: 3, ty: dyn_ref.clone(), name: None });
+    coerced.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::Cast(Operand::Copy(Place::local(2)), dyn_ref),
+        span: SourceSpan::default(),
+    });
+    let module = lower_to_trust_ir(&coerced).expect("retain the explicit symbolic coercion");
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(body.iter().any(|node| matches!(&node.inst, Inst::DialectOp(_))),
+        "the coercion must retain its unsupported symbolic input");
+    assert!(!body.iter().any(|node| matches!(&node.inst, Inst::PtrFromParts { .. })),
+        "an opaque borrowed address cannot become a defined pointer construction");
+
+    // The real dynamic-call UI also reaches this coercion through a promoted
+    // opaque constant, without a Ref rvalue. Its seed must retain the same
+    // unsupported classification through the ordinary local copy.
+    let mut opaque = coerced.clone();
+    opaque.body.blocks[0].stmts[0] = Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Use(Operand::Constant(ConstValue::opaque_const())),
+        span: SourceSpan::default(),
+    };
+    let module = lower_to_trust_ir(&opaque).expect("retain the opaque constant coercion");
+    let body: Vec<_> = module.functions[0].blocks.iter().flat_map(|b| b.body.iter()).collect();
+    assert!(body.iter().any(|node| matches!(&node.inst, Inst::DialectOp(_))),
+        "an opaque constant coercion must retain its unsupported symbolic input");
+    assert!(!body.iter().any(|node| matches!(&node.inst, Inst::PtrFromParts { .. })),
+        "an opaque constant cannot become a defined pointer construction");
 }
 
 #[test]

@@ -232,9 +232,48 @@ pub fn validate_native_public_contract_claim(
     bundle: &TrustContractBundle,
     obligation: &TrustObligation,
 ) -> Result<(), String> {
+    validate_raw_contract_claim(module, proof, bundle, obligation, false)
+}
+
+/// Bind an original definition-site entry clause. This does not make the
+/// clause a premise: only a sealed public question may expose its entry domain.
+pub fn validate_native_public_entry_contract_claim(
+    module: &Module,
+    proof: &ProofObligation,
+    bundle: &TrustContractBundle,
+    obligation: &TrustObligation,
+) -> Result<(), String> {
+    if proof.kind != trust_ir::ObligationKind::Precondition || proof.site.is_some() {
+        return Err("entry clause must be an original definition-site precondition".into());
+    }
+    validate_raw_contract_claim(module, proof, bundle, obligation, true)?;
+    let function = proof
+        .function
+        .and_then(|id| module.function_by_id(id))
+        .ok_or("entry clause has no original owning function")?;
+    let signature = module.func_type(function.ty).ok_or("entry function has no signature")?;
+    for (_, binding) in &proof.formula.as_ref().ok_or("entry clause has no formula")?.bindings {
+        let trust_ir::proof::ClausePlace::Param { index } = binding.place else {
+            return Err("entry clause must bind original parameters".into());
+        };
+        if usize::try_from(index).ok().and_then(|index| signature.params.get(index)).is_none() {
+            return Err("entry clause parameter is absent from the original signature".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_raw_contract_claim(
+    module: &Module,
+    proof: &ProofObligation,
+    bundle: &TrustContractBundle,
+    obligation: &TrustObligation,
+    entry: bool,
+) -> Result<(), String> {
     validate_native_public_module_binding(module, proof, obligation)?;
     validate_native_public_source_projection(module, proof, obligation)?;
-    if obligation.kind != ObligationKind::Postcondition || obligation.proof_item_id.is_some() {
+    let expected = if entry { ObligationKind::Precondition } else { ObligationKind::Postcondition };
+    if obligation.kind != expected || obligation.proof_item_id.is_some() {
         return Err(
             "native raw contract claim must be a postcondition of its original contract".into()
         );
@@ -248,7 +287,11 @@ pub fn validate_native_public_contract_claim(
         .as_ref()
         .and_then(|id| bundle.contracts.iter().find(|contract| &contract.contract_id == id))
         .ok_or("native raw claim requires the original typed public postcondition")?;
-    if contract.kind != ContractKind::Ensures {
+    if if entry {
+        !matches!(contract.kind, ContractKind::Requires | ContractKind::Assumes)
+    } else {
+        contract.kind != ContractKind::Ensures
+    } {
         return Err("native raw postcondition is not bound to an Ensures contract".into());
     }
     let (schema, value) = match &contract.predicate {
@@ -315,10 +358,20 @@ pub fn validate_native_public_contract_claim(
     if bindings != formula.bindings {
         return Err("native parameter/result bindings differ from the public contract".into());
     }
+    if entry
+        && bindings.iter().any(|(_, binding)| {
+            !matches!(binding.place, trust_ir::proof::ClausePlace::Param { .. })
+        })
+    {
+        return Err("entry clause bindings must denote original function parameters".into());
+    }
     if let Some(originals) = typed_scalar_bindings {
         let by_name: rustc_hash::FxHashMap<_, _> =
             bindings.iter().map(|(name, binding)| (name.as_str(), binding)).collect();
         for original in originals {
+            if entry && original.is_result_placeholder {
+                return Err("entry clause cannot refer to the returned result".into());
+            }
             let carrier = by_name.get(original.name.as_str()).ok_or_else(|| {
                 format!("native typed public contract has no binding for `{}`", original.name)
             })?;

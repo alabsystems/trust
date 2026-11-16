@@ -2106,7 +2106,7 @@ fn ensures_citation_discharge_row_carries_its_kernel_audited_clean_cic_artifact(
         "def keep_isl (x : UInt64) : UInt64 := x\n\n\
          theorem u64_ge_refl : forall (x : UInt64), \
              Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-             fun x => Nat.le.refl (UInt64.toNat x)",
+             fun x => @Nat.le.refl (UInt64.toNat x)",
     );
     assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
     let env = session.environment().expect("untainted session");
@@ -21558,6 +21558,112 @@ fn deadline_declined_native_bundle_publishes_clock_timeouts() {
     let gap = transport_native_lowering_gap_row(&failed);
     assert_eq!(gap.outcome, Outcome::Unknown);
     assert_eq!(clock_test_stop_cause(&gap), None);
+}
+
+/// RUNTIME-CHECKED-NO-STOP-CAUSE-1: a runtime-checked std-member row states
+/// `wall-backstop` only for a run the per-function deadline declined, the one
+/// clock that reaches the member set, and `not-dispatched` for any other run or
+/// none: the same split `transport_native_lowering_gap_row` makes. Driven through
+/// both seams `publish_body_verification_outcome` calls, with the artifacts it
+/// passes them, so a stop either publication branch chose on its own fails here.
+#[test]
+fn a_std_member_row_names_the_clock_only_when_the_deadline_declined_the_run() {
+    use trust_types::determinism::StopCause;
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &[]);
+    let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    let context = trust_router::VerifierExecutionContext::new("std-member-stop");
+    let declined = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        &format!("{NATIVE_BUNDLE_DEADLINE_DECLINE} during native trust-ir bundle construction"),
+    );
+    let failed = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        "typed TrustIr lowering refused the body",
+    );
+    for (run, expected) in [
+        (Some(declined), StopCause::WallBackstop),
+        (Some(failed), StopCause::NotDispatched),
+        (None, StopCause::NotDispatched),
+    ] {
+        let mut artifacts = memory_safe_gate_artifacts(
+            test_vc(5),
+            failed_test_result(),
+            TrustStatus::Unknown,
+            plain_transport_row(Outcome::Proved, false),
+        );
+        artifacts.runtime_checked_std_members = vec![RuntimeCheckedStdMember {
+            def_path: "core::iter::sum::{closure#0}".into(),
+            class: trust_ir_bridge::MemberAssertRefusalClass::AssertKindOutsideLane,
+            reason: "member Assert kind `Overflow(Add)` is outside the exact lane",
+        }];
+        artifacts.full_verification = run;
+        let stated = |rows: &[TransportObligationResult]| {
+            let member_rows: Vec<_> = rows
+                .iter()
+                .filter(|row| row.outcome == Outcome::RuntimeChecked)
+                .map(|row| StopCause::from_reason(row.reason.as_deref().unwrap_or_default()))
+                .collect();
+            assert_eq!(member_rows.len(), 1, "one row per member: {rows:#?}");
+            member_rows[0]
+        };
+        let nonzero = runtime_checked_std_member::rows_with_runtime_checked_std_members(
+            &[],
+            None,
+            &artifacts,
+        )
+        .expect("a member is owed a row");
+        assert_eq!(stated(&nonzero), Some(expected), "the non-zero-obligation branch");
+        let zero = runtime_checked_std_member::zero_obligation_rows(true, &[], None, &artifacts);
+        assert_eq!(stated(&zero), Some(expected), "the zero-obligation branch");
+    }
+}
+
+/// RUNTIME-CHECKED-NO-STOP-CAUSE-1: the entry-`Termination` dispatch row the seam
+/// mints states `not-dispatched`, so a `main` whose only row it is reads as
+/// reproducible; and every row whose reason begins with its reason (the bare one
+/// this seam wrote before, a stamped one, one with another token, a suffixed one)
+/// claims the seam and is stripped, while a row that only quotes it, and an
+/// ordinary row, are kept. Driven through the helper the seam calls.
+#[test]
+fn the_entry_termination_row_states_its_stop_and_every_claim_is_stripped() {
+    use trust_types::determinism::{Reproducibility, StopCause};
+    let row_with = |reason: String| {
+        let mut row = transport_no_obligations_row();
+        row.reason = Some(reason);
+        row
+    };
+    let quoting = row_with(format!("a note: {ENTRY_TERMINATION_DISPATCH_REASON}"));
+    let ordinary = transport_no_obligations_row();
+    let mut rows: Vec<TransportObligationResult> = [
+        ENTRY_TERMINATION_DISPATCH_REASON.to_string(),
+        StopCause::NotDispatched.stamp(ENTRY_TERMINATION_DISPATCH_REASON),
+        StopCause::Solved.stamp(ENTRY_TERMINATION_DISPATCH_REASON),
+        format!("{ENTRY_TERMINATION_DISPATCH_REASON}; closed"),
+    ]
+    .into_iter()
+    .map(row_with)
+    .collect();
+    rows.extend([quoting.clone(), ordinary.clone()]);
+    let kind = VcKind::Assertion { message: "panic freedom: entry dispatch".to_string() };
+    let out = rows_with_entry_termination_row(&rows, &kind, None);
+    assert_eq!(out.len(), 3, "the four claims stripped, two rows kept, one minted: {out:#?}");
+    assert_eq!(out[0], quoting);
+    assert_eq!(out[1], ordinary);
+    let minted = &out[2];
+    assert_eq!(minted.outcome, Outcome::RuntimeChecked);
+    let reason = minted.reason.as_deref().expect("the row states why");
+    assert!(reason.starts_with(ENTRY_TERMINATION_DISPATCH_REASON), "{reason}");
+    let read = StopCause::of_outcome(minted.outcome, Some(reason));
+    assert_eq!(read, StopCause::NotDispatched);
+    assert_eq!(read.reproducibility(), Reproducibility::Deterministic);
+    // A second pass strips the first pass's row: the seam mints exactly one.
+    assert_eq!(rows_with_entry_termination_row(&out, &kind, None).len(), 3);
 }
 
 /// A live mint lane that finds the function deadline passed names the receipts

@@ -993,6 +993,51 @@ pub(crate) struct CargoCompilerEvidence {
     /// gate or exit reads it, and a failed build is judged by
     /// `build_succeeded` and the compiler's exit as before.
     pub(crate) compile_errors: Vec<crate::obligations::CompileError>,
+    /// The island rows each proof unit published
+    /// (`trust_types::clean_island_rows`), validated and bound to the unit's
+    /// Cargo envelope ([`admit_clean_island_rows`]). Disclosure for the
+    /// records and the changed-only view only: no verdict, count, gate,
+    /// coverage or exit reads it.
+    pub(crate) clean_island_rows:
+        BTreeMap<CargoTargetIdentity, trust_types::clean_island_rows::CleanIslandRowsTransport>,
+}
+
+/// Admit one unit's island rows: at most one message per unit, published
+/// before its coverage summary (the compiler emits them inside its JSON
+/// block, before `CoverageSummary`; on a front-end error the unit publishes
+/// no coverage at all), that validates
+/// (`CleanIslandRowsTransport::validate`) and whose every key names a
+/// declaration of the unit's own crate. Anything else is a transport
+/// violation that fails the run, as a malformed proof message does: a row is
+/// never read from a message that could not have been written honestly.
+fn admit_clean_island_rows(
+    admitted: &mut BTreeMap<
+        CargoTargetIdentity,
+        trust_types::clean_island_rows::CleanIslandRowsTransport,
+    >,
+    phase: Option<CargoProofUnitPhase>,
+    target: CargoTargetIdentity,
+    rows: trust_types::clean_island_rows::CleanIslandRowsTransport,
+) -> Result<(), String> {
+    let label = target.report_label();
+    if !matches!(phase, None | Some(CargoProofUnitPhase::FunctionRows)) {
+        return Err(format!(
+            "Cargo proof unit emitted its island rows after its coverage summary: {label}"
+        ));
+    }
+    if admitted.contains_key(&target) {
+        return Err(format!("Cargo proof unit emitted island rows twice: {label}"));
+    }
+    rows.validate().map_err(|error| format!("invalid island rows from `{label}`: {error}"))?;
+    let prefix = format!("{}::", target.crate_name());
+    if let Some(row) = rows.rows.iter().find(|row| !row.key.starts_with(&prefix)) {
+        return Err(format!(
+            "island row `{}` does not name a declaration of `{label}`'s crate",
+            row.key
+        ));
+    }
+    admitted.insert(target, rows);
+    Ok(())
 }
 
 /// The package name a Cargo package ID names: the selected package's own
@@ -1338,6 +1383,10 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
     let mut declared_inventory = None;
     let mut censused_doctest_units = BTreeSet::<u64>::new();
     let mut compile_errors = Vec::new();
+    let mut clean_island_rows = BTreeMap::<
+        CargoTargetIdentity,
+        trust_types::clean_island_rows::CleanIslandRowsTransport,
+    >::new();
 
     while let Some(line) = read_bounded_utf8_line(&mut reader, max_line_bytes).map_err(|error| {
         format!("could not safely read Cargo JSON output line {}: {error}", line_index + 1)
@@ -1546,6 +1595,21 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
                     admit_proof_unit_identity(&mut proof_unit_identities, &target)?;
                     admit_primary_compile_target(&mut primary_compile_targets, &target)?;
                     require_declared_proof_target(declared_inventory.as_ref(), &target)?;
+                    // Island rows are disclosure (`crate::obligations`, CLEAN
+                    // ISLANDS): admitted once the envelope's scope and session
+                    // are checked, only before the unit's coverage, and never
+                    // a proof row, a proof count or a lifecycle step.
+                    if let trust_types::TransportMessage::CleanIslandRows(rows) =
+                        authenticated_message
+                    {
+                        admit_clean_island_rows(
+                            &mut clean_island_rows,
+                            proof_unit_lifecycles.get(&target).copied(),
+                            target,
+                            rows,
+                        )?;
+                        continue;
+                    }
                     proof_unit_lifecycles.entry(target.clone()).or_default().admit_transport(
                         &target,
                         &authenticated_message,
@@ -1665,6 +1729,7 @@ fn parse_cargo_json_stdout_impl<R: BufRead>(
         declared_inventory,
         authenticated_transport_messages,
         compile_errors,
+        clean_island_rows,
     };
     if evidence.build_succeeded == Some(true) {
         evidence
@@ -2895,6 +2960,13 @@ fn validate_cargo_transport_envelope(
             summary.primary_package,
             true,
         ),
+        trust_types::TransportMessage::CleanIslandRows(rows) => (
+            Some(rows.package_name.as_str()),
+            Some(rows.crate_name.as_str()),
+            rows.verification_session.as_str(),
+            rows.primary_package,
+            false,
+        ),
         _ => return Err("unsupported Trust transport message in Cargo envelope".to_string()),
     };
     if primary != expected_payload_primary
@@ -2920,6 +2992,7 @@ fn validate_cargo_transport_envelope(
         trust_types::TransportMessage::FunctionResult(result) => result.primary_package = true,
         trust_types::TransportMessage::CrateSummary(summary) => summary.primary_package = true,
         trust_types::TransportMessage::CoverageSummary(summary) => summary.primary_package = true,
+        trust_types::TransportMessage::CleanIslandRows(rows) => rows.primary_package = true,
         _ => unreachable!("supported variants matched above"),
     }
     Ok(Some((target, message)))
@@ -3169,6 +3242,10 @@ pub(crate) fn parse_compiler_stderr<R: BufRead>(reader: R, echo: bool) -> Parsed
                     trust_types::TransportMessage::CoverageSummary(coverage) => {
                         coverage_rows.push(coverage);
                     }
+                    // Island rows are disclosure, read only from an
+                    // authenticated Cargo envelope (`admit_clean_island_rows`):
+                    // never a proof row here, and no unknown row either.
+                    trust_types::TransportMessage::CleanIslandRows(_) => {}
                     _ => {
                         structured_results.push(unsupported_transport_message_result());
                     }
@@ -4771,6 +4848,336 @@ mod tests {
         assert_eq!(evidence.parsed.native_admission_observations.len(), 1);
         assert!(evidence.parsed.native_admission_problems.is_empty());
         assert_eq!(evidence.parsed.verification_results.len(), 1);
+    }
+
+    /// One unit's island rows: `rows` are `(name, status, stop, basis)`, keyed
+    /// `<krate>::<name>#<16 hex>`.
+    fn island_rows_message(
+        package: &str,
+        krate: &str,
+        phase: trust_types::clean_island_rows::CleanIslandPhase,
+        complete: bool,
+        rows: &[(&str, &str, &str, Option<&str>)],
+    ) -> trust_types::TransportMessage {
+        let mut rows: Vec<trust_types::clean_island_rows::CleanIslandRow> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (name, status, stop, basis))| {
+                trust_types::clean_island_rows::CleanIslandRow {
+                    key: format!("{krate}::{name}#{:016x}", index + 1),
+                    kind: "lean:theorem".to_string(),
+                    status: (*status).to_string(),
+                    stop: (*stop).to_string(),
+                    basis: basis.map(str::to_string),
+                    file: "src/lib.rs".to_string(),
+                    line: u32::try_from(10 + index).unwrap(),
+                    col: 5,
+                    source: Some(format!("{:064x}", index + 1)),
+                }
+            })
+            .collect();
+        rows.sort();
+        trust_types::TransportMessage::CleanIslandRows(
+            trust_types::clean_island_rows::CleanIslandRowsTransport {
+                schema: trust_types::clean_island_rows::CLEAN_ISLAND_ROWS_SCHEMA_V1.to_string(),
+                crate_name: krate.to_string(),
+                package_name: package.to_string(),
+                verification_session: TEST_SESSION.to_string(),
+                primary_package: true,
+                phase,
+                islands: 1,
+                complete,
+                problems: if complete {
+                    Vec::new()
+                } else {
+                    vec!["island 1 was not enumerated".to_string()]
+                },
+                rows,
+            },
+        )
+    }
+
+    const PROVED: (&str, &str, Option<&str>) = ("proved", "solved", None);
+
+    /// A successful unit of `demo` whose island rows precede its coverage.
+    fn island_unit_lines(
+        island_rows: Option<trust_types::TransportMessage>,
+    ) -> (BTreeMap<String, String>, Vec<serde_json::Value>) {
+        let package = "path+file:///fixture#demo@0.1.0";
+        let mut messages = vec![one_unknown_primary_function("demo", "demo", "demo::f")];
+        messages.extend(island_rows);
+        messages.push(complete_coverage("demo", "demo"));
+        messages.push(one_unknown_primary_summary("demo", "demo"));
+        let mut lines: Vec<_> =
+            messages.iter().map(|m| cargo_transport_envelope(package, "demo", m)).collect();
+        lines.push(cargo_artifact_with_kind(package, "demo", "lib", false));
+        ([(package.into(), "demo".into())].into_iter().collect(), lines)
+    }
+
+    fn two_island_rows() -> trust_types::TransportMessage {
+        let (status, stop, basis) = PROVED;
+        island_rows_message(
+            "demo",
+            "demo",
+            trust_types::clean_island_rows::CleanIslandPhase::Verified,
+            true,
+            &[("Demo.t", status, stop, basis), ("Demo.u", status, stop, basis)],
+        )
+    }
+
+    #[test]
+    fn island_rows_are_admitted_before_coverage_and_are_never_a_proof_row() {
+        let (selected, without) = island_unit_lines(None);
+        let baseline = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(without)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        let (selected, lines) = island_unit_lines(Some(two_island_rows()));
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(successful_cargo_input(lines)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .unwrap();
+        let [(target, rows)] = evidence.clean_island_rows.iter().collect::<Vec<_>>()[..] else {
+            panic!("{:?}", evidence.clean_island_rows)
+        };
+        assert_eq!(target.crate_name(), "demo");
+        assert_eq!(rows.rows.len(), 2);
+        // The proof rows, counts and coverage are exactly the run's without them.
+        assert_eq!(
+            serde_json::to_value(&evidence.parsed.verification_results).unwrap(),
+            serde_json::to_value(&baseline.parsed.verification_results).unwrap(),
+        );
+        assert_eq!(evidence.parsed.coverage_rows.len(), baseline.parsed.coverage_rows.len());
+        assert_eq!(
+            evidence.parsed.completed_proof_targets,
+            baseline.parsed.completed_proof_targets
+        );
+    }
+
+    #[test]
+    fn island_rows_out_of_place_twice_or_of_another_scope_fail_the_run() {
+        let refused = |lines: Vec<serde_json::Value>, selected: &BTreeMap<String, String>| {
+            parse_cargo_json_stdout(
+                Cursor::new(successful_cargo_input(lines)),
+                selected,
+                TEST_SESSION,
+                true,
+            )
+            .err()
+            .expect("refused")
+        };
+        let package = "path+file:///fixture#demo@0.1.0";
+        let (selected, mut lines) = island_unit_lines(Some(two_island_rows()));
+        // After the unit's coverage summary.
+        let mut after = lines.clone();
+        after.swap(1, 2);
+        let error = refused(after, &selected);
+        assert!(error.contains("island rows after its coverage summary"), "{error}");
+        // Twice.
+        let mut twice = lines.clone();
+        twice.insert(1, lines[1].clone());
+        let error = refused(twice, &selected);
+        assert!(error.contains("island rows twice"), "{error}");
+        // Another session, another crate.
+        let trust_types::TransportMessage::CleanIslandRows(mut other) = two_island_rows() else {
+            unreachable!()
+        };
+        other.verification_session = "another-session".to_string();
+        lines[1] = cargo_transport_envelope(
+            package,
+            "demo",
+            &trust_types::TransportMessage::CleanIslandRows(other.clone()),
+        );
+        let error = refused(lines.clone(), &selected);
+        assert!(error.contains("scope/session does not match"), "{error}");
+        other.verification_session = TEST_SESSION.to_string();
+        other.crate_name = "other".to_string();
+        for row in &mut other.rows {
+            row.key = row.key.replacen("demo::", "other::", 1);
+        }
+        lines[1] = cargo_transport_envelope(
+            package,
+            "demo",
+            &trust_types::TransportMessage::CleanIslandRows(other),
+        );
+        let error = refused(lines.clone(), &selected);
+        assert!(error.contains("scope/session does not match"), "{error}");
+        // A proved row in a payload that is not verified and complete.
+        let (status, stop, basis) = PROVED;
+        lines[1] = cargo_transport_envelope(
+            package,
+            "demo",
+            &island_rows_message(
+                "demo",
+                "demo",
+                trust_types::clean_island_rows::CleanIslandPhase::FrontEndError,
+                true,
+                &[("Demo.t", status, stop, basis)],
+            ),
+        );
+        let error = refused(lines, &selected);
+        assert!(error.contains("invalid island rows"), "{error}");
+        assert!(error.contains("is proved in a payload that is front-end-error"), "{error}");
+    }
+
+    #[test]
+    fn island_rows_of_a_unit_stopped_by_a_front_end_error_are_admitted_without_coverage() {
+        let package = "path+file:///fixture#demo@0.1.0";
+        let selected: BTreeMap<String, String> =
+            [(package.into(), "demo".into())].into_iter().collect();
+        let rows = island_rows_message(
+            "demo",
+            "demo",
+            trust_types::clean_island_rows::CleanIslandPhase::FrontEndError,
+            true,
+            &[
+                ("Demo.t", "failed", "solver-incomplete", Some("unproved_fail_closed")),
+                ("Demo.u", "unknown", "not-dispatched", None),
+            ],
+        );
+        let lines = vec![cargo_transport_envelope(package, "demo", &rows)];
+        let mut stream = cargo_input_with_inventory(lines, false);
+        stream.push_str("{\"reason\":\"build-finished\",\"success\":false}\n");
+        let evidence =
+            parse_cargo_json_stdout(Cursor::new(stream), &selected, TEST_SESSION, true).unwrap();
+        assert_eq!(evidence.build_succeeded, Some(false));
+        assert_eq!(evidence.clean_island_rows.len(), 1);
+        assert!(evidence.parsed.coverage_rows.is_empty());
+        assert!(evidence.parsed.verification_results.is_empty());
+    }
+
+    /// The frontend end to end over recorded island-row payloads, as the
+    /// compiler emitter will publish them: Cargo's stream through
+    /// `parse_cargo_json_stdout`, the records of the run, their snapshot and
+    /// the changed-only view. The emitter itself is not here (it needs a
+    /// stage-1 compiler); its payload's shape is the transport's.
+    #[test]
+    fn recorded_island_payloads_reach_the_record_and_the_changed_only_view() {
+        use trust_types::clean_island_rows::CleanIslandPhase;
+        let package = "path+file:///fixture#demo@0.1.0";
+        let refused = ("failed", "solver-incomplete", Some("unproved_fail_closed"));
+        let unchecked: (&str, &str, Option<&str>) = ("unknown", "not-dispatched", None);
+        let rows_of = |phase: CleanIslandPhase, t: (&str, &str, Option<&str>)| {
+            island_rows_message(
+                "demo",
+                "demo",
+                phase,
+                true,
+                &[
+                    ("Demo.t", t.0, t.1, t.2),
+                    (
+                        "Demo.u",
+                        if phase == CleanIslandPhase::Verified { "proved" } else { unchecked.0 },
+                        if phase == CleanIslandPhase::Verified { "solved" } else { unchecked.1 },
+                        None,
+                    ),
+                ],
+            )
+        };
+        let record = |message: trust_types::TransportMessage, built: bool| {
+            let (selected, lines) = island_unit_lines(Some(message.clone()));
+            let evidence = if built {
+                parse_cargo_json_stdout(
+                    Cursor::new(successful_cargo_input(lines)),
+                    &selected,
+                    TEST_SESSION,
+                    true,
+                )
+                .unwrap()
+            } else {
+                let lines = vec![cargo_transport_envelope(package, "demo", &message)];
+                let mut stream = cargo_input_with_inventory(lines, false);
+                stream.push_str("{\"reason\":\"build-finished\",\"success\":false}\n");
+                parse_cargo_json_stdout(Cursor::new(stream), &selected, TEST_SESSION, true).unwrap()
+            };
+            let records = crate::obligations::ObligationRecords::of_rows(
+                &[],
+                &crate::obligations::FunctionInventory::default(),
+                crate::obligations::RunFacts {
+                    lane: "strict".to_string(),
+                    policy: "strict".to_string(),
+                    selection: "default".to_string(),
+                    targo_trust_commit: "0".repeat(40),
+                    profile: "a".repeat(64),
+                    worker_threads: 0,
+                    outcome: trust_types::determinism::UnitOutcome::Measured,
+                    vector: "b".repeat(64),
+                    coverage_complete: built,
+                    degraded_anchors: 0,
+                },
+                crate::obligations::RunScope {
+                    selected: ["demo".to_string()].into_iter().collect(),
+                    resolved: BTreeSet::new(),
+                },
+                &crate::package_record::RunCoverage {
+                    rows: &evidence.parsed.coverage_rows,
+                    missing: BTreeSet::new(),
+                    publication_stops: &[],
+                    compile_errors: &evidence.compile_errors,
+                },
+            )
+            .with_clean_islands(
+                evidence
+                    .declared_inventory
+                    .as_ref()
+                    .map(|inventory| {
+                        inventory
+                            .proof_targets
+                            .iter()
+                            .map(|target| target.package_name.as_str())
+                            .collect::<Vec<_>>()
+                    })
+                    .as_deref(),
+                evidence
+                    .clean_island_rows
+                    .iter()
+                    .map(|(target, rows)| (target.package_name.as_str(), rows)),
+            );
+            vec![("demo".to_string(), records.package_ndjson("demo").unwrap())]
+        };
+        let target = tempfile::tempdir().unwrap();
+        let request = crate::agent_delta::DeltaRequest::default();
+        let publish = |records: &[(String, String)]| {
+            crate::agent_delta::publish_shown(target.path(), records, &request, Some("me"), false)
+                .lines()
+        };
+        let proved = rows_of(CleanIslandPhase::Verified, PROVED);
+        // First run: no base, both rows proved, so only the summary line.
+        let first = publish(&record(proved.clone(), true));
+        assert_eq!(first.len(), 1, "{first:#?}");
+        assert!(first[0].contains("; 2 island declaration(s)  (now "), "{first:#?}");
+        // A rerun with no edit: one line.
+        let again = publish(&record(proved.clone(), true));
+        assert_eq!(again.len(), 1, "{again:#?}");
+        assert!(again[0].contains("; 0 of 2 island declaration(s) changed"), "{again:#?}");
+        // A broken proof under a front-end error: the refused row and one
+        // count line, never every island row.
+        let broken = publish(&record(rows_of(CleanIslandPhase::FrontEndError, refused), false));
+        // The build failed, so the package's own header facts moved too: its
+        // `RUN` lines are the obligations' view, unchanged by islands.
+        let broken: Vec<&String> = broken.iter().filter(|line| !line.starts_with("RUN ")).collect();
+        assert_eq!(broken.len(), 3, "{broken:#?}");
+        assert!(
+            broken[0].starts_with(
+                "LOST        [FAILED: unproved, no counterexample; failed closed]  demo::Demo.t#"
+            ),
+            "{broken:#?}"
+        );
+        assert!(
+            broken[1].starts_with("NOT CHECKED  1 island declaration(s) of `demo` not checked"),
+            "{broken:#?}"
+        );
+        assert!(broken[2].contains("; 1 of 2 island declaration(s) changed"), "{broken:#?}");
+        // Fixed: compared with the last run that measured the islands.
+        let fixed = publish(&record(proved, true));
+        assert_eq!(fixed.len(), 1, "{fixed:#?}");
+        assert!(fixed[0].contains("; 0 of 2 island declaration(s) changed"), "{fixed:#?}");
     }
 
     #[test]

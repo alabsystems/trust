@@ -6163,6 +6163,10 @@ impl<'a> LoweringCtx<'a> {
             ) => {
                 let ty = self.map_type_ctx(expected_ty)?;
                 let result = self.fresh_value();
+                // These constants supply no derived address or metadata. Keep
+                // their producer classification through subsequent copies so
+                // an unsize cannot construct defined pointer parts from havoc.
+                self.mark_value_symbolic(result);
                 // Trust (2026-11-07): on the compiler path, the valtree-recovered
                 // promoted SHARED borrow of a fieldless (zero-sized) struct
                 // (`&UnitStruct`) or (2026-11-10) of an upvar-free closure (the
@@ -39158,19 +39162,16 @@ fn lower_rvalue(
             // `&*p` of `&[T]`/`&str`/`&dyn Tr` could only be a `Copy` at the
             // operand's own fat type, the sibling `Rvalue::AddressOf` arm's
             // spelling). On the THIN path `ptr_ir_ty` is `Ptr`, which equals the
-            // thin `borrow_result_ty`, so the respelling is type-identical. Each
-            // path keeps the symbolic marking it had: the fat path marks the
-            // result symbolic from its operand and the thin path does not
-            // (unifying them changes aggregate spellings downstream and is a
-            // separate, measured change).
+            // thin `borrow_result_ty`, so the respelling is type-identical.
+            // Copy preserves symbolic inputs on both paths. Otherwise a thin
+            // opaque address becomes apparently defined and a later unsize
+            // constructs pointer parts from a value this producer cannot derive.
             body.push(
                 InstrNode::new(Inst::Copy { ty: ptr_ir_ty.clone(), operand: ptr })
                     .with_result(result)
                     .with_proof(annotation),
             );
-            if matches!(ptr_ir_ty, TrustIrTy::FatPtr(_)) {
-                ctx.mark_result_symbolic_from(result, &[ptr]);
-            }
+            ctx.mark_result_symbolic_from(result, &[ptr]);
             assign_value_to_place(dest, result, ctx, body)?;
         }
         Rvalue::AddressOf(_mutable, place) => {

@@ -11,7 +11,7 @@
 //! This is the single most important file in the battery.
 
 clean {
-    theorem bogus : Nat.le 1 0 := Nat.le.refl 0
+    theorem bogus : Nat.le 1 0 := @Nat.le.refl 0
 }
 
 pub fn unreachable_if_kernel_works(x: u64) -> u64 {

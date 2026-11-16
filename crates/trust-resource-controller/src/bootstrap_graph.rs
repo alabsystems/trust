@@ -503,3 +503,5 @@ impl OutputReply {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::context as test_context;

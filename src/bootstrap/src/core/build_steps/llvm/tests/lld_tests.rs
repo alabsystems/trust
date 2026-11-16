@@ -34,6 +34,8 @@ fn paired_lld_cache_cannot_hide_a_changed_or_ambiguous_provider() {
     fs::create_dir_all(out.join("build")).unwrap();
     let cache = out.join("build/CMakeCache.txt");
     assert!(!lld_cached_provider(&out, &selected));
+    fs::write(&cache, format!("LLVM_DIR:UNINITIALIZED={}\n", selected.display())).unwrap();
+    assert!(!lld_cached_provider(&out, &selected), "an untyped same-provider hint is not binding");
     fs::write(&cache, format!("LLVM_DIR:PATH={}\n", selected.display())).unwrap();
     assert!(lld_cached_provider(&out, &selected));
     assert!(!lld_cached_provider(&out, &other));

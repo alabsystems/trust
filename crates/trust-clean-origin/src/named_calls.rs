@@ -1,9 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Source-side expansion of transparent Lean helper calls. This is a planning
-//! heuristic, never evidence: the gate still reads the original declaration
-//! from the environment and compares it with the independently reflected code.
+//! Source-side expansion of transparent Lean helper calls and immediately
+//! applied lambdas. This is a planning heuristic, never evidence: the gate still
+//! reads the original declaration from the environment and compares it with the
+//! independently reflected code.
 
 use std::collections::HashSet;
 
@@ -48,7 +49,12 @@ pub(crate) fn expand_named_calls(
         active: vec![declaration.clone()],
     };
     let result = expansion.walk(body, 0)?;
-    Ok((expansion.expanded != 0).then_some(result))
+    // Beta/zeta reduction can expose a scalar body without opening a named
+    // definition. Keep that complete candidate too; otherwise anonymous or
+    // locally bound pure lambdas are needlessly refused after successful
+    // expansion. The original source and independent faithfulness gate are
+    // unchanged, and every substitution still uses the existing effect checks.
+    Ok((expansion.expanded != 0 || result != *body).then_some(result))
 }
 
 struct Expansion<'a> {
@@ -290,11 +296,14 @@ impl Expansion<'_> {
                 self.walk(&substitute(body, &value)?, depth + 1)
             }
             ExprKind::MData(_, inner) => self.walk(inner, depth + 1),
-            ExprKind::Proj(name, field, inner) => Ok(Expr::proj_arc(
-                name.clone(),
-                *field,
-                std::sync::Arc::new(self.walk(inner, depth + 1)?),
-            )),
+            ExprKind::Proj(name, field, inner) => {
+                let inner = self.walk(inner, depth + 1)?;
+                if let Some(candidate) = self.projection_candidate(name, *field, &inner, &[])? {
+                    Ok(candidate)
+                } else {
+                    Ok(Expr::proj_arc(name.clone(), *field, std::sync::Arc::new(inner)))
+                }
+            }
             ExprKind::App(..) | ExprKind::Const(..) => self.application(expr, depth),
             // Binder types/propositions are retained, not evaluated as code.
             _ => Ok(expr.clone()),
@@ -323,6 +332,18 @@ impl Expansion<'_> {
         };
         crate::implemented_by::bound_callee(self.env, caller, name)
             .map_err(crate::implemented_by::NotRun::into_reason)?;
+        // The numeral reader deliberately protects this primitive spelling.
+        // A constructor-headed custom dictionary can instead propose its
+        // payload, without changing that reader or trusting the literal index
+        // as a value. The original source gate must independently establish
+        // this equation; no environment or constructor metadata is rewritten.
+        if name_eq_str2(name, "OfNat", "ofNat") && args.len() == 3 {
+            if let Some(candidate) =
+                self.projection_candidate(&Name::from_string("OfNat"), 0, &args[2], &args[..2])?
+            {
+                return Ok(candidate);
+            }
+        }
         // Preserve the established primitive spelling and opaque Rust callee
         // identity. In particular, a quoted display alias is never a match.
         if selection_head(name) || self.rust_names.contains(name) {
@@ -374,6 +395,55 @@ impl Expansion<'_> {
         let result = self.apply(body, &args, depth + 1);
         self.active.pop();
         result
+    }
+
+    /// Untrusted candidate selection for a fully applied, single-constructor
+    /// projection. These metadata tests choose a proposal, never permission:
+    /// the untouched original declaration is compared with independent scalar
+    /// reflection by the existing kernel/total-carrier gate.
+    fn projection_candidate(
+        &self,
+        family: &Name,
+        field: u32,
+        value: &Expr,
+        other_arguments: &[Expr],
+    ) -> Result<Option<Expr>, String> {
+        let ExprKind::Const(name, levels) = strip_metadata(value.get_app_fn()).kind() else {
+            return Ok(None);
+        };
+        let Some(constructor) = self.env.get_constructor(name) else {
+            return Ok(None);
+        };
+        let Some(inductive) = self.env.get_inductive(family) else {
+            return Ok(None);
+        };
+        if &constructor.inductive_name != family
+            || inductive.num_indices != 0
+            || inductive.constructor_names.as_slice() != std::slice::from_ref(name)
+            || constructor.level_params.len() != levels.len()
+            || field >= constructor.num_fields
+        {
+            return Ok(None);
+        }
+        let params = constructor.num_params as usize;
+        let fields = constructor.num_fields as usize;
+        let Some(arity) = params.checked_add(fields) else {
+            return Ok(None);
+        };
+        let arguments = value.get_app_args();
+        if arguments.len() != arity {
+            return Ok(None);
+        }
+        // Check every argument BEFORE dropping any, including type/index
+        // parameters and unused fields. Kernel equality alone can erase a
+        // native Rust effect or panic; the existing effect rail cannot.
+        for argument in other_arguments {
+            check_rust_call_free_with_names(self.env, argument, &self.rust_names)?;
+        }
+        for argument in &arguments {
+            check_rust_call_free_with_names(self.env, argument, &self.rust_names)?;
+        }
+        Ok(Some(arguments[params + field as usize].clone()))
     }
 
     fn apply(&mut self, mut body: Expr, args: &[Expr], depth: usize) -> Result<Expr, String> {

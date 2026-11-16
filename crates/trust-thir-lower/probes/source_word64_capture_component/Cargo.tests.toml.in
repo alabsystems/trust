@@ -1,0 +1,8 @@
+[package]
+name="rust-source-word64-record-tests"
+version="0.0.0"
+edition="2021"
+[workspace]
+[[test]]
+name="source-record"
+path="@TRUST_ROOT@/crates/trust-thir-lower/probes/source_word64_capture_component.rs"

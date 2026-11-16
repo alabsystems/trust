@@ -368,6 +368,7 @@ mod tests {
             declared_inventory: None,
             authenticated_transport_messages: Vec::new(),
             compile_errors: Vec::new(),
+            clean_island_rows: BTreeMap::new(),
         };
         let selected = [("path+file:///one#one@0.1.0".into(), "one".into())].into_iter().collect();
         assert!(evidence.require_successful_selected_roots(&selected, true).is_err());

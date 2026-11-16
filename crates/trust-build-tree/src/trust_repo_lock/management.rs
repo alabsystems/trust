@@ -463,14 +463,20 @@ impl Manager {
                 } else {
                     // Refused, since another account could have changed it. This
                     // crate made its holders 0775 under umask 002 before
-                    // `create_holder_directory`, and every verb, `break`
-                    // included, reads the holder through here, so the refusal
-                    // names the mode and the recovery, its path quoted so the
-                    // command can be pasted into a shell.
+                    // `create_holder_directory`, and every verb that reads the
+                    // holder (acquire, release, status and break;
+                    // reclaim-incremental reads none) reads it through here, so
+                    // the refusal names the mode and the recovery, its path
+                    // quoted so the command can be pasted into a shell. `break`
+                    // has no liveness check, so the recovery names it only for
+                    // a holder whose process lives on with no build under it.
                     Err(invalid(format!(
                         "holder directory {} is group or other writable (mode {:04o}); \
-                         check that its info is yours and names the holder you expect, \
-                         then run `chmod go-w {}` and `targo trust repo lock break --reason TEXT`",
+                         check that its info is yours and that no build still runs under \
+                         the holder it names, then run `chmod go-w {}`: the next acquire \
+                         takes over a holder whose process has exited, and \
+                         `targo trust repo lock break --reason TEXT` retires one whose \
+                         process lives on",
                         path.display(),
                         metadata.mode() & 0o7777,
                         crate::shell_word::quoted(&path)

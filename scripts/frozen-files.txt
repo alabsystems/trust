@@ -96,6 +96,27 @@
 #      alone. The gate fails on a waiver that is no longer needed, so a waiver
 #      cannot outlive the change it documents.
 #
+# EXACT INTRINSIC, SOURCE-IDENTITY AND MERGE EXCEPTIONS — 2026-11-12
+# Independent /root/frozen_source_review accepted exact lib.rs c380f823be7fe098dbffe4f0a72f6e2e684a507f
+# (+612/-248 from b9c pin), direct_obligations.rs 5d293c3c74030d581c2c195cdba8a4a3d18f0442
+# (+137/-54 from bdc pin), compiler lib.rs f0a8839be12b8d021019bfb2dfbf04cde6145db2
+# (+94/-25 from c84 pin), and comment-only f1_compile.rs 139f71444c64469edead557a2b287bdc40f37f94
+# (+6/-3 from e684 pin). DQ WRAPPING-INTRINSIC-IR-1 and DIRECT-OBLIGATION-SOURCE-KEY-1
+# record the new support/identity choices; source qualification of the merge also
+# reviewed repaired panic helper 987835e5141b4be1ddc3c2e86b3a13e4926ceadc and tests
+# 36f9118a7ac694d602739014da9dedf0b116f190. Keep ALL original pins and predecessor
+# arguments; none is a BYTE-IDENTICAL/refuses-more, native, proof or G1-G8 claim.
+# The exact waiver rows retain citations/residuals; every further blob needs review.
+#
+# EXACT CALL-PRESERVATION EXCEPTION — 2026-11-12
+# Independent /root/frozen_source_review accepted core_wrapping_add.rs exact
+# blob17c57f12a493ae85058be61a5dd306fe5499b3c5 (+8/-0 from unchanged8bcb pin),
+# DQ UPSTREAM-WRAPPING-CALL-1. A supplied entry preserves the real call; sealed
+# admission remains mandatory. No-entry model behavior stays; the old singleton
+# addition theorem does not cover entry-present call-bearing IR. This is a
+# support/capability trade-off, not BYTE-IDENTICAL/refuses-more or proof authority.
+# Keep the exact row's native/TCX residuals; no other movement inherits it.
+#
 # EXACT PRODUCER FEATURE EXCEPTION — 2026-11-06
 # Root independently adjudicated rmeta_entry.rs blob
 # 65d75e5a71ad9b9514517966b61e5352fda2933e:
@@ -231,14 +252,10 @@
 # Every lettered item is stated in full, with its refusal kind, in the merged
 # waiver row; its MUTATION EVIDENCE names the tests that fail with each
 # condition it lists removed, and its PROSE-RESIDUAL what no test reaches. No call_event or verify_output rule changes; a function sited at a
-# record grades Unknown and strict refuses it by policy (true until
-# 2026-11-15: since PKG-C5c S2a, call_event.rs's EXACT DEAD-TAIL-1
-# EXCEPTION below admits a dead sited tail's record pair, so such a function
-# can grade past O1 (s21 at O0 grades [VALIDATED]); verify_output.rs is still
-# unchanged and strict still refuses anything short of [PROVED]). A function in an
-# object the pin refused whole for its record may now be proved and shipped,
-# a function in an object the pin bound may now be refused with its object,
-# and (u) grades Unknown a call the pin paired; the row says how.
+# record grades Unknown and strict refuses it by policy. The Rust-only S2a
+# admission is withdrawn (PKG-C5c-DEAD-TAIL-1); verify_output remains unchanged.
+# The object-reader extension can bind records formerly refused whole; it
+# does not discharge the function's address materialization or failure call.
 # The original bf45acdd pin REMAINS. The merged exact-blob waiver accounts for
 # the complete +884/-66 movement from the pin: the earlier documentation
 # correction and `all_padding` helper (+22/-3, the pin to 5ca065b997), the
@@ -257,12 +274,12 @@
 # already computed for MachineSite::in_trap_tail). The walk's `unknown` text,
 # consumed relocations, sites, refusals and every grade are unchanged: the
 # line is computed once, recorded, then inserted as before. This increment
-# SAMPLES MORE and admits nothing; the admission that reads it is
-# call_event.rs's (EXACT DEAD-TAIL-1 EXCEPTION below). The merged row is
+# SAMPLES MORE and admits nothing; its former Rust-only admission
+# consumer is withdrawn below. The merged row is
 # re-keyed to 09cba96fcb with PIN-DELTA +983/-68 from bf45acdd08 and keeps
 # every earlier account; its PROSE-RESIDUAL (iv) "nothing outside the tests
-# reads verified_globals" held until this date: call_event.rs's DeadTails
-# now reads it in production (EXACT DEAD-TAIL-1 below).
+# reads verified_globals" is again true for this removed consumer; the
+# withdrawn DeadTails implementation no longer reads it in production.
 # ADJUDICATION 2026-11-15: a reviewer other than the author read blob
 # 09cba96fcb's increment and every consumer of `window.unknown`
 # (direct_ir_observation.rs, cer_memory_machine.rs, compiler_frame_inputs.rs,
@@ -272,95 +289,142 @@
 # the increment as SAMPLES MORE, admitting nothing. The two stale earlier
 # sentences it named are qualified above and in the waiver row.
 #
-# EXACT DEAD-TAIL-1 EXCEPTION — 2026-11-15 (ADJUDICATED 2026-11-15 for blob
-# d36a59d6d3; the post-review increment to 2c577f5e83 is disclosed below)
+# DEAD-TAIL-1 ADMISSION WITHDRAWN — 2026-11-15
+# The previous Rust-only S2a admission exception, including its historical
+# adjudication text, is withdrawn; no authority from that review is reused.
+# call_event restores the exact 787bd82833 acceptance boundary: no Unknown
+# filtering, no trap-tail call suppression, no raw ADRP X18 semantic override.
+# The cfg(test) reader/Unknown controls are retained and strengthened. The
+# complete predecessor waiver accounts and original pin remain unchanged;
+# the new exact row describes this refusal repair, not a new admission.
+# compiled_object page_halves/trap_tail remain DATA and confer no grade.
+# Independent review and composed compiler qualification are still required.
+#
+# BOOL-RET-EDGE-1 CALL ADMISSION WITHDRAWN — R21
+# The incoming co-emitted Bool call permission and both new post-call semantic
+# abstractions are removed pending a Lean-owned callee-to-caller relation.
+# Own-callee C2 remains in the actual kernel conjunction, with its range/value
+# controls; legacy Bool leaf refusal/no-C2 guard and tail refusal strengthening
+# remain. All original gate fixtures, both triples and O0/O3 cells remain;
+# former caller positives require precise O3 Unknown and strict refusal.
+# Algebra identities of a constructed poststate were not the missing bridge;
+# no Trusted-label, metadata, solver or structural-custody promotion is used.
+# Original pins 90fc6d2ecf and 0de9fa0451 remain. Exact-blob rows retain Root's
+# complete prior accounts, including withdrawn S2a and Rust-only S3d authority,
+# and add only the refusal strengthening/withdrawal scope. No predecessor
+# call-edge evidence is retagged as a current Lean or machine proof.
+#
+# EXACT LOOP-L0 EXCEPTION — 2026-11-15 (ADJUDICATED 2026-11-15 for blob
+# b95f32bd53, which the review-conditions commit leaves unchanged; every cited
+# test measured green 2026-11-15 on m32, branch loop-l0 merged with main
+# 859313686d; the review conditions met by the author, not re-reviewed; the
+# stage-1 F1 ladder NOT RUN)
 # trust-cg-bridge/src/call_event.rs blob
-# 2c577f5e83ed467f20cd10c725860c26d979198e (PKG-C5c S2a; docs/DECISION_QUEUE.md
-# PKG-C5c-DEAD-TAIL-1) ADMITS MORE in a SAMPLE-MORE-OR-REFUSE-MORE file; it is
-# not byte identity, samples-more or refuses-more. Its author does not certify
-# it; the ADJUDICATION at the end of this block records the independent
-# review, and what it did not cover.
-# Newly ACCEPTED, where blob 260da39500 graded Unknown:
-#   O1. A function whose only `window.unknown` lines are those of admitted
-#       pairs grades O1 Proven (detail: the walk's text, then "N dead
-#       panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a)" and
-#       each pair). A pair is admitted when ALL hold: an `adrp` at o and an
-#       `add` (64-bit immediate) at o+4, both in one trap run of
-#       `window.trap_tail`; Mach-O ARM64_RELOC_PAGE21 pcrel length 2 then
-#       ARM64_RELOC_PAGEOFF12 not pcrel length 2, or ELF
-#       R_AARCH64_ADR_PREL_PG_HI21 then R_AARCH64_ADD_ABS_LO12_NC (same flags);
-#       both against one symbol-table entry (never section-relative or
-#       non-extern), addends 0, in-word immediates 0, the `add`'s shift 0,
-#       adrp.Rd == add.Rn; the entry a defined, LOCAL, non-weak Object in
-#       `layout.verified_globals`, named as the uniquely named, immutable,
-#       non-TLS, Internal or Private M_cg global that the PanicLocation::Global
-#       of some sited Assert of this function's own M_cg body names; and the
-#       run whole: the pair the only one of its run, the run holding exactly
-#       one site, a Call naming the PanicSite.entry of an Assert located at
-#       that record (any such Assert), the word after it the run's trap. A run
-#       failing any of these admits none of its pairs (O1 stays Unknown).
-#   O2. A trap-tail site that is the one call of an admitted pair's run: it
-#       enters neither the pairing nor the events. The O2 detail appends
-#       "panic tails at [..] are unreachable wherever the IR returns (O4 reach
-#       + (4b), decided by ay; kernel-checked only at [PROVED]); entry and
-#       Location unverified (PKG-C5c S2)" when O4 is Proven, and otherwise
-#       "panic tails at [..] admitted unexecuted on the condition that O4
-#       reach + (4b) hold, which this certificate does not establish; entry
-#       and Location unverified (PKG-C5c S2)". Every other trap-tail site
-#       keeps blob 260da39500's Unknown text. Because a tail's `bl` is not in
-#       mach_sites, the Inlined route can now be taken for a co-emitted callee
-#       whose `bl` a dead tail still holds (sound: O3/O4 bind the inlined
-#       semantics and the tail is dead wherever O4 holds).
-#   X18. CerExec::trap_tail_writes_x18 reads an admitted `adrp` by its raw Rd
-#       (`word & 0x1f == 18` is an X18 write) instead of decoding it (decode
-#       refuses `adrp`); every other tail word is decoded as before.
-# Soundness rests on O4 reach and (4b), both items of the step-(4)
-# conjunction, decided by ay and kernel-checked only when the function grades
-# [PROVED] (at [VALIDATED], as s21 at O0, on ay's UNSAT alone): CerExec scores a path into a trap tail reach=false, so a tail reached where
-# the IR returns is Refuted at O4, and (4b) refuses a check that can fail on a
-# reached path. The admitted tail is UNCLAIMED: its entry call and Location
-# operand are unverified (S2's P1/P2). The shape conditions above are SCOPE
-# POLICY, not soundness. verify_output.rs is unchanged: its legacy
-# trap_tail_writes_x18/decode_at still refuses a tail `adrp`.
-# The original 90fc6d2ecf pin REMAINS. The re-keyed exact-blob waiver accounts
-# for the complete +2447/-188 movement from the pin (the S2a increment over
-# 260da39500 is +320/-22, its tests in call_event/dead_tail_tests.rs, a new
-# unfrozen file) and keeps every earlier account. Its MUTATION EVIDENCE names
-# the tests that fail with each condition IT LISTS removed. The conditions with
-# no mutant or no separating fixture are named in its PROSE-RESIDUAL. No other
+# b95f32bd53c2e9d9cb8ea03b3b84c8d324a709ce (+138/-14 over a40b88156f; PLAN
+# PKG-C5c-L0, docs/design/2026-11-15-pkg-c5c-loop-cut-points.md) REFUSES THE
+# SAME AND ADMITS NOTHING. Its author does not certify it; the REVIEWS at the
+# end of this block record the two independent reviews of this exact blob.
+# What every build compiles: spec_entry (eval_spec's entry environment and
+# SpecCx literal moved out token for token; eval_spec calls it and evaluates
+# as before, each Err with its text and order) and CerExec::is_cut, constant
+# false without test-hooks, conjoined negated into the three branch-level
+# backedge tests (so `visited.contains(&t) && !false` is the old test).
+# What only cfg(feature = "test-hooks") compiles (the compiler enables the
+# bridge with ay-proofs and kernel-recheck only): mod loop_cut; SpecCx.cut
+# (None in spec_entry's one literal) and its arm in SpecCx::edge;
+# CerExec.cut_addrs and cut_arrivals (empty in CerExec::new's one literal) and
+# the arrival arm at the top of CerExec::run; and analyze's one caller, in the
+# spec Err arm, gated on !observe_only, OriginalMode::Produce and the backedge
+# text, which records into a thread-local only a test installs and is followed
+# by the unchanged `spec side: {e}` Unknown and `return None`.
+# REFUSES THE SAME: with cut None and cut_addrs empty (every grading SpecCx and
+# CerExec) the edge arm and the arrival arm never fire and is_cut is false, so
+# every refusal, its text and its order is as in a40b88156f. Every loop's O4
+# stays `spec side: loop/backedge at bb{N} (fail-closed)` byte for byte, and
+# the report's JSON is byte-identical with and without the recorder (pinned
+# for r03, s06, s24 at O0 and O2 on both triples).
+# ADMITS NOTHING: loop_cut.rs holds no reference to a certificate, mints no
+# evidence, has no Refuted arm, and writes only its thread-local record; a
+# measurement that discharges every item is still Unknown. It calls ay only
+# through require_production_allowed (observe-only under without_production
+# records nothing and calls no solver, pinned) and is bounded by deterministic
+# caps only: 256 queries, 65 536 machine steps in total (a run starts only
+# when its worst case, CerExec's MAX_MACHINE_STEPS + 1 = 4 097, still fits),
+# 50 000 nodes per query, 8 cut blocks, 24 assignments; no wall clock decides
+# anything (PKG-DET). ay itself has no deterministic bound (no timeout; its
+# learned_clause_limit only triggers reduction), so one hard query under the
+# node cap can run unbounded: test-only liveness in L0, and L2 must add a
+# deterministic solver bound before it grades.
+# FROZEN AT L2, NOT HERE: call_event/loop_cut.rs has no manifest row in L0. It
+# grades nothing and is not compiled into the compiler. PKG-C5c-L2, which
+# makes it grade, freezes it with that blob and adds DECISION_QUEUE
+# LOOP-SIM-1 and its TCB.md sentence.
+# MUTATION EVIDENCE: (2026-11-15, each applied to blob b95f32bd53 under the
+# mutation lock, run with --no-fail-fast --lib --test call_event_gate -- l0_,
+# restored and cmp-confirmed; logs <home>/trust-cp-logs/l0/mut): ten
+# source mutants of the new code, each killed: m1 every item refl; m2 a SAT
+# answer Proven; m3 the SpecCx::edge arm on any target block; m4 the machine
+# arrival at the segment's first instruction; m5 is_cut false under test-
+# hooks; m6 non-injective assignments; m7 the query cap off by one; m8 the
+# observe-only guard dropped; m9 exit.cond compared with itself (it survived
+# the first battery; the wrong-exit pin that first killed it read exit.cond on
+# the WRONG reported pair, `%0 in X0` with X3 pinned, where exit.cond is a
+# counterexample even for clean bytes; since the review-conditions commit it
+# is killed on the CORRECT pair, loop_cut/tests.rs
+# l0_exhaustive_pairs_pin_the_pinned_path_and_the_exit_condition); m10 x - 0
+# folded from the left.
+# REVIEWS (2026-11-15): two non-author reviews of blob b95f32bd53.
+# Refuses-same lens, ACCEPT WITH CONDITIONS, no blocker ("the claim that
+# verdicts are unchanged" settled by reading and a mixed-module probe):
+# spec_entry is eval_spec moved out token for token, is_cut is constant false
+# outside test-hooks, no production feature set enables test-hooks, the
+# recorder leaves a later function's grade unchanged. Evidence lens, ACCEPT
+# WITH CONDITIONS, no blocker ("L0 grants nothing, so no soundness question
+# is left open"); its ten source mutants of the new code killed r6 and r7 and
+# left r1, r2, r4, r8, r9, r10, r11 and r13 alive. Conditions, taken in the
+# review-conditions commit (call_event.rs unchanged, loop_cut.rs and tests
+# only): (1) origin/main merged (859313686d), the exit test and this check
+# re-run on the merged tree; (2) the compiler's feature set (ay-proofs,
+# kernel-recheck, no test-hooks) and test-hooks alone each built with
+# --all-targets (see the STATUS row; mlock.sh hard-codes test-hooks, so a
+# sibling script with the same lock named the features); (3) the reviewer's
+# mixed-module pin committed, the plain run after the recorded one on the
+# SAME gate thread (call_event_gate.rs
+# l0_the_recorder_leaves_a_mixed_module_byte_identical); (4) the false claim
+# that the pinned path runs in no fixture corrected: it runs on every O0
+# rung and is now asserted (stale latch and wrong exit report `%0 in X0`
+# with X3 pinned and step.pinned(X3) discharged; the clean s06's first pair
+# likewise); no fixture reproduces a hoisted ground-constant pin;
+# (5) every mutant's exact undischarged set, reported live-ins and pins
+# pinned, and three object mutants added (exit `mov x0, x1`, `mov x0, x3`:
+# only exit.return; body `add x1, x1, #1; mov x19, x0`: only
+# step.frame(X19)), killing r1 and r2; per-segment item counts and the x18
+# and cover items pinned (r4, r10); the step cap made a true total bound
+# (before, Machine::run tested the total only before a run, so it could pass
+# 65 536 by up to 4 097) and pinned at 4 096 and 4 097 (r8, and the old
+# check as r8b); the node cap pinned at 0 (r9); the entry-arrival leaf check
+# moved into entry_arrivals_closed and unit-tested (r11: no call-free
+# fixture reaches it); (6) the unsited-check decline pinned byte for byte,
+# `checks:` at bb1 and bb2; (7) ay's missing deterministic bound recorded
+# above for L2. NOT KILLED, by judgement: r13 (the OriginalMode::Produce
+# guard in analyze removed) is equivalent today: in Replay mode analyze
+# returns at leaf_memory::replay_source_shape for every function of more
+# than one block, before the spec side, and a backedge needs a branch, which
+# that shape forbids; the guard stays as defence for L2. The re-run battery
+# over the final loop_cut.rs (logs <home>/trust-cp-logs/l0/cond-mut):
+# nine mutants, each killed: r1 (exit.return self-compared) and m9
+# (exit.cond self-compared) by the exhaustive-pairs unit test and the
+# machine-mutant test; r2 (step.frame self-compared) by the machine-mutant
+# test; r4 (loop cover dropped) and r10 (x18 item dropped) by the O0 and O2
+# rung tests; r8 (step cap off) and r8b (the old before-a-run check) by
+# l0_the_step_cap_bounds_the_total; r9 (node cap off) by
+# l0_the_node_cap_leaves_large_items_unknown; r11 (entry leaf check off) by
+# l0_entry_arrivals_mention_entry_leaves_only. Survivors: none of these; r13
+# not re-run (equivalent, above).
+# The pin 90fc6d2ecf REMAINS. The re-keyed exact-blob waiver keeps every
+# earlier account and states the cumulative PIN-DELTA (+2778/-166). No other
 # blob inherits this exception; a further edit needs its own row and its own
 # review. Executable freeze checks are unchanged.
-# ADJUDICATION 2026-11-15: a reviewer other than the author read blob
-# d36a59d6d3's movement and ACCEPTED the soundness of the admission. Its
-# reasons: CerExec scores entry into any trap-set word reach=false; the
-# executor's trap set equals window.trap_tail (pinned); the O4 item
-# spec_reach AND NOT machine_reach and the (4b) items are both in the
-# conjunction; the tail's contents never matter where the claim applies; the
-# raw-Rd test is exact for ADRP; the live path, the leaf route and the other
-# executors are unaffected or fail closed. The review re-ran the blobs,
-# PIN-DELTAs, ENFORCED-BY names and freeze gate, and found the rows exact. It
-# withheld adjudication until its two text findings were fixed: deadness is
-# "decided by ay; kernel-checked only at [PROVED]", not "kernel-checked"; and
-# the stale LOCATION-RECORD and verified_globals sentences are now qualified.
-# Both are fixed in 2c577f5e83. A second reviewer read the increment
-# d36a59d6d3 -> 2c577f5e83 (+71/-35) and ACCEPTED it: the whole-run rule only
-# drops collected pairs (O1 back to Unknown, the adrp back to the refusing
-# decode), the O2 text is detail that finish does not read, run bounds
-# start..=trap and offset+4 == trap match trap_run, and no partial run is
-# admitted.
-# A second reviewer confirmed the logs, counts and blobs. It found that no
-# test kept O1 Unknown for an admitted pair plus another line, and that the
-# mutation claim overstated the battery. Both are fixed in 2c577f5e83: there
-# is a whole-account test, and the battery was re-run on 2c577f5e83 with the
-# missing conditions added or named.
-# NOT separately reviewed: the increment from d36a59d6d3 to 2c577f5e83. It
-# makes four changes:
-#   (a) the whole-run rule, which REFUSES MORE and moves three former O2
-#       Unknown cells to O1 Unknown;
-#   (b) the conditional O2 text, read after the original-conjunction binding
-#       may reopen O4;
-#   (c) comments;
-#   (d) its tests.
 #
 # EXACT FOREIGN SCALAR PROTOTYPE EXCEPTION — 2026-11-11
 # Decision: docs/DECISION_QUEUE.md FOREIGN-SCALAR-SIGNATURE-1.
@@ -1057,7 +1121,10 @@ crates/trust-thir-lower/src/metadata_site/resolve.rs|6fefe51fe44109026754a37eb3e
 crates/trust-thir-lower/src/lib.rs|b9c101533f936507db8a2ddb3d9c87e716ef7e22|BYTE-IDENTICAL|Exact actual-Rust argument/type/const encoder and typed carrier used by new identity equality; whole-file protection intentionally includes its producer code
 crates/trust-thir-lower/src/core_wrapping_add.rs|8bcb65a51d7cb0ac8c771727a26e39b88c423676|BYTE-IDENTICAL|Versioned actual-core U64 wrapping-add model recognizer and once-only ordered lowering; source fingerprints select a model, not cryptographic authentication or source/body/proof authority. Exact adjudication: cd8558a1cf:docs/decisions/2026-11-07-core-u64-wrapping-add-producer.md
 crates/trust-thir-lower/src/to_mir.rs|0676e4e8a2785f244da56d04d15d92035a53044c|BYTE-IDENTICAL|Exact Rust argument/type/const reconstruction used by metadata identity recovery; whole-file protection grants no MIR production authority
+# EXACT CLEAN FRONTEND EXTENSION: only lib.rs blob09b8051baf3a2301b5b98861f41c4cf8fa2cf388, under DQ LEAN-F1-FRONTEND-ADMISSION-1. The complete original-pin +76/-25 includes the historical checked foreign factory and the new current-Session Clean handoff. This deliberately extends runtime admission; it is not BYTE-IDENTICAL/REFUSES-MORE. The original pin remains, and the exact-blob waiver accounts for the whole movement. The authoritative delegate is separately pinned below. This source review is not an independent-verifier claim, a test waiver, proof-grade authority, loaded-image proof or G1-G8 evidence; actual qualification and landing remain required. No other path/blob inherits the exception.
 compiler/rustc_codegen_trust_cg/src/lib.rs|c84d82f429d6c1d1f24c58ada7ea98c3d3e92a05|BYTE-IDENTICAL|Effective Always AArch64 object-frame setting, explicitly adjudicated in cd8558a1cf:docs/decisions/2026-11-07-f1-forced-frame-pointers.md; shared FnAbi/source/proof refusals unchanged
+compiler/rustc_codegen_trust_cg/src/clean_admission.rs|e8c6abbbac67b2ddf88e7a08248391b26f7df7dc|BYTE-IDENTICAL|Current-Session conserved Clean ledger, actual CER producer and compiler-owned placement custody; live private admissions remain borrowed through the Compiler callback
+compiler/rustc_mir_transform/src/clean_origin_import.rs|7a1f0fff0c3e72137a1a911527f7f5730598e253|BYTE-IDENTICAL|Full local-kernel, environment, encoded signature and available-body readmission before exact-DefId Session-local plan retention; no serialized verdict or unchecked plan can install a caller model
 compiler/rustc_codegen_trust_cg/src/trust_ir_frontend/clean_below_gate.rs|ab03f700ff8299f273437f8790b594e7e3e3d865|BYTE-IDENTICAL|Actual Clean-origin refusal delegate prevents Rust R stand-ins from becoming Clean bodies; no Clean carrier admission
 
 # 2026-11-06 exact R declaration installation: independent source adjudication
@@ -1138,9 +1205,13 @@ compiler/rustc_middle/src/ty/instance_seam_snapshot/pinned-production.txt|11f940
 # enforced by memory, and the file took admissions on 2026-11-09 and 2026-11-10.
 # A waiver here can argue only refuse-more or sample-more.
 crates/trust-cg-bridge/src/module_to_lir.rs|c494c627ee3d718d31bc9cbb7a0b4b1cf6877f4d|SAMPLE-MORE-OR-REFUSE-MORE|R-5: the lir consumer gets no new coverage; the row goes with the file when PKG-C2b exits
+crates/trust-clean-ir-gate/src/lib.rs|fd921c03bb523fda03c62f1d206a5c383bf393e3|BYTE-IDENTICAL|the carrier reflector, private kernel-bound permissions and publication authentication; codegen relocation cannot inherit a forged or stale subject
+crates/trust-clean-ir-gate/src/codegen.rs|6ef3b9992ab7ef41c32bb2c19a3b0ae2d8d95b6f|BYTE-IDENTICAL|step 3.6 identity-ABI third binding: reauthenticates the ledger and requires whole-function equality except compiler-owned id, linkage and visibility
 
 # EXACT CONST-TYPE API REPAIR EXCEPTION: only crates/trust-thir-lower/src/instance_const.rs at blob4585c2b416ae1e7f5c94cd533209cd807f954e71, under docs/DECISION_QUEUE.md D17-CONST-SOURCE and independent Root exact source review. The original bc3a7e6ba36c085cf6d56b9afe55c74539e7fd6b pin stays; whole movement +1/-1 unwraps type_of identity data with the maintained skip_normalization API BEFORE the existing checked monomorphize funnel and all declared/expression/value equality checks. This repairs actual fd9 E0308, not a type-check removal or new fallback. No other path/blob inherits the exception; actual qualification is separate.
 crates/trust-thir-lower/src/instance_const.rs|bc3a7e6ba36c085cf6d56b9afe55c74539e7fd6b|BYTE-IDENTICAL|Actual instance const-argument owner/index/kind/type binding and checked scalar Value-leaf transport; ordinary IR literal data only, no MIR body, value-evaluation fallback, admission token or proof authority
+crates/trust-cg-bridge/src/f1_compile.rs|e68412544c3c8d5cac99ee35eb184fa949e0ae3d|BYTE-IDENTICAL|the explicit Clean Compiler boundary: ordinary D31 API stays closed; live carrier permissions and unchanged CER shipping policy gate the optional API
+crates/trust-cg-bridge/src/f1_compile/clean_admission.rs|3143c80e1775f1fe32a895233703c930247e0125|BYTE-IDENTICAL|step 3.6 actual-module and output-gate source binding; copied stamps and other-producer authority reuse cannot inherit an authenticated Clean permission
 crates/trust-cg-bridge/src/verify_output_instantiate/branch_reflect.rs|76c7c87f521ac605c70fad757b313c60a493fb08|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 reflection: the ctx.branching arms (bit-vector Ite, faithful BvUDiv, high extract, condition B) that state the goal, the kernel-instance steps and condition bridges the proving pass splices, and the closed-data whitelist every kernel-evaluated closed term must pass; legacy contexts never reach it
 crates/trust-cg-bridge/src/verify_output_instantiate/branch_theory.rs|974c9e1f8848e7db868d3e7c704f1bc25bb2f6d9|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 kernel theory: the Trust.BVB / Trust.BVS.mul_add_self / zext_drop1_div2 theorems (each add_decl-checked), the audited branch base and environment, the constant decoder and the term-derived label
 crates/trust-cg-bridge/src/verify_output_instantiate/branch_split.rs|56ee86299dd0e22881dbb630fed6c0d11e325a94|SAMPLE-MORE-OR-REFUSE-MORE|BRANCH-SPLIT-1 route: goal built first from the items under branching_goal and only inside the width walk (trusted residual, not bypassable), caps and leaf checks that only decline, the atom case split, And.intro join and admission only through strength::admit_obligation; unwired until S3
@@ -1180,6 +1251,11 @@ crates/trust-cg-bridge/src/verify_output_instantiate/const_div_theory.rs|6e82ca1
 # goal_udiv_agrees_with_smt_on_non_power_of_two_pairs (div_split/tests.rs 15b5517a); open: div_split's
 # own has_var (div_split.rs:120-124) duplicates branch_split::has_var and can only decline on a
 # disagreement; reuse it, and drop "PROPOSED" from the row below, when the pin next moves.
+# This adjudication does not cover the PKG-C5c-S3b movement (blob 10601fdb, the proving arms
+# div_split::ite/udiv under div_proving; its waiver row in scripts/frozen-waivers.txt, which records
+# its two reviews and carries the open has_var item above, deferred because branch_split::has_var is
+# private to frozen branch_split.rs): the pin moves only after a reviewer other than the author
+# adjudicates that blob.
 # Prose residual: the delegation itself
 # is one line in an UNFROZEN file, verify_output_instantiate.rs try_branch_split_conjunction
 # (`let evidence = branch_dispatch::try_conjunction(items);`); an edit there (calling
@@ -1207,3 +1283,9 @@ crates/trust-cg-bridge/src/verify_output_instantiate/const_div_theory.rs|6e82ca1
 # and 2 gate tests; the dispatch reversed fails nothing (equivalent, above).
 crates/trust-cg-bridge/src/verify_output_instantiate/div_split.rs|c8525935aed8d9648674b9c3eeac160fd56c0b0a|SAMPLE-MORE-OR-REFUSE-MORE|DIV-SPLIT-1 route (PROPOSED, ADMITS MORE): the symbolic-divisor pre-filter, the walk_view substitution into the frozen walk (trusted residual: the one widened arm), goal_of from the original items under branching_goal (its loop a copy of branch_split::goal_of's, trusted, pinned equal to it and by DIV_GOAL_PIN), the deep atom abstraction and decline-only leaf comparison, the kernel check on the shared pool with no wall-clock deadline, admission only through strength::admit_obligation and the DIV-SPLIT-1 label
 crates/trust-cg-bridge/src/verify_output_instantiate/branch_dispatch.rs|d1e967f75e5012b14f9c309c3daac942f7d145bf|SAMPLE-MORE-OR-REFUSE-MORE|step-(5) branch-route dispatch (PROPOSED, ADMITS MORE): branch_split first and unchanged when Some, div_split only on its decline; what every BRANCH-SPLIT-1 call site now receives
+
+# First-time source snapshots for standalone object custody. These only detect
+# future byte changes; no reviewer/owner executable-pin ratification or new
+# semantic/proof certification is claimed. Existing executable pins above stay.
+crates/trust-clean-ir-gate/src/standalone.rs|3daadbf47736521e7e2fed69069240522cf4d0ad|BYTE-IDENTICAL|Existing standalone scalar kernel gate plus exact private publication/context custody; initial conservative source snapshot only
+crates/trust-cg-bridge/src/f1_compile/standalone_admission.rs|80fe446f07e59a86fe1354e786c0177d357a3238|BYTE-IDENTICAL|Exact standalone source/target/output-producer custody; initial conservative source snapshot only

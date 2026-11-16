@@ -248,6 +248,16 @@ ignore = [
     # the sweep is mechanical.
     "/tests/ordinary-rust-sweep/s20.rs",
 
+    # Trust: the bench's 71 programs, each the quoted source of one
+    # `b <category> <name> '<source>'` row of scripts/daily_driver_bench.sh and a
+    # newline. targo-trust's unit test
+    # corpus_delta::tests::cases::the_bench_table_matches_its_script compares
+    # each file with its row byte for byte, and the rows are one line each,
+    # which is not how the formatter writes them: measured 2026-11-14,
+    # `trustfmt --check` rewrites all 71. The script is the source until it is
+    # deleted (docs/PLAN.md PKG-S1 SE16); change a program there and here.
+    "/tests/daily-driver-bench/",
+
     # ---------------------------------------------------------------------
     # Trust: AN ENFORCED LINE CITATION POINTS INTO THESE (third pass,
     # 2026-09-27, organised by MECHANISM rather than by tree). The ledgers under

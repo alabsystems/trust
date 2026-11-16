@@ -239,6 +239,102 @@ impl FnBody {
 }
 
 // ===========================================================================
+// PKG-C5c-L0: THE LADDER'S LOOP RUNGS (r03, s06, s24) AS TRUST-IR
+// ===========================================================================
+
+/// A loop rung of tests/trust-f1-ladder, each `extern "C" fn rung(x: u64) -> u64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopRung {
+    /// `while i < x { s = s + (i ^ (s >> 3)); i += 1 } s`
+    R03,
+    /// `while i < x { s += i; i += 1 } s`
+    S06,
+    /// `loop { if i <= 1 { break } i = if i & 1 == 0 { i >> 1 } else { i * 3 + 1 }; n += 1 } n`
+    S24,
+}
+
+pub const LOOP_RUNGS: [LoopRung; 3] = [LoopRung::R03, LoopRung::S06, LoopRung::S24];
+
+/// The rung's function `rung` in a module of its own, laid out as the producer
+/// lays out the ladder's: bb0 the entry, bb1 the loop header (its parameters
+/// the loop variables), then the blocks in source order.
+pub fn loop_rung_module(rung: LoopRung, linkage: Linkage) -> Module {
+    let mut mb = ModBuilder::new("loop_rung");
+    let s = mb.sig(&[Ty::U64], Some(Ty::U64));
+    mb.define("rung", s, linkage, |fb| loop_rung_body(rung, fb));
+    mb.finish()
+}
+
+/// The body of [`loop_rung_module`]'s `rung`.
+pub fn loop_rung_body(rung: LoopRung, fb: &mut FnBody) {
+    let x = fb.p(0);
+    match rung {
+        LoopRung::R03 | LoopRung::S06 => {
+            let (head, hv) = fb.block(&[Ty::U64, Ty::U64]);
+            let (body, _) = fb.block(&[]);
+            let (exit, _) = fb.block(&[]);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.br(head, &[zero, zero]);
+            fb.switch_to(head);
+            let (i, s) = (hv[0], hv[1]);
+            let go = fb.icmp(ICmpOp::Ult, Ty::U64, i, x);
+            fb.cond_br(go, body, &[], exit, &[]);
+            fb.switch_to(body);
+            let s2 = if rung == LoopRung::S06 {
+                fb.bin(BinOp::Add, Ty::U64, s, i)
+            } else {
+                let three = fb.konst(Ty::U64, 3);
+                let sh = fb.bin(BinOp::LShr, Ty::U64, s, three);
+                let t = fb.bin(BinOp::Xor, Ty::U64, i, sh);
+                fb.bin(BinOp::Add, Ty::U64, s, t)
+            };
+            let one = fb.konst(Ty::U64, 1);
+            let i2 = fb.bin(BinOp::Add, Ty::U64, i, one);
+            fb.br(head, &[i2, s2]);
+            fb.switch_to(exit);
+            fb.ret(s);
+        }
+        LoopRung::S24 => {
+            let (head, hv) = fb.block(&[Ty::U64, Ty::U64]);
+            let (done, _) = fb.block(&[]);
+            let (test, _) = fb.block(&[]);
+            let (even, _) = fb.block(&[]);
+            let (odd, _) = fb.block(&[]);
+            let (join, jv) = fb.block(&[Ty::U64]);
+            let zero = fb.konst(Ty::U64, 0);
+            fb.br(head, &[x, zero]);
+            fb.switch_to(head);
+            let (i, n) = (hv[0], hv[1]);
+            let one = fb.konst(Ty::U64, 1);
+            let stop = fb.icmp(ICmpOp::Ule, Ty::U64, i, one);
+            fb.cond_br(stop, done, &[], test, &[]);
+            fb.switch_to(done);
+            fb.ret(n);
+            fb.switch_to(test);
+            let one = fb.konst(Ty::U64, 1);
+            let low = fb.bin(BinOp::And, Ty::U64, i, one);
+            let zero = fb.konst(Ty::U64, 0);
+            let is_even = fb.icmp(ICmpOp::Eq, Ty::U64, low, zero);
+            fb.cond_br(is_even, even, &[], odd, &[]);
+            fb.switch_to(even);
+            let one = fb.konst(Ty::U64, 1);
+            let half = fb.bin(BinOp::LShr, Ty::U64, i, one);
+            fb.br(join, &[half]);
+            fb.switch_to(odd);
+            let three = fb.konst(Ty::U64, 3);
+            let m = fb.bin(BinOp::Mul, Ty::U64, i, three);
+            let one = fb.konst(Ty::U64, 1);
+            let p = fb.bin(BinOp::Add, Ty::U64, m, one);
+            fb.br(join, &[p]);
+            fb.switch_to(join);
+            let one = fb.konst(Ty::U64, 1);
+            let n2 = fb.bin(BinOp::Add, Ty::U64, n, one);
+            fb.br(head, &[jv[0], n2]);
+        }
+    }
+}
+
+// ===========================================================================
 // PKG-C5c S2a: A SITED DIVISION CHECK (LADDER RUNG s21)
 // ===========================================================================
 
@@ -369,6 +465,34 @@ pub fn sited_div(guarded: bool, record: DivRecord) -> (Module, Module) {
     body(&mut producer, None);
     (m_cg.finish(), producer.finish())
 }
+
+/// [`sited_div`] compiled for `triple` at `opt`: the bytes from `M_cg`, the gate reading the
+/// producer's unsited check. Static.
+#[cfg(feature = "ay-proofs")]
+pub fn sited_div_fixture(guarded: bool, record: DivRecord, triple: &str, opt: OptLevel) -> Fixture {
+    let (m_cg, producer) = sited_div(guarded, record);
+    let m_cg = targeted(&m_cg, triple);
+    let object = compile(&m_cg, triple, opt);
+    let mut fx = Fixture::with_object(m_cg, object, triple);
+    let producer = Arc::new(targeted(&producer, triple));
+    fx.bodies = producer
+        .functions
+        .iter()
+        .filter(|f| !f.blocks.is_empty())
+        .map(|f| (f.name.clone(), ProducerBody { producer: 0, func: f.id }))
+        .collect();
+    fx.producers = vec![ProducerModule::named_by_symbols(producer)];
+    fx
+}
+
+/// The measured DIV-SPLIT-1 label of `rung` in [`sited_div_fixture`]`(true, Pointer, _, O0)`
+/// (PKG-C5c-S3b, 2026-11-15, both triples): the S3b operand congruence (`bvf_div_cong`) beside
+/// the folded s21 O0 label's theorems. The same string is pinned in the unit tests
+/// (`src/verify_output_instantiate/div_split/tests.rs` `S21_SITED_O0_LABEL`, which cannot import
+/// this module): change both together.
+pub const S21_SITED_O0_LABEL: &str = "Clean.BVC.bvf_div_cong+Clean.BVC.bvf_or_cong+\
+Clean.BVC.bvf_or_zero_id+Clean.BVC.bvf_sub_cong+Trust.BVB.ite_cong+Trust.BVB.ite_false+\
+Trust.BVB.ite_true+Trust.BVB.sub_zero+kernel atom case split, guarded symbolic division (DIV-SPLIT-1)";
 
 // ===========================================================================
 // COMPILING AND RUNNING THE GATE

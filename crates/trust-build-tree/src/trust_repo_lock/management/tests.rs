@@ -74,9 +74,11 @@ fn set_directory_mode(path: &Path, mode: u32) {
 }
 
 // The holder this crate made under umask 002 before `create_holder_directory`:
-// owned, but group writable. Every verb, `break` included, refuses it and says
-// why and how to recover, its path quoted for a shell when the checkout's path
-// has a space and a single quote; once it is made owner-only, `break` retires it.
+// owned, but group writable. Every verb that reads it (status, break, acquire,
+// release) refuses it and says why and how to recover, its path quoted for a
+// shell when the checkout's path has a space and a single quote; once it is
+// made owner-only, `break` retires it while its process lives on, and a plain
+// acquire takes it over once that process has exited.
 // The refusal names the whole mode, a setgid bit included (2775), and the
 // recovery it names (`chmod go-w`, here 2755) keeps that bit and is admitted.
 #[test]
@@ -109,7 +111,9 @@ fn group_or_other_writable_holder_is_refused_by_mode_until_made_owner_only() {
             holder.display()
         );
         let recovery = format!(
-            "run `chmod go-w {}` and `targo trust repo lock break --reason TEXT`",
+            "that no build still runs under the holder it names, then run `chmod go-w {}`: \
+             the next acquire takes over a holder whose process has exited, and \
+             `targo trust repo lock break --reason TEXT` retires one whose process lives on",
             crate::shell_word::quoted(&holder)
         );
         // In a checkout whose path has a space and a single quote, the exact
@@ -117,7 +121,7 @@ fn group_or_other_writable_holder_is_refused_by_mode_until_made_owner_only() {
         let exact = checkout.map(|_| {
             let text = holder.to_str().unwrap();
             assert!(text.contains(' ') && text.contains('\''), "{text}");
-            format!("run `chmod go-w '{}'` and", text.replace('\'', r"'\''"))
+            format!("run `chmod go-w '{}'`:", text.replace('\'', r"'\''"))
         });
         let mut breaking = request();
         breaking.break_reason = Some("owned fixture group-writable holder control".into());
@@ -139,11 +143,30 @@ fn group_or_other_writable_holder_is_refused_by_mode_until_made_owner_only() {
             }
         }
         assert_eq!(fs::read(holder.join("info")).unwrap(), info, "a refusal changed the holder");
-        // The recovery the refusal names: `chmod go-w`, then `break`.
+        // The recovery the refusal names: `chmod go-w`, then `break`, since
+        // this holder's process (the test) lives on.
         set_directory_mode(&holder, mode & !0o022);
         assert_eq!(manager.status().unwrap().holder.unwrap().pid, std::process::id());
         assert!(manager.break_holder("owned fixture group-writable holder recovery").unwrap());
         assert!(manager.status().unwrap().is_free());
+        assert!(!holder.exists());
+        // The other recovery it names: once owner-only, a holder whose process
+        // has exited (here, a recorded birth that is not the test's) is taken
+        // over by the next plain acquire, with no `break`.
+        let token = acquired(&manager, &request());
+        let info = holder.join("info");
+        let birth = process::read(std::process::id()).unwrap().birth;
+        let gone = fs::read_to_string(&info)
+            .unwrap()
+            .replace(&format!("native_birth={birth}\n"), "native_birth=1\n");
+        fs::write(&info, gone).unwrap();
+        set_directory_mode(&holder, mode);
+        let refused = manager.acquire(&request()).map(|_| ()).unwrap_err().to_string();
+        assert!(refused.contains(&named) && refused.contains(&recovery), "{mode:o}: {refused}");
+        set_directory_mode(&holder, mode & !0o022);
+        let replacement = acquired(&manager, &request());
+        assert_ne!(token, replacement, "{mode:o}: the exited holder was not taken over");
+        assert_eq!(manager.release(&replacement).unwrap(), Release::Released);
         assert!(!holder.exists());
         // A symlink to a group-writable directory is still refused as no owned
         // holder directory at all, not by its target's mode.

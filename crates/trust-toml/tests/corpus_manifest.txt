@@ -1,3 +1,5 @@
+# 2026-11-15: follow the actual stage-0 channel manifest rename 2026-11-07 -> 2026-11-15; 1515 documents, one dated input replaced, no exclusion.
+# 2026-11-14: include pointer_parts_operational/lakefile.toml, the retained Lean proof probe input; 1511 -> 1512 documents, no removals.
 # 2026-11-15: retain incoming native_check_all_targets fixture manifest; one document added, none removed.
 # 2026-11-14: include incoming main's committed-source crate manifest; one document added, none removed.
 # 2026-11-14: include the new Gix-free filesystem ACL crate manifest; one document added, none removed.
@@ -238,6 +240,15 @@
 #   is the table `targo trust gate corpus-delta` reads (the daily-driver corpora).
 #   Regenerated with the command above from the index, and read: this one line,
 #   nothing vanished. The new file parses with Python's tomllib.
+#
+# RE-PINNED 2026-11-15: +1/-1 tracked documents, 1515 -> 1515. da90362a5b (the seed
+#   re-pin to 5062eed55c, 0.14.0-trust) replaced
+#   bootstrap/trust-stage0/dist/2026-11-07/channel-rust-trust.toml with
+#   bootstrap/trust-stage0/dist/2026-11-15/channel-rust-trust.toml without re-pinning this
+#   list, so fast.corpus-membership was red on main at 61e05d7517. Regenerated with the
+#   command above from the index, and read: the one document lost is the old seed's channel
+#   manifest, which the tree no longer holds; the one gained is the new seed's, which parses
+#   with Python's tomllib.
 
 .cargo/config.toml
 .gitleaks.toml
@@ -245,7 +256,7 @@ Cargo.toml
 REUSE.toml
 benchmarks/verify_overhead/Cargo.toml
 bootstrap.example.toml
-bootstrap/trust-stage0/dist/2026-11-07/channel-rust-trust.toml
+bootstrap/trust-stage0/dist/2026-11-15/channel-rust-trust.toml
 bootstrap/trust-stage0/dist/channel-rust-trust.toml
 bootstrap/trust-stage0/seed-ledger.toml
 compiler/rustc/Cargo.toml
@@ -427,6 +438,7 @@ crates/trust-thir-lower/Cargo.toml
 crates/trust-thir-lower/probes/float_reference_original_module/Cargo.toml
 crates/trust-thir-lower/probes/indexed_field_compound_original_module/Cargo.toml
 crates/trust-thir-lower/probes/ordered_slice_original_module/Cargo.toml
+crates/trust-thir-lower/probes/pointer_parts_operational/lakefile.toml
 crates/trust-thir-lower/probes/unit_transport_original_module/Cargo.toml
 crates/trust-timearith/Cargo.toml
 crates/trust-toml/Cargo.toml

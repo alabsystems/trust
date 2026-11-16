@@ -100,6 +100,11 @@ def supported_minor() -> int:
 # Named by a file in SCOPE and NOT run by it or by the tests: each with where
 # the name stands. A file that starts being run moves to the lane's SCOPE.
 NOT_LOADED = {
+    "scripts/prewarm_push.sh": (
+        "daily_toolchain_stage.py constructs the train push command, but DailyStagingTests "
+        "installs its own inert prewarm_push.sh and Owners intercepts that command; "
+        "the repository prewarm/push implementation is never copied or executed"
+    ),
     "scripts/check_targo_trust_unit_tests.sh": (
         "landing_targo names the separate deferred push suite; seed consumers borrow only resource_fds, not run_targo"
     ),
@@ -132,6 +137,12 @@ NOT_LOADED = {
     "scripts/check_toolchain_coherence.py": (
         "comments in tools/verify-toolchain.sh and scripts/lib/trust_toolchain_surface.sh"
     ),
+    "scripts/build-tree-manager.sh": (
+        "daily_toolchain_stage.py runs it as its build-tree-manager step; the daily runner's "
+        "tests read its PROTOCOL and output path as text and use a fixture owner that writes a "
+        "stand-in manager, and neither they nor this lane's recreate_bootstrap_test and "
+        "promote_toolchain_test run the script"
+    ),
 }
 
 # The three subjects and four tests everything in SCOPE must be reachable from.
@@ -143,6 +154,7 @@ ROOTS = (
     "scripts/daily_toolchain_stage.py",
     "scripts/tests/daily_toolchain_stage_test.py",
     "scripts/tests/seed_lock_inventory_test.py",
+    "scripts/tests/github_source_transport_test.py",
 )
 
 
@@ -231,7 +243,7 @@ class ScopeIsDerivedFromTheSources(unittest.TestCase):
 
     def test_the_lists_are_well_formed(self):
         self.assertEqual(len(self.scope), len(set(self.scope)), "a path is listed twice")
-        self.assertEqual(self.tests, [ROOTS[2], ROOTS[3], ROOTS[5], ROOTS[6]])
+        self.assertEqual(self.tests, [ROOTS[7], ROOTS[2], ROOTS[3], ROOTS[5], ROOTS[6]])
         for path in (*ROOTS, LANE):
             self.assertIn(path, self.scope)
         for path in self.scope:
@@ -383,6 +395,7 @@ class LaneBehaviour(unittest.TestCase):
                 RECREATOR: "# stands for the recreator\n",
                 "scripts/promote-toolchain.sh": "# stands for the sealing script\n",
                 PYTHON_TEST: PASSING_PYTHON_TEST,
+                ROOTS[7]: PASSING_PYTHON_TEST,
                 SHELL_TEST: PASSING_SHELL_TEST,
                 DAILY_TEST: PASSING_PYTHON_TEST,
                 LOCK_TEST: PASSING_PYTHON_TEST.replace("STUB recreate test ran", "STUB lock inventory test ran"),
@@ -439,7 +452,7 @@ class LaneBehaviour(unittest.TestCase):
         out = result.stdout
         self.assertEqual(result.returncode, 0, out)
         self.assertIn(PASS_LINE, out)
-        self.assertEqual(self.ran(out), [PYTHON_TEST, SHELL_TEST, DAILY_TEST, LOCK_TEST])
+        self.assertEqual(self.ran(out), [ROOTS[7], PYTHON_TEST, SHELL_TEST, DAILY_TEST, LOCK_TEST])
         self.assertIsNone(re.search(r"^\s*SKIPPED: ", out, re.MULTILINE), out)
 
     @staticmethod
@@ -651,7 +664,7 @@ class LaneBehaviour(unittest.TestCase):
 
     # -- a run that tested nothing is not a pass ----------------------------
 
-    def red(self, files, *fragments, ran=(PYTHON_TEST, SHELL_TEST, DAILY_TEST, LOCK_TEST)):
+    def red(self, files, *fragments, ran=(ROOTS[7], PYTHON_TEST, SHELL_TEST, DAILY_TEST, LOCK_TEST)):
         before = self.git("rev-parse", "HEAD")
         tip = self.commit(files, "break a test")
         result = self.run_lane(pushed=self.update(tip, before))

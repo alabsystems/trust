@@ -17,14 +17,14 @@
 clean {
     def Doubled (n : Nat) : Nat := Nat.add n n
 
-    theorem doubled_unfolds (n : Nat) : Eq Nat (Doubled n) (Nat.add n n) := rfl
+    theorem doubled_unfolds (n : Nat) : @Eq Nat (Doubled n) (Nat.add n n) := rfl
 
     theorem le_doubled : forall (n : Nat), Nat.le n (Doubled n) :=
         fun n => Nat.le_add_right n n
 
     theorem le_doubled_trans : forall (n : Nat),
         Nat.le n (Doubled (Doubled n)) :=
-        fun n => Nat.le_trans n (Doubled n) (Doubled (Doubled n))
+        fun n => @Nat.le_trans n (Doubled n) (Doubled (Doubled n))
             (Nat.le_add_right n n)
             (Nat.le_add_right (Doubled n) (Doubled n))
 }

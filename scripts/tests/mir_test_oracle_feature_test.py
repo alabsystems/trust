@@ -10,11 +10,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from scripts.lib import land_select
+from scripts.lib.test_python import fixture_shebang
 
 
 # atpkg's targo refuses a target directory it reads from `.cargo/config.toml`
@@ -113,9 +115,11 @@ class UnitGraphTargetTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         record = Path(tmp.name) / "record.json"
         fake = Path(tmp.name) / "targo"
+        # fixture_shebang: an interpreter path with a space in it (atpkg's on
+        # macOS) is no shebang the kernel can run, and the exec is then ENOENT.
         fake.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os\n"
+            fixture_shebang()
+            + "import json, os\n"
             f"names = {TARGET_DIR_VARIABLES!r}\n"
             f"with open({str(record)!r}, 'w') as out:\n"
             "    json.dump({name: os.environ.get(name) for name in names}, out)\n"
@@ -136,6 +140,16 @@ class UnitGraphTargetTests(unittest.TestCase):
         self.assertEqual(handed["CARGO_TARGET_DIR"], os.path.realpath(ROOT / "crates" / "target"))
         self.assertIsNone(handed["CARGO_BUILD_TARGET_DIR"])
         self.assertIsNone(handed["TARGO_TARGET_DIR"])
+
+    def test_an_interpreter_path_with_spaces_executes_the_real_probe(self):
+        with tempfile.TemporaryDirectory(prefix="mir-oracle-interpreter.") as directory:
+            runtime = Path(directory) / "Python Runtime"
+            runtime.mkdir()
+            executable = runtime / "python3"
+            executable.symlink_to(sys.executable)
+            with mock.patch.object(sys, "executable", str(executable)):
+                handed = self.handed({"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(handed["CARGO_TARGET_DIR"], os.path.realpath(ROOT / "crates" / "target"))
 
     def test_a_caller_target_keeps_its_precedence(self):
         for name in TARGET_DIR_VARIABLES:

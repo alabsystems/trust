@@ -42,7 +42,7 @@ def si_select (frame : SMFrame) (condition : Nat) (yes : Nat) (no : Nat) : SMRea
   match sm_read frame condition with
   | SMRead.fault fault => SMRead.fault fault
   | SMRead.value value => match value with
-    | SMValue.bool b => Bool.rec (fun _ => SMRead) (sm_read frame no) (sm_read frame yes) b
+    | SMValue.bool b => @Bool.rec (fun _ => SMRead) (sm_read frame no) (sm_read frame yes) b
     | _ => SMRead.fault SMFault.typeMismatch
 
 def si_assert (pc : Nat) (rest : SIProgram) (frame : SMFrame) (trace : SMTrace)
@@ -50,7 +50,7 @@ def si_assert (pc : Nat) (rest : SIProgram) (frame : SMFrame) (trace : SMTrace)
   match sm_read frame condition with
   | SMRead.fault fault => SIState.halted (SMOutcome.fault fault) frame trace
   | SMRead.value value => match value with
-    | SMValue.bool b => Bool.rec (fun _ => SIState)
+    | SMValue.bool b => @Bool.rec (fun _ => SIState)
         (SIState.halted SMOutcome.panic frame trace)
         (SIState.running (Nat.succ pc) rest frame trace) b
     | _ => SIState.halted (SMOutcome.fault SMFault.typeMismatch) frame trace
@@ -79,7 +79,7 @@ def si_step (state : SIState) : SIState :=
     | SIProgram.cons instruction rest => si_execute pc rest frame (SMTrace.cons pc trace) instruction
 
 def si_run (fuel : Nat) (initial : SIState) : SIState :=
-  Nat.rec (fun _ => SIState) initial (fun _ previous => si_step previous) fuel
+  @Nat.rec (fun _ => SIState) initial (fun _ previous => si_step previous) fuel
 
 def si_observe (state : SIState) : SMObservation :=
   match state with

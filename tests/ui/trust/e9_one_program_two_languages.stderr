@@ -3,12 +3,12 @@ note: Clean island kernel-checked: 2 declaration(s) registered (u64_ge_refl, min
    |
 LL | /     theorem u64_ge_refl : forall (x : UInt64),
 LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+LL | |         fun x => @Nat.le.refl (UInt64.toNat x)
 LL | |     theorem min2_le_left : forall (x : UInt64) (y : UInt64),
 ...  |
 LL | |             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
-LL | |             (fun h => Nat.le.refl (UInt64.toNat x))
-   | |___________________________________________________^
+LL | |             (fun h => @Nat.le.refl (UInt64.toNat x))
+   | |____________________________________________________^
 
 
 === Trust Verification Report (e9_one_program_two_languages) ===

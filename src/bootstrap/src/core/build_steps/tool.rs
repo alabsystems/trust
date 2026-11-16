@@ -55,6 +55,8 @@ pub enum ToolArtifactKind {
     Binary,
     /// Explicit host/stage0 artifact with independently held compiler inputs.
     NativeEngineeringBinary,
+    // Trust: artifact-only frontend with a separately held oracle compiler.
+    RetainedFrontendBinary,
     // Trust: build-host mathematical DATA helper, built through the normal tool step.
     Example,
     Library,
@@ -152,17 +154,21 @@ impl Step for ToolBuild {
         let target = self.target;
         let mut tool = self.tool;
         let path = self.path;
-        let native_engineering = self.artifact_kind == ToolArtifactKind::NativeEngineeringBinary;
+        let input = self.cargo_input(builder);
+        let retained_frontend = self.artifact_kind == ToolArtifactKind::RetainedFrontendBinary;
+        let native_engineering = retained_frontend
+            || self.artifact_kind == ToolArtifactKind::NativeEngineeringBinary;
         if native_engineering {
-            assert_eq!(path, "src/tools/targo");
+            assert_eq!(path, if retained_frontend { "targo-trust" } else { "src/tools/targo" });
             assert_eq!(self.build_compiler.stage, 0);
             assert_eq!(self.output_compiler.stage, 0);
             assert_eq!(self.target, builder.host_target);
             assert_eq!(self.build_compiler.host, builder.host_target);
+            assert_eq!(self.mode, Mode::ToolTarget);
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let engineering = (native_engineering && !builder.config.dry_run())
-            .then(|| engineering_pairing::Inputs::capture(builder))
+            .then(|| engineering_pairing::Inputs::capture(builder, input))
             .transpose()
             .unwrap_or_else(|error| panic!("engineering compiler capture failed: {error}"));
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -196,7 +202,6 @@ impl Step for ToolBuild {
 
         // Trust: this exact recipe is the root of the internal Cargo dependency.
         // Every other ToolTarget recipe uses the source-built engineering Cargo.
-        let input = self.cargo_input(builder);
         let mut cargo = prepare_tool_cargo_with_input(
             builder,
             self.build_compiler,
@@ -211,11 +216,17 @@ impl Step for ToolBuild {
         // The private compile-time pairing input belongs solely to this SDK
         // constructor. Engineering/stage0 tools never inherit an ambient one.
         cargo.env_remove("TRUST_TARGO_PAIRED_COMPILER_PROFILE");
+        // Trust: only the held constructor below may bind a distinct compiler.
+        cargo.env_remove("CFG_TRUST_ORACLE_COMPILER_HASH");
+        cargo.env_remove("CFG_TRUST_ORACLE_COMPILER_RELEASE");
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(inputs) = &engineering {
-            inputs
-                .bind(&mut cargo)
-                .unwrap_or_else(|error| panic!("engineering pairing failed: {error}"));
+            if retained_frontend {
+                inputs.bind_frontend(&mut cargo, &builder.host_target.triple.to_string())
+            } else {
+                inputs.bind(&mut cargo)
+            }
+            .unwrap_or_else(|error| panic!("engineering pairing failed: {error}"));
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if path == "src/tools/targo"
@@ -304,7 +315,9 @@ impl Step for ToolBuild {
                 tool = "rust-tidy";
             }
             let tool_path = match self.artifact_kind {
-                ToolArtifactKind::Binary | ToolArtifactKind::NativeEngineeringBinary => {
+                ToolArtifactKind::Binary
+                | ToolArtifactKind::NativeEngineeringBinary
+                | ToolArtifactKind::RetainedFrontendBinary => {
                     copy_link_tool_bin(
                         builder,
                         self.output_compiler,
@@ -353,7 +366,9 @@ impl ToolBuild {
             CargoInput::Seed.for_original(builder.sess)
         } else if *self == trustup_tool_build_recipe(compiler, compiler, builder.host_target) {
             CargoInput::CurrentBuildToolSnapshotStd
-        } else if *self == targo_trust_tool_build_recipe(compiler, compiler, builder.host_target) {
+        } else if *self == targo_trust_tool_build_recipe(compiler, compiler, builder.host_target)
+            || *self == retained_frontend_tool_build_recipe(compiler, builder.host_target)
+        {
             CargoInput::CurrentBuildToolSnapshotStd
         } else {
             builder.cargo_input(self.mode)
@@ -2844,6 +2859,14 @@ fn targo_trust_tool_build_recipe(
     }
 }
 
+// Trust: this exact native artifact role retains compiler identity separately.
+fn retained_frontend_tool_build_recipe(compiler: Compiler, target: TargetSelection) -> ToolBuild {
+    ToolBuild {
+        artifact_kind: ToolArtifactKind::RetainedFrontendBinary,
+        ..targo_trust_tool_build_recipe(compiler, compiler, target)
+    }
+}
+
 pub(super) fn targo_trust_in_process_features() -> Vec<String> {
     // Trust: `ay-certify` makes the SHIPPED verifier's proof-carrying-ay promotion
     // lane LIVE (ay UNSAT for LIA/BV-mul/BV-shift → natively re-derived in the Clean
@@ -3116,7 +3139,12 @@ impl CommandLineStep for TCargoTrustBuildTool {
         // This exact role uses the current native Cargo and actual snapshot std.
         // Output0 writes only tools-bin. No stage1 compiler, daemon or sysroot is
         // assembled, copied or relabelled, and existing runtime refusals remain.
-        let result = builder.ensure(targo_trust_tool_build_recipe(compiler, compiler, self.target));
+        let recipe = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            retained_frontend_tool_build_recipe(compiler, self.target)
+        } else {
+            targo_trust_tool_build_recipe(compiler, compiler, self.target)
+        };
+        let result = builder.ensure(recipe);
         if let Some((full, runtime, config)) = inputs {
             let fresh = ExecutionContext::new(builder.config.exec_ctx().verbosity, false);
             let head = builder.rust_info().info().unwrap();

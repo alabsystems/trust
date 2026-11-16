@@ -240,6 +240,16 @@ impl RecoveryAuthority {
     }
 }
 
+/// Authentication only: no child holds this lock on purpose, and one released
+/// only by the final close would keep refused or ended material reading as
+/// live custody for as long as any concurrent spawn's descriptor copy lives.
+impl Drop for RecoveryAuthority {
+    fn drop(&mut self) {
+        // A failed unlock leaves the release to the final close.
+        let _ = self._backing.file.unlock();
+    }
+}
+
 impl Backing {
     /// Keep newly locked material once it validates. Until then `file` is
     /// still a `Locked`, so a refusal unlocks it.
@@ -291,8 +301,8 @@ fn validate_backing(
 /// posix_spawn as well as fork, holds a copy of every descriptor until its
 /// exec, and a lock released only by the final close stays held that long,
 /// so material that failed to persist or to open would read as live custody.
-/// Only `into_file` hands the locked file on, to the capability's close-only
-/// release.
+/// Only `into_file` hands the locked file on: a `PreparedRecovery` releases it
+/// by close, and a `RecoveryAuthority` unlocks it on drop.
 struct Locked(Option<File>);
 
 impl Locked {

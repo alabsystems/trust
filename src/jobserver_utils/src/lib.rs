@@ -173,6 +173,38 @@ impl Jobserver {
         Ok(selected)
     }
 
+    /// Recover only an authenticated ancestor-owned numeric scheduler.
+    ///
+    /// Unlike startup import, this never takes authority from ambient descriptor
+    /// numbers. The advertisement must bind the exact flags and a live ancestor;
+    /// both advertised slots must still be closed. Reused slots refuse. No tokens
+    /// are created or acquired. Retain the owner through the descendant wait.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn from_authenticated_handoff(
+        advertisement: &std::ffi::OsStr,
+        cargo_flags: &std::ffi::OsStr,
+    ) -> io::Result<Self> {
+        use std::os::fd::AsFd;
+        let pipe = handoff::recover(advertisement, cargo_flags)?;
+        Self::with_client(Client::from_pipe(pipe[0].as_fd(), pipe[1].as_fd())?)
+    }
+
+    /// Recover an advertised ancestor scheduler without importing ambient FDs.
+    /// Named FIFO locators are opened only after authenticating scoped original
+    /// witnesses; numeric transport retains the closed-slot recovery rule.
+    /// Absence returns None. An invalid advertisement never falls back.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn from_authenticated_env_handoff() -> io::Result<Option<Self>> {
+        let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) else {
+            return Ok(None);
+        };
+        if let Some(path) = Client::fifo_path_from_env()? {
+            return Self::from_fifo_handoff(&path, &advertisement).map(Some);
+        }
+        let flags = std::env::var_os("CARGO_MAKEFLAGS").unwrap_or_default();
+        Self::from_authenticated_handoff(&advertisement, &flags).map(Some)
+    }
+
     /// Capture an inherited server without acquiring or creating any tokens.
     /// An advertised but invalid server is an error, never a private budget.
     ///
@@ -259,8 +291,6 @@ impl Jobserver {
             Err(original) => {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 if let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) {
-                    use std::os::fd::AsFd;
-
                     // Trust (JOBSERVER-STALE-MAKEFLAGS-1): bind the handoff to the
                     // variable the failed import read. The client reads these in
                     // this order, and a harness between the scheduler and this
@@ -269,10 +299,7 @@ impl Jobserver {
                         .into_iter()
                         .find_map(std::env::var_os)
                         .unwrap_or_default();
-                    let recovered = handoff::recover(&advertisement, &flags).and_then(|pipe| {
-                        let client = Client::from_pipe(pipe[0].as_fd(), pipe[1].as_fd())?;
-                        Self::with_client(client)
-                    });
+                    let recovered = Self::from_authenticated_handoff(&advertisement, &flags);
                     return recovered.map(Some).map_err(|error| {
                         io::Error::new(
                             error.kind(),
@@ -283,6 +310,12 @@ impl Jobserver {
                 Err(original)
             }
         }
+    }
+
+    /// Retain an already-owned scheduler without importing ambient descriptors
+    /// or creating tokens. Keep its owner alive through every configured wait.
+    pub fn from_owned_client(client: Client) -> io::Result<Self> {
+        Self::with_client(client)
     }
 
     fn with_client(client: Client) -> io::Result<Self> {

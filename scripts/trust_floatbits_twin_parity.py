@@ -23,6 +23,11 @@ import subprocess
 import sys
 from typing import Optional
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older: refuse_named_build_program scans lines
+    tomllib = None  # type: ignore[assignment]
+
 
 EXPECTED_BY_CRATE = {
     "trust-intbound": {
@@ -110,6 +115,14 @@ class Refusal(Exception):
     pass
 
 
+def replace_list(text: str, key: str, replacement: str) -> str:
+    """Replace the one top-level `key = [ ... ]` list (at a line start) of a manifest."""
+    found = list(re.finditer(rf"(?m)^{re.escape(key)} = \[\n(?:.*\n)*?\]\n", text))
+    if len(found) != 1:
+        raise Refusal(f"candidate workspace {key} list is absent, unterminated or not unique")
+    return text[: found[0].start()] + replacement + text[found[0].end() :]
+
+
 def materialize_consumer_candidate(
     repo_root: Path, candidate: Path, consumer: str
 ) -> None:
@@ -122,6 +135,8 @@ def materialize_consumer_candidate(
     (candidate / ".trust-mutation-candidate").write_text(
         "owned by strict mutation G\n", encoding="utf-8"
     )
+    # The workspace manifest and its lock live at the repository root (one
+    # workspace for the compiler, the developer crates and Targo).
     tracked = subprocess.check_output(
         [
             "git",
@@ -130,6 +145,8 @@ def materialize_consumer_candidate(
             "ls-files",
             "-z",
             "--",
+            "Cargo.toml",
+            "Cargo.lock",
             "crates",
             ".cargo/config.toml",
         ]
@@ -159,20 +176,17 @@ def materialize_consumer_candidate(
         os.symlink(source, candidate / name)
 
     # Resolve only the consumer graph. Retaining the authoritative dependency
-    # and patch tables makes this a candidate of the crates workspace, while
-    # avoiding unrelated members and a custom-Cargo duplicate-edge panic.
+    # and patch tables makes this a candidate of the workspace, while avoiding
+    # unrelated members and a custom-Cargo duplicate-edge panic. The
+    # default-members list names members this candidate drops, which Cargo
+    # refuses, so it goes too.
     workspace = candidate / "Cargo.toml"
+    if not workspace.is_file():
+        raise Refusal(f"candidate workspace manifest is absent: {workspace}")
     text = workspace.read_text(encoding="utf-8")
-    if text.count("members = [") != 1:
-        raise Refusal("candidate workspace members anchor is not unique")
-    start = text.index("members = [")
-    try:
-        end = text.index("\n]", start) + 2
-    except ValueError as error:
-        raise Refusal("candidate workspace members list is unterminated") from error
-    workspace.write_text(
-        text[:start] + f'members = ["{consumer}"]' + text[end:], encoding="utf-8"
-    )
+    text = replace_list(text, "members", f'members = ["crates/{consumer}"]\n')
+    text = replace_list(text, "default-members", "")
+    workspace.write_text(text, encoding="utf-8")
 
     # The default trust-ir-bridge build never enables this rustc-private edge.
     # The referenced package is deliberately excluded from the crates workspace
@@ -278,6 +292,67 @@ def build_program(value: str) -> str:
     return "\n".join(line.strip() for line in code.splitlines() if line.strip())
 
 
+# A line that may spell the `build` key: bare, quoted, as a dotted segment
+# (`package.build`) or inside an inline table (`package = { build = ... }`).
+BUILD_KEY_SPELLING = re.compile(r"""(?:^|[\s{,.])["']?build["']?\s*=""")
+# A key holding a backslash may be an escaped spelling of `build` or `package`.
+ESCAPED_KEY = re.compile(r"^[^=]*\\[^=]*=")
+
+
+def refuse_named_build_program(manifest_path: Path, text: str) -> None:
+    """Refuse a manifest whose `[package] build` is anything but absent or `false`.
+
+    `build = true` and `build = "build.rs"` are refused too: the rule is the
+    two spellings that leave build.rs as the only program Cargo can run. With
+    tomllib (Python 3.11+) the key is read as Cargo reads it. Without it the
+    raw lines are scanned, and every line that could spell the key in any TOML
+    form, or that has an escaped key, is refused unless it is exactly
+    `build = false`; that scan refuses some manifests Cargo would accept, never
+    the reverse.
+    """
+    if tomllib is not None:
+        try:
+            manifest = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as error:
+            raise Refusal(f"{manifest_path} is not TOML: {error}") from error
+        package = manifest.get("package")
+        if not isinstance(package, dict):
+            raise Refusal(f"{manifest_path} has no [package] table")
+        if "build" in package and package["build"] is not False:
+            raise Refusal(
+                f"{manifest_path} names a build script (build = {package['build']!r}); "
+                "only build.rs is checked"
+            )
+        return
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (BUILD_KEY_SPELLING.search(stripped) or ESCAPED_KEY.search(stripped)):
+            continue
+        if not re.fullmatch(r"build\s*=\s*false\s*(?:#.*)?", stripped):
+            raise Refusal(
+                f"{manifest_path} names a build script or an escaped key ({stripped}); "
+                "only build.rs is checked, and without Python 3.11's tomllib any "
+                "spelling but `build = false` is refused"
+            )
+
+
+def crate_build_text(crate_root: Path) -> Optional[str]:
+    """The crate's build.rs, or None when the crate has no build script.
+
+    No build script is the stronger form: nothing can select or probe the
+    verification surface, and the workspace `[lints.rust] unexpected_cfgs`
+    declares `cfg(trust_verify)` (c133258d3c7 moved three of the four crates
+    there). Only build.rs is read, so a `[package] build` key naming any other
+    program is refused rather than left unchecked.
+    """
+    manifest_path = crate_root / "Cargo.toml"
+    refuse_named_build_program(manifest_path, manifest_path.read_text(encoding="utf-8"))
+    build_path = crate_root / "build.rs"
+    if not build_path.exists():
+        return None
+    return build_path.read_text(encoding="utf-8")
+
+
 def replace_nth(value: str, old: str, new: str, occurrence: int) -> str:
     starts = [match.start() for match in re.finditer(re.escape(old), value)]
     if len(starts) <= occurrence:
@@ -293,7 +368,7 @@ def validate(
     text: str,
     retired_contracts: Optional[Path],
     crate_name: str,
-    build_text: str,
+    build_text: Optional[str],
 ) -> None:
     expected = EXPECTED_BY_CRATE.get(crate_name)
     if expected is None:
@@ -318,7 +393,7 @@ def validate(
             "trust_verify may occur in code only in the two canonical macro selectors"
         )
 
-    if build_program(build_text) != BUILD_PROGRAM:
+    if build_text is not None and build_program(build_text) != BUILD_PROGRAM:
         raise Refusal(
             "build.rs is not the check-cfg-only program; it may select or probe "
             "the verification surface"
@@ -368,7 +443,7 @@ def validate(
 
 
 def require_rejected(
-    label: str, text: str, crate_name: str, build_text: str
+    label: str, text: str, crate_name: str, build_text: Optional[str]
 ) -> None:
     try:
         validate(text, None, crate_name, build_text)
@@ -388,10 +463,13 @@ def main() -> None:
     source = Path(sys.argv[1])
     retired = Path(sys.argv[2])
     crate_name = source.parent.parent.name
-    build_path = source.parent.parent / "build.rs"
     text = source.read_text(encoding="utf-8")
-    build_text = build_path.read_text(encoding="utf-8")
+    build_text = crate_build_text(source.parent.parent)
     validate(text, retired, crate_name, build_text)
+    # The build-script controls mutate the crate's own build.rs, or, for a
+    # crate with none, the one program a build.rs may be: either way they show
+    # that a build script which mints or hides the cfg is refused.
+    control_build = BUILD_PROGRAM if build_text is None else build_text
 
     expected = EXPECTED_BY_CRATE[crate_name]
     code = rust_code_without_comments(text, mask_strings=True)
@@ -471,19 +549,19 @@ def main() -> None:
         "build-script cfg minting",
         text,
         crate_name,
-        build_text.replace("rustc-check-cfg", "rustc-cfg"),
+        control_build.replace("rustc-check-cfg", "rustc-cfg"),
     )
     require_rejected(
         "invalid Cargo directive whitespace",
         text,
         crate_name,
-        build_text.replace("cargo::rustc-check-cfg", "cargo ::rustc-check-cfg"),
+        control_build.replace("cargo::rustc-check-cfg", "cargo ::rustc-check-cfg"),
     )
     require_rejected(
         "split build-script identifier",
         text,
         crate_name,
-        build_text.replace("fn main()", "fn ma in()"),
+        control_build.replace("fn main()", "fn ma in()"),
     )
 
     print(
@@ -492,7 +570,8 @@ def main() -> None:
     )
 
 
-try:
-    main()
-except (OSError, Refusal, subprocess.CalledProcessError) as error:
-    raise SystemExit(f"REFUSE: {error}")
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, Refusal, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"REFUSE: {error}")

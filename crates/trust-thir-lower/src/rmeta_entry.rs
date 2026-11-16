@@ -2,7 +2,7 @@
 //!
 //! Design: `docs/design/2026-10-02-step2-inc6-trust-ir-in-metadata.md` §2.2 (a level-R entry),
 //! §2.4 (the evidence), §2.5 (identity), §3 (when it is produced) and §4 (what the encoder
-//! refuses). The complete codec is now frozen; the schema-5 protocol extension requires
+//! refuses). The complete codec is now frozen; the schema-6 protocol extension requires
 //! separate exact-blob review. The consumer (step 6.3) re-checks its unlicensed data.
 //!
 //! # What an entry is
@@ -92,7 +92,9 @@ pub const ENTRY_MAGIC: &[u8; 8] = b"TRIRENTR";
 /// 4: evidence retains exact location-derived store argument correspondences.
 /// 5: the complete envelope binds the actual producing overflow-check mode,
 /// owner, module and evidence; the module digest remains a separate identity.
-pub const ENTRY_SCHEMA: u32 = 5;
+/// 6: binds an optional original word64 source claim to the same actual owner.
+/// Source claims carry no proof/admission and old schemas require a producer rebuild.
+pub const ENTRY_SCHEMA: u32 = 6;
 /// The evidence section's own magic and schema (a versioned section of the entry, §2.4).
 pub const EVIDENCE_MAGIC: &[u8; 8] = b"TRIREVID";
 /// 2: adds the collapsed enum types, the degraded struct rows and the placeholder lanes.
@@ -291,6 +293,7 @@ pub struct RetainedEvidence {
 #[derive(Default)]
 struct EntryRegistry {
     candidates: BTreeMap<u32, StoredCandidate>,
+    source: BTreeMap<u32, Option<crate::source_word64::record::Record>>,
     duplicated: BTreeSet<u32>,
     evidence: BTreeMap<u32, RetainedEvidence>,
     /// Trust (step 6.5.1): the template lane's record per definition ([`record_template`]).
@@ -591,6 +594,22 @@ pub fn not_lowered_reasons(lowered: &Lowered) -> Vec<String> {
         out.push(format!("{} functions in the per-body module", module.functions.len()));
     }
     out
+}
+
+/// Capture original source before constructing output IR. Only the main producer
+/// calls this seam; failed/unsupported capture remains unavailable, never proof.
+pub(crate) fn record_original_source(tcx: TyCtxt<'_>, def: LocalDefId) {
+    if !entries_enabled(tcx) {
+        return;
+    }
+    let source =
+        crate::source_word64::capture(tcx, def).and_then(|snapshot| snapshot.to_record()).ok();
+    let index = def.local_def_index.as_u32();
+    tcx.sess.with_trust_compiler_state::<EntryRegistry, _>(|r| {
+        if r.source.insert(index, source).is_some() {
+            r.duplicated.insert(index);
+        }
+    });
 }
 
 /// Capture `def`'s mainline lowering as an entry candidate. Called by the producer's
@@ -1452,6 +1471,25 @@ pub fn frame_entry(
     overflow_checks: bool,
     evidence: &[u8],
 ) -> Result<Vec<u8>, EntryRefusal> {
+    frame_entry_with_source(module, binding, overflow_checks, evidence, None)
+}
+
+/// Frame actual source data, never a source proof or admission capability.
+pub fn frame_entry_with_source(
+    module: &Module,
+    binding: EntryBinding,
+    overflow_checks: bool,
+    evidence: &[u8],
+    source: Option<&crate::source_word64::record::Record>,
+) -> Result<Vec<u8>, EntryRefusal> {
+    let source = crate::source_word64::record::encode_section(
+        source,
+        crate::source_word64::record::Definition {
+            stable_crate_id: binding.stable_crate_id,
+            local_hash: binding.local_hash,
+        },
+    )
+    .map_err(|error| EntryRefusal::Invalid(format!("source claim: {error}")))?;
     let bytes = trust_ir::binary::serialize_module(module).map_err(|refusal| {
         EntryRefusal::Invalid(format!("the entry module has no wire image: {refusal}"))
     })?;
@@ -1465,6 +1503,8 @@ pub fn frame_entry(
     payload.extend_from_slice(&bytes);
     payload.extend_from_slice(&(evidence.len() as u64).to_le_bytes());
     payload.extend_from_slice(evidence);
+    payload.extend_from_slice(&(source.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&source);
     let mut out = Vec::new();
     out.extend_from_slice(ENTRY_MAGIC);
     out.extend_from_slice(&ENTRY_SCHEMA.to_le_bytes());
@@ -1509,6 +1549,8 @@ pub struct DecodedEntry {
     pub digest: [u8; 32],
     pub module: Module,
     pub evidence: Vec<u8>,
+    /// Original source claim only; a consumer still owes independent Rust-source TV.
+    pub source: Option<crate::source_word64::record::Record>,
 }
 
 /// Why an entry did not decode (the consumer's `[upstream-entry](<check>)`, design §5.2).
@@ -1521,6 +1563,7 @@ pub enum EntryDecodeError {
     TrustIrVersion { producer: u32, consumer: u32 },
     Module(String),
     EnvelopeDigest,
+    Source(String),
     Digest,
     OverflowByte(u8),
     OverflowMode { producer: bool, consumer: bool },
@@ -1541,6 +1584,7 @@ impl std::fmt::Display for EntryDecodeError {
                 write!(f, "trust-ir-version(producer {producer}, consumer {consumer})")
             }
             EntryDecodeError::Module(e) => write!(f, "module({e})"),
+            EntryDecodeError::Source(error) => write!(f, "source-claim({error})"),
             EntryDecodeError::EnvelopeDigest => write!(f, "envelope-digest"),
             EntryDecodeError::Digest => write!(f, "digest"),
             EntryDecodeError::OverflowByte(byte) => write!(f, "overflow-check-byte({byte})"),
@@ -1614,6 +1658,14 @@ pub fn decode_entry(bytes: &[u8]) -> Result<DecodedEntry, EntryDecodeError> {
     let digest: [u8; 32] = r.take(32, "module digest")?.try_into().unwrap();
     let module_bytes = r.part("module")?;
     let evidence = r.part("evidence")?.to_vec();
+    let source = crate::source_word64::record::decode_section(
+        r.part("source claim")?,
+        crate::source_word64::record::Definition {
+            stable_crate_id: binding.stable_crate_id,
+            local_hash: binding.local_hash,
+        },
+    )
+    .map_err(|error| EntryDecodeError::Source(error.to_string()))?;
     if r.at != payload.len() {
         return Err(EntryDecodeError::TrailingBytes(payload.len() - r.at));
     }
@@ -1630,6 +1682,7 @@ pub fn decode_entry(bytes: &[u8]) -> Result<DecodedEntry, EntryDecodeError> {
         digest,
         module,
         evidence,
+        source,
     })
 }
 
@@ -2659,6 +2712,7 @@ fn build_one<'tcx>(
     tcx: TyCtxt<'tcx>,
     index: u32,
     stored: &StoredCandidate,
+    source: Option<&crate::source_word64::record::Record>,
     evidence: Option<&RetainedEvidence>,
     clean_origin: &BTreeSet<u32>,
     files: &BTreeMap<String, Option<String>>,
@@ -2687,7 +2741,7 @@ fn build_one<'tcx>(
     if let Some(refusal) = inherited_overflow_refusal(tcx, def) {
         return Err(refusal);
     }
-    frame_entry(&module, binding, tcx.sess.overflow_checks(), &evidence)
+    frame_entry_with_source(&module, binding, tcx.sess.overflow_checks(), &evidence, source)
 }
 
 /// Provider of the `trust_ir_local_entries` query: every recorded body's entry or refusal, built
@@ -2774,7 +2828,15 @@ pub fn local_entries(tcx: TyCtxt<'_>, (): ()) -> TrustIrLocalEntries {
             );
             result
         } else {
-            build_one(tcx, *index, candidate, registry.evidence.get(index), &clean_origin, &files)
+            build_one(
+                tcx,
+                *index,
+                candidate,
+                registry.source.get(index).and_then(Option::as_ref),
+                registry.evidence.get(index),
+                &clean_origin,
+                &files,
+            )
         };
         if let Err(refusal) = &result {
             tracing::debug!(

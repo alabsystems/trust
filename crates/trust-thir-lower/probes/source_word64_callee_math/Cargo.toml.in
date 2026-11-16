@@ -1,0 +1,20 @@
+[package]
+name = "actual-rust-callee-word64-math"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[lib]
+path = "@TRUST_ROOT@/crates/trust-thir-lower/probes/source_word64_callee_math/lib.rs"
+[dependencies]
+clean-kernel = { path = "@TRUST_ROOT@/first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
+clean-reflect = { path = "@TRUST_ROOT@/first-party/clean/crates/clean-reflect" }
+trust-ir = { path = "@TRUST_ROOT@/first-party/trust-ir/crates/trust-ir", default-features = false, features = ["binary", "serde"] }
+trust-ir-build = { path = "@TRUST_ROOT@/first-party/trust-ir/crates/trust-ir-build", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+[patch."https://github.com/alabsystems/trust-ir.git"]
+trust-ir = { path = "@TRUST_ROOT@/first-party/trust-ir/crates/trust-ir" }
+[patch."https://github.com/alabsystems/trust-ir"]
+trust-ir = { path = "@TRUST_ROOT@/first-party/trust-ir/crates/trust-ir" }
+[patch."https://github.com/alabsystems/clean.git"]
+clean-kernel = { path = "@TRUST_ROOT@/first-party/clean/crates/clean-kernel" }

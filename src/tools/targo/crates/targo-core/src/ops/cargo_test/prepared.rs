@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::util::machine_message::Message;
+use trust_test_execution::results::{HarnessEnd, HarnessExit, HarnessResultFiles};
 use trust_test_execution::{self as wire, PreparedTest, PreparedTests, PreparedTestsReceipt};
 
 impl Message for PreparedTestsReceipt {
@@ -61,17 +62,25 @@ fn export_plan(
             anyhow::bail!("prepared test export does not match the current compiler session");
         }
     }
-    let plan = capture(ws, no_fail_fast, args, compilation, session, retained)?;
-    let bytes = serde_json::to_vec(&plan)?;
-    if bytes.len() as u64 > wire::MAX_PLAN_BYTES {
-        anyhow::bail!("prepared test plan exceeds its bound");
-    }
     let path =
         PathBuf::from(gctx.get_env_os(wire::EXPORT_ENV).ok_or_else(|| {
             anyhow::anyhow!("retained tests require a prepared plan export path")
         })?);
     if !path.is_absolute() {
         anyhow::bail!("prepared test export path must be absolute");
+    }
+    let plan = capture(
+        ws,
+        no_fail_fast,
+        args,
+        compilation,
+        session,
+        retained,
+        &path,
+    )?;
+    let bytes = serde_json::to_vec(&plan)?;
+    if bytes.len() as u64 > wire::MAX_PLAN_BYTES {
+        anyhow::bail!("prepared test plan exceeds its bound");
     }
     let mut file = fs::OpenOptions::new();
     file.write(true).create_new(true);
@@ -104,6 +113,7 @@ fn capture(
     compilation: &Compilation<'_>,
     session: &str,
     retained: bool,
+    plan_path: &Path,
 ) -> CargoResult<PreparedTests> {
     if !retained && ws.gctx().build_config()?.test_jobs.unwrap_or(1) != 1 {
         anyhow::bail!("prepared authenticated execution does not yet support concurrent harnesses");
@@ -112,6 +122,17 @@ fn capture(
     let worker_budget = worker_budget::WorkerBudget::managed(ws.gctx())?;
     if compilation.tests.len() > 4096 {
         anyhow::bail!("too many prepared test harnesses");
+    }
+    // Trust: the per-case result channel (`trust_test_execution::results`).
+    // `--logfile` is Targo's: a test argument cannot redirect it.
+    if args.iter().any(|arg| wire::results::is_logfile_arg(arg)) {
+        anyhow::bail!(
+            "`--logfile` names Targo's per-case test result channel; a test argument cannot set it"
+        );
+    }
+    if !compilation.tests.is_empty() {
+        wire::results::create_results_dir(plan_path)
+            .context("cannot create the private test results directory")?;
     }
     let mut tests = Vec::new();
     let mut remaining = wire::MAX_PLAN_BYTES as usize;
@@ -128,6 +149,13 @@ fn capture(
             anyhow::bail!("prepared test export refuses custom runners");
         }
         reject_unbound_test_loader_env(output.script_metas.as_deref(), &compilation.extra_env)?;
+        // Trust: this harness's own result file, FIRST, sealed with the plan:
+        // a test argument after it (`--`, a value-taking `--skip`) cannot
+        // swallow it (`trust_test_execution::results`).
+        let results =
+            HarnessResultFiles::for_harness(plan_path, tests.len()).map_err(anyhow::Error::msg)?;
+        let harness_args = results.harness_args(args);
+        let harness_args = harness_args.iter().map(String::as_str).collect::<Vec<_>>();
         let (_, mut command) = cmd_builds(
             ws.gctx(),
             ws.gctx().cwd(),
@@ -135,10 +163,17 @@ fn capture(
             &output.path,
             output.script_metas.as_ref(),
             &output.env,
-            args,
+            &harness_args,
             compilation,
             "unittests",
         )?;
+        anyhow::ensure!(
+            command
+                .get_args()
+                .take(2)
+                .eq(results.libtest_args().iter().map(std::ffi::OsStr::new)),
+            "prepared test arguments must open with the per-case result channel"
+        );
         strip_test_execution_authority_env(&mut command);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         super::auth_scheduling::remove_transport_environment(&mut command);
@@ -193,6 +228,7 @@ fn capture(
                 .map(|arg| utf8(arg))
                 .collect::<CargoResult<Vec<_>>>()?,
             env: environment,
+            results: Some(results),
         });
     }
     let plan = PreparedTests {
@@ -315,18 +351,22 @@ fn execute(
         strip_test_execution_authority_env(&mut command);
         command.supervised_by(&scope);
         gctx.shell().status("Running", &test.target)?;
-        if let Err(error) =
-            execute_authenticated_test_with_cancel(authority, path, &command, &mut || {
-                cancelled(gctx, &scope)
-            })
-        {
+        let result = execute_authenticated_test_with_cancel(authority, path, &command, &mut || {
+            cancelled(gctx, &scope)
+        });
+        // The post-execution substitution check runs before the exit record
+        // is written, so a harness whose pathname was replaced after the run
+        // never has its exit recorded as an exit.
+        let validated = authority.validate_executable(path);
+        let recorded = record_harness_end(&plan.session, test, &result, &validated);
+        if let Err(error) = result.and(recorded) {
             failed = true;
             gctx.shell().error(&error)?;
             if !plan.no_fail_fast {
                 return Err(error);
             }
         }
-        authority.validate_executable(path)?;
+        validated?;
     }
     if cancelled(gctx, &scope) {
         anyhow::bail!(
@@ -339,6 +379,62 @@ fn execute(
         anyhow::bail!("one or more prepared test harnesses failed");
     }
     Ok(())
+}
+
+/// Trust: record how one harness ended beside its result file, so the
+/// frontend can tell a complete libtest result file from one a crash, a kill
+/// or a timeout cut short (`trust_test_execution::results`). Only an exit the
+/// harness process itself made, as the top of `result`'s error chain, is an
+/// exit (the rule `exit_that_is_the_whole_error` keeps for the exit status);
+/// anything else (cancellation, a refused launch, a failed wait, an
+/// authentication failure during the run, a reason Targo put above the
+/// process's exit) is recorded as no observed exit. So is every outcome when
+/// `validated`, the post-execution check that the authorized pathname still
+/// names the authorized bytes, failed. A plan without result files records
+/// nothing; an exit record already on disk is an error, never overwritten.
+pub(super) fn record_harness_end(
+    session: &str,
+    test: &PreparedTest,
+    result: &CargoResult<()>,
+    validated: &CargoResult<()>,
+) -> CargoResult<()> {
+    let Some(files) = &test.results else {
+        return Ok(());
+    };
+    let end = match (validated, result) {
+        (Err(_), _) => HarnessEnd::NotObserved {
+            reason: "the harness executable failed native Targo's post-execution check".into(),
+        },
+        (Ok(()), Ok(())) => HarnessEnd::Exited { code: 0 },
+        (Ok(()), Err(error)) => match error
+            .chain()
+            .next()
+            .and_then(|top| top.downcast_ref::<ProcessError>())
+        {
+            Some(ProcessError {
+                code: Some(code), ..
+            }) => HarnessEnd::Exited { code: *code },
+            Some(ProcessError {
+                signal: Some(signal),
+                ..
+            }) => HarnessEnd::Signaled { signal: *signal },
+            _ => HarnessEnd::NotObserved {
+                reason: "native Targo observed no exit status of the harness".into(),
+            },
+        },
+    };
+    wire::results::write_exit(
+        Path::new(&files.exit),
+        &HarnessExit {
+            schema: wire::results::HARNESS_EXIT_SCHEMA.into(),
+            session: session.into(),
+            executable: test.executable.clone(),
+            sha256: test.sha256.clone(),
+            logfile: files.logfile.clone(),
+            end,
+        },
+    )
+    .with_context(|| format!("cannot record how test harness `{}` ended", test.target))
 }
 
 pub(super) fn cancelled(gctx: &GlobalContext, scope: &cargo_util::StreamingProcessScope) -> bool {
@@ -354,6 +450,102 @@ pub(super) fn cancelled(gctx: &GlobalContext, scope: &cargo_util::StreamingProce
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_harness_end_is_recorded_only_as_the_harness_process_itself_ended() {
+        let root = tempfile::tempdir().unwrap();
+        let plan_path = root.path().join("prepared-tests.json");
+        wire::results::create_results_dir(&plan_path).unwrap();
+        let test_with = |index: usize, results: bool| PreparedTest {
+            target: "recorded-image".into(),
+            executable: "/authorized/test-image".into(),
+            sha256: "ab".repeat(32),
+            size: 1,
+            cwd: root.path().to_str().unwrap().into(),
+            args: Vec::new(),
+            env: Default::default(),
+            results: results.then(|| HarnessResultFiles::for_harness(&plan_path, index).unwrap()),
+        };
+        let exit = |code: Option<i32>, signal: Option<i32>| -> anyhow::Error {
+            ProcessError {
+                desc: "process didn't exit successfully".into(),
+                code,
+                signal,
+                stdout: None,
+                stderr: None,
+            }
+            .into()
+        };
+        let passed: CargoResult<()> = Ok(());
+        let refused: CargoResult<()> = Err(anyhow::anyhow!("authorized bytes were substituted"));
+        let not_observed = |end: &HarnessEnd| matches!(end, HarnessEnd::NotObserved { .. });
+        let cases: Vec<(
+            CargoResult<()>,
+            &CargoResult<()>,
+            &dyn Fn(&HarnessEnd) -> bool,
+        )> = vec![
+            (Ok(()), &passed, &|end| {
+                *end == HarnessEnd::Exited { code: 0 }
+            }),
+            (Err(exit(Some(101), None)), &passed, &|end| {
+                *end == HarnessEnd::Exited { code: 101 }
+            }),
+            (Err(exit(None, Some(6))), &passed, &|end| {
+                *end == HarnessEnd::Signaled { signal: 6 }
+            }),
+            // Not the process's own exit: a reason Targo put above it, a
+            // launch or wait failure, or a refused post-execution check.
+            (
+                Err(exit(Some(101), None).context("streaming stdout exceeds its limit")),
+                &passed,
+                &not_observed,
+            ),
+            (
+                Err(anyhow::anyhow!(
+                    "authenticated test cancelled before resume"
+                )),
+                &passed,
+                &not_observed,
+            ),
+            (Ok(()), &refused, &not_observed),
+            (Err(exit(Some(101), None)), &refused, &not_observed),
+        ];
+        for (index, (result, validated, expected)) in cases.into_iter().enumerate() {
+            let test = test_with(index, true);
+            record_harness_end("session", &test, &result, validated).unwrap();
+            let files = test.results.as_ref().unwrap();
+            let record = wire::results::read_exit(Path::new(&files.exit)).unwrap();
+            assert!(expected(&record.end), "case {index}: {:?}", record.end);
+            assert_eq!(record.schema, wire::results::HARNESS_EXIT_SCHEMA);
+            assert_eq!(record.session, "session");
+            assert_eq!(record.executable, test.executable);
+            assert_eq!(record.sha256, test.sha256);
+            assert_eq!(record.logfile, files.logfile);
+            // A second record for the same harness is an error; the first stays.
+            assert!(record_harness_end("other", &test, &Ok(()), &Ok(())).is_err());
+            assert_eq!(
+                wire::results::read_exit(Path::new(&files.exit)).unwrap(),
+                record
+            );
+        }
+        // A plan without the channel writes nothing.
+        let before = fs::read_dir(wire::results::results_dir(&plan_path).unwrap())
+            .unwrap()
+            .count();
+        record_harness_end("session", &test_with(99, false), &Ok(()), &Ok(())).unwrap();
+        let after = fs::read_dir(wire::results::results_dir(&plan_path).unwrap())
+            .unwrap()
+            .count();
+        assert_eq!(before, after);
+        assert!(
+            !Path::new(
+                &HarnessResultFiles::for_harness(&plan_path, 99)
+                    .unwrap()
+                    .exit
+            )
+            .exists()
+        );
+    }
 
     #[test]
     fn ambient_execution_authority_cannot_enter_prepared_execution() {
@@ -426,6 +618,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            results: None,
         };
         let plan = PreparedTests {
             schema: wire::PLAN_SCHEMA.into(),
@@ -498,6 +691,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                results: None,
             });
             executables.insert(
                 executable,
@@ -586,6 +780,7 @@ mod tests {
                             .map(|value| (key.clone(), value.to_str().unwrap().to_owned()))
                     })
                     .collect(),
+                results: None,
             };
             let queued_path = root.join("queued-image");
             fs::copy(&executable, &queued_path).unwrap();
@@ -618,6 +813,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                results: None,
             };
             let plan = PreparedTests {
                 schema: wire::PLAN_SCHEMA.into(),

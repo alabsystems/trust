@@ -168,6 +168,7 @@ impl Fixture {
 
     fn input(&self) -> CodegenModuleInput<'_> {
         CodegenModuleInput {
+            handoff_extensions: None,
             producer: &self.m,
             base: self.base.as_ref(),
             items: &self.items,
@@ -525,6 +526,49 @@ fn clean_origin_body_refuses() {
     assert!(names(&out).is_empty());
 }
 
+/// Candidate assembly is separate from the bridge's live-token admission.
+/// The ordinary assembler stays closed, and the candidate path retains the
+/// exact carrier stamp rather than converting it to a Rust authority.
+#[test]
+fn clean_candidate_requires_its_stamp_and_preserves_the_identity_body() {
+    let mut fx = Fixture::new();
+    let f = fx.body("_RF", &[]);
+    fx.function_mut(f).producer = Some(Producer::Clean);
+    fx.item("_RF", f);
+    let candidates = BTreeSet::from([f]);
+    for stamp in [
+        None,
+        Some(BodyGate::Ungated),
+        Some(BodyGate::Gated { authority: DIRECT.into(), evidence: None }),
+    ] {
+        fx.function_mut(f).body_gate = stamp;
+        let out = build_with_clean_candidates(&fx.input(), &candidates);
+        refused_with(&out, RefusalClass::CodegenModule, "_RF", "CleanOriginBelowCodegenGate");
+    }
+    fx.function_mut(f).body_gate = Some(trust_clean_ir_gate::clean_carrier_gate_stamp());
+    refused_with(&fx.run(), RefusalClass::CodegenModule, "_RF", "CleanOriginBelowCodegenGate");
+    let out = build_with_clean_candidates(&fx.input(), &candidates);
+    clean(&out);
+    let body = find(&out, "_RF");
+    let source = fx.m.function_by_id(f).expect("source");
+    assert_eq!(body.producer, Some(Producer::Clean));
+    assert_eq!(body.body_gate, source.body_gate);
+    assert_eq!(body.ty, source.ty);
+    assert_eq!(body.blocks, source.blocks);
+}
+
+#[test]
+fn clean_candidates_cannot_inherit_the_rust_abi_rewrite_rule() {
+    let mut fx = Fixture::new();
+    let f = fx.func("_RF", vec![Ty::U64, Ty::Unit], vec![Ty::U64], vec![ret(&[0])]);
+    fx.function_mut(f).producer = Some(Producer::Clean);
+    fx.function_mut(f).body_gate = Some(trust_clean_ir_gate::clean_carrier_gate_stamp());
+    fx.item_abi("_RF", f, abi(vec![direct(64), ArgShape::Ignore], direct(64)));
+    let out = build_with_clean_candidates(&fx.input(), &BTreeSet::from([f]));
+    refused_with(&out, RefusalClass::UnsupportedAbi, "_RF", "identity ABI");
+    assert!(names(&out).is_empty());
+}
+
 // ---- rules 6, 8 ----------------------------------------------------------------------------
 
 /// Rule 6: rustc's linkage and visibility, exactly.
@@ -850,6 +894,47 @@ fn handoff_body_that_differs_in_star_refuses() {
     let out = fx.run();
     refused_with(&out, RefusalClass::CodegenModule, "_RF", "differs between");
     assert!(!names(&out).contains(&"_RF"));
+}
+
+#[test]
+fn handoff_declaration_replacement_without_installation_custody_refuses() {
+    let mut fx = Fixture::new();
+    let g = fx.decl("crate::g");
+    let f = fx.body("crate::f", &[g]);
+    fx.item("_RF", f);
+    fx.item("_RG", g);
+    fx.items[0].handoff = true;
+    fx.base = Some(fx.m.clone());
+    let temporary = fx.body("crate::temporary", &[]);
+    let mut replacement = fx.m.functions.pop().unwrap();
+    assert_eq!(replacement.id, temporary);
+    replacement.id = g;
+    replacement.name = "crate::g".into();
+    *fx.function_mut(g) = replacement;
+    let out = fx.run();
+    refused_with(&out, RefusalClass::CodegenModule, "_RF", "no retained authenticated");
+    assert!(!names(&out).contains(&"_RF"));
+}
+
+#[test]
+fn postcondition_rederives_handoff_declaration_installation_custody() {
+    let mut fx = Fixture::new();
+    let g = fx.body("crate::g", &[]);
+    let f = fx.body("crate::f", &[g]);
+    fx.item("_RF", f);
+    fx.item("_RG", g);
+    let assembled = assemble(&fx.input());
+    assert!(assembled.output.refusals.is_empty());
+    assert!(check_postcondition(&fx.input(), &assembled).is_empty());
+    // Keep the produced M_cg untouched but supply a handoff original in which
+    // g was a declaration. Assembly's old success cannot authorize this input.
+    fx.items[0].handoff = true;
+    let mut base = fx.m.clone();
+    base.functions[g.as_usize()].blocks.clear();
+    fx.base = Some(base);
+    let errors = check_postcondition(&fx.input(), &assembled);
+    assert!(errors.iter().any(|error| error.to_string().contains(
+        "no retained authenticated declaration extension")), "{errors:?}");
 }
 
 // ---- dropping callers -----------------------------------------------------------------------

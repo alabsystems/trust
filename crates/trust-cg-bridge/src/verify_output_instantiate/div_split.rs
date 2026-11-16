@@ -45,8 +45,9 @@
 //! # The discharge
 //!
 //! As the branch split's, `π_i = trans P_l (trans S_i (symm P_r))` with the
-//! proving reflection (`branch_reflect::reflect_value` under
-//! `ReflectCtx::branching`), with two differences in `S_i` ([`Split`]):
+//! proving reflection (`branch_reflect::reflect_value` under [`div_proving`]:
+//! `ReflectCtx::branching` plus the S3b arms below), with two differences in
+//! `S_i` ([`Split`]):
 //!
 //! - **the deep split.** Each atom is abstracted at EVERY occurrence in the
 //!   rendered view, inside cores too ([`deep`]), in the statement and in the
@@ -62,6 +63,18 @@
 //!   over `Eq.refl` leaves, and the kernel discharges the remaining
 //!   definitional unfolding.
 //!
+//! and in `P_l`, `P_r`, the S3b proving arms (PKG-C5c-S3b), dispatched by two
+//! unfrozen `reflect_node` lines only under `ReflectCtx::div_steps &&
+//! branching_steps` (set by [`div_proving`] alone, so never in a goal
+//! reflection). They let a guard and a divisor read through a copy (`mov`:
+//! `BvOr(0, x)`) meet the spec inside a core: [`ite`] restates a nested
+//! condition with a variable by `reflect_bool`'s view, the same atom the split
+//! abstracts (`Trust.BVB.ite_cong`), and [`udiv`] carries a symbolic
+//! division's operands at their cores (`congrArg bvIsZero`, `congrArg (bvNot ∘
+//! bvAllFalse)` and `Clean.BVC.bvf_div_cong` under `ite_cong`). Both are
+//! proof construction the kernel checks; neither changes a `bvf` the frozen
+//! arms build.
+//!
 //! # What is trusted
 //!
 //! The kernel checks `π` against `G`; what `G` means is trusted residual:
@@ -76,6 +89,10 @@
 //!   `goal_udiv_agrees_with_smt_on_non_power_of_two_pairs`;
 //! - on the machine side, the lifter's AArch64 `UDIV` model
 //!   `ite(b == 0, 0, BvUDiv(a, b))` (TCB F1-OUTPUT-TV).
+//!
+//! The S3b [`udiv`] arm's proving `bvf` is a copy of the frozen goal arm's
+//! expression and is NOT trusted: no goal reflection reaches it, and the
+//! "left the goal" filter and the kernel compare it with G.
 //!
 //! # What only declines
 //!
@@ -97,12 +114,14 @@ use clean_kernel::{ConstantKind, Environment, Expr, ExprKind};
 use trust_types::Formula;
 
 use super::branch_reflect::{
-    AtomVal, BExpr, VExpr, atoms_b, atoms_v, eval_b, note_closed, reflect_value, render_b, render_v,
+    self, AtomVal, BExpr, VExpr, atoms_b, atoms_v, eval_b, note_closed, reflect_bool,
+    reflect_value, render_b, render_v,
 };
 use super::branch_split::{self, BranchFilter, Decline, Goal, Obligation};
-use super::kterm::{Fresh, bool_rec, bool_ty, lams, lb, refl, symm, trans};
+use super::kterm::{Fresh, bool_rec, bool_ty, congr_arg, lams, lb, refl, symm, trans};
 use super::{
-    ReflectCtx, branch_theory, kx, on_route_stack, reflect_formula, run_recheck_thread, strength,
+    ReflectCtx, Reflected, branch_theory, kx, on_route_stack, reflect_formula, run_recheck_thread,
+    strength,
 };
 use crate::verify_output::ProvenEvidence;
 
@@ -191,6 +210,241 @@ pub(crate) fn goal_of(items: &[(Formula, Formula)]) -> Result<Goal, String> {
         }
     }
     Ok((goal, sides, leaves))
+}
+
+// ── the proving reflection and its arms (S3b) ────────────────────────────────
+
+/// The proving reflection: `ReflectCtx::branching` plus the S3b arms
+/// (`ReflectCtx::div_steps`). [`obligation`] reflects under it; [`goal_of`]
+/// keeps `ReflectCtx::branching_goal`, so G never reaches these arms.
+pub(crate) fn div_proving() -> ReflectCtx {
+    let mut c = ReflectCtx::branching();
+    #[cfg(test)]
+    if mutant() == Mutant::NoDivSteps {
+        return c;
+    }
+    c.div_steps = true;
+    c
+}
+
+/// Count one call of an S3b arm on this thread (tests only).
+fn note_arm() {
+    #[cfg(test)]
+    ARM_CALLS.with(|n| n.set(n.get() + 1));
+}
+
+/// `(b, ca, ce)` of a core `BvF.Const (bvIteVal b ca ce)`; `None` for any
+/// other shape.
+fn ite_parts(core: &Expr) -> Option<(Expr, Expr, Expr)> {
+    if head(core).as_deref() != Some("Clean.BVC.BvF.Const") {
+        return None;
+    }
+    let [inner] = core.get_app_args()[..] else { return None };
+    if head(inner).as_deref() != Some("Clean.BVC.bvIteVal") {
+        return None;
+    }
+    let [b, ca, ce] = inner.get_app_args()[..] else { return None };
+    Some((b.clone(), ca.clone(), ce.clone()))
+}
+
+/// `R(Ite(c, a, e))` under [`div_proving`]: the frozen arm
+/// (`branch_reflect::ite`: its `bvf`, its arm cores, its ground selection),
+/// then, for a condition with a variable, one step restating the condition
+/// by `reflect_bool`'s view κ, the function that makes the split's atoms:
+/// `ite_cong (B c) (render κ) ca ca ce ce p refl refl`, `p : B c = render κ`.
+/// A nested guard read through a copy (`BvOr(0, x) == 0`) then carries the
+/// atom the split abstracts (`bvBeq ⟦x⟧ ⟦0⟧`) instead of its goal form. The
+/// step is taken only when `reflect_bool`'s `B(c)` is the frozen arm's
+/// condition byte for byte, its render differs and none of its counted
+/// steps hit the shared cap; otherwise the context is restored (counters and
+/// leaves) and the frozen output returned unchanged. A step taken still
+/// counts its condition's steps against the shared caps, so a later step of
+/// the same conjunction can reach a cap the frozen arms did not (a decline).
+pub(super) fn ite(
+    c: &Formula,
+    a: &Formula,
+    e: &Formula,
+    ctx: &mut ReflectCtx,
+) -> Result<Reflected, String> {
+    note_arm();
+    let out = branch_reflect::ite(c, a, e, ctx)?;
+    // A condition with a variable is never a closed literal comparison, so
+    // the frozen arm took its congruence path: core = Const (bvIteVal b ..).
+    if !has_var(c) {
+        return Ok(out);
+    }
+    let Some((b, ca, ce)) = ite_parts(&out.core) else { return Ok(out) };
+    let saved = ctx.clone();
+    let Ok((bc, kc, pc)) = reflect_bool(c, ctx) else {
+        *ctx = saved;
+        return Ok(out);
+    };
+    #[cfg(test)]
+    let bc = if mutant() == Mutant::CondSkewed { kx::bnot(bc) } else { bc };
+    // A counted step of the restated condition refused at the shared cap
+    // (`BRANCH_MAX_REWRITES`): not taken, so the step adds no "cap (steps)"
+    // decline of its own.
+    if ctx.branch_cap_hit && !saved.branch_cap_hit {
+        *ctx = saved;
+        return Ok(out);
+    }
+    let rk = render_b(&kc, &|_| None);
+    if bc != b || rk == b {
+        *ctx = saved;
+        return Ok(out);
+    }
+    #[cfg(test)]
+    let view = if mutant() == Mutant::ViewNegated { kx::bnot(rk.clone()) } else { rk.clone() };
+    #[cfg(not(test))]
+    let view = rk.clone();
+    let new_core = kx::const_(kx::bv_ite_val(view, ca.clone(), ce.clone()));
+    let step = branch_theory::ite_cong_inst(
+        b,
+        rk,
+        ca.clone(),
+        ca.clone(),
+        ce.clone(),
+        ce.clone(),
+        pc,
+        refl(lb(), ca),
+        refl(lb(), ce),
+    );
+    let proof = kx::eq_trans_list(
+        kx::evalf(out.bvf.clone()),
+        kx::evalf(out.core),
+        kx::evalf(new_core.clone()),
+        out.proof,
+        step,
+    );
+    Ok(Reflected { bvf: out.bvf, core: new_core, proof })
+}
+
+/// The all-ones value of the width of `t`: udiv's zero-divisor arm.
+fn all_ones(t: Expr) -> Expr {
+    kx::bv_not(kx::all_false(t))
+}
+
+/// `R(BvUDiv(a, b))` under [`div_proving`]. A divisor without a variable
+/// goes to the frozen arm (`branch_reflect::udiv`, its literal-divisor step
+/// unchanged). Otherwise the `bvf` is the frozen goal arm's expression
+/// (`bvIteVal (bvIsZero ⟦b⟧) (bvNot (bvAllFalse ⟦a⟧)) ⟦Div a b⟧`), an
+/// UNTRUSTED copy: no goal reflection reaches this arm, the obligation's
+/// "left the goal" filter and the kernel compare it with G (a wrong copy:
+/// `a_wrong_udiv_bvf_is_refused_by_the_kernel`), and
+/// `the_udiv_arm_states_the_frozen_bvf` pins it equal to the frozen arm's;
+/// the core carries both operands at their cores ([`faithful_div_core`]).
+pub(super) fn udiv(l: &Formula, r: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> {
+    note_arm();
+    if !has_var(r) {
+        return branch_reflect::udiv(l, r, ctx);
+    }
+    // The frozen arm's order: dividend, then divisor.
+    let ra = reflect_formula(l, ctx)?;
+    let rb = reflect_formula(r, ctx)?;
+    #[cfg(test)]
+    let guarded = if mutant() == Mutant::BvfWrong { &ra } else { &rb };
+    #[cfg(not(test))]
+    let guarded = &rb;
+    let bvf = kx::const_(kx::bv_ite_val(
+        kx::bv_is_zero(kx::evalf(guarded.bvf.clone())),
+        all_ones(kx::evalf(ra.bvf.clone())),
+        kx::evalf(kx::div(ra.bvf.clone(), rb.bvf.clone())),
+    ));
+    Ok(match faithful_div_core(&ra, &rb, kx::div, kx::div_cong, &all_ones) {
+        None => {
+            Reflected { core: bvf.clone(), proof: kx::eq_refl_list(kx::evalf(bvf.clone())), bvf }
+        }
+        Some((core, proof)) => Reflected { bvf, core, proof },
+    })
+}
+
+/// The core `Const (bvIteVal (bvIsZero ⟦b'⟧) (zero ⟦a'⟧) ⟦node a' b'⟧)`,
+/// `a'`, `b'` the operands' cores, with its proof `⟦bvf⟧ = ⟦core⟧` for the
+/// `bvf` `Const (bvIteVal (bvIsZero ⟦b⟧) (zero ⟦a⟧) ⟦node a b⟧)`:
+/// `ite_cong` over `congrArg bvIsZero` (the guard), `congrArg zero` (the
+/// zero-divisor arm, `Eq.refl` when the dividend is its own core) and
+/// `cong` (the quotient, e.g. `Clean.BVC.bvf_div_cong`). `None` when both
+/// operands are their own cores (the arm's output is then the frozen one).
+/// `zero` is the zero-divisor arm as a function of the dividend's value; a
+/// signed division passes its own.
+pub(super) fn faithful_div_core(
+    ra: &Reflected,
+    rb: &Reflected,
+    node: fn(Expr, Expr) -> Expr,
+    cong: fn(Expr, Expr, Expr, Expr, Expr, Expr) -> Expr,
+    zero: &dyn Fn(Expr) -> Expr,
+) -> Option<(Expr, Expr)> {
+    if ra.core == ra.bvf && rb.core == rb.bvf {
+        return None;
+    }
+    let (ea, eac) = (kx::evalf(ra.bvf.clone()), kx::evalf(ra.core.clone()));
+    let (eb, ebc) = (kx::evalf(rb.bvf.clone()), kx::evalf(rb.core.clone()));
+    let h_guard = congr_arg(
+        lb(),
+        bool_ty(),
+        eb.clone(),
+        ebc.clone(),
+        Expr::const_str("Clean.BVC.bvIsZero"),
+        rb.proof.clone(),
+    );
+    #[cfg(test)]
+    let h_guard = if mutant() == Mutant::GuardRefl {
+        refl(bool_ty(), kx::bv_is_zero(eb.clone()))
+    } else {
+        h_guard
+    };
+    let h_zero = if ra.core == ra.bvf {
+        refl(lb(), zero(ea.clone()))
+    } else {
+        let mut fr = Fresh::new();
+        let (t_id, t) = fr.local();
+        let f = lams(vec![(t_id, lb())], zero(t));
+        congr_arg(lb(), lb(), ea.clone(), eac.clone(), f, ra.proof.clone())
+    };
+    #[cfg(test)]
+    let swap = mutant() == Mutant::DivCongSwap;
+    #[cfg(not(test))]
+    let swap = false;
+    let h_quot = if swap {
+        cong(
+            rb.bvf.clone(),
+            rb.core.clone(),
+            ra.bvf.clone(),
+            ra.core.clone(),
+            rb.proof.clone(),
+            ra.proof.clone(),
+        )
+    } else {
+        cong(
+            ra.bvf.clone(),
+            ra.core.clone(),
+            rb.bvf.clone(),
+            rb.core.clone(),
+            ra.proof.clone(),
+            rb.proof.clone(),
+        )
+    };
+    let quot = kx::evalf(node(ra.bvf.clone(), rb.bvf.clone()));
+    let quot_core = kx::evalf(node(ra.core.clone(), rb.core.clone()));
+    #[cfg(test)]
+    let h_quot = if mutant() == Mutant::QuotRefl { refl(lb(), quot.clone()) } else { h_quot };
+    let core = kx::const_(kx::bv_ite_val(
+        kx::bv_is_zero(ebc.clone()),
+        zero(eac.clone()),
+        quot_core.clone(),
+    ));
+    let proof = branch_theory::ite_cong_inst(
+        kx::bv_is_zero(eb),
+        kx::bv_is_zero(ebc),
+        zero(ea),
+        zero(eac),
+        quot,
+        quot_core,
+        h_guard,
+        h_zero,
+        h_quot,
+    );
+    Some((core, proof))
 }
 
 // ── the deep abstraction and the leaf comparison ─────────────────────────────
@@ -492,7 +746,7 @@ pub(crate) fn obligation(
 ) -> Result<Obligation, Decline> {
     // G first, from the original items alone (the walk is part of it).
     let (goal, sides, leaves) = goal_of(items).map_err(Decline::Filter)?;
-    let mut ctx = ReflectCtx::branching();
+    let mut ctx = div_proving();
     let mut views = Vec::with_capacity(items.len());
     for ((l, r), (gl, gr)) in items.iter().zip(&sides) {
         let (lb_, vl, pl) = reflect_value(l, &mut ctx).map_err(Decline::Filter)?;
@@ -620,6 +874,9 @@ thread_local! {
     /// A deliberately wrong proof builder, for the tests that show the
     /// kernel (or, for `NormElse`, the kernel behind the filter) refusing it.
     static MUTANT: std::cell::Cell<Mutant> = const { std::cell::Cell::new(Mutant::None) };
+    /// How many times an S3b arm ([`ite`], [`udiv`]) was entered on this
+    /// thread.
+    static ARM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The test-only builder mutants ([`MUTANT`]).
@@ -634,6 +891,26 @@ pub(crate) enum Mutant {
     /// The leaf comparison reads `bvIteVal true a e` as `e` (the else arm on
     /// `true`; `false` stays right).
     NormElse,
+    /// [`div_proving`] is `ReflectCtx::branching()`: the S3b arms off.
+    NoDivSteps,
+    /// The S3b `ite` step writes `Bool.not` of the view into the core (its
+    /// proof still states the view).
+    ViewNegated,
+    /// The quotient's congruence instance takes the operand pairs swapped
+    /// (the core stays right).
+    DivCongSwap,
+    /// The S3b `ite` step sees `reflect_bool`'s `B(c)` negated (its proof
+    /// unchanged), so the `B(c) == b` check must decline it.
+    CondSkewed,
+    /// The S3b `udiv` arm's `bvf` guards the dividend (`bvIsZero ⟦a⟧`)
+    /// instead of the divisor: a wrong copy of the frozen goal arm.
+    BvfWrong,
+    /// The guard's `congrArg bvIsZero` replaced by `Eq.refl` (an equivalent
+    /// mutant where the kernel computes the copy away).
+    GuardRefl,
+    /// The quotient's `bvf_div_cong` instance replaced by `Eq.refl` (an
+    /// equivalent mutant where the kernel computes the copy away).
+    QuotRefl,
 }
 
 #[cfg(test)]

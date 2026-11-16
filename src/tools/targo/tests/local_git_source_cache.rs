@@ -161,6 +161,194 @@ fn new_world(nested: bool) -> (PathBuf, git2::Oid) {
     new_world_with_loose_objects(nested, 0)
 }
 
+// Trust: recreate the actual asymmetric reclamation state. The checkout is
+// original ordinary Cargo output; only its separate database is removed.
+fn missing_database_world() -> (PathBuf, git2::Oid, PathBuf, PathBuf) {
+    let (world, revision) = new_world(false);
+    let databases = fs::read_dir(world.join("donor/git/db"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(databases.len(), 1);
+    let database = databases[0].clone();
+    let ident = database.file_name().unwrap();
+    let checkouts = fs::read_dir(world.join("donor/git/checkouts").join(ident))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(checkouts.len(), 1);
+    let checkout = checkouts[0].clone();
+    assert!(checkout.join(".cargo-ok").is_file());
+    assert_eq!(
+        git2::Repository::open(&checkout)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target(),
+        Some(revision)
+    );
+    fs::remove_dir_all(&database).unwrap();
+    (world, revision, database, checkout)
+}
+
+#[test]
+fn missing_database_exact_ready_checkout_recovers_without_network_and_preserves_source() {
+    for whole_parent in [false, true] {
+        let (world, revision, database, checkout) = missing_database_world();
+        if whole_parent {
+            fs::remove_dir(database.parent().unwrap()).unwrap();
+        }
+        let manifest = fs::read(checkout.join("Cargo.toml")).unwrap();
+        let source = fs::read(checkout.join("src/lib.rs")).unwrap();
+        // Make the actual original remote unreachable, independently of --offline.
+        fs::rename(
+            world.join("source.git"),
+            world.join("unavailable-original.git"),
+        )
+        .unwrap();
+        let output = recorded(
+            command(&world, "donor").args(["fetch", "--locked", "--offline"]),
+            &world,
+            "missing-db-exact-fetch",
+        );
+        success(&output, &world);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Recovered"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("database directory created: {whole_parent}"))
+        );
+        let recovered = git2::Repository::open_bare(&database).unwrap();
+        assert_eq!(recovered.find_commit(revision).unwrap().id(), revision);
+        assert!(
+            recovered.remotes().unwrap().is_empty(),
+            "no donor remote/config authority copied"
+        );
+        assert!(!database.join("objects/info/alternates").exists());
+        assert!(!database.join("shallow").exists());
+        assert_eq!(fs::read(checkout.join("Cargo.toml")).unwrap(), manifest);
+        assert_eq!(fs::read(checkout.join("src/lib.rs")).unwrap(), source);
+        assert_eq!(
+            git2::Repository::open(&checkout)
+                .unwrap()
+                .head()
+                .unwrap()
+                .target(),
+            Some(revision)
+        );
+        let output = recorded(
+            command(&world, "donor").args(["--unverified", "check", "--locked", "--offline"]),
+            &world,
+            "missing-db-actual-consumer",
+        );
+        success(&output, &world);
+        let again = recorded(
+            command(&world, "donor").args(["fetch", "--locked", "--offline"]),
+            &world,
+            "existing-db-ordinary-fetch",
+        );
+        success(&again, &world);
+        assert!(!String::from_utf8_lossy(&again.stderr).contains("Recovered"));
+    }
+}
+
+#[test]
+fn missing_database_wrong_partial_ambiguous_or_indirected_checkout_refuses() {
+    for fault in [
+        "head",
+        "blob",
+        "parent",
+        "marker",
+        "ambiguous",
+        "alternate",
+        "shallow",
+    ] {
+        let (world, revision, database, checkout) = missing_database_world();
+        let repo = git2::Repository::open(&checkout).unwrap();
+        match fault {
+            "head" => repo
+                .set_head_detached(repo.find_commit(revision).unwrap().parent_id(0).unwrap())
+                .unwrap(),
+            "blob" | "parent" => {
+                let commit = repo.find_commit(revision).unwrap();
+                let oid = if fault == "parent" {
+                    commit.parent_id(0).unwrap()
+                } else {
+                    commit.tree().unwrap().get_name("Cargo.toml").unwrap().id()
+                };
+                let hex = oid.to_string();
+                fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..]))
+                    .unwrap();
+            }
+            "marker" => fs::remove_file(checkout.join(".cargo-ok")).unwrap(),
+            "ambiguous" => {
+                let other = checkout.parent().unwrap().join(&revision.to_string()[..8]);
+                fs::create_dir(other).unwrap(); // A second locator is ambiguous, never authority.
+            }
+            "alternate" => {
+                fs::write(repo.path().join("objects/info/alternates"), b"/untrusted\n").unwrap()
+            }
+            "shallow" => fs::write(repo.path().join("shallow"), format!("{revision}\n")).unwrap(),
+            _ => unreachable!(),
+        }
+        let output = recorded(
+            command(&world, "donor").args(["fetch", "--locked", "--offline"]),
+            &world,
+            "missing-db-refusal",
+        );
+        assert!(
+            !output.status.success(),
+            "fault {fault} world={}",
+            world.display()
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("exact checkout database recovery refused"),
+            "fault {fault}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!database.exists(), "fault {fault} published a database");
+        assert!(checkout.exists(), "fault {fault} deleted original checkout");
+    }
+}
+
+#[test]
+fn missing_database_branch_source_keeps_ordinary_offline_refusal() {
+    let (world, revision) = new_world(false);
+    let path = world.join("project/Cargo.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let branch = original.replace(&format!("rev='{revision}'"), "branch='master'");
+    assert_ne!(branch, original);
+    fs::write(&path, branch).unwrap();
+    // Obtain a genuine branch lock through the ordinary source path first.
+    let output = recorded(
+        command(&world, "donor").args(["generate-lockfile"]),
+        &world,
+        "ordinary-branch-source",
+    );
+    success(&output, &world);
+    for entry in fs::read_dir(world.join("donor/git/db")).unwrap() {
+        fs::remove_dir_all(entry.unwrap().path()).unwrap();
+    }
+    fs::rename(
+        world.join("source.git"),
+        world.join("unavailable-original.git"),
+    )
+    .unwrap();
+    let output = recorded(
+        command(&world, "donor").args(["fetch", "--locked", "--offline"]),
+        &world,
+        "missing-db-branch-refusal",
+    );
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("offline"), "{error}");
+    assert!(
+        !error.contains("Recovered"),
+        "branch refresh must not gain exact-revision recovery"
+    );
+    assert!(!error.contains("exact checkout database recovery refused"));
+}
+
 fn new_world_with_loose_objects(nested: bool, loose_objects: usize) -> (PathBuf, git2::Oid) {
     new_world_with_repository(nested, loose_objects, |_, revision| revision)
 }
@@ -323,6 +511,68 @@ fn add_packed_history(path: &Path, revision: git2::Oid) -> git2::Oid {
         (PACKED_HISTORY_BYTES, git2::ObjectType::Blob)
     );
     selected
+}
+
+#[test]
+fn missing_original_object_diagnostic_identifies_its_selected_source() {
+    let (world, revision) = new_world(false);
+    let donor = world.join("source.git");
+    let donor_url = url::Url::from_file_path(&donor).unwrap();
+    let repository = git2::Repository::open_bare(&donor).unwrap();
+    let blob = repository
+        .find_commit(revision)
+        .unwrap()
+        .tree()
+        .unwrap()
+        .get_path(Path::new("src/lib.rs"))
+        .unwrap()
+        .id();
+    let hex = blob.to_string();
+    fs::remove_file(donor.join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+    // Complete Cargo fallback DATA still exists. Explicit original object DATA
+    // must refuse, and identify the failed original source without falling back.
+    for (label, flag) in [
+        ("attributed-preflight", "--local-git-source-preflight"),
+        ("attributed-import", "--local-git-source-cache"),
+        ("attributed-snapshot", "--local-cargo-data-cache"),
+    ] {
+        let mut invocation = command(&world, label);
+        invocation.args(["fetch", "--locked", "--offline", flag]);
+        if flag != "--local-git-source-preflight" {
+            invocation.arg(world.join("donor"));
+        }
+        invocation
+            .arg("--local-git-object-source")
+            .arg(donor_url.as_str())
+            .arg(donor.join("objects"));
+        let output = recorded(&mut invocation, &world, &format!("{label}-result"));
+        assert!(!output.status.success(), "world={}", world.display());
+        let error = String::from_utf8_lossy(&output.stderr);
+        // Canonical diagnostics strip the optional .git suffix; transport and
+        // selector identity still use the original URL unchanged.
+        let mut canonical = donor_url.clone();
+        canonical.set_path(
+            canonical
+                .path()
+                .strip_suffix(".git")
+                .unwrap()
+                .to_owned()
+                .as_str(),
+        );
+        assert!(
+            error.contains(&format!(
+                "Git source `{canonical}` at selected commit {revision}"
+            )),
+            "world={}\n{error}",
+            world.display()
+        );
+        assert!(error.contains(&hex), "{error}");
+        assert!(
+            error.contains("class=Odb") && error.contains("code=NotFound"),
+            "{error}"
+        );
+        assert!(!world.join(label).exists());
+    }
 }
 
 #[test]

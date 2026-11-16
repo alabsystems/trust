@@ -104,6 +104,14 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
             self.unsupported.push((format!("{span:?}"), "Call(core wrapping_add signature)"));
             return Some(None);
         }
+        // Preserve the actual Rust call when its crate supplies IR metadata.
+        // Presence is not admission: the sealed upstream reader still checks
+        // the entry's identity, mode, ABI, body and effects. In particular,
+        // malformed metadata must refuse there, never become a model receipt.
+        // The versioned model remains the fallback for SDKs without an entry.
+        if self.tcx.trust_ir_entry(def).is_some() {
+            return None;
+        }
         // Callee effects were already evaluated by the common Call arm. Both
         // actual arguments are evaluated exactly once and in source order.
         let Some(lhs) = self.lower_expr(args[0]) else { return Some(None) };

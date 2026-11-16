@@ -413,6 +413,51 @@ static EXIT_HANDLER: Once = Once::new();
 /// One-millisecond attempts the exit path makes for the list's lock.
 const EXIT_LOCK_ATTEMPTS: usize = 50;
 
+// Trust (RL-65): a process ended by a signal runs no exit handler, so its
+// folder stayed for good. The owner of a folder therefore proves through the
+// kernel that it is alive, and every process that makes a folder first removes
+// the dead ones beside it.
+//
+// The owner holds an exclusive flock on the folder's own descriptor. flock
+// belongs to the open file description: the kernel releases it when the last
+// descriptor of that description closes, which the death of the process by any
+// signal does, and an exec too (the descriptor is close-on-exec). A forked
+// child that keeps a copy keeps the folder alive, which errs on the safe side.
+// The marker inside says the lock was taken, and was shown to exclude a second
+// description of the folder, before the marker appeared. A folder without it
+// is never swept: one from a pack before this change, one whose owner died
+// before the marker, one on a filesystem that does not enforce flock.
+//
+// The lock proves an owner alive only to a sweeper that asks the kernel
+// holding it, about the file it was taken on. Linux keeps flock on a folder of
+// NFS, FUSE, 9p and overlayfs in the calling kernel alone (their directory
+// operations have no `flock`, so `flock(2)` takes the local path): a second
+// host, or a guest and its host, that share a temporary folder each see the
+// other's live folders as unlocked, and so does one kernel that reaches a
+// folder through a second file system laid over the first. The marker
+// therefore holds where its lock lives (`liveness_record`): the kernel's
+// identity for this boot and the folder's device and inode numbers as the
+// owner's kernel reports them. A sweep removes a folder only when the marker
+// holds the sweeper's own three values. A process that cannot read its
+// kernel's identity makes no marker and sweeps nothing.
+//
+// Processes built at different times meet over this lock, so it names its
+// system call: std's `File::try_lock` is flock today by a choice std may change.
+const LIVE_MARKER: &std::ffi::CStr = c"l";
+/// The longest kernel identity a marker holds.
+const KERNEL_IDENTITY_BYTES: usize = 64;
+/// The most a marker holds: the identity, two 64-bit numbers in decimal, the
+/// two spaces between them and the newline.
+const MARKER_BYTES: usize = KERNEL_IDENTITY_BYTES + 1 + 20 + 1 + 20 + 1;
+/// Entries of the parent one sweep reads, so that a temporary folder of any
+/// size costs an endpoint a bounded listing. In a folder that holds more, the
+/// names listed after these are not seen.
+const SWEEP_ENTRIES: usize = 16_384;
+/// Job-server folders one sweep opens, and so the most it removes. A killed
+/// targo leaves one or two. This many removals cost about what the full
+/// listing above does (docs/STATUS.md, "Job-server folder removal").
+const SWEEP_FOLDERS: usize = 64;
+
 fn live_directories() -> MutexGuard<'static, Vec<LiveDirectory>> {
     // No code panics while it holds this lock; a poisoned list is still exact.
     LIVE_DIRECTORIES.lock().unwrap_or_else(PoisonError::into_inner)
@@ -463,8 +508,9 @@ extern "C" fn remove_endpoint_directories_at_exit() {
     let _ = std::panic::catch_unwind(remove_endpoint_directories);
 }
 
-/// Remove the socket and then the folder, both named through the folder's own
-/// descriptor. Running it again for a folder that is already gone does nothing.
+/// Remove the socket, the marker and then the folder, the first two named
+/// through the folder's own descriptor. Running it again for a folder that is
+/// already gone does nothing.
 fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path) {
     // SAFETY: remove only the socket entry in the directory we own, even
     // when its advertised pathname was replaced or redirected by a peer.
@@ -475,36 +521,269 @@ fn remove_owned(directory: BorrowedFd<'_>, path: &std::path::Path) {
     // keeps this view of it from closing it.
     let file =
         std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(directory.as_raw_fd()) });
-    if let (Ok(owned), Ok(named)) = (file.metadata(), std::fs::symlink_metadata(path))
-        && named.is_dir()
-        && owned.dev() == named.dev()
-        && owned.ino() == named.ino()
-    {
+    let named_here = matches!(
+        (file.metadata(), std::fs::symlink_metadata(path)),
+        (Ok(owned), Ok(named))
+            if named.is_dir() && owned.dev() == named.dev() && owned.ino() == named.ino()
+    );
+    // Trust (RL-65): the marker goes last, straight before the rmdir. A
+    // process killed after the socket's unlink and before this one leaves a
+    // folder a later sweep still recognises; one killed after this call leaves
+    // an empty folder nothing recognises, a window of one system call.
+    // SAFETY: as for the socket: only the entry in the directory we own.
+    unsafe {
+        libc::unlinkat(directory.as_raw_fd(), LIVE_MARKER.as_ptr(), 0);
+    }
+    if named_here {
         // rmdir does not follow a final symlink and cannot delete a
-        // nonempty substituted directory. Socket removal above never
-        // traverses this mutable pathname.
+        // nonempty substituted directory. The removals above never
+        // traverse this mutable pathname.
         let _ = std::fs::remove_dir(path);
     }
 }
 
+fn open_folder(path: &std::path::Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Try the lock that says a folder's owner is alive. `Ok(false)`: another open
+/// file description holds it.
+fn try_liveness_lock(directory: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: flock uses only the number of this borrowed, open descriptor.
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(error) }
+}
+
+/// The running kernel's name for itself, new at each boot: Darwin's
+/// `kern.bootsessionuuid`, Linux's `boot_id`. `None` when it cannot be read
+/// or is not a name (empty, too long, other bytes than letters, digits and
+/// `-`, or nothing but zeros).
+fn kernel_identity() -> Option<Vec<u8>> {
+    let identity = read_kernel_identity()?;
+    is_kernel_identity(&identity).then_some(identity)
+}
+
+fn is_kernel_identity(identity: &[u8]) -> bool {
+    (1..=KERNEL_IDENTITY_BYTES).contains(&identity.len())
+        && identity.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        && identity.iter().any(|byte| !matches!(byte, b'0' | b'-'))
+}
+
+#[cfg(target_os = "macos")]
+fn read_kernel_identity() -> Option<Vec<u8>> {
+    let mut bytes = [0_u8; KERNEL_IDENTITY_BYTES + 1];
+    let mut length = bytes.len();
+    // SAFETY: the name is NUL-terminated, the buffer is writable for the
+    // `length` bytes passed with it, and no new value is given.
+    let read = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    // A string: the length the kernel reports counts its terminating NUL.
+    let text = bytes.get(..length)?;
+    Some(text.strip_suffix(&[0]).unwrap_or(text).to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn read_kernel_identity() -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open("/proc/sys/kernel/random/boot_id")
+        .ok()?
+        .take(KERNEL_IDENTITY_BYTES as u64 + 2)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes.strip_suffix(b"\n").unwrap_or(&bytes).to_vec())
+}
+
+/// What a marker holds: where the owner's lock lives. `kernel` keeps the
+/// lock, and `device` and `inode` are the locked folder as that kernel reports
+/// it. Within one kernel a device number names one mounted file system and an
+/// inode number one file of it, so equal records mean one lock table and one
+/// entry in it.
+fn liveness_record(kernel: &[u8], device: u64, inode: u64) -> Vec<u8> {
+    let mut record = kernel.to_vec();
+    record.extend_from_slice(format!(" {device} {inode}\n").as_bytes());
+    record
+}
+
+/// Take the liveness lock on a new folder and, once this filesystem is shown
+/// to enforce it, make the marker that says where the lock lives. When any
+/// step fails, or this kernel's identity cannot be read, there is no marker:
+/// the endpoint works as it did before and its folder is never swept.
+fn mark_live(directory: &std::fs::File) {
+    let Some(kernel) = kernel_identity() else { return };
+    if !matches!(try_liveness_lock(directory.as_fd()), Ok(true)) {
+        return;
+    }
+    // The proof: a second description of the same folder must be refused, as
+    // a sweeper's will be. A filesystem that has no flock, or grants it twice,
+    // gets no marker.
+    // SAFETY: the folder's descriptor is open and `.` is NUL-terminated; a
+    // successful openat returns a new descriptor owned here alone.
+    let second = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if second < 0 {
+        return;
+    }
+    // SAFETY: the successful openat above returned this descriptor's one owner.
+    let second = unsafe { OwnedFd::from_raw_fd(second) };
+    if !matches!(try_liveness_lock(second.as_fd()), Ok(false)) {
+        return;
+    }
+    drop(second);
+    let Ok(folder) = directory.metadata() else { return };
+    let record = liveness_record(&kernel, folder.dev(), folder.ino());
+    // SAFETY: the marker is made in the directory we own, by a NUL-terminated
+    // name.
+    let marker = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            LIVE_MARKER.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if marker < 0 {
+        return;
+    }
+    // SAFETY: the successful openat above returned this descriptor's one owner.
+    let mut marker = unsafe { std::fs::File::from_raw_fd(marker) };
+    // A marker that does not hold the whole record equals no sweeper's, so
+    // one seen before this write, or left by an owner killed before it, only
+    // keeps its folder.
+    if marker.write_all(&record).is_err() {
+        // SAFETY: as for the socket: only the entry in the directory we own.
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), LIVE_MARKER.as_ptr(), 0);
+        }
+    }
+}
+
+/// `tjs-` and sixteen lowercase hexadecimal digits, as `new_scoped_resources`
+/// names a folder.
+fn is_folder_name(name: &[u8]) -> bool {
+    name.len() == 20
+        && name.starts_with(b"tjs-")
+        && name[4..].iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether the folder's marker is this user's regular file and holds exactly
+/// `record`.
+fn marker_holds(directory: BorrowedFd<'_>, user: libc::uid_t, record: &[u8]) -> bool {
+    // SAFETY: the descriptor is open and the name is NUL-terminated. A final
+    // symlink is not followed, and a FIFO put there is not waited on.
+    let marker = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            LIVE_MARKER.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if marker < 0 {
+        return false;
+    }
+    // SAFETY: the successful openat above returned this descriptor's one owner.
+    let mut marker = unsafe { std::fs::File::from_raw_fd(marker) };
+    let Ok(metadata) = marker.metadata() else { return false };
+    if !metadata.is_file() || metadata.uid() != user {
+        return false;
+    }
+    // One read, with room for one byte more than any record: a marker that is
+    // shorter, longer or still being written is not this record.
+    let mut bytes = [0_u8; MARKER_BYTES + 1];
+    matches!(marker.read(&mut bytes), Ok(count) if bytes[..count] == *record)
+}
+
+/// The folder at `path`, opened and locked, when it is one this user's
+/// process made and marked under the kernel `kernel` and no live owner holds
+/// it.
+fn stale_folder(path: &std::path::Path, user: libc::uid_t, kernel: &[u8]) -> Option<std::fs::File> {
+    let directory = open_folder(path).ok()?;
+    let metadata = directory.metadata().ok()?;
+    if !metadata.is_dir() || metadata.uid() != user || metadata.mode() & 0o777 != 0o700 {
+        return None;
+    }
+    // The marker must say that this kernel keeps the lock on this very
+    // folder: only then does the lock below ask the owner's lock table.
+    let record = liveness_record(kernel, metadata.dev(), metadata.ino());
+    if !marker_holds(directory.as_fd(), user, &record) {
+        return None;
+    }
+    // Last, and only for a marked folder: a folder still being made has no
+    // marker yet, so this lock never meets its owner's first attempt.
+    matches!(try_liveness_lock(directory.as_fd()), Ok(true)).then_some(directory)
+}
+
+/// Remove the marked folders in `parent` whose owners are gone. Every failure
+/// skips its folder: the sweep returns no error and its lock attempts never
+/// wait. No process table is read and no socket is connected to: the lock
+/// alone says an owner is alive. Its other calls are a listing and, for a
+/// matching name, the opens, fstats and one read of `stale_folder`. The open
+/// of a name can wait where another user serves a file system mounted under
+/// it (docs/OPEN_ISSUES.md TARGO-JOBSERVER-SWEEP-SHARED-1).
+fn sweep_stale_folders(parent: &std::path::Path, rotation: usize) {
+    let Ok(listing) = std::fs::read_dir(parent) else { return };
+    let names: Vec<OsString> = listing
+        .take(SWEEP_ENTRIES)
+        .map_while(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| is_folder_name(name.as_bytes()))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    // A sweeper that cannot name its kernel cannot tell whose lock a marker
+    // speaks of, and removes nothing.
+    let Some(kernel) = kernel_identity() else { return };
+    // SAFETY: geteuid has no preconditions.
+    let user = unsafe { libc::geteuid() };
+    // The listing's order is the filesystem's and does not change between
+    // calls. Starting somewhere else each time, more folders than one call
+    // opens (those of earlier packs are never removed) cannot hide a stale one.
+    let first = rotation % names.len();
+    for name in names.iter().cycle().skip(first).take(names.len().min(SWEEP_FOLDERS)) {
+        let path = parent.join(name);
+        if let Some(directory) = stale_folder(&path, user, &kernel) {
+            remove_owned(directory.as_fd(), &path);
+        }
+    }
+}
+
 impl Directory {
-    /// Make the private folder, open it, and list it for removal at exit.
+    /// Make the private folder, open it, lock and mark it as live, and list it
+    /// for removal at exit.
     fn create(path: PathBuf) -> io::Result<Self> {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .map_err(naming("create the job-server folder", &path))?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|error| {
-                // Nothing was put in the folder made above, and no `Directory`
-                // exists yet to remove it. rmdir removes only an empty
-                // directory and does not follow a final symlink.
-                let _ = std::fs::remove_dir(&path);
-                naming("open the job-server folder", &path)(error)
-            })?;
+        let file = open_folder(&path).map_err(|error| {
+            // Nothing was put in the folder made above, and no `Directory`
+            // exists yet to remove it. rmdir removes only an empty
+            // directory and does not follow a final symlink.
+            let _ = std::fs::remove_dir(&path);
+            naming("open the job-server folder", &path)(error)
+        })?;
+        mark_live(&file);
         EXIT_HANDLER.call_once(|| {
             // SAFETY: the handler is a function of this image, which exit(3)
             // may call once. Without it, removal is left to `Drop` alone.
@@ -861,7 +1140,8 @@ impl Endpoint {
                 base.display()
             )));
         }
-        let name = format!("tjs-{}", hex(&random()?[..8]));
+        let unique = random()?;
+        let name = format!("tjs-{}", hex(&unique[..8]));
         let preferred = base.join(&name);
         let directory = if socket_address(&preferred.join("s")).is_ok() {
             preferred
@@ -884,6 +1164,14 @@ impl Endpoint {
             // descriptor-based cleanup in this shared system temporary root.
             std::path::Path::new("/tmp").join(name)
         };
+        // Trust (RL-65): before this folder is made, remove the ones beside it
+        // whose owners were killed. The bytes of the draw the name did not use
+        // say where in the listing this sweep starts.
+        if let Some(parent) = directory.parent() {
+            let rotation =
+                unique[8..16].iter().fold(0, |sum, byte| (sum << 8) | usize::from(*byte));
+            sweep_stale_folders(parent, rotation);
+        }
         let directory = Directory::create(directory)?;
         let path = directory.path.join("s");
         let listener = bind_endpoint(&path)?;

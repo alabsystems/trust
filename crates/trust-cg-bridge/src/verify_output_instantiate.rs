@@ -488,6 +488,7 @@ fn is_store_free(f: &Formula) -> bool {
 /// caller memories that need axioms, plus the ONE policy bit that decides whether
 /// a bare memory read (a load from state the function never wrote) is in the
 /// fragment.
+#[derive(Clone)]
 pub(crate) struct ReflectCtx {
     /// `(name, width)` of each symbolic register leaf → a `BVC_LEAF_*` axiom.
     pub(crate) leaves: Vec<(String, u32)>,
@@ -539,6 +540,11 @@ pub(crate) struct ReflectCtx {
     /// Whether the `const_div` step builders run (multiplier fold, magic
     /// quotient, remainder tail). Off when the goal is built.
     const_div_steps: bool,
+    /// DIV-SPLIT-1 S3b: the proving-only `div_split::ite` / `div_split::udiv`
+    /// arms. Set only by `div_split::div_proving`; read only together with
+    /// `branching_steps`, so no goal reflection (`branching_goal`,
+    /// `branch_reflect`'s `goal_only`) reaches them.
+    div_steps: bool,
 }
 
 impl ReflectCtx {
@@ -563,6 +569,7 @@ impl ReflectCtx {
             cancel_steps: false,
             const_div: false,
             const_div_steps: false,
+            div_steps: false,
         }
     }
 
@@ -714,6 +721,13 @@ fn reflect_node(f: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> 
         // CONSTDIV (stage A): exactly the 64-bit multiply-high shape, under
         // `ctx.const_div` only (`const_div::umulh`).
         Formula::BvExtract { high: 127, low: 64, .. } if ctx.const_div => const_div::umulh(f, ctx),
+        // DIV-SPLIT-1 S3b: proving only (div_split's own context; never in a goal reflection).
+        Formula::Ite(c, a, e) if ctx.div_steps && ctx.branching_steps => {
+            div_split::ite(c, a, e, ctx)
+        }
+        Formula::BvUDiv(l, r, _w) if ctx.div_steps && ctx.branching_steps => {
+            div_split::udiv(l, r, ctx)
+        }
         // BRANCH-SPLIT-1: the bit-vector `Ite` and the faithful unsigned
         // division, active only under `ctx.branching` (`branch_reflect`).
         Formula::Ite(c, a, e) if ctx.branching => branch_reflect::ite(c, a, e, ctx),
@@ -2942,15 +2956,16 @@ pub use const_div::{HookCall, record_const_div_rewrites, without_const_div_rewri
 // Loop L1 spike (unwired, test-only): `Trust.Loop.sim` and the cut-point lockstep route.
 #[cfg(test)]
 #[path = "verify_output_instantiate/loop_sim.rs"]
-mod loop_sim;
+pub(crate) mod loop_sim;
 
 /// The step-(5) branch routes as the call-event gate calls them (call_event.rs and
 /// call_event/closed_branch.rs, DECISION_QUEUE BRANCH-SPLIT-1, DIV-SPLIT-1 and CONSTDIV-1): the
 /// branch split, then, on its decline, the guarded symbolic division split, then, on its decline
 /// and only with a multiply-high in the conj, the constant division route (`branch_dispatch.rs`,
 /// which this returns unchanged). `Some(KernelInstantiated)` when the kernel accepts a split, `None`
-/// otherwise. Under `test-hooks` each call's outcome is also recorded for
-/// [`record_branch_split_calls`]; the recording changes no result.
+/// otherwise. Under `test-hooks` each call's outcome and the items it was given are also recorded
+/// for [`record_branch_split_calls`] and [`record_branch_split_conjunctions`]; the recording
+/// changes no result.
 pub(crate) fn try_branch_split_conjunction(
     items: &[(Formula, Formula)],
 ) -> Option<crate::verify_output::ProvenEvidence> {
@@ -2958,15 +2973,19 @@ pub(crate) fn try_branch_split_conjunction(
     #[cfg(feature = "test-hooks")]
     BRANCH_SPLIT_CALLS.with(|calls| {
         if let Some(calls) = calls.borrow_mut().as_mut() {
-            calls.push(evidence.is_some());
+            calls.push((evidence.is_some(), items.to_vec()));
         }
     });
     evidence
 }
 
+/// One recorded call of the route: `true` when it returned kernel evidence, and the items given.
+#[cfg(feature = "test-hooks")]
+pub type RecordedConjunction = (bool, Vec<(Formula, Formula)>);
+
 #[cfg(feature = "test-hooks")]
 thread_local! {
-    static BRANCH_SPLIT_CALLS: std::cell::RefCell<Option<Vec<bool>>> =
+    static BRANCH_SPLIT_CALLS: std::cell::RefCell<Option<Vec<RecordedConjunction>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2979,6 +2998,21 @@ thread_local! {
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub fn record_branch_split_calls<R>(body: impl FnOnce() -> R) -> (R, Vec<bool>) {
+    let (result, calls) = record_branch_split_conjunctions(body);
+    (result, calls.into_iter().map(|(proved, _)| proved).collect())
+}
+
+/// TEST HOOK (`test-hooks` only): [`record_branch_split_calls`] with each call's items, exactly as
+/// the gate passed them to the route. It lets a gate test tie a unit test's captured fixture to
+/// the gate's live conjunction (DIV-SPLIT-1 S3d: `signed_requires_lean_semantics` in
+/// `tests/div_split_gate.rs`), so fixture controls read exactly what the gate
+/// would hand the route. Signed fixtures now exercise source-goal refusal,
+/// not kernel replay of a proposed signed goal. This observes the route only.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn record_branch_split_conjunctions<R>(
+    body: impl FnOnce() -> R,
+) -> (R, Vec<RecordedConjunction>) {
     let outer = BRANCH_SPLIT_CALLS.with(|calls| calls.borrow_mut().replace(Vec::new()));
     let result = body();
     let calls = BRANCH_SPLIT_CALLS.with(|calls| std::mem::replace(&mut *calls.borrow_mut(), outer));

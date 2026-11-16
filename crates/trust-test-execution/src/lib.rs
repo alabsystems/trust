@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 pub mod retained;
+// Per-case results, carried apart from the tests' own output.
+pub mod results;
 // Unverified workload observations share no prepared/proof execution authority.
 pub mod workload;
 
@@ -38,6 +40,11 @@ pub struct PreparedTest {
     pub cwd: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Where this harness's per-case results go (`results`). A plan from a
+    /// native Targo that records none has none, and its reader reports every
+    /// case of it as not concluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<results::HarnessResultFiles>,
 }
 
 impl std::fmt::Debug for PreparedTest {
@@ -48,6 +55,7 @@ impl std::fmt::Debug for PreparedTest {
             .field("sha256", &self.sha256)
             .field("argument_count", &self.args.len())
             .field("environment_count", &self.env.len())
+            .field("results", &self.results)
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +96,7 @@ impl PreparedTests {
             );
         }
         let mut seen = BTreeSet::new();
+        validate_result_files(&self.tests)?;
         for test in &self.tests {
             if test.target.is_empty()
                 || !seen.insert(&test.executable)
@@ -115,6 +124,45 @@ impl PreparedTests {
         }
         Ok(())
     }
+}
+
+/// Every harness names its own result files or none does; a harness that
+/// names them passes `--logfile <its result file>` as its first two arguments
+/// and nowhere else, and no harness passes `--logfile` otherwise: the result
+/// channel is Targo's, never an argument the user can redirect, and no test
+/// argument after it (`--`, a value-taking `--skip`) can swallow it.
+fn validate_result_files(tests: &[PreparedTest]) -> Result<(), String> {
+    let recorded = tests.iter().filter(|test| test.results.is_some()).count();
+    if recorded != 0 && recorded != tests.len() {
+        return Err("prepared tests name result files for some harnesses only".into());
+    }
+    let mut paths = BTreeSet::new();
+    for test in tests {
+        let logfile_args = test.args.iter().filter(|arg| results::is_logfile_arg(arg)).count();
+        let Some(files) = &test.results else {
+            if logfile_args != 0 {
+                return Err("`--logfile` names Targo's per-case result channel; a test \
+                            argument cannot set it"
+                    .into());
+            }
+            continue;
+        };
+        let expected = files.libtest_args();
+        if logfile_args != 1
+            || test.args.get(..2) != Some(&expected[..])
+            || !Path::new(&files.logfile).is_absolute()
+            || !Path::new(&files.exit).is_absolute()
+            || files.logfile.contains('\0')
+            || files.exit.contains('\0')
+            || !paths.insert(files.logfile.as_str())
+            || !paths.insert(files.exit.as_str())
+        {
+            return Err("a prepared test's result files are not its own first `--logfile` \
+                        argument, absolute and distinct"
+                .into());
+        }
+    }
+    Ok(())
 }
 
 /// Opaque runtime transports belong to the actual scheduler owner, never to a
@@ -190,6 +238,7 @@ mod tests {
             cwd: "/source".into(),
             args: vec!["--exact".into(), "example".into()],
             env: BTreeMap::new(),
+            results: None,
         };
         let expected =
             [(test.executable.clone(), (test.sha256.clone(), test.size))].into_iter().collect();
@@ -273,6 +322,38 @@ mod tests {
             plan.tests[0].env.insert(key.into(), "1".into());
         }
         assert!(plan.validate("current", &expected).is_ok());
+    }
+
+    #[test]
+    fn result_files_are_the_first_logfile_argument_of_every_harness_or_of_none() {
+        let (mut plan, expected) = fixture();
+        let files = results::HarnessResultFiles::for_harness(Path::new("/s/plan.json"), 0).unwrap();
+        let test_args = plan.tests[0].args.clone();
+        plan.tests[0].results = Some(files.clone());
+        assert!(plan.validate("current", &expected).is_err(), "named but not passed");
+        // Anywhere but first, a test argument before it (`--`, `--skip`)
+        // could swallow it: refused, last included.
+        for at in 1..=test_args.len() {
+            let mut args = test_args.clone();
+            args.splice(at..at, files.libtest_args());
+            plan.tests[0].args = args;
+            assert!(plan.validate("current", &expected).is_err(), "channel at {at}");
+        }
+        plan.tests[0].args = files.harness_args(&test_args);
+        assert!(plan.validate("current", &expected).is_ok());
+        plan.tests[0].args.push("--logfile=/elsewhere".into());
+        assert!(plan.validate("current", &expected).is_err(), "a second result file");
+        plan.tests[0].args.pop();
+        plan.tests[0].args.extend(["--logfile".to_string(), "/elsewhere".to_string()]);
+        assert!(plan.validate("current", &expected).is_err(), "a second result file, split");
+        plan.tests[0].args = files.harness_args(&["--", "--logfile", "/elsewhere"]);
+        assert!(plan.validate("current", &expected).is_err(), "a second one after `--`");
+        plan.tests[0].args = files.harness_args(&test_args);
+        plan.tests[0].results.as_mut().unwrap().exit = files.logfile.clone();
+        assert!(plan.validate("current", &expected).is_err(), "one file for both");
+        let (mut plan, expected) = fixture();
+        plan.tests[0].args.extend(["--logfile".to_string(), "/user/chosen".to_string()]);
+        assert!(plan.validate("current", &expected).is_err(), "the user cannot redirect it");
     }
 
     #[test]

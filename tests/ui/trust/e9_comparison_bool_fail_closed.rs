@@ -25,7 +25,7 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     theorem key64_le_refl : forall (a : BitVec 64), Nat.le (key64 a) (key64 a) :=
-        fun a => Nat.le.refl (key64 a)
+        fun a => @Nat.le.refl (key64 a)
 }
 
 pub fn unordered(a: i64, b: i64) -> bool

@@ -3511,6 +3511,8 @@ pub struct PublishedCrateModule {
     ambiguous_display_paths: Vec<String>,
     codegen_licensed: Vec<FuncId>,
     codegen_license_refusal: Option<String>,
+    /// In-process source data, not an inventory entry or an emission license.
+    pending_rust_calls: Vec<crate::clean_origin_join::PendingRustCallSource>,
 }
 
 impl PublishedCrateModule {
@@ -3535,6 +3537,16 @@ impl PublishedCrateModule {
     /// not a work list: see [`Self::codegen_inventory`].
     pub fn module(&self) -> &Module {
         &self.module
+    }
+
+    /// Unlicensed deferred source context beside this exact immutable module.
+    /// Its ids belong to `module()`, not a relocated codegen module. Source
+    /// registry authentication, TV and actual Rust evidence remain owed.
+    pub fn pending_rust_call_source(
+        &self,
+        def_index: u32,
+    ) -> Option<&crate::clean_origin_join::PendingRustCallSource> {
+        self.pending_rust_calls.iter().find(|row| row.def_index == def_index)
     }
 
     /// Resolve an intra-module callee by symbol.
@@ -4202,7 +4214,31 @@ fn decide_publication(
         ambiguous_display_paths,
         codegen_licensed,
         codegen_license_refusal,
+        pending_rust_calls: Vec::new(),
     })
+}
+
+/// Attach data only after publication's existing semantic decision succeeds.
+/// Returning an error drops both the candidate and all retained contexts.
+fn retain_pending_rust_call_sources(
+    decision: Result<PublishedCrateModule, String>,
+    pending: Vec<crate::clean_origin_join::PendingRustCallSource>,
+) -> Result<PublishedCrateModule, String> {
+    let mut published = decision?;
+    let mut definitions = BTreeSet::new();
+    let mut functions = BTreeSet::new();
+    for row in &pending {
+        let valid = published.module.function_by_id(row.func_id).is_some_and(|function| {
+            !function.is_declaration()
+                && function.producer == Some(trust_ir::Producer::Clean)
+                && function.name == row.link_symbol
+        });
+        if !valid || !definitions.insert(row.def_index) || !functions.insert(row.func_id) {
+            return Err("retained Rust-call source disagrees with its unique published Clean body".into());
+        }
+    }
+    published.pending_rust_calls = pending;
+    Ok(published)
 }
 
 /// Install one publication decision into the Session slot.
@@ -4247,9 +4283,12 @@ fn publish_crate_module(
     assigned: &[(u32, FuncId)],
     errors: &[String],
     codegen_license_refusal: Option<String>,
+    pending_rust_calls: Vec<crate::clean_origin_join::PendingRustCallSource>,
 ) {
-    let decision =
-        decide_publication(crate_name, module, assigned, errors, codegen_license_refusal);
+    let decision = retain_pending_rust_call_sources(
+        decide_publication(crate_name, module, assigned, errors, codegen_license_refusal),
+        pending_rust_calls,
+    );
     match &decision {
         Ok(published) => {
             tracing::debug!(
@@ -5050,6 +5089,7 @@ pub fn finalize_and_dump(
         &assigned,
         &errors,
         codegen_license_refusal,
+        std::mem::take(&mut clean_origin_summary.pending_rust_calls),
     );
 
     FinalizeSummary { seam, refused_bodies, dump, errors, direct_obligations: DIRECT_OBLIGATION_CAPABILITY }
@@ -17614,6 +17654,77 @@ mod validation_tripwire_order_tests {
 mod codegen_license_tests {
     use super::*;
     use trust_ir::{Block, Producer};
+
+    fn pending_source_fixture() -> (
+        crate::clean_origin_join::PendingRustCallSource,
+        std::sync::Weak<trust_certify::clean_island::KernelEnvironment>,
+    ) {
+        use trust_certify::clean_island::{CleanIslandSession, RustCallee};
+        let mut session = CleanIslandSession::new();
+        session.declare_rust_callees(&[RustCallee {
+            clean_name: "f".into(), params: vec![trust_types::Ty::u64()],
+            result: trust_types::Ty::u64(),
+        }]).unwrap();
+        assert!(!session.check("def answer (x : UInt64) : UInt64 := f x").is_rejected());
+        let environment = std::sync::Arc::new(session.environment().unwrap().clone());
+        let weak = std::sync::Arc::downgrade(&environment);
+        let plan = trust_clean_origin::plan_clean_origin_body_with_rust_callees(
+            &environment, "answer", &[trust_clean_origin::RustCalleeRef {
+                clean_name: "f".into(), def_path: "rust::f".into(),
+                params: vec![trust_types::Ty::u64()], result: trust_types::Ty::u64(),
+            }],
+        ).unwrap();
+        (crate::clean_origin_join::PendingRustCallSource {
+            def_index: 42, func_id: FuncId::new(1), link_symbol: "clean".into(),
+            source: trust_clean_ir_gate::rust_calls::RetainedRustCallSource::retain(
+                environment, std::sync::Arc::new(plan),
+            ),
+            bindings: vec![trust_clean_ir_gate::rust_calls::RustCallBinding {
+                plan_index: 0, function: FuncId::new(0),
+            }],
+        }, weak)
+    }
+
+    #[test]
+    fn retained_call_context_is_published_beside_its_module_without_a_license() {
+        let module = module_of(vec![defined(0, "rust", Producer::TRust),
+            defined(1, "clean", Producer::Clean)]);
+        let decision = stamp_then_publish("retained", module, &assigned(1), &[]);
+        let (pending, weak) = pending_source_fixture();
+        let published = retain_pending_rust_call_sources(decision, vec![pending]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(published.pending_rust_call_source(42).unwrap().func_id, FuncId::new(1));
+        assert!(published.pending_rust_call_source(43).is_none());
+        assert_eq!(published.codegen_inventory(), &[FuncId::new(0)]);
+        assert!(!published.is_codegen_licensed(FuncId::new(1)));
+        assert!(weak.upgrade().is_some());
+        drop(published);
+        assert!(weak.upgrade().is_none(), "snapshot lifetime follows its publication");
+    }
+
+    #[test]
+    fn failed_or_ambiguous_publication_drops_every_retained_call_context() {
+        for mutation in 0..8 {
+            let mut module = module_of(vec![defined(0, "rust", Producer::TRust),
+                defined(1, "clean", Producer::Clean), defined(2, "other", Producer::Clean)]);
+            if mutation == 6 { module.functions[1].blocks.clear(); }
+            if mutation == 7 { module.functions[1].producer = Some(Producer::TRust); }
+            let errors = if mutation == 0 { vec!["forced semantic refusal".into()] } else { vec![] };
+            let decision = stamp_then_publish("retained", module, &assigned(1), &errors);
+            if mutation != 0 { assert!(decision.is_ok(), "fixture must reach retention validation: {mutation}"); }
+            let (mut pending, weak) = pending_source_fixture();
+            if mutation == 1 { pending.link_symbol = "wrong".into(); }
+            if mutation == 5 { pending.func_id = FuncId::new(99); }
+            let mut rows = vec![pending];
+            if (2..=4).contains(&mutation) {
+                let mut duplicate = rows[0].clone();
+                if mutation == 3 { duplicate.def_index = 43; }
+                if mutation == 4 { duplicate.func_id = FuncId::new(2); duplicate.link_symbol = "other".into(); }
+                rows.push(duplicate);
+            }
+            assert!(retain_pending_rust_call_sources(decision, rows).is_err(), "mutation {mutation}");
+            assert!(weak.upgrade().is_none(), "refusal must not retain a partial source snapshot");
+        }
+    }
 
     /// A body-bearing function: one empty block is a body
     /// (`is_declaration` is `blocks.is_empty()`).

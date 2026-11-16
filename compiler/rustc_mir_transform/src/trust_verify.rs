@@ -7713,13 +7713,15 @@ fn with_body_publication_policy<'tcx, R>(
     // (`runtime_checked_std_member`). Computed from the compiler-private artifacts
     // field, never from row text; any stale row claiming the kind is stripped.
     // Added BEFORE `additional_policy_rows` so the human line counts it.
+    // Trust (RUNTIME-CHECKED-NO-STOP-CAUSE-1): each row states its stop, read by the
+    // seam from these artifacts' own native run; both branches below pass `artifacts`.
     let std_member_row_location = (!artifacts.runtime_checked_std_members.is_empty())
         .then(|| source_span_from_rustc_span(tcx, body.span));
     let runtime_checked_std_member_rows =
         runtime_checked_std_member::rows_with_runtime_checked_std_members(
             effective_rows,
             std_member_row_location.clone(),
-            &artifacts.runtime_checked_std_members,
+            artifacts,
         );
     let effective_rows = runtime_checked_std_member_rows.as_deref().unwrap_or(effective_rows);
     if !artifacts.runtime_checked_std_members.is_empty() {
@@ -7866,7 +7868,7 @@ fn with_body_publication_policy<'tcx, R>(
                 native_vacuously_clean,
                 base_rows,
                 std_member_row_location.clone(),
-                &artifacts.runtime_checked_std_members,
+                artifacts,
             );
             termination_unmeasured::rows_with_termination_unmeasured(
                 &base,
@@ -37661,12 +37663,12 @@ fn extracted_callee_body_for_tracing<'tcx>(
     })
 }
 
-/// Trust (I5 cross-authority call modeling): the plan of record for a LOCAL
-/// Clean-origin def — the SAME decision the sole body emitter acts on.
+/// Trust (I5 cross-authority call modeling): the plan of record for a local
+/// or locally readmitted imported Clean-origin definition.
 ///
 /// # The authority chain, and why this function may exist at all
 ///
-/// `clean_origin_mir::build_gated_body` derives a `CleanOriginPlan` via
+/// For local definitions, `clean_origin_mir::build_gated_body` derives a `CleanOriginPlan` via
 /// `clean_crate_environment` (the kernel-checked island environment) plus
 /// `trust_clean_origin::plan_clean_origin_body` (which re-checks the
 /// declaration's `FullKernelCheck` provenance and its total carrier
@@ -37681,14 +37683,18 @@ fn extracted_callee_body_for_tracing<'tcx>(
 /// `plan_clean_origin_body`, both deterministic over the same island bytes;
 /// the registry lookup keys the same `clean_origin_defs` row the emitter
 /// keys). It NEVER reads the emitted MIR and NEVER parses Clean text itself.
+/// Imported definitions instead use the private Session record installed only
+/// after `trust_clean_extern_readmission` has rechecked the local kernel, encoded
+/// Rust signature and every available body. No plan is taken from wire metadata,
+/// and no new MIR-derived producer or caller-side semantic model is introduced.
 ///
 /// `None` on ANY refusal — not a Clean-origin def, tainted/unrecoverable
 /// island session, plan refused. Every consumer must treat `None` as "no
 /// knowledge": the call stays havocked/absent and fails closed exactly as it
 /// did before this lane existed. Never a default, never a guess.
 ///
-/// COST: the registry lookup comes first and is empty in every crate without
-/// a `clean { … }` island, so ordinary crates never elaborate anything here.
+/// COST: ordinary definitions fail the local registry or imported exports-list
+/// lookup, so ordinary crates never elaborate anything here.
 /// Trust: registry hits reuse the session's checked crate environment and cache the
 /// resulting plan by local definition, matching `clean_origin_mir`'s inputs.
 #[derive(Default)]
@@ -37700,6 +37706,12 @@ fn clean_origin_plan_of_record(
     tcx: TyCtxt<'_>,
     callee_def_id: DefId,
 ) -> Option<trust_clean_origin::CleanOriginPlan> {
+    if !callee_def_id.is_local() {
+        // Imported native symbols no longer need an importer-generated copy.
+        // Modeling their calls still requires full local-kernel readmission;
+        // neither a digest nor the fact that a symbol exists supplies a plan.
+        return crate::clean_origin_import::readmitted_plan(tcx, callee_def_id);
+    }
     let local = callee_def_id.as_local()?;
     let (name, _span) = crate::clean_origin_mir::clean_origin_registry_entry(tcx, local)?;
     if let Some(cached) =
@@ -37725,7 +37737,7 @@ fn clean_origin_plan_of_record(
 }
 
 /// Trust (I5 cross-authority call modeling): the validated call model for a
-/// LOCAL Clean-origin def whose plan-of-record shape this lane models —
+/// local or locally readmitted Clean-origin def whose plan this lane models —
 /// everything the caller-side consumers (panic-free registry, compiler-total
 /// classification, definitional summary) need, re-checked against the plan
 /// rather than trusted from it.
@@ -37856,7 +37868,7 @@ impl CleanOriginSelectOperand {
 }
 
 /// Trust (I5 cross-authority call modeling): the [`CleanOriginCallModel`] for
-/// a LOCAL Clean-origin def; `None` for every other def, every unmodeled
+/// a local or locally readmitted Clean-origin def; `None` for every other def, every unmodeled
 /// shape, and any plan invariant violation (fail-closed, never a guess).
 ///
 /// The match is deliberately EXHAUSTIVE over `CleanOriginShape` with no `_`
@@ -39474,7 +39486,7 @@ fn add_direct_call_contract_summaries<'tcx>(
             continue;
         }
 
-        // Trust (I5 cross-authority call modeling): a LOCAL Clean-origin callee
+        // Trust (I5 cross-authority call modeling): a local or locally readmitted Clean callee
         // whose plan-of-record shape this increment models gets a DEFINITIONAL
         // summary here — kernel gate → plan → summary; the clause restates the
         // emitted body's complete value semantics, so it both discharges a
@@ -83656,12 +83668,24 @@ fn entry_termination_dispatch_rows<'tcx>(
              compilation does not verify"
         )),
     };
-    // Only this seam mints the row: strip any pre-existing row claiming it.
-    let mut out: Vec<TransportObligationResult> = rows
-        .iter()
-        .filter(|row| row.reason.as_deref() != Some(ENTRY_TERMINATION_DISPATCH_REASON))
-        .cloned()
-        .collect();
+    Some(rows_with_entry_termination_row(
+        rows,
+        &kind,
+        Some(source_span_from_rustc_span(tcx, body.span)),
+    ))
+}
+
+/// `rows` with every row claiming the entry-`Termination` dispatch row removed
+/// ([`claims_entry_termination_dispatch`]: only this seam mints it) and the row for
+/// `kind` appended. Built without a `TyCtxt`, so the strip and the row it mints are
+/// unit-tested (RUNTIME-CHECKED-NO-STOP-CAUSE-1).
+fn rows_with_entry_termination_row(
+    rows: &[TransportObligationResult],
+    kind: &VcKind,
+    location: Option<trust_types::SourceSpan>,
+) -> Vec<TransportObligationResult> {
+    let mut out: Vec<TransportObligationResult> =
+        rows.iter().filter(|row| !claims_entry_termination_dispatch(row)).cloned().collect();
     out.push(TransportObligationResult {
         assumes: Vec::new(),
         gap_class: None,
@@ -83672,26 +83696,44 @@ fn entry_termination_dispatch_rows<'tcx>(
         original_vc_snapshot: None,
         typed_kind: Some(Box::new(kind.clone())),
         description: kind.description(),
-        location: Some(source_span_from_rustc_span(tcx, body.span)),
+        location,
         outcome: Outcome::RuntimeChecked,
         solver: trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_SOLVER.to_string(),
         time_ms: 0,
         counterexample: None,
         counterexample_model: None,
-        reason: Some(ENTRY_TERMINATION_DISPATCH_REASON.to_string()),
+        reason: Some(entry_termination_dispatch_reason()),
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
         grade: None,
     });
-    Some(out)
+    out
 }
 
-/// The exact reason string of the entry-`Termination` dispatch row (policy B).
+/// The reason the entry-`Termination` dispatch row (policy B) begins with.
 const ENTRY_TERMINATION_DISPATCH_REASON: &str = "entry `Termination::report` dispatch: reported \
      gap (policy B) — a panic in the returned value's `Debug`/`Drop` is a defined abort during \
      error reporting; return `()`, `ExitCode`, or an error type whose `Debug`/`Drop` this crate \
      verifies to close it";
+
+/// Trust (RUNTIME-CHECKED-NO-STOP-CAUSE-1, 2026-11-13): the row's whole reason,
+/// [`ENTRY_TERMINATION_DISPATCH_REASON`] and its stop token. The row is minted from
+/// `main`'s return type and no engine is asked to decide the dispatch, so its stop
+/// is `not-dispatched`; with no token, `StopCause::of_outcome` read the
+/// runtime-checked row as `unclassified`, which is not reproducible.
+fn entry_termination_dispatch_reason() -> String {
+    trust_types::determinism::StopCause::NotDispatched.stamp(ENTRY_TERMINATION_DISPATCH_REASON)
+}
+
+/// Is `row` claiming to be the entry-`Termination` dispatch row? By a reason that
+/// begins with [`ENTRY_TERMINATION_DISPATCH_REASON`], whatever follows it. (Its
+/// solver label is the global-alloc seam's too, so the label is no key here.)
+fn claims_entry_termination_dispatch(row: &TransportObligationResult) -> bool {
+    row.reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with(ENTRY_TERMINATION_DISPATCH_REASON))
+}
 
 fn abort_on_entry_termination_dispatch(tcx: TyCtxt<'_>, body: &Body<'_>, func_path: &str) {
     publication_contracts::prepare_entry_termination_dispatch(tcx, body, func_path).emit(tcx);

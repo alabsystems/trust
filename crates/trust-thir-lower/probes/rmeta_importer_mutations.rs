@@ -77,7 +77,7 @@ impl rustc_driver::Callbacks for Reader {
                            tcx: TyCtxt<'tcx>) -> rustc_driver::Compilation {
         let out = std::path::PathBuf::from(std::env::var_os("R_IMPORT_MUTATION_OUT").unwrap());
         std::fs::create_dir_all(&out).unwrap();
-        assert_eq!(entry::ENTRY_SCHEMA, 5);
+        assert_eq!(entry::ENTRY_SCHEMA, 6);
         let crates: Vec<_> = tcx.crates(()).iter().copied()
             .filter(|krate| tcx.crate_name(*krate).as_str() == "attack_dep").collect();
         assert_eq!(crates.len(), 1, "actual canonical producer dependency must be loaded");
@@ -87,7 +87,7 @@ impl rustc_driver::Callbacks for Reader {
         let other = sibling(tcx, root, "other", DefKind::Fn);
         let marker = sibling(tcx, root, "Marker", DefKind::Struct);
         let header = tcx.trust_ir_crate_header(crates[0]).expect("actual producer header");
-        assert_eq!(header.entry_schema, 5);
+        assert_eq!(header.entry_schema, 6);
         assert_eq!(header.trust_ir_version, trust_ir::binary::VERSION);
         assert!(header.crate_refusal.is_none());
         let mut records = Vec::new();

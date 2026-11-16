@@ -91,6 +91,14 @@ ay-certify = [
 trust-vc-native = ["trust-vc-bridge/trust-build"]
 # Match the component's native test feature to the library used by this router.
 trust-ir-native = ["trust-wp-lib?/trust-ir-native"]
+# Exact native-input mathematics through Clean's existing SemR checker. This
+# companion fact does not change routed proof grades or source authority.
+native-wp-mathematics = [
+    "trust-build",
+    "dep:clean-olean",
+    "dep:trust-ir-build",
+    "trust-ir/binary",
+]
 trust-build = [
     "trust-bmc/trust-mc-native-trust-ir-bundle",
     "trust-verifier-api/native-trust-ir-claims",
@@ -142,6 +150,8 @@ trust-wp = { workspace = true }
 trust-wp-lib = { workspace = true, features = ["trust-ir-native"], optional = true }
 trust-ir-bridge = { workspace = true }
 trust-ir = { workspace = true, features = ["native-transport-json"] }
+clean-olean = { workspace = true, optional = true }
+trust-ir-build = { workspace = true, optional = true }
 tla-mc-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -179,6 +189,10 @@ clean-kernel = { workspace = true, optional = true }
 ay-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Closed translation regression only; the production dependency keeps the
+# native mathematics feature and does not enable fixture compilation.
+clean-olean = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
 # Router unit tests compile trust-coordinator's sources by path; its admission
 # receipts require OS-random incarnations, never PID/time substitutes.
 trust-rand = { workspace = true }

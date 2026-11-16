@@ -4545,8 +4545,10 @@ written to standard error output)"),
     /// so this boolean value is mostly used for enabling unstable _values_ of
     /// stable options. That separate check doesn't handle boolean values, so
     /// to avoid an inconsistent state we also forbid them here.
+    // Trust: this also enables internal lint registration. A change must invalidate
+    // incremental lint queries, while diagnostics alone do not change the crate hash.
     #[rustc_lint_opt_deny_field_access("use `Session::unstable_options` instead of this field")]
-    unstable_options: bool = (false, parse_no_value, [UNTRACKED],
+    unstable_options: bool = (false, parse_no_value, [TRACKED_NO_CRATE_HASH],
         "adds unstable command line options to rustc interface (default: no)"),
     use_ctors_section: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "use legacy .ctors section for initializers rather than .init_array"),

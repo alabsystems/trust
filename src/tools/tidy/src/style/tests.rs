@@ -30,6 +30,14 @@ fn long_sources_keep_real_style_diagnostics() {
     assert!(tidy_style_check(&source).iter().any(|error| error.contains("trailing whitespace")));
 }
 
+/// Trust: the file-length check is gone (6262f4f761), but upstream sources carry
+/// its directive, so tidy must not report it as unrecognized.
+#[test]
+fn removed_filelength_check_keeps_its_directive_recognized() {
+    let errors = tidy_style_check("// ignore-tidy-file-filelength\nconst _: () = ();\n");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
 #[test]
 fn test_tidy_style_unused_directive() {
     assert_eq!(

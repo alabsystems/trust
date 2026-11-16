@@ -42,12 +42,12 @@ clean {
 
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 
     theorem i64_le_refl : forall (x : BitVec 64),
         Nat.le (Nat.xor (BitVec.toNat x) 9223372036854775808)
                (Nat.xor (BitVec.toNat x) 9223372036854775808) :=
-        fun x => Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)
+        fun x => @Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)
 }
 
 // UNCITED island defeq, `result`-mentioning — the measured repro (e6 fragment

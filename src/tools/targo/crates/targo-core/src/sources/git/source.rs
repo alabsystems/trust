@@ -186,6 +186,20 @@ impl<'gctx> GitSource<'gctx> {
         let db_path = self.gctx.git_db_path().join(&self.ident);
         let db_path = db_path.into_path_unlocked();
 
+        // Trust: a surviving exact checkout may retain the original objects
+        // after cache reclamation removed only its database. Recover DATA only;
+        // ordinary source resolution/materialization remains below.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Revision::Locked(oid) = &*self.locked_rev.borrow() {
+            super::local_import::recover_missing_database(
+                self.gctx,
+                *self.source_id.borrow(),
+                *oid,
+                &self.ident,
+                &db_path,
+            )
+            .with_context(|| object_source_context(*self.source_id.borrow(), *oid))?;
+        }
         let db = self.remote.db_at(&db_path).ok();
 
         let (db, actual_rev) = match (&*self.locked_rev.borrow(), db) {
@@ -273,7 +287,9 @@ impl<'gctx> GitSource<'gctx> {
         // Don’t use the full hash, in order to contribute less to reaching the
         // path length limit on Windows. See
         // <https://github.com/servo/servo/pull/14397>.
-        let short_id = db.to_short_id(actual_rev)?;
+        let short_id = db
+            .to_short_id(actual_rev)
+            .with_context(|| object_source_context(*self.source_id.borrow(), actual_rev))?;
 
         // Check out `actual_rev` from the database to a scoped location on the
         // filesystem. This will use hard links and such to ideally make the
@@ -284,7 +300,8 @@ impl<'gctx> GitSource<'gctx> {
             .join(&self.ident)
             .join(short_id.as_str());
         let checkout_path = checkout_path.into_path_unlocked();
-        db.copy_to(actual_rev, &checkout_path, self.gctx, self.quiet)?;
+        db.copy_to(actual_rev, &checkout_path, self.gctx, self.quiet)
+            .with_context(|| object_source_context(*self.source_id.borrow(), actual_rev))?;
 
         let source_id = self
             .source_id
@@ -337,6 +354,23 @@ impl From<Revision> for GitReference {
             Revision::Locked(oid) => GitReference::Rev(oid.to_string()),
         }
     }
+}
+
+// Trust: attribution only. The canonical URL is never exposed until userinfo,
+// query and fragment have been removed. An unrepresentable redaction must not
+// replace the original object failure or expose the original URL.
+pub(super) fn object_source_context(source: SourceId, revision: git2::Oid) -> String {
+    let mut url = source.canonical_url().raw_canonicalized_url().clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    let redacted = (url.password().is_none() || url.set_password(None).is_ok())
+        && (url.username().is_empty() || url.set_username("").is_ok());
+    let display = if redacted {
+        url.as_str()
+    } else {
+        "<redacted Git URL>"
+    };
+    format!("Git source `{display}` at selected commit {revision}")
 }
 
 /// Create an identifier from a URL,

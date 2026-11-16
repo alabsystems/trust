@@ -47,7 +47,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use trust_certify::clean_island::CleanIslandOutcome;
-use trust_types::lean_declaration_identity::{lean_declaration_id, lean_declarations};
+use trust_types::lean_declaration_identity::{
+    lean_command_texts, lean_declaration_id, lean_declarations,
+};
 use trust_types::obligation_identity::obligation_key;
 
 use super::{CheckedLeanBatch, FileVerdict, line_and_column};
@@ -82,8 +84,8 @@ const PROOF_REJECTED: (&str, &str) = ("failed", "solver-incomplete");
 ///
 /// `Ok(None)` outside every workspace with none of these set: the caller then
 /// writes nothing rather than a `target/` directory wherever it was run, and
-/// says so ([`NO_TARGET_DIR`]). `Err` when the current directory or a
-/// manifest above it cannot be read.
+/// says so ([`NO_TARGET_DIR`]). `Err` when the current directory cannot be
+/// read or `config::workspace_root_dir` fails.
 pub(crate) fn record_target_dir(explicit: Option<&Path>) -> Result<Option<PathBuf>, String> {
     record_target_dir_in(explicit, std::env::current_dir)
 }
@@ -236,15 +238,12 @@ fn file_record(
     // to it. A span outside the text is a command this record cannot read
     // (and the record is then not complete), never a guess.
     let listed = commands.unwrap_or_default();
+    let spans: Vec<(usize, usize)> =
+        listed.iter().map(|command| (command.start, command.end)).collect();
     let readable: Vec<_> = listed
         .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let next = listed.get(index + 1).map_or(text.len(), |next| next.start);
-            let line_of_next = text.get(..next)?.rfind('\n').map_or(0, |at| at + 1);
-            let end = if line_of_next > command.end { line_of_next } else { next };
-            Some((command, text.get(command.start..end.max(command.end))?))
-        })
+        .zip(lean_command_texts(text, &spans))
+        .filter_map(|(command, source)| Some((command, source?)))
         .collect();
     let all_read = readable.len() == commands.map_or(0, <[_]>::len);
     let named = lean_declarations(

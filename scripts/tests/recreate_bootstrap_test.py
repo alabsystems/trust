@@ -6458,13 +6458,15 @@ prov_selected_receipt_action copy
                 for name in ("verify_stage_tool_provenance", "capture_llvm_before_build", "run_xpy_build"):
                     mocks[name].assert_not_called()
         # Refused by their own conflicts before the verifier runs, each in its own words:
-        # --prepare-tool and --source-object-cache grant no provenance grade, and
+        # --prepare-tool and source cache hints grant no provenance grade, and
         # --tool-source-inspector needs a --prepare-tool.
         own = {
             "prepare_tool": (["--prepare-tool", "targo-build-tool"],
                              "\n--prepare-tool requires stage0/1 --no-build with an explicit source inspector"),
             "source_object_cache": (["--source-object-cache", "first-party/clean=/r"],
                                     "\n--source-object-cache requires full indexed source materialization."),
+            "source_working_cache": (["--source-working-cache", "first-party/clean=/r"],
+                                     "\n--source-working-cache requires full indexed source materialization."),
             "tool_source_inspector": (["--tool-source-inspector", "/t/targo"],
                                       "\n--tool-source-inspector requires an explicit --prepare-tool."),
         }
@@ -15207,7 +15209,9 @@ class AghSourceTransportTests(unittest.TestCase):
         self.assertEqual(record["program"]["executable"], str(self.agh))
         self.assertEqual(record["program"]["resolved"], str(target))
         self.assertEqual(len(self.calls), 1)
-        _, env = self.calls[0]
+        argv, env = self.calls[0]
+        self.assertEqual(argv[5:], ["--ref", self.second, "--into", self.ref,
+                                   "--checkout-closure"])
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("GH_TOKEN", env)
@@ -15217,6 +15221,8 @@ class AghSourceTransportTests(unittest.TestCase):
         record = self.fetch("refs/heads/main", url="https://github.com/fixture/source")
         self.assertEqual(record["repository"], "fixture/source")
         self.assertEqual(record["commit"], self.second)
+        self.assertEqual(self.calls[0][0][5:],
+                         ["--ref", "refs/heads/main", "--into", self.ref])
 
     def test_wrong_immutable_revision_refuses_even_after_successful_transport(self):
         def wrong(argv, env):
@@ -15275,6 +15281,17 @@ class AghSourceTransportTests(unittest.TestCase):
                 which.assert_not_called()
         self.assertEqual(self.calls, [])
 
+    def test_checkout_closure_refuses_a_mutable_source_before_transport(self):
+        with patch.object(recreate_bootstrap, "which", return_value=str(self.agh)):
+            with self.assertRaisesRegex(RuntimeError, "exact immutable source commit"):
+                recreate_bootstrap._agh_source_fetch(
+                    "https://github.com/fixture/source.git", self.destination,
+                    "refs/heads/main", self.ref, execute=self.acquire,
+                    checkout_closure=True,
+                )
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.git(self.destination, "for-each-ref"), "")
+
     def test_pin_repair_dispatch_requires_local_root_after_successful_provider(self):
         self.fetch()
         tree = self.git(self.destination, "rev-parse", self.second + "^{tree}")
@@ -15304,7 +15321,8 @@ class AghSourceTransportTests(unittest.TestCase):
             self.assertEqual(recreate_bootstrap.main(arguments), 0)
         self.assertEqual(len(calls), 2)
         for command, kwargs in calls:
-            self.assertEqual(command[5:], ["--ref", self.second, "--into", private_ref])
+            self.assertEqual(command[5:], ["--ref", self.second, "--into", private_ref,
+                                           "--checkout-closure"])
             self.assertEqual(kwargs["timeout_seconds"], 600)
             self.assertIsNone(kwargs["credential_gh"])
 
@@ -15411,6 +15429,184 @@ class ConfigurationOnlySourcePreparation(unittest.TestCase):
         with patch.object(recreate_bootstrap, "ensure_submodules") as materialize:
             recreate_bootstrap.prepare_first_party_sources(root, no_build=False)
         materialize.assert_called_once_with(root)
+
+class BridgeSourceWitnessTests(unittest.TestCase):
+    """Real cold selected objects, without the deleted producer commit/history."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="bridge-source-witness-")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.source, self.root = self.base / "source", self.base / "root"
+        self.child = self.root / "first-party/trust-ir"
+        for repository in (self.source, self.root, self.child):
+            repository.mkdir(parents=True)
+            self.git(repository, "init", "-q", "-b", "main")
+            self.git(repository, "config", "user.name", "Witness fixture")
+            self.git(repository, "config", "user.email", "witness@example.invalid")
+        producer = self.source / "lean/trust_ir-semantics"
+        producer.mkdir(parents=True)
+        (producer / "lakefile.lean").write_text("import Lake\n")
+        (producer / "lean-toolchain").write_text("leanprover/lean4:v4.30.0-rc2\n")
+        (producer / "Basic.lean").write_text("def original := 1\n")
+        (self.source / "unrelated").write_text("original root\n")
+        self.git(self.source, "add", ".")
+        self.git(self.source, "commit", "-qm", "old source")
+        self.old = self.git(self.source, "rev-parse", "HEAD").decode().strip()
+        self.old_tree = self.git(self.source, "rev-parse", "HEAD^{tree}").decode().strip()
+        self.old_raw = self.git(self.source, "cat-file", "commit", self.old)
+        self.tree_raw = self.git(self.source, "cat-file", "tree", self.old_tree)
+        (self.source / "unrelated").write_text("mapped public root\n")
+        self.git(self.source, "add", ".")
+        tree = self.git(self.source, "write-tree").decode().strip()
+        self.selected = self.git(self.source, "commit-tree", tree, "-m", "mapped public source").decode().strip()
+        objects = {self.selected: "commit", tree: "tree"}
+        for row in self.git(self.source, "ls-tree", "-r", "-t", "-z", tree).split(b"\0"):
+            if row:
+                fields = row.partition(b"\t")[0].split()
+                objects[fields[2].decode()] = fields[1].decode()
+        for oid, kind in objects.items():
+            raw = self.git(self.source, "cat-file", kind, oid)
+            self.assertEqual(self.git(self.child, "hash-object", "-w", "-t", kind, "--stdin", data=raw).decode().strip(), oid)
+        self.git(self.child, "update-ref", "refs/heads/main", self.selected)
+        self.git(self.child, "reset", "--hard", "-q", self.selected)
+        (self.root / ".gitmodules").write_text('[submodule "ir"]\npath = first-party/trust-ir\nurl = https://github.com/alabsystems/trust-ir.git\n')
+        self.git(self.root, "config", "submodule.ir.url", "https://github.com/alabsystems/trust-ir.git")
+        self.manifest = self.root / "crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml"
+        self.manifest.parent.mkdir(parents=True)
+        self.manifest.write_text(f'[provenance]\ntrustir_commit = "{self.old}"\n[source_reuse]\nselected_trustir_commit = "{self.selected}"\n')
+        prefix = self.root / "data/bridge-source-witnesses/trust-ir/objects"
+        self.commit_file, self.tree_file = prefix / "commit" / self.old, prefix / "tree" / self.old_tree
+        for file, raw in ((self.commit_file, self.old_raw), (self.tree_file, self.tree_raw)):
+            file.parent.mkdir(parents=True)
+            file.write_bytes(raw)
+        self.git(self.root, "add", ".gitmodules", "data", "crates")
+        self.git(self.root, "update-index", "--add", "--cacheinfo", f"160000,{self.selected},first-party/trust-ir")
+        self.git(self.root, "commit", "-qm", "selected source and raw witnesses")
+        self.assert_missing(self.old)
+        self.assert_missing(self.old_tree)
+
+    @staticmethod
+    def git(repository, *args, data=None):
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_OPTIONAL_LOCKS="0")
+        done = subprocess.run(["git", "-C", str(repository), *args], input=data, capture_output=True, env=env)
+        if done.returncode:
+            raise AssertionError((args, done.returncode, done.stderr))
+        return done.stdout
+
+    def assert_missing(self, oid):
+        self.assertEqual(self.git(self.child, "cat-file", "--batch-check", data=(oid + "\n").encode()), (oid + " missing\n").encode())
+
+    def books(self):
+        return [(self.git(repo, "rev-parse", "HEAD"), self.git(repo, "for-each-ref"),
+                 (repo / ".git/config").read_bytes(), (repo / ".git/index").read_bytes(),
+                 self.git(repo, "status", "--porcelain=v1", "--untracked-files=no")) for repo in (self.root, self.child)]
+
+    def materialize(self):
+        return recreate_bootstrap.materialize_bridge_source_witnesses(self.root)
+
+    def test_cold_mapped_source_restores_only_two_objects_without_history_or_ref_changes(self):
+        before = self.books()
+        self.assertEqual(self.materialize(), 2)
+        self.assertEqual(self.git(self.child, "cat-file", "commit", self.old), self.old_raw)
+        self.assertEqual(self.git(self.child, "cat-file", "tree", self.old_tree), self.tree_raw)
+        self.assertEqual(self.git(self.child, "ls-tree", "-r", self.old, "--", "lean/trust_ir-semantics"),
+                         self.git(self.child, "ls-tree", "-r", self.selected, "--", "lean/trust_ir-semantics"))
+        self.assertEqual(self.books(), before)
+        self.assertEqual(self.materialize(), 0)
+        self.assertEqual(self.books(), before)
+
+    def test_complete_submodule_graph_still_uses_existing_materialization_owner(self):
+        before = self.books()
+        recreate_bootstrap.ensure_submodules(self.root)
+        self.assertEqual(self.git(self.child, "cat-file", "commit", self.old), self.old_raw)
+        self.assertEqual(self.books(), before)
+
+    def test_bad_commit_and_root_tree_hashes_refuse_before_writing_any_object(self):
+        for file in (self.commit_file, self.tree_file):
+            with self.subTest(path=file.name):
+                original = file.read_bytes()
+                file.write_bytes(original + b"tampered\n")
+                self.git(self.root, "add", str(file))
+                before = self.books()
+                with self.assertRaisesRegex(RuntimeError, "canonical type/object hash differs"):
+                    self.materialize()
+                self.assert_missing(self.old)
+                self.assert_missing(self.old_tree)
+                self.assertEqual(self.books(), before)
+                file.write_bytes(original)
+                self.git(self.root, "add", str(file))
+
+    @unittest.skipUnless(os.name == "posix", "symlink fixture")
+    def test_indexed_symlink_cannot_supply_witness_bytes(self):
+        self.commit_file.unlink()
+        self.commit_file.symlink_to(self.tree_file)
+        self.git(self.root, "add", str(self.commit_file))
+        with self.assertRaisesRegex(RuntimeError, "indexed regular blob"):
+            self.materialize()
+        self.assert_missing(self.old)
+
+    def test_missing_root_witness_refuses_before_commit_object_is_written(self):
+        self.git(self.root, "rm", "-q", str(self.tree_file))
+        with self.assertRaisesRegex(RuntimeError, "indexed regular blob"):
+            self.materialize()
+        self.assert_missing(self.old)
+
+    def test_wrong_selection_cannot_attach_data_to_another_gitlink(self):
+        self.manifest.write_text(self.manifest.read_text().replace(self.selected, "a" * 40))
+        self.git(self.root, "add", str(self.manifest))
+        with self.assertRaisesRegex(RuntimeError, "selection differs"):
+            self.materialize()
+        self.assert_missing(self.old)
+
+    def test_existing_corrupt_object_is_refused_without_rewriting_it(self):
+        import zlib
+        self.assertEqual(self.materialize(), 2)
+        path = self.child / ".git/objects" / self.old[:2] / self.old[2:]
+        wrong = self.old_raw[:-1] + b"x"
+        encoded = zlib.compress(f"commit {len(wrong)}\0".encode() + wrong)
+        mode = stat.S_IMODE(path.stat().st_mode)
+        path.chmod(mode | 0o200)
+        path.write_bytes(encoded)
+        path.chmod(mode)
+        with self.assertRaisesRegex(RuntimeError, "original object bytes differ"):
+            self.materialize()
+        self.assertEqual(path.read_bytes(), encoded)
+
+    def test_other_submodule_owner_is_not_bypassed(self):
+        lock = self.root / ".git/trust-bootstrap-submodules.lock"
+        lock.write_text("another owner\n")
+        with self.assertRaisesRegex(RuntimeError, "another submodule materialization owns"):
+            self.materialize()
+        self.assertEqual(lock.read_text(), "another owner\n")
+        self.assert_missing(self.old)
+
+    def test_index_mutation_during_object_write_refuses_and_preserves_the_change(self):
+        actual = subprocess.run
+        changed = []
+        def mutate(args, **kwargs):
+            if "hash-object" in args and not changed:
+                changed.append(True)
+                file = self.root / "concurrent"
+                file.write_text("preserve concurrent source\n")
+                self.git(self.root, "add", "concurrent")
+            return actual(args, **kwargs)
+        with patch.object(recreate_bootstrap.subprocess, "run", side_effect=mutate), self.assertRaisesRegex(RuntimeError, "bookends changed"):
+            self.materialize()
+        self.assertEqual((self.root / "concurrent").read_text(), "preserve concurrent source\n")
+        self.assertIn(b"concurrent", self.git(self.root, "ls-files", "--", "concurrent"))
+
+    def test_default_sync_is_read_only_and_explicit_fetch_restores_source_data(self):
+        sync = SCRIPT.with_name("submodule_sync.sh")
+        env = dict(os.environ, PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
+        for flags in (("--offline", "--quiet"), ("--fetch", "--quiet")):
+            done = subprocess.run(["bash", str(sync), *flags, "--root", str(self.root)], env=env, capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            if "--offline" in flags:
+                self.assert_missing(self.old)
+        self.assertEqual(self.git(self.child, "cat-file", "commit", self.old), self.old_raw)
+
 
 if __name__ == "__main__":
     unittest.main()

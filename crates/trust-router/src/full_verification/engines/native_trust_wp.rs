@@ -65,8 +65,8 @@ impl NativeTrustWpTrustIrEngine {
         proof_id: ProofId,
     ) -> ObligationEvidence {
         use trust_wp_lib::trust_ir_body::{
-            TRUST_IR_BODY_WP_SCHEMA, replay_trust_ir_body_contracts_validated,
-            verify_trust_ir_body_contracts_validated,
+            TRUST_IR_BODY_WP_SCHEMA, replay_trust_ir_body_request_validated,
+            verify_trust_ir_body_request_validated,
         };
 
         let mut row = self.native_trust_ir_bundle_unsupported_evidence(
@@ -81,8 +81,8 @@ impl NativeTrustWpTrustIrEngine {
             row.diagnostics = vec!["body-aware WP per-obligation budget expired".into()];
             return row;
         }
-        // Scope solving to this exact request. The module, source identities,
-        // original contract and lineage stay byte-for-byte unchanged.
+        // Select solving work without changing the original native input.
+        // The complete bundle, including unselected requests, binds the WP.
         if request.obligations != [proof_id]
             || !native.requests.iter().any(|candidate| {
                 matches!(candidate, NativeVerificationRequest::TrustWp(value) if value == request)
@@ -101,14 +101,10 @@ impl NativeTrustWpTrustIrEngine {
             row.diagnostics = vec![reason];
             return row;
         }
-        let mut scoped = native.clone();
-        scoped.requests.retain(|candidate| {
-            matches!(candidate, NativeVerificationRequest::TrustWp(value) if value == request)
-        });
-        // Admission belongs to this exact scoped input, not the full original
-        // bundle. Keep it immutably borrowed through solving and independent
-        // output replay; neither operation gains source-generation authority.
-        let admitted = match trust_ir::ValidatedNativeBundle::new(&scoped) {
+        // Reuse this exact full-input admission through solving and independent
+        // replay. Selection never reconstructs a smaller replacement bundle,
+        // and neither operation gains source-generation authority.
+        let admitted = match trust_ir::ValidatedNativeBundle::new(native) {
             Ok(admitted) => admitted,
             Err(errors) => {
                 row.diagnostics = vec![
@@ -120,13 +116,16 @@ impl NativeTrustWpTrustIrEngine {
                 return row;
             }
         };
-        let results = match verify_trust_ir_body_contracts_validated(&admitted) {
-            Ok(results) => results,
+        let verification = match verify_trust_ir_body_request_validated(&admitted, request.id) {
+            Ok(verification) => verification,
             Err(error) => {
                 row.diagnostics = vec![error.to_string()];
                 return row;
             }
         };
+        // Both values came from the same first-party derivation. The witness
+        // is diagnostic data until independent replay checks it below.
+        let results = std::slice::from_ref(verification.result());
         if expired() {
             row.status = EvidenceStatus::Timeout;
             row.diagnostics = vec!["body-aware WP per-obligation budget expired".into()];
@@ -140,6 +139,28 @@ impl NativeTrustWpTrustIrEngine {
                 trust_wp_lib::BundleObligationStatus::Failed { .. }
             )
         {
+            // The native body question is the bare postcondition: the module
+            // carries no function precondition, and trust-wp's fragment has
+            // none. For a function that declares `requires` (or an authored
+            // assumption) the public claim is the postcondition UNDER that
+            // precondition, so a body state that falsifies the bare clause may
+            // be one the precondition excludes. Such a counterexample refutes
+            // nothing. A proof of the bare clause is still a proof of the
+            // conditional one, so only the refutation is withheld.
+            if bundle.contracts.iter().any(|contract| {
+                matches!(
+                    contract.kind,
+                    trust_verifier_api::ContractKind::Requires
+                        | trust_verifier_api::ContractKind::Assumes
+                )
+            }) {
+                row.diagnostics = vec![
+                    "body-aware WP counterexample withheld: the body question omits this \
+                     function's `requires`, so it does not refute the conditional postcondition"
+                        .into(),
+                ];
+                return row;
+            }
             row.status = EvidenceStatus::Failed;
             row.diagnostics = vec![
                 "body-aware WP refuted the original postcondition over the supported body fragment"
@@ -164,9 +185,47 @@ impl NativeTrustWpTrustIrEngine {
                 EvidenceStatus::Unsupported
             };
             row.diagnostics = vec!["body-aware WP did not prove the original postcondition".into()];
+            // Retain the actual attempted question's reasons. These are data,
+            // never proof evidence or a reason to change the outcome above.
+            for result in results {
+                for diagnostic in &result.diagnostics {
+                    row.diagnostics
+                        .push(
+                            format!("body-aware WP {}: {}", diagnostic.code, diagnostic.message,),
+                        );
+                }
+                for leaf in &result.obligation_results {
+                    let reason = match &leaf.status {
+                        trust_wp_lib::BundleObligationStatus::Failed { reason }
+                        | trust_wp_lib::BundleObligationStatus::Unknown { reason }
+                        | trust_wp_lib::BundleObligationStatus::Unsupported { reason } => {
+                            Some(reason)
+                        }
+                        _ => None,
+                    };
+                    if let Some(reason) = reason {
+                        row.diagnostics.push(format!(
+                            "body-aware WP obligation `{}` is {}: {reason}",
+                            leaf.obligation_id,
+                            leaf.status.as_str(),
+                        ));
+                    }
+                    for diagnostic in &leaf.diagnostics {
+                        row.diagnostics.push(format!(
+                            "body-aware WP obligation `{}` {}: {}",
+                            leaf.obligation_id, diagnostic.code, diagnostic.message,
+                        ));
+                    }
+                }
+            }
             return row;
         }
-        if let Err(error) = replay_trust_ir_body_contracts_validated(&admitted, &results) {
+        if let Err(error) = replay_trust_ir_body_request_validated(
+            &admitted,
+            request.id,
+            verification.result(),
+            Some(verification.witness()),
+        ) {
             row.diagnostics = vec![format!("body-aware WP replay rejected evidence: {error}")];
             return row;
         }
@@ -184,20 +243,44 @@ impl NativeTrustWpTrustIrEngine {
             "module_digest": native.trust_ir_module_digest,
             "source_digest": native.provenance.source_digest,
             "results": results,
+            "translation_witness": verification.witness(),
         });
-        let certificate = serde_json::json!({
+        let mut certificate = serde_json::json!({
             "statement": statement,
             "replay": "rederive WP from original typed body and contract; replay native pure evidence",
             "accepted": true,
             "authority": "Trusted; not Clean-kernel certified",
-        }).to_string();
+        });
+        let mut certificate_bytes = certificate.to_string();
+        if !super::super::native_trust_ir::native_wp_certificate_is_decodable(
+            certificate_bytes.as_bytes(),
+        ) {
+            // A recursive diagnostic plan can exceed the unchanged normal
+            // certificate decoder's bounds even when native replay remains
+            // representable. Preserve that proof without a mathematical
+            // witness; never relax the decoder or materialization limits.
+            certificate["statement"]
+                .as_object_mut()
+                .expect("the producer constructed the statement object")
+                .remove("translation_witness");
+            certificate_bytes = certificate.to_string();
+            if !super::super::native_trust_ir::native_wp_certificate_is_decodable(
+                certificate_bytes.as_bytes(),
+            ) {
+                return self.native_trust_ir_bundle_unsupported_evidence(
+                    bundle,
+                    obligation,
+                    "body-aware WP certificate exceeds decoder bounds",
+                );
+            }
+        }
         row.status = EvidenceStatus::Proved;
         row.proof_strength = Some(ProofStrength::deductive());
         let artifacts = [artifact(
             EvidenceArtifactKind::ProofCertificate,
             "certificate",
             &row.obligation_id,
-            certificate,
+            certificate_bytes,
         )]
         .into_iter()
         .collect::<Option<Vec<_>>>();

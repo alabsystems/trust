@@ -9897,6 +9897,9 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    mod division_domain;
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     mod refutation_scope;
 
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]

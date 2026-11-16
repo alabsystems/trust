@@ -361,6 +361,55 @@ EOF
 git -C "$D" add ty/Cargo.toml && git -C "$D" commit -qm "ungated dep, no store" >/dev/null
 check "a finding beside an unreadable remote still exits 1" "$D" 1
 
+# 17b. AN UNREAD REMOTE DOES NOT MAKE A LIVE WAIVER STALE (2026-11-13: agh rate
+#      limited every remote read, and the gate told the reader to delete the
+#      row that covered a real divergence). The digest comes from the local
+#      store, so case 7's waived divergence is still waived, the run says
+#      COULD NOT RUN (exit 2), and nothing calls the row stale.
+D="$TMP/offline-waiver"; make_fixture "$D"
+decl "$D" "a/Cargo.toml" "$REV_A"
+decl "$D" "b/Cargo.toml" "$REV_B"
+B_DIGEST="$(python3 "$GATE" --root "$D" 2>&1 | grep -o 'schema [0-9a-f]\{12\} diverges' | awk '{print $2}' | head -1)"
+mkdir -p "$D/scripts/hooks-pin"
+echo "trust-ir | $B_DIGEST | 2099-01-01 | test | current" > "$D/scripts/hooks-pin/ir-cohort-waivers.txt"
+mv "$REMOTE" "$REMOTE.gone"
+out="$(python3 "$GATE" --root "$D" 2>&1)"; got=$?
+if [ -n "$B_DIGEST" ] && [ "$got" = 2 ] && printf '%s\n' "$out" | grep -q '^IR COHORT COULD NOT RUN' \
+  && printf '%s\n' "$out" | grep -q "waived  $B_DIGEST" \
+  && ! printf '%s\n' "$out" | grep -q 'STALE waiver'; then
+  printf 'ok    an unread remote leaves a live waiver waived, not stale (exit 2)\n'; pass=$((pass+1))
+else
+  printf 'FAIL  unread remote + live waiver: wanted exit 2, the divergence waived, no STALE row (got exit %s)\n' "$got"
+  printf '%s\n' "$out" | sed 's/^/      | /'; fail=$((fail+1))
+fi
+# ... and a revision the store does not hold has no digest, so a waiver for
+# that repository cannot be judged stale either; with the remote back, the
+# same row covering nothing is stale again (case 8).
+D="$TMP/offline-undigested"; make_fixture "$D"
+decl "$D" "a/Cargo.toml" "$REV_A"
+decl "$D" "b/Cargo.toml" "0123456789012345678901234567890123456789"
+mkdir -p "$D/scripts/hooks-pin"
+echo "trust-ir | deadbeefcafe | 2099-01-01 | test | covers nothing yet" > "$D/scripts/hooks-pin/ir-cohort-waivers.txt"
+git -C "$D" add scripts && git -C "$D" commit -qm "waiver" >/dev/null
+mv "$REMOTE" "$REMOTE.gone"
+out="$(python3 "$GATE" --root "$D" 2>&1)"; got=$?
+if [ "$got" = 2 ] && printf '%s\n' "$out" | grep -q '^IR COHORT COULD NOT RUN' \
+  && ! printf '%s\n' "$out" | grep -q 'STALE waiver'; then
+  printf 'ok    an unread, undigested revision leaves its repository'"'"'s waiver unjudged (exit 2)\n'; pass=$((pass+1))
+else
+  printf 'FAIL  unread undigested revision: wanted exit 2 and no STALE row (got exit %s)\n' "$got"
+  printf '%s\n' "$out" | sed 's/^/      | /'; fail=$((fail+1))
+fi
+mv "$REMOTE.gone" "$REMOTE"
+decl "$D" "b/Cargo.toml" "$REV_A"
+out="$(python3 "$GATE" --root "$D" 2>&1)"; got=$?
+if [ "$got" = 1 ] && printf '%s\n' "$out" | grep -q 'STALE waiver'; then
+  printf 'ok    with the remote readable the row covering nothing is stale again\n'; pass=$((pass+1))
+else
+  printf 'FAIL  readable remote: wanted exit 1 and the STALE row (got exit %s)\n' "$got"
+  printf '%s\n' "$out" | sed 's/^/      | /'; fail=$((fail+1))
+fi
+
 # 18. A SHALLOW STORE MUST NOT READ AS A FORK (2026-10-26). The by-sha fetch
 #     brings the pin and the remote tip but not the history between them,
 #     so in a depth-1 store `merge-base --is-ancestor` answers 1 for a pin

@@ -31,6 +31,24 @@
 //! * `quarantine/`: what a read or the audit refused, kept for a person to read.
 //! * `identity/`: the driver image digests, memoized by the mapped image's
 //!   device, inode, size, modification and status-change times.
+//! * `footprint`: the bytes the facts the index names take on disk, as the last
+//!   count found them plus each later write; it only decides when to count
+//!   again, never what a read serves.
+//!
+//! # Last use and the cap
+//!
+//! A served hit and a write mark the fact used, as its index entry's
+//! modification time, so a disk pass reads last use without running Trust.
+//! After a write, a store over [`MAX_STORE_BYTES`] removes its least recently
+//! used index entries until it is under, and then each object no entry names
+//! once it is [`STALE_PARTIAL`] old (rescan's rule). Every key carries the
+//! compiler identity, so the facts a previous compiler wrote are never read
+//! again and go first. A removed fact is a miss: the session elaborates and
+//! checks afresh. An entry whose object is gone is a miss, not a quarantine:
+//! beside an eviction in another process it is a fact that was just removed,
+//! not a refused one. The quarantine is never evicted. One process evicts at
+//! a time, under the store's `evicting` lock; a write that finds it held
+//! leaves the count to that eviction.
 //!
 //! Every directory is `0700` and every file `0600`, this user's, written by a
 //! create-new temporary and an atomic rename, and every read checks the open
@@ -172,6 +190,33 @@ const PARTIAL: &str = ".partial";
 /// live writer renames within seconds: a fact is at most [`MAX_FACT_BYTES`]),
 /// and is removed.
 const STALE_PARTIAL: Duration = Duration::from_secs(60 * 60);
+
+/// The most the facts the index names may take on disk (their index entries
+/// and objects, in allocated blocks) before a write evicts the least recently
+/// used. Eight of the largest fact a read loads ([`MAX_FACT_BYTES`]), so one
+/// fact never empties the store, and a quarter of the 31.8 GiB that trust-cg's
+/// certificate store, which records no use, was measured at (DC-14). A first
+/// value: no fact store had been measured when it was set, and per-function
+/// facts are far smaller than the largest one.
+const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// An eviction stops at seven eighths of the cap, so a store at its cap does
+/// not count every entry again on each write.
+const EVICT_TO_EIGHTHS: u64 = 7;
+
+/// The `footprint` record's count is trusted this long after the count that
+/// wrote it. Writes in two processes can each add to the same old record, so
+/// it drifts low; an hour bounds how long before the store is counted again.
+const FOOTPRINT_TRUSTED_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// The store's record of its own size, in its root.
+const FOOTPRINT: &str = "footprint";
+
+/// The lock an eviction holds, in the store's root. Each eviction removes
+/// what its own count says is over, so two counting the same store at once
+/// would each remove that much and together empty it; one at a time, the
+/// others skip.
+const EVICTING: &str = "evicting";
 
 #[cfg(unix)]
 fn euid() -> u32 {
@@ -333,8 +378,14 @@ fn check_private_dir(path: &Path) -> io::Result<()> {
 /// a symlink or waiting on a FIFO, and the open descriptor must be a regular
 /// file of this user's that no one else can read or write, so what is checked
 /// is what is read.
-#[cfg(unix)]
 fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    open_bounded(path, limit).map(|(_, bytes)| bytes)
+}
+
+/// [`read_bounded`], keeping the descriptor read, so a caller can mark that
+/// very file used.
+#[cfg(unix)]
+fn open_bounded(path: &Path, limit: u64) -> io::Result<(fs::File, Vec<u8>)> {
     use nix::fcntl::OFlag;
     if let Some(parent) = path.parent() {
         check_private_dir(parent)?;
@@ -356,16 +407,83 @@ fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     }
     trust_resource_provenance::require_no_acl_entries(&file)?;
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
+    (&file).take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(io::Error::other("oversized fact store file"));
     }
-    Ok(bytes)
+    Ok((file, bytes))
 }
 
 #[cfg(not(unix))]
-fn read_bounded(_path: &Path, _limit: u64) -> io::Result<Vec<u8>> {
+fn open_bounded(_path: &Path, _limit: u64) -> io::Result<(fs::File, Vec<u8>)> {
     Err(io::Error::other(NO_STORE_OFF_UNIX))
+}
+
+/// Mark the open store file used: its modification time is now. The owner
+/// may set it through a read-only descriptor. Best effort: an unmarked fact is
+/// evicted sooner, never read wrongly.
+fn mark_used(file: &fs::File) {
+    let _ = file.set_modified(std::time::SystemTime::now());
+}
+
+/// The [`EVICTING`] lock in `root`, held until the file returned is dropped;
+/// `None` while another process (or another handle of this one) holds it, or
+/// when the lock file is not this user's private regular file. Never waits:
+/// a write that finds an eviction under way goes on without one.
+#[cfg(unix)]
+fn try_evicting(root: &Path) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC).bits())
+        .open(root.join(EVICTING))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || !owned_without(&metadata, 0o077) {
+        return None;
+    }
+    trust_resource_provenance::require_no_acl_entries(&file).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+#[cfg(not(unix))]
+fn try_evicting(_root: &Path) -> Option<fs::File> {
+    None
+}
+
+/// The bytes `metadata`'s file takes on disk: its allocated blocks, which for
+/// a 64-byte index entry are a whole block.
+fn allocated(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        metadata.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
+
+/// Whether `metadata`'s file was modified at least [`STALE_PARTIAL`] ago.
+fn older_than_a_writer(metadata: &fs::Metadata) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age >= STALE_PARTIAL)
+}
+
+/// Seconds since the epoch, or zero before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// A name no other write of this process, or of any other, takes:
@@ -383,6 +501,14 @@ fn unique_stamp() -> String {
 }
 
 fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    write_renamed(directory, name, bytes, true)
+}
+
+/// Write `name` in `directory` by a create-new temporary and a rename;
+/// `durable` syncs the bytes before the rename. Only the `footprint` record is
+/// written without: losing it to a crash costs a count, and syncing it would
+/// add a third flush to every fact written.
+fn write_renamed(directory: &Path, name: &str, bytes: &[u8], durable: bool) -> io::Result<()> {
     private_dir(directory)?;
     reclaim_partials(directory);
     let mut options = OpenOptions::new();
@@ -408,7 +534,9 @@ fn atomic_write(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         trust_resource_provenance::require_no_acl_entries(&file)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         fs::rename(&temporary, directory.join(name))
     })();
     if result.is_err() {
@@ -462,6 +590,19 @@ pub(crate) enum StoreRead {
 #[derive(Debug, Clone)]
 pub struct FactStore {
     root: PathBuf,
+    /// [`MAX_STORE_BYTES`]; a unit test sets a smaller one.
+    cap: u64,
+}
+
+/// What an eviction did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Eviction {
+    /// The bytes the remaining facts take, as counted.
+    pub bytes: u64,
+    /// Index entries removed, least recently used first.
+    pub evicted: usize,
+    /// Objects removed because no index entry names them any more.
+    pub collected: usize,
 }
 
 /// What a rescan found.
@@ -541,7 +682,14 @@ impl FactStore {
         for table in TABLES {
             private_dir(&root.join(table))?;
         }
-        Ok(Self { root })
+        Ok(Self { root, cap: MAX_STORE_BYTES })
+    }
+
+    /// This store under a smaller cap, for a unit test.
+    #[cfg(test)]
+    pub(crate) fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
     }
 
     /// The store's directory.
@@ -558,10 +706,22 @@ impl FactStore {
         self.shard(table, name).join(hex(name))
     }
 
-    /// Read the fact stored for `key`, checking its content address.
+    /// Read the fact stored for `key`, checking its content address; a fact
+    /// served is marked used.
     pub(crate) fn get(&self, key: &Digest32) -> StoreRead {
-        let pointer = match read_bounded(&self.path_of("index", key), 128) {
-            Ok(pointer) => pointer,
+        self.read(key, true)
+    }
+
+    /// [`Self::get`] for an audit of the whole store, which marks nothing: a
+    /// `targo trust store verify --facts` reads every fact and would otherwise
+    /// make each look just used.
+    pub(crate) fn peek(&self, key: &Digest32) -> StoreRead {
+        self.read(key, false)
+    }
+
+    fn read(&self, key: &Digest32, mark: bool) -> StoreRead {
+        let (entry, pointer) = match open_bounded(&self.path_of("index", key), 128) {
+            Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return StoreRead::Absent,
             Err(error) => {
                 let why = format!("index entry unreadable: {error}");
@@ -577,13 +737,20 @@ impl FactStore {
         let object_hex = hex(&object);
         let why = match read_bounded(&self.path_of("objects", &object), MAX_FACT_BYTES) {
             Ok(bytes) if <[u8; 32]>::from(Sha256::digest(&bytes)) == object => {
+                if mark {
+                    mark_used(&entry);
+                }
                 return StoreRead::Present { object, bytes };
             }
             Ok(_) => format!("object {object_hex} does not match its SHA-256"),
+            // An eviction removes the entry, then its object; a reader that
+            // read the entry first finds the object gone. That fact was
+            // removed, not refused: a miss, with nothing quarantined. An entry
+            // left naming nothing is never marked, so it is evicted in turn,
+            // and the next write of its key replaces it.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let why = format!("object {object_hex} is gone");
-                self.quarantine_index(key, &why);
-                return StoreRead::Quarantined(why);
+                stat("GONE", format_args!("key={} object={object_hex}", hex(key)));
+                return StoreRead::Absent;
             }
             Err(error) => format!("object {object_hex} unreadable: {error}"),
         };
@@ -597,20 +764,194 @@ impl FactStore {
 
     /// Store `bytes` as the fact for `key`: the object first, then the index
     /// entry naming it, each atomically. An object already stored under the
-    /// same address is kept only when it holds those bytes.
+    /// same address is kept only when it holds those bytes, and is then made
+    /// young again, so an eviction in another process, which removes only an
+    /// object [`STALE_PARTIAL`] old, keeps it for the entry about to name it.
+    /// The new entry's modification time marks the fact used. A store this
+    /// write takes over its cap evicts ([`Self::evict`]).
     pub(crate) fn put(&self, key: &Digest32, bytes: &[u8]) -> io::Result<Digest32> {
         let object: Digest32 = Sha256::digest(bytes).into();
         let path = self.path_of("objects", &object);
-        let sound = read_bounded(&path, MAX_FACT_BYTES)
-            .is_ok_and(|stored| <[u8; 32]>::from(Sha256::digest(&stored)) == object);
-        if !sound {
+        let stored = open_bounded(&path, MAX_FACT_BYTES)
+            .ok()
+            .filter(|(_, stored)| <[u8; 32]>::from(Sha256::digest(stored)) == object);
+        let mut added = 0;
+        if let Some((file, _)) = stored {
+            mark_used(&file);
+        } else {
             if fs::symlink_metadata(&path).is_ok() {
                 self.quarantine_object(&object, "the stored object does not hold its bytes");
             }
             atomic_write(&self.shard("objects", &object), &hex(&object), bytes)?;
+            added += fs::symlink_metadata(&path).map_or(0, |metadata| allocated(&metadata));
         }
+        let entry = self.path_of("index", key);
         atomic_write(&self.shard("index", key), &hex(key), hex(&object).as_bytes())?;
+        added += fs::symlink_metadata(&entry).map_or(0, |metadata| allocated(&metadata));
+        self.grew(added);
         Ok(object)
+    }
+
+    /// Add `added` bytes to the `footprint` record, or count the store again
+    /// and evict when the record is missing, no longer trusted, or the sum is
+    /// over the cap. A write that replaced an entry adds its bytes again; the
+    /// record runs high until the next count, which only counts sooner.
+    ///
+    /// A write that would count while another process evicts leaves it to
+    /// that eviction, which records what it counted. One that takes the lock
+    /// reads the record again first: an eviction that ended in between left
+    /// a fresh one, and the store needs no second count.
+    fn grew(&self, added: u64) {
+        if self.add_to_footprint(added) {
+            return;
+        }
+        let Some(_evicting) = try_evicting(&self.root) else { return };
+        if self.add_to_footprint(added) {
+            return;
+        }
+        let eviction = self.evict_holding_the_lock();
+        if eviction.evicted + eviction.collected > 0 {
+            stat("EVICT", format_args!("{eviction:?}"));
+        }
+    }
+
+    /// Add `added` to the `footprint` record when it is trusted and the sum
+    /// stays within the cap; whether it did.
+    fn add_to_footprint(&self, added: u64) -> bool {
+        let now = unix_now();
+        let trusted = self.footprint().filter(|&(_, counted)| {
+            now.checked_sub(counted).is_some_and(|age| age < FOOTPRINT_TRUSTED_FOR.as_secs())
+        });
+        match trusted {
+            Some((bytes, counted)) if bytes.saturating_add(added) <= self.cap => {
+                self.record_footprint(bytes.saturating_add(added), counted);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The `footprint` record: bytes, and when they were last counted.
+    fn footprint(&self) -> Option<(u64, u64)> {
+        let record = read_bounded(&self.root.join(FOOTPRINT), 64).ok()?;
+        let record = std::str::from_utf8(&record).ok()?;
+        let mut parts = record.split_ascii_whitespace();
+        let (Some(bytes), Some(counted), None) = (parts.next(), parts.next(), parts.next()) else {
+            return None;
+        };
+        Some((bytes.parse().ok()?, counted.parse().ok()?))
+    }
+
+    fn record_footprint(&self, bytes: u64, counted: u64) {
+        let _ =
+            write_renamed(&self.root, FOOTPRINT, format!("{bytes} {counted}\n").as_bytes(), false);
+    }
+
+    /// Count what the facts the index names take, and when that is over the
+    /// cap remove the least recently used index entries until it is under
+    /// seven eighths of it; then remove each object no entry names under
+    /// rescan's rule ([`Self::collect_unnamed`]). An object no entry names but
+    /// too young to remove is not counted: it is a fact a writer is about to
+    /// name, or one a later count removes.
+    ///
+    /// Beside a reader in another process this costs a miss only: an entry
+    /// goes before its object, so a reader that read the entry finds the
+    /// object gone (a miss, [`Self::get`]), and an object is re-hashed on every
+    /// read, so nothing removed here can be served wrongly. An entry marked
+    /// used after it was counted is kept.
+    ///
+    /// `None` while another process evicts ([`EVICTING`]): that eviction
+    /// removes what is over, and a second counting the same store would
+    /// remove as much again.
+    pub fn evict(&self) -> Option<Eviction> {
+        let _evicting = try_evicting(&self.root)?;
+        Some(self.evict_holding_the_lock())
+    }
+
+    /// [`Self::evict`], its caller holding [`EVICTING`]. An entry another
+    /// process removed meanwhile (a rescan, a quarantine) is gone all the
+    /// same: its bytes leave the count, so the eviction removes no more than
+    /// is over.
+    fn evict_holding_the_lock(&self) -> Eviction {
+        struct Named {
+            path: PathBuf,
+            modified: Option<std::time::SystemTime>,
+            bytes: u64,
+            object: Option<Digest32>,
+        }
+        let mut objects = std::collections::BTreeMap::new();
+        for entry in entries(&self.root.join("objects")) {
+            if let Ok(metadata) = fs::symlink_metadata(&entry.path)
+                && metadata.file_type().is_file()
+            {
+                objects.insert(entry.name, allocated(&metadata));
+            }
+        }
+        let mut index = Vec::new();
+        let mut names = std::collections::BTreeMap::<Digest32, usize>::new();
+        for entry in entries(&self.root.join("index")) {
+            let Ok(metadata) = fs::symlink_metadata(&entry.path) else { continue };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let object = read_bounded(&entry.path, 128)
+                .ok()
+                .and_then(|pointer| std::str::from_utf8(&pointer).ok().and_then(parse_hex32))
+                .filter(|object| objects.contains_key(object));
+            if let Some(object) = object {
+                *names.entry(object).or_default() += 1;
+            }
+            index.push(Named {
+                path: entry.path,
+                modified: metadata.modified().ok(),
+                bytes: allocated(&metadata),
+                object,
+            });
+        }
+        let mut eviction = Eviction {
+            bytes: index.iter().map(|entry| entry.bytes).sum::<u64>()
+                + names.keys().map(|object| objects[object]).sum::<u64>(),
+            ..Eviction::default()
+        };
+        if eviction.bytes > self.cap {
+            let target = self.cap / 8 * EVICT_TO_EIGHTHS;
+            // Least recently used first; an entry with no time, first of all.
+            index.sort_by(|a, b| a.modified.cmp(&b.modified).then_with(|| a.path.cmp(&b.path)));
+            for entry in index {
+                if eviction.bytes <= target {
+                    break;
+                }
+                let gone = match fs::symlink_metadata(&entry.path) {
+                    Err(error) => error.kind() == io::ErrorKind::NotFound,
+                    // Marked used since it was counted: kept.
+                    Ok(metadata) if metadata.modified().ok() != entry.modified => false,
+                    Ok(_) => match fs::remove_file(&entry.path) {
+                        Ok(()) => {
+                            eviction.evicted += 1;
+                            true
+                        }
+                        Err(error) => error.kind() == io::ErrorKind::NotFound,
+                    },
+                };
+                if !gone {
+                    continue;
+                }
+                eviction.bytes -= entry.bytes;
+                if let Some(object) = entry.object
+                    && let Some(count) = names.get_mut(&object)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        names.remove(&object);
+                        eviction.bytes -= objects[&object];
+                    }
+                }
+            }
+        }
+        let named = names.into_keys().collect();
+        eviction.collected = self.collect_unnamed(&named);
+        self.record_footprint(eviction.bytes, unix_now());
+        eviction
     }
 
     /// Move the fact for `key` (its index entry and its object) to the
@@ -682,29 +1023,39 @@ impl FactStore {
             }
         }
         let named = self.sweep_index(&mut report);
-        // An object no index entry names was superseded under its key, or its
-        // entry was quarantined. One younger than a temporary's lifetime may be
-        // one a writer stored and is about to name, so it is kept; removing one
-        // a writer names after all costs a miss, never a wrong hit.
+        report.collected = self.collect_unnamed(&named);
+        report
+    }
+
+    /// Remove each object not in `named` once it is [`STALE_PARTIAL`] old;
+    /// how many. An object no index entry names was superseded under its key,
+    /// evicted, or its entry was quarantined. One younger than a temporary's
+    /// lifetime may be one a writer stored and is about to name (a write that
+    /// reuses an object makes it young again), so it is kept; removing one a
+    /// writer names after all costs a miss, never a wrong hit.
+    fn collect_unnamed(&self, named: &std::collections::BTreeSet<Digest32>) -> usize {
+        let mut collected = 0;
         for entry in entries(&self.root.join("objects")) {
             let old = fs::symlink_metadata(&entry.path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age >= STALE_PARTIAL);
+                .is_ok_and(|metadata| older_than_a_writer(&metadata));
             if entry.regular
                 && old
                 && !named.contains(&entry.name)
                 && fs::remove_file(&entry.path).is_ok()
             {
-                report.collected += 1;
+                collected += 1;
             }
         }
-        report
+        collected
     }
 
     /// Drop every index entry whose object is gone or that cannot be read,
-    /// counting each in `report`; the objects the remaining entries name.
+    /// counting each in `report`; the objects the remaining entries name. An
+    /// entry that cannot be read is quarantined. One whose object is gone is
+    /// removed: its object was evicted, collected or already quarantined with
+    /// its reason, so a row would hold nothing for a person to read, and beside
+    /// an eviction and a write of the same key in other processes it could be
+    /// the sound fact just written.
     fn sweep_index(&self, report: &mut RescanReport) -> std::collections::BTreeSet<Digest32> {
         let mut named = std::collections::BTreeSet::new();
         for entry in entries(&self.root.join("index")) {
@@ -726,7 +1077,13 @@ impl FactStore {
                         named.insert(object);
                         continue;
                     }
-                    "rescan: its object is gone".to_string()
+                    if std::str::from_utf8(&pointer).ok().and_then(parse_hex32).is_some() {
+                        if fs::remove_file(&entry.path).is_ok() {
+                            report.dangling += 1;
+                        }
+                        continue;
+                    }
+                    "rescan: not a SHA-256".to_string()
                 }
             };
             if self.quarantine_index(&entry.name, &why) {
@@ -1514,6 +1871,242 @@ mod tests {
         let store = FactStore::open(&cargo_home).expect("store");
         assert_eq!(store.root(), store.root().canonicalize().expect("canonical"));
         assert!(store.root().starts_with(elsewhere.canonicalize().expect("canonical")));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Set a store file's modification time `age` ago.
+    fn age(path: &Path, age: Duration) {
+        let file = OpenOptions::new().write(true).open(path).expect("store file");
+        file.set_modified(std::time::SystemTime::now() - age).expect("mtime");
+    }
+
+    /// Whether a store file was modified within the last hour (or later).
+    fn recently_used(path: &Path) -> bool {
+        let modified = fs::metadata(path).expect("store file").modified().expect("mtime");
+        modified.elapsed().map_or(true, |age| age < STALE_PARTIAL)
+    }
+
+    /// The bytes one fact takes on disk: its index entry and its object.
+    fn fact_bytes(store: &FactStore, key: &Digest32, object: &Digest32) -> u64 {
+        let of = |path: PathBuf| allocated(&fs::metadata(path).expect("store file"));
+        of(store.path_of("index", key)) + of(store.path_of("objects", object))
+    }
+
+    /// Fact bytes of one size, distinct per tag.
+    fn sized_fact(tag: &str) -> Vec<u8> {
+        let mut bytes = tag.as_bytes().to_vec();
+        bytes.resize(10_000, b'.');
+        bytes
+    }
+
+    fn quarantined(store: &FactStore) -> usize {
+        fs::read_dir(store.root().join("quarantine")).expect("quarantine").count()
+    }
+
+    /// DC-25: a served hit and a write mark the fact used, as its index
+    /// entry's modification time; a miss and an audit's read do not.
+    #[test]
+    fn a_served_fact_and_a_stored_one_mark_their_last_use() {
+        let home = scratch("last-use");
+        let store = FactStore::open(&home).expect("store");
+        let key = digest_parts(&[b"k"]);
+        let object = store.put(&key, b"fact bytes").expect("put");
+        let entry = store.path_of("index", &key);
+        assert!(recently_used(&entry), "a write marks the fact used");
+        age(&entry, 2 * DAY);
+        // NEGATIVE CONTROLS: a miss on another key and `store verify`'s read
+        // of this one mark nothing.
+        assert!(matches!(store.get(&digest_parts(&[b"other"])), StoreRead::Absent));
+        assert!(matches!(store.peek(&key), StoreRead::Present { .. }));
+        assert!(!recently_used(&entry), "an audit's read is not a use");
+        assert!(matches!(store.get(&key), StoreRead::Present { .. }));
+        assert!(recently_used(&entry), "a served hit marks the fact used");
+        age(&entry, 2 * DAY);
+        let objects = store.path_of("objects", &object);
+        age(&objects, 2 * DAY);
+        store.put(&key, b"fact bytes").expect("put again");
+        assert!(recently_used(&entry), "a write of a stored fact marks it used");
+        assert!(recently_used(&objects), "and its reused object is young again");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// DC-25: a write that takes the store over its cap removes the least
+    /// recently used index entries until it is under seven eighths of the cap,
+    /// and their objects with them; it quarantines nothing.
+    #[test]
+    fn a_store_over_its_cap_evicts_its_least_recently_used_facts_and_their_objects() {
+        let home = scratch("evict");
+        let store = FactStore::open(&home).expect("store");
+        let tags = ["a", "b", "c", "d", "e"];
+        let keys = tags.map(|tag| digest_parts(&[tag.as_bytes()]));
+        let objects: Vec<Digest32> = (0..4)
+            .map(|index| store.put(&keys[index], &sized_fact(tags[index])).expect("put"))
+            .collect();
+        let one = fact_bytes(&store, &keys[0], &objects[0]);
+        for (key, object) in keys.iter().zip(&objects) {
+            assert_eq!(fact_bytes(&store, key, object), one, "the facts are one size");
+        }
+        // Last used: a three days ago, c one day, d when written; b is served
+        // after that. Every object is old enough to collect.
+        age(&store.path_of("index", &keys[0]), 3 * DAY);
+        age(&store.path_of("index", &keys[1]), 2 * DAY);
+        age(&store.path_of("index", &keys[2]), DAY);
+        for object in &objects {
+            age(&store.path_of("objects", object), 2 * STALE_PARTIAL);
+        }
+        assert!(matches!(store.get(&keys[1]), StoreRead::Present { .. }));
+        // Room for four and a half facts: the fifth takes the store over, and
+        // the eviction stops under seven eighths of the cap (3.94 facts), so
+        // the two least recently used go: a, then c.
+        let store = store.with_cap(4 * one + one / 2);
+        store.put(&keys[4], &sized_fact(tags[4])).expect("put");
+        for (index, key) in keys.iter().enumerate() {
+            let evicted = index == 0 || index == 2;
+            assert_eq!(
+                matches!(store.peek(key), StoreRead::Absent),
+                evicted,
+                "fact {}",
+                tags[index]
+            );
+        }
+        for (index, object) in objects.iter().enumerate() {
+            let evicted = index == 0 || index == 2;
+            assert_eq!(!store.path_of("objects", object).exists(), evicted, "object {index}");
+        }
+        assert_eq!(store.footprint().map(|(bytes, _)| bytes), Some(3 * one));
+        assert_eq!(quarantined(&store), 0, "an eviction quarantines nothing");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// DC-25: a reader in another process beside an eviction gets a miss and
+    /// quarantines nothing. An eviction removes an index entry, then its
+    /// object; a reader that read the entry before the eviction then finds an
+    /// entry naming an object that is gone, which is the state set up here.
+    /// Before, that read quarantined the entry ("object is gone").
+    #[test]
+    fn an_evicted_fact_is_a_miss_beside_a_reader_and_never_a_quarantine() {
+        let home = scratch("evicted-miss");
+        let store = FactStore::open(&home).expect("store");
+        let key = digest_parts(&[b"k"]);
+        let object = store.put(&key, b"fact bytes").expect("put");
+        fs::remove_file(store.path_of("objects", &object)).expect("the evicted object");
+        assert!(matches!(store.get(&key), StoreRead::Absent), "a miss");
+        assert_eq!(quarantined(&store), 0, "not a quarantine");
+        // A rescan beside it drops the entry and records nothing either.
+        assert_eq!(
+            store.rescan(),
+            RescanReport { sound: 0, quarantined: 0, dangling: 1, collected: 0 }
+        );
+        assert_eq!(quarantined(&store), 0);
+        assert!(store.keys().is_empty());
+        // The session checks afresh and stores the fact again; it hits.
+        store.put(&key, b"fact bytes").expect("put again");
+        assert!(matches!(store.get(&key), StoreRead::Present { .. }));
+        // An eviction under a cap that holds nothing removes it, and its
+        // object once old; the read is a miss and nothing is quarantined.
+        age(&store.path_of("objects", &object), 2 * STALE_PARTIAL);
+        let eviction = store.clone().with_cap(0).evict();
+        assert_eq!(eviction, Some(Eviction { bytes: 0, evicted: 1, collected: 1 }));
+        assert!(matches!(store.get(&key), StoreRead::Absent));
+        assert_eq!(quarantined(&store), 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// DC-25: one process evicts at a time. Each eviction removes what its own
+    /// count says is over, so two counting the same store at once would each
+    /// remove that much; while one holds the store's `evicting` lock, a write
+    /// over the cap and an explicit eviction elsewhere remove nothing, and a
+    /// write once it is released finds the record that eviction left.
+    #[test]
+    fn an_eviction_under_way_is_the_only_one_and_never_doubled() {
+        let home = scratch("one-evictor");
+        let store = FactStore::open(&home).expect("store");
+        let tags = ["a", "b", "c", "d"];
+        let keys = tags.map(|tag| digest_parts(&[tag.as_bytes()]));
+        let objects: Vec<Digest32> = (0..3)
+            .map(|index| store.put(&keys[index], &sized_fact(tags[index])).expect("put"))
+            .collect();
+        let one = fact_bytes(&store, &keys[0], &objects[0]);
+        for (index, (key, object)) in keys.iter().zip(&objects).enumerate() {
+            age(&store.path_of("index", key), (3 - index as u32) * DAY);
+            age(&store.path_of("objects", object), 2 * STALE_PARTIAL);
+        }
+        let store = store.with_cap(3 * one + one / 2);
+        // Another process is evicting (a second open of the lock file
+        // conflicts like another process's would).
+        let held = try_evicting(store.root()).expect("the lock is free");
+        assert!(store.evict().is_none(), "an explicit eviction defers to it");
+        store.put(&keys[3], &sized_fact(tags[3])).expect("put");
+        assert!(
+            keys.iter().all(|key| matches!(store.peek(key), StoreRead::Present { .. })),
+            "a write over the cap beside an eviction under way removes nothing"
+        );
+        // The eviction under way removes the oldest (a) and records 3 facts.
+        drop(held);
+        let eviction = store.evict().expect("the lock is free again");
+        assert_eq!(eviction, Eviction { bytes: 3 * one, evicted: 1, collected: 1 });
+        // A write after it finds that record trusted and within the cap and
+        // adds to it, evicting nothing more.
+        store.put(&keys[3], &sized_fact(tags[3])).expect("put again");
+        assert!(matches!(store.peek(&keys[0]), StoreRead::Absent));
+        for key in &keys[1..] {
+            assert!(matches!(store.peek(key), StoreRead::Present { .. }), "b, c and d stay");
+        }
+        assert_eq!(quarantined(&store), 0);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// DC-25: every key carries the compiler identity, so after a toolchain
+    /// update nothing reads the previous compiler's facts, nothing marks them
+    /// used, and they are the first an eviction removes, even when this
+    /// compiler wrote its own earlier, because use decides and not writing.
+    #[test]
+    fn a_previous_compilers_facts_are_evicted_first_once_unused() {
+        let home = scratch("previous-compiler");
+        let previous = FactContext::for_tests(&home, "the previous compiler", false);
+        let this = FactContext::for_tests(&home, "this compiler", false);
+        let key = |context: &FactContext, item: &str| {
+            digest_parts(&[&context.key_prefix(), item.as_bytes()])
+        };
+        let items = ["f", "g", "h"];
+        let mut stored = Vec::new();
+        for (context, tag) in [(&previous, "previous"), (&this, "this")] {
+            for item in items {
+                let key = key(context, item);
+                let object =
+                    context.store().put(&key, &sized_fact(&format!("{tag} {item}"))).expect("put");
+                stored.push((key, object));
+            }
+        }
+        let (theirs, ours) = stored.split_at(items.len());
+        assert!(theirs.iter().zip(ours).all(|(a, b)| a.0 != b.0), "the keys differ");
+        // The previous compiler last used its facts two days ago; this one
+        // wrote its own three days ago and serves them now.
+        for ((their_key, their_object), (our_key, our_object)) in theirs.iter().zip(ours) {
+            age(&this.store().path_of("index", their_key), 2 * DAY);
+            age(&this.store().path_of("index", our_key), 3 * DAY);
+            age(&this.store().path_of("objects", their_object), 2 * STALE_PARTIAL);
+            age(&this.store().path_of("objects", our_object), 2 * STALE_PARTIAL);
+        }
+        for item in items {
+            assert!(matches!(this.store().get(&key(&this, item)), StoreRead::Present { .. }));
+        }
+        for (their_key, _) in theirs {
+            assert!(!recently_used(&this.store().path_of("index", their_key)));
+        }
+        // Room for five and a half facts: the seventh takes the store over,
+        // and the eviction stops under 4.81 facts, so three go.
+        let one = fact_bytes(this.store(), &ours[0].0, &ours[0].1);
+        let store = this.store().clone().with_cap(5 * one + one / 2);
+        store.put(&key(&this, "i"), &sized_fact("this i")).expect("put");
+        for ((their_key, their_object), (our_key, _)) in theirs.iter().zip(ours) {
+            assert!(matches!(store.peek(their_key), StoreRead::Absent), "theirs go");
+            assert!(!store.path_of("objects", their_object).exists(), "with their objects");
+            assert!(matches!(store.peek(our_key), StoreRead::Present { .. }), "ours stay");
+        }
+        assert_eq!(quarantined(&store), 0);
         let _ = fs::remove_dir_all(home);
     }
 }

@@ -151,7 +151,12 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
 // metadata format in the same window (their own 11 -> 12 bump), so
 // `mir_layout.golden` is re-recorded under 22 in the same commit.
 // Trust: 22 -> 23 adds the per-ADT ODT transport table (TG10).
-const METADATA_VERSION: u8 = 23;
+//
+// Trust: bumped 23 -> 24 — PKG-C5d adds the optional `trust_mentioned_items` table
+// (each encoded body's span-free `mentioned_items`), which changes the `LazyTables`
+// layout for EVERY crate. Same discipline: rebuild the sysroot in the same step, and
+// `mir_layout.golden` is re-recorded under 24 (its MIR layout lines are unchanged).
+const METADATA_VERSION: u8 = 24;
 
 /// Metadata header which includes `METADATA_VERSION`.
 ///
@@ -823,6 +828,12 @@ define_tables! {
     trust_clean_verdict_digest: Table<LazyValue<Vec<u8>>>,
     // Trust: D-2 C1/C2 data, not a serialized kernel authority token.
     trust_odt_entry: Table<LazyValue<Vec<u8>>>,
+    // Trust: PKG-C5d — the span-free `mentioned_items` of each body in
+    // `optimized_mir`, written beside that row from the same body, absent exactly
+    // when the body's field is `None`. Unfiltered on purpose: every predicate over
+    // it (the spawn census's sysroot scan) stays in the reader, so a reader never
+    // trusts a projection another build chose.
+    trust_mentioned_items: Table<LazyValue<Vec<mir::MentionedItem<'static>>>>,
     // Trust: step 2 increment 6 (6.2) — one OPAQUE trust-ir entry per definition the direct
     // producer encoded (`trust_thir_lower::rmeta_entry`), the precedent above: rmeta never
     // names a trust-ir type, and the entry's own magic, schema and trust-ir wire version are

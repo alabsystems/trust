@@ -154,8 +154,8 @@ fn entries(rmeta: &[u8]) -> Vec<Vec<u8>> {
     let mut at = 0;
     while let Some(found) = rmeta[at..].windows(8).position(|w| w == b"TRIRENTR") {
         let start = at + found;
-        // Trust: entry schema 5 frames the complete owner/mode/module/evidence payload.
-        assert_eq!(u32::from_le_bytes(rmeta[start + 8..start + 12].try_into().unwrap()), 5);
+        // Trust: entry schema 6 frames the complete owner/mode/module/evidence payload.
+        assert_eq!(u32::from_le_bytes(rmeta[start + 8..start + 12].try_into().unwrap()), 6);
         let p = start + 56 + u64_at(start + 48);
         out.push(rmeta[start..p].to_vec());
         at = p;
@@ -163,7 +163,7 @@ fn entries(rmeta: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Schema-5 module bytes: after the 56-byte header and payload owner, mode and module digest.
+/// Schema-6 module bytes: after the 56-byte header and payload owner, mode and module digest.
 fn module_bytes(entry: &[u8]) -> &[u8] {
     let at = 56 + 16 + 1 + 32;
     let len = u64::from_le_bytes(entry[at..at + 8].try_into().unwrap()) as usize;

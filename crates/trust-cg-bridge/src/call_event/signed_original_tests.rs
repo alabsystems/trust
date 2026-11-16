@@ -5,10 +5,10 @@ use crate::original_conjunction_certificate::without_production;
 
 const LEAVES: [&str; 4] = ["trust_c_i8_id", "trust_c_i8_not", "trust_c_i16_id", "trust_c_i16_not"];
 fn load_current() -> crate::compiler_input_capture::DecodedCompilerInputs {
-    let bytes = include_bytes!("../../tests/fixtures/signed_o0_original/compiler-input.json");
+    let bytes = include_bytes!("../../tests/fixtures/signed_e76_o0_original/compiler-input.json");
     assert_eq!(
         crate::object_replay::artifact_digest(bytes),
-        "8b0fea9f81e69a36adab955bcb2bb3ad158aaaf1ebe63c20439da1944199f104"
+        "f8f368beb5df7b2668b1c5f7b1d2ee0b479215e23ef83786d1de630fd8b5180c"
     );
     CompilerInputCapture::from_bytes(bytes).unwrap().decode_inputs().unwrap()
 }
@@ -19,7 +19,7 @@ fn replay(input: &CerInput<'_>, sidecar: &[u8]) -> Result<OriginalReplayReport, 
 fn actual_signed_leaves_keep_full_original_and_replay_in_fresh_process() {
     if let Some(directory) = std::env::var_os("TRUST_SIGNED_LEAF_REPLAY_CHILD") {
         let dir = std::path::PathBuf::from(directory);
-        // Current inputs are independently selected compiled-in immutable b8
+        // Current inputs are independently selected compiled-in immutable e76
         // capture bytes, never reconstructed from the retained certificate.
         let current = load_current();
         let result =
@@ -42,13 +42,25 @@ fn actual_signed_leaves_keep_full_original_and_replay_in_fresh_process() {
         let rows = mixed["certificates"].as_array_mut().unwrap();
         rows.iter_mut().find(|r| r["symbol"] == "trust_c_i8_store").unwrap()["original_proof"] =
             serde_json::from_slice(legacy).unwrap();
+        let stale = replay(&current.input(), &serde_json::to_vec(&mixed).unwrap()).unwrap();
+        let rejected = stale.rows.iter().find(|r| r.symbol == "trust_c_i8_store").unwrap();
+        assert!(!rejected.replayed && rejected.detail.contains("subject mismatch"), "{stale:?}");
+        let fresh = std::fs::read(dir.join("current-compatible-v1.json")).unwrap();
+        mixed["certificates"].as_array_mut().unwrap().iter_mut()
+            .find(|r| r["symbol"] == "trust_c_i8_store").unwrap()["original_proof"] =
+            serde_json::from_slice(&fresh).unwrap();
         let old_and_new = replay(&current.input(), &serde_json::to_vec(&mixed).unwrap()).unwrap();
         assert_eq!(old_and_new.rows.len(), 8);
-        assert_eq!(
-            old_and_new.rows.iter().filter(|r| r.replayed).count(),
-            6,
-            "v1 must replay unchanged beside v2: {old_and_new:?}"
-        );
+        assert_eq!(old_and_new.rows.iter().filter(|r| r.replayed).count(), 6,
+            "compatible v1 data must replay unchanged beside v2: {old_and_new:?}");
+        for name in LEAVES.into_iter().chain(["trust_c_i8_store", "trust_c_i16_store"]) {
+            assert!(old_and_new.rows.iter().find(|row| row.symbol == name).unwrap().replayed,
+                "compatible mixed row {name}: {old_and_new:?}");
+        }
+        for name in ["trust_c_i8_tail", "trust_c_i16_tail"] {
+            assert!(!old_and_new.rows.iter().find(|row| row.symbol == name).unwrap().replayed,
+                "tail must remain outside original replay: {old_and_new:?}");
+        }
         std::fs::write(
             dir.join("fresh-mixed-v1-v2.json"),
             serde_json::to_vec_pretty(&old_and_new).unwrap(),
@@ -106,8 +118,13 @@ fn actual_signed_leaves_keep_full_original_and_replay_in_fresh_process() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| tmp.path().to_owned());
     std::fs::create_dir_all(&out).unwrap();
+    let current_store = report.certificate("trust_c_i8_store").unwrap().original_proof.as_ref().unwrap();
+    let compatible = current_store.test_legacy_wire_advice().unwrap();
+    assert_eq!(serde_json::to_value(&compatible).unwrap()["packet"]["model"], 1);
+    without_production(|| compatible.replay(current_store.original_equations())).unwrap();
+    std::fs::write(out.join("current-compatible-v1.json"), serde_json::to_vec(&compatible).unwrap()).unwrap();
     std::fs::write(out.join("report.json"), report.to_json()).unwrap();
-    std::fs::write(out.join("actual-b8-object.o"), &current.object).unwrap();
+    std::fs::write(out.join("actual-current-object.o"), &current.object).unwrap();
     let child=std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact","call_event::signed_original_tests::actual_signed_leaves_keep_full_original_and_replay_in_fresh_process","--nocapture","--test-threads=1"])
         .env("TRUST_SIGNED_LEAF_REPLAY_CHILD",&out).output().unwrap();
@@ -205,9 +222,14 @@ fn retained_v1_specializes_to_v2_without_production_in_fresh_process() {
     if let Some(out) = std::env::var_os("TRUST_V1_SPECIALIZATION_CHILD") {
         // This is proof transport, not a fabricated machine call or caller
         // admission witness. The production caller owner still owes its sites.
-        let raw = include_bytes!("../../tests/fixtures/signed_leaf_original/store-i8-v1.json");
+        let historical = include_bytes!("../../tests/fixtures/signed_leaf_original/store-i8-v1.json");
+        let stale: crate::original_conjunction_certificate::OriginalConjunctionCertificate =
+            serde_json::from_slice(historical).unwrap();
+        let refusal = without_production(|| stale.replay(stale.original_equations())).unwrap_err();
+        assert!(refusal.contains("actual trusted kernel environment mismatch"), "{refusal}");
+        let raw = std::fs::read(std::path::PathBuf::from(&out).join("current-compatible-v1.json")).unwrap();
         let old: crate::original_conjunction_certificate::OriginalConjunctionCertificate =
-            serde_json::from_slice(raw).unwrap();
+            serde_json::from_slice(&raw).unwrap();
         let instance = without_production(|| {
             let checked = old.replay(old.original_equations()).unwrap();
             let substitutions = checked
@@ -228,7 +250,7 @@ fn retained_v1_specializes_to_v2_without_production_in_fresh_process() {
         assert_eq!(instance.original_equations().len(), old.original_equations().len() + 1);
         assert_eq!(serde_json::to_value(instance.packet()).unwrap()["model"], 2);
         std::fs::write(std::path::PathBuf::from(out).join("v1-specialization.json"),serde_json::to_vec_pretty(&serde_json::json!({
-            "old_model":1,"new_model":2,"old_packet_sha256":crate::object_replay::artifact_digest(raw),
+            "old_model":1,"new_model":2,"historical_packet_refused":true,"old_packet_sha256":crate::object_replay::artifact_digest(&raw),
             "old_conjuncts":old.original_equations().len(),"new_conjuncts":instance.original_equations().len(),
             "producer_forbidden":true,"result":"kernel-checked proof specialization; no caller admission claim"})).unwrap()).unwrap();
         return;
@@ -238,6 +260,15 @@ fn retained_v1_specializes_to_v2_without_production_in_fresh_process() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| temp.path().to_owned());
     std::fs::create_dir_all(&out).unwrap();
+    let historical: crate::original_conjunction_certificate::OriginalConjunctionCertificate =
+        serde_json::from_slice(include_bytes!("../../tests/fixtures/signed_leaf_original/store-i8-v1.json")).unwrap();
+    assert!(historical.test_legacy_wire_advice().err().unwrap().contains("historical packets cannot be retagged"));
+    let current = load_current();
+    let report = verify_compiled_module(&current.input()).unwrap();
+    let checked = report.certificate("trust_c_i8_store").unwrap().original_proof.as_ref().unwrap();
+    let compatible = checked.test_legacy_wire_advice().unwrap();
+    without_production(|| compatible.replay(checked.original_equations())).unwrap();
+    std::fs::write(out.join("current-compatible-v1.json"), serde_json::to_vec(&compatible).unwrap()).unwrap();
     let child=std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact","call_event::signed_original_tests::retained_v1_specializes_to_v2_without_production_in_fresh_process","--nocapture","--test-threads=1"])
         .env("TRUST_V1_SPECIALIZATION_CHILD",&out).output().unwrap();

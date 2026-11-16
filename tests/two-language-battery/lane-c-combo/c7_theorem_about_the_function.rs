@@ -49,7 +49,7 @@ clean {
                     d (fun _ => b) (fun _ => a))) (UInt64.toNat a))
             (instDecidableUInt64Lt a b)
             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat a) (UInt64.toNat b)) h)
-            (fun h => Nat.le.refl (UInt64.toNat a))
+            (fun h => @Nat.le.refl (UInt64.toNat a))
 }
 
 /// Ordinary Rust, and its own postcondition is proved by the Lean theorem above

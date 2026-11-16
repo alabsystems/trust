@@ -227,7 +227,7 @@ fn scoped_original_bank_refuses_idle_scope_and_preserves_unused_conversion_custo
     let mut local = capacity_bank(root.path(), &debt, "bank");
     let loan = local.try_loan().unwrap().unwrap();
     let (error, mut local) = match local.try_into_scoped() {
-        Err(original) => original,
+        Err((error, original)) => (error, *original),
         Ok(_) => panic!("an issued original bank cannot become another phase owner"),
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);

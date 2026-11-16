@@ -3943,7 +3943,8 @@ def record_step(plan: Plan) -> int:
 def git_call(repo: Path, *args: str, env: dict[str, str] | None = None,
              payload: bytes | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], input=payload, capture_output=True, env=env)
+        return subprocess.run(refresh.git_command(repo, *args), input=payload,
+                              capture_output=True, env=env)
     except OSError as error:
         raise Refusal(f"git could not be started in {repo}: {error.strerror or error}") from error
 

@@ -25,35 +25,35 @@ signatures = [
 
 # sha256:<hex> for every dist/*.tar.xz archive pinned in src/stage0 (all 9).
 checksums = [
-  "sha256:9daef404105f86603cb670e9c885cf68289dd494e3ab15cf607593772eab4514", # targo-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:148fd4fe60a96545addf6192eb5b1913878b5a4b80993a92616c8cc4f36e35ce", # targo-trust-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:0c0ef8f7929855f66f56e8f7548be362ba035ae71ebbe57eaedb7b72a17a0724", # tippy-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:6070ceaaefdc81e84a25b440308ef34452de678f088a3a32d83a69f0066e8d31", # trust-analyzer-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:17a4c26ef376dc739db147263e82b04bd0e290fd1e3cd6e219d0e7b40edc7689", # trust-src-0.13.0-trust.tar.xz
-  "sha256:9ed1059a7bbb2914da06b3d9fa5d4faecede52362560659123c5ab6c792120eb", # trust-std-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:c81028808506a0c9b4fdca33ceaabf4ffdab45b23c4169de44596209ac573505", # trustc-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:12fd22868dfe622d40d5a9a4ded9ec35dc96dbbfe51d3d5db027de2ad4847e7f", # trustc-dev-0.13.0-trust-aarch64-apple-darwin.tar.xz
-  "sha256:04a7bed03547504084235b7a294d9bf7834e35e7f2fea35245e1a6da5824262d", # trustfmt-0.13.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:8964a289ed4408bf4083b57e1089fece518b28e252b63c1720b693bb23c502cb", # targo-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:80db4a8118c2e205f3db6f7d5391ffdaa1f98e20f73510394fe1fc2fa9e1ab16", # targo-trust-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:79811ac5959ba9c0f49a96d688d6ee93b8539ae07499fcefb45a4825ae222f78", # tippy-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:d43761eba39f6b6877cfe0f00ae458428852a56bae6bf5e82d6c2f9ed98bc5fb", # trust-analyzer-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:3132a403c6464454ee1392a7988c69b545bdaeb3c7900455b4e542a8321fe0e2", # trust-src-0.14.0-trust.tar.xz
+  "sha256:7aa8cf7fc719582465d53b2b495a6dcbaec68143e5169f61c3e7aeb433cfc174", # trust-std-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:80ab3947374ef9ca61fe4562c6c8a7da90ee840f739889f8afa88c47eac4c69c", # trustc-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:50060e6d160a32a402a43b82d731e16f1a3dcffe1eb1bafacafec6d2a31b271e", # trustc-dev-0.14.0-trust-aarch64-apple-darwin.tar.xz
+  "sha256:8cc2827f2324e378384d9686c83564588785140a3efb8bd790184249a3b7d28f", # trustfmt-0.14.0-trust-aarch64-apple-darwin.tar.xz
 ]
 
 [release]
 repo = "alabsystems/trust"
-tag = "trust-stage0-2026-11-07-82bb867ed"
-title = "Trust stage0 seed 2026-11-07 (0.13.0-trust, aarch64-apple-darwin)"
-date = "2026-11-07"
+tag = "trust-stage0-2026-11-15-5062eed55"
+title = "Trust stage0 seed 2026-11-15 (0.14.0-trust, aarch64-apple-darwin)"
+date = "2026-11-15"
 host_triple = "aarch64-apple-darwin"
-compiler_version = "0.13.0-trust"
-compiler_git_commit_hash = "82bb867eddb94599f68194f701c766f2b6f5a02f"
-channel_manifest_hash = "1d845790968a3cacb2f960cd3681c263360e7393459833034cc10bbf48ff4c99"
+compiler_version = "0.14.0-trust"
+compiler_git_commit_hash = "5062eed55c0bc9df8a79eba1368d88ffde76c741"
+channel_manifest_hash = "5bf59951b5b6dc34b13c32692f820721ada9d38f04dab06b0b04331cfa6fcd2d"
 visibility = "private"
-authenticated_fetch = "gh release download trust-stage0-2026-11-07-82bb867ed --repo alabsystems/trust --dir bootstrap/trust-stage0/dist/2026-11-07 --pattern '*.tar.xz' --clobber"
+authenticated_fetch = "gh release download trust-stage0-2026-11-15-5062eed55 --repo alabsystems/trust --dir bootstrap/trust-stage0/dist/2026-11-15 --pattern '*.tar.xz' --clobber"
 
 # The exact first line every canonical version probe prints (distribution
 # archive labels and product-reported versions are distinct namespaces).
 [release.reported_product_identities]
-targo = "targo 1.101.0-dev (82bb867ed 2026-11-07) (targo 0.13.0+g82bb867ed)"
-trustc = "rustc 1.101.0-dev (82bb867ed 2026-11-07) (trustc 0.13.0+g82bb867ed)"
-trustfmt = "trustfmt 1.12.0-trust (82bb867edd 2026-11-07)"
+targo = "targo 1.101.0-dev (5062eed55 2026-11-15) (targo 0.14.0+g5062eed55)"
+trustc = "rustc 1.101.0-dev (5062eed55 2026-11-15) (trustc 0.14.0+g5062eed55)"
+trustfmt = "trustfmt 1.12.0-trust (5062eed55c 2026-11-15)"
 
 # The pack cut that minted this seed (scripts/mint_and_prove_seed.sh). The
 # pack's SEED-MINT file carries the same record and every compared file.
@@ -61,13 +61,13 @@ trustfmt = "trustfmt 1.12.0-trust (82bb867edd 2026-11-07)"
 # lineage-disjoint is diverse. lineage_disjoint_anchor is the latest cut on
 # this chain that was, carried forward by every later cut (or none).
 [release.mint]
-pinned_seed_commit = "29ebb403de7a102850d6cb10a62d5cc3baf723ed"
-ddc_seed_relation = "lineage-disjoint"
-ddc_seed_commit = "fd8e211ae301c84a86d13cf52a6d3ce08c589e2e"
-ddc_seed_lineage = "stock"
+pinned_seed_commit = "82bb867eddb94599f68194f701c766f2b6f5a02f"
+ddc_seed_relation = "same-lineage"
+ddc_seed_commit = "84c139d26eadd0680372efac5e4305e6f98c1baa"
+ddc_seed_lineage = "trust"
 lineage_disjoint_anchor = "82bb867eddb94599f68194f701c766f2b6f5a02f"
-stage2_tree_sha256_pinned_seed = "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf"
-stage2_tree_sha256_ddc_seed = "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf"
+stage2_tree_sha256_pinned_seed = "e715376c3c0041d06c8737e6b1974a4d72a1bff95522a5336323b4a0e37a099d"
+stage2_tree_sha256_ddc_seed = "e715376c3c0041d06c8737e6b1974a4d72a1bff95522a5336323b4a0e37a099d"
 self_host_proof = "pass"
 
 # Each host binds its own completed native mint receipt, installed
@@ -76,48 +76,48 @@ self_host_proof = "pass"
 [release.hosts."aarch64-apple-darwin"]
 schema = "trust-seed-host-record-v1"
 host = "aarch64-apple-darwin"
-source_commit = "82bb867eddb94599f68194f701c766f2b6f5a02f"
-source_commit_date = "2026-11-07"
-source_version = "0.13.0"
-pinned_seed_date = "2026-10-28"
+source_commit = "5062eed55c0bc9df8a79eba1368d88ffde76c741"
+source_commit_date = "2026-11-15"
+source_version = "0.14.0"
+pinned_seed_date = "2026-11-07"
 receipt_path = "host-proofs/aarch64-apple-darwin/SEED-MINT"
-receipt_sha256 = "864b0eff17f8ab7ce49aedb8d760f47ebc7c47f33c77575de7868f2f1551f20b"
+receipt_sha256 = "92ed06359852bcce9afbdc883d8e0494a6027f58a2ac096d37512c8987cf657f"
 surface_path = "host-proofs/aarch64-apple-darwin/seed-surface.json"
-surface_sha256 = "5d4a045319f2812ebc66ab1beb60818ae05bc75a8ed4616844beedb497eda214"
+surface_sha256 = "f1c6241f3eb71e8dc3d8f3c6adb90d5e50250e08663e2004cd32deaeba6135c1"
 
 [release.hosts."aarch64-apple-darwin".reported_product_identities]
-"targo" = "targo 1.101.0-dev (82bb867ed 2026-11-07) (targo 0.13.0+g82bb867ed)"
-"trustc" = "rustc 1.101.0-dev (82bb867ed 2026-11-07) (trustc 0.13.0+g82bb867ed)"
-"trustfmt" = "trustfmt 1.12.0-trust (82bb867edd 2026-11-07)"
+"targo" = "targo 1.101.0-dev (5062eed55 2026-11-15) (targo 0.14.0+g5062eed55)"
+"trustc" = "rustc 1.101.0-dev (5062eed55 2026-11-15) (trustc 0.14.0+g5062eed55)"
+"trustfmt" = "trustfmt 1.12.0-trust (5062eed55c 2026-11-15)"
 
 [release.hosts."aarch64-apple-darwin".entrypoint_sha256]
-"cargo" = "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc"
-"rustc" = "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e"
-"targo" = "937d9c8852a76dae34a98bc907ef8f8abc620cc3df17be6fc384c61067cc25dc"
-"trustc" = "5d505579da7eeaac54868d794d5e7fb4c142de28ebf06c35d3dbb92d07a3671e"
-"trustdoc" = "0be5a5a83f9e2711e2aa3727a192b237388b49fc66ccd6ebed882ccf5ef316fb"
-"trustfmt" = "6b7e6b843296a9dc87eb557dcda4eb1e9014285b2b308d2aaa3e61ba8f7a0f41"
+"cargo" = "e052036773580276deaad0192650a3e4d853f6a9c5f2ea8278038a8ef5d7d765"
+"rustc" = "8c321463ee4bc5161f5b61a9d63f931e726cb0f442652f5ac495e8c9b6fb8ac4"
+"targo" = "e052036773580276deaad0192650a3e4d853f6a9c5f2ea8278038a8ef5d7d765"
+"trustc" = "8c321463ee4bc5161f5b61a9d63f931e726cb0f442652f5ac495e8c9b6fb8ac4"
+"trustdoc" = "146b1af8a7048c86a83794bd129936cd9acfd97e2752b6101330b82b89d22750"
+"trustfmt" = "927bffd5d9a3cc193e0d5f087454bc4a87f7e98d818394811bace009522ec026"
 
 [release.hosts."aarch64-apple-darwin".mint]
-"ddc_seed_commit" = "fd8e211ae301c84a86d13cf52a6d3ce08c589e2e"
-"ddc_seed_lineage" = "stock"
-"ddc_seed_relation" = "lineage-disjoint"
+"ddc_seed_commit" = "84c139d26eadd0680372efac5e4305e6f98c1baa"
+"ddc_seed_lineage" = "trust"
+"ddc_seed_relation" = "same-lineage"
 "lineage_disjoint_anchor" = "82bb867eddb94599f68194f701c766f2b6f5a02f"
-"pinned_seed_commit" = "29ebb403de7a102850d6cb10a62d5cc3baf723ed"
+"pinned_seed_commit" = "82bb867eddb94599f68194f701c766f2b6f5a02f"
 "self_host_proof" = "pass"
-"stage2_tree_sha256_ddc_seed" = "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf"
-"stage2_tree_sha256_pinned_seed" = "6bff6fd144f5da4b804a311969bc0ad260150e5705611f7547f9a36449debcdf"
+"stage2_tree_sha256_ddc_seed" = "e715376c3c0041d06c8737e6b1974a4d72a1bff95522a5336323b4a0e37a099d"
+"stage2_tree_sha256_pinned_seed" = "e715376c3c0041d06c8737e6b1974a4d72a1bff95522a5336323b4a0e37a099d"
 
 [release.hosts."aarch64-apple-darwin".payloads]
-"dist/2026-11-07/targo-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "9daef404105f86603cb670e9c885cf68289dd494e3ab15cf607593772eab4514"
-"dist/2026-11-07/targo-trust-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "148fd4fe60a96545addf6192eb5b1913878b5a4b80993a92616c8cc4f36e35ce"
-"dist/2026-11-07/tippy-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "0c0ef8f7929855f66f56e8f7548be362ba035ae71ebbe57eaedb7b72a17a0724"
-"dist/2026-11-07/trust-analyzer-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "6070ceaaefdc81e84a25b440308ef34452de678f088a3a32d83a69f0066e8d31"
-"dist/2026-11-07/trust-src-0.13.0-trust.tar.xz" = "17a4c26ef376dc739db147263e82b04bd0e290fd1e3cd6e219d0e7b40edc7689"
-"dist/2026-11-07/trust-std-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "9ed1059a7bbb2914da06b3d9fa5d4faecede52362560659123c5ab6c792120eb"
-"dist/2026-11-07/trustc-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "c81028808506a0c9b4fdca33ceaabf4ffdab45b23c4169de44596209ac573505"
-"dist/2026-11-07/trustc-dev-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "12fd22868dfe622d40d5a9a4ded9ec35dc96dbbfe51d3d5db027de2ad4847e7f"
-"dist/2026-11-07/trustfmt-0.13.0-trust-aarch64-apple-darwin.tar.xz" = "04a7bed03547504084235b7a294d9bf7834e35e7f2fea35245e1a6da5824262d"
+"dist/2026-11-15/targo-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "8964a289ed4408bf4083b57e1089fece518b28e252b63c1720b693bb23c502cb"
+"dist/2026-11-15/targo-trust-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "80db4a8118c2e205f3db6f7d5391ffdaa1f98e20f73510394fe1fc2fa9e1ab16"
+"dist/2026-11-15/tippy-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "79811ac5959ba9c0f49a96d688d6ee93b8539ae07499fcefb45a4825ae222f78"
+"dist/2026-11-15/trust-analyzer-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "d43761eba39f6b6877cfe0f00ae458428852a56bae6bf5e82d6c2f9ed98bc5fb"
+"dist/2026-11-15/trust-src-0.14.0-trust.tar.xz" = "3132a403c6464454ee1392a7988c69b545bdaeb3c7900455b4e542a8321fe0e2"
+"dist/2026-11-15/trust-std-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "7aa8cf7fc719582465d53b2b495a6dcbaec68143e5169f61c3e7aeb433cfc174"
+"dist/2026-11-15/trustc-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "80ab3947374ef9ca61fe4562c6c8a7da90ee840f739889f8afa88c47eac4c69c"
+"dist/2026-11-15/trustc-dev-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "50060e6d160a32a402a43b82d731e16f1a3dcffe1eb1bafacafec6d2a31b271e"
+"dist/2026-11-15/trustfmt-0.14.0-trust-aarch64-apple-darwin.tar.xz" = "8cc2827f2324e378384d9686c83564588785140a3efb8bd790184249a3b7d28f"
 
 [artifact_root]
-path = "https://github.com/alabsystems/trust/releases/tag/trust-stage0-2026-11-07-82bb867ed"
+path = "https://github.com/alabsystems/trust/releases/tag/trust-stage0-2026-11-15-5062eed55"

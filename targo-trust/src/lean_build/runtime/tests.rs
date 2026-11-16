@@ -2,6 +2,13 @@ use super::*;
 
 const SOURCE: &str = "inductive Data where\n  | make : Data\ndef identity (x : Data) : Data := x\ndef twice (x : Data) : Data := identity (identity x)\n";
 
+// This is the unchanged complete original source of the separate logical
+// quotation prerequisite. Its accepted payload is not that quotation, and the
+// existing Object/RC diagnostic emitter is allowed to refuse it.
+const ESCAPING_ORIGINAL: &str = include_str!(
+    "../../../../crates/trust-clean-ir-gate/probes/source_closure_refinement/Original.lean"
+);
+
 fn request(dir: &Path, source: &str, entry: &str) -> Request {
     std::fs::write(dir.join("Main.lean"), source).unwrap();
     parse(&[
@@ -19,6 +26,250 @@ fn request(dir: &Path, source: &str, entry: &str) -> Request {
 fn report(request: &Request) -> Value {
     serde_json::from_slice(&std::fs::read(request.build.census_output.as_ref().unwrap()).unwrap())
         .unwrap()
+}
+
+fn original_payload<'a>(receipt: &'a Value, name: &str) -> &'a Value {
+    receipt["accepted_original"]["owned_payloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == json!(Name::from_string(name)))
+        .unwrap()
+}
+
+#[test]
+fn accepted_original_attachment_retains_all_three_real_bodies_on_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = request(dir.path(), ESCAPING_ORIGINAL, "EscapingOriginal.useAffine");
+    let checked =
+        crate::lean_cli::check_batch_for_runtime(std::slice::from_ref(&request.build.input));
+    let accepted = checked.accepted_context().expect("actual original source is accepted");
+    assert_eq!(accepted.owned_declarations().len(), 3);
+    let error = build(&request).expect_err("logical quotation does not authorize runtime emission");
+    assert!(!error.is_empty());
+    assert!(!request.build.output.exists());
+    let observed = report(&request);
+    let receipt = &observed["diagnostic_runtime"];
+    assert_eq!(receipt["status"], "refused-no-artifact");
+    assert!(receipt["module_attachment"].is_null());
+    let original = &receipt["accepted_original"];
+    assert_eq!(original["authority"], "none-data-only-not-source-refinement");
+    assert_eq!(original["capture_delta_complete"], true);
+    assert_eq!(original["sources"][0]["source"], ESCAPING_ORIGINAL);
+    assert_eq!(original["source_closure_sha256"], accepted.source_closure_sha256());
+    assert_eq!(original["owned_declarations_sha256"], accepted.owned_declarations_sha256());
+    assert_eq!(original["owned_payloads"].as_array().unwrap().len(), 3);
+    for name in
+        ["EscapingOriginal.makeAffine", "EscapingOriginal.apply64", "EscapingOriginal.useAffine"]
+    {
+        let row = original_payload(receipt, name);
+        let info = accepted.environment().get_const(&Name::from_string(name)).unwrap();
+        assert_eq!(row["constant"], serde_json::to_value(info).unwrap());
+        assert!(!row["constant"]["value"].is_null(), "full original body retained");
+        assert!(!row["constant"]["type_"].is_null(), "full original type retained");
+        for role in ["inductive", "constructor", "recursor", "quotient"] {
+            assert!(row.as_object().unwrap().contains_key(role), "complete represented roles");
+        }
+    }
+}
+
+#[test]
+fn typed_closure_candidate_retains_real_module_without_runtime_or_object_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = request(dir.path(), ESCAPING_ORIGINAL, "EscapingOriginal.useAffine");
+    assert!(build(&request).is_err());
+    assert!(!request.build.output.exists());
+    let receipt = report(&request);
+    let runtime = &receipt["diagnostic_runtime"];
+    assert_eq!(runtime["status"], "refused-no-artifact");
+    assert!(runtime["module_attachment"].is_null());
+    let candidate = &runtime["typed_closure_candidate"];
+    assert_eq!(candidate["status"], "candidate-data", "{candidate}");
+    assert_eq!(candidate["authority"], "none-data-only-not-source-refinement");
+    assert_eq!(
+        candidate["environment_snapshot_blake3"],
+        runtime["context"]["source"]["snapshot_blake3"]
+    );
+    assert!(!candidate["environment_snapshot_blake3"].is_null());
+    assert_eq!(candidate["complete_owned_roster"].as_array().unwrap().len(), 3);
+    assert_eq!(candidate["originals"].as_array().unwrap().len(), 3);
+    for row in candidate["originals"].as_array().unwrap() {
+        let original = runtime["accepted_original"]["owned_payloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|original| original["name"] == row["constant"]["name"])
+            .unwrap();
+        assert_eq!(original["constant"], row["constant"]);
+    }
+    let module: trust_ir::Module = serde_json::from_value(candidate["module"].clone()).unwrap();
+    assert_eq!(module.functions.len(), 4);
+    assert!(module.functions.iter().all(|f| !f.blocks.is_empty()
+        && f.body_gate == Some(trust_ir::BodyGate::Ungated)
+        && f.calling_conv == trust_ir::CallingConv::Rust));
+    let bytes: Vec<u8> = serde_json::from_value(candidate["wire_bytes"].clone()).unwrap();
+    assert_eq!(trust_ir::binary::deserialize_module(&bytes).unwrap(), module);
+    assert_eq!(trust_ir::binary::serialize_module(&module).unwrap(), bytes);
+    assert_eq!(candidate["wire_sha256"], format!("{:x}", Sha256::digest(&bytes)));
+
+    // The ordinary full-source library and strict object paths still refuse
+    // their original missing function carrier. Candidate DATA is not consulted.
+    for object in [false, true] {
+        let ordinary = super::super::Request {
+            input: request.build.input.clone(),
+            output: dir.path().join(if object { "strict.o" } else { "library.json" }),
+            verbose: false,
+            census_output: None,
+            olean_paths: Vec::new(),
+        };
+        let error = super::super::build_artifact(&ordinary, object).unwrap_err().render(true);
+        assert!(error.contains("carrier"), "{error}");
+        assert!(!ordinary.output.exists());
+    }
+}
+
+#[test]
+fn typed_closure_candidate_tracks_actual_body_capture_and_complete_roster_changes() {
+    let mut modules = Vec::new();
+    for source in [
+        ESCAPING_ORIGINAL.to_owned(),
+        ESCAPING_ORIGINAL.replace("a * x + b", "a + x + b"),
+        ESCAPING_ORIGINAL.replace("makeAffine a b\n", "makeAffine b a\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request(dir.path(), &source, "EscapingOriginal.useAffine");
+        assert!(build(&request).is_err());
+        assert!(!request.build.output.exists());
+        let receipt = report(&request);
+        let candidate = &receipt["diagnostic_runtime"]["typed_closure_candidate"];
+        assert_eq!(candidate["status"], "candidate-data", "{candidate}");
+        modules.push(candidate["module"].clone());
+    }
+    assert_ne!(modules[0], modules[1]);
+    assert_ne!(modules[0], modules[2]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!("{ESCAPING_ORIGINAL}\ndef unselected (x : UInt64) : UInt64 := x\n");
+    let request = request(dir.path(), &source, "EscapingOriginal.useAffine");
+    assert!(build(&request).is_err());
+    assert!(!request.build.output.exists());
+    let receipt = report(&request);
+    let runtime = &receipt["diagnostic_runtime"];
+    assert_eq!(runtime["typed_closure_candidate"]["status"], "refused-no-candidate");
+    assert!(runtime["typed_closure_candidate"]["module"].is_null());
+    assert_eq!(runtime["accepted_original"]["owned_payloads"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn accepted_original_attachment_observes_a_real_source_body_mutation() {
+    let original_dir = tempfile::tempdir().unwrap();
+    let changed_dir = tempfile::tempdir().unwrap();
+    let changed = ESCAPING_ORIGINAL.replace("a * x + b", "a + x + b");
+    assert_ne!(changed, ESCAPING_ORIGINAL);
+    let original = request(original_dir.path(), ESCAPING_ORIGINAL, "EscapingOriginal.useAffine");
+    let mutated = request(changed_dir.path(), &changed, "EscapingOriginal.useAffine");
+    for request in [&original, &mutated] {
+        assert!(build(request).is_err());
+        assert!(!request.build.output.exists());
+    }
+    let a = report(&original);
+    let b = report(&mutated);
+    let a = &a["diagnostic_runtime"];
+    let b = &b["diagnostic_runtime"];
+    assert_ne!(
+        a["accepted_original"]["source_closure_sha256"],
+        b["accepted_original"]["source_closure_sha256"]
+    );
+    assert_ne!(
+        a["accepted_original"]["owned_declarations_sha256"],
+        b["accepted_original"]["owned_declarations_sha256"]
+    );
+    assert_ne!(
+        original_payload(a, "EscapingOriginal.makeAffine")["constant"]["value"],
+        original_payload(b, "EscapingOriginal.makeAffine")["constant"]["value"]
+    );
+    assert!(a["module_attachment"].is_null() && b["module_attachment"].is_null());
+}
+
+#[test]
+fn accepted_original_attachment_retains_the_known_uint64_metadata_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "def scalar (x : UInt64) : UInt64 := x\n";
+    let request = request(dir.path(), source, "scalar");
+    let error = build(&request).expect_err("UInt64 runtime metadata remains unsupported");
+    assert!(
+        error.contains("OfNat") && error.contains("constructor header and field metadata disagree"),
+        "{error}"
+    );
+    assert!(!request.build.output.exists());
+    let observed = report(&request);
+    let receipt = &observed["diagnostic_runtime"];
+    assert_eq!(receipt["accepted_original"]["sources"][0]["source"], source);
+    assert_eq!(receipt["accepted_original"]["owned_payloads"].as_array().unwrap().len(), 1);
+    assert!(!original_payload(receipt, "scalar")["constant"]["value"].is_null());
+    assert!(receipt["module_attachment"].is_null());
+}
+
+#[test]
+fn accepted_original_attachment_keeps_unselected_siblings_and_exact_produced_wire() {
+    use clean_compiler::emit_trust_ir::deserialize_module_bytes;
+    let with_sibling = "def scalar (x : Bool) : Bool := x\ndef sibling (x y : Bool) : Bool := x\n";
+    let changed_body = with_sibling.replace(":= x\n", ":= y\n");
+    // Only mutate the sibling; the selected root remains the same original.
+    let changed_body = changed_body.replacen(
+        "def scalar (x : Bool) : Bool := y",
+        "def scalar (x : Bool) : Bool := x",
+        1,
+    );
+    let no_sibling = "def scalar (x : Bool) : Bool := x\n";
+    let mut receipts = Vec::new();
+    for source in [with_sibling, changed_body.as_str(), no_sibling] {
+        let dir = tempfile::tempdir().unwrap();
+        let request = request(dir.path(), source, "scalar");
+        build(&request).expect("actual scalar source diagnostic emission");
+        let observed = report(&request);
+        let receipt = &observed["diagnostic_runtime"];
+        let attachment = &receipt["module_attachment"];
+        let wire: Vec<u8> = serde_json::from_value(attachment["wire_bytes"].clone()).unwrap();
+        assert_eq!(wire, std::fs::read(&request.build.output).unwrap());
+        assert_eq!(&wire[..8], b"tMBC\x01\0\0\0");
+        let actual = deserialize_module_bytes(&wire[8..]).expect("canonical actual wire reader");
+        let data: trust_ir::Module = serde_json::from_value(attachment["module"].clone()).unwrap();
+        assert_eq!(data, actual, "complete produced module, not a logical quotation");
+        // Mutate the genuinely produced module, not a separately hand-authored
+        // quotation. Transport equality is sensitive to its real convention;
+        // this does not claim any semantic validator rejects forged receipts.
+        let mut mutant = data.clone();
+        mutant.functions[0].calling_conv =
+            if mutant.functions[0].calling_conv == trust_ir::CallingConv::C {
+                trust_ir::CallingConv::Rust
+            } else {
+                trust_ir::CallingConv::C
+            };
+        assert_ne!(serialize_diagnostic_module(&mutant).unwrap(), wire);
+        assert_ne!(serde_json::to_value(mutant).unwrap(), attachment["module"]);
+        assert_eq!(attachment["wire_sha256"], format!("{:x}", Sha256::digest(&wire)));
+        assert_eq!(
+            attachment["source_closure_sha256"],
+            receipt["accepted_original"]["source_closure_sha256"]
+        );
+        assert_eq!(
+            attachment["owned_declarations_sha256"],
+            receipt["accepted_original"]["owned_declarations_sha256"]
+        );
+        assert_eq!(attachment["authority"], "none-data-only-not-source-refinement");
+        receipts.push(receipt.clone());
+    }
+    assert_eq!(receipts[0]["accepted_original"]["owned_payloads"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        original_payload(&receipts[0], "sibling")["constant"]["value"],
+        original_payload(&receipts[1], "sibling")["constant"]["value"]
+    );
+    assert_eq!(receipts[2]["accepted_original"]["owned_payloads"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        receipts[0]["accepted_original"]["owned_declarations_sha256"],
+        receipts[2]["accepted_original"]["owned_declarations_sha256"]
+    );
 }
 
 #[test]

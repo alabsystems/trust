@@ -50,6 +50,101 @@ def serialize_and_parse(configure_args, bootstrap_args=None):
     return build
 
 
+class ChildResourceTransportTestCase(unittest.TestCase):
+    @unittest.skipIf(sys.platform == "win32", "POSIX resource descriptions")
+    def test_actual_child_keeps_original_resource_identity_and_explicit_pipe(self):
+        reader, writer = os.pipe()
+        explicit, explicit_writer = os.pipe()
+        unrelated, unrelated_writer = os.pipe()
+        for descriptor in (reader, writer, explicit, explicit_writer, unrelated, unrelated_writer):
+            self.addCleanup(os.close, descriptor)
+        os.set_inheritable(unrelated, True)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "observed.json"
+            program = (
+                "import json,os; from pathlib import Path\n"
+                "names=json.loads(os.environ['PROBE_NAMES'])\n"
+                "data={name:os.environ[name] for name in names}\n"
+                "data['identities']={fd:[os.fstat(int(fd)).st_dev,os.fstat(int(fd)).st_ino] "
+                "for fd in json.loads(os.environ['PROBE_FDS'])}\n"
+                "try: os.fstat(int(os.environ['PROBE_UNRELATED']))\n"
+                "except OSError: data['unrelated_closed']=True\n"
+                "else: data['unrelated_closed']=False\n"
+                "Path(os.environ['PROBE_OUTPUT']).write_text(json.dumps(data))\n"
+            )
+            for fixed in (str(reader), "requires-live-ancestor-v1"):
+                with self.subTest(fixed=fixed):
+                    transport = {
+                        "ATERM_SDK_LEASE_V3": str(reader),
+                        "ATERM_WORKLOAD_HOST_STORE_FD_V1": str(reader),
+                        "ATERM_WORKLOAD_CPU_FDS_V1": f"{reader},{writer}",
+                        "BUILD_SLOT_FENCE_FDS": str(reader),
+                        "TRUST_CPU_IMPLICIT_FD": str(reader),
+                        "TRUST_CPU_HANDOFF": "opaque-original-python-fixture",
+                        "TRUST_FIXED_ADMISSION_FD_V1": fixed,
+                        "TRUST_FIXED_CLAIM_HANDOFF_V1": "opaque-original-fixed-fixture",
+                        "CARGO_MAKEFLAGS": f"-j --jobserver-auth={reader},{writer}",
+                        "CARGO_JOBSERVER_HANDOFF": "opaque-original-descendant-fixture",
+                        "MAKEFLAGS": "--jobserver-auth=ignored,lower-priority",
+                    }
+                    environment = {
+                        **transport, "PROBE_NAMES": json.dumps(list(transport)),
+                        "PROBE_FDS": json.dumps([str(fd) for fd in (reader, writer, explicit)]),
+                        "PROBE_UNRELATED": str(unrelated), "PROBE_OUTPUT": str(output),
+                    }
+                    bootstrap.run([sys.executable, "-c", program], env=environment,
+                                  pass_fds=(explicit,), exception=True)
+                    observed = json.loads(output.read_text())
+                    self.assertEqual({name: observed[name] for name in transport}, transport)
+                    self.assertEqual(observed["identities"], {
+                        str(fd): [os.fstat(fd).st_dev, os.fstat(fd).st_ino]
+                        for fd in (reader, writer, explicit)})
+                    self.assertTrue(observed["unrelated_closed"])
+
+    def test_malformed_closed_or_missing_ancestor_refuses_before_launch(self):
+        reader, writer = os.pipe()
+        os.close(reader); os.close(writer)
+        for environment in (
+            {"TRUST_CPU_IMPLICIT_FD": str(reader)},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "bad-descriptor"},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1"},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1",
+             "TRUST_FIXED_CLAIM_HANDOFF_V1": ""},
+            {"CARGO_MAKEFLAGS": "--jobserver-auth=malformed"},
+        ):
+            with self.subTest(environment=environment), \
+                    patch.object(bootstrap.subprocess, "Popen") as child:
+                with self.assertRaisesRegex(RuntimeError, "row custody"):
+                    bootstrap.run([sys.executable, "-c", "pass"], env=environment)
+                child.assert_not_called()
+
+    def test_implicit_environment_and_gnu_precedence_use_the_shared_parser(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader); self.addCleanup(os.close, writer)
+        environment = {"TRUST_CPU_IMPLICIT_FD": str(reader), "CARGO_MAKEFLAGS": "",
+                       "MAKEFLAGS": "--jobserver-auth=ignored,lower-priority"}
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(bootstrap.subprocess, "Popen") as child:
+            child.return_value.wait.return_value = 0
+            bootstrap.run([sys.executable, "-c", "pass"])
+            self.assertEqual(child.call_args.kwargs["pass_fds"], (reader,))
+            self.assertNotIn("env", child.call_args.kwargs)
+
+    def test_windows_preserves_direct_no_fd_path_and_refuses_native_fd(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader); self.addCleanup(os.close, writer)
+        with patch.object(bootstrap, "platform_is_win32", return_value=True), \
+                patch.object(bootstrap.subprocess, "Popen") as child:
+            child.return_value.wait.return_value = 0
+            bootstrap.run([sys.executable, "-c", "pass"], env={})
+            self.assertNotIn("pass_fds", child.call_args.kwargs)
+            child.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "Windows bootstrap child"):
+                bootstrap.run([sys.executable, "-c", "pass"],
+                              env={"TRUST_CPU_IMPLICIT_FD": str(reader)})
+            child.assert_not_called()
+
+
 class UnpackProjectionTestCase(unittest.TestCase):
     def test_public_unpack_uses_exact_component_segments_and_shared_projection(self):
         with tempfile.TemporaryDirectory() as directory:

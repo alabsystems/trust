@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import io
 import importlib.util
 import contextlib
@@ -1281,8 +1282,10 @@ def push_exact_source(url: str, root: Path, before: str, after: str, *,
     """Publish exact objects through an owned clean local transport clone.
 
     A development checkout can have hooks that Agh correctly refuses in its
-    source repository. Borrow its immutable objects, not its configuration or
-    working files. The gate still checks the original checkout and remote ACK.
+    source repository. Retain immutable object data in the transport itself,
+    not its configuration or working files. A native publication reader cannot
+    depend on access to the caller's object directory through Git alternates.
+    The gate still checks the original checkout and remote ACK.
     """
     if any(re.fullmatch(r"[0-9a-f]{40}", oid) is None for oid in (before, after)) or before == after:
         return subprocess.CompletedProcess([], 2, "", "publication requires two distinct exact SHA-1 commits")
@@ -1320,20 +1323,182 @@ def push_exact_source(url: str, root: Path, before: str, after: str, *,
         require(re.fullmatch(r"[0-9a-f]{40}", tree), "publication source tree is not an exact SHA-1 identity")
         return tree
 
+    def require_history(directory):
+        # A complete selected checkout can still lack old blobs or trees.
+        # Refuse that local availability failure before native strict packing;
+        # this traversal is not a replacement for Agh's full connectivity,
+        # shallow-source, pack validation or remote expected-ref checks.
+        done = _run(["git", "-C", str(directory), "rev-list", "--quiet", "--objects",
+                     "--missing=error", after], timeout=remaining(), env=env, cwd=directory,
+                    isolate_git_config=True)
+        if done.returncode:
+            raise _PublicationSourceFailure(subprocess.CompletedProcess(
+                done.args, done.returncode, done.stdout,
+                "publication history is incomplete or unreadable: " + (done.stderr or "")))
+
+    def retain_alternate_objects(transport):
+        # --local owns the caller's existing objects by hardlink, but inherits
+        # its alternates. Retain those same immutable DATA files too, without
+        # --dissociate's full-history repack and temporary disk amplification.
+        # Git resolves recursive/relative alternates; we do not parse their
+        # pointer files or grant the native reader access to borrowed stores.
+        def alternates():
+            output = local(["-C", str(transport), "count-objects", "-v"], transport)
+            return [line[len("alternate: "):] for line in output.splitlines()
+                    if line.startswith("alternate: ")]
+
+        git_dir = Path(local(["-C", str(transport), "rev-parse", "--absolute-git-dir"], transport))
+        require(git_dir.resolve(strict=True) == transport / ".git",
+                "publication transport object namespace escaped its owned clone")
+        objects = git_dir / "objects"
+        borrowed = alternates()
+        if not borrowed:
+            return
+        with contextlib.ExitStack() as stack:
+            def directory(path, lifetime=stack):
+                remaining()
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                lifetime.callback(os.close, fd)
+                observed = os.fstat(fd)
+                def current():
+                    now = os.stat(path, follow_symlinks=False)
+                    require(stat.S_ISDIR(now.st_mode) and
+                            (now.st_dev, now.st_ino) == (observed.st_dev, observed.st_ino),
+                            "publication object directory changed during retention")
+                current()
+                lifetime.callback(current)
+                return fd
+
+            destination = directory(objects)
+
+            def retain(source_fd, destination_fd, name):
+                remaining()
+                before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                require(stat.S_ISREG(before.st_mode),
+                        "publication borrowed object is not a regular data file")
+                try:
+                    os.link(name, name, src_dir_fd=source_fd, dst_dir_fd=destination_fd,
+                            follow_symlinks=False)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    # A borrowed store can be on another volume. Preserve that
+                    # capability without recompression: copy only on EXDEV,
+                    # exclusively into our owned namespace, then run the same
+                    # exact-byte and source identity checks as for collisions.
+                    try:
+                        copied = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=destination_fd)
+                    except FileExistsError:
+                        pass
+                    else:
+                        with contextlib.ExitStack() as copying:
+                            copying.callback(os.close, copied)
+                            original = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd)
+                            copying.callback(os.close, original)
+                            original_stat = os.fstat(original)
+                            require(stat.S_ISREG(original_stat.st_mode) and
+                                    (original_stat.st_dev, original_stat.st_ino,
+                                     original_stat.st_size, original_stat.st_mtime_ns) ==
+                                    (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
+                                    "publication borrowed object changed before copying")
+                            while True:
+                                remaining()
+                                chunk = os.read(original, 1024 * 1024)
+                                if not chunk:
+                                    break
+                                pending = memoryview(chunk)
+                                while pending:
+                                    remaining()
+                                    written = os.write(copied, pending)
+                                    require(written > 0, "publication object copy made no progress")
+                                    pending = pending[written:]
+                            os.fchmod(copied, stat.S_IMODE(before.st_mode) & 0o666)
+                # Pin both files while comparing; a distinct existing file is
+                # accepted only when byte-identical. Never overwrite an object.
+                with contextlib.ExitStack() as files:
+                    def opened(parent):
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+                        files.callback(os.close, fd)
+                        observed = os.fstat(fd)
+                        require(stat.S_ISREG(observed.st_mode),
+                                "publication retained object is not a regular data file")
+                        return fd, observed
+                    src, src_stat = opened(source_fd)
+                    dst, dst_stat = opened(destination_fd)
+                    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+                    require(identity(src_stat) == identity(before),
+                            "publication borrowed object changed before retention")
+                    if (src_stat.st_dev, src_stat.st_ino) != (dst_stat.st_dev, dst_stat.st_ino):
+                        require(src_stat.st_size == dst_stat.st_size,
+                                "publication object data collision")
+                        def digest(fd):
+                            result = hashlib.sha256()
+                            while True:
+                                remaining()
+                                chunk = os.read(fd, 1024 * 1024)
+                                if not chunk:
+                                    return result.digest()
+                                result.update(chunk)
+                        require(digest(src) == digest(dst), "publication object data collision")
+                    require(identity(os.fstat(src)) == identity(src_stat) and
+                            identity(os.fstat(dst)) == identity(dst_stat) and
+                            identity(os.stat(name, dir_fd=source_fd, follow_symlinks=False)) == identity(src_stat) and
+                            identity(os.stat(name, dir_fd=destination_fd, follow_symlinks=False)) == identity(dst_stat),
+                            "publication object data changed during retention")
+
+            for raw in borrowed:
+                require(raw.startswith("/") and not any(ord(char) < 32 for char in raw),
+                        "publication alternate is not an unambiguous absolute object path")
+                source_path = Path(raw).resolve(strict=True)
+                with contextlib.ExitStack() as source_lifetime:
+                    source = directory(source_path, source_lifetime)
+                    for name in os.listdir(source):
+                        remaining()
+                        if name != "pack" and re.fullmatch(r"[0-9a-f]{2}", name) is None:
+                            continue
+                        with contextlib.ExitStack() as child_lifetime:
+                            source_child = directory(source_path / name, child_lifetime)
+                            try:
+                                os.mkdir(name, dir_fd=destination)
+                            except FileExistsError:
+                                pass
+                            destination_child = directory(objects / name, child_lifetime)
+                            pattern = (r"pack-[0-9a-f]{40}\.(?:pack|idx|rev|keep|bitmap|promisor|mtimes)"
+                                       if name == "pack" else r"[0-9a-f]{38}")
+                            for entry in os.listdir(source_child):
+                                remaining()
+                                if re.fullmatch(pattern, entry):
+                                    retain(source_child, destination_child, entry)
+            # Retire only the owned clone's borrowing pointer, after all data
+            # is owned. Native full-history/pack/hash/custody checks still run.
+            info = directory(objects / "info")
+            pointer = os.stat("alternates", dir_fd=info, follow_symlinks=False)
+            require(stat.S_ISREG(pointer.st_mode),
+                    "publication transport alternates pointer is not regular")
+            os.unlink("alternates", dir_fd=info)
+            require(not alternates(), "publication transport still borrows object directories")
+
     try:
         root = Path(root).resolve(strict=True)
         tree = source_tree(root)
         require(local(["-C", str(root), "cat-file", "-t", before], root) == "commit",
                 "publication destination is not an exact commit")
         local(["-C", str(root), "merge-base", "--is-ancestor", before, after], root)
+        require_history(root)
         with _source_transport("trust-land-publication-") as (directory, data, check_private):
             transport = data / "source.noindex"
-            local(["clone", "--quiet", "--shared", "--no-checkout", "--single-branch", "--no-tags",
+            local(["clone", "--quiet", "--local", "--no-checkout", "--single-branch", "--no-tags",
                    "--template=", "--", str(root), str(transport)], directory)
+            check_private()
+            retain_alternate_objects(transport)
             check_private()
             require(source_tree(transport) == tree, "publication transport tree differs from the qualified source")
             local(["-C", str(transport), "merge-base", "--is-ancestor", before, after], transport)
             require(source_tree(root) == tree, "publication source changed during transport preparation")
+            require_history(transport)
             request = data / "update.json"
             request.write_text(json.dumps([{"ref": MAIN_REF, "before": before, "after": after}]))
             native = _run(["agh", "repo", "push", repository, str(transport), "--input", str(request),

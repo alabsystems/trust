@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit local patch targets, external fabric consumers, and solver fanout.
+"""Audit patch targets, fabric consumers, solver fanout and codec retirement.
 
 Targo resolves one canonical workspace. There are no parallel workspace patch
 or membership tables to compare. These checks cover policies Cargo does not:
@@ -59,6 +59,8 @@ except ModuleNotFoundError:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
+import rust_lex
 
 MANIFESTS = {"root": REPO_ROOT / "Cargo.toml"}
 
@@ -79,6 +81,7 @@ LOCK_GIT_SOURCE_RE = re.compile(
 )
 
 FANOUT_POLICY_MANIFESTS = {
+    "root": REPO_ROOT / "Cargo.toml",
     "trust-coordinator": REPO_ROOT / "crates" / "trust-coordinator" / "Cargo.toml",
     "trust-file-lock": REPO_ROOT / "crates" / "trust-file-lock" / "Cargo.toml",
     "trust-rand": REPO_ROOT / "crates" / "trust-rand" / "Cargo.toml",
@@ -642,6 +645,37 @@ def dependency_is_declared(manifest: dict[str, Any], name: str) -> bool:
     return dependency_value(manifest, name) is not None
 
 
+def production_dependency_is_declared(
+    manifest: dict[str, Any], workspace: dict[str, Any], name: str
+) -> bool:
+    """Find normal/build dependencies, including target and package aliases.
+
+    Dev dependencies supply fixtures without adding a production backend.
+    Workspace aliases inherit their package identity from the workspace owner.
+    """
+    scopes = [manifest]
+    targets = manifest.get("target", {})
+    if isinstance(targets, dict):
+        scopes.extend(value for value in targets.values() if isinstance(value, dict))
+    inherited = workspace_table(workspace, "dependencies")
+    for scope in scopes:
+        for section in ("dependencies", "build-dependencies"):
+            dependencies = scope.get(section, {})
+            if not isinstance(dependencies, dict):
+                continue
+            for alias, declaration in dependencies.items():
+                identities = [alias]
+                if isinstance(declaration, dict):
+                    identities.append(declaration.get("package", alias))
+                    if declaration.get("workspace") is True:
+                        owner = inherited.get(alias, {})
+                        if isinstance(owner, dict):
+                            identities.append(owner.get("package", alias))
+                if name in identities:
+                    return True
+    return False
+
+
 def set_dependency_optional(manifest: dict[str, Any], name: str, optional: bool) -> None:
     dependencies = manifest.setdefault("dependencies", {})
     if not isinstance(dependencies, dict):
@@ -819,9 +853,11 @@ def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list
         )
     if feature_is_declared(trust_router, "trust-wp-backend"):
         errors.append("trust-router must not restore the retired parsed TrustWP backend feature")
-    if dependency_is_declared(trust_router, "trust-wp-core"):
+    if production_dependency_is_declared(
+        trust_router, manifests.get("root", {}), "trust-wp-core"
+    ):
         errors.append(
-            "trust-router must not restore the retired TrustWP backend dependency; "
+            "trust-router must not restore the retired TrustWP backend dependency in production; "
             "historical wire decoding belongs to the zero-capability trust-wp adapter"
         )
     for dep in ("ay", "ay-bindings"):
@@ -889,6 +925,248 @@ def check_wp_native_facade_retirement(
             errors.append(f"trust-wp facade {path} restores a retired native request/body API")
     return errors
 
+
+
+FORMULA_CODEC_PATHS = {
+    "trust-types": "crates/trust-types/src/trust_formula_v1.rs",
+    "trust-wp-core": "first-party/trust-wp/crates/trust-wp-core/src/verify_bundle/trust_formula.rs",
+}
+
+NATIVE_SP_SOURCE_PATH = "first-party/trust-wp/crates/trust-wp-lib/src/trust_ir_native.rs"
+
+
+def native_sp_source() -> str:
+    path = REPO_ROOT / NATIVE_SP_SOURCE_PATH
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def shared_formula_codec_inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    manifests, workspaces, sources = {}, {}, {}
+    for owner, source in FORMULA_CODEC_PATHS.items():
+        path = REPO_ROOT / source
+        manifest = path.parents[1] / "Cargo.toml" if owner == "trust-types" else path.parents[2] / "Cargo.toml"
+        workspace = REPO_ROOT if owner == "trust-types" else REPO_ROOT / "first-party/trust-wp"
+        # An absent submodule is missing evidence, not a successful retirement.
+        manifests[owner] = load_manifest(manifest) if manifest.is_file() else {}
+        workspaces[owner] = load_manifest(workspace / "Cargo.toml") if (workspace / "Cargo.toml").is_file() else {}
+        sources[owner] = path.read_text(encoding="utf-8") if path.is_file() else ""
+    return manifests, workspaces, sources
+
+
+def _production_rust(source: str) -> tuple[Any, str]:
+    lexed = rust_lex.lex(source)
+    code = list(lexed.code)
+    for start, end in lexed.test_spans:
+        code[start:end] = " " * (end - start)
+    return lexed, "".join(code)
+
+
+def check_native_sp_splitter_retirement(source: str) -> list[str]:
+    """Hold the two retired native SP raw-JSON splitter declarations.
+
+    Atom serialization and original-JSON pointer projection remain legitimate.
+    This checks exact known declarations, not arbitrary renamed implementations.
+    """
+    if not source.strip():
+        return ["trust-wp-lib native SP source is missing; splitter retirement cannot be checked"]
+    _, code = _production_rust(source)
+    retired = {"split_trust_formula_body", "flatten_trust_formula_conjunction"}
+    restored = sorted(set(re.findall(r"\bfn\s+(?:r#)?(\w+)\b", code)) & retired)
+    if restored:
+        return ["trust-wp-lib native SP restores retired raw JSON splitters: " + ", ".join(restored)]
+    return []
+
+
+def native_sp_splitter_self_check() -> list[str]:
+    source = native_sp_source()
+    baseline = check_native_sp_splitter_retirement(source)
+    if baseline:
+        return ["current native SP splitter retirement should pass: " + error for error in baseline]
+    failures: list[str] = []
+    for name in ("split_trust_formula_body", "flatten_trust_formula_conjunction"):
+        self_check_error_contains(
+            check_native_sp_splitter_retirement(source + f"\nfn {name}() {{}}"),
+            "retired raw JSON splitters", failures, f"native SP {name} reintroduction",
+        )
+    self_check_error_contains(
+        check_native_sp_splitter_retirement(""), "native SP source is missing",
+        failures, "native SP missing source",
+    )
+    return failures
+
+
+def _rust_imports(code: str) -> dict[str, str]:
+    """Expand bounded Rust use trees, retaining aliases and rejecting collisions."""
+    bindings: dict[str, str] = {}
+
+    def expand(tree: str, prefix: str = "") -> None:
+        if "{" in tree:
+            start = tree.index("{")
+            if not tree.rstrip().endswith("}"):
+                return
+            for child in split_top_level(tree[start + 1:tree.rfind("}")]):
+                expand(child.strip(), prefix + tree[:start])
+            return
+        parts = re.split(r"\s+as\s+", tree.strip())
+        if len(parts) > 2:
+            return
+        path = re.sub(r"\s+", "", prefix + parts[0]).lstrip(":")
+        if path.endswith("::self"):
+            path = path[:-6]
+        if not re.fullmatch(r"(?:r#)?\w+(?:::(?:r#)?\w+)*", path):
+            return
+        alias = parts[-1].strip() if len(parts) == 2 else path.split("::")[-1]
+        alias = alias[2:] if alias.startswith("r#") else alias
+        path = path.replace("r#", "")
+        bindings[alias] = path if alias not in bindings else ""
+
+    for statement in re.finditer(r"\buse\s+([^;]+);", code):
+        expand(statement.group(1))
+    return bindings
+
+
+def _rust_paths(code: str, imports: dict[str, str]) -> list[tuple[str, int, int]]:
+    paths = []
+    for match in re.finditer(r"\b(?:r#)?[A-Za-z_]\w*(?:\s*::\s*(?:r#)?[A-Za-z_]\w*)*", code):
+        path = re.sub(r"\s+", "", match.group()).replace("r#", "")
+        first, *rest = path.split("::")
+        if first in imports:
+            path = "::".join([imports[first], *rest])
+        paths.append((path, match.start(), match.end()))
+    return paths
+
+
+def _rust_function(code: str, name: str) -> str | None:
+    functions = list(re.finditer(r"\bfn\s+" + re.escape(name) + r"\s*\(", code))
+    if len(functions) != 1:
+        return None
+    start = code.find("{", functions[0].end())
+    if start < 0 or ";" in code[functions[0].end():start]:
+        return None
+    depth = 1
+    for end in range(start + 1, len(code)):
+        depth += (code[end] == "{") - (code[end] == "}")
+        if depth == 0:
+            return code[start + 1:end]
+    return None
+
+
+def check_shared_formula_codec(
+    manifests: dict[str, dict[str, Any]],
+    workspaces: dict[str, dict[str, Any]],
+    sources: dict[str, str],
+) -> list[str]:
+    """Hold the concrete shared-codec retirement in the two production adapters.
+
+    The IR leaf owns duplicate-key JSON and the typed wire grammar. Producers,
+    expression algebras and bounded serde entry policies remain local. This
+    lexical boundary does not prove the absence of arbitrary alternative decoders.
+    """
+    errors: list[str] = []
+    retired = {
+        "UniqueJsonValue", "UniqueJsonVisitor", "WireSort", "TrustFormulaV1Sort", "Binding",
+        "decode_expr", "decode_sort", "decode_binding", "decode_result_binding",
+        "decode_quantifier_expr", "decode_let_expr", "decode_bin_op", "decode_trust_formula_v1_sort",
+        "validate_arithmetic_free_trust_formula_v1", "validate_arithmetic_free_expr",
+        "validate_child_expr", "validate_binding", "required_name_and_sort",
+        "reject_unknown_fields",
+    }
+    entrypoints = {
+        "trust-types": ("canonical_arithmetic_free_trust_formula_v1_payload", "validate_value", "parse_unique_proof_json_payload"),
+        "trust-wp-core": ("decode_trust_formula_v1_declared_claim_and_value", "decode_value", "parse_unique_json"),
+    }
+    for owner, (entry, delegate, parser) in entrypoints.items():
+        manifest = manifests.get(owner, {})
+        workspace = workspace_table(workspaces.get(owner, {}), "dependencies")
+        dependencies = []
+        for alias, declaration in manifest.get("dependencies", {}).items():
+            inherited = workspace.get(alias, {})
+            package = inherited.get("package", alias) if isinstance(inherited, dict) else alias
+            if package == "trust-ir-contract" or alias == "trust-ir-contract":
+                dependencies.append((alias, declaration, inherited, package))
+        if len(dependencies) != 1:
+            errors.append(f"{owner} codec requires one normal workspace trust-ir-contract dependency with proof-json")
+            crate = "trust_ir_contract"
+        else:
+            alias, declaration, inherited, package = dependencies[0]
+            features = set(declaration.get("features", [])) if isinstance(declaration, dict) else set()
+            if isinstance(inherited, dict):
+                features.update(inherited.get("features", []))
+            if (not isinstance(declaration, dict) or declaration.get("workspace") is not True
+                    or declaration.get("optional") is True or package != "trust-ir-contract"
+                    or not isinstance(inherited, dict) or inherited.get("optional") is True
+                    or set(declaration) - {"workspace", "features", "default-features", "optional"}
+                    or "proof-json" not in features):
+                errors.append(f"{owner} codec requires a nonoptional normal workspace trust-ir-contract dependency with proof-json")
+            crate = alias.replace("-", "_")
+        source = sources.get(owner, "")
+        if not source:
+            errors.append(f"{owner} production codec source is missing")
+            continue
+        lexed, code = _production_rust(source)
+        imports = _rust_imports(code)
+        restored = sorted(set(re.findall(r"\b(?:struct|enum|type|fn)\s+(?:r#)?(\w+)", code)) & retired)
+        if restored:
+            errors.append(f"{owner} codec restores retired local grammar: {', '.join(restored)}")
+        # Strings/comments cannot manufacture a delegation or a declaration.
+        # Inspect actual literal positions only for the former Value.get keys.
+        if any(not lexed.in_test(start) and re.search(r"\.\s*get\s*\(\s*&?\s*$", code[:start])
+               for start, _end, _value in lexed.strings):
+            errors.append(f"{owner} codec restores raw JSON field reads; use the shared typed grammar")
+        canonical = crate + "::"
+        aliases = {name for name, path in imports.items() if path.startswith(canonical)} | {crate}
+        if any(re.search(r"\b(?:mod|struct|enum|type|fn|const|static|let)\s+(?:r#)?" + re.escape(name) + r"\b", code)
+               for name in aliases):
+            errors.append(f"{owner} codec shadows a canonical owner import")
+        body = _rust_function(code, entry)
+        body_paths = _rust_paths(body or "", imports)
+        expected = canonical + "trust_formula_v1::" + delegate
+        calls = [end for path, _start, end in body_paths if path == expected
+                 and re.match(r"\s*(?:::<[^;{}]*>)?\s*\(", (body or "")[end:])]
+        if body is None or not calls:
+            errors.append(f"{owner} {entry} must delegate to trust-ir-contract {delegate}")
+        if owner == "trust-wp-core":
+            wrapper = _rust_function(code, "decode_trust_formula_v1_declared_claim")
+            if wrapper is None or not re.search(r"\bdecode_trust_formula_v1_declared_claim_and_value\s*\(", wrapper):
+                errors.append("trust-wp-core declared claim wrapper must delegate to the shared decoded-value entrypoint")
+        policy = "CanonicalArithmeticFree" if owner == "trust-types" else "NativeReplay"
+        if not any(path == canonical + "trust_formula_v1::DecodePolicy::" + policy for path, _, _ in body_paths):
+            errors.append(f"{owner} {entry} must select canonical DecodePolicy::{policy}")
+        parse_body = _rust_function(code, parser)
+        unique = canonical + "proof_json::UniqueJsonValue"
+        reads_unique = any(
+            (path == unique + "::deserialize" and re.match(r"\s*\(", (parse_body or "")[end:]))
+            or (path == unique and re.search(r"\bfrom_str_deep\s*::\s*<\s*$", (parse_body or "")[:start])
+                and re.match(r"\s*>\s*\(", (parse_body or "")[end:]))
+            for path, start, end in _rust_paths(parse_body or "", imports)
+        )
+        if parse_body is None or not reads_unique:
+            errors.append(f"{owner} {parser} must parse with canonical proof_json::UniqueJsonValue")
+    return errors
+
+
+def shared_formula_codec_self_check() -> list[str]:
+    manifests, workspaces, sources = shared_formula_codec_inputs()
+    baseline = check_shared_formula_codec(manifests, workspaces, sources)
+    if baseline:
+        return ["current shared formula codec should pass: " + error for error in baseline]
+    failures: list[str] = []
+    for owner in FORMULA_CODEC_PATHS:
+        for text, expected in (
+            ("\nstruct UniqueJsonVisitor;", "retired local grammar"),
+            ('\nfn old_codec() { value.get("body"); }', "raw JSON field reads"),
+        ):
+            self_check_error_contains(
+                check_shared_formula_codec(manifests, workspaces, {**sources, owner: sources[owner] + text}),
+                expected, failures, f"{owner} shared codec reintroduction",
+            )
+        case = copy.deepcopy(manifests)
+        case[owner]["dev-dependencies"] = case[owner].pop("dependencies", {})
+        self_check_error_contains(
+            check_shared_formula_codec(case, workspaces, sources),
+            "normal workspace trust-ir-contract dependency", failures, f"{owner} shared codec test-only dependency",
+        )
+    return failures
 
 
 def check_shared_integer_bounds(manifest: dict[str, Any], source: str) -> list[str]:
@@ -1227,6 +1505,33 @@ def run_self_check() -> list[str]:
     )
 
     case = copy.deepcopy(fanout_manifests)
+    case["trust-router"].setdefault("dev-dependencies", {})["trust-wp-core"] = {
+        "path": "../../first-party/trust-wp/crates/trust-wp-core"
+    }
+    if check_dependency_fanout_policy(case):
+        failures.append("trust-router test-only core fixture must preserve fanout policy")
+
+    for section, target in (
+        ("dependencies", None), ("build-dependencies", None),
+        ("dependencies", "cfg(unix)"), ("build-dependencies", "cfg(unix)"),
+    ):
+        for alias in ("trust-wp-core", "retired-wp"):
+            case = copy.deepcopy(fanout_manifests)
+            scope = case["trust-router"]
+            if target is not None:
+                scope = scope.setdefault("target", {}).setdefault(target, {})
+            declaration = {"version": "1", "optional": True}
+            if alias != "trust-wp-core":
+                declaration["package"] = "trust-wp-core"
+            scope.setdefault(section, {})[alias] = declaration
+            self_check_error_contains(
+                check_dependency_fanout_policy(case),
+                "trust-router must not restore the retired TrustWP backend dependency",
+                failures,
+                f"trust-router retired core {section} target={target} alias={alias}",
+            )
+
+    case = copy.deepcopy(fanout_manifests)
     set_dependency_optional(case["trust-types"], "ay-bindings", False)
     self_check_error_contains(
         check_dependency_fanout_policy(case),
@@ -1259,6 +1564,8 @@ def run_self_check() -> list[str]:
         )
 
     failures.extend(wp_retirement_self_check())
+    failures.extend(shared_formula_codec_self_check())
+    failures.extend(native_sp_splitter_self_check())
     failures.extend(shared_integer_bounds_self_check())
 
     return failures
@@ -1429,11 +1736,15 @@ def main() -> int:
     wp_retirement_errors = check_wp_native_facade_retirement(
         fanout_manifests["trust-wp"], local_patch_manifests["root"], wp_facade_sources()
     )
+    formula_codec_errors = check_shared_formula_codec(*shared_formula_codec_inputs())
+    native_sp_errors = check_native_sp_splitter_retirement(native_sp_source())
     integer_bound_errors = check_shared_integer_bounds(
         load_manifest(REPO_ROOT / "crates/trust-vcgen/Cargo.toml"),
         (REPO_ROOT / "crates/trust-vcgen/src/range.rs").read_text(encoding="utf-8"),
     )
     errors = [
+        *formula_codec_errors,
+        *native_sp_errors,
         *integer_bound_errors,
         *local_patch_errors,
         *fabric_boundary_errors,
@@ -1454,7 +1765,7 @@ def main() -> int:
 
     print(
         "Cargo manifest alignment, local patch integrity, temporal fabric boundary, "
-        "and dependency fanout policy check passed."
+        "dependency fanout policy, and shared formula codec retirement check passed."
     )
     return 0
 

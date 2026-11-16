@@ -51,6 +51,7 @@ fn pkgconf_fixture(root: &Path, retarget: bool) -> (PathBuf, PathBuf, PathBuf) {
              --variable=libdir) printf '%s\\n' {};;\n\
              --path) printf '%s\\n' {};;\n\
              --modversion) printf '%s\\n' 1.5.7;;\n\
+             --libs) printf '%s\\n' {};;\n\
              --libs-only-l) printf '%s\\n' -lzstd;;\n\
              --libs-only-other) printf '\\n';;\n\
              --libs-only-L) printf '%s\\n' {};;\n\
@@ -58,6 +59,7 @@ fn pkgconf_fixture(root: &Path, retarget: bool) -> (PathBuf, PathBuf, PathBuf) {
              *) exit 9;;\nesac\n",
             quote(&library_directory),
             quote(&metadata_directory.join("libzstd.pc")),
+            shlex::try_quote(&format!("-L{} -lzstd", library_directory.display())).unwrap(),
             shlex::try_quote(&format!("-L{}", library_directory.display())).unwrap(),
             quote(&include),
         )

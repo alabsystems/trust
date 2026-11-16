@@ -29,7 +29,7 @@
    downstream is reached, which is the fail-closed behaviour this row pins. -/
 
 def span_fits_isl (d : UInt32) : Bool :=
-  Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 63)
+  @Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 63)
                    (Nat.decLt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 63)
 
 theorem depth_carrier_iff (d : UInt32) :

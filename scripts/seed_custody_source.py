@@ -264,6 +264,87 @@ class _PendingObservedExecution:
 
 
 class BoundSourceLoader:
+    def _seed_surface_check(self, deadline):
+        if time.monotonic() >= deadline:
+            raise ValueError('seed surface DATA original endpoint expired')
+        # Like _preparation_fd, include the captured loader entry itself. It
+        # does not occur in executed merely because it constructed this object.
+        for relative in ('scripts/seed_custody_source.py', 'scripts/mint_seed_support.py',
+                         'src/bootstrap/stage0_identity.py'):
+            if hashlib.sha256(regular_bytes(self.root / relative)).hexdigest() != self.expected[relative]:
+                raise ValueError('original seed surface source changed: ' + relative)
+        self.recheck()
+        if time.monotonic() >= deadline:
+            raise ValueError('seed surface DATA original endpoint expired')
+
+    def _seed_surface_helper(self, deadline):
+        paths = {'scripts/seed_custody_source.py', 'scripts/mint_seed_support.py',
+                 'src/bootstrap/stage0_identity.py'}
+        if (self._captured is None or self.extra_sources
+                or self.expected.keys() != paths or self._captured.keys() != paths):
+            raise ValueError('seed surface DATA requires its complete fixed captured graph')
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or not time.monotonic() < deadline <= time.monotonic() + 900):
+            raise ValueError('seed surface DATA needs its original bounded endpoint')
+        self._seed_surface_check(deadline)
+        return self.module('trust_native_seed_surface',
+                           self.root / 'scripts/mint_seed_support.py')
+
+    def seed_loader_plan_from_capture(self, *, deadline):
+        """Canonical loader selector DATA; never native command/Seed authority."""
+        helper = self._seed_surface_helper(deadline)
+        try:
+            self._seed_surface_check(deadline)
+            return helper.native_seed_loader_plan()
+        finally:
+            self._seed_surface_check(deadline)
+
+    def seed_surface_data_from_capture(self, seed, version, host, observations,
+                                       selected_loader, loader_observations, *, deadline):
+        """Ordinary whole Darwin surface DATA after actual native closures.
+
+        The native issuer still owns every actual original input, selected
+        command/search read-set, closed probe, producer and final EOF/ACK. A
+        successful-looking surface, path or saved result creates none of them.
+        """
+        helper = self._seed_surface_helper(deadline)
+        try:
+            self._seed_surface_check(deadline)
+            return helper.native_seed_surface_data(seed, version, host, observations,
+                                                   selected_loader, loader_observations)
+        finally:
+            # As for canonical extraction, retain semantic failure and expose
+            # postcheck drift through the ordinary Python exception chain.
+            self._seed_surface_check(deadline)
+
+    def seed_static_probe_data_from_capture(self, seed, version, host, observations, *, deadline):
+        """Reuse ordinary seed prechecks and fixed probe parsing; return DATA only.
+
+        The native owner must supply the SAME four actually closed probes and
+        retain the complete source, seed, loader, cache, producer and original
+        endpoint owners through closure. This partial result supplies no ELF
+        runtime/loader evidence, final tree fingerprint, full seed surface,
+        Seed/SDK or READY. In particular it never invokes the Linux ELF loader.
+        """
+        paths = {'scripts/seed_custody_source.py', 'scripts/mint_seed_support.py',
+                 'src/bootstrap/stage0_identity.py'}
+        if (self._captured is None or self.extra_sources
+                or self.expected.keys() != paths or self._captured.keys() != paths):
+            raise ValueError('seed validation DATA requires its complete fixed captured graph')
+        if (type(deadline) not in (int, float) or not math.isfinite(deadline)
+                or not time.monotonic() < deadline <= time.monotonic() + 900):
+            raise ValueError('seed validation DATA needs its original bounded endpoint')
+        helper = self.module('trust_native_seed_static_probe',
+                             self.root / 'scripts/mint_seed_support.py')
+        version = helper.canonical_version_value(version)
+        host = helper.canonical_host(host)
+        static = helper.seed_static_data(seed)
+        probes = helper.native_seed_probe_data(seed, version, host, observations)
+        self.recheck()
+        if time.monotonic() >= deadline:
+            raise ValueError('seed validation DATA original endpoint expired')
+        return static | probes
+
     def select_seed_archives_from_capture(self, raw, host, *, deadline):
         """Execute the maintained parser/Bootstrap selection on retained DATA.
 

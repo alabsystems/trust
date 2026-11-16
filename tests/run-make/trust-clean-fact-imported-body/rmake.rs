@@ -12,7 +12,7 @@ const ISLANDS: &str = r#"
 clean {
     theorem tg6_u64_le_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 
 clean {
@@ -26,7 +26,7 @@ clean {
                     d (fun _ => b) (fun _ => a))) (UInt64.toNat a))
             (instDecidableUInt64Lt a b)
             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat a) (UInt64.toNat b)) h)
-            (fun h => Nat.le.refl (UInt64.toNat a))
+            (fun h => @Nat.le.refl (UInt64.toNat a))
 }
 "#;
 

@@ -44,16 +44,16 @@ clean {
 
     theorem bv64_le_refl : forall (x : BitVec 64),
         Nat.le (BitVec.toNat x) (BitVec.toNat x) :=
-        fun x => Nat.le.refl (BitVec.toNat x)
+        fun x => @Nat.le.refl (BitVec.toNat x)
 
     theorem u32_ge_refl : forall (x : UInt32),
         Nat.le (UInt32.toNat x) (UInt32.toNat x) :=
-        fun x => Nat.le.refl (UInt32.toNat x)
+        fun x => @Nat.le.refl (UInt32.toNat x)
 
     theorem i64_le_refl : forall (x : BitVec 64),
         Nat.le (Nat.xor (BitVec.toNat x) 9223372036854775808)
                (Nat.xor (BitVec.toNat x) 9223372036854775808) :=
-        fun x => Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)
+        fun x => @Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)
 }
 
 pub fn wrong_carrier(n: usize) -> usize

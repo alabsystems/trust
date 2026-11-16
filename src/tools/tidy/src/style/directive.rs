@@ -67,6 +67,13 @@ configurable_checks!(
     #[dont_check_unused]
     linelength => LINELENGTH_CHECK,
 
+    // Trust: no check reads this since 6262f4f761 removed the file-length check,
+    // but upstream sources carry `ignore-tidy-file-filelength`, so it stays a
+    // recognized directive. We deliberately do not warn about this being
+    // unnecessary, that would just lead to annoying churn.
+    #[dont_check_unused]
+    filelength => "filelength",
+
     // ignore tidy for this entire file
     #[dont_check_unused]
     all => "all",

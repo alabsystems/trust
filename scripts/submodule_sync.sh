@@ -264,6 +264,19 @@ REMOTE_PINS_OUT=""
 ANCHORED_OUT=0
 ANCHOR_NOTE_OUT="-"
 
+# scripts/lib/github_source_transport.py owns GitHub URL selection and Agh refs.
+github_source() {
+  local python
+  for python in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$python" >/dev/null 2>&1; then
+      "$python" -B "$SCRIPT_DIR/lib/github_source_transport.py" "$@"
+      return $?
+    fi
+  done
+  echo 'submodule_sync: Python is required to select source transport' >&2
+  return 2
+}
+
 remote_pins_for() { # <moddir> <remote-name> <url> -> REMOTE_PINS_OUT
   # Cached per remote URL per run: several modules share a forge, and the cost
   # this function exists to control is the round trip, not the parsing.
@@ -281,9 +294,16 @@ remote_pins_for() { # <moddir> <remote-name> <url> -> REMOTE_PINS_OUT
     out="$NET_UNREACHABLE"
   else
     [ -z "${SUBMODULE_SYNC_TRACE_NET:-}" ] || echo "net: ls-remote $url" >&2
-    out="$(net_git -C "$moddir" ls-remote --refs "$name" 'refs/pins/*' 2>/dev/null \
-           | awk 'NF >= 2 { print $1, $2 }')"
-    rc=$?
+    local repository transport_rc
+    repository="$(github_source repository "$url")"; transport_rc=$?
+    if [ "$transport_rc" -eq 0 ]; then
+      out="$(github_source pins "$url" --timeout "$NET_TIMEOUT")"; rc=$?
+    elif [ "$transport_rc" -eq 1 ]; then
+      out="$(net_git -C "$moddir" ls-remote --refs "$name" 'refs/pins/*' 2>/dev/null \
+             | awk 'NF >= 2 { print $1, $2 }')"; rc=$?
+    else
+      out=""; rc=2
+    fi
     # Fail CLOSED. A remote that cannot be read is not a remote that said yes.
     [ "$rc" -eq 0 ] || out="$NET_UNREACHABLE"
   fi
@@ -401,6 +421,14 @@ fetch_pin() { # <moddir> <pin> <display> [missing|refetch]
     return 1
   fi
   rname="${pair%% *}"; rurl="${pair#* }"
+  local repository transport_rc
+  repository="$(github_source repository "$rurl")"; transport_rc=$?
+  if [ "$transport_rc" -eq 0 ]; then
+    repair_incomplete_pin "$moddir" "$pin" "$display"
+    return $?
+  elif [ "$transport_rc" -ne 1 ]; then
+    return 1
+  fi
   if [ "$mode" = refetch ]; then
     [ -z "${SUBMODULE_SYNC_TRACE_NET:-}" ] || echo "net: refetch $rurl $pin" >&2
     # Negotiation can assume a locally present commit includes its ancestors.
@@ -464,7 +492,9 @@ repair_incomplete_pin() { # <moddir> <pin> <display>; explicit --fetch only
   rurl="${pair#* }"
   # The maintained provider validates the full canonical URL. Other transports
   # retain their existing local behavior; none is a fallback from Agh refusal.
-  case "$rurl" in https://github.com/*) ;; *) return 1 ;; esac
+  local repository
+  repository="$(github_source repository "$rurl")" || return 1
+  rurl="https://github.com/$repository.git"
   key="${moddir}${TAB}${pin}"
   while [ "$i" -lt "${#FETCH_FAILED_KEYS[@]}" ]; do
     [ "${FETCH_FAILED_KEYS[$i]}" != "$key" ] || return 1
@@ -761,6 +791,27 @@ scan_modules() {
 }
 
 scan_modules || exit $?
+
+materialize_source_witnesses() {
+  # Explicit --fetch also restores tiny, indexed historical source witnesses.
+  # The default diagnostic remains read-only; this owner imports object DATA,
+  # never a ref/checkout or a substitute for the unchanged bridge validator.
+  [ "$FETCH" -eq 1 ] || return 0
+  [ -n "$(git -C "$ROOT" ls-files -- data/bridge-source-witnesses)" ] || return 0
+  local python
+  for python in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$python" >/dev/null 2>&1; then
+      "$python" -B "$SCRIPT_DIR/recreate_bootstrap.py" materialize-source-witnesses --root "$ROOT" >&2
+      return $?
+    fi
+  done
+  echo "submodule_sync: Python unavailable for exact bridge source DATA restoration" >&2
+  return 3
+}
+
+if [ "$RC" -eq 0 ]; then
+  materialize_source_witnesses || exit $?
+fi
 
 restore_cmd_for() {
   # One explicit path per invocation, run from the module's own parent. No bare
@@ -1171,7 +1222,10 @@ do_restore() {
     echo "Run scripts/submodule_sync.sh for the per-module reasoning."
     rc=2
   fi
-  [ "$rc" -ne 0 ] || emit_quiet
+  if [ "$rc" -eq 0 ]; then
+    materialize_source_witnesses || exit $?
+    emit_quiet
+  fi
   exit "$rc"
 }
 

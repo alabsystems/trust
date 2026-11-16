@@ -1,4 +1,4 @@
-"""Pure producer-input tests: no compiler, x.py, proof or native code executes."""
+"""Producer-input tests; real children are Python-only transport fixtures."""
 from __future__ import annotations
 
 import hashlib
@@ -107,6 +107,110 @@ class BootstrapXpyEnvironmentTests(unittest.TestCase):
         # This does not expand strict provenance's ambient-authority allowlist.
         self.assertIn("TRUST_BUILD_TREE_MANAGER_TARGO",
                       bootstrap._ambient_build_authority_overrides(ambient))
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX descriptor transport")
+    def test_actual_python_child_keeps_matching_resource_values_and_live_descriptors(self):
+        reader, writer = os.pipe()
+        unrelated, unrelated_writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        self.addCleanup(os.close, writer)
+        self.addCleanup(os.close, unrelated)
+        self.addCleanup(os.close, unrelated_writer)
+        os.set_inheritable(unrelated, True)
+        output = self.root / "observed-resource-transport.json"
+        (self.root / "x.py").write_text(
+            "import json,os\nfrom pathlib import Path\n"
+            "names=json.loads(os.environ['PROBE_NAMES'])\n"
+            "observed={name:os.environ[name] for name in names}\n"
+            "observed['identities']={fd:[os.fstat(int(fd)).st_dev,os.fstat(int(fd)).st_ino] "
+            "for fd in json.loads(os.environ['PROBE_FDS'])}\n"
+            "try: os.fstat(int(os.environ['PROBE_UNRELATED_FD']))\n"
+            "except OSError: observed['unrelated_closed']=True\n"
+            "else: observed['unrelated_closed']=False\n"
+            "observed['authority_scrubbed']=not any(name in os.environ for name in "
+            "('RUSTC','RUSTFLAGS','TRUST_NO_VERIFY','CARGO_BUILD_RUSTC','SDKROOT','DEVELOPER_DIR'))\n"
+            "Path(os.environ['PROBE_OUTPUT']).write_text(json.dumps(observed))\n"
+        )
+        for fixed in (str(reader), "requires-live-ancestor-v1"):
+            with self.subTest(fixed=fixed):
+                transport = {
+                    "ATERM_SDK_LEASE_V3": str(reader),
+                    "ATERM_WORKLOAD_HOST_STORE_FD_V1": str(reader),
+                    "ATERM_WORKLOAD_CPU_FDS_V1": f"{reader},{writer}",
+                    "BUILD_SLOT_FENCE_FDS": str(reader),
+                    "TRUST_CPU_IMPLICIT_FD": str(reader),
+                    "TRUST_CPU_HANDOFF": "opaque-original-python-fixture-data",
+                    "TRUST_FIXED_ADMISSION_FD_V1": fixed,
+                    "TRUST_FIXED_CLAIM_HANDOFF_V1": "opaque-original-fixed-fixture-data",
+                    "CARGO_MAKEFLAGS": f"-j --jobserver-auth={reader},{writer}",
+                    "CARGO_JOBSERVER_HANDOFF": "opaque-original-descendant-fixture-data",
+                    # A present CARGO_MAKEFLAGS takes precedence; neither lower
+                    # advertisement may be inspected or substituted for it.
+                    "MAKEFLAGS": "--jobserver-auth=ignored,lower-priority",
+                    "MFLAGS": "--jobserver-fds=also,ignored",
+                }
+                environment = {
+                    **transport, "BUILD_SLOT_HELD": "1", "CARGO_BUILD_JOBS": "1",
+                    "PROBE_NAMES": json.dumps(list(transport)),
+                    "PROBE_FDS": json.dumps([str(reader), str(writer)]),
+                    "PROBE_UNRELATED_FD": str(unrelated), "PROBE_OUTPUT": str(output),
+                    "RUSTC": "/unselected/compiler", "RUSTFLAGS": "hostile",
+                    "TRUST_NO_VERIFY": "unselected", "CARGO_BUILD_RUSTC": "/other/compiler",
+                    "SDKROOT": "/unselected/sdk", "DEVELOPER_DIR": "/unselected/developer",
+                }
+                with patch.dict(os.environ, environment, clear=True), \
+                        patch.object(bootstrap, "add_homebrew_library_path"), \
+                        patch.object(bootstrap, "seed_verification_off_switch", return_value="flag"):
+                    self.assertEqual(bootstrap.run_xpy_build(
+                        self.root, "test-host", 1, 1, [], seed_mode=True,
+                        clean_lean=self.selection, normal_config=self.config_identity()), 0)
+                observed = json.loads(output.read_text())
+                self.assertEqual({name: observed[name] for name in transport}, transport)
+                self.assertEqual(observed["identities"], {
+                    str(fd): [os.fstat(fd).st_dev, os.fstat(fd).st_ino] for fd in (reader, writer)})
+                self.assertTrue(observed["unrelated_closed"])
+                self.assertTrue(observed["authority_scrubbed"])
+                # Normal resource forwarding does not relax Stage2 provenance.
+                self.assertTrue(set(transport) & set(
+                    bootstrap._ambient_build_authority_overrides(environment)))
+
+    def test_malformed_or_closed_resource_locators_refuse_before_child(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        os.close(writer)
+        cases = [
+            {"TRUST_CPU_IMPLICIT_FD": str(reader)},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "not-a-descriptor"},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1"},
+            {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1",
+             "TRUST_FIXED_CLAIM_HANDOFF_V1": ""},
+            {"CARGO_MAKEFLAGS": "--jobserver-auth=malformed"},
+            {"BUILD_SLOT_FENCE_FDS": "3,3"},
+            {"ATERM_SDK_LEASE_V3": "not-a-descriptor"},
+        ]
+        for environment in cases:
+            with self.subTest(environment=environment), self.contexts(environment):
+                with self.assertRaisesRegex(RuntimeError, "row custody"):
+                    bootstrap.run_xpy_build(self.root, "test-host", 1, 1, [], seed_mode=True)
+        self.assertEqual(self.calls, [])
+
+    def test_selected_gnu_advertisement_does_not_resurrect_lower_priority_flags(self):
+        environment = {"CARGO_MAKEFLAGS": "", "MAKEFLAGS": "--jobserver-auth=malformed"}
+        with self.contexts(environment):
+            self.assertEqual(bootstrap.run_xpy_build(
+                self.root, "test-host", 1, 1, [], seed_mode=True), 0)
+        self.assertEqual(self.calls[0][1]["CARGO_MAKEFLAGS"], "")
+        self.assertEqual(self.calls[0][1]["MAKEFLAGS"], environment["MAKEFLAGS"])
+
+    def test_original_gnu_descendant_handoff_remains_with_its_advertisement(self):
+        environment = {"CARGO_MAKEFLAGS": "", "CARGO_JOBSERVER_HANDOFF": "opaque-original-fixture"}
+        with self.contexts(environment):
+            self.assertEqual(bootstrap.run_xpy_build(
+                self.root, "test-host", 1, 1, [], seed_mode=True), 0)
+        self.assertEqual(self.calls[0][1].get("CARGO_JOBSERVER_HANDOFF"),
+                         environment["CARGO_JOBSERVER_HANDOFF"])
+        self.assertIn("CARGO_JOBSERVER_HANDOFF",
+                      bootstrap._ambient_build_authority_overrides(environment))
 
     def test_undeclared_or_conflicting_clean_environment_refuses_before_child(self):
         for selection, environment in [

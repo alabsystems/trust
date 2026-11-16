@@ -172,6 +172,11 @@ pub mod clean_fact;
 pub mod clean_island;
 pub mod clean_island_batch;
 
+/// One row per declaration of a crate's `clean { … }` islands, keyed as a
+/// `.lean` declaration is (PKG-LIVE-2): what the compiler publishes as
+/// `trust_types::TransportMessage::CleanIslandRows`.
+pub mod clean_island_rows;
+
 /// Invocation-local reuse of an immutable, exactly bound checked island environment.
 pub mod clean_island_environment;
 

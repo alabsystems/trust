@@ -46,12 +46,17 @@ pub mod qualification_command;
 mod shared_dependencies;
 // Trust: compiler-declared managed cache ownership, separate from proof transport.
 mod build_config;
+// Trust: DC-12a, the receipt a successful build keeps of the units it used.
+mod build_receipt;
+// Trust: DC-12b, the incremental folders a build directory keeps.
+mod incremental_trim;
 pub(crate) mod build_context;
 pub(crate) mod build_runner;
 mod compilation;
 mod compile_kind;
 mod crate_type;
 mod custom_build;
+mod post_build_compiler;
 mod rustc_command_context;
 pub(crate) mod trust_witness_cleanup;
 // Trust: deterministic evidence identities over the resolved dependency graph.

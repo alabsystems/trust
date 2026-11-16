@@ -24,7 +24,10 @@ fn invalid(why: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
 }
 
+mod configuration_observer;
 mod file_offer;
+mod input;
+pub use configuration_observer::ConfigurationInputObserver;
 #[cfg(test)]
 mod tests;
 pub use file_offer::{HeldSourceFileOffer, RefusedSourceFileOffer};

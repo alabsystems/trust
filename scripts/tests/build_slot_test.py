@@ -106,6 +106,9 @@ loader.exec_module(gate)
 if os.environ.get("FIXTURE_IGNORE_SIGCHLD"):
     import signal
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+if os.environ.get("FIXTURE_IGNORE_SIGTERM"):
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if "FIXTURE_GATE_REEXEC" in os.environ:
     gate._REEXEC = [sys.executable, "-I", "-B", "-c",
                     os.environ["FIXTURE_GATE_REEXEC"], sys.argv[1]]
@@ -354,6 +357,138 @@ class PrivateAdmissionTests(unittest.TestCase):
             process, marker = self.spawn("--cpus", "14", env={"TARGO_CALLER_JOBS": "3"})
             self.assertEqual(self.started(process, marker)["jobs"], "3")
             self.finish(process)
+
+    def test_execution_notice_waits_for_real_admission_and_names_original_child(self):
+        holder, held_marker = self.spawn('--slots', '1')
+        self.started(holder, held_marker)
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        try:
+            child, marker = self.spawn('--slots', '1', '--execution-start-fd', str(writer),
+                                       pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        self.waiting(child, marker, 'waiting')
+        self.assertEqual(select.select([reader], [], [], 0)[0], [])
+        before_us = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+        self.finish(holder)
+        row = self.started(child, marker)
+        self.assertTrue(select.select([reader], [], [], 5)[0])
+        message = os.read(reader, 18)
+        self.assertEqual(len(message), 17)
+        self.assertEqual(message[:9], b'S' + row['pid'].to_bytes(8, 'big'))
+        started_us = int.from_bytes(message[9:], 'big')
+        self.assertGreaterEqual(started_us, before_us)
+        self.assertLessEqual(started_us, time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000)
+        self.finish(child)
+        self.assertEqual(os.read(reader, 1), b'')
+
+    def test_execution_notice_writer_never_reaches_the_payload(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        code = """import json,os,sys
+try:
+    os.fstat(int(sys.argv[1]))
+    inherited = True
+except OSError:
+    inherited = False
+print(json.dumps({'pid':os.getpid(),'inherited':inherited}))
+"""
+        try:
+            result = self.invoke('--execution-start-fd', str(writer), '--',
+                                 sys.executable, '-I', '-B', '-c', code, str(writer),
+                                 pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)
+        self.assertFalse(row['inherited'])
+        message = os.read(reader, 18)
+        self.assertEqual(len(message), 17)
+        self.assertEqual(message[:9], b'S' + row['pid'].to_bytes(8, 'big'))
+
+    def test_execution_notice_rejects_a_nonpipe_before_admission_or_child(self):
+        with open(self.root / 'not-a-pipe', 'wb') as output:
+            result = self.invoke('--execution-start-fd', str(output.fileno()), '--',
+                                 sys.executable, '-c', 'raise SystemExit(91)',
+                                 pass_fds=(output.fileno(),))
+        # This fixture imports main directly, before the installed CLI's
+        # NamespaceError-to-exit-2 adapter; the payload's exit 91 must not run.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b'original nonblocking writable pipe', result.stderr)
+        self.assertFalse(self.pool.exists())
+
+    def test_closed_execution_notice_receiver_retires_the_original_child(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        os.set_blocking(writer, False)
+        try:
+            process, _ = self.spawn('--slots', '1', '--execution-start-fd', str(writer),
+                                    pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        _, stderr = process.communicate(b'x', timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        self.assertIn(b'execution-start notification refused', stderr)
+        # A live original child would retain its slot. The next real child
+        # cannot start until the failed observer's group has actually drained.
+        next_child, next_marker = self.spawn('--slots', '1')
+        self.started(next_child, next_marker)
+        self.finish(next_child)
+
+    def test_closed_execution_notice_receiver_retires_a_child_ignoring_term(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        os.set_blocking(writer, False)
+        try:
+            process, _ = self.spawn('--slots', '1', '--execution-start-fd', str(writer),
+                                    env={'FIXTURE_IGNORE_SIGTERM': '1'}, pass_fds=(writer,))
+        finally:
+            os.close(writer)
+        # Keep stdin open: the child inherits SIG_IGN and cannot finish its
+        # blocking read naturally. TERM alone would retain the claim forever.
+        self.assertEqual(process.wait(timeout=5), 2)
+        _, stderr = process.communicate(timeout=5)
+        self.assertIn(b'execution-start notification refused', stderr)
+        next_child, next_marker = self.spawn('--slots', '1')
+        self.started(next_child, next_marker)
+        self.finish(next_child)
+
+    def test_execution_notice_rejects_a_duplicate_of_original_gnu_transport(self):
+        environment, passed, _ = self.resource_fixture()
+        writer = int(environment['CARGO_MAKEFLAGS'].rsplit(',', 1)[1])
+        alias = os.dup(writer)
+        os.set_blocking(alias, False)
+        try:
+            result = self.invoke('--execution-start-fd', str(alias), '--',
+                                 sys.executable, '-c', 'raise SystemExit(91)',
+                                 env=environment, pass_fds=(*passed, alias))
+        finally:
+            os.close(alias)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b'aliases original scheduling transport', result.stderr)
+        self.assertFalse(self.pool.exists())
+
+    def test_execution_notice_preserves_distinct_original_gnu_transport(self):
+        environment, passed, _ = self.resource_fixture()
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        try:
+            result = self.invoke('--execution-start-fd', str(writer), '--',
+                                 sys.executable, '-I', '-B', '-c', RESOURCE_PROBE,
+                                 env=environment, pass_fds=(*passed, writer))
+        finally:
+            os.close(writer)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed['missing'], [])
+        self.assertFalse(observed['undeclared'])
+        notice = os.read(reader, 18)
+        self.assertEqual(len(notice), 17)
+        self.assertEqual(notice[:1], b'S')
 
     def invoke(self, *arguments, env=None, cwd=None, pass_fds=()):
         return subprocess.run(

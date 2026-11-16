@@ -177,6 +177,13 @@ def setUpModule():
     )
     managed.start()
     unittest.addModuleCleanup(managed.stop)
+    # Nor ask the installed package which targo it holds.
+    selected = mock.patch.object(
+        land_gate.native_checkout, "selected_executable",
+        side_effect=land_gate.native_checkout.Unavailable("synthetic gate fixture has no installed native reader"),
+        create=True)
+    selected.start()
+    unittest.addModuleCleanup(selected.stop)
 
 
 def load_crates_lane():
@@ -374,7 +381,7 @@ FIXTURE_GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMI
 # handed closed keeps a gate run's pool from starting (_CheckoutWorkers.start).
 ADVERTISED_DESCRIPTORS = ("ATERM_SDK_LEASE_V3", "ATERM_WORKLOAD_HOST_STORE_FD_V1", "TRUST_CPU_IMPLICIT_FD",
                           "ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS", "CARGO_MAKEFLAGS", "MAKEFLAGS",
-                          "MFLAGS")
+                          "MFLAGS", "TRUST_FIXED_ADMISSION_FD_V1")
 
 
 def make_repo(root: Path, files=FILES, symlinks=None) -> str:
@@ -3021,6 +3028,149 @@ class DoctestReaderReviewFourTests(unittest.TestCase):
         self.assertTrue([b for b in blind if "a doc read with every line code" in b[2]], blind)
 
 
+class ScannedBeforeAttributeSourceTests(unittest.TestCase):
+    """LAND-IR-READER-GAPS-1: which files the escape scan read before
+    LAND-GATE-EW1-FOLLOWUP-REVIEW-3 (land_select._scanned_before, `git grep
+    -I`) is told from the judged commit alone. Its `binary` and `-diff` marks
+    came from an untracked .gitattributes, $GIT_COMMON_DIR/info/attributes and
+    the global attributes file (core.attributesFile, or the XDG default), and a
+    diff driver's `binary` setting from the clone's or the user's config, so
+    state no commit holds added or dropped a file's test-only evidence. Each
+    uncommitted channel below changes the answer on 46a6408ff56f; the
+    committed marks are the controls and hold on both."""
+
+    D = "crates/p"
+    TEST_ONLY = "crates/p/src/t.rs"  # only helper.rs's #[cfg(test)] path attribute names it
+
+    def repo(self, extra=None):
+        files = {"Cargo.toml": f'[workspace]\nmembers = ["{self.D}"]\n',
+                 f"{self.D}/Cargo.toml": '[package]\nname = "p"\n',
+                 f"{self.D}/src/lib.rs": "mod helper;\n",
+                 f"{self.D}/src/helper.rs": '#[cfg(test)]\n#[path = "t.rs"]\nmod t;\n',
+                 self.TEST_ONLY: "pub fn t() {}\n"}
+        files.update(extra or {})
+        tmp = tempfile.TemporaryDirectory(prefix="land-attr-source.")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        return root, make_repo(root, files, {})
+
+    def evidence(self, root, rev, env=None):
+        """Whether the scan takes TEST_ONLY's test-only evidence from helper.rs."""
+        with mock.patch.object(ls, "SCAN_CACHE", None), mock.patch.dict(os.environ, env or {}):
+            graph = ls.build_graph(ls.TreeIndex.load(str(root), rev))
+        return self.TEST_ONLY in graph.test_path_modules
+
+    def git_path(self, root, name):
+        return Path(subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-path", name],
+                                   check=True, capture_output=True, text=True).stdout.strip())
+
+    def test_the_committed_marks_decide(self):
+        root, rev = self.repo()
+        self.assertTrue(self.evidence(root, rev), "helper.rs is text: its evidence is taken")
+        for name, extra in (("a root -diff", {".gitattributes": "*.rs -diff\n"}),
+                            ("a nested binary", {f"{self.D}/src/.gitattributes": "helper.rs binary\n"}),
+                            ("a NUL", {f"{self.D}/src/helper.rs": '// \0\n#[cfg(test)]\n#[path = "t.rs"]\nmod t;\n'})):
+            with self.subTest(name):
+                root, rev = self.repo(extra)
+                self.assertFalse(self.evidence(root, rev), "a file the commit marks binary was never scanned")
+        with self.subTest("no isolated query"):
+            # An object directory git cannot name gives no isolated query, and
+            # a failed query (a git without --attr-source) no answer: no
+            # test-only evidence, never the clone's own attributes.
+            root, rev = self.repo()
+            with mock.patch.object(ls, "_committed_attribute_git", lambda g, git_dir: None):
+                self.assertFalse(self.evidence(root, rev))
+
+    def test_an_untracked_attributes_file_marks_nothing(self):
+        for where in (".gitattributes", f"{self.D}/.gitattributes", f"{self.D}/src/.gitattributes"):
+            with self.subTest(where):
+                root, rev = self.repo()
+                (root / where).write_text("*.rs -diff\n")
+                self.assertTrue(self.evidence(root, rev))
+
+    def test_the_clones_info_attributes_marks_nothing(self):
+        root, rev = self.repo()
+        info = self.git_path(root, "info/attributes")
+        info.parent.mkdir(parents=True, exist_ok=True)
+        info.write_text("*.rs binary\n")
+        self.assertTrue(self.evidence(root, rev))
+
+    def test_the_global_attributes_file_marks_nothing(self):
+        root, rev = self.repo()
+        home = root.parent / (root.name + ".home")
+        home.mkdir()
+        self.addCleanup(shutil.rmtree, home, True)
+        marks = home / "marks"
+        marks.write_text("*.rs -diff\n")
+        config = home / "gitconfig"
+        config.write_text(f"[core]\n\tattributesFile = {marks}\n")
+        (home / "xdg/git").mkdir(parents=True)
+        (home / "xdg/git/attributes").write_text("*.rs -diff\n")
+        for name, env in (("core.attributesFile", {"GIT_CONFIG_GLOBAL": str(config)}),
+                          ("the XDG default", {"GIT_CONFIG_GLOBAL": os.devnull, "XDG_CONFIG_HOME": str(home / "xdg")})):
+            with self.subTest(name):
+                self.assertTrue(self.evidence(root, rev, env))
+
+    def test_no_configured_diff_driver_unmarks_a_nul(self):
+        # A committed `diff=txt` names a driver no commit defines: a
+        # `diff.txt.binary = false` in the clone's or the user's config made
+        # git grep -I read the NUL file as text, adding evidence.
+        nul = '// \0\n#[cfg(test)]\n#[path = "t.rs"]\nmod t;\n'
+        for where in ("clone", "global"):
+            with self.subTest(where):
+                root, rev = self.repo({f"{self.D}/src/helper.rs": nul, ".gitattributes": "*.rs diff=txt\n"})
+                env = {}
+                if where == "clone":
+                    subprocess.run(["git", "-C", str(root), "config", "diff.txt.binary", "false"], check=True)
+                else:
+                    config = root.parent / (root.name + ".gitconfig")
+                    config.write_text("[diff \"txt\"]\n\tbinary = false\n")
+                    self.addCleanup(config.unlink)
+                    env = {"GIT_CONFIG_GLOBAL": str(config)}
+                self.assertFalse(self.evidence(root, rev, env))
+
+    def test_marks_a_case_folding_checkout_honours_count(self):
+        # Review of d034e8e620dd: a clean checkout on the landing host (APFS,
+        # core.ignorecase=true) honours each of these committed marks, but the
+        # isolated query matched patterns case-sensitively and read only the
+        # exact name `.gitattributes` in the exact directory, so it took
+        # helper.rs's evidence. The last case needs both settings: only a
+        # case-insensitive match takes the mark back. The clone's own
+        # core.ignorecase changes nothing.
+        git = lambda root, *args, **kw: subprocess.run(["git", "-C", str(root), *args], check=True,
+                                                       capture_output=True, text=True,
+                                                       env=dict(os.environ, **FIXTURE_GIT_ENV), **kw).stdout.strip()
+        for name, extra in (("a pattern in another case", {f"{self.D}/src/.gitattributes": "HELPER.RS -diff\n"}),
+                            ("an attributes file named in another case",
+                             {f"{self.D}/src/.GitAttributes": "helper.rs -diff\n"}),
+                            ("a mark only a case-insensitive match takes back",
+                             {".gitattributes": "*.rs -diff\nHelper.rs diff\n"})):
+            for ignorecase in ("true", "false"):
+                with self.subTest(name, ignorecase=ignorecase):
+                    root, rev = self.repo(extra)
+                    git(root, "config", "core.ignorecase", ignorecase)
+                    self.assertFalse(self.evidence(root, rev))
+        with self.subTest("an attributes file in a directory spelled in another case"):
+            root, _rev = self.repo()
+            oid = git(root, "hash-object", "-w", "--stdin", input="helper.rs -diff\n")
+            git(root, "-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo",
+                f"100644,{oid},{self.D}/Src/.gitattributes")
+            git(root, "commit", "-qm", "a second spelling of src")
+            self.assertFalse(self.evidence(root, git(root, "rev-parse", "HEAD")))
+        with self.subTest("an attributes file that is a link"):
+            # A checkout reads no .gitattributes through a link; the tree
+            # query reads the link's text. Neither is taken: no evidence.
+            root, _rev = self.repo({f"{self.D}/src/marks": "helper.rs -diff\n"})
+            oid = git(root, "hash-object", "-w", "--stdin", input="marks")
+            git(root, "update-index", "--add", "--cacheinfo", f"120000,{oid},{self.D}/src/.gitattributes")
+            git(root, "commit", "-qm", "a linked attributes file")
+            self.assertFalse(self.evidence(root, git(root, "rev-parse", "HEAD")))
+        with self.subTest("control: another case beside, not above, the file"):
+            root, rev = self.repo({"crates/q/.GitAttributes": "*.rs -diff\n",
+                                   f"{self.D}/.gitattributes": "*.txt -diff\n"})
+            self.assertTrue(self.evidence(root, rev))
+
+
 class ScanRepairReviewThreeTests(unittest.TestCase):
     """LAND-GATE-EW1-FOLLOWUP-REVIEW-3, the scan repairs. Every git grep of the
     selector skipped a file git takes for binary (-I: a NUL, which trustc
@@ -5023,6 +5173,152 @@ class ValidationDependencyTests(unittest.TestCase):
         self.assertEqual(ls.land_rows_coverage(table, [*tracked, "scripts/tests/sub/zz_test.py",
                                                        "scripts/tests/zz_helper.py", "tests/zz_test.py",
                                                        "x/scripts/tests/zz_test.py"]), [])
+
+    # The second reader of the table is `targo trust land --check`
+    # (targo-trust/src/land/). This file holds the cases both readers answer:
+    # every expected value in it is this selector's, recomputed here, and
+    # targo-trust/src/land/tests.rs asserts the Rust reader's is the same.
+    SELECT_CASES = "targo-trust/tests/fixtures/land_select_cases.json"
+
+    @staticmethod
+    def row_ids(modules):
+        return ["validation." + module.removeprefix("scripts.tests.") for module in modules]
+
+    def test_the_conformance_cases_of_the_two_table_readers_are_this_selectors_answers(self):
+        cases = json.loads((REPO / self.SELECT_CASES).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(cases), ["base_table", "coverage", "covered_match", "covered_match_paths",
+                                         "python_whitespace", "real_table", "schema", "tables", "what"])
+        self.assertEqual(cases["schema"], "trust.land-select-cases.v1")
+        moved = "{}: the selector's answer, to put in " + self.SELECT_CASES + ":\n{}"
+
+        # The real table. The instrument: the cases select something, and they
+        # hold each kind of selecting path (a subject, a program, the table,
+        # its reader, a manifest, this file) and paths that select nothing.
+        real = {case["name"]: case for case in cases["real_table"]}
+        self.assertEqual(len(real), len(cases["real_table"]))
+        self.assertGreaterEqual(len(real), 20)
+        for name, case in real.items():
+            with self.subTest(real_table=name):
+                self.assertEqual(sorted(case), ["changed", "name", "rows"])
+                answer = self.row_ids(ls.validation_test_modules(case["changed"]))
+                self.assertEqual(case["rows"], answer, moved.format(name, json.dumps(answer, indent=1)))
+        self.assertEqual(real["an empty change"]["rows"], [])
+        self.assertEqual(real["an unmapped path"]["rows"], [])
+        self.assertEqual(real["a Cargo.toml in another letter case"]["rows"],
+                         ["validation.mir_test_oracle_feature_test"])
+        self.assertEqual(real["names that only resemble Cargo.toml"]["rows"], [])
+        self.assertIn("validation.land_gate_test", real["the table itself"]["rows"])
+        self.assertEqual(real["the table itself"]["rows"], real["the table's Python reader"]["rows"])
+        self.assertEqual(real["this fixture"]["changed"], [self.SELECT_CASES])
+        self.assertIn("validation.land_gate_test", real["this fixture"]["rows"])
+        self.assertGreater(len(real["a validation program"]["rows"]), 0)
+
+        # Small tables: one edit of a base table each, accepted or refused.
+        base = cases["base_table"]
+        accepted = refused = selections = 0
+        names = set()
+        for case in cases["tables"]:
+            with self.subTest(table=case["name"]):
+                self.assertNotIn(case["name"], names)
+                names.add(case["name"])
+                text = base
+                for old, new in case["edits"]:
+                    self.assertEqual(text.count(old), 1, old)
+                    text = text.replace(old, new)
+                self.assertEqual(text == base, not case["edits"])
+                try:
+                    table, error = ls.parse_land_rows(text), None
+                except ls.LandRowsError as exc:
+                    table, error = None, str(exc)
+                if not case["accepted"]:
+                    self.assertEqual(sorted(case), ["accepted", "edits", "name", "says"])
+                    self.assertIsNone(table, "the selector accepts this table")
+                    self.assertTrue(case["says"])
+                    self.assertIn(case["says"], error)
+                    refused += 1
+                    continue
+                self.assertEqual(sorted(case), ["accepted", "edits", "name", "select"])
+                self.assertIsNone(error)
+                accepted += 1
+                with mock.patch.object(ls, "VALIDATION_PROGRAM_TESTS", table.program_tests), \
+                        mock.patch.object(ls, "VALIDATION_TEST_SUBJECTS", table.test_subjects):
+                    for selection in case["select"]:
+                        answer = self.row_ids(ls.validation_test_modules(selection["changed"]))
+                        self.assertEqual(selection["rows"], answer,
+                                         moved.format(selection["changed"], json.dumps(answer)))
+                        selections += 1
+        self.assertGreaterEqual(accepted, 15)
+        self.assertGreaterEqual(refused, 57)
+        self.assertGreaterEqual(selections, 30)
+
+        # The `covered` rule, asked of the base table.
+        table = ls.parse_land_rows(base)
+        reported = 0
+        for case in cases["coverage"]:
+            with self.subTest(coverage=case["name"]):
+                answer = ls.land_rows_coverage(table, case["tracked"])
+                self.assertEqual(case["problems"], answer, moved.format(case["name"], json.dumps(answer, indent=1)))
+                reported += bool(answer)
+        self.assertGreaterEqual(reported, 3)
+        self.assertIn([], [case["problems"] for case in cases["coverage"]])
+
+        # A `covered` pattern, component by component.
+        paths = cases["covered_match_paths"]
+        matched = 0
+        for case in cases["covered_match"]:
+            with self.subTest(pattern=case["pattern"]):
+                answer = [path for path in paths if ls._covered_match(path, case["pattern"])]
+                self.assertEqual(case["matches"], answer, moved.format(case["pattern"], json.dumps(answer)))
+                matched += len(answer)
+        self.assertGreaterEqual(len(cases["covered_match"]), 20)
+        self.assertGreater(matched, 0)
+        self.assertIn([], [case["matches"] for case in cases["covered_match"]])
+        # The cases hold the bracket classes the Rust reader once read as they
+        # are written: fnmatch drops a range whose ends are out of order, with
+        # both its ends, before anything says whether the class is negated. So
+        # these are "not x", "any one character" and "neither - nor z".
+        answers = {case["pattern"]: case["matches"] for case in cases["covered_match"]}
+        self.assertEqual(len(answers), len(cases["covered_match"]))
+        for pattern, matched_paths, other_paths in (("[b-a!x]", ["q", "!"], ["x"]),
+                                                    ("[z-a!]", ["q", "x", "!"], ["", "ab"]),
+                                                    ("[b-a!-z]", ["q", "!"], ["-", "z"]),
+                                                    ("[b-a]", [], ["a", "b", "!"])):
+            with self.subTest(reversed_range=pattern):
+                for path in matched_paths + other_paths:
+                    self.assertIn(path, paths)
+                self.assertLessEqual(set(matched_paths), set(answers[pattern]))
+                self.assertFalse(set(other_paths) & set(answers[pattern]))
+
+        # What `str.strip` strips: a blank `catches`, `why` or path is one made
+        # of these and nothing else.
+        self.assertEqual(cases["python_whitespace"],
+                         [point for point in range(0x110000)
+                          if not 0xD800 <= point <= 0xDFFF and not chr(point).strip()])
+
+    def test_a_changed_manifest_is_named_in_ascii_in_either_letter_case(self):
+        # The Rust selector compares a changed path's last component with
+        # `cargo.toml` ignoring ASCII case; this one folds the whole path first
+        # (NFD, then casefold). The two agree on every path when no character
+        # outside ASCII folds to nothing, to a `/`, or to letters of that name
+        # alone, and when ASCII folds to its own lower case. Every code point:
+        letters = set("cargo.toml")
+        for point in range(0x110000):
+            if 0xD800 <= point <= 0xDFFF:
+                continue
+            folded = ls.fold(chr(point))
+            if point < 0x80:
+                self.assertEqual(folded, chr(point).lower(), hex(point))
+            else:
+                self.assertNotIn("/", folded, hex(point))
+                self.assertFalse(set(folded) <= letters, hex(point))
+        # The instrument: the fold does move characters outside ASCII into
+        # ASCII (KELVIN SIGN to k), and into a letter of the name with a mark
+        # the comparison then sees (LATIN SMALL LETTER C WITH ACUTE).
+        self.assertEqual(ls.fold("K"), "k")
+        self.assertEqual(ls.fold("ć"), "ć")
+        selects = ["scripts.tests.mir_test_oracle_feature_test"]
+        self.assertEqual(ls.validation_test_modules(["a/CARGO.toml"]), selects)
+        self.assertEqual(ls.validation_test_modules(["a/ćargo.toml", "a/Cargo.toml/b", "Cargo.tom"]), [])
 
     # What a `catches` may not be. A floor the tree is held to, not the field's
     # meaning (the defect the row exists to catch), which no pattern can judge.
@@ -10406,7 +10702,8 @@ class TcbRatchetReadTests(unittest.TestCase):
         # the pinned programs' directory alone.
         self.assertEqual(env, {
             "PATH": f"{sealed}/bin", "LC_ALL": "C", "LANG": "C",
-            "HOME": f"{sealed}/home", "TMPDIR": f"{sealed}/tmp", "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": f"{sealed}/home", "TMPDIR": f"{sealed}/tmp", "PYTHONPYCACHEPREFIX": f"{sealed}/pycache",
+            "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_LAZY_FETCH": "1", "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "false",
@@ -12875,12 +13172,16 @@ class DiscoverySnapshotTests(unittest.TestCase):
         new_code, new_tables, new_aliases = land_gate._selection_owner_data(added)
         self.assertEqual(old_code, new_code)
         # No alias is declared or resolved: the five paths that shared one tuple
-        # literal (BUILD_SLOT_VALIDATION_TESTS) each decode to it, in its order.
+        # literal (BUILD_SLOT_VALIDATION_TESTS) each decode to it, in its order;
+        # scripts/build-slot alone also runs qualify_targo_resource_test, whose
+        # qualifier executes build-slot's decoder (ef753b9eef36).
         self.assertEqual((aliases, new_aliases), ({}, {}))
         shared = ("scripts.tests.build_slot_test", "scripts.tests.build_slot_quiet_test",
                   "scripts.tests.build_slot_recovery_test", "scripts.tests.build_slot_cpu_bridge_test",
                   "scripts.tests.check_bootstrap_script_tests_test")
-        for path in ("scripts/build-slot", "scripts/tests/build_slot_test.py",
+        self.assertEqual(old_tables["VALIDATION_PROGRAM_TESTS"]["scripts/build-slot"],
+                         (*shared, "scripts.tests.qualify_targo_resource_test"))
+        for path in ("scripts/tests/build_slot_test.py",
                      "scripts/tests/build_slot_cpu_bridge_test.py", "scripts/tests/build_slot_quiet_test.py",
                      "scripts/tests/build_slot_recovery_test.py"):
             self.assertEqual(old_tables["VALIDATION_PROGRAM_TESTS"][path], shared, path)
@@ -20323,7 +20624,9 @@ class ScalerTests(unittest.TestCase):
                 # Exercise the owned-child interface instead of an iterator-only
                 # mock that cannot represent a waitable PID or pipe descriptor.
                 with mock.patch.object(land_gate.subprocess, "Popen", side_effect=fixture_leg_process) as spawn:
-                    self.assertEqual(land_gate._run_one(l, ["targo", "test"], io.StringIO(), {}, (1, 2), Path("logs")), 0)
+                    logs = Path(tempfile.mkdtemp(prefix="logs."))
+                    self.addCleanup(shutil.rmtree, logs, ignore_errors=True)
+                    self.assertEqual(land_gate._run_one(l, ["targo", "test"], io.StringIO(), {}, (1, 2), logs), 0)
                 env = selected_spawn_call(spawn).kwargs["env"]
                 self.assertEqual(env["RUST_TEST_THREADS"], "7")
                 self.assertEqual(env["RAYON_NUM_THREADS"], "2")
@@ -22018,8 +22321,9 @@ MUTANTS = [
     ("a program that is not a native executable is keyed",
      lambda: _m_source(land_gate, "_native_executable", "if magic not in NATIVE_MAGIC:", "if False:")),
     ("a sealed leg's process inherits the caller's environment",
-     lambda: _m_source(land_gate, "sealed_launch", "env = sealed_environment(str(home), str(tmpdir), str(bindir))",
-                       "env = {**os.environ, **sealed_environment(str(home), str(tmpdir), str(bindir))}")),
+     lambda: _m_source(land_gate, "sealed_launch",
+                       "env = sealed_environment(str(home), str(tmpdir), str(bindir), str(pycache))",
+                       "env = {**os.environ, **sealed_environment(str(home), str(tmpdir), str(bindir), str(pycache))}")),
     ("a sealed leg's PATH is the caller's",
      lambda: _m_source(land_gate, "sealed_environment", '"PATH": bindir, ', '"PATH": os.environ.get("PATH", ""), ')),
     ("a sealed leg's PATH holds the system directories after its pinned programs",
@@ -22051,6 +22355,30 @@ MUTANTS = [
      lambda: _m_source(land_gate, "sealed_environment", '"GIT_CONFIG_GLOBAL": "/dev/null",', "")),
     ("a sealed leg's git follows replace refs",
      lambda: _m_source(land_gate, "sealed_environment", '"GIT_NO_REPLACE_OBJECTS": "1", ', "")),
+    ("a sealed leg's Python reads the checkout's compiled modules",
+     lambda: _m_source(land_gate, "sealed_environment", "PYCACHE_ENV: pycache, ", "")),
+    ("a leg's Python reads the checkout's compiled modules",
+     lambda: _m_source(land_gate, "_run_one", "    env[PYCACHE_ENV] = str(pycache)\n", "")),
+    ("a leg's compiled Python is kept in the run directory",
+     lambda: _m_source(land_gate, "_run_one", "        shutil.rmtree(pycache, ignore_errors=True)\n", "        pass\n")),
+    ("a push row's Python reads the checkout's compiled modules",
+     lambda: _m_source(land_gate, "_run_row", "    child_env[PYCACHE_ENV] = str(fresh_pycache(log.parent, row.id))\n", "")),
+    ("the targo probe compiles Python under the key's placeholder",
+     lambda: _m_source(land_gate, "targo_unready", "leg_environment(leg, pycache=Path(pycache))", "leg_environment(leg)")),
+    ("run makes the checkout binding's pipe before checking the advertised descriptors",
+     lambda: _m_source(land_gate, "_run_unsealed", "    row_resource_fds(env)\n    handed, digest", "    handed, digest")),
+    ("push-rows takes run's checkout binding without the planned HEAD",
+     lambda: _m_source(land_gate, "cmd_push_rows", 'if not getattr(args, "expect_head", None):', "if False:")),
+    ("run hands push-rows its checkout binding without a planned HEAD",
+     lambda: _m_source(land_gate, "push_rows_leg", "checkout_handoff=bool(landing.head)", "checkout_handoff=True")),
+    ("run files push-rows' exit without its report of run's token",
+     lambda: _m_source(land_gate, "_run_unsealed", "    if not re.search(", "    if False and re.search(")),
+    ("the native reader's answer is stored under a replaced targo's key",
+     lambda: _m_source(land_gate, "remember_native_unavailable",
+                       "        if native_reader_key(dict(os.environ)) != key:\n            return\n", "")),
+    ("push rows share one compiled-Python directory",
+     lambda: _m_source(land_gate, "_run_row", "str(fresh_pycache(log.parent, row.id))",
+                       "str(log.parent / 'pycache')", ("    shell = Path", "    (log.parent / 'pycache').mkdir(exist_ok=True)\n    shell = Path"))),
 ] + [(f"the TCB ratchet leaves {name} unpinned",
       (lambda name=name: patched(land_gate, "TCB_RATCHET_PROGRAMS",
                                  tuple(p for p in land_gate.TCB_RATCHET_PROGRAMS if p != name))))
@@ -23285,15 +23613,64 @@ MUTANTS = [
     ("tracked bytecode stands for no module",
      lambda: _m_source(land_gate, "ir_diagnostic_import_shadowed", 'if _ir_fold(base) == "__pycache__":', "if False:")),
     ("a gitlink is no package",
-     lambda: _m_source(land_gate, "ir_diagnostic_import_shadowed", 'fields[1] not in ("tree", "commit")',
-                       'fields[1] not in ("tree",)')),
+     lambda: _m_source(land_gate, "ir_diagnostic_import_shadowed", 'fields[1] in ("tree", "commit")',
+                       'fields[1] in ("tree",)')),
     ("a reader's name shadows only in its own directory",
      lambda: _m_source(land_gate, "ir_diagnostic_import_shadowed", "(stem in readers and path not in readers[stem])",
                        "(stem in readers and path not in readers[stem] and directory in "
                        "{r.rpartition('/')[0] for r in readers[stem]})")),
     ("the standard library is the names Python lists",
-     lambda: patched(land_gate, "ir_diagnostic_standard_modules",
+     lambda: patched(land_gate, "python_standard_modules",
                      lambda: frozenset(land_gate._ir_fold(n) for n in sys.stdlib_module_names))),
+    # LAND-GATE-PY-SHADOW-1: PythonImportShadowTests.
+    ("the checkout pass reads no Python import directory",
+     lambda: _m_source(land_gate, "_tracked_checkout_walk",
+                       "        problem = python_import_problem(repo, committed, label, label == \".\")\n"
+                       "        if problem:\n            return problem\n", "")),
+    ("an untracked entry shadows no module",
+     lambda: _m_source(land_gate, "python_import_problem", "if stem is not None and stem in names:", "if False:")),
+    ("an untracked directory is no package",
+     lambda: _m_source(land_gate, "python_import_problem", "package = os.path.isdir(here / name)", "package = False")),
+    ("a shared import directory counts only its own names",
+     lambda: _m_source(land_gate, "python_import_problem",
+                       "names = standard | (shared_names if directory in shared else tracked_names(directory))",
+                       "names = standard | tracked_names(directory)")),
+    ("an untracked entry never shadows the standard library",
+     lambda: _m_source(land_gate, "python_import_problem", "standard = python_standard_modules() | PACKAGE_MODULES",
+                       "standard = PACKAGE_MODULES")),
+    ("an untracked __init__ shadows nothing",
+     lambda: patched(land_gate, "PACKAGE_MODULES", frozenset())),
+    ("untracked names compare as spelled",
+     lambda: _m_source(land_gate, "python_import_problem", "stem = importable_name(name, package)",
+                       "stem = importable_name(name, package) if name == name.lower() else None")),
+    ("an extension module is no module", lambda: patched(land_gate, "IMPORT_SUFFIX", re.compile(r"pyw?|pyc"))),
+    ("sourceless bytecode is no module",
+     lambda: patched(land_gate, "IMPORT_SUFFIX", re.compile(r"pyw?|(?:.*\.)?(?:so|pyd)"))),
+    ("the root is no import directory", lambda: patched(land_gate, "PYTHON_SHARED_ROOTS", ("src/bootstrap",))),
+    ("compiled Python in the checkout is never read", lambda: patched(land_gate, "bytecode_problem", lambda *a: None)),
+    ("bytecode under the source's header is never compared",
+     lambda: _m_source(land_gate, "bytecode_problem", "    return None if same else", "    return None if True else")),
+    ("constants compare by value alone",
+     lambda: _m_source(land_gate, "same_code", "    if type(held) is not type(compiled):\n        return False\n", "")),
+    ("a source-hash header is never compared",
+     lambda: _m_source(land_gate, "bytecode_problem", "if not flags & 0b1 and data[8:16] != stamp:",
+                       "if data[8:16] != stamp:")),
+    ("another interpreter's bytecode is ignored",
+     lambda: _m_source(land_gate, "bytecode_problem", "if len(data) >= 12 and (", "if False and (")),
+    ("bytecode names compare as spelled",
+     lambda: _m_source(land_gate, "_bytecode_source", "    name = _ir_fold(name)\n", "")),
+    ("a slice constant compares by ==",
+     lambda: _m_source(land_gate, "same_code", "    if isinstance(held, slice):\n", "    if False:\n")),
+    ("the standard library is the gate interpreter's alone",
+     lambda: patched(land_gate, "python_interpreters", lambda: [])),
+    ("optimized bytecode belongs to no source",
+     lambda: _m_source(land_gate, "_bytecode_source", 'parts[1] in ("opt-1", "opt-2")', "False")),
+    ("the ordinary push compiles Python in the checkout",
+     lambda: _m_source(land_gate, "ordinary_push", "dict(git_query_env(), **{PYCACHE_ENV: str(pycache)})",
+                       "git_query_env()")),
+    ("the ordinary push's compiled Python is kept",
+     lambda: _m_source(land_gate, "ordinary_push", "        shutil.rmtree(pycache, ignore_errors=True)\n",
+                       "        pass\n")),
     ("a spaced bare parameter is none",
      lambda: patched(ls, "BARE_PARAM_ARG", ls.re.compile(r'\s*\$(?:r#)?' + ls.IDENT + r'\s*,?\s*[)\]}]'))),
     ("a rename's `use` is looked for in the 2000 characters before it",
@@ -26027,6 +26404,460 @@ class CheckoutBindingTests(unittest.TestCase):
                     self.assertIn("tracked inputs changed", land_gate.checkout_problem(planned, root))
 
 
+class CompiledPythonOutsideTreeTests(unittest.TestCase):
+    """Every Python process a leg or push row starts compiles into a fresh
+    directory the gate made (PYCACHE_ENV), never the checkout's __pycache__.
+    `-B` stops only writes: Python runs a __pycache__/*.pyc whose header (the
+    source's mtime and size) matches whatever code it holds, so a leg that
+    left one beside a tracked module made a later leg run code no commit
+    holds while every tracked byte, all a checkout pass reads, still matched."""
+
+    VAR = "PYTHONPYCACHEPREFIX"
+    PROBE = (
+        "import sys; sys.path.insert(0, 'scripts/lib'); import probe; print('VALUE=' + probe.VALUE)")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="pycache-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / "checkout"
+        lib = self.root / "scripts" / "lib"
+        lib.mkdir(parents=True)
+        source = lib / "probe.py"
+        source.write_text('VALUE = "committed"\n', encoding="utf-8")
+        # A .pyc of other code under the header Python checks the source by.
+        st = source.stat()
+        code = compile('VALUE = "planted"\n', str(source), "exec")
+        planted = lib / "__pycache__" / f"probe.{sys.implementation.cache_tag}.pyc"
+        planted.parent.mkdir()
+        planted.write_bytes(importlib._bootstrap_external._code_to_timestamp_pyc(
+            code, int(st.st_mtime), st.st_size))
+        self.planted = planted
+        self.env = {k: v for k, v in os.environ.items() if k != self.VAR}
+        # The fixture is live: Python run as before reads the planted bytecode.
+        shown = subprocess.run([sys.executable, "-B", "-c", self.PROBE], cwd=self.root, env=self.env,
+                               capture_output=True, text=True, check=True).stdout
+        self.assertEqual(shown, "VALUE=planted\n")
+
+    def test_a_leg_that_imports_a_module_runs_its_committed_source(self):
+        probe = leg(id="probe-leg", command=[sys.executable, "-B", "-c", self.PROBE], inputs=[])
+        # A caller's prefix (one naming a tree the caller filled among them) is not taken.
+        for n, caller in enumerate((self.env, dict(self.env, **{self.VAR: str(self.root / "elsewhere")}))):
+            with self.subTest(caller=caller.get(self.VAR)):
+                run_dir = self.tmp / f"run{n}"
+                run_dir.mkdir()
+                with mock.patch.dict(os.environ, caller, clear=True), \
+                        mock.patch.object(land_gate, "REPO_ROOT", self.root), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    rc, _secs, log, _prep = land_gate.run_leg(probe, run_dir, {}, (1, 2))
+                text = Path(log).read_text(encoding="utf-8")
+                self.assertIn("VALUE=committed", text)
+                self.assertNotIn("VALUE=planted", text)
+                self.assertEqual(rc, 0, text)
+                self.assertFalse((self.root / "elsewhere").exists())
+                self.assertTrue((run_dir / "pycache").is_dir(), "made under the run's directory")
+
+    def test_a_legs_directory_is_fresh_and_removed_once_it_exits(self):
+        # Review of the after-leg branch: a leg run without -B filled its
+        # directory on every run, and nothing removed old runs' directories.
+        # The leg's process names its prefix and compiles into it.
+        show = ("import os, sys; sys.path.insert(0, 'scripts/lib'); import probe; "
+                "print('PREFIX=' + sys.pycache_prefix); print('FILLED', len(list(os.walk(sys.pycache_prefix))) > 1)")
+        probe = leg(id="probe-leg", command=[sys.executable, "-c", show], inputs=[])
+        run_dir = self.tmp / "run"
+        run_dir.mkdir()
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(land_gate, "REPO_ROOT", self.root), contextlib.redirect_stdout(io.StringIO()):
+            rc, _secs, log, _prep = land_gate.run_leg(probe, run_dir, {}, (1, 2))
+        text = Path(log).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0, text)
+        prefix = Path(re.search(r"^PREFIX=(.*)$", text, re.M).group(1))
+        self.assertIn("FILLED True", text, "the control: the leg compiled into its prefix")
+        self.assertEqual(prefix.parent, run_dir / "pycache")
+        self.assertTrue(prefix.name.startswith("probe-leg."))
+        self.assertFalse(prefix.exists(), "removed once the leg exited")
+
+    def test_a_push_row_that_imports_a_module_runs_its_committed_source(self):
+        row = land_gate.PushRow("fast.probe", "false", f"{shlex.quote(sys.executable)} -B -c {shlex.quote(self.PROBE)}")
+        push = land_gate.LandingPush("a" * 40, "b" * 40, "")
+        out = io.StringIO()
+        with mock.patch.object(land_gate, "REPO_ROOT", self.root), contextlib.redirect_stdout(out):
+            rc = land_gate.run_push_rows([row], self.root, push, 1, None, env=dict(self.env), readers=None)
+        self.assertIn("VALUE=committed", out.getvalue())
+        self.assertNotIn("VALUE=planted", out.getvalue())
+        self.assertEqual(rc, 0, out.getvalue())
+
+    def test_a_push_row_never_runs_what_an_earlier_row_compiled(self):
+        # Review of the after-leg branch: one directory for all of a run's
+        # rows let a row leave a compiled module, of code no commit holds,
+        # under the header of a tracked source, and a later row (or the
+        # INHERITED replay) ran it. Row 1 plants exactly that in its own prefix.
+        plant = ("import importlib._bootstrap_external as b, importlib.util, os; "
+                 "src = os.path.abspath('scripts/lib/probe.py'); st = os.stat(src); "
+                 "out = importlib.util.cache_from_source(src); os.makedirs(os.path.dirname(out), exist_ok=True); "
+                 "open(out, 'wb').write(b._code_to_timestamp_pyc(compile('VALUE = \"planted\"\\n', src, 'exec'), "
+                 "int(st.st_mtime), st.st_size)); print('PLANTED', out)")
+        rows = [land_gate.PushRow("fast.plant", "false", f"{shlex.quote(sys.executable)} -c {shlex.quote(plant)}"),
+                land_gate.PushRow("fast.probe", "false",
+                                  f"{shlex.quote(sys.executable)} -B -c {shlex.quote(self.PROBE)}")]
+        push = land_gate.LandingPush("a" * 40, "b" * 40, "")
+        out = io.StringIO()
+        with mock.patch.object(land_gate, "REPO_ROOT", self.root), contextlib.redirect_stdout(out):
+            rc = land_gate.run_push_rows(rows, self.root, push, 1, None, env=dict(self.env), readers=None)
+        self.assertIn("PLANTED", out.getvalue(), "the control: row 1 wrote its compiled module")
+        self.assertIn("VALUE=committed", out.getvalue())
+        self.assertNotIn("VALUE=planted", out.getvalue())
+        self.assertEqual(rc, 0, out.getvalue())
+
+    def test_the_targo_probe_gets_a_real_directory_never_the_keys_text(self):
+        # Review of the after-leg branch: targo_unready handed the capability
+        # probe leg_environment(leg), whose PYTHONPYCACHEPREFIX is LEG_PYCACHE,
+        # a relative path under the probe's cwd (the checkout).
+        seen = []
+
+        def capture(command, env, cwd):
+            prefix = Path(env[self.VAR])
+            seen.append((prefix, prefix.is_absolute(), prefix.is_dir(), list(prefix.iterdir()) if prefix.is_dir() else None))
+            return None
+
+        probe = leg(id="targo-probe", command=["targo", "--unverified", "test"], inputs=[])
+        with mock.patch.object(land_gate.landing_targo, "capability_gap", capture), \
+                mock.patch.object(land_gate, "REPO_ROOT", self.root):
+            self.assertIsNone(land_gate.targo_unready(probe))
+        [(prefix, absolute, directory, entries)] = seen
+        self.assertNotEqual(str(prefix), land_gate.LEG_PYCACHE)
+        self.assertEqual((absolute, directory, entries), (True, True, []), "a fresh empty directory")
+        self.assertFalse(prefix.exists(), "removed after the probe")
+
+    def test_the_key_holds_the_shape_and_a_sealed_run_gets_its_own_directory(self):
+        probe = leg(id="probe-leg", inputs=[])
+        for caller in ({}, {self.VAR: "/caller/prefix"}):
+            self.assertIn(self.VAR, land_gate.leg_environment(probe, caller), caller)
+            self.assertEqual(land_gate.leg_environment(probe, caller)[self.VAR], land_gate.LEG_PYCACHE)
+        sealed = land_gate.sealed_environment()
+        self.assertIn(self.VAR, sealed)
+        self.assertEqual(sealed[self.VAR], land_gate.SEALED_PYCACHE, "a constant in the key")
+        ratchet = land_gate.tcb_panic_ratchet_leg([])
+        self.assertEqual(land_gate.leg_environment(ratchet, {self.VAR: "/caller/prefix"}), sealed)
+        bare = leg(id="sealed-probe", inputs=[], command=["/bin/true"])
+        bare.sealed_programs, bare.pinned = (), {}
+        with land_gate.sealed_launch(bare, ["/bin/true"]) as (_command, env, _moved):
+            made = Path(env[self.VAR])
+            self.assertTrue(made.is_dir())
+            self.assertEqual(list(made.iterdir()), [])
+            self.assertEqual(made.parent, Path(env["HOME"]).parent, "beside the run's HOME, in its own base")
+            self.assertEqual(set(env), set(sealed), "the run's environment has the key's shape")
+        self.assertFalse(made.exists())
+
+
+class PythonImportShadowTests(unittest.TestCase):
+    """LAND-GATE-PY-SHADOW-1: a checkout pass reads tracked files only, and
+    Python imports untracked entries ahead of, or instead of, a committed or
+    standard-library module, so a leg or push row ran code no commit holds
+    while every tracked byte matched (a false PASS). Each test builds one
+    channel in a fresh checkout, shows Python takes it (the control), and
+    holds checkout_problem (every pass of the gate) to refuse it by path."""
+
+    VAR = "PYTHONPYCACHEPREFIX"
+    FILES = {
+        "scripts/run.py": "import shlex\nprint('SHLEX=' + shlex.__file__)\n",
+        "scripts/top.py": 'VALUE = "committed"\n',
+        "scripts/lib/probe.py": 'VALUE = "committed"\nNUMBER = 1000.\n',
+        "scripts/lib/nsp/part.py": "",
+        "scripts/lib/sliced.py": "class K:\n    __getitem__ = lambda s, k: type(k.start).__name__\nVALUE = K()[1:2]\n",
+        "docs/README.md": "fixture\n",
+    }
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="py-shadow-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # Verdicts are remembered by content per process: none from another test.
+        verdicts = mock.patch.object(land_gate, "_BYTECODE_VERDICTS", {})
+        verdicts.start()
+        self.addCleanup(verdicts.stop)
+        self.root = self.tmp / "checkout"
+        self.root.mkdir()
+        self.head = make_repo(self.root, self.FILES, symlinks={})
+        self.env = {k: v for k, v in os.environ.items() if k != self.VAR}
+        self.assertIsNone(land_gate.checkout_problem(self.head, self.root), "the fixture starts clean")
+
+    def python(self, code: str, *flags: str, env=None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-B", *flags, "-c", code], cwd=self.root,
+                              env=self.env if env is None else env, capture_output=True, text=True, timeout=60)
+
+    def assert_refused(self, path: str) -> None:
+        problem = land_gate.checkout_problem(self.head, self.root)
+        self.assertIsNotNone(problem, f"{path} was not refused")
+        self.assertIn("LAND-GATE-PY-SHADOW-1", problem)
+        self.assertIn(f"./{path}", problem)
+
+    def plant(self, path: str, data) -> Path:
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.write_bytes if isinstance(data, bytes) else target.write_text)(data)
+        return target
+
+    def remove(self, path: str) -> None:
+        target = self.root / path
+        shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
+
+    def pyc(self, source: str, code_text: str, *, stamp=None, flags=None, magic=None, optimize=0) -> bytes:
+        st = (self.root / source).stat()
+        code = compile(code_text, str(self.root / source), "exec", dont_inherit=True, optimize=optimize)
+        if flags is not None:
+            data = importlib._bootstrap_external._code_to_hash_pyc(code, b"\0" * 8, checked=flags == 3)
+        else:
+            mtime, size = stamp if stamp is not None else (int(st.st_mtime), st.st_size)
+            data = importlib._bootstrap_external._code_to_timestamp_pyc(code, mtime, size)
+        return (magic + data[4:]) if magic is not None else bytes(data)
+
+    def test_a_package_directory_beside_a_module_is_refused(self):
+        self.plant("scripts/lib/probe/__init__.py", 'VALUE = "planted"\n')
+        shown = self.python("import sys; sys.path.insert(0, 'scripts/lib'); import probe; print(probe.VALUE)")
+        self.assertEqual(shown.stdout, "planted\n", "the control: a package wins over the module beside it")
+        self.assert_refused("scripts/lib/probe")
+
+    def test_a_namespace_package_is_refused(self):
+        # A directory with no __init__.py imports a standard-library name
+        # this platform lacks; an untracked __init__.py turns a tracked
+        # namespace package into another package.
+        cases = [("scripts/lib/nsp/__init__.py", 'VALUE = "planted"\n',
+                  "import sys; sys.path.insert(0, 'scripts/lib'); import nsp; print(nsp.VALUE)", "planted\n")]
+        absent = next((n for n in ("winreg", "msvcrt", "_winapi") if importlib.util.find_spec(n) is None), None)
+        if absent:
+            cases.append((f"scripts/lib/{absent}/hook.py", "",
+                          f"import sys; sys.path.insert(0, 'scripts/lib'); import {absent}; "
+                          f"print(type({absent}.__path__).__name__)", "_NamespacePath\n"))
+        for path, text, code, want in cases:
+            with self.subTest(path=path):
+                self.plant(path, text)
+                self.assertEqual(self.python(code).stdout, want, "the control: Python imports it")
+                self.assert_refused(path if path.endswith("__init__.py") else path.rpartition("/")[0])
+                self.remove(path if path.endswith("__init__.py") else path.rpartition("/")[0])
+                self.assertIsNone(land_gate.checkout_problem(self.head, self.root))
+
+    def test_an_extension_module_is_refused(self):
+        for suffix in dict.fromkeys((importlib.machinery.EXTENSION_SUFFIXES[0], ".abi3.so", ".so")):
+            with self.subTest(suffix=suffix):
+                path = "scripts/lib/probe" + suffix
+                self.plant(path, b"not a loadable image")
+                try:
+                    shown = self.python("import sys; sys.path.insert(0, 'scripts/lib'); import probe")
+                    if suffix in importlib.machinery.EXTENSION_SUFFIXES:
+                        self.assertIn("probe" + suffix, shown.stderr, "the control: extension loaders come first")
+                    self.assert_refused(path)
+                finally:
+                    self.remove(path)
+
+    def test_a_standard_library_name_is_refused(self):
+        self.plant("scripts/shlex.py", "print('planted')\n")
+        shown = subprocess.run([sys.executable, "-B", "scripts/run.py"], cwd=self.root, env=self.env,
+                               capture_output=True, text=True, timeout=60)
+        self.assertIn("planted", shown.stdout, "the control: sys.path[0] is the script's directory")
+        self.assert_refused("scripts/shlex.py")
+        self.remove("scripts/shlex.py")
+        # Names compare case-folded (APFS, PYTHONCASEOK); the root is
+        # sys.path[0] of `python3 -c` and `python3 -` run there.
+        for path in ("scripts/Shlex.py", "json.py"):
+            with self.subTest(path=path):
+                self.plant(path, "print('planted')\n")
+                self.assert_refused(path)
+                self.remove(path)
+
+    def test_sourceless_bytecode_is_refused(self):
+        # scripts/lib comes first: a .pyc there is loaded where no source is
+        # beside it, ahead of scripts/top.py.
+        data = importlib._bootstrap_external._code_to_timestamp_pyc(
+            compile('VALUE = "planted"\n', "top.py", "exec"), 0, 0)
+        self.plant("scripts/lib/top.pyc", bytes(data))
+        shown = self.python("import sys; sys.path[:0] = ['scripts/lib', 'scripts']; import top; print(top.VALUE)")
+        self.assertEqual(shown.stdout, "planted\n", "the control: sourceless bytecode runs")
+        self.assert_refused("scripts/lib/top.pyc")
+
+    def test_an_isolated_interpreters_bytecode_must_be_the_sources(self):
+        # -I (and -E) ignores PYTHONPYCACHEPREFIX: such an interpreter reads
+        # the checkout's __pycache__ whatever prefix the gate gives it.
+        tag = sys.implementation.cache_tag
+        cache = f"scripts/lib/__pycache__/probe.{tag}.pyc"
+        probe = "import sys; sys.path.insert(0, 'scripts/lib'); import probe; print(probe.VALUE, probe.NUMBER)"
+        prefix = dict(self.env, **{self.VAR: str(self.tmp / "prefix")})
+        source = 'VALUE = "committed"\nNUMBER = 1000.\n'
+        self.plant(cache, self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\nNUMBER = 1000.\n'))
+        self.assertEqual(self.python(probe, "-I", env=prefix).stdout, "planted 1000.0\n",
+                         "the control: -I reads the checkout's bytecode under any prefix")
+        self.assertEqual(self.python(probe, env=prefix).stdout, "committed 1000.0\n")
+        self.assert_refused(cache)
+        refused = {
+            # 1_000 is spelled as long as 1000., so only the constant's type differs.
+            "a constant of another type": self.pyc("scripts/lib/probe.py", 'VALUE = "committed"\nNUMBER = 1_000\n'),
+            "an unchecked source-hash header": self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\nNUMBER = 1000\n',
+                                                        flags=1),
+        }
+        for name, data in refused.items():
+            with self.subTest(refused=name):
+                self.plant(cache, data)
+                self.assert_refused(cache)
+        # Bytecode of the commit's own source (as an -I interpreter run
+        # without -B writes it), and bytecode no interpreter loads, are not.
+        allowed = {
+            "the source's own code": self.pyc("scripts/lib/probe.py", source),
+            "a stale timestamp": self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\n', stamp=(1, 1)),
+        }
+        for name, data in allowed.items():
+            with self.subTest(allowed=name):
+                self.plant(cache, data)
+                self.assertIsNone(land_gate.checkout_problem(self.head, self.root))
+        self.assertEqual(self.python(probe, "-I", env=prefix).stdout, "committed 1000.0\n")
+        self.remove(cache)
+        # -O and -OO interpreters read their own files; another interpreter's
+        # cannot be compared here and is refused when its header can match.
+        for path, data, want in (
+                (f"scripts/lib/__pycache__/probe.{tag}.opt-1.pyc",
+                 self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\n', optimize=1), "refused"),
+                ("scripts/lib/__pycache__/probe.cpython-39.pyc",
+                 self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\n', magic=b"\x61\x0d\x0d\x0a"), "refused"),
+                ("scripts/lib/__pycache__/probe.cpython-39.pyc",
+                 self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\n', magic=b"\x61\x0d\x0d\x0a", stamp=(1, 1)),
+                 None)):
+            with self.subTest(path=path, want=want):
+                self.plant(path, data)
+                if want:
+                    self.assert_refused(path)
+                else:
+                    self.assertIsNone(land_gate.checkout_problem(self.head, self.root))
+                self.remove(path)
+
+    def test_bytecode_under_another_spelling_is_compared(self):
+        # Review of db12f8a252: the loader opens the cache path it builds, so
+        # on a file system that folds case (APFS) an -I interpreter reads
+        # `PROBE.cpython-314.pyc` for probe.py; the pass matched names as
+        # spelled and never compared it.
+        tag = sys.implementation.cache_tag
+        folds = (self.root / "SCRIPTS").exists()
+        probe = "import sys; sys.path.insert(0, 'scripts/lib'); import probe; print(probe.VALUE)"
+        for name, flags, optimize in ((f"PROBE.{tag}.pyc", (), 0), (f"probe.{tag}.PYC", (), 0),
+                                      (f"Probe.{tag.upper()}.pyc", (), 0), (f"probe.{tag}.OPT-1.pyc", ("-O",), 1)):
+            path = f"scripts/lib/__pycache__/{name}"
+            with self.subTest(path=path):
+                self.plant(path, self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\nNUMBER = 1000.\n',
+                                          optimize=optimize))
+                if folds:
+                    self.assertEqual(self.python(probe, "-I", *flags).stdout, "planted\n",
+                                     "the control: the loader opens the case variant")
+                self.assert_refused(path)
+                self.remove(path)
+        # The source's own code under another spelling is not refused.
+        self.plant(f"scripts/lib/__pycache__/PROBE.{tag}.pyc",
+                   self.pyc("scripts/lib/probe.py", 'VALUE = "committed"\nNUMBER = 1000.\n'))
+        self.assertIsNone(land_gate.checkout_problem(self.head, self.root))
+        self.remove(f"scripts/lib/__pycache__/PROBE.{tag}.pyc")
+        if not folds:
+            # A file system that keeps case holds both spellings of the
+            # directory, and `__PYCACHE__` sorts ahead of the one Python reads.
+            self.plant("scripts/lib/__PYCACHE__/unrelated", "x\n")
+            path = f"scripts/lib/__pycache__/probe.{tag}.pyc"
+            self.plant(path, self.pyc("scripts/lib/probe.py", 'VALUE = "planted"\nNUMBER = 1000.\n'))
+            self.assertEqual(self.python(probe, "-I").stdout, "planted\n")
+            self.assert_refused(path)
+
+    def test_a_slice_constant_compares_by_its_elements(self):
+        # Review of db12f8a252: Python 3.14 folds `a[1:2]` into a slice
+        # constant, and slice(True, 2) == slice(1, 2), so bytecode whose slice
+        # holds a bool was taken for the source's code.
+        source = "scripts/lib/sliced.py"
+        compiled = compile((self.root / source).read_bytes(), str(self.root / source), "exec", dont_inherit=True)
+        if slice(1, 2, None) not in [c for c in compiled.co_consts if isinstance(c, slice)]:
+            self.skipTest("this interpreter folds no slice constant")
+        self.assertFalse(land_gate.same_code(slice(True, 2, None), slice(1, 2, None)))
+        self.assertFalse(land_gate.same_code(slice(1.0, 2, None), slice(1, 2, None)))
+        self.assertTrue(land_gate.same_code(slice(1, 2, None), slice(1, 2, None)))
+        consts = tuple(slice(True, 2, None) if isinstance(c, slice) else c for c in compiled.co_consts)
+        st = (self.root / source).stat()
+        path = f"scripts/lib/__pycache__/sliced.{sys.implementation.cache_tag}.pyc"
+        self.plant(path, bytes(importlib._bootstrap_external._code_to_timestamp_pyc(
+            compiled.replace(co_consts=consts), int(st.st_mtime), st.st_size)))
+        probe = "import sys; sys.path.insert(0, 'scripts/lib'); import sliced; print(sliced.VALUE)"
+        prefix = dict(self.env, **{self.VAR: str(self.tmp / "prefix")})
+        self.assertEqual(self.python(probe, "-I", env=prefix).stdout, "bool\n", "the control: -I runs the plant")
+        self.assertEqual(self.python(probe, env=prefix).stdout, "int\n")
+        self.assert_refused(path)
+
+    def test_a_standard_library_name_of_any_python_on_path_is_refused(self):
+        # Review of db12f8a252: the names came from the gate's own
+        # interpreter, but a push row's `python3` resolves through PATH to
+        # another release (here /usr/bin/python3 is 3.9, whose shutil imports
+        # `_compression`, which 3.14 lacks), so a planted scripts/_compression.py
+        # ran under every such row unrefused. A stand-in interpreter on PATH
+        # reports a name the gate's own lacks.
+        name = "_legacy_probe_shadow"
+        self.assertNotIn(name, land_gate.python_standard_modules())
+        self.plant(f"scripts/{name}.py", "print('planted')\n")
+        self.assertIsNone(land_gate.checkout_problem(self.head, self.root), "the control: no interpreter holds it")
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        for exe, text in (("python3", f"#!/bin/sh\nprintf '%s\\n' {name} os\n"),
+                          ("python3.9", "#!/bin/sh\nexit 1\n"), ("python3-config", f"#!/bin/sh\necho {name}x\n")):
+            (bindir / exe).write_text(text)
+            (bindir / exe).chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', os.defpath)}"}):
+            self.assertIn(str((bindir / "python3").resolve()), land_gate.python_interpreters())
+            self.assertNotIn(str((bindir / "python3-config").resolve()), land_gate.python_interpreters())
+            standard = land_gate.python_standard_modules()
+            self.assertIn(name, standard)
+            self.assertNotIn(name + "x", standard)
+            self.assert_refused(f"scripts/{name}.py")
+        shutil.rmtree(bindir)
+        self.assertIsNone(land_gate.checkout_problem(self.head, self.root), "off PATH, the name is no one's")
+
+    def test_untracked_files_under_other_names_are_not_refused(self):
+        # The control for every refusal above: what no import resolves to.
+        for path, data in (("scripts/lib/scratch_notes.py", "x = 1\n"), ("scripts/lib/notes.txt", "notes\n"),
+                           ("target.noindex/x", "build output\n"), ("scripts/lib/__pycache__/orphan.cpython-314.pyc",
+                                                                    b"\0" * 32)):
+            self.plant(path, data)
+        self.assertIsNone(land_gate.checkout_problem(self.head, self.root))
+
+    def test_the_ordinary_push_compiles_python_outside_the_checkout(self):
+        # Coordinator.push ran `git push` under git_query_env(), which names no
+        # prefix: the pre-push hook's rows read and wrote the checkout's
+        # __pycache__.
+        source = self.root / "scripts/lib/probe.py"
+        st = source.stat()
+        planted = self.root / "scripts/lib/__pycache__" / f"probe.{sys.implementation.cache_tag}.pyc"
+        planted.parent.mkdir()
+        planted.write_bytes(importlib._bootstrap_external._code_to_timestamp_pyc(
+            compile('VALUE = "planted"\n', str(source), "exec"), int(st.st_mtime), st.st_size))
+        hook = self.root / "scripts/hooks/pre-push"
+        hook.parent.mkdir(parents=True)
+        show = ("import sys; sys.path.insert(0, 'scripts/lib'); import probe; "
+                "print('VALUE=' + probe.VALUE); print('PREFIX=' + str(sys.pycache_prefix))")
+        hook.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(show)}\n")
+        hook.chmod(0o755)
+        remote = self.tmp / "origin.git"
+        git_in(self.root, "init", "--bare", "-q", str(remote))
+        git_in(self.root, "remote", "add", "origin", str(remote))
+        git_in(self.root, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/main")
+        (self.root / "docs/README.md").write_text("planned\n")
+        git_in(self.root, "commit", "-qam", "planned")
+        head = git_in(self.root, "rev-parse", "HEAD")
+        run_dir = self.tmp / "run"
+        run_dir.mkdir()
+        coordinator = land_gate.landing_targo.Coordinator(head, self.head, None, lambda _head: None)
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(land_gate, "REPO_ROOT", self.root), \
+                mock.patch.object(land_gate.landing_targo, "protocol_problem", lambda _root: None), \
+                (run_dir / "push.log").open("w", encoding="utf-8") as log, contextlib.redirect_stdout(io.StringIO()):
+            rc = land_gate.ordinary_push(coordinator, log, run_dir)
+        text = (run_dir / "push.log").read_text(encoding="utf-8")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("VALUE=committed", text)
+        self.assertNotIn("VALUE=planted", text)
+        prefix = Path(re.search(r"^PREFIX=(.*)$", text, re.M).group(1))
+        self.assertEqual(prefix.parent, run_dir / "pycache", "a directory of the push's own")
+        self.assertFalse(prefix.exists(), "removed after the push")
+        self.assertEqual(sorted(p.name for p in planted.parent.iterdir()), [planted.name],
+                         "the hook's Python wrote nothing into the checkout")
+
+
 class CheckoutSecondPassTests(unittest.TestCase):
     """LAND-GATE-PUSHROWS-SPEED-1 (2026-11-09): push-rows binds the checkout
     with a complete pass before its rows and another after them, and the
@@ -26083,6 +26914,45 @@ class CheckoutSecondPassTests(unittest.TestCase):
             self.assertEqual(sorted(self.reads), sorted([*self.FILES, "link.rs"]),
                              "an unchanged file is read again, never vouched for by its stat key")
             self.assertEqual((tally.files, tally.jobs), (5, 1))
+
+    def test_a_python_pass_row_carries_its_git_time_and_rate(self):
+        # PKG-LIVE-3: how a pass splits between Git plumbing and per-file
+        # overhead, so a cheaper pass is chosen on a measurement (the bytes
+        # read are the native reader's native_bytes).
+        root, head = self.repository()
+        rows, tally = [], land_gate.CheckoutTally()
+        with mock.patch.object(land_gate, "_ACTIVE_CHECKOUT_TIMINGS", rows):
+            self.assertIsNone(land_gate.checkout_problem(head, root, tally=tally))
+        [row] = rows
+        self.assertEqual(row["backend"], "python")
+        self.assertEqual(row["files"], 5)
+        self.assertGreater(row["git_seconds"], 0.0)
+        self.assertLessEqual(row["git_seconds"], row["seconds"])
+        self.assertEqual(row["files_per_s"], round(5 / tally.seconds, 1))
+
+    def test_a_sparse_partial_clone_needs_no_blob_it_left_out(self):
+        # Review of the after-leg branch: `ls-tree -r -l` asks Git for every
+        # blob's size, so a partial clone fetched each blob it lacks, the
+        # sparse-excluded ones included, and with its promisor unreachable the
+        # pass was NOT JUDGED ("cannot inspect tracked inventory"). A pass reads
+        # only the files the checkout holds and needs no other object.
+        origin, root = self.top / "origin", self.top / "work"
+        origin.mkdir()
+        make_repo(origin, {"kept/a.txt": "kept\n", "left/b.txt": "left out\n"}, symlinks={})
+        git_in(origin, "config", "uploadpack.allowfilter", "true")
+        subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", origin.as_uri(), str(root)],
+                       check=True, capture_output=True, env=dict(os.environ, **FIXTURE_GIT_ENV))
+        git_in(root, "sparse-checkout", "set", "--cone", "kept")
+        git_in(root, "checkout", "-q", "main")
+        head = git_in(root, "rev-parse", "HEAD")
+        origin.rename(self.top / "origin.gone")  # its promisor cannot answer
+        missing = subprocess.run(["git", "-C", str(root), "cat-file", "-e", "HEAD:left/b.txt"],
+                                 capture_output=True, env=dict(os.environ, GIT_NO_LAZY_FETCH="1"))
+        self.assertNotEqual(missing.returncode, 0, "the control: the left-out blob is not in this clone")
+        self.assertIsNone(land_gate.checkout_problem(head, root))
+        self.assertEqual(self.reads, ["kept/a.txt"])
+        (root / "kept/a.txt").write_text("edited\n")
+        self.assertIn("raw bytes differ", land_gate.checkout_problem(head, root) or "")
 
     def test_a_same_size_edit_with_its_mtime_restored_is_refused(self):
         root, head = self.repository()
@@ -26194,6 +27064,113 @@ class CheckoutSecondPassTests(unittest.TestCase):
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertIn("raw bytes differ from the committed blob at './first-party/demo/lib.rs'",
                       self.second(root, head))
+
+
+@unittest.skipUnless(sys.platform == "darwin" and land_gate.platform.machine() == "arm64",
+                     "the native reader is macOS arm64's")
+class NativeReaderMemoryTests(unittest.TestCase):
+    """The installed targo's "no such command" to `source-check` is
+    remembered under <common>/trust-land, keyed on that targo image's path and
+    physical stat key, so a later worker start does not pay the package
+    admission (9.1 s of a development run) to hear it again. "Available" and
+    every other refusal are never stored."""
+
+    NO_COMMAND = "native reader ended: error: no such command: `source-check`"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="native-memory."))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.image = self.tmp / "targo"
+        self.image.write_bytes(b"\xcf\xfa\xed\xfe image")
+        self.common = self.tmp / "common"
+        self.admitted, self.readers = [], []
+        self.answer = land_gate.native_checkout.Unavailable(self.NO_COMMAND)
+        program = SimpleNamespace(executable=self.image, expected="0" * 64, close=lambda: None)
+
+        def managed(env):
+            self.admitted.append(1)
+            return program
+
+        def reader(*args, **kwargs):
+            self.readers.append(1)
+            if isinstance(self.answer, BaseException):
+                raise self.answer
+            return self.answer
+
+        for target, name, value in (
+                (land_gate.native_checkout, "selected_executable", lambda env: self.image),
+                (land_gate.native_checkout, "managed_program", managed),
+                (land_gate.native_checkout, "Reader", reader),
+                (land_gate, "common_dir", lambda: self.common),
+                (land_gate, "_NATIVE_CHECKOUT_READER_SHA256", "a" * 64),
+                (land_gate, "_ACTIVE_CANCELLATION", object()),
+                (land_gate._CheckoutWorkers, "_start", lambda workers: None)):
+            patcher = mock.patch.object(target, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def start(self):
+        workers = land_gate._CheckoutWorkers(2)
+        workers.start()
+        return workers
+
+    def test_a_remembered_no_such_command_constructs_no_reader_for_the_same_targo(self):
+        # No other answer is stored: "available" and every other refusal ask again.
+        for answer in (land_gate.native_checkout.Unavailable("native reader request timed out"),
+                       land_gate.native_checkout.Unavailable("native reader managed package admission was refused"),
+                       SimpleNamespace(runtime_identity="b" * 64, close=lambda: None)):
+            with self.subTest(answer=str(answer)):
+                self.answer = answer
+                self.start()
+                self.start()
+                self.assertFalse((self.common / "trust-land").exists(), "nothing stored")
+        self.assertEqual((len(self.admitted), len(self.readers)), (6, 6), "each start asked")
+        self.admitted.clear()
+        self.readers.clear()
+        self.answer = land_gate.native_checkout.Unavailable(self.NO_COMMAND)
+        first = self.start()
+        self.assertEqual((len(self.admitted), len(self.readers)), (1, 1))
+        self.assertEqual(first.startup["native"], "unavailable")
+        second = self.start()
+        self.assertEqual((len(self.admitted), len(self.readers)), (1, 1), "no admission and no Reader again")
+        self.assertEqual(second.startup["native"], "unavailable")
+        self.assertIn("remembered for this targo", second.native_fallback)
+        self.assertIn(self.NO_COMMAND, second.native_fallback)
+        # Another image (a new install moves its stat key): asked again.
+        before = self.image.stat()
+        os.utime(self.image, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+        self.start()
+        self.assertEqual((len(self.admitted), len(self.readers)), (2, 2))
+
+    def test_an_answer_from_a_targo_replaced_while_it_was_asked_is_not_stored(self):
+        # Review of the after-leg branch: nothing exercised the key's second
+        # read. The image the answer is stored under must still be the one
+        # asked; here a new install lands while the reader starts.
+        original = self.admitted.append
+
+        class Replacing(list):
+            def append(inner, item):
+                before = self.image.stat()
+                os.utime(self.image, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+                original(item)
+
+        self.admitted = Replacing()
+        self.start()
+        self.assertEqual(len(self.readers), 1, "the control: the reader answered no such command")
+        self.assertFalse((self.common / "trust-land" / land_gate.NATIVE_UNAVAILABLE_FILE).exists(),
+                         "stored under neither the asked image's key nor the new one's")
+
+    def test_a_relative_common_directory_stores_nothing(self):
+        # A mocked or broken `git rev-parse --git-common-dir` that names no
+        # absolute directory must not put the file under the current one.
+        cwd = Path.cwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.tmp)
+        with mock.patch.object(land_gate, "common_dir", lambda: Path("")):
+            self.start()
+            self.start()
+        self.assertEqual(len(self.readers), 2, "asked each time")
+        self.assertFalse((self.tmp / "trust-land").exists())
 
 
 class CheckoutWorkerTests(unittest.TestCase):
@@ -26838,6 +27815,242 @@ class LandingPushCheckoutTests(unittest.TestCase):
         self.assertTrue(out.rstrip().endswith("(2 processes)"), out)
 
 
+class PushRowsDelegationTests(unittest.TestCase):
+    """`run` hands push-rows its checkout binding (CHECKOUT_BOUND_FLAG): a
+    pipe holding one random token, its write end closed before the leg
+    started. push-rows then reads neither of its two checkout passes (95.0 s
+    of a development run), starts no worker pool, and `run`'s own complete
+    pass after the leg binds it. Anything else on that descriptor judges
+    nothing; standalone push-rows keeps both passes (READS-ONCE-WINDOW-1)."""
+
+    landing = LandingPushCheckoutTests.landing
+
+    def token_pipe(self, token=None, close_writer=True):
+        token = (os.urandom(32).hex() + "\n").encode() if token is None else token
+        readable, writable = os.pipe()
+        os.write(writable, token)
+        if close_writer:
+            os.close(writable)
+        else:
+            self.addCleanup(os.close, writable)
+        return readable, hashlib.sha256(token).hexdigest()[:16]
+
+    def push_rows(self, root, args):
+        passes, rows, forks = [], [], []
+        original, fork = land_gate.checkout_problem, os.fork
+
+        def counted(*a, **kw):
+            passes.append(1)
+            return original(*a, **kw)
+
+        def spawn():
+            forks.append(1)
+            return fork()
+
+        out = io.StringIO()
+        with mock.patch.object(land_gate, "push_profile_rows", return_value=[]), \
+                mock.patch.object(land_gate, "run_push_rows", side_effect=lambda *a, **kw: rows.append(1) or 0), \
+                mock.patch.object(land_gate, "checkout_problem", counted), \
+                mock.patch.object(land_gate.os, "fork", spawn), \
+                mock.patch.object(land_gate, "CHECKOUT_PARALLEL_MIN_FILES", 1), \
+                mock.patch.dict(os.environ, {"TRUST_CHECKOUT_JOBS": "2"}), \
+                contextlib.redirect_stdout(out):
+            for name in ADVERTISED_DESCRIPTORS:
+                os.environ.pop(name, None)
+            rc = land_gate.cmd_push_rows(args, root=root)
+        return rc, len(passes), len(rows), len(forks), out.getvalue()
+
+    def test_a_run_token_skips_both_checkout_passes(self):
+        _top, _origin, root, tip, head = self.landing()
+        rc, passes, rows, forks, out = self.push_rows(root, land_gate.argparse.Namespace())
+        self.assertEqual((rc, passes, rows, forks), (0, 2, 1, 2), out)
+        readable, digest = self.token_pipe()
+        rc, passes, rows, forks, out = self.push_rows(
+            root, land_gate.argparse.Namespace(checkout_bound_by_fd=readable, expect_tip=tip, expect_head=head))
+        self.assertEqual((rc, passes, rows, forks), (0, 0, 1, 0), out)
+        self.assertIn(f"push-rows: checkout bound by run {digest}", out)
+        self.assertIn(f"after the rows is bound by run {digest}'s next complete pass", out)
+        with self.assertRaises(OSError, msg="the descriptor is closed once read"):
+            os.fstat(readable)
+
+    def test_a_descriptor_that_is_no_closed_run_pipe_judges_nothing(self):
+        _top, _origin, root, tip, head = self.landing()
+        token = (os.urandom(32).hex() + "\n").encode()
+        stored = Path(tempfile.mkdtemp(prefix="token.")) / "token"
+        self.addCleanup(shutil.rmtree, stored.parent, ignore_errors=True)
+        stored.write_bytes(token)
+        cases = (("a file", lambda: os.open(stored, os.O_RDONLY), "is no pipe"),
+                 ("no token", lambda: self.token_pipe(b"not a token\n")[0], "holds no run token"),
+                 ("two tokens", lambda: self.token_pipe(token + token)[0], "holds no run token"),
+                 ("an open writer", lambda: self.token_pipe(token, close_writer=False)[0], "still open for writing"),
+                 ("no descriptor", lambda: 987, "cannot be read"))
+        for name, descriptor, why in cases:
+            with self.subTest(name):
+                rc, passes, rows, _forks, out = self.push_rows(
+                    root, land_gate.argparse.Namespace(checkout_bound_by_fd=descriptor(), expect_tip=tip,
+                                                       expect_head=head))
+                self.assertEqual((rc, passes, rows), (2, 0, 0), out)
+                self.assertIn("PUSH-ROWS: NOT JUDGED", out)
+                self.assertIn(why, out)
+                self.assertIn("No row ran.", out)
+
+    def test_a_binding_without_the_planned_head_judges_nothing(self):
+        # Review of the after-leg branch: with no pass of its own, only
+        # --expect-head ties the HEAD the rows judge to the run's revision.
+        _top, _origin, root, tip, _head = self.landing()
+        readable, _digest = self.token_pipe()
+        rc, passes, rows, _forks, out = self.push_rows(
+            root, land_gate.argparse.Namespace(checkout_bound_by_fd=readable, expect_tip=tip))
+        self.assertEqual((rc, passes, rows), (2, 0, 0), out)
+        self.assertIn("PUSH-ROWS: NOT JUDGED", out)
+        self.assertIn("without --expect-head", out)
+        with self.assertRaises(OSError, msg="the descriptor is closed"):
+            os.fstat(readable)
+        # run hands the binding only with a planned HEAD; without one the leg binds itself.
+        for head, handed in (("h" * 40, True), ("", False)):
+            landing = land_gate.LandingRange("t" * 40, head, "origin", True, ("docs/README.md",))
+            leg_ = land_gate.push_rows_leg("b" * 40, HOOK_OFF, landing)
+            self.assertEqual(leg_.checkout_handoff, handed, head)
+            self.assertEqual("--expect-head" in leg_.command, handed, head)
+
+    def test_run_hands_the_push_rows_leg_a_closed_pipe_holding_one_token(self):
+        # The leg's real process: the descriptor named after the flag is open
+        # in it, a pipe, holding the token whose digest the run logged.
+        FLAG = "--checkout-bound-by-fd"
+        probe = ("import hashlib, os, stat, sys\n"
+                 "argv = sys.argv[1:]\n"
+                 f"fd = int(argv[argv.index({FLAG!r}) + 1]) if {FLAG!r} in argv else None\n"
+                 "if fd is None: print('HANDED nothing'); raise SystemExit(0)\n"
+                 "data = os.read(fd, 4096)\n"
+                 "print('HANDED', stat.S_ISFIFO(os.fstat(fd).st_mode), os.read(fd, 1) == b'', "
+                 "hashlib.sha256(data).hexdigest()[:16])\n"
+                 "print('push-rows: checkout bound by run ' + hashlib.sha256(data).hexdigest()[:16] + ': probe')\n")
+        tmp = Path(tempfile.mkdtemp(prefix="handoff."))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        landing = land_gate.LandingRange("t" * 40, "h" * 40, "origin", True, ("docs/README.md",))
+        handed = land_gate.push_rows_leg("b" * 40, HOOK_OFF, landing)
+        handed.command = [sys.executable, "-B", "-c", probe]
+        with mock.patch.object(land_gate, "REPO_ROOT", tmp), contextlib.redirect_stdout(io.StringIO()):
+            rc, _secs, log, _prep = land_gate.run_leg(handed, tmp, {}, (1, 2))
+        text = Path(log).read_text(encoding="utf-8")
+        self.assertEqual(rc, 0, text)
+        logged = re.search(r"is handed this run's checkout binding \(token ([0-9a-f]{16})\)", text)
+        self.assertIsNotNone(logged, text)
+        self.assertIn(f"HANDED True True {logged.group(1)}", text)
+
+    def test_a_closed_advertised_descriptor_is_refused_before_the_pipe_is_made(self):
+        # Review of the after-leg branch: the pipe was made before the
+        # advertised descriptors were checked live, so a closed advertised
+        # number the pipe then took passed the check and reached the leg as
+        # that resource. Here the pipe is made to take exactly that number.
+        closed = 900
+        with self.assertRaises(OSError, msg="the control: the advertised number is closed"):
+            os.fstat(closed)
+        real, made = land_gate.checkout_handoff_pipe, []
+
+        def taking():
+            made.append(1)
+            readable, digest = real()
+            os.dup2(readable, closed)
+            os.close(readable)
+            return closed, digest
+
+        tmp = Path(tempfile.mkdtemp(prefix="handoff-fds."))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        landing = land_gate.LandingRange("t" * 40, "h" * 40, "origin", True, ("docs/README.md",))
+        handed = land_gate.push_rows_leg("b" * 40, HOOK_OFF, landing)
+        handed.command = [sys.executable, "-B", "-c", "print('RAN')"]
+        caller = {k: v for k, v in os.environ.items() if k not in ADVERTISED_DESCRIPTORS}
+        caller["TRUST_CPU_IMPLICIT_FD"] = str(closed)
+        try:
+            with mock.patch.dict(os.environ, caller, clear=True), \
+                    mock.patch.object(land_gate, "checkout_handoff_pipe", taking), \
+                    mock.patch.object(land_gate, "REPO_ROOT", tmp), contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaisesRegex(RuntimeError, "TRUST_CPU_IMPLICIT_FD descriptor is not live"):
+                land_gate.run_leg(handed, tmp, {}, (1, 2))
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(closed)
+        self.assertEqual(made, [], "no pipe was made")
+        self.assertNotIn("RAN", (tmp / "push-rows.log").read_text(encoding="utf-8"))
+
+    def test_a_leg_that_reports_no_read_of_runs_token_is_not_judged(self):
+        # Review of the after-leg branch: nothing compared what the leg read
+        # with the token run handed, so a push-rows that never read run's pipe
+        # (or read another) had its GREEN filed as bound by run's passes.
+        tmp = Path(tempfile.mkdtemp(prefix="handoff-report."))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        landing = land_gate.LandingRange("t" * 40, "h" * 40, "origin", True, ("docs/README.md",))
+        read = ("import hashlib, os, sys; fd = int(sys.argv[sys.argv.index('--checkout-bound-by-fd') + 1]); "
+                "data = os.read(fd, 4096); ")
+        cases = (("ignores the descriptor", "print('PUSH-ROWS: GREEN')", 0, 2),
+                 ("names another token", read + "print('push-rows: checkout bound by run ' + 'f' * 16 + ': x')", 0, 2),
+                 ("reports it inside a line", read + "print('row said push-rows: checkout bound by run ' + "
+                  "hashlib.sha256(data).hexdigest()[:16] + ': x'); sys.exit(1)", 1, 2),
+                 ("reads and names it", read + "print('push-rows: checkout bound by run ' + "
+                  "hashlib.sha256(data).hexdigest()[:16] + ': x'); sys.exit(1)", 1, 1),
+                 ("is not judged itself", "raise SystemExit(2)", 2, 2))
+        for name, body, exits, graded in cases:
+            with self.subTest(name):
+                handed = land_gate.push_rows_leg("b" * 40, HOOK_OFF, landing)
+                handed.command = [sys.executable, "-B", "-c", body]
+                run_dir = tmp / name.replace(" ", "-")
+                run_dir.mkdir()
+                with mock.patch.object(land_gate, "REPO_ROOT", tmp), contextlib.redirect_stdout(io.StringIO()):
+                    rc, _secs, log, _prep = land_gate.run_leg(handed, run_dir, {}, (1, 2))
+                text = Path(log).read_text(encoding="utf-8")
+                self.assertEqual(rc, graded, text)
+                self.assertEqual(f"never reported reading this run's checkout binding" in text,
+                                 graded != exits, text)
+
+    def test_a_row_that_writes_a_tracked_file_is_not_judged_after_push_rows(self):
+        graph = Fixture.graph()
+        selection = ls.select(graph, "base", ["docs/README.md"])
+        landing = land_gate.LandingRange("t" * 40, graph.index.rev, "origin", True, ("docs/README.md",))
+        handed_leg = land_gate.push_rows_leg("base", HOOK_OFF, landing)
+        events: List[str] = []
+        state = {"changed": False}
+        with tempfile.TemporaryDirectory(prefix="push-rows-handoff.") as tmp, contextlib.ExitStack() as stack:
+            root = Path(tmp)
+            log = root / "leg.log"
+            log.write_text("PUSH-ROWS: GREEN\n")
+
+            def check_source(expected=None, **kwargs):
+                if kwargs.get("history_only"):
+                    return None
+                events.append("pass")
+                return "tracked inputs changed at 'docs/README.md'" if state["changed"] else None
+
+            def run_child(selected, *args, **kwargs):
+                events.append(f"run {selected.id} handed={getattr(selected, 'checkout_handoff', False)}")
+                state["changed"] = True  # a row wrote a tracked file and left it
+                return 0, 0.01, str(log), False
+
+            for name, value in (
+                    ("git", lambda *a, **kw: ""), ("checkout_problem", check_source),
+                    ("compute", lambda *a, **kw: (graph, selection, "base")),
+                    ("read_landing", lambda *a, **kw: landing),
+                    ("push_hook_state", lambda *a, **kw: HOOK_OFF),
+                    ("build_legs", lambda *a, **kw: [handed_leg]), ("toolchain_identity", lambda: {}),
+                    ("common_dir", lambda: root), ("global_fingerprint", lambda *a, **kw: "source"),
+                    ("stage1_key", lambda *a, **kw: "stage"), ("rustc_identity", lambda: None),
+                    ("targo_unready", lambda selected: None), ("run_leg", run_child),
+                    ("checkout_git_state", lambda *a, **kw: "unchanged")):
+                stack.enter_context(mock.patch.object(land_gate, name, value))
+            stack.enter_context(mock.patch.object(host_budget, "measure", return_value=host(28, 128, 100)))
+            output = io.StringIO()
+            args = SimpleNamespace(base="base", only=["push-rows"], no_cache=True, dry_run=False, development=False)
+            with contextlib.redirect_stdout(output):
+                rc = land_gate.cmd_run(args)
+            record = json.loads(next(root.rglob("record.json")).read_text())
+        self.assertEqual(rc, 2, output.getvalue())
+        self.assertEqual(events, ["pass", "run push-rows handed=True", "pass"], output.getvalue())
+        self.assertEqual(record["source_refusal"]["boundary"], "after push-rows")
+        self.assertEqual(record["legs"]["push-rows"]["outcome"], "NOT JUDGED (source changed)")
+        self.assertNotIn("after push-rows", [row["boundary"] for row in record["checkout_checks"] if "reused" in row],
+                         "a complete pass, never a reuse")
+
+
 class IrDiagnosticPhysicalInputsTests(unittest.TestCase):
     def repository(self):
         tmp = tempfile.TemporaryDirectory(prefix="ir-physical-inputs.")
@@ -27165,6 +28378,44 @@ class IrDiagnosticPhysicalInputsTests(unittest.TestCase):
         # LAND-GATE-PUSHROWS-SPEED-1: the per-file check, loaded by its path too.
         self.assertIn('REPO_ROOT / "scripts/lib/checkout_inputs.py"', (REPO / "scripts/land_gate.py").read_text())
         self.assertIn("scripts/lib/checkout_inputs.py", land_gate.IR_DIAGNOSTIC_READERS)
+
+
+class RunRecordClockTests(unittest.TestCase):
+    """record.json `seconds` is the run's wall time on every path. The clock
+    it reads is bound once in _cmd_run_in_scope, from time.time(): the
+    development and source-diagnostic path rebound it to time.monotonic()
+    for its discovery timer, and `seconds` was then epoch minus uptime
+    (about 1.79e9), which `targo trust meter` read as the run's total."""
+
+    def test_the_run_clock_is_bound_once_from_the_wall_clock(self):
+        import ast
+        tree = ast.parse((REPO / "scripts/land_gate.py").read_text(encoding="utf-8"))
+        run = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef) and node.name == "_cmd_run_in_scope")
+        writes = [node for node in ast.walk(run) if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Subscript) and getattr(target.value, "id", None) == "record"
+            and isinstance(target.slice, ast.Constant) and target.slice.value == "seconds"
+            for target in node.targets)]
+        self.assertEqual(len(writes), 1, "one write of record['seconds']")
+        clocks = {node.id for node in ast.walk(writes[0].value) if isinstance(node, ast.Name)} - {"round", "time"}
+        self.assertEqual(len(clocks), 1, f"record['seconds'] reads one clock, not {sorted(clocks)}")
+        clock = clocks.pop()
+
+        def bound(node):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For)):
+                targets = [node.target]
+            elif isinstance(node, ast.withitem):
+                targets = [node.optional_vars] if node.optional_vars is not None else []
+            else:
+                return False
+            return any(isinstance(name, ast.Name) and name.id == clock
+                       for target in targets for name in ast.walk(target))
+
+        binds = [node for node in ast.walk(run) if bound(node)]
+        self.assertEqual(len(binds), 1, f"`{clock}` is bound {len(binds)} times in _cmd_run_in_scope")
+        self.assertEqual(ast.unparse(binds[0].value), "time.time()")
 
 
 class LegacyPythonLaunchTests(unittest.TestCase):

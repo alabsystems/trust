@@ -100,17 +100,17 @@ impl std::fmt::Display for NativeHelperRefusal {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::error::Error for NativeHelperRefusal {}
 
-/// Fixed admission may select an unpaired compiler. A recognized paired
-/// compiler with missing required helpers is broken, not unsupported: retain
-/// that refusal even when an older admission client cannot read its discovery
-/// response. No compiler or CPU grant is constructed by this check.
+/// Trust: ordinary fixed commands retain a recognized compiler/runtime pair,
+/// without claiming the native worker SDK's link/debug helper surface. A
+/// metadata-only unit must not need tools it never invokes. Pair mismatches
+/// retain the existing fixed-admission fallback; actual native-worker entry
+/// and capability discovery use `require_paired_compiler` below.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn optional_paired_compiler(
     gctx: &targo::util::GlobalContext,
 ) -> targo::util::CargoResult<Option<trust_resource_provenance::program::HeldProgram>> {
-    match require_paired_compiler(gctx) {
+    match hold_paired_compiler(gctx) {
         Ok(program) => Ok(Some(program)),
-        Err(error) if error.is::<NativeHelperRefusal>() => Err(error),
         Err(_) => Ok(None),
     }
 }
@@ -139,7 +139,23 @@ fn preflight_native_helpers(root: &std::path::Path) -> Result<(), NativeHelperRe
 pub(super) fn require_paired_compiler(
     gctx: &targo::util::GlobalContext,
 ) -> targo::util::CargoResult<trust_resource_provenance::program::HeldProgram> {
-    use std::ffi::OsString;
+    require_native_helpers(hold_paired_compiler(gctx)?)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn require_native_helpers(
+    held: trust_resource_provenance::program::HeldProgram,
+) -> targo::util::CargoResult<trust_resource_provenance::program::HeldProgram> {
+    preflight_native_helpers(held.root())?;
+    Ok(held)
+}
+
+/// Trust: keep the exact original compiler/runtime inputs through execution.
+/// Compatibility supplies neither helper completeness nor a source/CPU grant.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hold_paired_compiler(
+    gctx: &targo::util::GlobalContext,
+) -> targo::util::CargoResult<trust_resource_provenance::program::HeldProgram> {
     use std::time::{Duration, Instant};
 
     let encoded = option_env!("TRUST_TARGO_PAIRED_COMPILER_PROFILE")
@@ -153,6 +169,25 @@ pub(super) fn require_paired_compiler(
     let bin = executable
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Targo has no binary directory"))?;
+    hold_selected_compiler(
+        gctx,
+        bin,
+        &compiler,
+        encoded,
+        Instant::now() + Duration::from_secs(2),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn hold_selected_compiler(
+    gctx: &targo::util::GlobalContext,
+    bin: &std::path::Path,
+    compiler: &std::path::Path,
+    encoded: &str,
+    deadline: std::time::Instant,
+) -> targo::util::CargoResult<trust_resource_provenance::program::HeldProgram> {
+    use std::ffi::OsString;
+
     let root = bin
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Targo has no paired SDK root"))?;
@@ -173,12 +208,7 @@ pub(super) fn require_paired_compiler(
                 .is_symlink(),
         "paired compiler directory or image is an indirect selection"
     );
-    let held = targo::paired_compiler::hold(
-        root,
-        &compiler,
-        encoded,
-        Instant::now() + Duration::from_secs(2),
-    )?;
+    let held = targo::paired_compiler::hold(root, compiler, encoded, deadline)?;
     let expected = held.runtime_environment()?;
     let configured = gctx.env_config()?;
     let mut keys = std::env::vars_os()
@@ -207,9 +237,6 @@ pub(super) fn require_paired_compiler(
             );
         }
     }
-    // Keep this original content/runtime custody through actual execution.
-    // These files and compatibility data confer no source or CPU grant.
-    preflight_native_helpers(root)?;
     Ok(held)
 }
 
@@ -302,6 +329,127 @@ mod tests {
         std::fs::remove_file(&debug).unwrap();
         symlink(&linker, &debug).unwrap();
         assert!(preflight_native_helpers(root.path()).is_err());
+    }
+
+    /// The provider and profile are actual qualified input DATA, not a fake
+    /// compiler, SDK receipt, native-worker grant or favorable proof result.
+    /// Run explicitly with the retained provider; absence never counts as PASS.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires real retained compiler bin/profile input paths"]
+    fn real_pair_without_helpers_retains_ordinary_custody_but_refuses_native_worker() {
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        const ACTOR: &str = "TARGO_TEST_REAL_PAIR_ACTOR";
+        const NAME: &str = "resource_capabilities::tests::real_pair_without_helpers_retains_ordinary_custody_but_refuses_native_worker";
+        let actor = std::env::var(ACTOR).ok();
+        if actor.is_none() {
+            // Trust: Cargo adds its own loader search path for libtest. Observe
+            // the compiler pair in an isolated actual native test process;
+            // production still refuses every foreign compiler loader input.
+            for mode in ["clean", "foreign-loader"] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", NAME, "--include-ignored"]);
+                command.env(ACTOR, mode);
+                for (key, _) in std::env::vars_os() {
+                    if key.as_encoded_bytes().starts_with(b"DYLD_")
+                        || key.as_encoded_bytes().starts_with(b"LD_")
+                    {
+                        command.env_remove(key);
+                    }
+                }
+                if mode == "foreign-loader" {
+                    command.env("LD_LIBRARY_PATH", "/foreign-compiler-loader-input");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "real compiler pair actor {mode}: {output:?}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("1 passed; 0 failed; 0 ignored;")
+                );
+            }
+            return;
+        }
+        assert!(matches!(actor.as_deref(), Some("clean" | "foreign-loader")));
+
+        let bin =
+            PathBuf::from(std::env::var_os("TARGO_TEST_REAL_PAIR_BIN").expect("real pair bin"));
+        let profile = PathBuf::from(
+            std::env::var_os("TARGO_TEST_REAL_PAIR_PROFILE").expect("producer profile DATA"),
+        );
+        let encoded = std::fs::read_to_string(profile).unwrap();
+        let root = bin.parent().unwrap();
+        assert!(
+            !root.join("bin/rust-lld").exists(),
+            "retain the real absent-helper case"
+        );
+        assert!(
+            !root.join("bin/dsymutil").exists(),
+            "retain the real absent-helper case"
+        );
+        let compiler = bin.join("trustc");
+        let gctx = targo::util::GlobalContext::default().unwrap();
+        if actor.as_deref() == Some("foreign-loader") {
+            let Err(error) = hold_selected_compiler(
+                &gctx,
+                &bin,
+                &compiler,
+                &encoded,
+                Instant::now() + Duration::from_secs(30),
+            ) else {
+                panic!("foreign compiler loader input accepted");
+            };
+            assert!(
+                error.to_string().contains("unsupported loader override"),
+                "{error:#}"
+            );
+            return;
+        }
+        // A longer test observation budget removes disk-cache timing from the
+        // semantic regression. Production keeps its original two-second bound.
+        let held = hold_selected_compiler(
+            &gctx,
+            &bin,
+            &compiler,
+            &encoded,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        held.validate(Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let Err(error) = require_native_helpers(held) else {
+            panic!("native worker accepted a provider without its required helpers");
+        };
+        assert!(error.is::<NativeHelperRefusal>(), "{error:#}");
+        assert!(native_refusal(&error));
+        assert!(error.to_string().contains("rust-lld"));
+
+        let mut wrong: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        wrong["executable"]["sha256"] = "0".repeat(64).into();
+        assert!(
+            hold_selected_compiler(
+                &gctx,
+                &bin,
+                &compiler,
+                &wrong.to_string(),
+                Instant::now() + Duration::from_secs(30)
+            )
+            .is_err()
+        );
+        assert!(
+            hold_selected_compiler(
+                &gctx,
+                &root.join("lib"),
+                &compiler,
+                &encoded,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .is_err()
+        );
     }
 
     #[test]

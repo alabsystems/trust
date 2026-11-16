@@ -227,3 +227,199 @@ fn r_assembly_transport_existing_relink_keeps_the_installed_body_edge_without_a_
     .unwrap();
     assert_eq!(host, before, "the already authenticated same-ID body edge stays unchanged");
 }
+
+#[test]
+fn retained_declaration_binds_the_actual_base_guest_and_installed_slot() {
+    let base = Arc::new(image("_RLeaf", false, None));
+    let guest = image("_RLeaf", true, None);
+    let binding = data_binding(&base, FuncId::new(0), &guest);
+    let mut host = (*base).clone();
+    let installed =
+        append_instance_body(Some(&binding), &mut host, &guest, 0, true, &BTreeMap::new()).unwrap();
+    assert!(binding.check_retained(&base, &guest, installed).is_ok());
+    assert!(!host.functions[0].is_declaration());
+    // Content equality alone must not substitute another handoff allocation.
+    let other_base = (*base).clone();
+    assert_eq!(*base, other_base);
+    assert!(binding.check_retained(&other_base, &guest, installed).is_err());
+    assert!(binding.check_retained(&host, &guest, installed).is_err());
+    assert!(binding.check_retained(&base, &guest, FuncId::new(1)).is_err());
+    for mutation in 0..4 {
+        let mut changed = guest.clone();
+        match mutation {
+            0 => changed.functions[0].name.push_str("_other"),
+            1 => changed.func_types[0].params[0] = Ty::I64,
+            2 => changed.functions[0].calling_conv = CallingConv::C,
+            _ => changed.functions[0].blocks[0].body.clear(),
+        }
+        assert!(binding.check_retained(&base, &changed, installed).is_err());
+    }
+}
+
+#[test]
+fn retained_declaration_rechecks_its_original_definition_and_signature() {
+    let base = Arc::new(image("_RLeaf", false, None));
+    let guest = image("_RLeaf", true, None);
+    for mutation in 0..5 {
+        // Deliberately corrupt private test data; this does not fabricate an
+        // actual-TCX declaration binding or an upstream admission token.
+        let mut binding = data_binding(&base, FuncId::new(0), &guest);
+        match mutation {
+            0 => binding.original.name.push_str("_other"),
+            1 => binding.original.calling_conv = CallingConv::C,
+            2 => binding.signature.params[0] = Ty::I64,
+            3 => binding.original = guest.functions[0].clone(),
+            _ => binding.original.id = FuncId::new(1),
+        }
+        assert!(binding.check_retained(&base, &guest, FuncId::new(0)).is_err());
+    }
+}
+
+// Raw immutable installation data only. These fixtures do not construct an
+// UpstreamBody, Admitted token or actual-TCX Plan. The run-make positive must
+// separately exercise that production provenance and the full codegen gate.
+struct ExtensionData {
+    base: Arc<Module>,
+    guest: Module,
+    binding: BoundDeclaration,
+    star: Module,
+    evidence: trust_thir_lower::rmeta_entry::Evidence,
+    edges: BTreeMap<FuncId, FuncId>,
+    image: Function,
+    signature: FuncTy,
+}
+
+impl ExtensionData {
+    fn new() -> Self {
+        let mut original = image("_RLeaf", false, None);
+        let mut existing = image("_RExisting", true, None).functions.remove(0);
+        existing.id = FuncId::new(1);
+        original.functions.push(existing);
+        let mut root = image("_RRoot", true, Some("_RLeaf")).functions.remove(0);
+        root.id = FuncId::new(2);
+        let trust_ir::Inst::Call { callee, .. } = &mut root.blocks[0].body[0].inst else {
+            panic!("root call fixture");
+        };
+        *callee = FuncId::new(0);
+        original.functions.push(root);
+        let base = Arc::new(original);
+        let guest = image("_RLeaf", true, Some("_RExisting"));
+        let binding = data_binding(&base, FuncId::new(0), &guest);
+        let edges = BTreeMap::from([(FuncId::new(1), FuncId::new(1))]);
+        let mut star = (*base).clone();
+        let installed =
+            append_instance_body(Some(&binding), &mut star, &guest, 1, true, &edges).unwrap();
+        assert_eq!(installed, FuncId::new(0));
+        let image = star.function_by_id(installed).unwrap().clone();
+        let signature = star.func_type(image.ty).unwrap().clone();
+        let mut evidence = trust_thir_lower::rmeta_entry::Evidence::default();
+        evidence.ledger.push(trust_thir_lower::rmeta_entry::EvidenceLedgerRow {
+            func_id: 1,
+            ids: Vec::new(),
+            site: None,
+        });
+        Self { base, guest, binding, star, evidence, edges, image, signature }
+    }
+
+    fn entry(&self) -> super::super::RetainedDeclarationInstallation<'_> {
+        super::super::RetainedDeclarationInstallation {
+            binding: &self.binding,
+            original: &self.guest,
+            guest: &self.guest,
+            evidence: &self.evidence,
+            installed: FuncId::new(0),
+            image: &self.image,
+            signature: &self.signature,
+            edges: &self.edges,
+        }
+    }
+
+    fn extension(&self) -> super::super::HandoffDeclarationExtensions<'_> {
+        super::super::HandoffDeclarationExtensions {
+            base: &self.base,
+            star: &self.star,
+            installations: vec![self.entry()],
+        }
+    }
+}
+
+#[test]
+fn declaration_extension_data_preserves_existing_definitions_and_rechecks_images() {
+    use super::super::super::codegen_module::check_handoff_closure;
+    let data = ExtensionData::new();
+    let extension = data.extension();
+    assert!(check_handoff_closure(&data.base, &data.star, FuncId::new(2), None).is_err());
+    assert!(
+        check_handoff_closure(&data.base, &data.star, FuncId::new(2), Some(&extension),).is_ok()
+    );
+    assert!(extension.check(&data.base, &data.star.clone(), FuncId::new(0)).is_ok());
+    let other = ExtensionData::new();
+    assert_eq!(*data.base, *other.base);
+    assert!(extension.check(&other.base, &other.star, FuncId::new(0)).is_err());
+    assert!(extension.check(&data.base, &data.star, FuncId::new(1)).is_err());
+    let mut duplicate = data.extension();
+    duplicate.installations.push(data.entry());
+    assert!(duplicate.check(&data.base, &data.star, FuncId::new(0)).is_err());
+    let mut transformed = data.star.clone();
+    transformed.functions[1].name.push_str("_other");
+    assert!(extension.check(&data.base, &transformed, FuncId::new(0)).is_err());
+}
+
+#[test]
+fn declaration_extension_data_rejects_modified_installation_and_edge_evidence() {
+    for mutation in 0..6 {
+        let mut data = ExtensionData::new();
+        match mutation {
+            0 => data.star.functions[0].blocks[0].body.clear(),
+            1 => data.star.func_types[0].params[0] = Ty::I64,
+            2 => {
+                data.edges.insert(FuncId::new(1), FuncId::new(2));
+            }
+            3 => data.evidence.ledger.clear(),
+            4 => data.guest.functions[0].calling_conv = CallingConv::C,
+            _ => data.binding.signature.params[0] = Ty::I64,
+        }
+        let extension = data.extension();
+        assert!(
+            extension.check(&data.base, &data.star, FuncId::new(0)).is_err(),
+            "modified retained installation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn expanded_handoff_closure_keeps_newly_reached_existing_definitions_exact() {
+    use super::super::super::codegen_module::check_handoff_closure;
+    let mut data = ExtensionData::new();
+    // This definition was hidden behind the original declaration. Keep the
+    // installed body/edges exact and capture this actual candidate image, so
+    // only the expanded-closure preservation rule can catch the changed body.
+    data.star.functions[1].blocks[0].body.insert(
+        0,
+        trust_ir::InstrNode::new(trust_ir::Inst::Const {
+            ty: Ty::U64,
+            value: trust_ir::Constant::Int(1),
+        })
+        .with_result(ValueId::new(9)),
+    );
+    let extension = data.extension();
+    assert!(extension.check(&data.base, &data.star, FuncId::new(0)).is_ok());
+    let error = check_handoff_closure(&data.base, &data.star, FuncId::new(2), Some(&extension))
+        .unwrap_err();
+    assert!(error.contains("pre-existing definition changed"), "{error}");
+}
+
+#[test]
+fn handoff_closure_data_rejects_missing_original_and_expanded_nodes() {
+    use super::super::super::codegen_module::check_handoff_closure;
+    let mut malformed = image("_RRoot", true, None);
+    malformed.functions[0].blocks[0].body.insert(
+        0,
+        trust_ir::InstrNode::new(trust_ir::Inst::Call {
+            callee: FuncId::new(999),
+            args: vec![ValueId::new(0)],
+        })
+        .with_result(ValueId::new(1)),
+    );
+    assert!(check_handoff_closure(&malformed, &malformed, FuncId::new(0), None).is_err());
+}

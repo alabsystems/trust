@@ -4,9 +4,9 @@ note: Clean island kernel-checked: 2 declaration(s) registered (key64, axis_with
 LL | /     def key64 (v : BitVec 64) : Nat :=
 LL | |         Nat.xor (BitVec.toNat v) 9223372036854775808
 LL | |     def axis_within_isl (p : BitVec 64) (lo : BitVec 64) (hi : BitVec 64) : Bool :=
-LL | |         Bool.and (Decidable.decide (Nat.le (key64 lo) (key64 p))
+LL | |         Bool.and (@Decidable.decide (Nat.le (key64 lo) (key64 p))
 LL | |                                    (Nat.decLe (key64 lo) (key64 p)))
-LL | |                  (Decidable.decide (Nat.le (key64 p) (key64 hi))
+LL | |                  (@Decidable.decide (Nat.le (key64 p) (key64 hi))
 LL | |                                    (Nat.decLe (key64 p) (key64 hi)))
    | |____________________________________________________________________^
 

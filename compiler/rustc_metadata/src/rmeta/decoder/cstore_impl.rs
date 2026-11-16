@@ -347,6 +347,26 @@ provide! { tcx, def_id, other, cdata,
     trust_clean_verdict_digest => { table }
     // Trust: ODT transport only. The logical-face query owns local B1 readmission.
     trust_odt_entry => { table }
+    // Trust: PKG-C5d — a projection of the def's optimized MIR, so it is served under
+    // the same (I7) gate as the `optimized_mir` arm above: a listed Clean-origin def is
+    // readmitted before any of its MIR, whole or projected, is read.
+    trust_mentioned_items => {
+        if tcx.trust_clean_origin_exports(def_id.krate).contains(&def_id.index) {
+            tcx.ensure_done().trust_clean_extern_readmission(def_id);
+        }
+        match cdata.root.tables.trust_mentioned_items.get(cdata, def_id.index) {
+            Some(lazy) => Some(lazy.decode((cdata, tcx))),
+            // No row beside a body (encoded MIR always carries the field, so a v24
+            // encoder always writes one): read the field from the body itself, which
+            // is the value by construction, rather than answer "none" for it.
+            None if cdata.root.tables.optimized_mir.get(cdata, def_id.index).is_some() => tcx
+                .optimized_mir(def_id)
+                .mentioned_items
+                .as_ref()
+                .map(|items| items.iter().map(|item| item.node).collect()),
+            None => None,
+        }
+    }
     trust_clean_island_sources => {
         cdata.root.trust_clean_island_sources.decode((cdata, tcx)).collect()
     }

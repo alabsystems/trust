@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Helper proc-macro for Cargo's testsuite."
 
+[dependencies]
+jobserver_utils.workspace = true
+
 [lib]
 proc-macro = true
 

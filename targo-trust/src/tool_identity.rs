@@ -22,7 +22,7 @@ pub(crate) fn retained_daemon_build() -> Result<Option<RetainedDaemonBuild<'stat
         option_env!("CFG_VER_HASH"),
         option_env!("CFG_TRUST_ORACLE_COMPILER_HASH"),
         option_env!("CFG_TRUST_ORACLE_HOST"),
-        option_env!("CFG_RELEASE"),
+        option_env!("CFG_TRUST_ORACLE_COMPILER_RELEASE"),
     )
 }
 
@@ -49,7 +49,7 @@ fn select_retained_daemon_build<'a>(
                 && value.len() <= 128
                 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
         })
-        .ok_or("retained daemon requires the observed compiler CFG_RELEASE")?;
+        .ok_or("retained daemon requires the observed compiler release")?;
     Ok(Some(RetainedDaemonBuild { release, commit: retained }))
 }
 

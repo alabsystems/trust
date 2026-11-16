@@ -1205,7 +1205,7 @@ impl super::CleanIslandSession {
 pub(crate) fn verify_store(store: &clean_fact::FactStore) -> FactStoreReport {
     let mut report = FactStoreReport { rescan: store.rescan(), ..FactStoreReport::default() };
     for key in store.keys() {
-        let StoreRead::Present { object, bytes } = store.get(&key) else { continue };
+        let StoreRead::Present { object, bytes } = store.peek(&key) else { continue };
         let verdict = match StoredFact::decode(&bytes) {
             Ok(fact) if fact.key == key => super::CleanIslandSession::recheck_fact(&fact),
             Ok(_) => FactRecheck::Differs("the fact does not name its key".to_string()),

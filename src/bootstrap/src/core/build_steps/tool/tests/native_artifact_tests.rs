@@ -834,6 +834,34 @@ fn frontend_build_tool_does_not_assemble_or_modify_a_target_sdk() {
     }
 }
 
+// Trust: the retained compiler binding belongs to one exact artifact recipe.
+#[test]
+fn retained_frontend_recipe_uses_snapshot_std_without_changing_sdk_recipe() {
+    let context = crate::utils::tests::TestCtx::new();
+    let config = context.config("build").stage(1).create_config();
+    let build = crate::core::session::Session::new(config);
+    let builder = Builder::new(&build);
+    let compiler = Compiler::new(0, builder.host_target);
+    let recipe = retained_frontend_tool_build_recipe(compiler, builder.host_target);
+    let ordinary = targo_trust_tool_build_recipe(compiler, compiler, builder.host_target);
+    assert_ne!(recipe, ordinary);
+    assert_eq!(ordinary.artifact_kind, ToolArtifactKind::Binary);
+    assert_eq!(recipe.artifact_kind, ToolArtifactKind::RetainedFrontendBinary);
+    assert_eq!(recipe.cargo_input(&builder), CargoInput::CurrentBuildToolSnapshotStd);
+    for change in ["path", "feature", "argument", "compiler", "output"] {
+        let mut changed = recipe.clone();
+        match change {
+            "path" => changed.path = "some-other-tool",
+            "feature" => changed.extra_features.push("another-feature".into()),
+            "argument" => changed.cargo_args.push("--lib".into()),
+            "compiler" => changed.build_compiler = Compiler::new(1, builder.host_target),
+            "output" => changed.output_compiler = Compiler::new(1, builder.host_target),
+            _ => unreachable!(),
+        }
+        assert_eq!(changed.cargo_input(&builder), CargoInput::CurrentBuildTool, "{change}");
+    }
+}
+
 #[test]
 #[should_panic(expected = "targo-trust-build-tool only supports the native build host")]
 fn frontend_build_tool_refuses_a_non_native_host() {

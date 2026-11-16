@@ -134,19 +134,29 @@ def declared_environment(root, receipt, terminal):
     require(len(command) >= 2 and command[0] in ("bash", "/bin/bash") and
             Path(command[1]) == root / "scripts/mint_and_prove_seed.sh", "foreign original entrypoint")
 
-    def option(name):
+    def option(name, required=True):
+        if not required and name not in command:
+            return None
         require(command.count(name) == 1, f"original argv must contain exactly one {name}")
         index = command.index(name)
         require(index + 1 < len(command), f"missing original {name} value")
         return command[index + 1]
 
     host = option("--host")
-    jobs_text = option("--jobs")
-    require(re.fullmatch(r"[1-9][0-9]*", jobs_text), "invalid original job count")
-    jobs = int(jobs_text)
     configuration = receipt["bootstrap_lineage"]["mint_configuration"]
+    recorded_jobs = configuration["xpy_config_overrides"].get("build.jobs")
+    jobs_text = option("--jobs", required=False)
+    if jobs_text is None:
+        # A mint run under build-slot without --jobs (the daily runner's) takes its job
+        # count from admission; the receipt records the count every x.py ran with.
+        require(type(recorded_jobs) is int and recorded_jobs >= 1,
+                "neither the original argv (--jobs) nor the stage receipt (build.jobs) names a job count")
+        jobs = recorded_jobs
+    else:
+        require(re.fullmatch(r"[1-9][0-9]*", jobs_text), "invalid original job count")
+        jobs = int(jobs_text)
     require(host == receipt["host"] == configuration["host"], "original host differs")
-    require(configuration["xpy_config_overrides"].get("build.jobs") == jobs, "original jobs differ")
+    require(recorded_jobs == jobs, "original jobs differ")
     lean = configuration["clean_lean_inputs"]
     require(option("--clean-lean-lib") == lean["library_path"], "original Lean selection differs")
     authority = receipt["build_authority"]
@@ -169,7 +179,18 @@ def declared_environment(root, receipt, terminal):
     for name, rows in authority.get("declared_native_library_paths", {}).items():
         require(name in ("LIBRARY_PATH", "DYLD_LIBRARY_PATH") and isinstance(rows, list), "foreign native environment")
         env[name] = os.pathsep.join(row["selected_local_path"] for row in rows)
-    return host, jobs, work, cargo, env, Path(option("--ddc-seed")), Path(option("--cargo-home"))
+    # Without --ddc-seed the mint chose its default seed; the caller takes it from the
+    # kept ddc-seed.json (kept_ddc_seed) once that is bound to its observation.
+    seed = option("--ddc-seed", required=False)
+    return host, jobs, work, cargo, env, None if seed is None else Path(seed), Path(option("--cargo-home"))
+
+
+def kept_ddc_seed(oracle):
+    """The DDC seed sysroot a mint whose argv named none recorded in its ddc-seed.json."""
+    sysroot = oracle.get("sysroot")
+    require(isinstance(sysroot, str) and Path(sysroot).is_absolute(),
+            "neither the original argv (--ddc-seed) nor the kept ddc-seed.json (sysroot) names a DDC seed")
+    return Path(sysroot)
 
 
 def validate(root, build, evidence, *, support, owner, engine):
@@ -282,6 +303,8 @@ def validate(root, build, evidence, *, support, owner, engine):
     require(state["ddc"].get("stage2_tree_sha256") == pinned["sha256"], "DDC tree differs from original cut")
     require(ddc_docs["ddc-seed.json"] == ddc_docs["ddc-seed-post-build.json"], "DDC oracle changed during build")
     oracle = ddc_docs["ddc-seed.json"]
+    if oracle_root is None:
+        oracle_root = kept_ddc_seed(oracle)
     require(observation.get("oracle_commit") == oracle.get("commit") and
             observation.get("relation") == oracle.get("relation"), "DDC observation oracle differs")
     require(state["ddc"].get("oracle_commit") == oracle.get("commit") and
@@ -525,6 +548,8 @@ def validate_at_provenance(root, build, evidence, *, support, owner, engine):
             support.stage2_records(document(work / "stage2-ddc-seed.json"), "retained oracle stage"), "retained DDC entries differ")
     support.verify_stage2_unchanged(work / "stage2-pinned-seed.json", build / host / "stage2")
     oracle_doc = document(work / "ddc-seed.json")
+    if oracle is None:
+        oracle = kept_ddc_seed(oracle_doc)
     require(oracle_doc == document(work / "ddc-seed-post-build.json") and oracle_doc["sysroot"] == str(oracle) and
             oracle_doc["host"] == host and oracle_doc["relation"] in support.DDC_RELATIONS and
             oracle_doc["relation"] != "reproducibility-control", "retained DDC oracle differs")

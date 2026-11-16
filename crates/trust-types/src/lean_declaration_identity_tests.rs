@@ -123,3 +123,21 @@ fn a_rename_keeps_the_local_id() {
     assert_eq!(before.local_id, after.local_id);
     assert_eq!(before.source_digest, after.source_digest);
 }
+
+#[test]
+fn a_command_runs_to_the_line_the_next_listed_command_starts_on() {
+    let text = "theorem a : 1 = 1 := rfl\n@[simp] def b : Nat := 2\n-- tail\n";
+    let b = text.find("def").unwrap();
+    let texts = lean_command_texts(text, &[(0, 7), (b, b + 3), (text.len() + 1, text.len() + 2)]);
+    // `a` runs to the start of `b`'s line, so `b`'s attribute is `b`'s.
+    assert_eq!(texts[0], Some("theorem a : 1 = 1 := rfl\n"));
+    // A span outside the text is a command no record can read, and so is the
+    // one before it, whose end that span would fix: never a guess.
+    assert_eq!(texts[1], None);
+    assert_eq!(texts[2], None);
+    assert_eq!(lean_command_texts(text, &[(b, b + 3)]), [Some("def b : Nat := 2\n-- tail\n")]);
+    // Two commands on one line: the first ends where the second starts.
+    let one_line = "open Nat theorem c : 2 = 2 := rfl";
+    let c = one_line.find("theorem").unwrap();
+    assert_eq!(lean_command_texts(one_line, &[(0, 4), (c, c + 7)])[0], Some("open Nat "));
+}

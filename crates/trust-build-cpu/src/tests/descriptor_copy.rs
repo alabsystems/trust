@@ -104,10 +104,29 @@ pub(crate) fn relockable(path: &Path) -> bool {
 fn a_copy_exits_on_its_own_once_this_process_end_closes() {
     let fixture = super::kernel_fixture();
     let child = Unexecuted::copy(&fixture).orphan();
-    // No kill and no deadline: only the copy's own exit ends this wait, so a
-    // copy that outlives its parent hangs this test.
-    let status = reap(child);
+    // No kill before the deadline: only the copy's own exit ends this wait in
+    // time. A copy that outlives its parent's end is killed at the deadline and
+    // fails this test, rather than hanging every test that waits on the kernel
+    // fixture.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        let mut status = 0;
+        // SAFETY: child is this test's own unreaped child; status is live.
+        let reaped = unsafe { libc::waitpid(child, &raw mut status, libc::WNOHANG) };
+        if reaped == child {
+            break Some(status);
+        }
+        assert!(reaped == 0 || interrupted(), "waitpid: {}", io::Error::last_os_error());
+        if std::time::Instant::now() >= deadline {
+            // SAFETY: child is this test's own, still unreaped.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            reap(child);
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     drop(fixture);
+    let status = status.expect("the copy outlived its parent's end: still running after 60 s");
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         "the copy did not exit by itself once its parent's end closed: wait status {status}"

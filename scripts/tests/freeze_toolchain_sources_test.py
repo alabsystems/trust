@@ -27,6 +27,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import runpy
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -130,6 +131,23 @@ class FrozenSourcesTests(unittest.TestCase):
         self.assertEqual(manifest["dependencies"]["core"]["package"], "rustc-std-workspace-core")
         self.assertEqual(leaf.read_text(), "live bignum mutation\n")
         self.assertIn("999.0.0", workspace.read_text())
+
+    def test_cli_preserves_clean_checkout_without_bytecode_flag(self):
+        for relative in ("scripts/freeze_toolchain_sources.py",
+                         "src/tools/trust-stage0-dist/prepare.py",
+                         "src/tools/trust-stage0-dist/bootstrap_steps.py"):
+            source = SCRIPT.parent.parent / relative
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "source freezer and TOML owner")
+        result = subprocess.run(
+            [sys.executable, "-I", str(self.repo / "scripts/freeze_toolchain_sources.py"),
+             str(self.repo), "HEAD", str(self.output)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertFalse(list(self.repo.rglob("__pycache__")))
 
     def test_vendored_libunwind_source_is_supported(self):
         repository = self.repository(self.root / "vendored", gitlink=False)

@@ -1,9 +1,8 @@
-error: Clean island batch has no source-local recovery boundary: the publish audit refused this batch; nothing was registered
-         - `hole` reaches the incomplete-proof marker `sorryAx`. Finish the proof, or state the missing step as an `axiom` so it is disclosed by name in the certification closure.
-  --> $DIR/clean_island_tainted_citation.rs:18:5
+error: `hole` did not elaborate: Type mismatch: expected valid type, got Unknown constant: SMT_PROOF
+  --> $DIR/clean_island_tainted_citation.rs:24:5
    |
-LL |     theorem registered_before_failure : 0 = 0 := rfl
-   |     ^
+LL |     theorem hole : True := sorry
+   |     ^^^^^^^
    |
    = note: the Clean island was rejected during resolver checking (two-language design E10)
 

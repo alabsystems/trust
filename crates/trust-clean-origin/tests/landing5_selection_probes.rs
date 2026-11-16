@@ -908,7 +908,7 @@ fn l5_p3_no_existing_route_admits_the_beq_spelling_and_the_kernel_says_why() {
     assert_eq!(
         (got_a, got_b),
         (unfolded_a.as_str(), unfolded_a.as_str()),
-        "MEASURED at clean `46d887ef9`: `rfl` is assigned side A's `Decidable.rec` unfolding, \
+        "MEASURED at clean `554a57b72`: `rfl` is assigned side A's `Decidable.rec` unfolding, \
          so the refused type is `unfold(side A) = unfold(side A)` against `side A = side B`: \
          {rejection}"
     );
@@ -990,8 +990,10 @@ fn split_top_level_eq(eq: &str) -> Option<(&str, &str)> {
 /// `ite α c h t e` as the island prints its δ-unfolding, built from the `ite`'s own
 /// five arguments:
 /// `Decidable.rec c (fun (x : Decidable c) => α)
-///  (fun (f : c -> False) => (fun (f1 : c -> False) => e) f)
+///  (fun (x : ¬c) => (fun (x1 : ¬c) => e) x)
 ///  (fun (x : c) => (fun (x1 : c) => t) x) h`.
+/// The negative arm's binder type prints as `¬c` from clean `554a57b72` (it printed
+/// its unfolding `c -> False`, with binders `f`/`f1`, through `46d887ef9`).
 /// `None` unless `ite` is `ite` applied to exactly five top-level arguments with a
 /// parenthesized condition.
 fn ite_delta_unfolding(ite: &str) -> Option<String> {
@@ -1000,7 +1002,7 @@ fn ite_delta_unfolding(ite: &str) -> Option<String> {
     let bare = cond.strip_prefix('(')?.strip_suffix(')')?;
     Some(format!(
         "Decidable.rec {cond} (fun (x : Decidable {cond}) => {ty}) \
-         (fun (f : {bare} -> False) => (fun (f1 : {bare} -> False) => {else_arm}) f) \
+         (fun (x : ¬{bare}) => (fun (x1 : ¬{bare}) => {else_arm}) x) \
          (fun (x : {bare}) => (fun (x1 : {bare}) => {then_arm}) x) {inst}"
     ))
 }

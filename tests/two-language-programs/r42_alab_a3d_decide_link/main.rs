@@ -118,17 +118,17 @@ clean {
     -- `axiom_closure: Empty`.
     theorem decide_eq_decide_mpr (p : Prop) (q : Prop)
         (dp : Decidable p) (dq : Decidable q) (h : Iff p q) :
-        Eq (Decidable.decide p dp) (Decidable.decide q dq) :=
+        Eq (@Decidable.decide p dp) (@Decidable.decide q dq) :=
       Decidable.casesOn
-        (motive := fun i => Eq (Decidable.decide p i) (Decidable.decide q dq)) dp
+        (motive := fun i => Eq (@Decidable.decide p i) (@Decidable.decide q dq)) dp
         (fun hnp =>
           Decidable.casesOn
-            (motive := fun j => Eq Bool.false (Decidable.decide q j)) dq
+            (motive := fun j => Eq Bool.false (@Decidable.decide q j)) dq
             (fun _ => Eq.refl Bool.false)
             (fun hq => False.elim (hnp (Iff.mpr h hq))))
         (fun hp =>
           Decidable.casesOn
-            (motive := fun j => Eq Bool.true (Decidable.decide q j)) dq
+            (motive := fun j => Eq Bool.true (@Decidable.decide q j)) dq
             (fun hnq => False.elim (hnq (Iff.mp h hp)))
             (fun _ => Eq.refl Bool.true))
 
@@ -138,7 +138,7 @@ clean {
     -- decision instance; the `decide (d < 21)` sugar does not kernel-match the
     -- compiler's import of the body (a3d CONVERSION.md §4.2).
     def depth_fits_isl (d : UInt32) : Bool :=
-      Decidable.decide (LT.lt d (UInt32.ofNat 21))
+      @Decidable.decide (LT.lt d (UInt32.ofNat 21))
                        (instDecidableUInt32Lt d (UInt32.ofNat 21))
 
     -- ── What makes 21 the RIGHT number ────────────────────────────────────
@@ -150,7 +150,7 @@ clean {
     -- WRAPS and the two decisions genuinely differ (d = 1431655765 makes the
     -- UInt32 product 0).
     def span_fits_isl (d : UInt32) : Bool :=
-      Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
+      @Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
                        (Nat.decLt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
 
     -- The machine carrier and the Nat carrier agree DEFINITIONALLY: UInt32's
@@ -198,7 +198,7 @@ clean {
     --
     -- This is the statement a3d's CONVERSION.md §4 asks for, in its own
     -- spelling: `depth_fits_isl d = span_fits_isl d`. MEASURED: the unfolded
-    -- form — `Eq (Decidable.decide (LT.lt d (UInt32.ofNat 21)) (…)) (span_fits_isl d)`,
+    -- form — `Eq (@Decidable.decide (LT.lt d (UInt32.ofNat 21)) (…)) (span_fits_isl d)`,
     -- which is what the compiler's E6 import of the body reduces to — also
     -- discharges the clause, with the identical `4 proved, 0 unknown`. The
     -- kernel delta-reduces the definition, so the readable form is enough;

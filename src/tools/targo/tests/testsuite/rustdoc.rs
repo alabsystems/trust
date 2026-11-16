@@ -8,6 +8,97 @@ use cargo_test_support::{basic_manifest, cross_compile, project};
 
 use crate::utils::cross_compile::disabled as cross_compile_disabled;
 
+/// A native proxy observes the actual inherited FIFO pair, rather than trusting
+/// MAKEFLAGS text. The post-build doctest must use the same scheduler as the
+/// fixture's compiler; a lost handoff or a fresh replacement pool fails here.
+#[cfg(unix)]
+#[cargo_test]
+fn doctests_retain_the_original_compiler_scheduler() {
+    let proxy = project()
+        .at("doc-gnu-proxy")
+        .file("Cargo.toml", &basic_manifest("doc-gnu-proxy", "0.0.1"))
+        .file("src/main.rs", r#"
+use std::ffi::{CString, OsString};
+use std::mem::ManuallyDrop;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::Path;
+
+unsafe extern "C" {
+    fn execvp(program: *const std::ffi::c_char, args: *const *const std::ffi::c_char) -> i32;
+}
+
+fn main() {
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let rustc = args.first().is_some_and(|arg| {
+        matches!(Path::new(arg).file_name().and_then(|s| s.to_str()), Some("rustc" | "trustc"))
+    });
+    let program = if rustc { args.remove(0) }
+        else { std::env::var_os("DOC_GNU_REAL_RUSTDOC").expect("real rustdoc") };
+    let compiler_work = rustc && args.windows(2).any(|a| a[0] == "--crate-name" && a[1] == "foo");
+    let doctest_work = !rustc && args.iter().any(|a| a == "--test");
+    if compiler_work || doctest_work {
+        let flags = std::env::var("CARGO_MAKEFLAGS").expect("compiler scheduler was not retained");
+        let auth = flags.split_whitespace().find_map(|s| s.strip_prefix("--jobserver-auth="))
+            .expect("GNU pipe handoff");
+        let (read, write) = auth.split_once(',').expect("GNU pipe pair");
+        let read = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(read.parse().unwrap()) });
+        let write = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(write.parse().unwrap()) });
+        let r = read.metadata().expect("live original GNU read endpoint");
+        let w = write.metadata().expect("live original GNU write endpoint");
+        assert!(r.file_type().is_fifo() && w.file_type().is_fifo());
+        let identity = format!("{}:{}:{}:{}", r.dev(), r.ino(), w.dev(), w.ino());
+        let record = std::env::var_os("DOC_GNU_RECORD").expect("identity record");
+        if compiler_work { std::fs::write(record, identity).unwrap(); }
+        else {
+            assert_eq!(std::fs::read_to_string(record).unwrap(), identity, "doctest replaced the compiler's original pool");
+            std::fs::write(std::env::var_os("DOC_GNU_DOCTEST_RECORD").expect("doctest identity record"), identity).unwrap();
+        }
+    }
+    let program = CString::new(program.as_os_str().as_bytes()).unwrap();
+    let args: Vec<CString> = std::iter::once(program.clone()).chain(
+        args.iter().map(|a| CString::new(a.as_os_str().as_bytes()).unwrap())
+    ).collect();
+    let mut pointers: Vec<_> = args.iter().map(|a| a.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    unsafe { execvp(program.as_ptr(), pointers.as_ptr()); }
+    panic!("exec compiler: {}", std::io::Error::last_os_error());
+}
+"#)
+        .build();
+    proxy.cargo("build").run();
+    let p = project()
+        .at("doc-gnu-subject")
+        .file(
+            "src/lib.rs",
+            r#"
+/// ```
+/// assert_eq!(foo::answer(), 42);
+/// ```
+pub fn answer() -> u32 { 42 }
+/// ```compile_fail,E0451
+/// let _ = foo::Sealed { private: () };
+/// ```
+pub struct Sealed { private: () }
+"#,
+        )
+        .build();
+    p.cargo("test --doc")
+        .env("RUSTC_WRAPPER", proxy.bin("doc-gnu-proxy"))
+        .env("RUSTDOC", proxy.bin("doc-gnu-proxy"))
+        .env("DOC_GNU_REAL_RUSTDOC", "rustdoc")
+        .env("DOC_GNU_RECORD", p.root().join("compiler-gnu.identity"))
+        .env("DOC_GNU_DOCTEST_RECORD", p.root().join("doctest-gnu.identity"))
+        .with_stdout_contains("test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;[..]")
+        .run();
+    // Trust: require both actual events. A successful library build alone must
+    // not count as evidence that the post-build doctest used the original pool.
+    let compiler_identity = fs::read(p.root().join("compiler-gnu.identity")).unwrap();
+    let doctest_identity = fs::read(p.root().join("doctest-gnu.identity")).unwrap();
+    assert_eq!(compiler_identity, doctest_identity);
+}
+
 #[cargo_test]
 fn rustdoc_simple() {
     let p = project().file("src/lib.rs", "").build();

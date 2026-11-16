@@ -6,7 +6,7 @@ LL | |         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
 LL | |         Nat.le (UInt64.toNat (if a < b then b else a)) (UInt64.toNat a) :=
 LL | |         fun a b h => Decidable.casesOn
 ...  |
-LL | |             (fun _ => Nat.le.refl (UInt64.toNat a))
+LL | |             (fun _ => @Nat.le.refl (UInt64.toNat a))
 LL | |             (fun _ => h)
    | |________________________^
 
@@ -72,7 +72,7 @@ LL | | }
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=4 proof_obligations=[4] request_digest=sha256:$DIGEST
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=5 proof_obligations=[5] request_digest=sha256:$DIGEST
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-wp request_id=6 proof_obligations=[2] request_digest=sha256:$DIGEST
-   = note: native full verifier evidence `obligation:e9_requires_hypothesis_arithmetic_omitted__rmax_guarded:postcondition:2`: native trust_mc raw source admission refused: raw postcondition function carries native body assumptions
+   = note: native full verifier evidence `obligation:e9_requires_hypothesis_arithmetic_omitted__rmax_guarded:postcondition:2`: native trust-mc has no encoding for this exactly bound raw source postcondition
    = note: native full verifier evidence `obligation:e9_requires_hypothesis_arithmetic_omitted__rmax_guarded:postcondition:2`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
    = note: native full verifier evidence `obligation:e9_requires_hypothesis_arithmetic_omitted__rmax_guarded:postcondition:2`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
    = note: native full verifier evidence `vc:e9_requires_hypothesis_arithmetic_omitted__rmax_guarded:postcondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-3-proof-3, function=rmax_guarded, kind=Assertion, relations=1, clauses=1

@@ -58,22 +58,22 @@
 clean {
     theorem decide_eq_decide_mpr (p : Prop) (q : Prop)
         (dp : Decidable p) (dq : Decidable q) (h : Iff p q) :
-        Eq (Decidable.decide p dp) (Decidable.decide q dq) :=
+        Eq (@Decidable.decide p dp) (@Decidable.decide q dq) :=
       Decidable.casesOn
-        (motive := fun i => Eq (Decidable.decide p i) (Decidable.decide q dq)) dp
+        (motive := fun i => Eq (@Decidable.decide p i) (@Decidable.decide q dq)) dp
         (fun hnp =>
           Decidable.casesOn
-            (motive := fun j => Eq Bool.false (Decidable.decide q j)) dq
+            (motive := fun j => Eq Bool.false (@Decidable.decide q j)) dq
             (fun _ => Eq.refl Bool.false)
             (fun hq => False.elim (hnp (Iff.mpr h hq))))
         (fun hp =>
           Decidable.casesOn
-            (motive := fun j => Eq Bool.true (Decidable.decide q j)) dq
+            (motive := fun j => Eq Bool.true (@Decidable.decide q j)) dq
             (fun hnq => False.elim (hnq (Iff.mp h hp)))
             (fun _ => Eq.refl Bool.true))
 
     def span_fits_isl (d : UInt32) : Bool :=
-      Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
+      @Decidable.decide (Nat.lt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
                        (Nat.decLt (Nat.mul 3 (Nat.add (UInt32.toNat d) 1)) 64)
 
     theorem depth_carrier_iff (d : UInt32) :
@@ -101,7 +101,7 @@ clean {
                   (Nat.le_of_lt h) (by decide)))))
 
     theorem depth_fits_is_span_fits : forall (d : UInt32),
-        Eq (Decidable.decide (LT.lt d (UInt32.ofNat 21))
+        Eq (@Decidable.decide (LT.lt d (UInt32.ofNat 21))
                              (instDecidableUInt32Lt d (UInt32.ofNat 21)))
            (span_fits_isl d) :=
       fun d =>

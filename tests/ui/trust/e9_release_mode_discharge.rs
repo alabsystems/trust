@@ -26,7 +26,7 @@ clean {
                     d (fun _ => y) (fun _ => x))) (UInt64.toNat x))
             (instDecidableUInt64Lt x y)
             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
-            (fun h => Nat.le.refl (UInt64.toNat x))
+            (fun h => @Nat.le.refl (UInt64.toNat x))
 }
 
 pub fn min2(a: u64, b: u64) -> u64 { if a < b { a } else { b } }

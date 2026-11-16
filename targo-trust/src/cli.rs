@@ -904,6 +904,7 @@ pub(crate) fn usage_text() -> String {
         "  targo trust check <file.lean>  Kernel-check standalone Clean/Lean with the linked CIC kernel",
         "  targo trust build [file]       Verify and build the crate or a single file",
         "  targo trust build <file.lean> --emit=trust-ir --out <new-path>  Write a checked local-source Lean IR-library JSON envelope (not an executable or raw .tir)",
+        "  targo trust build <file.lean> --emit=object --out <new.o>  Emit a kernel-gated scalar strict trust-cg object for this AArch64 host (no executable linked)",
         "  targo trust test               Verify and run tests with certified clause monitors",
         "  targo trust spec --emit clean [-p <pkg>]  Print the Clean goals the kernel actually graded (compiler-authoritative, v6/D1)",
         "  targo trust version            Emit Trust product/toolchain identity",
@@ -922,6 +923,7 @@ pub(crate) fn usage_text() -> String {
         "  targo trust survey <crate>     Survey a crate's obligations to per-obligation JSON (status + reason)",
         "  targo trust gap [survey.json]  Classify a survey into user-logic vs derived gap + reason histogram",
         "  targo trust benchmark program-index  Run compile/verify program-index benchmarks",
+        "  targo trust benchmark verify-cost  Time verifying a crate of trivial functions",
         "  targo trust lift <binary>      Lift a binary into TrustIr and summarize coverage",
         "  targo trust verify-binary <binary>  Generate binary VCs from a lifted binary",
         "  targo trust decompile <binary> --to trust_ir|rust|trust-cg|wasm  Produce conservative decompilation output",
@@ -939,9 +941,10 @@ pub(crate) fn usage_text() -> String {
         "  targo trust bootstrap <command> Run Trust stage0 maintenance scripts",
         "  targo trust diff <ref>..<ref>   Run a non-proof source-contract audit between git refs",
         "  targo trust diff --baseline <file> [-p <pkg>]...  Re-check and fail on any proof lost against a committed obligation baseline",
-        "  targo trust delta [--since <token>] [--all-rows] <record.ndjson>...  Snapshot a check's obligation records and print the rows that changed since <token> or since this agent session's last run",
+        "  targo trust delta [--since <token>] [--all-rows] [--target-dir <dir>] <record.ndjson>...  Snapshot `trust.obligations.v1` records already on disk (a check's, or a test run's snapshot) and print the rows that changed since a base measured on the same lane, policy and selection (<token>, for its package only; else the last such token this session was shown for that package in this target directory within 30 days), and every row not plainly proved (every row with --all-rows)",
+        crate::land::USAGE_LINE,
         "  targo trust stability [--axes <list>] [--against <dir>]  Re-run the check in legs under pairs of conditions; exit 1 names every obligation whose verdict moved, or a record's solver fault or unexplained stop",
-        "  targo trust meter [--target-dir DIR] [--gate-runs DIR] [--hook-log FILE] [--json] [--check]  Where an agent's time went (proof, Lean, gate legs, push), largest wait first; --check names every phase not measured",
+        "  targo trust meter [--target-dir DIR]... [--gate-runs DIR]... [--gate-record FILE]... [--hook-log FILE]... [--window <N>h|<N>d] [--top N] [--json | --format terminal|json] [--check]  Where an agent's time went, largest wait first; --check exits 1 naming every phase not measured (a named source that is missing or empty is one)",
         "  targo trust init [file]        Scaffold inert, review-required contract candidates",
         "  targo trust temporal [path]    Inspect the proof-bearing temporal engine boundary; exits 2 pending authenticated build binding",
         "  targo trust temporal ingest <spec.tla> --config <spec.cfg> [--out <image.json>]  Emit a bounded zero-authority canonical Lean/Clean proposition image",
@@ -983,8 +986,8 @@ pub(crate) fn usage_text() -> String {
         "  --scope <path>            Scope git diff to a path prefix (e.g., crates/)",
         "  --baseline <path>         Committed obligation baseline (`trust-baseline v1`) for `diff`",
         "  --save-baseline <path>    `check`: write this run's proved obligation keys to a committed baseline",
-        "  --since <token>           `check`: print the rows that changed since that snapshot token, and every row not plainly proved (crate or .lean)",
-        "  --all-rows                `check`: print every row as well as the changes since the base",
+        "  --since <token>           `check` (crate or .lean) and `test`: print the changes since that snapshot, as `targo trust delta` does; a Rust check refuses it (exit 2) with --standalone, --rewrite or a single .rs file, else ignores it with a note under --function",
+        "  --all-rows                `check` (crate or .lean) and `test`: print every row as well as the changes; refused or ignored as --since is",
         "  --report-dir <dir>        Write proof report files (JSON, HTML, NDJSON) to dir",
         "  --function <name>         Focus check exit semantics on one function selector",
         "  --inline                  Write inert, commented contract candidates into source files (init)",
@@ -1217,6 +1220,37 @@ mod tests {
         assert!(usage.contains("a refuted obligation still"), "{usage}");
         assert!(usage.contains("exits 1, and failing tests, a compiler error the rows"), "{usage}");
         assert_eq!(crate::determinism_report::EXIT_COULD_NOT_RUN, 3);
+    }
+
+    /// The changed-only view's base is stated as `agent_delta` chooses it (per
+    /// package, measurement and target directory, for `POINTER_RETENTION`, not
+    /// "the last run"), and the single-file refusal before the `--function` note.
+    #[test]
+    fn usage_text_states_the_delta_base_as_agent_delta_chooses_it() {
+        let usage = usage_text();
+        let line = |start: &str| {
+            usage
+                .lines()
+                .map(str::trim_start)
+                .find(|line| line.starts_with(start))
+                .unwrap_or_else(|| panic!("no `{start}` line:\n{usage}"))
+        };
+        let days = crate::agent_delta::POINTER_RETENTION.as_secs() / (24 * 60 * 60);
+        let delta = line("targo trust delta ");
+        assert!(delta.contains("measured on the same lane, policy and selection"), "{delta}");
+        assert!(delta.contains("<token>, for its package only"), "{delta}");
+        let session = format!(
+            "the last such token this session was shown for that package in this target \
+             directory within {days} days"
+        );
+        assert!(delta.contains(&session), "{delta}");
+        assert!(!delta.contains("last run"), "{delta}");
+        let since = line("--since <token>");
+        assert!(since.contains("as `targo trust delta` does"), "{since}");
+        assert!(since.contains("single .rs file, else ignores it with a note"), "{since}");
+        let all_rows = line("--all-rows");
+        assert!(all_rows.contains("refused or ignored as --since is"), "{all_rows}");
+        assert!(!all_rows.contains("does not change that"), "{all_rows}");
     }
 
     #[test]

@@ -488,3 +488,6 @@ fn check_supplied(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "kernel-recheck"))]
+mod current_legacy_advice;

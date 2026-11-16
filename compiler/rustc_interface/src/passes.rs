@@ -1028,6 +1028,11 @@ fn changed_trust_critical_query_provider(providers: &Providers) -> Option<&'stat
     // refusal; a callback answering `true` would admit real `global_asm!`.
     reject_changed_query!(trust_def_is_clean_island);
     reject_changed_extern_query!(trust_def_is_clean_island);
+    // Trust: PKG-C5d — the spawn census's sysroot scan reads each sysroot body's
+    // `mentioned_items` through this query; a callback answering `None` would close
+    // `dyn` pools short (a missing spawn row) without disturbing codegen.
+    reject_changed_query!(trust_mentioned_items);
+    reject_changed_extern_query!(trust_mentioned_items);
     reject_changed_query!(codegen_fn_attrs);
     reject_changed_extern_query!(codegen_fn_attrs);
     reject_changed_extern_query!(crate_dep_kind);

@@ -28,7 +28,7 @@ clean {
     def key128 (v : BitVec 128) : Nat :=
         Nat.xor (BitVec.toNat v) 170141183460469231731687303715884105728
     def bound_isl (x : BitVec 128) : Bool :=
-        Decidable.decide (Nat.le (key128 x) (key128 (BitVec.ofNat 128 100)))
+        @Decidable.decide (Nat.le (key128 x) (key128 (BitVec.ofNat 128 100)))
                          (Nat.decLe (key128 x) (key128 (BitVec.ofNat 128 100)))
 }
 pub fn at_bound(x: i128) -> bool

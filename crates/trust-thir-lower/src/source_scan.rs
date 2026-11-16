@@ -115,6 +115,10 @@ pub(crate) const PRODUCER_FILES: &[(&str, &str)] = &[
     ("concrete_type_transport.rs", include_str!("concrete_type_transport.rs")),
     ("instance_const.rs", include_str!("instance_const.rs")),
     ("effect_conservation/thir_source/capture.rs", include_str!("effect_conservation/thir_source/capture.rs")),
+    // Original pre-IR source intake and the source claim written by production metadata.
+    // Both remain visible to every producer scan; neither grants proof/admission.
+    ("source_word64.rs", include_str!("source_word64.rs")),
+    ("source_word64/record.rs", include_str!("source_word64/record.rs")),
 ];
 /// Out-of-line test files of producer modules (all test code, no production section), each under
 /// `producer_tests/`.
@@ -273,6 +277,8 @@ pub(crate) const NON_PRODUCER_FILES: &[&str] = &[
     "rmeta_entry/tests.rs",
     "rmeta_entry/envelope_tests.rs",
     "source_static_readback/tests.rs",
+    // Unit-test code only, like the other out-of-line helper tests above.
+    "source_word64/record/tests.rs",
     "spawn_census/tests.rs",
     "template_lowering/tests.rs",
     // `lib.rs`'s out-of-line test modules. No scan has ever read them as producer text.
@@ -1134,7 +1140,7 @@ mod tests {
     /// before the first inline test module. No new source may hide in the tail.
     #[test]
     fn producer_text_contains_every_complete_production_section_before_tests() {
-        assert_eq!(PRODUCER_FILES.len(), 20, "all current production files are pinned");
+        assert_eq!(PRODUCER_FILES.len(), 22, "all current production files are pinned");
         let paths: Vec<_> = PRODUCER_FILES.iter().map(|(path, _)| *path).collect();
         assert_eq!(paths, [
             "lib.rs", "ordered_slice_match.rs", "shared_borrow.rs", "float_storage.rs",
@@ -1149,6 +1155,8 @@ mod tests {
             "concrete_type_transport.rs",
             "instance_const.rs",
             "effect_conservation/thir_source/capture.rs",
+            "source_word64.rs",
+            "source_word64/record.rs",
         ]);
         assert!(PRODUCER_TEST_FILES.is_empty());
         let lib = include_str!("lib.rs");
@@ -1185,9 +1193,13 @@ mod tests {
         let instance_end = production_end(instance_consts).expect("instance const inline tests");
         let source_capture = include_str!("effect_conservation/thir_source/capture.rs");
         assert_eq!(production_end(source_capture), None);
+        let word64_source = include_str!("source_word64.rs");
+        let word64_record = include_str!("source_word64/record.rs");
+        assert_eq!(production_end(word64_source), None);
+        assert_eq!(production_end(word64_record), None);
         let joined = producer_text();
         let expected = format!(
-            "{}{FILE_BOUNDARY}{ordered_slice}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{float_storage}{FILE_BOUNDARY}{primitive_storage}{FILE_BOUNDARY}{unit_transport}{FILE_BOUNDARY}{float_binding}{FILE_BOUNDARY}{coroutine}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{indexed}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{raw_entry}{FILE_BOUNDARY}{raw_coercion}{FILE_BOUNDARY}{wrapping_add}{FILE_BOUNDARY}{callable}{FILE_BOUNDARY}{concrete_types}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{source_capture}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}",
+            "{}{FILE_BOUNDARY}{ordered_slice}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{float_storage}{FILE_BOUNDARY}{primitive_storage}{FILE_BOUNDARY}{unit_transport}{FILE_BOUNDARY}{float_binding}{FILE_BOUNDARY}{coroutine}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{indexed}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{raw_entry}{FILE_BOUNDARY}{raw_coercion}{FILE_BOUNDARY}{wrapping_add}{FILE_BOUNDARY}{callable}{FILE_BOUNDARY}{concrete_types}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{source_capture}{FILE_BOUNDARY}{word64_source}{FILE_BOUNDARY}{word64_record}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}{FILE_BOUNDARY}{}",
             &lib[..lib_end], include_str!("shared_borrow.rs"),
             include_str!("drops/owned_shared.rs"), include_str!("shared_receiver_freeze.rs"),
             &calling[..calling_end], &provenance[..provenance_end],
@@ -1195,7 +1207,7 @@ mod tests {
             &calling[calling_end..], &provenance[provenance_end..], &instance_consts[instance_end..],
         );
         assert_eq!(joined, expected);
-        assert_eq!(joined.matches(FILE_BOUNDARY_TOKEN).count(), 23);
+        assert_eq!(joined.matches(FILE_BOUNDARY_TOKEN).count(), 25);
         let end = production_end(joined).expect("joined inline test section");
         assert!(joined.starts_with(&lib[..lib_end]));
         assert!(joined.ends_with(&instance_consts[instance_end..]));

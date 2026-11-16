@@ -161,10 +161,14 @@ impl NativeCapacityBank {
 
     /// Consume an unused cooperative bank into recovery-scoped custody. A
     /// refused conversion returns the SAME original bank; no active/local
-    /// loan, fixed V1 handoff or observed record can be converted here.
-    pub fn try_into_scoped(self) -> Result<ScopedNativeCapacityBank, (io::Error, Self)> {
+    /// loan, fixed V1 handoff or observed record can be converted here. The
+    /// bank is returned boxed, since it is large.
+    pub fn try_into_scoped(self) -> Result<ScopedNativeCapacityBank, (io::Error, Box<Self>)> {
         if self.process != std::process::id() || self.next != 0 || self.phase != Phase::Running {
-            return Err((invalid("scoped bank requires its unused original owner"), self));
+            return Err((
+                invalid("scoped bank requires its unused original owner"),
+                Box::new(self),
+            ));
         }
         Ok(ScopedNativeCapacityBank::new(self))
     }

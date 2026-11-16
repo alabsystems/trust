@@ -1113,6 +1113,22 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    /// Trust (PKG-C5d): the `mentioned_items` of `key`'s optimized MIR, without
+    /// their spans, and `None` exactly when that body's own field is `None`.
+    /// For an extern def it is read from the producer's `trust_mentioned_items`
+    /// table, which the encoder writes from the same body in the same step that
+    /// writes its `optimized_mir` row, so it is that body's field and nothing
+    /// else: no filter is applied on either side. The spawn census's sysroot
+    /// scan reads this instead of decoding every sysroot body whole. Ask it only
+    /// where `is_mir_available` holds: off-MIR the extern provider answers `None`
+    /// and the local one ICEs exactly as `optimized_mir` does (the census never
+    /// asks for a local def). A missing row beside a body is read from the body.
+    query trust_mentioned_items(key: DefId) -> Option<&'tcx Vec<mir::MentionedItem<'tcx>>> {
+        desc { "reading the mentioned items of `{}`", tcx.def_path_str(key) }
+        arena_cache
+        separate_provide_extern
+    }
+
     /// Trust: cached local/extern logical face. Imported data is bound to the
     /// imported Rust declaration and re-earns kernel B1. Unsupported requested
     /// shapes refuse by name. No B2/B3 authority follows from these bytes.

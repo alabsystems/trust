@@ -8,7 +8,9 @@
 //! separate domain binds those roots, the structural declaration identity, its
 //! exact kernel payload, and the actual emitted/relocated Trust-IR function.
 //! These private tokens are in-memory permissions, not serializable kernel
-//! certificates or authority for linking, codegen, or a complete program.
+//! certificates or authority for linking or a complete program. Object emission
+//! additionally requires exact typed codegen custody and the unchanged strict
+//! machine-output gate; a token or stored stamp alone never licenses bytes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -201,6 +203,9 @@ pub struct StandaloneTrustIrFaithful {
 /// Exact post-relocation function identity, still an in-memory bounded verdict.
 #[derive(Debug)]
 pub struct PublishedStandaloneTrustIrFaithful {
+    // Exact custody retained at the existing kernel mint, never reconstructed from a receipt.
+    signature: FuncTy,
+    function: Function,
     identity: StandaloneLeanIdentity,
     subject_digest: ProofDigest,
     carrier: StandaloneCarrier,
@@ -274,6 +279,8 @@ impl StandaloneTrustIrFaithful {
             return Err(GateRefusal::new("published-carrier", "published carrier changed"));
         }
         Ok(PublishedStandaloneTrustIrFaithful {
+            signature: signature.clone(),
+            function: published.clone(),
             identity: self.identity.clone(),
             subject_digest: subject_digest(self.shape, &self.identity, signature, published)?,
             carrier: self.carrier,
@@ -303,6 +310,58 @@ impl StandaloneTrustIrFaithful {
 }
 
 impl PublishedStandaloneTrustIrFaithful {
+    /// Reconcile this retained publication with the actual accepted source batch.
+    /// This reuses the existing exact source identity, not a caller digest.
+    pub fn authenticate_context(
+        &self,
+        context: &AcceptedLeanSourceContext<'_>,
+    ) -> Result<(), GateRefusal> {
+        if capture_identity(context, &self.identity.declaration)? != self.identity {
+            return Err(GateRefusal::new(
+                "standalone-codegen-context",
+                "standalone publication belongs to a different accepted source/kernel context",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Authenticate exact retained subjects and identity-only codegen placement.
+    /// This transports an existing kernel verdict; it reads no new instructions
+    /// or source semantics and grants no caller, linker or executable authority.
+    pub fn authenticate_codegen(
+        &self,
+        source_signature: &FuncTy,
+        source_function: &Function,
+        codegen_signature: &FuncTy,
+        codegen_function: &Function,
+        relocation: crate::CodegenRelocation,
+    ) -> Result<(), GateRefusal> {
+        if source_signature != &self.signature || source_function != &self.function {
+            return Err(GateRefusal::new(
+                "standalone-retained-subject",
+                "standalone publication does not retain this exact signature/function",
+            ));
+        }
+        if source_signature != codegen_signature {
+            return Err(GateRefusal::new(
+                "standalone-codegen-signature",
+                "standalone object emission requires exact identity ABI; no signature legalization",
+            ));
+        }
+        let mut expected = self.function.clone();
+        expected.id = relocation.function_id;
+        expected.linkage = relocation.linkage;
+        expected.visibility = relocation.visibility;
+        expected.body_gate = Some(standalone_codegen_gate_stamp());
+        if &expected != codegen_function {
+            return Err(GateRefusal::new(
+                "standalone-codegen-function",
+                "standalone codegen changed a field beyond explicit id/linkage/visibility and inert gate metadata",
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn identity(&self) -> &StandaloneLeanIdentity {
         &self.identity
@@ -1910,4 +1969,14 @@ fn subject_digest(
     module.func_types.push(signature.clone());
     module.functions.push(function.clone());
     Ok(module.stable_digest())
+}
+
+/// Distinct standalone custody domain; a freely writable stamp alone is never admission.
+pub const STANDALONE_CODEGEN_AUTHORITY: &str = "clean-standalone-kernel-gate";
+
+/// Disclosure metadata only. The F1 boundary additionally requires the original
+/// private in-memory publication and exact retained signature/function.
+#[must_use]
+pub fn standalone_codegen_gate_stamp() -> trust_ir::BodyGate {
+    trust_ir::BodyGate::Gated { authority: STANDALONE_CODEGEN_AUTHORITY.to_owned(), evidence: None }
 }

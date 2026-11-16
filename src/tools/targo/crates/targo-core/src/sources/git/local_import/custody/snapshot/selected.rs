@@ -105,21 +105,28 @@ pub(in super::super::super) fn import_selected(
         if !databases.contains_key(&ident) {
             let original = if let Some(path) = selectors.get(source.id.canonical_url()) {
                 used.insert(source.id.canonical_url().clone());
-                ObjectSource::capture_objects(path)?
+                ObjectSource::capture_objects(path)
             } else {
-                ObjectSource::capture(&cache.home.path.join("git/db").join(&ident))?
-            };
+                ObjectSource::capture(&cache.home.path.join("git/db").join(&ident))
+            }
+            .with_context(|| {
+                crate::sources::git::source::object_source_context(source.id, revision)
+            })?;
             let objects = selectors
                 .get(source.id.canonical_url())
                 .map(|path| (*path).clone())
                 .unwrap_or_else(|| cache.home.path.join("git/db").join(&ident).join("objects"));
             let mut view = stage.create_view(&ident)?;
-            let copied = original.materialize_view(
-                &objects,
-                &mut view,
-                super::super::super::MAX_TOTAL_BYTES - view_bytes,
-                &mut budget,
-            )?;
+            let copied = original
+                .materialize_view(
+                    &objects,
+                    &mut view,
+                    super::super::super::MAX_TOTAL_BYTES - view_bytes,
+                    &mut budget,
+                )
+                .with_context(|| {
+                    crate::sources::git::source::object_source_context(source.id, revision)
+                })?;
             view_bytes += copied.bytes;
             let odb = git2::Odb::new()?;
             odb.add_disk_alternate(
@@ -172,8 +179,13 @@ pub(in super::super::super) fn import_selected(
         database.original.check_current()?;
         database.view.check_current()?;
         // Actual selected commit/tree parsing, never a saved presence status.
-        database.input.find_commit(revision)?;
-        let children = submodules::selected(&database.input, revision, &source.parent_url)?;
+        database.input.find_commit(revision).with_context(|| {
+            crate::sources::git::source::object_source_context(source.id, revision)
+        })?;
+        let children = submodules::selected(&database.input, revision, &source.parent_url)
+            .with_context(|| {
+                crate::sources::git::source::object_source_context(source.id, revision)
+            })?;
         if references.insert((ident.clone(), revision)) {
             output.generated(
                 &PathBuf::from("git/db")

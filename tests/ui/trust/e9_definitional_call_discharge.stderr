@@ -3,8 +3,8 @@ note: Clean island kernel-checked: 1 declaration(s) registered (u64_ge_refl)
    |
 LL | /     theorem u64_ge_refl : forall (x : UInt64),
 LL | |         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-LL | |         fun x => Nat.le.refl (UInt64.toNat x)
-   | |_____________________________________________^
+LL | |         fun x => @Nat.le.refl (UInt64.toNat x)
+   | |______________________________________________^
 
 
 === Trust Verification Report (e9_definitional_call_discharge) ===

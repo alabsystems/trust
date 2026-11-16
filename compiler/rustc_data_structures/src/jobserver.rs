@@ -270,6 +270,19 @@ pub fn native_v3_context() -> Option<Arc<NativeV3>> {
     CLIENT.get()?.as_ref().ok()?.native_context()
 }
 
+/// Trust: retain the scheduler for a child compiler even when rustdoc has not
+/// initialized a global compiler session. Reuse native-entry custody; never
+/// reimport ambient descriptor numbers here. A truly unscoped caller uses the
+/// existing local policy with one permanently held execution and no extra GNU
+/// credit. The caller must serialize loans and retain the owner through wait.
+pub fn for_compiler_descendant() -> Result<jobserver_utils::Jobserver, String> {
+    if let Some(client) = CLIENT.get() {
+        return client.as_ref().map_err(Clone::clone)?.for_compiler_descendant();
+    }
+    let local = early::local(1, false)?;
+    early::for_compiler_descendant(&local)
+}
+
 /// Returns the jobserver client previously initialized by `initialize_checked`.
 ///
 /// # Assumptions about holding jobserver tokens

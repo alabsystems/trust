@@ -52,7 +52,7 @@
 //! subtype separator token, so an annotation inside the braces is island source.
 
 clean {
-    theorem le_self (n : Nat) : Nat.le n n := Nat.le.refl n
+    theorem le_self (n : Nat) : Nat.le n n := @Nat.le.refl n
 }
 //~^^ NOTE Clean island kernel-checked: 1 declaration(s) registered (le_self)
 

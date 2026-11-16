@@ -365,6 +365,9 @@ fn partial_oversized_eof_and_deadlines_never_authorize_or_extend() {
     {
         let (mut child, mut parent) = child_pair();
         parent.write_all(&bytes).unwrap();
+        // Establish actual EOF even if another test is launching a process
+        // with a temporary CLOEXEC copy of this peer descriptor.
+        parent.shutdown(std::net::Shutdown::Write).unwrap();
         drop(parent);
         assert!(child.poll_grant(child.deadline()).is_err());
     }
@@ -379,8 +382,27 @@ fn partial_oversized_eof_and_deadlines_never_authorize_or_extend() {
         "qualification peek must retain the queued grant"
     );
     assert!(child.poll_grant(child.deadline()).unwrap().is_some());
+    // Dropping one descriptor is not EOF while a concurrent fork holds a
+    // copy until exec. Shutdown establishes EOF across those copies without
+    // changing the original deadline or relaxing the cancellation assertion.
+    parent.shutdown(std::net::Shutdown::Write).unwrap();
     drop(parent);
     assert!(child.poll_cancelled().unwrap());
+}
+
+#[test]
+fn a_live_peer_copy_is_not_eof_and_write_shutdown_cancels_across_copies() {
+    let (mut child, mut parent) = child_pair();
+    raw_frame(&mut parent, VERSION, grant_message());
+    assert!(child.poll_grant(child.deadline()).unwrap().is_some());
+    // A fork can hold the same socket until exec even when its descriptor is
+    // CLOEXEC. An owned duplicate deterministically pins that socket state.
+    let held_copy = parent.try_clone().unwrap();
+    drop(parent);
+    assert!(!child.poll_cancelled().unwrap(), "the actual peer is still live");
+    held_copy.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(child.poll_cancelled().unwrap(), "actual EOF cancels immediately");
+    assert!(child.poll_cancelled().unwrap(), "cancellation remains sticky");
 }
 
 #[test]

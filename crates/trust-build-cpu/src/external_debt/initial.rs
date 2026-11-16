@@ -86,10 +86,11 @@ impl PreparingNativeCapacityBank {
     }
 
     /// Only genuine committed backing can cross into the loan/export API.
-    /// On refusal the SAME preparation and uncertain custody are returned.
-    pub fn into_funded(self) -> Result<ScopedNativeCapacityBank, Self> {
+    /// On refusal the SAME preparation and uncertain custody are returned,
+    /// boxed, since a preparation is large.
+    pub fn into_funded(self) -> Result<ScopedNativeCapacityBank, Box<Self>> {
         if self.bank.funded_width() == 0 || self.bank.has_pending_reacquisition() {
-            Err(self)
+            Err(Box::new(self))
         } else {
             Ok(self.bank)
         }
@@ -108,7 +109,7 @@ mod tests {
         let mut idle = unit_plan(root.path(), &debt, "first-pair", [31; 32]);
         let preparing = debt.prepare_partial_capacity_bank(&idle).unwrap();
         let mut preparing = match preparing.into_funded() {
-            Err(original) => original,
+            Err(original) => *original,
             Ok(_) => panic!("an unfunded preparation cannot enter the loan API"),
         };
         assert!(!preparing.try_fund(&mut idle, 0).unwrap());

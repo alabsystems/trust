@@ -6,7 +6,7 @@
 #
 # Build the binary first:
 #   build/host/stage2/bin/targo --unverified build -p trust-clean --manifest-path Cargo.toml \
-#     --bin corpus-census-2026-07-24
+#     --features diagnostic-tools --bin corpus-census-2026-07-24
 #
 # Needs NO `trustc` and NO stage2 build: committed dumps are serialized
 # `VerifiableFunction`s and the per-function proof is pure computation, so this is

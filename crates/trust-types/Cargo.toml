@@ -43,7 +43,7 @@ trust-wp-bridge = ["dep:trust-wp-core"]
 # the translation-validation data records. trust-types re-exports these so its
 # public API (and the whole compiler) is unchanged; the leaf crate lets backends
 # (e.g. clean) share the vocabulary without depending on the Trust repo.
-trust-ir-contract = { workspace = true }
+trust-ir-contract = { workspace = true, features = ["proof-json"] }
 # Publication binds v2 body-WP identities through the IR owner's canonical
 # native-input digest. This is the same workspace package, with codecs only:
 # do not inherit the workspace dependency's Clean-kernel replay feature.
@@ -72,3 +72,6 @@ libc = { workspace = true }
 bincode = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# Publication positives come from real full-input WP verification/replay;
+# the retained historical scoped certificate remains negative evidence.
+trust-wp-lib = { workspace = true, features = ["trust-ir-native"] }

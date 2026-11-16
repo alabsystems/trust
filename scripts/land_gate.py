@@ -270,6 +270,7 @@ import tomllib  # noqa: E402
 import types  # noqa: E402
 import sysconfig  # noqa: E402
 import unicodedata  # noqa: E402
+import warnings  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple  # noqa: E402
@@ -581,6 +582,32 @@ ENV_IGNORED = re.compile(
     # The declared date (DATE_ENV): carried by each outcome's window instead.
     r"TRUST_GATE_DATE\Z|TRUST_UPSTREAM_COMPAT_VALIDATION_DATE\Z)$")
 UNIT_SUBSET_RUN_MAKE = ("trust-cg-", "trust-instance-", "trust-ir-emit")
+# Where the Python processes a leg, a push row or the Targo probe starts read
+# and write their compiled modules: a fresh empty directory the gate made for
+# that process tree, removed once it exits. `-B` only stops writes; Python
+# still runs a __pycache__/*.pyc whose header (the source's mtime and size)
+# matches, whatever code it holds. A leg that left such a file beside a
+# tracked module made a later leg run other code than the commit's while every
+# tracked byte, which is all a checkout pass reads, still matched: a false
+# PASS. With the prefix set, Python neither reads nor writes the tree's
+# __pycache__; `land`'s ordinary push gets one too (ordinary_push), for the
+# pre-push hook's rows. The gate's own imports of the checkout's modules run
+# their source bytes (_discovery_source_imports), never a .pyc. An
+# interpreter started with -E or -I ignores the variable, and no gate can add
+# `-X pycache_prefix` to the command lines a leg's own programs build: the
+# checkout pass refuses instead any __pycache__ bytecode such an interpreter
+# would load for a tracked source unless it is exactly that source's code
+# (python_import_problem, LAND-GATE-PY-SHADOW-1).
+PYCACHE_ENV = "PYTHONPYCACHEPREFIX"
+# What a key's env element holds for it: each run makes its own.
+LEG_PYCACHE = "<the run's fresh directory of the leg's compiled Python>"
+
+
+def fresh_pycache(run_dir: Path, owner: str) -> Path:
+    """A new empty directory under `run_dir`/pycache for one process tree's
+    compiled Python (PYCACHE_ENV)."""
+    (run_dir / "pycache").mkdir(exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{owner}.", dir=run_dir / "pycache"))
 
 
 def git(*args: str, check: bool = True) -> str:
@@ -1698,6 +1725,10 @@ class Leg:
     # An unpopulated one makes the leg NOT JUDGED before it runs (targo_unready);
     # a populated one is bound to its pin by the checkout binding.
     required_gitlinks: List[str] = field(default_factory=list)
+    # `run` hands the leg's command its checkout binding (CHECKOUT_BOUND_FLAG:
+    # push-rows), and the boundary after the leg is a complete pass whatever
+    # was reused before it.
+    checkout_handoff: bool = False
 
 
 # The trust-cg run-make fixtures, as a member of the compiler-unit-tests leg:
@@ -1875,7 +1906,10 @@ def push_rows_leg(base: str, hook: PushHook, landing: "LandingRange") -> Leg:
     a landing `run` read (`landing.remote`), the expected remote and tip name the
     publication the other legs were planned onto; push-rows is NOT JUDGED on any other
     (round 3, D5). Never cached: the rows read history, origin/main and the
-    ledger (the hook's own reason it replays no verdict, HOOK-NO-REPLAY-2)."""
+    ledger (the hook's own reason it replays no verdict, HOOK-NO-REPLAY-2).
+    `run` hands it its checkout binding (CHECKOUT_BOUND_FLAG) only with the
+    planned HEAD to hold it to (`--expect-head`); without one it binds the
+    checkout itself."""
     covered = ", ".join(f"{r} ({leg_id})" for r, (_c, leg_id) in sorted(HOOK_ROWS_COVERED.items()))
     command = [sys.executable, "scripts/land_gate.py", "push-rows"]
     if landing.remote and landing.tip:
@@ -1896,7 +1930,8 @@ def push_rows_leg(base: str, hook: PushHook, landing: "LandingRange") -> Leg:
                 "fresh publication rows; a moved destination requires composition and requalification"]
                if not hook.active else
                [f"the pre-push hook is installed and answers for this landing ({hook.why}): it runs these "
-                "rows on the push"])
+                "rows on the push"],
+               checkout_handoff=bool(landing.head))
 
 
 def landing_selection(g: ls.Graph, sel: ls.Selection, landing: Optional["LandingRange"]) -> Optional[ls.Selection]:
@@ -2298,6 +2333,7 @@ SEALED_GIT_CONFIG = (("core.fsmonitor", "false"), ("core.hooksPath", "/dev/null"
 SEALED_HOME = "<gate-owned empty directory>"
 SEALED_TMPDIR = "<fresh gate-owned empty directory>"
 SEALED_BIN = "<gate-owned directory of the pinned programs>"
+SEALED_PYCACHE = "<fresh gate-owned empty directory of compiled Python>"
 # The first bytes of a native executable: ELF, and Mach-O thin (32 or 64 bits,
 # either byte order) or universal. Anything else is a script run by an
 # interpreter, or a text file a shell runs itself when exec refuses it
@@ -2310,16 +2346,17 @@ NATIVE_MAGIC = (b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa
 DEVELOPER_STUB_MARK = b"/usr/lib/libxcselect.dylib"
 
 
-def sealed_environment(home: str = SEALED_HOME, tmpdir: str = SEALED_TMPDIR, bindir: str = SEALED_BIN
-                       ) -> Dict[str, str]:
+def sealed_environment(home: str = SEALED_HOME, tmpdir: str = SEALED_TMPDIR, bindir: str = SEALED_BIN,
+                       pycache: str = SEALED_PYCACHE) -> Dict[str, str]:
     """The whole environment of a sealed leg's process; nothing is inherited.
     BASH_ENV, ENV, CDPATH, SHELLOPTS, BASHOPTS, PS4, GREP_OPTIONS, exported
     functions (BASH_FUNC_*), ZDOTDIR, LD_*, DYLD_*, locale directories and
     every other variable a shell or program consults are absent by
     construction; the locale is C, whose data is built in. PATH is only the
-    directory of pinned programs: a name the gate did not pin runs nothing."""
+    directory of pinned programs: a name the gate did not pin runs nothing.
+    PYTHONPYCACHEPREFIX is the run's own empty directory (PYCACHE_ENV)."""
     env = {"PATH": bindir, "LC_ALL": "C", "LANG": "C", "HOME": home,
-           "TMPDIR": tmpdir, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "TMPDIR": tmpdir, PYCACHE_ENV: pycache, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
            "GIT_CONFIG_COUNT": str(len(SEALED_GIT_CONFIG))}
     for i, (name, value) in enumerate(SEALED_GIT_CONFIG):
@@ -2482,8 +2519,8 @@ SEALED_BIN_MODE = 0o555
 def sealed_launch(leg: Leg, command: List[str]):
     """(command, env, moved) for a sealed leg's run, in fresh gate-owned
     directories under the sealed base root (never a path the clone or the
-    caller chose), each literal: an empty HOME, an empty TMPDIR, and a
-    read-only directory, the whole of PATH, holding for each sealed program a
+    caller chose), each literal: an empty HOME, an empty TMPDIR, an empty
+    directory of compiled Python (PYCACHE_ENV), and a read-only directory, the whole of PATH, holding for each sealed program a
     link to the binary leg.pinned names (sealed_unrunnable: all of them).
     When git is one of them it must name REPO_ROOT as its top level there
     (sealed_git_toplevel). ReadUnobservable before anything of the leg starts
@@ -2499,14 +2536,14 @@ def sealed_launch(leg: Leg, command: List[str]):
     except OSError as exc:
         raise ReadUnobservable(f"a sealed run's directory cannot be made ({exc.__class__.__name__})") from exc
     try:
-        home, tmpdir, bindir = base / "home", base / "tmp", base / "bin"
-        for directory in (home, tmpdir, bindir):
+        home, tmpdir, bindir, pycache = base / "home", base / "tmp", base / "bin", base / "pycache"
+        for directory in (home, tmpdir, bindir, pycache):
             directory.mkdir()
             sealed_literal(str(directory), "a sealed run's directory")
         for name, real in sorted(pinned.items()):
             os.symlink(real, bindir / name)
         os.chmod(bindir, SEALED_BIN_MODE)
-        env = sealed_environment(str(home), str(tmpdir), str(bindir))
+        env = sealed_environment(str(home), str(tmpdir), str(bindir), str(pycache))
         if "git" in pinned:
             sealed_git_toplevel(str(bindir / "git"), env)
 
@@ -2944,8 +2981,12 @@ def command_for_key(leg: Leg) -> List[str]:
     return out
 
 
-def leg_environment(leg: Leg, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """The same defaults, caller choices and mandatory settings for keys and execution."""
+def leg_environment(leg: Leg, env: Optional[Dict[str, str]] = None, *,
+                    pycache: Optional[Path] = None) -> Dict[str, str]:
+    """The same defaults, caller choices and mandatory settings for keys and
+    execution. `pycache` is the fresh directory the leg's process compiles
+    Python into (PYCACHE_ENV); a key, which has none, holds LEG_PYCACHE, and
+    every program the gate starts with this environment is given one."""
     if leg.sealed_programs:
         # A sealed leg's environment is built, never inherited (LEG-READS-1):
         # its key holds this shape, and its run the same with real directories
@@ -2994,6 +3035,9 @@ def leg_environment(leg: Leg, env: Optional[Dict[str, str]] = None) -> Dict[str,
     # The one declared date (EW-1), over any caller's: what a leg reads as
     # today is the date its outcome is recorded under.
     merged.update({var: gate_date().isoformat() for var in DATE_ENV})
+    # Over any caller's: compiled Python is read from the gate's own fresh
+    # directory, never from the checkout's __pycache__ (PYCACHE_ENV).
+    merged[PYCACHE_ENV] = LEG_PYCACHE if pycache is None else str(pycache)
     return merged
 
 
@@ -3379,7 +3423,10 @@ def targo_unready(leg: Leg) -> Optional[str]:
     itself gave). The hook's landing suite asks the same question
     (landing_targo.run_targo). The leg never falls back to a shorter command
     or another targo: the canonical environment, whose PATH tools are in the
-    key, names the one that runs."""
+    key, names the one that runs. That environment's compiled Python goes to
+    a fresh directory of the probe's own, removed after it (PYCACHE_ENV), never
+    LEG_PYCACHE: a key's text, which as a relative path would put a cache in
+    the checkout that every later probe reads."""
     command = list(leg.command)
     if not command or command[0] != "targo":
         return None
@@ -3390,7 +3437,11 @@ def targo_unready(leg: Leg) -> Optional[str]:
         return (f"{leg.id} builds the pinned first-party sources of {', '.join(unpopulated)}, which this "
                 "checkout has not populated; populate the exact committed pins "
                 f"(`git submodule update --init -- {' '.join(unpopulated)}`) and run again; no test ran")
-    env = leg_environment(leg)
+    with tempfile.TemporaryDirectory(prefix="land-gate-probe-pycache.") as pycache:
+        return _targo_unready(leg, command, leg_environment(leg, pycache=Path(pycache)))
+
+
+def _targo_unready(leg: Leg, command: List[str], env: Dict[str, str]) -> Optional[str]:
     from land_development import (LOCAL_GIT_CORE_LEG, LOCAL_GIT_FIXTURE_LEG, TARGO_CLEANUP_LEG,
                                   TARGO_NATIVE_CORE_LEG, TARGO_CORE_EXAMPLE_LEG, TOOL_NAME_LEG)
     if leg.id in (TARGO_CLEANUP_LEG, TARGO_NATIVE_CORE_LEG, TARGO_CORE_EXAMPLE_LEG, TOOL_NAME_LEG):
@@ -3484,7 +3535,7 @@ def run_leg(leg: Leg, log_dir: Path, extra_env: Dict[str, str], governor: Tuple[
                 if rc != 0:
                     return rc, time.monotonic() - t0, str(log), True
             prepare = False
-            rc = _run_one(leg, leg.command, fh, extra_env, governor, log_dir)
+            rc = _run_one(leg, leg.command, fh, extra_env, governor, log_dir, hand_off=leg.checkout_handoff)
     except LegCleanupFailed as exc:
         # A prepare that exited 0 is not this leg's exit: its command never ran.
         if prepare and exc.returncode == 0:
@@ -3869,7 +3920,7 @@ def _stream_leg(owned, leg, fh, cancellation, echo):
 
 
 def _run_one(leg: Leg, command: List[str], fh, extra_env: Dict[str, str], governor: Tuple[int, int],
-             log_dir: Path) -> int:
+             log_dir: Path, hand_off: bool = False) -> int:
     # Fail before spawning if the OS cannot retain a waitable identity pin.
     if not landing_targo.exit_observation_available():
         raise RuntimeError("landing child cleanup requires nonreaping exit observation")
@@ -3899,13 +3950,51 @@ def _run_one(leg: Leg, command: List[str], fh, extra_env: Dict[str, str], govern
             return _sealed_not_judged(fh, changed)
         return rc
     env = dict(leg_environment(leg), **extra_env)
+    pycache = fresh_pycache(log_dir, leg.id)
+    env[PYCACHE_ENV] = str(pycache)
+    try:
+        return _run_unsealed(leg, command, fh, env, governor, log_dir, hand_off)
+    finally:
+        # Its process tree has exited (_run_process reaps the group): what it
+        # compiled serves nothing after, and a run directory is never reused.
+        shutil.rmtree(pycache, ignore_errors=True)
+
+
+def _run_unsealed(leg: Leg, command: List[str], fh, env: Dict[str, str], governor: Tuple[int, int],
+                  log_dir: Path, hand_off: bool) -> int:
     command = development_native_command(leg, command, fh, env)
     if leg.id == "development-recipes":
         case_directory = log_dir / "development-recipes.cases"
         case_directory.mkdir()  # fresh actual invocation data; never reuse old output
         env["TRUST_UPSTREAM_RUST_PROOF_DIR"] = str(case_directory)
-    # Every other leg and its governor share one environment.
-    return _run_process(leg, command, fh, env, env, governor, log_dir)
+    if not hand_off:
+        # Every other leg and its governor share one environment.
+        return _run_process(leg, command, fh, env, env, governor, log_dir)
+    # Every descriptor the environment advertises is checked live before the
+    # pipe exists, as _CheckoutWorkers.start checks before its pipes: a closed
+    # advertised number would otherwise be the pipe's, and the leg would be
+    # handed the token as that resource. RuntimeError, as for any other leg;
+    # once all are live, the pipe cannot take one of their numbers.
+    row_resource_fds(env)
+    handed, digest = checkout_handoff_pipe()
+    try:
+        line = f"run: {leg.id} is handed this run's checkout binding (token {digest}) on descriptor {handed}\n"
+        fh.write(line)
+        sys.stdout.write(line)
+        rc = _run_process(leg, [*command, CHECKOUT_BOUND_FLAG, str(handed)], fh, env, env, governor, log_dir,
+                          keep_fds=(handed,))
+    finally:
+        os.close(handed)
+    if rc == SEALED_NOT_JUDGED_EXIT:
+        return rc
+    # The leg judged rows on run's binding only if it read run's own pipe: it
+    # names that token's digest (cmd_push_rows) before any row starts.
+    fh.flush()
+    said = Path(fh.name).read_text(encoding="utf-8", errors="replace")
+    if not re.search(rf"^{re.escape(CHECKOUT_BOUND_REPORT)}{digest}:", said, re.M):
+        return _sealed_not_judged(fh, f"{leg.id} never reported reading this run's checkout binding (token "
+                                      f"{digest}), so its exit {rc} is bound to no pass of this run")
+    return rc
 
 
 # A sealed leg that did not run sealed, or whose run cannot be trusted, says
@@ -3921,10 +4010,11 @@ def _sealed_not_judged(fh, why: str) -> int:
 
 
 def _run_process(leg: Leg, command: List[str], fh, env: Dict[str, str], gov_env: Optional[Dict[str, str]],
-                 governor: Tuple[int, int], log_dir: Path, stdin=None) -> int:
+                 governor: Tuple[int, int], log_dir: Path, stdin=None, keep_fds: Tuple[int, ...] = ()) -> int:
     """Run `command` as the leg, beside the memory governor in `gov_env`, or
-    alone when `gov_env` is None."""
-    passing = row_resource_fds(env)
+    alone when `gov_env` is None. `keep_fds` reach the leg's process (never
+    the governor) under their own numbers."""
+    passing = tuple(sorted(set(row_resource_fds(env)) | set(keep_fds)))
     if gov_env is not None:
         gov_env['TRUST_GOV_CRITICAL_GIB'], gov_env['TRUST_GOV_RESUME_GIB'] = str(governor[0]), str(governor[1])
         gov_env['TRUST_GOV_LOG'] = str(log_dir / f'{leg.id}.governor.log')
@@ -5813,7 +5903,7 @@ def ir_diagnostic_import_shadowed(revision: str, env: Dict[str, str]) -> bool:
                        *(d + "/" for d in directories), timeout=10)
     if listing.returncode:
         return True
-    names = ir_diagnostic_standard_modules()
+    names = python_standard_modules()
     readers: Dict[str, Set[str]] = {}
     for reader in IR_DIAGNOSTIC_READERS:
         directory, _slash, base = reader.rpartition("/")
@@ -5831,37 +5921,396 @@ def ir_diagnostic_import_shadowed(revision: str, env: Dict[str, str]) -> bool:
             return True
         if directory not in IR_DIAGNOSTIC_IMPORT_DIRS:
             continue
-        stem, dot, suffix = base.partition(".")
-        # A directory or a gitlink may be a package; a file is a module only
-        # by an import suffix (`.py`, `.pyc`, `.pyw`, an extension module's
-        # `.so`/`.pyd`).
-        if fields[1] not in ("tree", "commit") and not (dot and IMPORT_SUFFIX.fullmatch(_ir_fold(suffix))):
+        # A directory or a gitlink may be a package (importable_name).
+        stem = importable_name(base, fields[1] in ("tree", "commit"))
+        if stem is None:
             continue
-        stem = _ir_fold(stem)
         if stem in names or (stem in readers and path not in readers[stem]):
             return True
     return False
 
 
-def ir_diagnostic_standard_modules() -> FrozenSet[str]:
-    """Every standard-library module name, case-folded: those Python lists,
-    and every module the running interpreter's library directories hold
-    (sys.stdlib_module_names omits names computed per platform, such as
-    `_sysconfigdata_<abi>_<platform>`), with the names `site` imports
-    (`sitecustomize`, `usercustomize`)."""
-    names = set(sys.stdlib_module_names) | {"sitecustomize", "usercustomize"}
-    paths = sysconfig.get_paths()
-    for root in {paths.get("stdlib"), paths.get("platstdlib")} - {None}:
-        for directory in (root, os.path.join(root, "lib-dynload")):
-            try:
-                entries = os.listdir(directory)
-            except OSError:
-                continue
-            names.update(entry.partition(".")[0] for entry in entries)
-    return frozenset(_ir_fold(name) for name in names if name)
+# The names an interpreter on PATH reports as its standard library
+# (python_standard_modules), written for any Python from 2.7 on: those it
+# lists or builds in, and every module its library directories hold.
+_STANDARD_QUERY = """\
+import os, sys, sysconfig
+names = set(sys.builtin_module_names) | set(getattr(sys, "stdlib_module_names", ()))
+paths = sysconfig.get_paths()
+for root in set([paths.get("stdlib"), paths.get("platstdlib")]) - set([None]):
+    for directory in (root, os.path.join(root, "lib-dynload")):
+        try:
+            names.update(entry.partition(".")[0] for entry in os.listdir(directory))
+        except OSError:
+            pass
+sys.stdout.write("\\n".join(sorted(name for name in names if name)))
+"""
+# An executable a command starts by the name `python`, `python3` or
+# `python3.N` (a free-threaded build adds `t`).
+PYTHON_EXECUTABLE = re.compile(r"python(?:\d+(?:\.\d+)*t?)?")
+# The running interpreter's names, then each interpreter's by
+# (real path, inode, size, mtime): read once per process.
+_STANDARD_MODULES: List[FrozenSet[str]] = []
+_INTERPRETER_MODULES: Dict[Tuple[str, int, int, int], FrozenSet[str]] = {}
+
+
+def python_interpreters() -> List[str]:
+    """Every Python a leg or push row may start by name, by real path: each
+    PYTHON_EXECUTABLE in an absolute directory of the gate's PATH (rows and
+    legs inherit it; the pre-push hook's `python3 scripts/...` rows resolve
+    through it) or of SEALED_PATH (the sealed leg's, and the `/usr/bin:/bin`
+    verify.executes puts first)."""
+    found: Dict[str, None] = {}
+    for directory in [*os.environ.get("PATH", os.defpath).split(os.pathsep), *SEALED_PATH]:
+        if not os.path.isabs(directory):
+            continue
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(directory, name)
+            if PYTHON_EXECUTABLE.fullmatch(name) and os.path.isfile(path) and os.access(path, os.X_OK):
+                found.setdefault(os.path.realpath(path))
+    return list(found)
+
+
+def _interpreter_standard_modules(path: str) -> FrozenSet[str]:
+    """The standard-library names the interpreter `path` reports
+    (_STANDARD_QUERY), case-folded. It runs with -E -S (no PYTHON* variable,
+    no site) in an empty directory, so the query imports nothing a checkout
+    holds. An interpreter that does not answer reports nothing: it runs no
+    Python under these flags, so it imports no shadow either."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return frozenset()
+    key = (path, st.st_ino, st.st_size, st.st_mtime_ns)
+    if key in _INTERPRETER_MODULES:
+        return _INTERPRETER_MODULES[key]
+    names: FrozenSet[str] = frozenset()
+    with tempfile.TemporaryDirectory(prefix="land-gate-stdlib.") as empty:
+        try:
+            done = subprocess.run([path, "-E", "-S", "-c", _STANDARD_QUERY], cwd=empty, stdin=subprocess.DEVNULL,
+                                  capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+    if done is not None and done.returncode == 0:
+        names = frozenset(_ir_fold(name) for name in done.stdout.decode("utf-8", "replace").split("\n") if name)
+    _INTERPRETER_MODULES[key] = names
+    return names
+
+
+def python_standard_modules() -> FrozenSet[str]:
+    """Every standard-library module name, case-folded, of every Python a
+    leg or push row may start: the running interpreter's (those it lists,
+    and every module its library directories hold: sys.stdlib_module_names
+    omits names computed per platform, such as
+    `_sysconfigdata_<abi>_<platform>`), each interpreter's on PATH
+    (python_interpreters; a push row's `python3` resolves to another
+    release, whose standard library holds modules this one's lacks, such as
+    3.9's `_compression`), and the names `site` imports (`sitecustomize`,
+    `usercustomize`)."""
+    if not _STANDARD_MODULES:
+        names = set(sys.stdlib_module_names) | {"sitecustomize", "usercustomize"}
+        paths = sysconfig.get_paths()
+        for root in {paths.get("stdlib"), paths.get("platstdlib")} - {None}:
+            for directory in (root, os.path.join(root, "lib-dynload")):
+                try:
+                    entries = os.listdir(directory)
+                except OSError:
+                    continue
+                names.update(entry.partition(".")[0] for entry in entries)
+        _STANDARD_MODULES.append(frozenset(_ir_fold(name) for name in names if name))
+    names = set(_STANDARD_MODULES[0])
+    for interpreter in python_interpreters():
+        names |= _interpreter_standard_modules(interpreter)
+    return frozenset(names)
 
 
 IMPORT_SUFFIX = re.compile(r"pyw?|pyc|(?:.*\.)?(?:so|pyd)")
+
+
+def importable_name(base: str, package: bool) -> Optional[str]:
+    """The case-folded module name under which Python may import the entry
+    `base` of a directory it imports from, or None. A directory (`package`;
+    a gitlink is one once populated) is a package, regular or namespace, read
+    under its name before any dot; a file is a module only by an import
+    suffix (IMPORT_SUFFIX: source `.py`/`.pyw`, sourceless `.pyc`, an
+    extension module's `.so`/`.pyd` after any ABI tag)."""
+    stem, dot, suffix = base.partition(".")
+    if not package and not (dot and IMPORT_SUFFIX.fullmatch(_ir_fold(suffix))):
+        return None
+    return _ir_fold(stem) or None
+
+
+# LAND-GATE-PY-SHADOW-1. A checkout pass binds tracked files only, but Python
+# imports from a directory whatever it holds: an untracked or ignored entry
+# can run in place of a committed module, or of a standard-library one, while
+# every tracked byte still matches, and the leg's PASS is false. The
+# directories a leg or a push row imports from, read from how each starts
+# Python (python_import_roots):
+# - the repository root: `land_gate.py validation-tests` puts it first to
+#   load scripts.tests.<module> (cmd_validation_tests); tests insert it
+#   (REPO_ROOT, ROOT); `python3 -` and `python3 -c` started in it (the
+#   pre-push hook's here-documents, every row and leg runs from the root)
+#   hold it as sys.path[0];
+# - every tracked directory under scripts/: scripts/ is a package
+#   (scripts/__init__.py) and sys.path[0] of every scripts/*.py; programs and
+#   tests put scripts/lib, scripts/tests, scripts/trust_core, their own and
+#   their parents' directories first; each scripts/**/<x>.py run as a script
+#   holds its own directory as sys.path[0];
+# - src/bootstrap, which x.py inserts (the bootstrap-tests, tidy and
+#   native-targo-tests legs run x.py from the root);
+# - every other tracked directory holding a tracked .py file: a script run
+#   there holds it as sys.path[0], and its package's modules are found in it.
+# The first three share search paths, in orders their programs choose, so a
+# name tracked in any of them counts in each (PYTHON_SHARED_ROOTS); any other
+# directory counts its own. A `.pth` file is read only in a site directory
+# (site.addsitedir), which none of these is, so it is no entry here. A
+# populated submodule is checked the same way from its own root, with no
+# shared directories. Not refused: an untracked module under a name that
+# neither the commit nor the standard library holds; it runs only where
+# tracked code imports a name its commit lacks (an optional import such as
+# `tomli`, which some scripts fall back to without tomllib).
+PYTHON_SHARED_ROOTS = (".", "src/bootstrap")
+PYTHON_SHARED_TREE = "scripts"
+# A name Python imports from any package directory, whatever it holds.
+PACKAGE_MODULES = frozenset({"__init__", "__main__"})
+# Code objects compared field by field (same_code): every field the
+# interpreter executes or reports, not co_filename, which the loader rewrites
+# to the source's own path.
+_CODE_FIELDS = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals", "co_stacksize",
+                "co_flags", "co_firstlineno", "co_code", "co_names", "co_varnames", "co_freevars",
+                "co_cellvars", "co_name", "co_qualname", "co_linetable", "co_exceptiontable")
+# (sha256 of the bytecode file, sha256 of the source, optimization level) ->
+# whether the bytecode is the source's code: the same bytes give the same
+# answer, so each distinct file is compiled once per process.
+_BYTECODE_VERDICTS: Dict[Tuple[str, str, int], bool] = {}
+
+
+def _directory_children(committed: Iterable[str]) -> Dict[str, Set[str]]:
+    """Each tracked directory ("." the root) -> the names of its tracked
+    entries, files and directories."""
+    children: Dict[str, Set[str]] = {}
+    for path in committed:
+        child = path
+        while True:
+            parent, _slash, name = child.rpartition("/")
+            parent = parent or "."
+            known = parent in children
+            children.setdefault(parent, set()).add(name)
+            if known or parent == ".":
+                break
+            child = parent
+    return children
+
+
+def python_import_roots(committed: Dict[str, Tuple[str, str]], children: Dict[str, Set[str]],
+                        top: bool) -> Tuple[Set[str], Set[str]]:
+    """(the shared import directories, every import directory) of a
+    repository whose commit holds `committed` (the comment above
+    PYTHON_SHARED_ROOTS); `top` is the checkout itself, not a submodule."""
+    shared: Set[str] = set()
+    if top:
+        shared = {d for d in children if d in PYTHON_SHARED_ROOTS or d == PYTHON_SHARED_TREE
+                  or d.startswith(PYTHON_SHARED_TREE + "/")}
+    sources = {path.rpartition("/")[0] or "." for path, (mode, _oid) in committed.items()
+               if path.endswith(".py") and mode != "160000"}
+    return shared, shared | sources
+
+
+def same_code(held: object, compiled: object) -> bool:
+    """Whether two compiled constants are one program: code objects field by
+    field (_CODE_FIELDS), containers (a tuple, a frozenset, a slice, which
+    Python 3.14 folds `a[1:2]` into) element by element, the rest by exact
+    type and value (1, 1.0 and True differ, and so do 0.0 and -0.0; so do
+    slice(1, 2) and slice(True, 2), which `==` holds equal)."""
+    if type(held) is not type(compiled):
+        return False
+    if isinstance(held, slice):
+        return same_code((held.start, held.stop, held.step), (compiled.start, compiled.stop, compiled.step))
+    if isinstance(held, types.CodeType):
+        return (all(getattr(held, f) == getattr(compiled, f) for f in _CODE_FIELDS)
+                and same_code(held.co_consts, compiled.co_consts))
+    if isinstance(held, tuple):
+        return len(held) == len(compiled) and all(map(same_code, held, compiled))
+    if isinstance(held, frozenset):
+        return len(held) == len(compiled) and all(
+            map(same_code, sorted(held, key=repr), sorted(compiled, key=repr)))
+    if isinstance(held, (float, complex)):
+        return repr(held) == repr(compiled)
+    return held == compiled
+
+
+def bytecode_problem(pyc: Path, source: Path, tag: str, optimize: int) -> Optional[str]:
+    """Why Python could run `pyc` (a __pycache__ file for the tracked `source`
+    under cache tag `tag` and optimization level `optimize`) in place of the
+    source's own code, or None.
+
+    An interpreter started with -E or -I ignores PYCACHE_ENV and reads the
+    checkout's __pycache__, and the gate cannot add `-X pycache_prefix` to
+    the command lines a leg's programs build. Refusing every __pycache__
+    would refuse the bytecode those interpreters themselves write, from the
+    commit's source, when started without -B. So the file is read as Python
+    reads it: one Python ignores (short, unknown flags, a stale timestamp)
+    is no problem; one it would load must hold exactly the code this
+    interpreter compiles from the source (same_code). Bytecode of another
+    interpreter (another cache tag or magic number) whose header could
+    match cannot be compared here, and is refused."""
+    try:
+        data = pyc.read_bytes()
+        raw = source.read_bytes()
+        st = source.stat()
+    except OSError:
+        return None  # Python reads no bytecode it cannot open: it compiles the source
+    stamp = ((int(st.st_mtime) & 0xFFFFFFFF).to_bytes(4, "little")
+             + (st.st_size & 0xFFFFFFFF).to_bytes(4, "little"))
+    flags = int.from_bytes(data[4:8], "little") if len(data) >= 16 else -1
+    if tag != _ir_fold(sys.implementation.cache_tag) or data[:4] != importlib.util.MAGIC_NUMBER:
+        # The header layouts since Python 3.3: a timestamp after the magic
+        # number (3.3-3.6) or after the flags (3.7 on), or a source hash.
+        if len(data) >= 12 and (data[4:12] == stamp or data[8:16] == stamp or flags in (1, 3)):
+            return (f"bytecode for another interpreter ({tag}) whose header can match the source; "
+                    f"this gate cannot compare it with the source")
+        return None
+    if flags < 0 or flags & ~0b11:
+        return None  # Python rejects the header and compiles the source
+    if not flags & 0b1 and data[8:16] != stamp:
+        return None  # stale: Python compiles the source
+    # A source-hash header is loaded unchecked under its own flag or
+    # --check-hash-based-pycs never: compared whatever its hash says.
+    key = (hashlib.sha256(data).hexdigest(), hashlib.sha256(raw).hexdigest(), optimize)
+    same = _BYTECODE_VERDICTS.get(key)
+    if same is None:
+        try:
+            held = marshal.loads(data[16:])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                compiled = compile(raw, str(source), "exec", dont_inherit=True, optimize=optimize)
+            same = same_code(held, compiled)
+        except (ValueError, EOFError, TypeError, SyntaxError, MemoryError, RecursionError):
+            same = False
+        _BYTECODE_VERDICTS[key] = same
+    return None if same else "bytecode Python would load for the tracked source holds other code"
+
+
+def _bytecode_source(name: str, sources: Set[str]) -> Optional[Tuple[str, str, int]]:
+    """(the tracked source, case-folded cache tag, optimization level) a
+    __pycache__ entry `name` is for (importlib's cache_from_source:
+    `<stem>.<tag>[.opt-N].pyc` for `<stem>.py`), or None: no tracked source,
+    or a level no interpreter flag selects. Compared case-folded (_ir_fold):
+    the loader opens the cache path it builds with open(), so on a file
+    system that folds case `PROBE.CPYTHON-314.OPT-1.PYC` is what it reads
+    for `probe.py` under -O."""
+    name = _ir_fold(name)
+    if not name.endswith(".pyc"):
+        return None
+    for source in sorted(sources):
+        stem = _ir_fold(source[:-len(".py")])
+        if not name.startswith(stem + "."):
+            continue
+        parts = name[len(stem) + 1:-len(".pyc")].split(".")
+        if len(parts) == 1 and parts[0]:
+            return source, parts[0], 0
+        if len(parts) == 2 and parts[0] and parts[1] in ("opt-1", "opt-2"):
+            return source, parts[0], int(parts[1][-1])
+    return None
+
+
+def python_import_problem(repo: Path, committed: Dict[str, Tuple[str, str]], label: str,
+                          top: bool) -> Optional[str]:
+    """Why Python a leg or push row starts in `repo` (`label`; `top` is the
+    checkout, not a populated submodule) could run code its commit, which
+    holds `committed` (path -> (mode, oid)), does not, or None. In each
+    import directory (python_import_roots) it refuses:
+    - an untracked or ignored entry Python imports under the name of a
+      standard-library module, of a module or package tracked there or (a
+      shared directory) in any shared directory, or `__init__`/`__main__`
+      (PACKAGE_MODULES): a package directory, regular or namespace (a
+      package wins over a module beside it, and a namespace directory
+      imports a standard-library name this platform lacks), an extension
+      module (extension loaders come before source), a sourceless `.pyc`
+      (loaded where no source is beside it) or a source; names compare
+      case-folded (_ir_fold), as a case-insensitive file system or
+      PYTHONCASEOK matches them, and an entry that is a tracked one's own
+      file under another spelling is that entry;
+    - an untracked __pycache__ file Python would load for a tracked source
+      that is not exactly that source's code (bytecode_problem).
+    An entry the directory cannot list is refused; an absent directory
+    (sparse) holds nothing to import."""
+    children = _directory_children(committed)
+    shared, roots = python_import_roots(committed, children, top)
+    standard = python_standard_modules() | PACKAGE_MODULES
+
+    def path_of(directory: str, name: str) -> str:
+        return name if directory == "." else directory + "/" + name
+
+    def spelled(directory: str, name: str) -> str:
+        return f"{label}/{path_of(directory, name)}"
+
+    def tracked_names(directory: str) -> Set[str]:
+        names = set()
+        for name in children.get(directory, ()):
+            path = path_of(directory, name)
+            stem = importable_name(name, path in children or committed.get(path, ("",))[0] == "160000")
+            if stem:
+                names.add(stem)
+        return names
+
+    shared_names = set().union(*(tracked_names(d) for d in shared)) if shared else set()
+    for directory in sorted(roots):
+        here = repo if directory == "." else repo / directory
+        try:
+            entries = sorted(entry.name for entry in os.scandir(here))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            return f"cannot list the Python import directory {spelled(directory, '')!r} ({exc.strerror})"
+        tracked = children.get(directory, set())
+        folded = {_ir_fold(name): name for name in tracked}
+        names = standard | (shared_names if directory in shared else tracked_names(directory))
+        for name in entries:
+            if name in tracked or _ir_fold(name) == "__pycache__":
+                continue
+            twin = folded.get(_ir_fold(name))
+            if twin is not None:
+                try:
+                    if os.path.samestat(os.lstat(here / name), os.lstat(here / twin)):
+                        continue
+                except OSError:
+                    pass
+            package = os.path.isdir(here / name)
+            stem = importable_name(name, package)
+            if stem is not None and stem in names:
+                return (f"untracked {'package' if package else 'module'} {spelled(directory, name)!r} shadows the module "
+                        f"{stem!r}: Python a leg or push row starts imports it ahead of, or instead of, a tracked "
+                        f"or standard-library module, and no checkout pass reads it (LAND-GATE-PY-SHADOW-1); "
+                        f"remove it")
+        sources = {name for name in tracked if name.endswith(".py")
+                   and committed.get(path_of(directory, name), ("",))[0] in ("100644", "100755")}
+        # Every spelling: on a file system that keeps case, `__PYCACHE__`
+        # sorts ahead of the `__pycache__` Python reads.
+        for cache_dir in (name for name in entries if sources and _ir_fold(name) == "__pycache__"):
+            cache = here / cache_dir
+            try:
+                cached = sorted(entry.name for entry in os.scandir(cache))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                return f"cannot list the compiled-Python directory {spelled(directory, cache_dir)!r} ({exc.strerror})"
+            held = children.get(path_of(directory, cache_dir), set())
+            for name in cached:
+                found = None if name in held else _bytecode_source(name, sources)
+                if found is None:
+                    continue
+                source, tag, optimize = found
+                problem = bytecode_problem(cache / name, here / source, tag, optimize)
+                if problem:
+                    return (f"untracked compiled Python {spelled(directory, cache_dir + '/' + name)!r}: {problem}; an "
+                            f"interpreter started with -E or -I runs it in place of the tracked source "
+                            f"(LAND-GATE-PY-SHADOW-1); remove it")
+    return None
 
 
 def ir_diagnostic_physical_input(path: str) -> bool:
@@ -5879,8 +6328,12 @@ def ir_diagnostic_physical_input(path: str) -> bool:
     # LAND-GATE-EW1-FOLLOWUP-REVIEW-4: the scope was matched as spelled.)
     path = _ir_fold(path.removeprefix("./"))
     parts = path.split("/")
-    # A .gitattributes anywhere: the selector's `git grep -I` (land_select's
-    # _scanned_before) takes binary marks from the worktree's attribute files.
+    # A .gitattributes anywhere: until LAND-IR-READER-GAPS-1 the selector's
+    # `git grep -I` (land_select's _scanned_before) took binary marks from the
+    # worktree's attribute files; it now reads the judged commit's from its
+    # tree (_committed_attribute_git). They stay in the scope: checking them
+    # physically only makes the run stricter, and no audit has shown that no
+    # other git query of the run reads a worktree attributes file.
     # A crate root: gate planning's host limits read each crates-tests
     # member's src/lib.rs (check_crates_tests_scoped.apply_host_limits). (Round
     # 6 of LAND-GATE-EW1-FOLLOWUP-REVIEW-4, the IR reader audit.)
@@ -6578,7 +7031,17 @@ def cmd_plan(args, discovery: Optional[DiscoverySession] = None) -> int:
     return 0
 
 
-_git_ask = checkout_inputs.git_ask
+# Seconds this process has spent in Git plumbing asked through _git_ask:
+# a checkout pass's timing row takes its own share as `git_seconds`.
+_GIT_ASK_SECONDS = [0.0]
+
+
+def _git_ask(root: Path, env: Dict[str, str], *args: str, **options) -> subprocess.CompletedProcess:
+    started = time.monotonic()
+    try:
+        return checkout_inputs.git_ask(root, env, *args, **options)
+    finally:
+        _GIT_ASK_SECONDS[0] += time.monotonic() - started
 
 
 def _git_said(proc: subprocess.CompletedProcess) -> str:
@@ -6799,6 +7262,68 @@ class _ForkedWorker:
                 pass
 
 
+# The installed targo answers "no such command" to `source-check` until a
+# sealed pack carries it (STATUS.md), and asking costs a whole package
+# admission first: `atpkg verify` of the store and a digest of targo, 9.1 s
+# of the measured development run's worker start (run 20261114T134816).
+# That one answer is remembered, keyed on the managed targo image's path and
+# physical stat key (path, dev, ino, size, mtime, ctime). "Available" is never
+# stored, and no other refusal is: a stale key can only leave a pass on the
+# Python reader, which reads every file as the native one does, never skip one.
+NATIVE_UNAVAILABLE_FILE = "native-reader-unavailable.json"
+NATIVE_NO_COMMAND = "no such command: `source-check`"
+
+
+def native_reader_key(env: Dict[str, str]) -> Optional[List[object]]:
+    """The managed targo image's path and physical stat key, or None."""
+    try:
+        path = native_checkout.selected_executable(env)
+        st = os.stat(path)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return [str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _native_unavailable_path() -> Path:
+    common = common_dir()
+    if not common.is_absolute():
+        # Never a file under whatever directory the gate was started in.
+        raise ValueError(f"the Git common directory {str(common)!r} is not absolute")
+    return common / "trust-land" / NATIVE_UNAVAILABLE_FILE
+
+
+def remembered_native_unavailable(key: Optional[List[object]]) -> Optional[str]:
+    """The remembered "no such command" answer for exactly `key`, or None."""
+    if key is None:
+        return None
+    try:
+        doc = json.loads(_native_unavailable_path().read_text(encoding="utf-8"))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return None
+    if isinstance(doc, dict) and doc.get("key") == key and isinstance(doc.get("why"), str) \
+            and NATIVE_NO_COMMAND in doc["why"]:
+        return doc["why"]
+    return None
+
+
+def remember_native_unavailable(key: Optional[List[object]], why: str) -> None:
+    """Store `why` under `key` when it is the reader's "no such command" and
+    the image's key is unchanged since it was read; nothing else is stored."""
+    if key is None or NATIVE_NO_COMMAND not in why:
+        return
+    try:
+        if native_reader_key(dict(os.environ)) != key:
+            return
+        path = _native_unavailable_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, staged = tempfile.mkstemp(prefix=".native-reader.", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"key": key, "why": why}, fh)
+        os.replace(staged, path)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return
+
+
 class _CheckoutWorkers:
     """Worker processes for complete passes, all forked (start) when a gate run
     begins and each fed one batch at a time by its own thread (which only waits
@@ -6842,6 +7367,13 @@ class _CheckoutWorkers:
                 and _ACTIVE_CANCELLATION is not None and sys.platform == "darwin" and platform.machine() == "arm64"):
             program = None
             started = time.monotonic()
+            key = native_reader_key(dict(os.environ))
+            remembered = remembered_native_unavailable(key)
+            if remembered is not None:
+                self.native_fallback = f"native reader unavailable (remembered for this targo): {remembered}"
+                self.startup.update({"native": "unavailable", "remembered": True,
+                                     "native_seconds": round(time.monotonic() - started, 6)})
+                return
             try:
                 program = native_checkout.managed_program(dict(os.environ))
                 share = host_budget.admitted_jobs()
@@ -6857,6 +7389,7 @@ class _CheckoutWorkers:
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
                 self.native_fallback = f"native reader unavailable: {error}"
                 self.startup["native"] = "unavailable"
+                remember_native_unavailable(key, str(error))
             finally:
                 self.startup["native_seconds"] = round(time.monotonic()-started,6)
                 if program is not None and self.native is None:
@@ -7273,6 +7806,13 @@ class CheckoutTally:
     native_bytes: Optional[int] = None
     native_threads: int = 0
     fallback: str = ""
+    # Seconds of the pass spent in Git plumbing in the gate's process (the
+    # inventory, history overlays, gitlinks, sparse rules, HEAD). The bytes a
+    # pass read are native_bytes, the native reader's own count; the Python
+    # reader counts none, and the inventory asks Git for no object sizes
+    # (`ls-tree -l` reads every blob's header, and in a partial clone fetches
+    # each one it lacks, sparse-excluded ones included).
+    git_seconds: float = 0.0
 
 
 def _populated_gitlink(repo: Path, root: Path, relative: str, expected: str, child_label: str,
@@ -7329,7 +7869,7 @@ def _tracked_checkout_problem(root: Path, revision: str, env: Dict[str, str], *,
     workers = _CheckoutWorkers(1) if workers is None else workers
     tally = tally if tally is not None else CheckoutTally()
     tally.files, tally.jobs = 0, 1
-    started = time.monotonic()
+    started, git_before = time.monotonic(), _GIT_ASK_SECONDS[0]
     native_started = workers.native is not None
     tally.native_threads = workers.native.jobs if workers.native is not None else 0
     workers.native_bytes = 0
@@ -7362,6 +7902,7 @@ def _tracked_checkout_problem(root: Path, revision: str, env: Dict[str, str], *,
         tally.native_seconds = time.monotonic() - started
     tally.fallback = workers.native_fallback
     tally.seconds = time.monotonic() - started
+    tally.git_seconds = _GIT_ASK_SECONDS[0] - git_before
     if workers.fallback:
         tally.jobs = 1
     if _ACTIVE_CHECKOUT_TIMINGS is not None:
@@ -7370,6 +7911,8 @@ def _tracked_checkout_problem(root: Path, revision: str, env: Dict[str, str], *,
             "backend":tally.backend, "native_seconds":round(tally.native_seconds, 6),
             "native_bytes":tally.native_bytes, "fallback":tally.fallback,
             "native_threads":tally.native_threads,
+            "git_seconds":round(tally.git_seconds, 6),
+            "files_per_s":round(tally.files / tally.seconds, 1) if tally.seconds > 0 else 0.0,
             "refused":problem is not None})
     return problem
 
@@ -7481,6 +8024,10 @@ def _tracked_checkout_walk(root: Path, revision: str, env: Dict[str, str], ir_di
             tally.jobs = workers.jobs  # this repository's files were read by the workers
         if problem or refusal:
             return problem or refusal
+        # What Python imports here beside the tracked files (LAND-GATE-PY-SHADOW-1).
+        problem = python_import_problem(repo, committed, label, label == ".")
+        if problem:
+            return problem
         current = _git_ask(repo, env, "rev-parse", "--verify", "HEAD^{commit}", timeout=10)
         if current.returncode or current.stdout.strip() != revision:
             return f"HEAD changed during tracked-input inspection at {label!r}"
@@ -7673,7 +8220,10 @@ def _cmd_run_in_scope(args, discovery: Optional[DiscoverySession] = None) -> int
     if problem:
         print(f"LAND-GATE: NOT JUDGED — {problem}. No selection or leg ran.")
         return 2
-    started = time.time()
+    # The run's wall clock: record.json `seconds` is read from it, and nothing
+    # else binds this name (the discovery below keeps its own monotonic clock;
+    # rebinding this one made `seconds` epoch-minus-uptime, about 1.79e9).
+    run_started = time.time()
     try:
         host = host_budget.measure()
     except host_budget.HostUnmeasurable as exc:
@@ -8179,7 +8729,7 @@ def _cmd_run_in_scope(args, discovery: Optional[DiscoverySession] = None) -> int
                     entry["x.py rc"], entry["judged"] = rc, why
                     suite_said = f"{leg.id}: {why}"
                     rc = verdict
-            if source_refusal(f"after {leg.id}"):
+            if source_refusal(f"after {leg.id}", fresh=leg.checkout_handoff):
                 entry["outcome"] = "NOT JUDGED (source changed)"
                 judged_nothing += 1
                 record_outcome(leg, entry, ran, CACHE_NOT_JUDGED, "the source changed", round(secs, 1))
@@ -8296,11 +8846,18 @@ def _cmd_run_in_scope(args, discovery: Optional[DiscoverySession] = None) -> int
                         record["ordinary_push"] = publish_native_source(current_push, log)
                         push_rc = 0
                     else:
-                        coordinator = landing_targo.Coordinator(
-                            current_push.head, current_push.destination,
-                            leg_environment(deferred_targo) if deferred_targo is not None else None,
-                            checkout_problem, remote=current_push.remote, keys=deferred_keys)
-                        push_rc = coordinator.push(REPO_ROOT, log, git_query_env())
+                        targo_pycache = (fresh_pycache(run_dir, deferred_targo.id)
+                                         if deferred_targo is not None else None)
+                        try:
+                            coordinator = landing_targo.Coordinator(
+                                current_push.head, current_push.destination,
+                                leg_environment(deferred_targo, pycache=targo_pycache)
+                                if deferred_targo is not None else None,
+                                checkout_problem, remote=current_push.remote, keys=deferred_keys)
+                            push_rc = ordinary_push(coordinator, log, run_dir)
+                        finally:
+                            if targo_pycache is not None:
+                                shutil.rmtree(targo_pycache, ignore_errors=True)
                         record["ordinary_push"] = {"rc": push_rc, "log": str(log_path), **coordinator.receipt()}
                         if deferred_targo is not None:
                             record["live_targo"] = coordinator.receipt()
@@ -8318,7 +8875,7 @@ def _cmd_run_in_scope(args, discovery: Optional[DiscoverySession] = None) -> int
                 print(f"LAND-GATE: ordinary push not judged — {exc}")
     if "source_refusal" not in record and source_refusal("before final record"):
         judged_nothing += 1
-    record["seconds"] = round(time.time() - started, 1)
+    record["seconds"] = round(time.time() - run_started, 1)
     record["checkout_checks"] = list(_ACTIVE_CHECKOUT_TIMINGS or [])
     record["checkout_startup"] = dict(_ACTIVE_CHECKOUT_WORKERS.startup) if _ACTIVE_CHECKOUT_WORKERS else {}
     record["split_keys"] = split_keys
@@ -8901,7 +9458,8 @@ def row_environment(env: Optional[Dict[str, str]], push: LandingPush,
     variables unset, TRUST_PUSHED_REFS and TRUST_PUSH_REMOTE the landing's
     (never an outer push's), and every target directory named by its real
     path (the caller's included; a relative one is read from `root`, where
-    the rows run)."""
+    the rows run). Each row's process gets its own compiled-Python directory
+    from _run_row (PYCACHE_ENV), over any caller's."""
     out = dict(os.environ if env is None else env)
     try:
         local = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True).stdout.split()
@@ -9065,11 +9623,16 @@ def _run_row(row: PushRow, root: Path, env: Dict[str, str], log: Path, stream: b
     """Run `row` as the hook runs a lane and keep its output in `log` as the
     hook's `tee` keeps it: the raw bytes (round 4, D4). A text-mode read here
     turned `\\r\\n` and a bare `\\r` into `\\n`, so `FINDINGS: complete\\r` read as
-    complete and `x\\rSKIPPED: ` as SKIPPED where the hook's grep reads neither."""
+    complete and `x\\rSKIPPED: ` as SKIPPED where the hook's grep reads neither.
+    The row's process compiles Python into a fresh directory of its own beside
+    `log` (PYCACHE_ENV), over any caller's: a row that left a compiled module
+    under a shared prefix would make a later row, or the INHERITED replay, run
+    code no commit holds while every tracked byte still matched."""
     shell = Path("/bin/bash")
     shell_before = (str(shell.resolve(strict=True)), sha256_file(shell))
     command, passing = row_command(row, root, env), row_resource_fds(env)
     child_env = landing_targo.hook_environment(env)
+    child_env[PYCACHE_ENV] = str(fresh_pycache(log.parent, row.id))
     compiler = None
     compiler_before = None
     if row.id == "verify.executes":
@@ -9158,10 +9721,19 @@ def run_push_rows(rows: Sequence[PushRow], root: Path, push: LandingPush, jobs: 
     """Run and grade `rows` (manifest order) on the landing push; 0 no FAIL,
     1 a FAIL, 2 refused (an unreadable ledger) or nothing judged. `readers`
     is the hook's PUSH_REFS_READERS (None: no red is inherited). `table` is
-    the push's quarantine table when the caller already read it."""
+    the push's quarantine table when the caller already read it. The rows'
+    logs and each row's compiled Python (_run_row) live in one fresh
+    directory, removed after."""
+    with tempfile.TemporaryDirectory(prefix="land-gate-push-rows.") as tmp:
+        return _run_push_rows_in(rows, root, push, jobs, solo, row_environment(env, push, root),
+                                 covered, readers, today, table, Path(tmp))
+
+
+def _run_push_rows_in(rows: Sequence[PushRow], root: Path, push: LandingPush, jobs: int,
+                      solo: Optional[re.Pattern], env: Dict[str, str], covered: Sequence[str],
+                      readers: Optional[frozenset], today: Optional[datetime.date],
+                      table: Optional["PushQuarantine"], tmp: Path) -> int:
     import concurrent.futures
-    import tempfile
-    env = row_environment(env, push, root)
     unadmitted = row_admission_problem(rows, env)
     if unadmitted:
         print(f"PUSH-ROWS: NOT JUDGED — {unadmitted}. No row ran.")
@@ -9207,28 +9779,27 @@ def run_push_rows(rows: Sequence[PushRow], root: Path, push: LandingPush, jobs: 
         print(line)
         grades.setdefault(grade, []).append(row.id)
 
-    with tempfile.TemporaryDirectory(prefix="land-gate-push-rows.") as tmp:
-        logs = {r.id: Path(tmp) / f"{i}.log" for i, r in enumerate(rows)}
-        try:
-            if pooled:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-                    futs = [pool.submit(_run_row, r, root, env, logs[r.id], False) for r in pooled]
-                    for r, fut in zip(pooled, futs):
-                        status = fut.result()
-                        print(f"\n=== {r.id} ===")
-                        echo_bytes(logs[r.id].read_bytes())
-                        judge(r, status, logs[r.id])
-            for r in alone:
-                print(f"\n=== {r.id} ===", flush=True)
-                judge(r, _run_row(r, root, env, logs[r.id], True), logs[r.id])
-            for grade, ids in judge_inherited(cands, root, push, env, Path(tmp)).items():
-                grades.setdefault(grade, []).extend(ids)
-            for r in scoped:
-                print(f"\n=== {r.id} ===", flush=True)
-                judge(r, _run_row(r, root, env, logs[r.id], True), logs[r.id])
-        except RuntimeError as exc:
-            print(f"push-rows: {exc} — refusing to judge any row (the hook exits 2 here)")
-            return 2
+    logs = {r.id: tmp / f"{i}.log" for i, r in enumerate(rows)}
+    try:
+        if pooled:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+                futs = [pool.submit(_run_row, r, root, env, logs[r.id], False) for r in pooled]
+                for r, fut in zip(pooled, futs):
+                    status = fut.result()
+                    print(f"\n=== {r.id} ===")
+                    echo_bytes(logs[r.id].read_bytes())
+                    judge(r, status, logs[r.id])
+        for r in alone:
+            print(f"\n=== {r.id} ===", flush=True)
+            judge(r, _run_row(r, root, env, logs[r.id], True), logs[r.id])
+        for grade, ids in judge_inherited(cands, root, push, env, tmp).items():
+            grades.setdefault(grade, []).extend(ids)
+        for r in scoped:
+            print(f"\n=== {r.id} ===", flush=True)
+            judge(r, _run_row(r, root, env, logs[r.id], True), logs[r.id])
+    except RuntimeError as exc:
+        print(f"push-rows: {exc} — refusing to judge any row (the hook exits 2 here)")
+        return 2
     summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(grades.items()))
     if grades.get("FAIL"):
         print(f"\nPUSH-ROWS: RED ({summary}) — failed: {', '.join(grades['FAIL'])}")
@@ -9281,6 +9852,19 @@ def push_row_refresh(leg_id: str, status: int, landing: "LandingRange", revision
     if current.remote == landing.remote and current.tip and current.tip != landing.tip:
         return LandingRefreshRequired(current)
     return None
+
+
+def ordinary_push(coordinator, log, run_dir: Path) -> int:
+    """`land`'s ordinary push (landing_targo.Coordinator.push). The pre-push
+    hook's rows and every other Python process it starts compile into a
+    fresh directory of the push's own (PYCACHE_ENV), removed after it, never
+    the checkout's __pycache__ (LAND-GATE-PY-SHADOW-1): the push is the
+    one effect no later pass can take back."""
+    pycache = fresh_pycache(run_dir, "ordinary-push")
+    try:
+        return coordinator.push(REPO_ROOT, log, dict(git_query_env(), **{PYCACHE_ENV: str(pycache)}))
+    finally:
+        shutil.rmtree(pycache, ignore_errors=True)
 
 
 def publish_native_source(push: "LandingPush", log) -> dict:
@@ -9395,8 +9979,70 @@ def read_landing(root: Optional[Path] = None, head: str = "HEAD") -> LandingRang
     return LandingRange(tip, head_sha, remote, False, changed, why)
 
 
+# push-rows run as `run`'s leg: `run` binds the checkout with complete passes
+# before the leg (its last one, with only push-rows started since) and after
+# it (a fresh one, after every read that judges the leg), so push-rows' own
+# two passes read the same bytes again around nothing but its rows: 95.0 s of
+# a development run (STATUS.md, run 20261114T134816), in a worker pool of its
+# own. `run` hands it that binding instead: a pipe whose write end it closed
+# before the leg started, holding one random token, whose descriptor it names
+# after this flag. Only a closed pipe holding one token skips the passes, and
+# only with --expect-head; that proves no run handed it, so `run` requires the
+# leg to report the digest of the token it read (CHECKOUT_BOUND_REPORT) or
+# calls the leg NOT JUDGED. Standalone push-rows and landing_preflight read in
+# full as before, and a standalone result is recorded nowhere
+# (READS-ONCE-WINDOW-1).
+CHECKOUT_BOUND_FLAG = "--checkout-bound-by-fd"
+CHECKOUT_BOUND_REPORT = "push-rows: checkout bound by run "
+CHECKOUT_TOKEN = re.compile(rb"[0-9a-f]{64}\n")
+
+
+def checkout_handoff_pipe() -> Tuple[int, str]:
+    """(read descriptor, token digest): a pipe holding one fresh random token,
+    its write end already closed, so the reader meets the token and then EOF."""
+    token = (os.urandom(32).hex() + "\n").encode("ascii")
+    readable, writable = os.pipe()
+    try:
+        os.write(writable, token)
+    except BaseException:
+        os.close(readable)
+        raise
+    finally:
+        os.close(writable)
+    return readable, hashlib.sha256(token).hexdigest()[:16]
+
+
+def checkout_bound_by(descriptor: int) -> str:
+    """The digest of the token `run` handed on `descriptor` (checkout_handoff_pipe),
+    which is then closed; LandingUnjudged unless it is a pipe holding exactly
+    one token whose writer has closed it."""
+    try:
+        if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
+            raise LandingUnjudged(f"{CHECKOUT_BOUND_FLAG} {descriptor} is no pipe")
+        os.set_blocking(descriptor, False)
+        data = b""
+        while len(data) <= 65:
+            try:
+                chunk = os.read(descriptor, 128)
+            except BlockingIOError:
+                raise LandingUnjudged(f"{CHECKOUT_BOUND_FLAG} {descriptor} is a pipe still open for writing, "
+                                      "not one a run closed after its token") from None
+            if not chunk:
+                break
+            data += chunk
+    except OSError as exc:
+        raise LandingUnjudged(f"{CHECKOUT_BOUND_FLAG} {descriptor} cannot be read ({exc.__class__.__name__})") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+    if not CHECKOUT_TOKEN.fullmatch(data):
+        raise LandingUnjudged(f"{CHECKOUT_BOUND_FLAG} {descriptor} holds no run token")
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 def landing_push(root: Optional[Path] = None, expect_tip: Optional[str] = None,
-                 expect_head: Optional[str] = None, expect_remote: Optional[str] = None) -> LandingPush:
+                 expect_head: Optional[str] = None, expect_remote: Optional[str] = None,
+                 bound_by_run: bool = False) -> LandingPush:
     """The landing's push as the hook would see it (round 2, D1): this
     checkout's HEAD onto `refs/heads/main` of origin's push URL (the hook's $2),
     whose tip is read FROM THE REMOTE when the leg runs (remote_main_tip), never
@@ -9409,7 +10055,9 @@ def landing_push(root: Optional[Path] = None, expect_tip: Optional[str] = None,
     `run` read when it planned the legs that stand in for the hook's scoped
     rows, round 3's D5) is not the tip the remote names now: those legs judge
     the push onto that tip, and push-rows judges no other. Nothing is fetched
-    and no ref moves."""
+    and no ref moves. `bound_by_run`: the run that started this push-rows
+    binds the checkout (CHECKOUT_BOUND_FLAG), so no pass is read here and the
+    remote is read once."""
     root = Path(root or REPO_ROOT)
     env = git_query_env()
     head = _git_ask(root, env, "rev-parse", "--verify", "HEAD^{commit}")
@@ -9418,6 +10066,9 @@ def landing_push(root: Optional[Path] = None, expect_tip: Optional[str] = None,
     head_sha = head.stdout.strip()
     if expect_head is not None and head_sha != expect_head:
         raise LandingUnjudged(f"HEAD changed from planned {expect_head[:12]} to {head_sha[:12]}")
+    if bound_by_run:
+        remote, tip = _landing_destination(root, env, head_sha, expect_tip, expect_remote)
+        return LandingPush(tip, head_sha, remote)
     # The remote is read before the complete checkout pass as well as after
     # it, so a push that main has already outrun is refused in seconds, not
     # after the pass; the tip the push is judged onto is the one read after.
@@ -9452,15 +10103,34 @@ def _landing_destination(root: Path, env: Dict[str, str], head_sha: str,
 
 
 def cmd_push_rows(args, root: Optional[Path] = None) -> int:
-    with _checkout_workers_scope():
-        return _cmd_push_rows_in_scope(args, root)
+    descriptor = getattr(args, "checkout_bound_by_fd", None)
+    if descriptor is None:
+        with _checkout_workers_scope():
+            return _cmd_push_rows_in_scope(args, root, None)
+    if not getattr(args, "expect_head", None):
+        # With no pass here, only --expect-head ties the HEAD these rows judge
+        # (TRUST_PUSHED_REFS) to the revision the run bound: a commit of the
+        # same tree, moved to and back inside the leg, would pass unseen.
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        print(f"PUSH-ROWS: NOT JUDGED — {CHECKOUT_BOUND_FLAG} without --expect-head names no revision the run "
+              "bound. No row ran.")
+        return 2
+    try:
+        bound = checkout_bound_by(descriptor)
+    except LandingUnjudged as exc:
+        print(f"PUSH-ROWS: NOT JUDGED — {exc}. No row ran.")
+        return 2
+    # No pass here, so no worker pool either.
+    print(f"{CHECKOUT_BOUND_REPORT}{bound}: it reads every tracked file before and after this leg")
+    return _cmd_push_rows_in_scope(args, root, bound)
 
 
-def _cmd_push_rows_in_scope(args, root: Optional[Path]) -> int:
+def _cmd_push_rows_in_scope(args, root: Optional[Path], bound: Optional[str]) -> int:
     root = Path(root or REPO_ROOT)
     try:
         push = landing_push(root, getattr(args, "expect_tip", None), getattr(args, "expect_head", None),
-                            getattr(args, "expect_remote", None))
+                            getattr(args, "expect_remote", None), bound_by_run=bound is not None)
     except LandingUnjudged as exc:
         print(f"PUSH-ROWS: NOT JUDGED — {exc}. No row ran.")
         return 2
@@ -9478,6 +10148,9 @@ def _cmd_push_rows_in_scope(args, root: Optional[Path]) -> int:
         print(f"push-rows: the checkout is HEAD {push.head[:12]}: {_tally_text(push.checkout)}")
     result = run_push_rows(rows, root, push, _row_jobs(), _hook_solo_re(root),
                            covered=covered, readers=push_refs_readers(root), table=table)
+    if bound is not None:
+        print(f"push-rows: the checkout after the rows is bound by run {bound}'s next complete pass")
+        return result
     tally = CheckoutTally()
     problem = checkout_problem(push.head, root, tally=tally)
     if problem:
@@ -10125,6 +10798,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pr.add_argument("--expect-remote", help="the captured publication remote; refuse another identity even at the same tip")
     pr.add_argument("--expect-head", help="the commit whose inputs and legs were planned; refuse a changed HEAD")
     pr.add_argument("--all-rows", action="store_true", help="execute all fresh push rows without claiming diagnostic-leg coverage")
+    pr.add_argument(CHECKOUT_BOUND_FLAG, type=int, metavar="FD",
+                    help="`run`'s leg only: a pipe holding run's token; run binds the checkout around this leg, "
+                         "so push-rows reads no checkout pass of its own")
     rw = sub.add_parser("rows", help="the row table gates/land.toml on the pushed commit(s) (TRUST_PUSHED_REFS), "
                                      "--rev's or HEAD's, from git objects (the push row fast.land-rows-coverage)")
     rw.add_argument("--check", action="store_true", required=True,

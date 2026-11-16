@@ -2890,13 +2890,21 @@ def _scanned_before(g: Graph, paths: Sequence[str], blobs: Dict[str, bytes]) -> 
     git (no NUL in its first 8000 bytes, no `binary` or `-diff` mark: git
     grep -I tells, the last of -a and -I counting), at a path git does not
     quote. It ran in the caller's locale, where a byte that is not UTF-8
-    before a match on its line hid it: here any such byte does. Only the
+    before a match on its line hid it: here any such byte does. The marks
+    are the judged commit's own .gitattributes, read from its tree, and no
+    configured diff driver changes them (_committed_attribute_git); a clean
+    checkout of the commit had no others. The landing host's file system may
+    fold case (APFS: core.ignorecase=true), so a file counts only when git
+    lists it with case-sensitive and with case-insensitive attribute
+    matching alike (_git_grep_committed_attributes), and none when an
+    attributes file of the tree differs from the name `--attr-source` reads
+    only by case or normalization (_committed_attributes_exact). Only the
     audited ones when git grep fails (no test-only evidence)."""
     audited = load_audits(g)
     out = {p for p in paths if p in audited}
     rest = []
     for p in paths:
-        if p in out or not p.endswith(".rs") or GIT_QUOTED.search(p):
+        if p in out or not p.endswith(".rs") or GIT_QUOTED.search(p) or not _committed_attributes_exact(g, p):
             continue
         try:
             blobs[p].decode("utf-8")
@@ -2904,9 +2912,43 @@ def _scanned_before(g: Graph, paths: Sequence[str], blobs: Dict[str, bytes]) -> 
             continue
         rest.append(p)
     if rest:
-        found = _git_grep(g, ["-l", "-z", "-I", "-F", "-e", "#[path"], [":(literal)" + p for p in rest])
-        out.update(_grep_listed(g, found) if found is not None else ())
+        found = _git_grep_committed_attributes(g, ["-l", "-z", "-I", "-F", "-e", "#[path"],
+                                               [":(literal)" + p for p in rest])
+        out.update(found if found is not None else ())
     return out
+
+
+def _committed_attributes_exact(g: Graph, path: str) -> bool:
+    """Whether every attributes file of the judged tree that a checkout on a
+    case-folding host reads for `path` is one `--attr-source` reads: git
+    there opens `<dir>/.gitattributes` for each directory above `path`, and
+    APFS answers with any entry whose name folds to it (fold: case and
+    Unicode normalization), in a directory whose name folds to that one;
+    the tree query reads the exact name in the exact directory only, and
+    reads a link's text where a checkout reads no file through a link. False
+    when the tree holds such a file under another spelling (a
+    `.GitAttributes`, or a `.gitattributes` in a `Src/` beside `src/`) or as
+    anything but a regular file.
+    (LAND-IR-READER-GAPS-1 review: the isolated query dropped a committed
+    `.GitAttributes` mark that a clean checkout on the landing host honours,
+    adding test-only evidence.)"""
+    named = g.__dict__.get("_attribute_files")
+    if named is None:
+        named = {}
+        for p in g.index.entries:
+            if fold(p.rsplit("/", 1)[-1]) == ".gitattributes":
+                d = p.rsplit("/", 1)[0] if "/" in p else ""
+                named.setdefault(fold(d), set()).add((p, g.index.entries[p][0] in REGULAR))
+        g.__dict__["_attribute_files"] = named
+    if not named:
+        return True
+    parts = path.split("/")[:-1]
+    for i in range(len(parts) + 1):
+        d = "/".join(parts[:i])
+        exact = (d + "/" if d else "") + ".gitattributes"
+        if any(p != exact or not regular for p, regular in named.get(fold(d), ())):
+            return False
+    return True
 
 
 def _named_in_production(g: Graph, path: str, main: bool = False) -> bool:
@@ -3252,6 +3294,81 @@ def _git_grep(g: Graph, args: Sequence[str], pathspecs: Sequence[str]) -> Option
         return proc.stdout
     g.__dict__["_grep_complaint"] = proc.stderr.decode("utf-8", "replace").strip()
     return None
+
+
+def _git_grep_committed_attributes(g: Graph, args: Sequence[str], pathspecs: Sequence[str]) -> Optional[Set[str]]:
+    """The paths a `-l -z` listing whose answer reads attributes (-I) lists,
+    run in a Git directory where they come from the judged commit alone
+    (_committed_attribute_git), with `--attr-source` naming that commit and
+    core.attributesFile the null device: those git lists both with
+    core.ignorecase false and true. The landing host's clone takes the
+    setting from its file system (APFS: true), where `HELPER.RS -diff`
+    marks helper.rs; with a case-sensitive one it does not, and a later
+    `Helper.rs diff` can unmark it again only case-insensitively, so neither
+    setting alone lists a subset of the other's. None when either query
+    failed, or when no such directory could be made (_grep_complaint).
+    (LAND-IR-READER-GAPS-1 review: the isolated directory had no
+    core.ignorecase, so a committed `HELPER.RS -diff` the landing host
+    honoured was dropped, adding test-only evidence.)"""
+    g._grep_pathspecs.add(tuple(pathspecs))
+    listed: Optional[Set[str]] = None
+    with tempfile.TemporaryDirectory(prefix="land-select-attributes.") as temporary:
+        env = _committed_attribute_git(g, temporary)
+        if env is None:
+            g.__dict__["_grep_complaint"] = "cannot read the clone's object directory"
+            return None
+        for ignorecase in ("false", "true"):
+            argv = _grep_command(g, [*GREP_AS_TEXT, *args, g.index.rev, "--", *pathspecs])
+            argv[1:1] = ["-c", "core.attributesFile=" + os.devnull, "-c", "core.ignorecase=" + ignorecase,
+                         "--attr-source=" + g.index.rev]
+            proc = subprocess.run(argv, capture_output=True, env=env)
+            if proc.returncode not in (0, 1):
+                g.__dict__["_grep_complaint"] = proc.stderr.decode("utf-8", "replace").strip()
+                return None
+            found = set(_grep_listed(g, proc.stdout))
+            listed = found if listed is None else listed & found
+    return listed
+
+
+def _committed_attribute_git(g: Graph, git_dir: str) -> Optional[Dict[str, str]]:
+    """Make `git_dir` a bare Git directory that shares only the clone's objects
+    (GIT_OBJECT_DIRECTORY, its alternates included), and return the
+    environment a query runs in there: one whose attributes, and whatever
+    configuration gives them meaning, the judged commit alone supplies. Git
+    reads attributes from, highest first, $GIT_COMMON_DIR/info/attributes,
+    the .gitattributes files of the worktree or index, core.attributesFile
+    (by default $XDG_CONFIG_HOME/git/attributes) and the system file; a diff
+    driver's `binary` setting, which decides -I for a `diff=<driver>` path,
+    comes from the clone's, the user's and the system's config. Here the
+    info directory is empty, the directory is bare (no worktree and no index,
+    whatever directory the query starts in), `--attr-source`
+    (_git_grep_committed_attributes; git 2.40 and later) reads .gitattributes
+    from the commit's tree, core.attributesFile is the null device,
+    GIT_ATTR_NOSYSTEM drops the system file, and the config is this
+    directory's own (no driver) with the global and system files dropped.
+    Git without `--attr-source` refuses the option: the query fails, and its
+    caller takes no answer from it.
+    None when the clone's object directory cannot be read.
+    (LAND-IR-READER-GAPS-1: an untracked `*.rs -diff`, one in info/attributes
+    or the global file, or a configured `diff.<driver>.binary`, added or
+    dropped _scanned_before's test-only evidence; no commit held any of
+    them.)"""
+    try:
+        objects = git(g.index.repo, "rev-parse", "--path-format=absolute", "--git-path", "objects").decode().strip()
+    except RuntimeError:
+        return None
+    if not objects or not os.path.isdir(objects):
+        return None
+    for name in ("objects", "refs", "info"):
+        os.mkdir(os.path.join(git_dir, name))
+    sha256 = len(g.index.rev) == 64
+    with open(os.path.join(git_dir, "HEAD"), "w", encoding="ascii") as head:
+        head.write("ref: refs/heads/unused\n")
+    with open(os.path.join(git_dir, "config"), "w", encoding="ascii") as config:
+        config.write("[core]\n\trepositoryformatversion = " + ("1" if sha256 else "0") + "\n\tbare = true\n"
+                     + ("[extensions]\n\tobjectformat = sha256\n" if sha256 else ""))
+    return git_env(LC_ALL="C", GIT_DIR=git_dir, GIT_OBJECT_DIRECTORY=objects, GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1")
 
 
 def _grep_complaint(g: Graph) -> str:

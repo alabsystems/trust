@@ -28,7 +28,7 @@
 
 clean {
     theorem self_le : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 
 // The signature surface — the lane that already worked, kept here as the

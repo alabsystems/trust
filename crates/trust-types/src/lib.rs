@@ -2029,6 +2029,9 @@ pub mod obligation_identity;
 // Stable names for Lean declarations, the same `<name>#<16 hex>` shape as an
 // obligation key, so a `.lean` check's records diff like a crate's.
 pub mod lean_declaration_identity;
+// The per-declaration rows of a crate's `clean { … }` islands, keyed as a
+// `.lean` declaration is, as the compiler publishes them (PKG-LIVE-2).
+pub mod clean_island_rows;
 // Distinct-site accounting over refuted rows (a MIR assert's L0 row and its
 // hardened panic-boundary twin are two rows at one site). Informational only.
 pub mod failure_sites;

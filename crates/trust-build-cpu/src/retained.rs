@@ -1144,4 +1144,29 @@ mod candidate_tests {
         let reopened = RecoveryAuthority::open(&store, "grant").unwrap();
         assert_eq!(pool.restore_original(reopened).unwrap().retained_units(), 1);
     }
+
+    #[test]
+    fn a_refused_restoration_unlocks_its_material_while_a_spawn_holds_a_copy() {
+        let fixture = crate::tests::kernel_fixture();
+        let directory = crate::tests::private_tempdir();
+        let root = directory.path().join("retained");
+        let pool = RetainedPool::create_private(&root, NonZeroU32::MIN).unwrap();
+        let store = directory.path().join("authority");
+        crate::tests::private_dir(&store);
+        let store = store.canonicalize().unwrap();
+        let material =
+            RecoveryMaterial::mint([1; 32], Owner::current(None), NonZeroU32::MIN, [2; 32])
+                .unwrap();
+        drop(material.persist(&store, "grant").unwrap());
+        let authority = RecoveryAuthority::open(&store, "grant").unwrap();
+        tear(&only_slot(&pool));
+        let (restored, reopened, copies) = while_copied(
+            fixture,
+            || pool.restore_original(authority),
+            || RecoveryAuthority::open(&store, "grant").map(drop).map_err(|error| error.kind()),
+        );
+        assert_eq!(copies, 1, "restoration did not lock its one candidate");
+        assert_eq!(restored.err().map(|error| error.kind()), Some(io::ErrorKind::InvalidData));
+        assert_eq!(reopened, Ok(()), "a refused restoration kept its material locked");
+    }
 }

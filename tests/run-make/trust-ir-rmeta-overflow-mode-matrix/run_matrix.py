@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded canonical schema-5 protocol/custody matrix; never builds an SDK.
+"""Bounded canonical schema-6 protocol/custody matrix; never builds an SDK.
 
 Execution requires Root's matching fresh compiler/std/private closure and build
 receipt. --plan prepares an explicitly NOT RUN record without those inputs.
@@ -111,7 +111,7 @@ def main():
     args.out.mkdir(parents=True)
     sources = {str(p): digest(p) for p in
                [HERE / "producer.rs", HERE / "consumer.rs", HERE / "rmake.rs", Path(__file__), PROBE]}
-    record = {"schema": "trust.schema5.overflow-mode-matrix.v1", "status": "PREPARED_NOT_RUN",
+    record = {"schema": "trust.schema6.overflow-mode-matrix.v1", "status": "PREPARED_NOT_RUN",
               "protocol_commit": PROTOCOL, "required_guard_commit": GUARD, "source_files": sources, "cells": [], "steps": [],
               "expected": {"producer_sessions": 2, "canonical_consumer_sessions": 4,
                            "read_only_consumer_sessions": 4, "cells": 4,
@@ -119,7 +119,7 @@ def main():
               "scope": "Protocol/custody only. No F1 admission, selected trust-cg backend, execution, ABI/NoUB or proof authority."}
     write(args.out / "MATRIX.json", record)
     if args.plan:
-        record["reason"] = "Requires Root's matching fresh schema5 compiler/std/private closure ; exact inherited-overflow guard is already bound. No compilation or matrix execution."
+        record["reason"] = "Requires Root's matching fresh schema6 compiler/std/private closure ; exact inherited-overflow guard is already bound. No compilation or matrix execution."
         write(args.out / "MATRIX.json", record)
         return
     required = ["sdk_root", "compiler_source", "compiler_commit", "guard_commit", "build_receipt"]
@@ -139,8 +139,8 @@ def main():
         for ancestor in dict.fromkeys([PROTOCOL, GUARD, args.guard_commit]):
             output(["git", "merge-base", "--is-ancestor", ancestor, args.compiler_commit], cwd=args.compiler_source)
         protected = args.compiler_source / "crates/trust-thir-lower/src/rmeta_entry.rs"
-        if not re.search(r"pub const ENTRY_SCHEMA:\s*u32\s*=\s*5\s*;", protected.read_text()):
-            raise AssertionError("source is not the schema5 protocol")
+        if not re.search(r"pub const ENTRY_SCHEMA:\s*u32\s*=\s*6\s*;", protected.read_text()):
+            raise AssertionError("source is not the schema6 protocol")
         if output(["git", "status", "--porcelain", "--untracked-files=no"], cwd=args.compiler_source).strip():
             raise AssertionError("matching compiler source must have no tracked edits")
         sdk = args.sdk_root.resolve()

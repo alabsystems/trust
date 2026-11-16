@@ -13,9 +13,61 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+autobins = false
 
 [lints]
 workspace = true
+
+[features]
+# Measurement programs are explicit tools, rather than prerequisites of every
+# integration test. Keep the four supported CLI targets available by default.
+diagnostic-tools = []
+
+[[bin]]
+name = "clean-axioms"
+path = "src/bin/clean-axioms.rs"
+
+[[bin]]
+name = "clean-contract"
+path = "src/bin/clean-contract.rs"
+
+[[bin]]
+name = "clean-reflect"
+path = "src/bin/clean-reflect.rs"
+
+[[bin]]
+name = "clean-reflect-source"
+path = "src/bin/clean-reflect-source.rs"
+
+[[bin]]
+name = "census-2026-07-06"
+path = "src/bin/census-2026-07-06.rs"
+required-features = ["diagnostic-tools"]
+
+[[bin]]
+name = "corpus-census-2026-07-24"
+path = "src/bin/corpus-census-2026-07-24.rs"
+required-features = ["diagnostic-tools"]
+
+[[bin]]
+name = "ff-gate-diagnose-2026-07-10"
+path = "src/bin/ff-gate-diagnose-2026-07-10.rs"
+required-features = ["diagnostic-tools"]
+
+[[bin]]
+name = "fold-crate-intake-2026-07-11"
+path = "src/bin/fold-crate-intake-2026-07-11.rs"
+required-features = ["diagnostic-tools"]
+
+[[bin]]
+name = "r4-worklist-2026-08-20"
+path = "src/bin/r4-worklist-2026-08-20.rs"
+required-features = ["diagnostic-tools"]
+
+[[bin]]
+name = "vc-cluster-2026-07-08"
+path = "src/bin/vc-cluster-2026-07-08.rs"
+required-features = ["diagnostic-tools"]
 
 [dependencies]
 trust-bridge-closure = { workspace = true }

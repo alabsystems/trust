@@ -442,6 +442,154 @@ fn a_case_with_a_lean_island_gets_its_own_arguments() {
     assert_eq!(sweep.flips().len(), SWEEP.len(), "{}", sweep.all());
 }
 
+/// A corpus whose files state their own rows, with a dependency crate, a
+/// variable for one group's compiles and a `conditional` row.
+const HEADED_TABLE: &str = r#"schema = "trust.corpora.v1"
+
+[[corpus]]
+id = "ladder"
+
+[corpus.conditional]
+disclosure = 'recorded as `assumption:x` (NOT proved)'
+certify_args = ["-Zpolicy=certify"]
+certify_refusal = "certify verification failed"
+
+[[corpus.group]]
+glob = "ladder/*.rs"
+args = ["--edition", "2021"]
+env = { VANILLA_DEBUG = "1" }
+headers = "trust-ladder"
+
+[[corpus.group]]
+glob = "ladder/xcrate/user_*.rs"
+ids_under = "ladder"
+args = ["--edition", "2021"]
+headers = "trust-ladder-xcrate"
+dependencies = "ladder/xcrate/lib*.rs"
+dependency_args = ["--edition", "2021", "--crate-type=lib", "-Zalways-encode-mir"]
+"#;
+
+/// A compiler for [`HEADED_TABLE`]. It prints its arguments and whether it was
+/// given `VANILLA_DEBUG`, builds a dependency by leaving its rlib (and refuses
+/// `libbroken`), refuses under the certify argument, refuses a row of the
+/// first group without the variable and a cross-crate row whose `--extern`
+/// file is not there, and otherwise does what each row's name says.
+const HEADED_COMPILER: &str = r#"out=; src=; prev=; certify=0; dep=0; rlib=
+for a in "$@"; do
+  [ "$prev" = --out-dir ] && out=$a
+  [ "$prev" = --extern ] && rlib=${a#*=}
+  case "$a" in -Zpolicy=certify) certify=1 ;; -Zalways-encode-mir) dep=1 ;; esac
+  prev=$a; src=$a
+done
+stem=$(basename -- "$src" .rs)
+echo "argv: $*"
+echo "debug=${VANILLA_DEBUG:-unset}"
+if [ "$dep" = 1 ]; then
+  [ "$stem" = libbroken ] && { echo "error: libbroken does not build" >&2; exit 1; }
+  : > "$out/lib$stem.rlib"
+  exit 0
+fi
+[ "$certify" = 1 ] && { echo "error: Trust certify verification failed" >&2; exit 1; }
+case "$stem" in
+  user_*) [ -f "$rlib" ] || { echo "error: no rlib at $rlib" >&2; exit 1; } ;;
+  *) [ "${VANILLA_DEBUG:-}" = 1 ] || { echo "error: no VANILLA_DEBUG" >&2; exit 1; } ;;
+esac
+case "$stem" in
+  c1) echo 'note: 1 row recorded as `assumption:x` (NOT proved)' ;;
+  r1) echo "error: <dyn Write>::write_str is not panic-free" >&2; exit 1 ;;
+  r2) echo "error: refused for some other reason" >&2; exit 1 ;;
+esac"#;
+
+/// What a row can ask beyond an exit status, with real processes: the
+/// dependency is built where the row's `--extern` says, the group's variable
+/// reaches a case's compile and no other, and the certify compile is the
+/// case's with the certify argument.
+#[test]
+fn a_headed_corpus_builds_its_dependency_and_asks_each_row_what_its_file_says() {
+    let world = World::new();
+    world.write("tests/corpora.toml", HEADED_TABLE);
+    let row = "//@ trust-ladder-row: <dyn Write>::write_str\n";
+    world.write("ladder/c1.rs", "//@ trust-ladder: conditional\n");
+    world.write("ladder/r1.rs", &format!("//@ trust-ladder: refuses\n{row}"));
+    world.write("ladder/r2.rs", &format!("//@ trust-ladder: refuses\n{row}"));
+    world.write("ladder/v1.rs", "//@ trust-ladder: verifies\n");
+    world.write("ladder/xcrate/libt.rs", "pub trait T {}\n");
+    world.write("ladder/xcrate/libbroken.rs", "pub trait B {}\n");
+    world.write("ladder/xcrate/user_ok.rs", "//@ trust-ladder-xcrate: verifies\n");
+    world.write(
+        "ladder/xcrate/user_stuck.rs",
+        "//@ trust-ladder-xcrate: refuses\n//@ trust-ladder-xcrate-dep: libbroken\n",
+    );
+    let compiler = world.compiler("headed", 'a', HEADED_COMPILER);
+    let run = world.delta(&compiler, &compiler, &["--fail-on-loss", "--keep", "kept"]);
+    assert_eq!(run.code, 0, "{}", run.all());
+    assert!(run.flips().is_empty(), "{}", run.all());
+    let verdicts: Vec<(String, String)> =
+        world.kept("kept", "new").into_iter().map(|(_, case, verdict)| (case, verdict)).collect();
+    let expected = [
+        ("c1", "conditional"),
+        ("r1", "refuses"),
+        ("r2", "refuses-otherwise"),
+        ("v1", "verifies"),
+        ("xcrate/user_ok", "verifies"),
+        // Pinned `refuses`, and not as pinned: its dependency refused, not it.
+        ("xcrate/user_stuck", "blocked"),
+    ];
+    let expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(case, verdict)| ((*case).to_owned(), (*verdict).to_owned()))
+        .collect();
+    assert_eq!(verdicts, expected, "{}", run.all());
+    let counts = ["ladder", "4", "/", "6", "4", "/", "6"];
+    assert!(
+        run.stdout.lines().any(|line| line.split_whitespace().collect::<Vec<_>>() == counts),
+        "{}",
+        run.all()
+    );
+
+    let log = |name: &str| {
+        fs::read_to_string(world.path("kept/new/ladder").join(name))
+            .unwrap_or_else(|error| panic!("no log {name}: {error}\n{}", run.all()))
+    };
+    // The group's variable: on a case's compile, not on its certify compile,
+    // a dependency's build or the other group's compiles.
+    assert!(log("v1.log").contains("debug=1\n"), "{}", log("v1.log"));
+    assert!(log("c1.log").contains("debug=1\n"), "{}", log("c1.log"));
+    for other in ["c1.certify.log", "xcrate/libt.dependency.log", "xcrate/user_ok.log"] {
+        assert!(log(other).contains("debug=unset\n"), "{other}:\n{}", log(other));
+    }
+    // The certify compile: the case's arguments, then the certify argument.
+    assert!(
+        log("c1.certify.log")
+            .starts_with("argv: --edition 2021 --crate-type=lib -Zpolicy=certify --out-dir "),
+        "{}",
+        log("c1.certify.log")
+    );
+    // The dependency's rlib is where the row's `--extern` and `-L` point.
+    let user = log("xcrate/user_ok.log");
+    let argv = user.lines().next().unwrap();
+    let rlib = argv
+        .split_whitespace()
+        .find_map(|argument| argument.strip_prefix("libt="))
+        .unwrap_or_else(|| panic!("no --extern libt=: {argv}"));
+    let directory = rlib.strip_suffix("/liblibt.rlib").expect("the rlib is liblibt.rlib");
+    assert!(directory.ends_with("/ladder/xcrate/libt.dependency"), "{argv}");
+    assert!(
+        argv.starts_with(&format!("argv: --edition 2021 --extern libt={rlib} -L {directory} ")),
+        "{argv}"
+    );
+    let dependency = log("xcrate/libt.dependency.log");
+    assert!(
+        dependency
+            .starts_with("argv: --edition 2021 --crate-type=lib -Zalways-encode-mir --out-dir "),
+        "{dependency}"
+    );
+    // A blocked case is not compiled: it has its dependency's log and none of
+    // its own.
+    assert!(log("xcrate/libbroken.dependency.log").contains("error: libbroken does not build"));
+    assert!(!world.path("kept/new/ladder/xcrate/user_stuck.log").exists());
+}
+
 #[test]
 fn help_is_printed_on_stdout_and_the_gate_table_is_not_asked() {
     let world = World::new();

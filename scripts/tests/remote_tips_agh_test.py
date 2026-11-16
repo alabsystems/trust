@@ -98,6 +98,7 @@ class AghMetadataTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, json.dumps(self.route), "")
         self.assertIn("--no-anonymous-api", args)
         self.assertNotIn("--anonymous", args)
+        self.assertNotEqual(args[1], "api", "ref advertisements must not consume REST quota")
         if args[1:3] == ["repo", "refs"]:
             self.assertNotIn("--as", args)
             self.assertEqual(args[3], rt.github_repository(self.url))
@@ -119,6 +120,10 @@ class AghMetadataTests(unittest.TestCase):
         # incomplete borrowed object graph. Native tests independently qualify
         # authenticated acquisition and the bounded transfer itself.
         for sha in dict.fromkeys(wanted):
+            kind = subprocess.run(["git", "-C", str(self.donor), "cat-file", "-t", sha],
+                                  capture_output=True, text=True)
+            if kind.returncode or kind.stdout.strip() != "commit":
+                return subprocess.CompletedProcess(args, 6, "", "native commit-only read refuses non-commit")
             result = subprocess.run(["git", "-C", str(self.donor), "cat-file", "commit", sha],
                                     capture_output=True)
             if result.returncode:
@@ -504,9 +509,39 @@ class AghMetadataTests(unittest.TestCase):
 
     def test_malformed_ref_collection_never_supplies_a_tip(self):
         for rows in ("{}", '[{"ref":"refs/heads/main","oid":"bad"}]',
-                     json.dumps([{"ref":"refs/heads/main", "oid":self.tip}] * 2)):
+                     json.dumps([{"ref":"refs/heads/main", "oid":self.tip}] * 2),
+                     json.dumps([{"ref":"refs/heads/../main", "oid":self.tip}]),
+                     json.dumps([{"ref":"HEAD", "oid":self.tip}])):
             with self.subTest(rows=rows), patch.object(rt, "_agh", return_value=subprocess.CompletedProcess([], 0, rows, "")):
                 self.assertNotEqual(rt.remote_refs(self.url).returncode, 0)
+
+    def test_native_advertisement_preserves_heads_and_pins_but_not_tags(self):
+        self.refs = {"refs/heads/main": self.tip,
+                     "refs/heads/master": self.pin, "refs/pins/kept": self.fork,
+                     "refs/tags/release": self.pin, "refs/tags/release^{}": self.tip}
+        result = rt.remote_refs(self.url, git_dir=self.store / ".git")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(dict((ref, oid) for oid, ref in
+                              (line.split() for line in result.stdout.splitlines())),
+                         {name: oid for name, oid in self.refs.items()
+                          if name.startswith(("refs/heads/", "refs/pins/"))})
+        self.assertFalse(any(c[:2] == ["agh", "api"] for c in self.calls))
+
+    def test_advertised_unknown_object_does_not_establish_containment(self):
+        self.refs = {"refs/heads/main": "1" * 40}
+        before = self.state()
+        self.assertEqual(rt.RemoteTips().judge(self.store, self.pin).state, rt.UNJUDGED)
+        self.assertEqual(self.state(), before)
+        self.assertTrue(any(c[:3] == ["agh", "repo", "commit-ancestry"] for c in self.calls))
+
+    def test_noncommit_durable_ref_is_not_peeled_into_a_commit(self):
+        self.git("-C", str(self.donor), "tag", "-a", "release", self.tip, "-m", "tag object")
+        tag = self.git("-C", str(self.donor), "rev-parse", "refs/tags/release")
+        self.git("-C", str(self.store), "fetch", "-q", str(self.donor), tag)
+        self.assertEqual(rt.RemoteTips.present(self.store / ".git", [tag]), set())
+        self.refs = {"refs/heads/main": tag}
+        self.assertEqual(rt.RemoteTips().judge(self.store, self.pin).state, rt.UNJUDGED)
+        self.assertTrue(any(c[:3] == ["agh", "repo", "commit-ancestry"] for c in self.calls))
 
     def test_commit_presence_requires_complete_matching_object_body(self):
         self.git("-C", str(self.store), "fetch", "-q", str(self.donor), self.pin)

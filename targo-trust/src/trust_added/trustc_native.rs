@@ -591,6 +591,9 @@ fn authenticated_transport(
                 }
                 coverage_summary = Some(summary);
             }
+            // Island rows are disclosure: never an authenticated outcome or a
+            // count.
+            TransportMessage::CleanIslandRows(_) => {}
             _ => return None,
         }
     }

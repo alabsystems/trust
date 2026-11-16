@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual operation lifetime controls; no remote or ancestry verdict is mocked."""
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -71,7 +72,7 @@ class SourcePublicationViewTests(unittest.TestCase):
             if arguments[:2] == ["git", "clone"]:
                 self.prepared.append(Path(arguments[-1]))
                 self.assertTrue(kwargs["isolate_git_config"])
-                for flag in ("--shared", "--no-checkout", "--single-branch", "--no-tags", "--template="):
+                for flag in ("--local", "--no-checkout", "--single-branch", "--no-tags", "--template="):
                     self.assertIn(flag, arguments)
                 if after_clone:
                     after_clone(Path(arguments[-1]))
@@ -97,7 +98,7 @@ class SourcePublicationViewTests(unittest.TestCase):
             self.assertEqual(self.git(view, "rev-parse", "HEAD^{tree}"), self.git(self.root, "rev-parse", "HEAD^{tree}"))
             self.assertEqual(self.git(view, "cat-file", "-t", self.before), "commit")
             self.assertEqual(self.git(view, "config", "--local", "--get", "core.hooksPath", check=False).returncode, 1)
-            self.assertTrue((view / ".git/objects/info/alternates").is_file())
+            self.assertFalse((view / ".git/objects/info/alternates").exists())
             return subprocess.CompletedProcess(arguments, 0, "native-created\n", "")
         for root in (self.root, linked):
             with self.subTest(root=root):
@@ -105,6 +106,202 @@ class SourcePublicationViewTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout), (0, "native-created\n"))
                 self.assertEqual(len(self.views), 1)
                 self.assert_cleaned_only_view()
+
+    def test_native_view_reads_qualified_blob_without_source_object_directory(self):
+        blob = self.git(self.root, "rev-parse", self.after + ":source.txt")
+        objects = self.root / ".git/objects"
+        retained = self.root / ".git/retained-object-data"
+
+        def provider(arguments, view):
+            # The native transport receives its own directory, not authority to
+            # open the caller's object directory. Exercise an actual Git read
+            # with that pathname unavailable, then restore the source before
+            # its existing post-operation bookend.
+            objects.rename(retained)
+            try:
+                self.assertEqual(self.git(view, "cat-file", "blob", blob), "qualified")
+            finally:
+                retained.rename(objects)
+            return subprocess.CompletedProcess(arguments, 0, "native-created\n", "")
+
+        result = self.publication(provider)
+        self.assertEqual(result.returncode, 0)
+        self.assert_cleaned_only_view()
+
+    def test_borrowed_caller_retains_packed_and_loose_history_without_any_provider(self):
+        # Packed history, nested relative alternates, spaces, and a local loose
+        # commit exercise Git's resolved object graph without a repack/copy.
+        self.git(self.root, "repack", "-ad")
+        middle = self.directory / "middle provider"
+        borrowed = self.directory / "borrowed caller"
+        self.git(self.directory, "clone", "--quiet", "--shared", str(self.root), str(middle))
+        self.git(self.directory, "clone", "--quiet", "--shared", str(middle), str(borrowed))
+        for caller, upstream in ((middle, self.root), (borrowed, middle)):
+            objects = caller / ".git/objects"
+            (objects / "info/alternates").write_text(
+                os.path.relpath(upstream / ".git/objects", objects) + "\n")
+        (borrowed / "source.txt").write_text("caller-local\n")
+        self.git(borrowed, "-c", "user.email=fixture@example.invalid", "-c",
+                 "user.name=Source fixture", "commit", "-qam", "caller local source")
+        selected = self.git(borrowed, "rev-parse", "HEAD")
+        blob = self.git(borrowed, "rev-parse", selected + ":source.txt")
+        namespaces = [self.root / ".git/objects", middle / ".git/objects", borrowed / ".git/objects"]
+        saved = {caller: ((caller / ".git/config").read_bytes(),
+                         (caller / ".git/objects/info/alternates").read_bytes())
+                 for caller in (middle, borrowed)}
+        retained_files = list((namespaces[0] / "pack").glob("*.pack"))
+        retained_files += list((namespaces[0] / "pack").glob("*.idx"))
+        self.assertTrue(retained_files)
+        retained_files.append(namespaces[-1] / blob[:2] / blob[2:])
+
+        def provider(arguments, view):
+            self.assertFalse((view / ".git/objects/info/alternates").exists())
+            self.assertNotIn("alternate: ", self.git(view, "count-objects", "-v"))
+            for original in retained_files:
+                origin = namespaces[-1] if original.is_relative_to(namespaces[-1]) else namespaces[0]
+                owned = view / ".git/objects" / original.relative_to(origin)
+                old_stat, new_stat = original.stat(), owned.stat()
+                self.assertEqual((new_stat.st_dev, new_stat.st_ino),
+                                 (old_stat.st_dev, old_stat.st_ino),
+                                 "publication must retain existing object DATA without recompression")
+            retained = []
+            try:
+                for objects in namespaces:
+                    moved = objects.with_name("held-object-data")
+                    objects.rename(moved)
+                    retained.append((objects, moved))
+                self.assertEqual(self.git(view, "show", self.before + ":source.txt"), "before")
+                self.assertEqual(self.git(view, "show", selected + ":source.txt"), "caller-local")
+                self.git(view, "rev-list", "--quiet", "--objects", "--missing=error", selected)
+            finally:
+                for objects, moved in reversed(retained):
+                    moved.rename(objects)
+            return subprocess.CompletedProcess(arguments, 0, "native-created\n", "")
+
+        result = self.publication(provider, root=borrowed, after=selected)
+        self.assertEqual((result.returncode, result.stdout), (0, "native-created\n"), result.stderr)
+        for caller, (config, alternate) in saved.items():
+            self.assertEqual((caller / ".git/config").read_bytes(), config)
+            self.assertEqual((caller / ".git/objects/info/alternates").read_bytes(), alternate)
+        self.assertEqual(self.git(borrowed, "rev-parse", "HEAD"), selected)
+        self.assertEqual((borrowed / "source.txt").read_text(), "caller-local\n")
+        self.assert_cleaned_only_view()
+
+    def test_borrowed_data_symlink_or_collision_refuses_before_native_publication(self):
+        blob = self.git(self.root, "rev-parse", self.before + ":source.txt")
+        original = self.root / ".git/objects" / blob[:2] / blob[2:]
+        for hazard in ("symlink", "collision"):
+            with self.subTest(hazard=hazard):
+                borrowed = self.directory / ("borrowed " + hazard)
+                self.git(self.directory, "clone", "--quiet", "--shared", str(self.root), str(borrowed))
+                held = self.directory / "held-historical-object"
+                def mutate(view):
+                    if hazard == "symlink":
+                        original.rename(held)
+                        original.symlink_to(held)
+                    else:
+                        collision = view / ".git/objects" / blob[:2] / blob[2:]
+                        collision.parent.mkdir(exist_ok=True)
+                        collision.write_bytes(b"unrelated object data")
+                def forbidden(*_):
+                    self.fail("unsafe borrowed object reached native publication")
+                try:
+                    result = self.publication(forbidden, root=borrowed, after_clone=mutate)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("regular data file" if hazard == "symlink" else "object data collision",
+                                  result.stderr)
+                    self.assertFalse(self.views)
+                finally:
+                    if hazard == "symlink" and held.exists():
+                        original.unlink()
+                        held.rename(original)
+                self.assertEqual(self.git(self.root, "cat-file", "blob", blob), "before")
+                self.assert_cleaned_only_view()
+
+    def test_borrowed_data_exdev_copy_preserves_history_without_any_provider(self):
+        self.git(self.root, "repack", "-ad")
+        borrowed = self.directory / "borrowed other volume"
+        self.git(self.directory, "clone", "--quiet", "--shared", str(self.root), str(borrowed))
+        namespaces = [self.root / ".git/objects", borrowed / ".git/objects"]
+        pack = next((namespaces[0] / "pack").glob("*.pack"))
+        def provider(arguments, view):
+            self.assertFalse((view / ".git/objects/info/alternates").exists())
+            owned = view / ".git/objects/pack" / pack.name
+            self.assertEqual(owned.read_bytes(), pack.read_bytes())
+            self.assertNotEqual((owned.stat().st_dev, owned.stat().st_ino),
+                                (pack.stat().st_dev, pack.stat().st_ino))
+            retained = []
+            try:
+                for objects in namespaces:
+                    moved = objects.with_name("held-object-data")
+                    objects.rename(moved)
+                    retained.append((objects, moved))
+                self.assertEqual(self.git(view, "show", self.before + ":source.txt"), "before")
+                self.assertEqual(self.git(view, "show", self.after + ":source.txt"), "qualified")
+                self.git(view, "rev-list", "--quiet", "--objects", "--missing=error", self.after)
+            finally:
+                for objects, moved in reversed(retained):
+                    moved.rename(objects)
+            return subprocess.CompletedProcess(arguments, 0, "native-created\n", "")
+        # Exercise only the EXDEV result of the OS link operation; all copy,
+        # comparison, history, ownership and provider-loss reads are actual.
+        with patch.object(rt.os, "link", side_effect=OSError(errno.EXDEV, "cross-device link")):
+            result = self.publication(provider, root=borrowed)
+        self.assertEqual((result.returncode, result.stdout), (0, "native-created\n"), result.stderr)
+        self.assert_cleaned_only_view()
+
+    def test_borrowed_data_link_failure_refuses_without_copy_or_native_publication(self):
+        borrowed = self.directory / "borrowed link failure"
+        self.git(self.directory, "clone", "--quiet", "--shared", str(self.root), str(borrowed))
+        def forbidden(*_):
+            self.fail("failed object retention reached native publication")
+        with patch.object(rt.os, "link", side_effect=PermissionError(13, "permission denied")):
+            result = self.publication(forbidden, root=borrowed)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("permission denied", result.stderr)
+        self.assertFalse(self.views)
+        self.assert_cleaned_only_view()
+
+    def test_missing_historical_blob_refuses_before_native_publication(self):
+        old_blob = self.git(self.root, "rev-parse", self.before + ":source.txt")
+        path = self.root / ".git/objects" / old_blob[:2] / old_blob[2:]
+        retained = self.directory / "historical-blob-data"
+        path.rename(retained)
+        try:
+            # The complete selected checkout does not establish complete
+            # historical object availability for native strict packing.
+            self.assertEqual(self.git(self.root, "show", "HEAD:source.txt"), "qualified")
+
+            def forbidden(*_):
+                self.fail("incomplete source history reached native publication")
+
+            result = self.publication(forbidden)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("publication history", result.stderr)
+            self.assertIn(old_blob, result.stderr)
+            self.assertFalse(self.views)
+            self.assertFalse(self.prepared)
+        finally:
+            retained.rename(path)
+        self.assert_cleaned_only_view()
+
+    def test_transport_missing_historical_blob_refuses_before_native_publication(self):
+        old_blob = self.git(self.root, "rev-parse", self.before + ":source.txt")
+
+        def remove_old_blob(view):
+            (view / ".git/objects" / old_blob[:2] / old_blob[2:]).unlink()
+
+        def forbidden(*_):
+            self.fail("incomplete transport history reached native publication")
+
+        result = self.publication(forbidden, after_clone=remove_old_blob)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("publication history", result.stderr)
+        self.assertIn(old_blob, result.stderr)
+        self.assertFalse(self.views)
+        self.assertEqual(len(self.prepared), 1)
+        self.assertEqual(self.git(self.root, "cat-file", "blob", old_blob), "before")
+        self.assert_cleaned_only_view()
 
     def test_wrong_head_and_nonancestor_never_reach_native_publication(self):
         tree = self.git(self.root, "rev-parse", "HEAD^{tree}")
@@ -827,6 +1024,88 @@ assert pins==retired
 
     def test_persistent_census_failure_refuses_and_stops_every_known_group(self):
         self.census_failure(True)
+
+
+@unittest.skipUnless(os.name == "posix" and rt._process_owner.exit_observation_available(),
+                     "requires the supported local POSIX operation profile")
+class InheritedRepositoryEnvironmentTests(unittest.TestCase):
+    """A hook's exported repository-local variables never choose what
+    RemoteTips reads (the inherited-environment half of IR-COHORT-LOCAL-REMOTE-1): _env
+    removes every GIT_* name, inherited or passed, before its fixed profile."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="remote-tips-env-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name).resolve()
+        self.clean = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.store = self.repository("store", "/remotes/declared.git")
+        self.other = self.repository("other", "/remotes/elsewhere.git")
+
+    def git(self, *arguments):
+        return subprocess.run(["git", *arguments], env=self.clean, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def repository(self, name, url):
+        path = self.directory / name
+        self.git("init", "-q", "-b", "main", str(path))
+        self.git("-C", str(path), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-q", "--allow-empty", "-m", name)
+        self.git("-C", str(path), "remote", "add", "origin", url)
+        return path
+
+    def reported(self):
+        return subprocess.run(["git", "rev-parse", "--local-env-vars"], cwd=os.path.abspath(os.sep), env=self.clean,
+                              capture_output=True, text=True, check=True).stdout.split()
+
+    def test_resolve_answers_for_the_named_store_whatever_a_hook_exports(self):
+        other_git = str(self.other / ".git")
+        exports = {
+            "GIT_DIR": {"GIT_DIR": other_git},
+            "GIT_DIR and GIT_WORK_TREE": {"GIT_DIR": other_git, "GIT_WORK_TREE": str(self.other)},
+            "GIT_COMMON_DIR": {"GIT_COMMON_DIR": other_git},
+            "GIT_OBJECT_DIRECTORY": {"GIT_OBJECT_DIRECTORY": str(self.other / ".git/objects")},
+            "GIT_INDEX_FILE": {"GIT_INDEX_FILE": str(self.other / ".git/index")},
+            "GIT_CONFIG_PARAMETERS": {"GIT_CONFIG_PARAMETERS": "'remote.origin.url'='/remotes/elsewhere.git'"},
+            "GIT_CONFIG_COUNT": {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "remote.origin.url",
+                                 "GIT_CONFIG_VALUE_0": "/remotes/elsewhere.git"},
+        }
+        expected = rt.Remote(self.store / ".git", "origin", "/remotes/declared.git")
+        self.assertEqual(rt.RemoteTips._resolve(self.store), expected)
+        for name, exported in exports.items():
+            with self.subTest(name), patch.dict(os.environ, exported):
+                self.assertEqual(rt.RemoteTips._resolve(self.store), expected)
+                self.assertEqual(rt.RemoteTips._resolve(self.store / ".git"), expected)
+                self.assertEqual(rt.RemoteTips().remote(self.store), expected)
+
+    def test_env_drops_every_name_git_reports_inherited_or_passed(self):
+        reported = self.reported()
+        self.assertTrue({"GIT_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"} <= set(reported))
+        hostile = {name: "/nonexistent/hook-export" for name in reported}
+        hostile.update(GIT_CONFIG_PARAMETERS="'core.bare'='true'", GIT_CONFIG_COUNT="1",
+                       GIT_CONFIG_KEY_0="core.bare", GIT_CONFIG_VALUE_0="true", GIT_CONFIG_GLOBAL="/nonexistent",
+                       # Global pathspec switches git exports to a hook, and a
+                       # transport profile the fixed one must replace.
+                       GIT_GLOB_PATHSPECS="1", GIT_ICASE_PATHSPECS="1", GIT_TERMINAL_PROMPT="1",
+                       GIT_NO_LAZY_FETCH="0", GIT_ALLOW_PROTOCOL="https:ssh")
+        # The fixed profile, which _env sets after removing every GIT_* name.
+        fixed = {"GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull,
+                 "GIT_ALLOW_PROTOCOL": "file", "GIT_NO_LAZY_FETCH": "1"}
+        objects = self.directory / "intake-objects"
+        with patch.dict(os.environ, hostile):
+            profiles = {
+                "inherited": (rt._env(), fixed),
+                "passed": (rt._env(dict(os.environ)), fixed),
+                "isolated": (rt._env(isolate_git_config=True), dict(
+                    fixed, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_GLOBAL=os.devnull)),
+                # Isolated object intake names its own object directory, deliberately.
+                "object intake": (rt._env(isolate_git_config=True, git_object_directory=objects), dict(
+                    fixed, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_GLOBAL=os.devnull,
+                    GIT_OBJECT_DIRECTORY=str(objects))),
+            }
+        for name, (env, profile) in profiles.items():
+            with self.subTest(name):
+                self.assertEqual({key: value for key, value in env.items() if key.startswith("GIT_")}, profile)
+                self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
 
 
 if __name__ == "__main__":

@@ -255,6 +255,55 @@ fn context_report(context: &RuntimeContext) -> Value {
                 }})).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect::<Vec<_>>()})
 }
 
+/// Untrusted producer DATA, alongside the unchanged Object/RC diagnostic lane.
+/// Neither this construction nor a lossless wire roundtrip earns permission.
+fn typed_closure_candidate(
+    accepted: &trust_certify::lean_source_batch::AcceptedLeanSourceContext<'_>,
+    entry: &Name,
+) -> Result<Value, String> {
+    let proposal = trust_clean_ir::closure_proposal::propose(
+        accepted.environment(),
+        accepted.owned_declarations(),
+        entry,
+    )?;
+    let bytes = trust_ir::binary::serialize_module(&proposal.module)
+        .map_err(|e| format!("typed closure candidate wire: {e}"))?;
+    let decoded = trust_ir::binary::deserialize_module(&bytes)
+        .map_err(|e| format!("typed closure candidate wire decode: {e}"))?;
+    if decoded != proposal.module {
+        return Err("typed closure candidate wire roundtrip changed Module DATA".into());
+    }
+    Ok(json!({
+        "status":"candidate-data",
+        "authority":"none-data-only-not-source-refinement",
+        "source_closure_sha256":accepted.source_closure_sha256(),
+        "owned_declarations_sha256":accepted.owned_declarations_sha256(),
+        "complete_owned_roster":accepted.owned_declarations(),
+        "originals":proposal.originals.iter().map(|r|json!({
+            "constant":r.constant,"function":r.function,"role":r.role
+        })).collect::<Vec<_>>(),
+        "lifted":{"owner":proposal.lifted_owner,"function":proposal.lifted_function,
+            "closure_type":proposal.closure_type,"apparent_signature":proposal.apparent_signature,
+            "maker_supplied":proposal.maker_supplied,"capture_parameter_indices":proposal.captures},
+        "arithmetic_erasure_proposals":proposal.arithmetic.iter().map(|r|json!({
+            "owner":r.owner,"source":r.source,"erased_prefix":r.erased_prefix,
+            "generated_function":if r.owner == proposal.lifted_owner {
+                Some(proposal.lifted_function)
+            } else {
+                proposal.originals.iter().find(|f| f.constant.name == r.owner).map(|f|f.function)
+            },
+            "result":r.result,"operation":r.operation
+        })).collect::<Vec<_>>(),
+        "module":proposal.module,
+        "wire_format":"trust_ir::binary::serialize_module",
+        "wire_sha256":format!("{:x}",Sha256::digest(&bytes)),
+        "wire_bytes":bytes,
+        "limitations":["Untrusted bounded proposal from the actual accepted CIC context; source/body/erasure/capture/convention associations are proposed DATA.",
+            "All original and lifted bodies are explicitly Ungated; no carrier, source-refinement, runtime, ABI, object or machine authority.",
+            "The existing Object/RC runtime producer and every carrier/object refusal remain unchanged."]
+    }))
+}
+
 fn produce(
     request: &Request,
     checked: &crate::lean_cli::CheckedLeanBatch,
@@ -288,6 +337,29 @@ fn produce(
     report["context"] = context_report(&context);
     report["context_status"] = json!("captured-diagnostic-context-not-source-refinement");
     let source = context.environment_capture().expect("environment capture requested");
+    // Transport the original accepted payloads before attempting any lowering.
+    // The old census's name/role/body-present bits cannot reconstruct a source
+    // subject. These are the existing capture's complete rows, not summaries or
+    // a newly interpreted source language. Failed/truncated captures still owe
+    // the checks below and never obtain a module attachment.
+    report["accepted_original"] = json!({
+        "schema":"trust.lean.accepted-original-data/v1",
+        "authority":"none-data-only-not-source-refinement",
+        "source_closure_sha256":accepted.source_closure_sha256(),
+        "owned_declarations_sha256":accepted.owned_declarations_sha256(),
+        "sources":accepted.sources().iter().map(|s|json!({
+            "module":s.module,"path":s.path,"source":s.source
+        })).collect::<Vec<_>>(),
+        "aliases":accepted.aliases().iter().map(|a|json!({
+            "module":a.module,"source_index":a.source_index
+        })).collect::<Vec<_>>(),
+        "owned_declarations":accepted.owned_declarations(),
+        "owned_payloads":source.after.iter().filter(|r|source.added.contains(&r.name)).collect::<Vec<_>>(),
+        "capture_delta_complete":source.delta_complete,
+        "capture_errors":source.errors,
+        "limitations":["Eager accepted original kernel payloads, not a complete runtime or lifted-body universe.",
+            "Labels and hashes bind observed data, not a Lean-owned source/IR refinement, ABI or admission proof."]
+    });
     if !source.delta_complete
         || source.snapshot_blake3.is_none()
         || !source.errors.is_empty()
@@ -304,6 +376,14 @@ fn produce(
         report["preproduction_errors"] = json!(errors);
         return Err(errors.join("; "));
     }
+    report["typed_closure_candidate"] = match typed_closure_candidate(&accepted, &request.entry) {
+        Ok(mut candidate) => {
+            candidate["environment_snapshot_blake3"] = json!(source.snapshot_blake3);
+            candidate
+        }
+        Err(reason) => json!({"status":"refused-no-candidate",
+            "authority":"none-data-only-not-source-refinement","reason":reason}),
+    };
     let output = context
         .lower_trust_ir_diagnostic(
             &request.entry,
@@ -322,7 +402,29 @@ fn produce(
         "dynamic_application_sites":emitted.dynamic_applications,
         "fixed_runtime_imports":emitted.runtime_imports.iter().map(|r|json!({"function_index":r.function_index,"function_id":r.function_id.0,"symbol":r.symbol,
             "calling_convention":format!("{:?}",r.calling_convention),"linkage":format!("{:?}",r.linkage),"parameters":format!("{:?}",r.parameters),"returns":format!("{:?}",r.returns),"variadic":r.variadic})).collect::<Vec<_>>()});
-    serialize_diagnostic_module(&emitted.module)
+    let bytes = serialize_diagnostic_module(&emitted.module)?;
+    // This is the actual existing producer's canonical Rust Module and exact
+    // returned artifact, associated in this one invocation with the original
+    // payload above. It is not the handquoted logical closure model. In
+    // particular Object/RC runtime output does not acquire that model's proof.
+    // Serialize fallibly: a data encoding failure must not publish a partial
+    // or supposedly attached artifact.
+    let module = serde_json::to_value(&emitted.module)
+        .map_err(|error| format!("diagnostic module data encoding refused: {error}"))?;
+    report["module_attachment"] = json!({
+        "schema":"trust.lean.produced-module-data/v1",
+        "authority":"none-data-only-not-source-refinement",
+        "source_closure_sha256":accepted.source_closure_sha256(),
+        "owned_declarations_sha256":accepted.owned_declarations_sha256(),
+        "module":module,
+        "wire_format":"raw-tMBC-current-clean-emitter",
+        "wire_sha256":format!("{:x}",Sha256::digest(&bytes)),
+        "wire_bytes":bytes,
+        "publication":"candidate-data-not-publication-or-postflight-attestation",
+        "limitations":["Existing diagnostic Object/RC producer output, not the logical closure quotation.",
+            "No Lean-owned source/decoded-module relation, physical closure layout, runtime, ABI, object or admission authority."]
+    });
+    Ok(bytes)
 }
 
 fn serialize_diagnostic_module(module: &trust_ir::Module) -> Result<Vec<u8>, String> {

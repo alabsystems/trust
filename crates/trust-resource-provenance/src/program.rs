@@ -125,8 +125,8 @@ mod current_code;
 pub use current_code::{CURRENT_CODE_POLICY, HeldExecutingProgram};
 mod selected_source;
 pub use selected_source::{
-    HeldSourceFileOffer, HeldSourceReadSet, RefusedSourceFileOffer, SourceDirectoryEntry,
-    SourceEntryKind, SourceRead,
+    ConfigurationInputObserver, HeldSourceFileOffer, HeldSourceReadSet, RefusedSourceFileOffer,
+    SourceDirectoryEntry, SourceEntryKind, SourceRead,
 };
 mod directory_input;
 pub use directory_input::HeldDirectoryInput;

@@ -44,7 +44,9 @@
 // low halves of D8-D15 (and X18 on Darwin) are preserved; the caller's frame
 // `[SP_at_call, SP_entry)` is preserved and all other memory becomes fresh. The
 // result bits the callee's FnAbi defines are the shared `R`. Qualified Darwin
-// C-u8 Zext places zeroes in W0[31:8]; all higher unspecified bits are fresh. Divergence (`D_s`) is implicit and shared: every obligation
+// C-u8 Zext places zeroes in W0[31:8]; all higher unspecified bits are fresh.
+// Bool call edges remain Unknown: a callee's own C1/C2 proof does not establish
+// a Lean-checked callee-to-caller transport relation (BOOL-RET-EDGE-1 withdrawn). Divergence (`D_s`) is implicit and shared: every obligation
 // after a paired event is stated for the executions in which the callee
 // returns, so a callee that never returns ends both executions at the same
 // event, after O3 matched it.
@@ -65,7 +67,9 @@
 //
 // ASSUMPTIONS, recorded per callee in each certificate:
 //   * `CoEmitted(g)` — discharged by g's own certificate (O0 + O4 + O5); the
-//     closure report checks that, as a greatest fixpoint over recursion SCCs;
+//     closure report checks that, as a greatest fixpoint over recursion SCCs.
+//     A Bool definition's O4 also carries C2 (BOOL-RET-EDGE-1): its own
+//     carrier is 0/1 wherever its IR returns. This grants no Bool call edge;
 //   * `External(g)` — a declaration, or a definition preemptible under PIC;
 //     rests on the Trusted row EXTERNAL-CALLEE (owner ruling D30).
 //
@@ -88,6 +92,17 @@
 // exit: a change may widen what is compared or add a refusal; it may never
 // widen what is accepted without an explicit frozen waiver and a complete
 // physical contract (including the recorded domain and kernel-checked laws).
+//
+// LOOPS (PKG-C5c-L0, call_event/loop_cut.rs): a loop is still Unknown with the
+// spec side's `loop/backedge at bb{N} (fail-closed)` text, byte for byte. In a
+// `test-hooks` build only (the compiler never enables it), a test that installs
+// `record_loop_segments` on the gate thread gets a MEASUREMENT of the loop's
+// cut-point segments: both sides cut at one loop cut point, every segment item
+// decided (structurally, else by ay under deterministic caps) and recorded for
+// the test. Nothing of it reaches a grade, a certificate or a refusal. What
+// every build compiles is `spec_entry` (the entry environment `eval_spec`
+// always built, moved out unchanged so the measurement reads the same one) and
+// `CerExec::is_cut`, constant `false` outside `test-hooks`.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -139,7 +154,15 @@ mod scalar_original_tests;
 mod signed_original_tests;
 #[path = "call_event/source_memory.rs"]
 mod source_memory;
+// PKG-C5c-L0: the loop cut-point measurement (test-hooks builds only).
+#[cfg(feature = "test-hooks")]
+mod loop_cut;
 use closure_values::{Capture, ClosureValue};
+#[cfg(feature = "test-hooks")]
+pub use loop_cut::{
+    ItemOutcome, LoopOutcome, LoopRecord, Measurement, record_loop_segments,
+    with_loop_cut_query_cap,
+};
 
 /// The schema name of one per-function certificate record.
 pub const CERTIFICATE_SCHEMA: &str = "trust-cg-bridge.call-refinement.v1";
@@ -1152,220 +1175,6 @@ enum SiteDecision {
     Inlined { producer: usize, func: FuncId },
 }
 
-/// PKG-C5c S2a (docs/DECISION_QUEUE.md PKG-C5c-DEAD-TAIL-1): the dead panic
-/// tails of one function. A tail admitted here is admitted UNEXECUTED: nothing
-/// checks its entry call or its Location record. Soundness rests on O4 alone
-/// (`spec_reach ⇒ machine_reach`, and the machine side scores every path into
-/// a trap tail `reach = false`) and (4b) (no check of the producer fails on a
-/// reached path), both items of the step-(4) conjunction: together they say
-/// that no execution on which the IR returns enters a tail. Those items are
-/// decided by ay, and kernel-checked only when the function grades [PROVED];
-/// at [VALIDATED] the deadness rests on ay's UNSAT alone. The admission is
-/// granted only for the whole run: the exact pair, the record named by a
-/// sited `Assert` of the function, exactly one pair and exactly one site in
-/// the run, that site a `bl` to the entry of an `Assert` located at that
-/// record, the word after it the run's trap. Those shape conditions are SCOPE
-/// POLICY, not soundness: they keep the admission to the one lowering
-/// trust-cg emits for a sited check.
-#[derive(Debug, Default)]
-struct DeadTails {
-    pairs: Vec<DeadPair>,
-}
-
-/// One admitted Location pair, `adrp` at `adrp`, `add` at `adrp + 4`.
-#[derive(Debug)]
-struct DeadPair {
-    adrp: u64,
-    symbol: String,
-    /// The entry symbols of every sited `Assert` of the body located at `symbol`.
-    entries: BTreeSet<String>,
-    /// The two lines the walk put in `window.unknown` for the halves.
-    lines: [String; 2],
-    /// The trap run holding both halves: (first word, the trap).
-    tail: (u64, u64),
-}
-
-/// The trap run of `window` holding `at`: its first word and its trap, or
-/// `None` when `at` is in no run. A run is read off [`FunctionWindow::trap_tail`]:
-/// from `at` forward to the first trap, and back while the word before is in
-/// the set and not itself a trap (every non-trap word of the set falls only to
-/// the next word, which is in the set).
-fn trap_run(window: &FunctionWindow, at: u64) -> Option<(u64, u64)> {
-    use crate::compiled_object::{InsnClass, classify_insn};
-    let is_trap = |o: u64| classify_insn(word(window, o)) == InsnClass::Trap;
-    if !window.trap_tail.contains(&at) {
-        return None;
-    }
-    let mut end = at;
-    while !is_trap(end) {
-        end += 4;
-        if !window.trap_tail.contains(&end) {
-            return None;
-        }
-    }
-    let mut start = at;
-    while start >= window.start + 4
-        && window.trap_tail.contains(&(start - 4))
-        && !is_trap(start - 4)
-    {
-        start -= 4;
-    }
-    Some((start, end))
-}
-
-impl DeadTails {
-    /// The admitted pairs of `window`: an `adrp` at `o` and an `add` at `o + 4`,
-    /// both in one trap run, relocated Mach-O `PAGE21` (pc-relative, length 2)
-    /// then `PAGEOFF12` (not pc-relative, length 2), or ELF
-    /// `R_AARCH64_ADR_PREL_PG_HI21` then `R_AARCH64_ADD_ABS_LO12_NC` (same
-    /// flags), against ONE symbol entry (never a section) with addend 0, the
-    /// in-word immediates 0 and the `add`'s shift 0, `adrp.Rd == add.Rn`; the
-    /// symbol a LOCAL, non-weak data object of this object in
-    /// `layout.verified_globals`, the uniquely named, immutable, non-TLS,
-    /// Internal or Private `M_cg` global some sited `Assert` of the function's
-    /// own `M_cg` body names as its `PanicLocation::Global`; and the pair the
-    /// only one of its run, whose one site is its [`entry_call`].
-    fn read(input: &CerInput<'_>, layout: &ObjectLayout, window: &FunctionWindow) -> DeadTails {
-        use trust_ir::inst::PanicLocation;
-
-        use crate::compiled_object::{
-            InsnClass, RelocKind, RelocTarget, SymbolBinding, SymbolKind,
-        };
-        let mut out = DeadTails::default();
-        let m_cg = input.m_cg;
-        let mut bodies =
-            m_cg.functions.iter().filter(|f| f.name == window.symbol && !f.blocks.is_empty());
-        let (Some(f), None) = (bodies.next(), bodies.next()) else {
-            return out;
-        };
-        let mut located: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for node in f.blocks.iter().flat_map(|block| &block.body) {
-            let Inst::Assert { site: Some(site), .. } = &node.inst else {
-                continue;
-            };
-            let PanicLocation::Global(gid) = site.location else {
-                continue;
-            };
-            let (Some(g), Some(entry)) =
-                (m_cg.globals.get(gid.as_usize()), m_cg.function_by_id(site.entry))
-            else {
-                continue;
-            };
-            let unique = m_cg.globals.iter().filter(|x| x.name == g.name).count() == 1
-                && !m_cg.functions.iter().any(|x| x.name == g.name);
-            if unique
-                && !g.mutable
-                && g.tls.is_none()
-                && matches!(g.linkage, trust_ir::Linkage::Internal | trust_ir::Linkage::Private)
-            {
-                located.entry(g.name.clone()).or_default().insert(entry.name.clone());
-            }
-        }
-        let object = &layout.object;
-        let (page, page_off) = match object.format {
-            ObjectFormat::MachO => (RelocKind::Page21, RelocKind::PageOff12),
-            ObjectFormat::Elf => (RelocKind::AdrPrelPgHi21, RelocKind::AddAbsLo12Nc),
-        };
-        for (&at, hi) in &window.page_halves {
-            let Some(lo) = window.page_halves.get(&(at + 4)) else {
-                continue;
-            };
-            let Some(tail) = trap_run(window, at) else {
-                continue;
-            };
-            let shape = trap_run(window, at + 4) == Some(tail)
-                && hi.class == InsnClass::Adrp
-                && hi.kind == page
-                && hi.pc_relative
-                && hi.length == 2
-                && lo.class == InsnClass::AddImm64
-                && lo.kind == page_off
-                && !lo.pc_relative
-                && lo.length == 2
-                && hi.addend == 0
-                && lo.addend == 0
-                && hi.imm == 0
-                && lo.imm == 0
-                && lo.shift == 0
-                && hi.rd == lo.rn
-                && hi.target == lo.target;
-            if !shape {
-                continue;
-            }
-            let RelocTarget::Symbol(index) = hi.target else {
-                continue;
-            };
-            let Some(s) = object.symbols.get(index) else {
-                continue;
-            };
-            if s.kind != SymbolKind::Object
-                || s.section.is_none()
-                || s.binding != SymbolBinding::Local
-                || s.weak
-                || !layout.verified_globals.contains(&s.name)
-            {
-                continue;
-            }
-            let Some(entries) = located.get(&s.name) else {
-                continue;
-            };
-            out.pairs.push(DeadPair {
-                adrp: at,
-                symbol: s.name.clone(),
-                entries: entries.clone(),
-                lines: [hi.unknown_line.clone(), lo.unknown_line.clone()],
-                tail,
-            });
-        }
-        // The whole run, or nothing: a run holding one pair and its one entry
-        // call keeps it; any other run (no call, a second pair or site, a call
-        // elsewhere or to another symbol) admits none of its pairs, so their
-        // lines keep O1 Unknown.
-        let per_run: BTreeMap<(u64, u64), usize> =
-            out.pairs.iter().fold(BTreeMap::new(), |mut n, p| {
-                *n.entry(p.tail).or_default() += 1;
-                n
-            });
-        out.pairs.retain(|p| per_run[&p.tail] == 1 && entry_call(window, p).is_some());
-        out
-    }
-
-    /// The lines of `window.unknown` the admitted pairs account for.
-    fn lines(&self) -> BTreeSet<&str> {
-        self.pairs.iter().flat_map(|p| p.lines.iter().map(String::as_str)).collect()
-    }
-
-    /// The `adrp` offsets of the admitted pairs.
-    fn adrps(&self) -> BTreeSet<u64> {
-        self.pairs.iter().map(|p| p.adrp).collect()
-    }
-
-    /// The trap run of the trap-tail site `site`, when it is admitted: the
-    /// run of an admitted pair, and `site` that run's [`entry_call`].
-    fn admit_call(
-        &self,
-        window: &FunctionWindow,
-        site: &crate::compiled_object::MachineSite,
-    ) -> Option<(u64, u64)> {
-        let tail = trap_run(window, site.offset)?;
-        let pair = self.pairs.iter().find(|p| p.tail == tail)?;
-        (entry_call(window, pair) == Some(site.offset)).then_some(tail)
-    }
-}
-
-/// The offset of the one call of `pair`'s trap run, when the run holds
-/// exactly one site, that site is a `bl` naming the entry of an `Assert`
-/// located at `pair`'s record, and the word after it is the run's trap.
-fn entry_call(window: &FunctionWindow, pair: &DeadPair) -> Option<u64> {
-    let (start, trap) = pair.tail;
-    let mut here = window.sites.iter().filter(|s| (start..=trap).contains(&s.offset));
-    let (Some(site), None) = (here.next(), here.next()) else {
-        return None;
-    };
-    let callee = site.callee.as_ref().filter(|_| site.kind == MachineSiteKind::Call)?;
-    (site.offset + 4 == trap && pair.entries.contains(callee)).then_some(site.offset)
-}
-
 fn verify_function(
     input: &CerInput<'_>,
     splits: &SplitIndex<'_>,
@@ -1402,7 +1211,6 @@ fn verify_function(
         }
     };
     let mut closed_leaf = None;
-    let mut dead_tails: Vec<(u64, u64)> = Vec::new();
     let mut evidence = analyze(
         input,
         splits,
@@ -1418,7 +1226,6 @@ fn verify_function(
         retain_scalar_original,
         &mut closed_leaf,
         observe_only,
-        &mut dead_tails,
     );
     if let Some(ProvenEvidence::KernelInstantiated { original: Some(checked), .. }) = &evidence {
         match crate::original_conjunction_certificate::OriginalConjunctionCertificate::bind(
@@ -1430,31 +1237,6 @@ fn verify_function(
                 evidence = None;
             }
         }
-    }
-    // PKG-C5c S2a: O2's account names the tails it admitted unexecuted, and
-    // claims them unreachable only where O4 (reach and (4b)) is Proven, read
-    // after the original-conjunction binding may have reopened O4.
-    if !dead_tails.is_empty() && cert.obligations.o2_pairing.grade != Grade::NotReached {
-        let tails = dead_tails
-            .iter()
-            .map(|(start, trap)| format!("{start:#x}..={trap:#x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        cert.obligations.o2_pairing.detail.push_str(&if cert.obligations.o4_return.grade
-            == Grade::Proven
-        {
-            format!(
-                "; panic tails at [{tails}] are unreachable wherever the IR returns (O4 reach + \
-                 (4b), decided by ay; kernel-checked only at [PROVED]); entry and Location \
-                 unverified (PKG-C5c S2)"
-            )
-        } else {
-            format!(
-                "; panic tails at [{tails}] admitted unexecuted on the condition that O4 reach + \
-                 (4b) hold, which this certificate does not establish; entry and Location \
-                 unverified (PKG-C5c S2)"
-            )
-        });
     }
     finish(&mut cert, evidence);
     if let (Some(proofs), Some(closed)) = (leaf_proofs, closed_leaf) {
@@ -1482,7 +1264,6 @@ fn analyze(
     retain_scalar_original: bool,
     closed_leaf: &mut Option<leaf_memory::Closed>,
     observe_only: bool,
-    admitted_tails: &mut Vec<(u64, u64)>,
 ) -> Option<ProvenEvidence> {
     let symbol = window.symbol.clone();
     let ob = &mut cert.obligations;
@@ -1493,42 +1274,17 @@ fn analyze(
     }
 
     // ---- O1: the object-level reasons this function is Unknown -------------
-    // PKG-C5c S2a: the lines of admitted dead-tail Location pairs are set
-    // aside; any other line keeps O1 Unknown, with the walk's whole account.
-    let dead = DeadTails::read(input, layout, window);
-    let set_aside = dead.lines();
-    if window.unknown.iter().any(|line| !set_aside.contains(line.as_str())) {
+    if !window.unknown.is_empty() {
         ob.o1_binding = ObligationGrade::unknown(window.unknown.join("; "));
         return None;
     }
     ob.o1_binding = ObligationGrade::proven(format!(
-        "one symbol, binding {:?}/{:?}, extent [{:#x}, {:#x}) covered, {} relocation(s) consumed{}",
+        "one symbol, binding {:?}/{:?}, extent [{:#x}, {:#x}) covered, {} relocation(s) consumed",
         window.expected.binding,
         window.expected.symbol_visibility,
         window.start,
         window.end,
-        window.relocations.len(),
-        if dead.pairs.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; {} dead panic-tail Location pair(s) admitted unexecuted (PKG-C5c S2a), their \
-                 lines set aside: {}",
-                dead.pairs.len(),
-                dead.pairs
-                    .iter()
-                    .map(|p| format!(
-                        "adrp {:#x}/add {:#x} -> `{}` [{}; {}]",
-                        p.adrp,
-                        p.adrp + 4,
-                        p.symbol,
-                        p.lines[0],
-                        p.lines[1]
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
+        window.relocations.len()
     ));
 
     // ---- the producer body and P(f) ---------------------------------------
@@ -1667,21 +1423,14 @@ fn analyze(
     }
 
     // ---- site decisions (O2, first half) -----------------------------------
-    // PKG-C5c S2a: a trap-tail call is admitted, unpaired and with no event,
-    // only as `DeadTails::admit_call` reads it; any other keeps O2 Unknown.
-    for s in window.sites.iter().filter(|s| s.in_trap_tail) {
-        match dead.admit_call(window, s) {
-            Some(tail) => admitted_tails.push(tail),
-            None => {
-                admitted_tails.clear();
-                ob.o2_pairing = ObligationGrade::unknown(format!(
-                    "the call at {:#x} lies in an assert's failure tail: a divergent call event, \
-                     modeled at step 5.7 (callee {:?})",
-                    s.offset, s.callee
-                ));
-                return None;
-            }
-        }
+    let trap_sites: Vec<_> = window.sites.iter().filter(|s| s.in_trap_tail).collect();
+    if let Some(s) = trap_sites.first() {
+        ob.o2_pairing = ObligationGrade::unknown(format!(
+            "the call at {:#x} lies in an assert's failure tail: a divergent call event, modeled at \
+             step 5.7 (callee {:?})",
+            s.offset, s.callee
+        ));
+        return None;
     }
     let mach_sites: Vec<_> = window.sites.iter().filter(|s| !s.in_trap_tail).collect();
     let mut by_callee_m: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -1715,13 +1464,8 @@ fn analyze(
         let n_m = by_callee_m.get(g).map_or(0, Vec::len);
         if n_m == 0 {
             // OPT-4 inlined every site of `g` (there is no call to it anywhere in
-            // the extent outside the dead tails PKG-C5c S2a admitted: a tail's
-            // `bl` is not in `mach_sites`, so a sited `Assert` whose entry is a
-            // co-emitted `g` the IR also calls explicitly still lands here when
-            // trust-cg inlines that explicit call; O3/O4 bind the inlined
-            // semantics and the tail is unreachable wherever O4 holds):
-            // interpret g's OWN producer IR — only if g is a co-emitted body we
-            // hold.
+            // the extent): interpret g's OWN producer IR — only if g is a
+            // co-emitted body we hold.
             let Some(gb) = input.bodies.get(g) else {
                 ob.o2_pairing = ObligationGrade::unknown(format!(
                     "the IR calls `{g}` but the bytes never do, and `{g}` has no producer body to \
@@ -1800,14 +1544,23 @@ fn analyze(
             // `check_placement` blocks it again here, so no path grades it Unknown for
             // `AllowUnknown` to ship. A variadic callee that states its fixed prefix stays
             // Unknown.
+            // A callee's own C1/C2 proof does not establish caller transport.
+            // BOOL-RET-EDGE-1 remains Unknown pending a Lean-owned relation.
             if let Err(e) =
                 check_placement(module, &caller_view, callee_decl.calling_conv, gp, false)
             {
                 ob.o3_events = e.grade(&format!("the callee `{g}`"), |e| {
-                    format!(
-                        "the callee `{g}` is called under a signature P(`{g}`) does not place: {e} \
-                         (the same symbol under two signatures)"
-                    )
+                    if caller_view.1.contains(&IrTy::Bool) {
+                        format!(
+                            "the callee `{g}` has a bool call-edge transport without a Lean-owned \
+                             callee-to-caller relation (BOOL-RET-EDGE-1 withdrawn): {e}"
+                        )
+                    } else {
+                        format!(
+                            "the callee `{g}` is called under a signature P(`{g}`) does not place: \
+                             {e} (the same symbol under two signatures)"
+                        )
+                    }
                 });
                 return None;
             }
@@ -1926,6 +1679,29 @@ fn analyze(
     let spec = match eval_spec(input, module, func, &own_sig, place, &decisions) {
         Ok(s) => s,
         Err(e) => {
+            // PKG-C5c-L0 (call_event/loop_cut.rs): test-hooks builds only, and
+            // only while `record_loop_segments` is installed on THIS thread. It
+            // records a measurement for the test; the reason below is unchanged.
+            #[cfg(feature = "test-hooks")]
+            if !observe_only
+                && matches!(original_mode, OriginalMode::Produce)
+                && e.starts_with("loop/backedge at bb")
+            {
+                loop_cut::record_if_installed(|| loop_cut::Subject {
+                    input,
+                    module,
+                    func,
+                    sig: &own_sig,
+                    place,
+                    decisions: &decisions,
+                    window,
+                    x18_reserved,
+                    call_free: ir_sites.is_empty()
+                        && window.sites.is_empty()
+                        && window.page_halves.is_empty()
+                        && window.trap_tail.is_empty(),
+                });
+            }
             ob.o4_return = ObligationGrade::unknown(format!("spec side: {e}"));
             return None;
         }
@@ -1967,7 +1743,6 @@ fn analyze(
     let bound_observer =
         observer_object.as_ref().map_err(Clone::clone).and_then(|object| object.function(&symbol));
     let mut exec = CerExec::new(window, &callee_places, &place.ret, x18_reserved);
-    exec.dead_tail_adrp = dead.adrps();
     let memory_frontier = spec.memory.missing_integration();
     // Zero observed source memory is a genuine complete M0 -> M0 case, not a
     // reason to omit the full-memory theorem. The same sealed source census,
@@ -2095,6 +1870,32 @@ fn analyze(
                     OriginalMode::Replay(row) => row.original_proof.as_ref(),
                 },
             ) {
+                // BOOL-RET-EDGE-1 (F2): this goal states value(return) but not
+                // C2, so it grants no grade to a Bool definition. Like a declined
+                // goal (the `Err` arm), it falls through to `discharge_under`,
+                // which states C2, when the original is optional, and is
+                // Unknown when it is required. Unreachable while
+                // `source_memory::width` has no Bool arm (`leaf_memory::
+                // Source::read` refuses the signature; bool_edge_tests N9).
+                Ok(_)
+                    if abi_extensions::is_bool_result(&place.ret)
+                        || own_sig.1.contains(&IrTy::Bool) =>
+                {
+                    const DETAIL: &str = "the leaf original goal does not state the bool result \
+                                          range (BOOL-RET-EDGE-1 C2)";
+                    if let Some(diagnostic) = cert.leaf_memory.as_mut() {
+                        diagnostic.status = if optional_scalar_original && !required {
+                            format!(
+                                "complete original retention unavailable ({DETAIL}); legacy scalar verification only"
+                            )
+                        } else {
+                            format!("{DETAIL}; no memory grade granted")
+                        };
+                    }
+                    if required {
+                        ob.o4_return = ObligationGrade::unknown(format!("{reason}; {DETAIL}"));
+                    }
+                }
                 Ok(closed) => {
                     cert.leaf_memory = Some(closed.diagnostic().clone());
                     ob.o0_abi = ObligationGrade::proven(
@@ -2255,9 +2056,10 @@ fn analyze(
     // ---- O3/O4 under each valid pairing ------------------------------------
     let mut refutation: Option<(String, String)> = None;
     let mut undecided: Option<(String, String)> = None;
+    let own_bool = own_sig.1 == [IrTy::Bool];
     for pi in &valid {
         match discharge_under(
-            &symbol, &spec, &exec, &outcome, pi, &decisions, &residue, &abi, &own_abi,
+            &symbol, &spec, &exec, &outcome, pi, &decisions, &residue, &abi, &own_abi, own_bool,
         ) {
             PairOutcome::Proven { o3, o4, evidence } => {
                 ob.o2_pairing = ObligationGrade::proven(format!(
@@ -3005,13 +2807,30 @@ fn conflict_split_block(
     None
 }
 
+/// BOOL-RET-EDGE-1 C2's O4 detail when the carrier is not proved 0/1.
+const BOOL_C2: &str = "the bool result carrier is not provably 0/1 where the IR returns \
+                       (BOOL-RET-EDGE-1 C2; fail-closed)";
+
+/// BOOL-RET-EDGE-1 C2 at (4c): ay's decision on `NOT bad`, where `bad` is "the
+/// IR returns and carrier[31:1] != 0". Only `Proven` yields `bad`, the item
+/// step (5) joins to the kernel conjunction; a counterexample and an ay
+/// Unknown are both the O4 Unknown detail (a spec-model defect, never Refuted,
+/// and never a grade without the item).
+fn bool_range_decision(discharge: Discharge, bad: Formula) -> Result<Formula, String> {
+    match discharge {
+        Discharge::Proven => Ok(bad),
+        Discharge::CounterExample => Err(BOOL_C2.into()),
+        Discharge::Unknown(reason) => Err(format!("{BOOL_C2}: {reason}")),
+    }
+}
+
 /// Check that P places exactly the producer signature `sig`, whose owner
 /// declares the convention `conv`: one entry per parameter, each at the
 /// producer type's declared width, and no extension on any slot except a
-/// definition's own `bool` result (held to 32 bits, as the step-5.0 gate does).
-/// Extension-bearing CALL EDGES are refused until 5.10. A variadic signature is
-/// never placed: BLOCKED when its split is unknown, Unknown otherwise
-/// ([`variadic_split`]).
+/// definition's own `bool` result held to 32 bits (with its own C2 obligation).
+/// Bool call edges remain refused pending a Lean-owned transport relation.
+/// Other extension-bearing edges use the C-small contract or step 5.10. A variadic signature is never placed: BLOCKED when its split is
+/// unknown, Unknown otherwise ([`variadic_split`]).
 fn check_placement(
     module: &Module,
     sig: &Signature,
@@ -3161,6 +2980,11 @@ struct SpecCx<'a> {
     memory: source_memory::ResultMemory,
     /// Declared SSA types of the function, read once on first use (`aggregate_values`).
     value_tys: Option<HashMap<ValueId, IrTy>>,
+    /// PKG-C5c-L0: the one cut block, its shared variables and the arrivals
+    /// the evaluation recorded at it. `None` from `spec_entry`'s one literal;
+    /// only call_event/loop_cut.rs sets it, on its own `SpecCx`.
+    #[cfg(feature = "test-hooks")]
+    cut: Option<loop_cut::SpecCut>,
 }
 
 const MAX_SPEC_BLOCK_EVALS: u32 = 20_000;
@@ -3202,6 +3026,32 @@ fn eval_spec(
     place: &FnPlacement,
     decisions: &BTreeMap<SiteKey, SiteDecision>,
 ) -> Result<SpecResult, String> {
+    let (mut cx, env) = spec_entry(input, module, func, sig, place, decisions)?;
+    let (value, reach) = cx.block(func.entry, env, Formula::Bool(true), Vec::new(), 0)?;
+    Ok(SpecResult {
+        value,
+        reach,
+        side: cx.side,
+        checks: cx.checks,
+        events: cx.events,
+        result_vars: cx.result_vars,
+        memory: cx.memory,
+    })
+}
+
+/// The spec side's entry: the block map, the entry checks, the result width,
+/// the entry ABI plan, the source memory, every parameter bound as `eval_spec`
+/// reads it and the `SpecCx` that evaluates from it. Moved out of `eval_spec`
+/// unchanged (PKG-C5c-L0) so call_event/loop_cut.rs measures from the entry
+/// environment grading builds, not a copy; every `Err` keeps its text and order.
+fn spec_entry<'a>(
+    input: &'a CerInput<'a>,
+    module: &'a Module,
+    func: &'a trust_ir::Function,
+    sig: &Signature,
+    place: &FnPlacement,
+    decisions: &'a BTreeMap<SiteKey, SiteDecision>,
+) -> Result<(SpecCx<'a>, SpecEnv), String> {
     let blocks: HashMap<u32, &trust_ir::Block> =
         func.blocks.iter().map(|blk| (blk.id.index(), blk)).collect();
     let entry = blocks.get(&func.entry.index()).ok_or("no entry block")?;
@@ -3253,7 +3103,7 @@ fn eval_spec(
             }
         }
     }
-    let mut cx = SpecCx {
+    let cx = SpecCx {
         input,
         module,
         func: func.id,
@@ -3268,17 +3118,10 @@ fn eval_spec(
         roots: trust_ir::analysis::pointer_roots(func),
         memory,
         value_tys: None,
+        #[cfg(feature = "test-hooks")]
+        cut: None,
     };
-    let (value, reach) = cx.block(func.entry, env, Formula::Bool(true), Vec::new(), 0)?;
-    Ok(SpecResult {
-        value,
-        reach,
-        side: cx.side,
-        checks: cx.checks,
-        events: cx.events,
-        result_vars: cx.result_vars,
-        memory: cx.memory,
-    })
+    Ok((cx, env))
 }
 
 impl SpecCx<'_> {
@@ -3290,6 +3133,10 @@ impl SpecCx<'_> {
         Capture::checked(declared.ty.clone(), lookup(&env.scalars, id)?)
     }
 
+    /// Evaluate block `id` and everything it reaches. The `visited` refusal is
+    /// unchanged; with a PKG-C5c-L0 cut installed (test-hooks, loop_cut.rs
+    /// only) an edge into the cut block ends its path in `edge` first, so the
+    /// refusal then fires only for a cycle that avoids the cut.
     fn block(
         &mut self,
         id: BlockId,
@@ -3702,6 +3549,16 @@ impl SpecCx<'_> {
         }
         // Trust: aggregates bind only to parameters of their exact type (AGG-SSA-1).
         let (next, aggs) = aggregate_values::bind_edge(self, target, args, env)?;
+        // PKG-C5c-L0: an edge into the cut block ENDS this segment as an
+        // arrival: the path and the cut's shared values on this edge, no
+        // return (reach false). Unreachable while `cut` is None (spec_entry).
+        #[cfg(feature = "test-hooks")]
+        if let Some(cut) = self.cut.as_mut().filter(|c| c.block == target.index()) {
+            let values =
+                cut.shared.iter().map(|v| lookup(&next, *v)).collect::<Result<Vec<_>, _>>()?;
+            cut.arrivals.push((path, values));
+            return Ok((Formula::BitVec { value: 0, width: self.out_width }, Formula::Bool(false)));
+        }
         self.block(
             target,
             SpecEnv {
@@ -3840,11 +3697,13 @@ struct CerExec<'a> {
     leaf_trace: Option<leaf_memory::Trace>,
     tail_instance_trace: Option<leaf_call_instance::PrefixTrace>,
     leaf_refusal: Option<String>,
-    /// PKG-C5c S2a: the `adrp` of every admitted dead-tail Location pair,
-    /// which [`Self::trap_tail_writes_x18`] reads by its raw `Rd` instead of
-    /// decoding (CER has no runtime placement for object-relative address
-    /// data, so [`Self::decode`] refuses every `adrp`).
-    dead_tail_adrp: BTreeSet<u64>,
+    /// PKG-C5c-L0: cut addresses. A path reaching one after its first
+    /// instruction stops as an arrival. Empty from `CerExec::new`'s one
+    /// literal; only call_event/loop_cut.rs sets it, on its own executor.
+    #[cfg(feature = "test-hooks")]
+    cut_addrs: BTreeSet<u64>,
+    #[cfg(feature = "test-hooks")]
+    cut_arrivals: Vec<loop_cut::MachineCutArrival>,
 }
 
 const MAX_MACHINE_STEPS: u32 = 4096;
@@ -3905,7 +3764,24 @@ impl<'a> CerExec<'a> {
             leaf_trace: None,
             tail_instance_trace: None,
             leaf_refusal: None,
-            dead_tail_adrp: BTreeSet::new(),
+            #[cfg(feature = "test-hooks")]
+            cut_addrs: BTreeSet::new(),
+            #[cfg(feature = "test-hooks")]
+            cut_arrivals: Vec::new(),
+        }
+    }
+
+    /// PKG-C5c-L0: whether `pc` is a cut address. Constant `false` outside
+    /// test-hooks, and in every executor but loop_cut.rs's own.
+    fn is_cut(&self, pc: u64) -> bool {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.cut_addrs.contains(&pc)
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            let _ = pc;
+            false
         }
     }
 
@@ -4237,20 +4113,13 @@ impl<'a> CerExec<'a> {
             ) {
                 return Ok(false);
             }
-            if self.dead_tail_adrp.contains(&pc) {
-                // An admitted Location `adrp` (PKG-C5c S2a) writes exactly its Rd.
-                if word(self.window, pc) & 0x1f == 18 {
-                    return Ok(true);
-                }
-            } else {
-                let insn = self.decode(pc)?;
-                let effects = self
-                    .sem
-                    .effects(state, &insn)
-                    .map_err(|e| format!("effects failed in the trap tail at {pc:#x}: {e:?}"))?;
-                if effects.iter().any(|e| matches!(e, Effect::RegWrite { index: 18, .. })) {
-                    return Ok(true);
-                }
+            let insn = self.decode(pc)?;
+            let effects = self
+                .sem
+                .effects(state, &insn)
+                .map_err(|e| format!("effects failed in the trap tail at {pc:#x}: {e:?}"))?;
+            if effects.iter().any(|e| matches!(e, Effect::RegWrite { index: 18, .. })) {
+                return Ok(true);
             }
             if !self.trap.contains(&(pc + 4)) {
                 return Ok(false);
@@ -4273,6 +4142,23 @@ impl<'a> CerExec<'a> {
             return Err("fork-depth budget exceeded (fail-closed)".into());
         }
         loop {
+            // PKG-C5c-L0 (call_event/loop_cut.rs): a cut address reached after
+            // the segment's first instruction ends this path as an ARRIVAL: no
+            // return (reach false), entry values in `abi`, the whole state
+            // captured. Checked before the backedge test because the latch
+            // jumps back to the address the segment started at.
+            #[cfg(feature = "test-hooks")]
+            if !visited.is_empty() && self.is_cut(pc) {
+                self.cut_arrivals
+                    .push(loop_cut::MachineCutArrival { path: path.clone(), state: state.clone() });
+                return Ok(PathOutcome {
+                    value: Formula::BitVec { value: 0, width: own_width(self.own_ret) },
+                    reach: Formula::Bool(false),
+                    abi: AbiExit::entry(),
+                    x18_written: Formula::Bool(x18_written),
+                    arrivals: Vec::new(),
+                });
+            }
             if self.trap.contains(&pc) {
                 self.leaf_result(Err("leaf traversal skipped a trap prefix".into()));
                 self.observation_incomplete.push(format!(
@@ -4432,7 +4318,7 @@ impl<'a> CerExec<'a> {
                     other => {
                         let t = const_addr(&other)
                             .ok_or_else(|| format!("unmodeled pc-update at {pc:#x}"))?;
-                        if visited.contains(&t) {
+                        if visited.contains(&t) && !self.is_cut(t) {
                             return Err(format!("backedge at pc-update {pc:#x}"));
                         }
                         pc = t;
@@ -4445,7 +4331,9 @@ impl<'a> CerExec<'a> {
 
             if let Some((c, target_pc)) = fork {
                 let fall_pc = pc + 4;
-                if visited.contains(&target_pc) || visited.contains(&fall_pc) {
+                if (visited.contains(&target_pc) && !self.is_cut(target_pc))
+                    || (visited.contains(&fall_pc) && !self.is_cut(fall_pc))
+                {
                     return Err(format!(
                         "loop/backedge at conditional branch {pc:#x} (fail-closed)"
                     ));
@@ -4510,7 +4398,7 @@ impl<'a> CerExec<'a> {
                 }
                 let t = const_addr(&target)
                     .ok_or_else(|| format!("indirect branch at {pc:#x} (fail-closed)"))?;
-                if visited.contains(&t) {
+                if visited.contains(&t) && !self.is_cut(t) {
                     return Err(format!("backedge at unconditional branch {pc:#x} (fail-closed)"));
                 }
                 pc = t;
@@ -4618,6 +4506,7 @@ fn discharge_under(
     residue: &[AbiConjunct],
     abi: &AbiDischarge,
     entry_abi: &abi_extensions::Plan,
+    own_bool: bool,
 ) -> PairOutcome {
     // Bind each IR site's result variable to its paired machine site's.
     let mut map: HashMap<String, Formula> = HashMap::new();
@@ -4863,10 +4752,8 @@ fn discharge_under(
     // item inside `spec_reach` (a real execution the check lets through) is
     // still Refuted. A check that cannot fail passes, and joins the kernel
     // conjunction (5) as `fail == 0`, so [PROVED] never rests on ay alone for
-    // it. A faithful sited lowering is Unknown at O2 (its `bl` lies in a trap
-    // tail) unless PKG-C5c S2a admits the tail unexecuted, which this item and
-    // O4's reach are what make sound: no check fails where the IR returns, and
-    // the machine reaches no tail there.
+    // it. A faithful sited lowering is Unknown already (O2: its `bl` lies in
+    // a trap tail).
     let checks: Vec<(&str, Formula)> =
         spec.checks.iter().map(|(what, c)| (what.as_str(), substitute(c, &map))).collect();
     for (what, c) in &checks {
@@ -4887,12 +4774,48 @@ fn discharge_under(
         }
     }
 
+    // (4c) BOOL-RET-EDGE-1 C2: a Rust `bool` result's carrier is 0/1 wherever
+    // the IR returns. It strengthens the definition's own value(return)
+    // obligation (C1); it does not establish transport to any caller. A failure is a defect of the spec model (a Cast or an Int literal
+    // into Bool), so it is Unknown, never Refuted. It runs after (4), so a
+    // byte counterexample on value(return) is still Refuted, not masked.
+    let mut bool_range: Option<Formula> = None;
+    if abi_extensions::is_bool_result(exec.own_ret) {
+        if !own_bool {
+            return PairOutcome::Unknown {
+                which: "O4".into(),
+                detail: "a Zext32 result that is not a bool".into(),
+            };
+        }
+        let ReturnPlace::Scalar(s) = exec.own_ret else {
+            return PairOutcome::Unknown { which: "O4".into(), detail: BOOL_C2.into() };
+        };
+        let carrier = match abi_extensions::physical_value(s, spec_value.clone()) {
+            Ok(value) => value,
+            Err(reason) => return PairOutcome::Unknown { which: "O4".into(), detail: reason },
+        };
+        let bad = and2(
+            &spec_reach,
+            Formula::Not(b(Formula::Eq(
+                b(Formula::BvExtract { inner: b(carrier), high: 31, low: 1 }),
+                b(Formula::BitVec { value: 0, width: 31 }),
+            ))),
+        );
+        match bool_range_decision(discharge_valid(&Formula::Not(b(bad.clone()))), bad) {
+            Ok(bad) => bool_range = Some(bad),
+            Err(detail) => return PairOutcome::Unknown { which: "O4".into(), detail },
+        }
+    }
+
     // (5) The kernel re-checks the ONE conjunction: O0's residue (when the
-    // structural reading left one), O3, O4 and (4b).
+    // structural reading left one), O3, O4, (4b) and (4c).
     let mut conj: Vec<(Formula, Formula)> =
         items.iter().map(|(_, _, m, s)| (m.clone(), s.clone())).collect();
     for (_, c) in checks {
         conj.push((pred_to_int(c, 1), Formula::BitVec { value: 0, width: 1 }));
+    }
+    if let Some(bad) = bool_range {
+        conj.push((pred_to_int(bad, 1), Formula::BitVec { value: 0, width: 1 }));
     }
     conj.extend(model_equations);
     let mut abi_lowerable = true;
@@ -4905,6 +4828,8 @@ fn discharge_under(
             _ => abi_lowerable = false,
         }
     }
+    #[cfg(test)]
+    step5_record::push(symbol, &conj);
     let kernel_eligible =
         side.is_empty() && abi_lowerable && !matches!(abi, AbiDischarge::Verdict(_));
     let evidence = if kernel_eligible {
@@ -4957,8 +4882,43 @@ fn discharge_under(
     }
 }
 
+/// TEST-ONLY observation of the step-(5) conjunction `discharge_under` hands
+/// the kernel routes, per symbol, on this thread (BOOL-RET-EDGE-1: it lets a
+/// test pin that C2, which ay decides at (4c), is also in that conjunction). It
+/// grants nothing and changes no verdict.
+#[cfg(test)]
+pub(crate) mod step5_record {
+    use std::cell::RefCell;
+
+    use super::Formula;
+
+    type Recorded = Vec<(String, Vec<(Formula, Formula)>)>;
+
+    thread_local! {
+        static CONJUNCTIONS: RefCell<Option<Recorded>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn push(symbol: &str, conj: &[(Formula, Formula)]) {
+        CONJUNCTIONS.with(|c| {
+            if let Some(recorded) = c.borrow_mut().as_mut() {
+                recorded.push((symbol.to_owned(), conj.to_vec()));
+            }
+        });
+    }
+
+    /// Run `body`, returning its result and every step-(5) conjunction built
+    /// on this thread while it ran.
+    pub(crate) fn record<R>(body: impl FnOnce() -> R) -> (R, Recorded) {
+        let outer = CONJUNCTIONS.with(|c| c.borrow_mut().replace(Vec::new()));
+        let result = body();
+        let recorded = CONJUNCTIONS.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer));
+        (result, recorded.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod variadic_split_tests;
+
 #[cfg(test)]
 #[path = "call_event/dead_tail_tests.rs"]
 mod dead_tail_tests;
-#[cfg(test)]
-mod variadic_split_tests;

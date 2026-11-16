@@ -264,7 +264,8 @@ pub struct CleanOriginRustCallRecord {
     /// has `tcx`). The emitted row is NAMED by it; the Lean spelling becomes `display_path`.
     pub link_symbol: String,
     pub clean_name: String,
-    pub plan: trust_clean_origin::CleanOriginPlan,
+    /// Shared immutable kernel snapshot and plan; this is not gate authority.
+    pub source: trust_clean_ir_gate::rust_calls::RetainedRustCallSource,
     pub callees: Vec<CleanOriginRustCallee>,
     /// Plan step 3.5: what the recorder did with the def's MIR body, for the disclosure.
     pub mir_gate: MirGateAtSeam,
@@ -390,6 +391,17 @@ pub struct GatedCleanRow {
     pub published: PublishedTrustIrFaithful,
 }
 
+/// Unlicensed context retained beside its exact published source module.
+/// Function ids refer to that module, never a relocated codegen module.
+#[derive(Clone)]
+pub struct PendingRustCallSource {
+    pub def_index: u32,
+    pub func_id: FuncId,
+    pub link_symbol: String,
+    pub source: trust_clean_ir_gate::rust_calls::RetainedRustCallSource,
+    pub bindings: Vec<trust_clean_ir_gate::rust_calls::RustCallBinding>,
+}
+
 /// One assembled declaration's identity at the Clean-origin relink seam.
 ///
 /// `local_def_index` is `Some` exactly for a `local-unlowered` declaration. It is the
@@ -468,6 +480,8 @@ pub struct CleanOriginJoinSummary {
     /// emission order, for the finalize ([`Self::take_gated`]). Empty when the
     /// transaction did not publish.
     pub gated: Vec<GatedCleanRow>,
+    /// Data only; no gate row, summary, codegen inventory entry or permission.
+    pub pending_rust_calls: Vec<PendingRustCallSource>,
     /// Plan step 3.5: what the recorder did with each recorded def's MIR body, by `def_index`,
     /// for the disclosure's `mir_gate` field.
     pub mir_gate: BTreeMap<u32, MirGateAtSeam>,
@@ -484,6 +498,7 @@ impl CleanOriginJoinSummary {
             general_functions: Vec::new(),
             general_renamed: Vec::new(),
             gated: Vec::new(),
+            pending_rust_calls: Vec::new(),
             mir_gate: BTreeMap::new(),
         }
     }
@@ -598,6 +613,35 @@ pub fn link_prepared_clean_origin(
     if !errors.is_empty() {
         return CleanOriginJoinSummary::not_recorded();
     }
+    // Candidate diagnostics over the actual whole linked module, never a TV
+    // companion or admission. Preserve every existing tier, body and token on
+    // both outcomes: unsupported historical structural rows remain unlicensed.
+    for pending in &summary.pending_rust_calls {
+        let Some(row) = summary.emitted.iter_mut().find(|row| {
+            row.def_index == pending.def_index
+                && row.func_id == pending.func_id.index()
+                && row.shape == "rust-call-chain"
+                && row.tier == CleanOriginTier::Structural
+        }) else {
+            continue;
+        };
+        let result = pending.source.check_module_call_trace(
+            &candidate,
+            pending.func_id,
+            &pending.bindings,
+        );
+        row.tv_note = Some(match result {
+            Ok(()) => "linked-module candidate model/trace accepted; structural only: no \
+                       independent kernel-TV companion, Rust semantic/effects evidence or \
+                       codegen permission".into(),
+            Err(refusal) => format!(
+                "linked-module candidate model/trace refused ({}); structural only: no \
+                 independent kernel-TV companion, Rust semantic/effects evidence or \
+                 codegen permission",
+                refusal.note(),
+            ),
+        });
+    }
     *module = candidate;
     summary
 }
@@ -618,6 +662,7 @@ fn append_clean_origin_candidates(
         general_functions: Vec::new(),
         general_renamed: Vec::new(),
         gated: Vec::new(),
+        pending_rust_calls: Vec::new(),
         mir_gate: BTreeMap::new(),
     };
     if module.spec_modules.iter().any(|spec| spec.name == CLEAN_ORIGIN_DISCLOSURE_NAME) {
@@ -1012,7 +1057,7 @@ fn append_clean_origin_candidates(
                 {
                     continue;
                 }
-                if trust_clean_ir_gate::gate_targets(&record.plan) {
+                if trust_clean_ir_gate::gate_targets(record.source.plan()) {
                     errors.push(format!(
                         "fatal clean-origin targeted Clean `{}` arrived as a pending Rust call \
                          plan; gate authority is never skipped or demoted",
@@ -1021,8 +1066,15 @@ fn append_clean_origin_candidates(
                     continue;
                 }
                 match bind_rust_call_candidate(module, &record, rust_bodies, declarations) {
-                    Ok((candidate, func_id)) => {
+                    Ok((candidate, func_id, bindings)) => {
                         *module = candidate;
+                        summary.pending_rust_calls.push(PendingRustCallSource {
+                            def_index: record.def_index,
+                            func_id,
+                            link_symbol: record.link_symbol.clone(),
+                            source: record.source.clone(),
+                            bindings,
+                        });
                         summary.emitted.push(EmittedRow {
                             def_index: record.def_index,
                             def_path: record.def_path,
@@ -1092,9 +1144,10 @@ fn bind_rust_call_candidate(
     record: &CleanOriginRustCallRecord,
     rust_bodies: &[RustBodyIdentity],
     declarations: &[DeclarationLinkIdentity],
-) -> Result<(Module, FuncId), String> {
-    if !matches!(record.plan.shape(), trust_clean_origin::CleanOriginShape::RustCallChain { .. })
-        || record.clean_name != record.plan.name()
+) -> Result<(Module, FuncId, Vec<trust_clean_ir_gate::rust_calls::RustCallBinding>), String> {
+    let plan = record.source.plan();
+    if !matches!(plan.shape(), trust_clean_origin::CleanOriginShape::RustCallChain { .. })
+        || record.clean_name != plan.name()
         || record.def_path.is_empty()
     {
         return Err("the pending identity or shape disagrees with the sealed call plan".into());
@@ -1106,7 +1159,7 @@ fn bind_rust_call_candidate(
     }
     let mut targets = Vec::with_capacity(record.callees.len());
     for callee in &record.callees {
-        let plan_callee = record.plan.callees().get(callee.plan_index).ok_or_else(|| {
+        let plan_callee = plan.callees().get(callee.plan_index).ok_or_else(|| {
             format!("callee index {} is outside the sealed roster", callee.plan_index)
         })?;
         if callee.plan_def_path != plan_callee.def_path
@@ -1181,7 +1234,7 @@ fn bind_rust_call_candidate(
             signature,
         });
     }
-    let signature = trust_clean_ir::trust_ir_func_ty(record.plan.signature())
+    let signature = trust_clean_ir::trust_ir_func_ty(plan.signature())
         .map_err(|refusal| format!("caller signature refused: {refusal:?}"))?;
     let mut candidate = module.clone();
     // Trust (WS5.2): published in its Rust declaration's row when a Rust caller minted one.
@@ -1194,7 +1247,7 @@ fn bind_rust_call_candidate(
     };
     let ty = intern_func_ty(&mut candidate, &signature);
     let mut function =
-        trust_clean_ir::emit_clean_origin_rust_call_function(&record.plan, id, ty, &targets)
+        trust_clean_ir::emit_clean_origin_rust_call_function(plan, id, ty, &targets)
             .map_err(|refusal| format!("sealed call emission refused: {refusal:?}"))?;
     crate::link_symbol::bind_clean_origin_link_symbol(&mut function, &record.link_symbol)?;
     if !function.attrs.is_empty()
@@ -1212,7 +1265,11 @@ fn bind_rust_call_candidate(
     }
     function.producer = Some(Producer::Clean);
     publish_clean_row(&mut candidate, function)?;
-    Ok((candidate, id))
+    let bindings = targets.iter().map(|target| trust_clean_ir_gate::rust_calls::RustCallBinding {
+        plan_index: target.plan_index,
+        function: target.id,
+    }).collect();
+    Ok((candidate, id, bindings))
 }
 
 /// Trust (WS5.2): does a DEFINED (body-bearing) row already claim the Clean definition of the
@@ -3243,7 +3300,10 @@ mod tests {
             def_path: "answer".into(),
             link_symbol: ANSWER_SYMBOL.into(),
             clean_name: "answer".into(),
-            plan,
+            source: trust_clean_ir_gate::rust_calls::RetainedRustCallSource::retain(
+                std::sync::Arc::new(session.environment().unwrap().clone()),
+                std::sync::Arc::new(plan),
+            ),
             callees,
             mir_gate: MirGateAtSeam::Reearned,
         };
@@ -3268,6 +3328,16 @@ mod tests {
         assert!(summary.skipped.is_empty());
         let row = &summary.emitted[0];
         assert!(row.tier == CleanOriginTier::Structural);
+        assert!(
+            row.tv_note.as_deref().unwrap().contains("linked-module candidate model/trace accepted")
+        );
+        assert_eq!(summary.pending_rust_calls.len(), 1);
+        let pending = &summary.pending_rust_calls[0];
+        assert_eq!(pending.def_index, row.def_index);
+        assert_eq!(pending.func_id.index(), row.func_id);
+        pending.source.check_module_model(&module, pending.func_id, &pending.bindings)
+            .expect("the original kernel snapshot survives actual owned-body binding");
+        assert!(summary.gated.is_empty(), "retention grants no gate token");
         assert!(
             row.gate_subject_digest.is_none()
                 && row.gate_carrier.is_none()
@@ -3690,6 +3760,7 @@ mod tests {
             link_prepared_clean_origin(&mut module, prepared, &[declaration], &mut errors);
         assert!(!errors.is_empty());
         assert!(!summary.recorded && summary.emitted.is_empty() && summary.skipped.is_empty());
+        assert!(summary.pending_rust_calls.is_empty(), "failed batch retains no source contexts");
         assert_eq!(module, before);
     }
 
@@ -3707,6 +3778,54 @@ mod tests {
         assert_eq!(summary.skipped.len(), 1);
         assert!(summary.skipped[0].4.contains("assembled owners"));
         assert_eq!(module.functions, before);
+    }
+
+    #[test]
+    fn source_candidate_comparison_refusal_is_disclosed_without_minting_authority() {
+        use trust_certify::clean_island::RustCallee;
+        let (mut module, mut record, owners) = rust_call_fixture();
+        let declared = ["left", "right"].map(|name| RustCallee {
+            clean_name: name.into(),
+            params: vec![trust_types::Ty::u64()],
+            result: trust_types::Ty::u64(),
+        });
+        let mut later = CleanIslandSession::new();
+        later.declare_rust_callees(&declared).unwrap();
+        assert!(!later.check("def answer (x : UInt64) : UInt64 := right (left x)").is_rejected());
+        // Keep the original emission plan but supply a different source
+        // snapshot. Ordinary structural binding still succeeds; the actual
+        // original-source comparison must disclose this disagreement.
+        record.source = trust_clean_ir_gate::rust_calls::RetainedRustCallSource::retain(
+            std::sync::Arc::new(later.environment().unwrap().clone()),
+            std::sync::Arc::new(record.source.plan().clone()),
+        );
+        let original = module.clone();
+        let mut errors = Vec::new();
+        let summary = append_clean_origin_with_rust_callees(
+            &mut module,
+            vec![CleanOriginIrOutcome::RustCalls(record)],
+            &mut errors,
+            &owners,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(summary.emitted.len(), 1);
+        let row = &summary.emitted[0];
+        assert!(row.tier == CleanOriginTier::Structural);
+        assert!(
+            row.tv_note.as_deref().unwrap().contains("linked-module candidate model/trace refused")
+        );
+        assert!(summary.gated.is_empty());
+        assert!(
+            row.gate_subject_digest.is_none()
+                && row.gate_carrier.is_none()
+                && row.gate_method.is_none()
+        );
+        assert_eq!(&module.functions[..original.functions.len()], original.functions.as_slice());
+        let body = module.function_by_id(FuncId::new(row.func_id)).unwrap();
+        assert!(body.attrs.is_empty() && body.proofs.is_empty() && body.summary.is_none());
+        assert!(body.body_gate.is_none());
+        assert!(trust_ir_build::validate_module(&module).is_empty());
+        assert!(coverage_section(&summary).contains("candidate model/trace refused"));
     }
 
     #[test]
@@ -3739,11 +3858,14 @@ mod tests {
         let (mut module, mut record, owners) = rust_call_fixture();
         let mut session = CleanIslandSession::new();
         assert!(!session.check("def add8 (a b : UInt8) : UInt8 := a + b").is_rejected());
-        record.plan =
-            trust_clean_origin::plan_clean_origin_body(session.environment().unwrap(), "add8")
-                .unwrap();
+        let plan = trust_clean_origin::plan_clean_origin_body(session.environment().unwrap(), "add8")
+            .unwrap();
+        record.source = trust_clean_ir_gate::rust_calls::RetainedRustCallSource::retain(
+            std::sync::Arc::new(session.environment().unwrap().clone()),
+            std::sync::Arc::new(plan),
+        );
         record.clean_name = "add8".into();
-        assert!(trust_clean_ir_gate::gate_targets(&record.plan));
+        assert!(trust_clean_ir_gate::gate_targets(record.source.plan()));
         let before = module.functions.clone();
         let mut errors = Vec::new();
         let summary = append_clean_origin_with_rust_callees(

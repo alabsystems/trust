@@ -1,0 +1,44 @@
+/- Explicit operational own-goal export/audit list. Concrete fixed-wire
+   composition and independent replay remain separate required checks. -/
+import CanonicalClosureTransport
+
+#print axioms CanonicalClosure.context_exact
+#print axioms CanonicalClosure.owned_roster
+#print axioms CanonicalClosure.original_and_lifted_names
+#print axioms CanonicalClosure.complete_type_rows
+#print axioms CanonicalClosure.original_order
+#print axioms CanonicalClosure.no_body_errors
+#print axioms CanonicalClosure.canonical_function_headers
+#print axioms CanonicalClosure.inferred_locals_present
+#print axioms CanonicalClosure.memory_service_present
+#print axioms CanonicalClosure.all_five_signature_rows
+#print axioms CanonicalClosure.nominal_closure_table
+#print axioms CanonicalClosure.construction_exact
+#print axioms CanonicalClosure.application_arguments_exact
+#print axioms CanonicalClosure.maker_body_evaluates
+#print axioms CanonicalClosure.target_body_evaluates
+#print axioms CanonicalClosure.application_body_evaluates
+#print axioms CanonicalClosure.caller_body_evaluates
+#print axioms CanonicalClosure.maker_evaluates
+#print axioms CanonicalClosure.target_evaluates
+#print axioms CanonicalClosure.application_evaluates
+#print axioms CanonicalClosure.caller_evaluates
+#print axioms CanonicalClosure.caller_world_restored
+#print axioms CanonicalClosure.caller_inputs_restored
+#print axioms CanonicalClosure.caller_low_fuel
+#print axioms CanonicalClosure.caller_low_depth
+#print axioms CanonicalClosure.surrounding_world_execution
+#print axioms CanonicalClosure.original_observation
+#print axioms CanonicalClosure.changed_operator_observation
+#print axioms CanonicalClosure.wrong_target_observation
+#print axioms CanonicalClosure.swapped_captures_observation
+#print axioms CanonicalClosure.erased_parameter_observation
+#print axioms CanonicalClosure.application_arity_observation
+#print axioms CanonicalClosure.target_convention_observation
+#print axioms CanonicalClosure.omitted_original_observation
+#print axioms CanonicalClosure.omitted_original_error_retained
+#print axioms CanonicalClosure.omitted_original_roster
+#print axioms CanonicalClosure.omitted_roster_differs
+#print axioms CanonicalClosure.all_seven_observations_differ
+#print axioms CanonicalClosure.run_decoded_caller
+#print axioms CanonicalClosure.observe_decoded_exact

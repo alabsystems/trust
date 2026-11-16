@@ -129,3 +129,6 @@ fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -886,9 +886,12 @@ pub struct InitialNativeOriginals {
 }
 #[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
 impl InitialNativeOriginals {
+    /// The ready reply this Initial host delivered, for observation only.
     pub fn observation(&self) -> &trust_resource_controller::workload::host::initial::ReadyReply {
         &self.reply
     }
+    /// Consume this owner into its ready reply, primary lease, workload
+    /// control and authenticated keeper; the caller takes custody of each.
     pub fn into_originals(
         self,
     ) -> (

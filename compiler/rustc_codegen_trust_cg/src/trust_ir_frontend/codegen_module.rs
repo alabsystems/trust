@@ -28,7 +28,9 @@
 //!
 //! 1. Bodies. Each work-list item names its producer `FuncId`; all items come from ONE module.
 //!    When `star` was built, every body in a HANDOFF item's call closure must be equal in `base`
-//!    and `star` (a relink must not have touched it). `FuncId <-> symbol` is injective.
+//!    and `star` (a relink must not have touched it). Exact authenticated upstream
+//!    declaration installations may extend that closure; existing definitions in
+//!    the expanded closure must also remain identical. `FuncId <-> symbol` is injective.
 //! 2. Reachable closure. A body reached through a direct call that is not a work-list item is
 //!    INVENTORY RESIDUE: a local, non-generic handoff body is emitted `Internal` under its own
 //!    symbol and disclosed (`inventory-residue-local`); residue the instance lane spliced is
@@ -254,6 +256,10 @@ pub(crate) struct CodegenModuleInput<'a> {
     pub(crate) producer: &'a Module,
     /// `base` when `producer` is `star` (rule 1); `None` when the producer IS `base`.
     pub(crate) base: Option<&'a Module>,
+    /// Private retained upstream declaration installations from the actual Plan.
+    /// This is no body/gate permission and accepts no caller-supplied IDs.
+    pub(crate) handoff_extensions:
+        Option<&'a super::instance_assembly::HandoffDeclarationExtensions<'a>>,
     /// The work list, in rustc's inventory order.
     pub(crate) items: &'a [WorkItem],
     /// The identity of every reachable non-work-list body the rustc half could read.
@@ -316,7 +322,21 @@ pub(crate) struct Assembled {
 
 /// Assemble M_cg, run the postcondition and the final checks.
 pub(crate) fn build(input: &CodegenModuleInput<'_>) -> CodegenModuleOutput {
-    let assembled = assemble(input);
+    finish_build(input, assemble(input))
+}
+
+/// Construct candidate Clean bodies without granting a shipping license. The
+/// caller obtains these ids from its current authenticated, conserved ledger.
+/// The Compiler bridge must still reauthenticate each actual relocated body
+/// using its live publication token; this set is never proof authority.
+pub(crate) fn build_with_clean_candidates(
+    input: &CodegenModuleInput<'_>,
+    clean_candidates: &BTreeSet<FuncId>,
+) -> CodegenModuleOutput {
+    finish_build(input, assemble_with_clean_candidates(input, clean_candidates))
+}
+
+fn finish_build(input: &CodegenModuleInput<'_>, assembled: Assembled) -> CodegenModuleOutput {
     let mut post = check_postcondition(input, &assembled);
     let mut output = assembled.output;
     output.refusals.append(&mut post);
@@ -443,6 +463,13 @@ enum DeclBinding {
 
 /// Assemble M_cg (rules 1-12). The postcondition (rule 13) is [`check_postcondition`].
 pub(crate) fn assemble(input: &CodegenModuleInput<'_>) -> Assembled {
+    assemble_with_clean_candidates(input, &BTreeSet::new())
+}
+
+fn assemble_with_clean_candidates(
+    input: &CodegenModuleInput<'_>,
+    clean_candidates: &BTreeSet<FuncId>,
+) -> Assembled {
     let p = input.producer;
     let mut refusals: Vec<FrontendRefusal> = Vec::new();
 
@@ -598,7 +625,7 @@ pub(crate) fn assemble(input: &CodegenModuleInput<'_>) -> Assembled {
             continue;
         }
         let function = p.function_by_id(*id).expect("members are producer bodies");
-        match member_refusal(input, *id, function, member) {
+        match member_refusal(input, *id, function, member, clean_candidates) {
             Ok(plan) => {
                 legal.insert(*id, plan);
             }
@@ -1023,11 +1050,17 @@ fn member_refusal(
     id: FuncId,
     function: &Function,
     member: &Member,
+    clean_candidates: &BTreeSet<FuncId>,
 ) -> Result<Legalization, LocalRefusal> {
     let p = input.producer;
     // Rule 4.
     match &function.producer {
         Some(Producer::TRust) => {}
+        Some(Producer::Clean)
+            if clean_candidates.contains(&id)
+                && matches!(&function.body_gate,
+                    Some(trust_ir::BodyGate::Gated { authority, evidence: None })
+                    if authority == trust_clean_ir_gate::CLEAN_CARRIER_GATE_AUTHORITY) => {}
         Some(Producer::Clean) => {
             return Err(LocalRefusal::Module(
                 "CleanOriginBelowCodegenGate: a Clean-origin body is not admitted to codegen \
@@ -1043,22 +1076,15 @@ fn member_refusal(
             )));
         }
     }
-    // Rule 1: a handoff item's closure must be equal in `base` and `star`.
+    // Rule 1: preserve every pre-existing definition in both the original and
+    // expanded handoff closure. A declaration may gain a body only through the
+    // actual Plan's retained authenticated installation, rechecked here and
+    // wherever this rule is re-derived by the codegen postcondition.
     if let (Some(base), Member::Item(index)) = (input.base, member)
         && input.items[*index].handoff
     {
-        let census = inspect_function_dependencies(base, id);
-        for node in census.nodes() {
-            let DependencyNode::Function(f) = node else { continue };
-            if base.function_by_id(*f) != p.function_by_id(*f) {
-                return Err(LocalRefusal::Module(format!(
-                    "the handoff body {} in this item's call closure differs between the \
-                     finalize-assembled module and the instance-keyed one (a relink touched a \
-                     handoff closure); design §3.1 rule 1",
-                    producer_name(p, *f)
-                )));
-            }
-        }
+        check_handoff_closure(base, p, id, input.handoff_extensions)
+            .map_err(LocalRefusal::Module)?;
     }
     // Rule 5: every function reference other than a direct call.
     if let Some(why) = function_reference(p, function) {
@@ -1085,6 +1111,11 @@ fn member_refusal(
         legalize_signature(p, ty, abi).map_err(|why| LocalRefusal::Abi(why.into_message()))?;
     legalizable_attributes(function, &plan).map_err(LocalRefusal::Abi)?;
     legalizable_body(function, &plan).map_err(LocalRefusal::Abi)?;
+    if function.producer == Some(Producer::Clean) && !plan.is_identity() {
+        return Err(LocalRefusal::Abi(
+            "Clean carrier admission requires identity ABI legalization; this plan rewrites the signature or body".into(),
+        ));
+    }
     Ok(plan)
 }
 
@@ -1157,6 +1188,51 @@ fn names_one_global(p: &Module, symbol: &str) -> bool {
 }
 
 /// Rules 5 (module-wide references), 7 and 8.
+/// The rule-1 relation, independently rechecked by the codegen postcondition. Appended nodes gain no admission here; all
+/// ordinary body, producer, ABI and strict output-gate rules still apply.
+pub(super) fn check_handoff_closure(
+    base: &Module,
+    producer: &Module,
+    root: FuncId,
+    extensions: Option<&super::instance_assembly::HandoffDeclarationExtensions<'_>>,
+) -> Result<(), String> {
+    let original = inspect_function_dependencies(base, root);
+    let expanded = inspect_function_dependencies(producer, root);
+    let functions = original.nodes().iter().chain(expanded.nodes()).filter_map(|node| {
+        if let DependencyNode::Function(f) = node { Some(*f) } else { None }
+    }).collect::<BTreeSet<_>>();
+    for id in functions {
+        if producer.function_by_id(id).is_none() {
+            return Err("the expanded handoff closure names a missing function".into());
+        }
+        let Some(before) = base.function_by_id(id) else {
+            if original.nodes().contains(&DependencyNode::Function(id)) {
+                return Err("the original handoff closure names a missing function".into());
+            }
+            // Newly appended functions still owe every ordinary codegen rule.
+            continue;
+        };
+        if Some(before) == producer.function_by_id(id) {
+            continue;
+        }
+        let installation = if before.is_declaration() {
+            extensions
+                .ok_or_else(|| "no retained authenticated declaration extension".to_string())
+                .and_then(|extensions| extensions.check(base, producer, id))
+        } else {
+            Err("a pre-existing definition changed".into())
+        };
+        if let Err(why) = installation {
+            return Err(format!(
+                "the handoff body {} in this item's call closure differs between the \
+                 finalize-assembled module and the instance-keyed one ({why}); design §3.1 rule 1",
+                producer_name(producer, id)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn module_rules(input: &CodegenModuleInput<'_>, refusals: &mut Vec<FrontendRefusal>) {
     let p = input.producer;
     let at = p.name.as_str();
@@ -2703,6 +2779,19 @@ pub(crate) fn check_postcondition(
             && previous != *producer_id
         {
             refusals.push(refusal(symbol, "S maps two producer bodies to this symbol (rule 1)"));
+        }
+    }
+    // Re-earn the declaration-extension relation from the actual inputs. The
+    // assembler's success or unchanged M_cg bytes are not a retained witness.
+    if let Some(base) = input.base {
+        for item in input.items.iter().filter(|item| item.handoff) {
+            if out.symbols.contains_key(&item.func)
+                && let Err(why) =
+                    check_handoff_closure(base, p, item.func, input.handoff_extensions)
+            {
+                refusals.push(refusal(&item.symbol,
+                    format!("the handoff closure relation cannot be re-derived: {why} (rule 13)")));
+            }
         }
     }
     for (m_id, producer_id) in &assembled.m_to_producer {

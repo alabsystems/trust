@@ -700,3 +700,26 @@ fn trust_platform_z_rows_are_exactly_the_five_controls() {
         ],
     );
 }
+
+// Trust: internal lint registration changes query results, but no emitted-code identity.
+#[test]
+fn unstable_options_changes_incremental_but_not_crate_hash() {
+    let base = super::Options::default();
+    let option = super::Z_OPTIONS
+        .iter()
+        .find(|option| option.name == "unstable_options")
+        .expect("the unstable-options selector is registered");
+    let mut enabled = base.clone();
+    let mut collected = super::CollectedOptions::default();
+    assert!((option.setter)(&mut enabled.unstable_opts, &mut collected, None, 0));
+    assert_ne!(
+        enabled.dep_tracking_hash(false),
+        base.dep_tracking_hash(false),
+        "internal lint registration must invalidate the incremental cache",
+    );
+    assert_eq!(
+        enabled.dep_tracking_hash(true),
+        base.dep_tracking_hash(true),
+        "internal lint diagnostics must not change the crate hash",
+    );
+}

@@ -93,7 +93,7 @@ fn prewrite_pair_retention_holds_both_actual_originals_through_sender_loss() {
             .unwrap_or_else(|(error, _)| panic!("{error}"));
         bank.release_idle(width(1)).unwrap().unwrap();
         let mut idle = unit_plan(root.path(), &debt, "pending", [31; 32]);
-        let mut wrong = unit_plan(root.path(), &debt, "wrong", [31; 32]);
+        let wrong = unit_plan(root.path(), &debt, "wrong", [31; 32]);
         let (native_copy, shadow_copy, native_slot, shadow_slot, nonce) = {
             let offer = bank.prepare_reacquire_idle(&debt, &mut idle, 4).unwrap().unwrap();
             let [native, shadow] = offer.descriptions().unwrap();
@@ -114,7 +114,6 @@ fn prewrite_pair_retention_holds_both_actual_originals_through_sender_loss() {
             (native_slot, shadow_slot, nonce),
             "same original key/FD pair, no new acquisition"
         );
-        drop(again);
         wrong.validate_issuance(debt.recovery_domain().unwrap()).unwrap();
         if torn {
             assert!(
@@ -242,7 +241,6 @@ fn moved_pending_keeper_preserves_originals_and_only_returns_to_the_same_bank() 
         (pair.native_slot(), pair.shadow_slot().unwrap(), pair.nonce().unwrap()),
         (slot, shadow, nonce)
     );
-    drop(pair);
     assert_eq!(bank.commit_reacquire_idle(&debt, &idle).unwrap(), slot);
     bank.settle_drained().unwrap(); // Neither fixture exported work.
     other.commit_reacquire_idle(&other_debt, &other_idle).unwrap();

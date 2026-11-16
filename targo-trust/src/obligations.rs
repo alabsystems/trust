@@ -62,6 +62,70 @@
 // package that did not compile is `could-not-run` by its missing coverage, as
 // before.
 //
+// TEST RESULTS. The record of a `targo trust test` run that executed (or was
+// refused before executing) its harnesses names in its header's `"tests"` the
+// libtest arguments its harnesses were given (without the result channel):
+// `"tests":["--exact","edits::one_row"]`, `"tests":[]` with none. Those
+// arguments choose which cases run, so a test run is compared only with a
+// test run given the same ones (`crate::agent_delta`). The record carries, after the compile-error lines and before any function line,
+// one line per harness of the package and then one line per case, each in key
+// order (`crate::test_results`):
+//
+//   {"test_harness":"test/agent_delta","concluded":false,"reason":"ended by signal 6"}
+//   {"test":"test/agent_delta::edits::one_row","outcome":"failed"}
+//
+// A harness key is the test target's kinds and name; a case key is its
+// harness key, `::` and libtest's name for the case. The outcome is `passed`,
+// `failed`, `ignored` or `not concluded`, as the test binary's own harness
+// reported it: disclosure, never proof, in no verdict, count, baseline or
+// vector. A record without `"tests"` (every `check`) has no such line.
+//
+// CLEAN ISLANDS. A package whose compilation units published island rows
+// (`trust_types::clean_island_rows`: one message per unit the compiler
+// reaches its islands in, `islands: 0` when it has none, one row per
+// declaration of the crate's `clean { … }` islands, PKG-LIVE-2) carries,
+// after the test lines and before any function line, one line counting the
+// units that published of the package's proof units in the run's declared
+// inventory (`null` when it declared none), then per crate in name order one
+// section line and then one line per island declaration in key order:
+//
+//   {"clean_island_units":P,"proof_units":N|null}
+//   {"clean_islands":"<crate>","phase":"verified"|"front-end-error","islands":N,
+//    "complete":true|false,"problems":[…]}
+//   {"clean_decl":"<crate>::<Clean name>#<16 hex>","kind":"lean:theorem",
+//    "status":…,"stop":…,"file":…,"line":…,"col":…,"source":"<64 hex>"|null
+//    [,"basis":"unproved_fail_closed"]}
+//
+// A declaration's key is the one a standalone `.lean` file's declaration gets
+// (`trust_types::lean_declaration_identity`) with the crate in front, so no
+// island key can be a Rust obligation's. The units of one package that share a
+// crate name (a library and its own test unit; a library and a binary of the
+// package's name) are one section: a key keeps its worse row, `complete` is
+// every unit's, the phase is `front-end-error` when any unit's is, the
+// problems are every unit's, and `islands` is the most any unit had; a
+// verified, complete unit with no island adds no section, only its count. A
+// unit that published nothing (a Rust parse or macro error stopped it before
+// its islands were read) is in no section, so a key missing from the record
+// is one no unit has only when every proof unit published (`P` = `N`): the
+// package's units are WHOLE. Otherwise no row of the package is proved (the
+// writer states each `not-dispatched`, as a merge with a unit that is not a
+// measurement does) and the view reads a missing key as not measured. A row
+// states one of four verdicts only — `proved`/`solved`, `failed`/
+// `solver-incomplete` with basis `unproved_fail_closed`, `unknown`/
+// `unsupported`, `unknown`/`not-dispatched` — and `proved` only in a section
+// that is `verified` and complete; the reader refuses any other line, a row
+// before its crate's section line, a section whose `complete` disagrees
+// with its problems, an island line before the units line, and a `proved`
+// row in a package whose units are not whole. What `proved` means for an
+// island row is the producer's (`trust_certify::clean_island_rows`;
+// docs/TCB.md): never `Certified`. The
+// rows are ungraded, so the listing's label is the `.lean` lane's (`PROVED`,
+// `FAILED: unproved, no counterexample; failed closed`, `UNKNOWN`).
+//
+// An island line is disclosure, like a compile-error or test line: it is in
+// the record's bytes, so in its snapshot token (`crate::agent_delta`), and in
+// no verdict, count, `Summary:` line, baseline, vector or `coverage_complete`.
+//
 // After the header, each function's `fn` line is followed by its obligations,
 // functions in def-path order and obligations in key order. Every function the
 // compiler verified has its `fn` line — one whose obligations were all elided
@@ -785,6 +849,16 @@ pub(crate) struct ObligationRecords {
     /// The keyed compile errors ([`key_compile_errors`]) of each package that
     /// reported one.
     pub(crate) compile_errors: BTreeMap<String, Vec<CompileErrorRecord>>,
+    /// The test results of a `test` run, by package (`crate::test_results`):
+    /// `Some` (every package's record names `"tests"`) for a run that
+    /// executed or refused its harnesses, `None` for every other run.
+    pub(crate) tests: Option<BTreeMap<String, crate::test_results::PackageTests>>,
+    /// The libtest arguments of that run's harnesses, without the result
+    /// channel ([`crate::test_results::harness_arguments`]).
+    pub(crate) test_arguments: Vec<String>,
+    /// The island sections of each package that published island rows
+    /// (module docs, CLEAN ISLANDS), by crate.
+    pub(crate) clean_islands: BTreeMap<String, clean_islands::PackageCleanIslands>,
 }
 
 impl ObligationRecords {
@@ -924,7 +998,39 @@ impl ObligationRecords {
             conflicting_functions: conflicting,
             units,
             compile_errors,
+            tests: None,
+            test_arguments: Vec::new(),
+            clean_islands: BTreeMap::new(),
         }
+    }
+
+    /// The same records, carrying the island rows each unit published, by
+    /// the unit's package (module docs, CLEAN ISLANDS). `proof_units` names
+    /// the package of every proof unit the run declared, one entry per unit
+    /// (`None` when it declared none). Disclosure only: no fact, vector,
+    /// count or coverage above reads them.
+    pub(crate) fn with_clean_islands<'a>(
+        mut self,
+        proof_units: Option<&[&str]>,
+        units: impl IntoIterator<
+            Item = (&'a str, &'a trust_types::clean_island_rows::CleanIslandRowsTransport),
+        >,
+    ) -> Self {
+        self.clean_islands = clean_islands::sections_of_units(proof_units, units);
+        self
+    }
+
+    /// The same records, carrying a `test` run's results and the libtest
+    /// `arguments` its harnesses were given. Every package with a result is
+    /// one the run selected, so it already has facts.
+    pub(crate) fn with_tests(
+        mut self,
+        tests: BTreeMap<String, crate::test_results::PackageTests>,
+        arguments: Vec<String>,
+    ) -> Self {
+        self.tests = Some(tests);
+        self.test_arguments = arguments;
+        self
     }
 
     /// The `trust.obligations.v1` bytes of one package: `None` for a package
@@ -945,9 +1051,15 @@ impl ObligationRecords {
             degraded_anchors: unit.degraded_anchors,
         };
         let empty = PackageRecords::new();
-        Some(render_package_ndjson_with_errors(
+        let no_tests = crate::test_results::PackageTests::default();
+        let no_islands = clean_islands::PackageCleanIslands::default();
+        Some(render_package_ndjson_with_islands(
             &header,
             self.compile_errors.get(package).map(Vec::as_slice).unwrap_or_default(),
+            self.tests.as_ref().map(|tests| {
+                (self.test_arguments.as_slice(), tests.get(package).unwrap_or(&no_tests))
+            }),
+            self.clean_islands.get(package).unwrap_or(&no_islands),
             self.packages.get(package).unwrap_or(&empty),
         ))
     }
@@ -1023,7 +1135,39 @@ pub(crate) fn render_package_ndjson_with_errors(
     compile_errors: &[CompileErrorRecord],
     functions: &PackageRecords,
 ) -> String {
-    let header = serde_json::json!({
+    render_package_ndjson_with_tests(header, compile_errors, None, functions)
+}
+
+/// [`render_package_ndjson_with_errors`] with a `test` run's harness
+/// arguments and results: with `tests`, the header names the arguments in
+/// `"tests"` and the harness and case lines follow the compile-error lines
+/// (module docs, TEST RESULTS).
+pub(crate) fn render_package_ndjson_with_tests(
+    header: &RecordHeader<'_>,
+    compile_errors: &[CompileErrorRecord],
+    tests: Option<(&[String], &crate::test_results::PackageTests)>,
+    functions: &PackageRecords,
+) -> String {
+    render_package_ndjson_with_islands(
+        header,
+        compile_errors,
+        tests,
+        &clean_islands::PackageCleanIslands::default(),
+        functions,
+    )
+}
+
+/// [`render_package_ndjson_with_tests`] with the package's island sections,
+/// after the test lines and before the first function line (module docs,
+/// CLEAN ISLANDS).
+pub(crate) fn render_package_ndjson_with_islands(
+    header: &RecordHeader<'_>,
+    compile_errors: &[CompileErrorRecord],
+    tests: Option<(&[String], &crate::test_results::PackageTests)>,
+    islands: &clean_islands::PackageCleanIslands,
+    functions: &PackageRecords,
+) -> String {
+    let mut header = serde_json::json!({
         "schema": OBLIGATIONS_SCHEMA,
         "package": header.package,
         "lane": header.lane,
@@ -1038,6 +1182,9 @@ pub(crate) fn render_package_ndjson_with_errors(
         "concluded": header.concluded,
         "degraded_anchors": header.degraded_anchors,
     });
+    if let Some((arguments, _)) = tests {
+        header["tests"] = serde_json::json!(arguments);
+    }
     let mut out = String::new();
     push_json_line(&mut out, &header);
     let mut compile_errors: Vec<&CompileErrorRecord> = compile_errors.iter().collect();
@@ -1055,6 +1202,30 @@ pub(crate) fn render_package_ndjson_with_errors(
             }),
         );
     }
+    if let Some((_, tests)) = tests {
+        let mut harnesses: Vec<&crate::test_results::TestHarnessRecord> =
+            tests.harnesses.iter().collect();
+        harnesses.sort();
+        for harness in harnesses {
+            push_json_line(
+                &mut out,
+                &serde_json::json!({
+                    "test_harness": harness.key,
+                    "concluded": harness.concluded,
+                    "reason": harness.reason,
+                }),
+            );
+        }
+        let mut cases: Vec<&crate::test_results::TestCaseRecord> = tests.cases.iter().collect();
+        cases.sort();
+        for case in cases {
+            push_json_line(
+                &mut out,
+                &serde_json::json!({ "test": case.key, "outcome": case.outcome.as_str() }),
+            );
+        }
+    }
+    clean_islands::render(&mut out, islands);
     for (def_path, function) in functions {
         push_json_line(&mut out, &serde_json::json!({ "fn": def_path, "source": function.source }));
         for record in function.obligations.values() {
@@ -1107,6 +1278,15 @@ pub(crate) struct PackageObligations {
     pub(crate) obligations: Vec<ObligationRecord>,
     /// The compile-error lines, in key order.
     pub(crate) compile_errors: Vec<CompileErrorRecord>,
+    /// A `test` run's record: the libtest arguments its harnesses were given
+    /// (its header's `"tests"`). `None` for every other record.
+    pub(crate) tests: Option<Vec<String>>,
+    /// The harness lines, in key order.
+    pub(crate) test_harnesses: Vec<crate::test_results::TestHarnessRecord>,
+    /// The case lines, in key order.
+    pub(crate) test_cases: Vec<crate::test_results::TestCaseRecord>,
+    /// The island sections, by crate (module docs, CLEAN ISLANDS).
+    pub(crate) clean_islands: clean_islands::PackageCleanIslands,
 }
 
 /// The header line, every field named: a record of another shape is refused.
@@ -1128,6 +1308,26 @@ struct ObligationsHeader {
     concluded: bool,
     #[serde(rename = "degraded_anchors")]
     _degraded_anchors: usize,
+    /// Present on a `test` run's record only: its harnesses' arguments.
+    #[serde(default)]
+    tests: Option<Vec<String>>,
+}
+
+/// A test-harness line.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestHarnessLine {
+    test_harness: String,
+    concluded: bool,
+    reason: Option<String>,
+}
+
+/// A test-case line.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestCaseLine {
+    test: String,
+    outcome: String,
 }
 
 /// A function line.
@@ -1186,6 +1386,11 @@ pub(crate) fn parse_package_ndjson(text: &str) -> Result<PackageObligations, Str
     let mut obligations = Vec::new();
     let mut functions = BTreeMap::new();
     let mut compile_errors: Vec<CompileErrorRecord> = Vec::new();
+    let tests = header.tests.is_some();
+    let mut test_harnesses: Vec<crate::test_results::TestHarnessRecord> = Vec::new();
+    let mut test_cases: Vec<crate::test_results::TestCaseRecord> = Vec::new();
+    let mut islands = clean_islands::PackageCleanIslands::default();
+    let mut last_island_crate: Option<String> = None;
     for (index, line) in lines.enumerate() {
         let number = index + 2;
         let value: serde_json::Value = serde_json::from_str(line)
@@ -1195,8 +1400,15 @@ pub(crate) fn parse_package_ndjson(text: &str) -> Result<PackageObligations, Str
                 .map_err(|error| format!("line {number} is not a compile-error line: {error}"))?;
             // After the header and before every function line, in key order,
             // each key once: as the writer puts them.
-            if !functions.is_empty() || !obligations.is_empty() {
-                return Err(format!("line {number} is a compile-error line after a function line"));
+            if !functions.is_empty()
+                || !obligations.is_empty()
+                || !test_harnesses.is_empty()
+                || !test_cases.is_empty()
+                || !islands.is_empty()
+            {
+                return Err(format!(
+                    "line {number} is a compile-error line after a test, island or function line"
+                ));
             }
             if compile_errors.last().is_some_and(|last| last.key >= error.compile_error) {
                 return Err(format!(
@@ -1211,6 +1423,98 @@ pub(crate) fn parse_package_ndjson(text: &str) -> Result<PackageObligations, Str
                 line: error.line,
                 col: error.col,
             });
+            continue;
+        }
+        if value.get("test_harness").is_some() {
+            let harness = serde_json::from_value::<TestHarnessLine>(value)
+                .map_err(|error| format!("line {number} is not a test-harness line: {error}"))?;
+            // In a test run's record only, after the compile errors and
+            // before every case and function line, in key order; a harness
+            // that concluded states no reason and one that did not states one.
+            if !tests {
+                return Err(format!(
+                    "line {number} is a test-harness line in a record that is not a test run's"
+                ));
+            }
+            if !functions.is_empty()
+                || !obligations.is_empty()
+                || !test_cases.is_empty()
+                || !islands.is_empty()
+            {
+                return Err(format!(
+                    "line {number} is a test-harness line after a case, island or function line"
+                ));
+            }
+            if test_harnesses.last().is_some_and(|last| last.key >= harness.test_harness) {
+                return Err(format!(
+                    "line {number} is a test-harness line out of key order or repeated"
+                ));
+            }
+            if harness.concluded == harness.reason.is_some() {
+                return Err(format!(
+                    "line {number} is a test-harness line whose reason does not match `concluded`"
+                ));
+            }
+            test_harnesses.push(crate::test_results::TestHarnessRecord {
+                key: harness.test_harness,
+                concluded: harness.concluded,
+                reason: harness.reason,
+            });
+            continue;
+        }
+        if value.get("test").is_some() {
+            let case = serde_json::from_value::<TestCaseLine>(value)
+                .map_err(|error| format!("line {number} is not a test-case line: {error}"))?;
+            if !tests {
+                return Err(format!(
+                    "line {number} is a test-case line in a record that is not a test run's"
+                ));
+            }
+            if !functions.is_empty() || !obligations.is_empty() || !islands.is_empty() {
+                return Err(format!(
+                    "line {number} is a test-case line after an island or function line"
+                ));
+            }
+            if test_cases.last().is_some_and(|last| last.key >= case.test) {
+                return Err(format!(
+                    "line {number} is a test-case line out of key order or repeated"
+                ));
+            }
+            let outcome = crate::test_results::CaseOutcome::parse(&case.outcome)
+                .ok_or_else(|| format!("line {number} names test outcome `{}`", case.outcome))?;
+            let record = crate::test_results::TestCaseRecord { key: case.test, outcome };
+            // A case belongs to a harness this record states, and a case of a
+            // harness that did not conclude is never `passed` or `ignored`.
+            match test_harnesses.iter().find(|harness| harness.key == record.harness()) {
+                None => return Err(format!("line {number} is a test case of no harness line")),
+                Some(harness)
+                    if !harness.concluded
+                        && matches!(
+                            record.outcome,
+                            crate::test_results::CaseOutcome::Passed
+                                | crate::test_results::CaseOutcome::Ignored
+                        ) =>
+                {
+                    return Err(format!(
+                        "line {number} is a `{}` case of a harness that did not conclude",
+                        record.outcome.as_str()
+                    ));
+                }
+                Some(_) => {}
+            }
+            test_cases.push(record);
+            continue;
+        }
+        if value.get("clean_island_units").is_some()
+            || value.get("clean_islands").is_some()
+            || value.get("clean_decl").is_some()
+        {
+            // After the test lines and before every function line.
+            if !functions.is_empty() || !obligations.is_empty() {
+                return Err(format!("line {number} is an island line after a function line"));
+            }
+            clean_islands::parse_line(&mut islands, &mut last_island_crate, value)
+                .map_err(|error| format!("line {number} {error}"))?;
             continue;
         }
         if value.get("fn").is_some() {
@@ -1252,6 +1556,10 @@ pub(crate) fn parse_package_ndjson(text: &str) -> Result<PackageObligations, Str
         functions,
         obligations,
         compile_errors,
+        tests: header.tests,
+        test_harnesses,
+        test_cases,
+        clean_islands: islands,
     })
 }
 
@@ -1290,6 +1598,8 @@ fn push_json_line(out: &mut String, value: &serde_json::Value) {
 pub(crate) fn records_dir(target_dir: &Path) -> PathBuf {
     target_dir.join("trust").join("obligations")
 }
+
+pub(crate) mod clean_islands;
 
 #[cfg(test)]
 #[path = "obligations_tests.rs"]

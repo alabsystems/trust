@@ -3766,6 +3766,14 @@ pub struct CleanImportBatch {
     pub cycles: Vec<crate::clean_island_batch::CleanIslandCycle>,
     /// Original indices excluded from the final successful atomic batch.
     pub refused_islands: Vec<usize>,
+    /// Whether the surviving units were committed: their final attempt was
+    /// accepted (under the reference recheck) with no integrity failure. False
+    /// for every other ending — every unit refused, no attributable failed
+    /// unit, a global failure — and for an empty suffix. Nothing a surviving
+    /// unit declared is accepted unless this is true: the absence of errors on
+    /// a unit is not acceptance (every outcome of an ending with nothing
+    /// checked is a default with no errors).
+    pub committed: bool,
 }
 
 impl CleanImportBatch {
@@ -4088,6 +4096,7 @@ impl CleanIslandSession {
         let tainted = self.tainted;
         let standins = self.standin_imports.clone();
         let mut cycles = Vec::new();
+        let mut committed = false;
         let mut result = loop {
             if refusals.iter().all(Option::is_some) {
                 break crate::clean_island_batch::CleanIslandBatch {
@@ -4114,6 +4123,7 @@ impl CleanIslandSession {
             if global_failure || !batch.is_rejected() {
                 // Integrity failure keeps global taint/quarantine, including
                 // for earlier hits. An accepted surviving batch commits once.
+                committed = !global_failure && !batch.is_rejected();
                 break batch;
             }
             let mut removed = false;
@@ -4183,7 +4193,7 @@ impl CleanIslandSession {
             }
         }
         cycles.extend(result.cycles);
-        CleanImportBatch { outcomes: result.outcomes, cycles, refused_islands }
+        CleanImportBatch { outcomes: result.outcomes, cycles, refused_islands, committed }
     }
 
     /// A singleton convenience over the same header-first recovery operation.
@@ -6386,18 +6396,18 @@ def sextWide (v : BitVec 64) : BitVec 128 :=
     ofInt128 (toInt64 v)
 
 def eqOkW (m : BitVec 64) (t : BitVec 128) : Bool :=
-    Decidable.decide (Eq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
+    @Decidable.decide (Eq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
                      (Nat.decEq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
 
 def zextWide (v : BitVec 64) : BitVec 128 :=
     BitVec.ofNat 128 (BitVec.toNat v)
 
 def eqOkZeroExt (m : BitVec 64) (t : BitVec 128) : Bool :=
-    Decidable.decide (Eq (BitVec.toNat (zextWide m)) (BitVec.toNat t))
+    @Decidable.decide (Eq (BitVec.toNat (zextWide m)) (BitVec.toNat t))
                      (Nat.decEq (BitVec.toNat (zextWide m)) (BitVec.toNat t))
 
 def eqOkTrunc (m : BitVec 64) (t : BitVec 128) : Bool :=
-    Decidable.decide (Eq (BitVec.toNat m) (BitVec.toNat (trunc64 t)))
+    @Decidable.decide (Eq (BitVec.toNat m) (BitVec.toNat (trunc64 t)))
                      (Nat.decEq (BitVec.toNat m) (BitVec.toNat (trunc64 t)))
 
 def zeroI64 : BitVec 64 := BitVec.ofNat 64 Nat.zero
@@ -7763,7 +7773,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
         let ok = check_clean_island_into(
             "def self_id (x : UInt64) : UInt64 := x\n\n\
              theorem t : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-                 fun x => Nat.le.refl (UInt64.toNat x)",
+                 fun x => @Nat.le.refl (UInt64.toNat x)",
             &mut env,
         );
         assert!(!ok.is_rejected(), "setup island: {:?}", ok.errors);
@@ -7782,7 +7792,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
         let mut env2 = Environment::with_prelude();
         let ok2 = check_clean_island_into(
             "def self_id (x : UInt64) : UInt64 := x\n\n\
-             theorem t : forall (n : Nat), Nat.le n n := fun n => Nat.le.refl n",
+             theorem t : forall (n : Nat), Nat.le n n := fun n => @Nat.le.refl n",
             &mut env2,
         );
         assert!(!ok2.is_rejected(), "setup island 2: {:?}", ok2.errors);
@@ -7861,7 +7871,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
                              d (fun _ => b) (fun _ => a))) (UInt64.toNat a)) \
                      (instDecidableUInt64Lt a b) \
                      (fun h => Iff.mp (Nat.not_lt (UInt64.toNat a) (UInt64.toNat b)) h) \
-                     (fun h => Nat.le.refl (UInt64.toNat a))",
+                     (fun h => @Nat.le.refl (UInt64.toNat a))",
         );
         assert!(
             !outcome.is_rejected(),
@@ -8230,7 +8240,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
                              9223372036854775808) {ka}) \
                      (Nat.decLt {ka} {kb}) \
                      (fun h => Iff.mp (Nat.not_lt {ka} {kb}) h) \
-                     (fun h => Nat.le.refl {ka})",
+                     (fun h => @Nat.le.refl {ka})",
         );
         let outcome = session.check(&theorem);
         assert!(
@@ -8661,7 +8671,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
                              (fun _ => a))) (key64 a)) \
                      (Nat.decLt (key64 a) (key64 b)) \
                      (fun h => Iff.mp (Nat.not_lt (key64 a) (key64 b)) h) \
-                     (fun h => Nat.le.refl (key64 a))";
+                     (fun h => @Nat.le.refl (key64 a))";
         let outcome = session.check(theorem);
         assert!(!outcome.is_rejected(), "island theorem must check: {:?}", outcome.errors);
 
@@ -8737,7 +8747,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
                              (fun _ => a))) (key64 a)) \
                      (Nat.decLt (key64 a) (key64 b)) \
                      (fun h => Iff.mp (Nat.not_lt (key64 a) (key64 b)) h) \
-                     (fun h => Nat.le.refl (key64 a))";
+                     (fun h => @Nat.le.refl (key64 a))";
         let outcome = session.check(theorem);
         assert!(!outcome.is_rejected(), "island theorem must check: {:?}", outcome.errors);
 
@@ -10268,7 +10278,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
         let outcome = check_clean_island_into(
             "theorem u64_ge_refl : forall (x : UInt64), \
              Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-             fun x => Nat.le.refl (UInt64.toNat x)\n",
+             fun x => @Nat.le.refl (UInt64.toNat x)\n",
             &mut env,
         );
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
@@ -10533,14 +10543,14 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
              def bump_us (n : UInt64) : UInt64 := UInt64.add n 1\n\n\
              theorem u64_ge_refl : forall (x : UInt64), \
                  Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-                 fun x => Nat.le.refl (UInt64.toNat x)\n\n\
+                 fun x => @Nat.le.refl (UInt64.toNat x)\n\n\
              theorem u32_ge_refl : forall (x : UInt32), \
                  Nat.le (UInt32.toNat x) (UInt32.toNat x) := \
-                 fun x => Nat.le.refl (UInt32.toNat x)\n\n\
+                 fun x => @Nat.le.refl (UInt32.toNat x)\n\n\
              theorem i64_le_refl : forall (x : BitVec 64), \
                  Nat.le (Nat.xor (BitVec.toNat x) 9223372036854775808) \
                         (Nat.xor (BitVec.toNat x) 9223372036854775808) := \
-                 fun x => Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)",
+                 fun x => @Nat.le.refl (Nat.xor (BitVec.toNat x) 9223372036854775808)",
             &mut env,
         );
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
@@ -10703,7 +10713,7 @@ def maxI128Bits : BitVec 128 := BitVec.ofNat 128 1701411834604692317316873037158
             "def proof_shaped_def : 0 = 0 := rfl\n\n\
              theorem u64_ge_refl : forall (x : UInt64), \
                  Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-                 fun x => Nat.le.refl (UInt64.toNat x)",
+                 fun x => @Nat.le.refl (UInt64.toNat x)",
             &mut env,
         );
         assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
@@ -12549,7 +12559,7 @@ def pb_min (lhs : UInt64) (rhs : UInt64) : UInt64 := if rhs < lhs then rhs else 
                          Nat.le (UInt64.toNat (Decidable.casesOn (motive := fun _ => UInt64) \
                              d (fun _ => a) (fun _ => b))) (UInt64.toNat a)) \
                      (instDecidableUInt64Lt a b) \
-                     (fun _ => Nat.le.refl (UInt64.toNat a)) \
+                     (fun _ => @Nat.le.refl (UInt64.toNat a)) \
                      (fun _ => h)",
             &mut env,
         );
@@ -12897,7 +12907,7 @@ def pb_min (lhs : UInt64) (rhs : UInt64) : UInt64 := if rhs < lhs then rhs else 
         let ok = check_clean_island_into(
             "def self_id (x : UInt64) : UInt64 := x\n\n\
              theorem t : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
-                 fun x => Nat.le.refl (UInt64.toNat x)",
+                 fun x => @Nat.le.refl (UInt64.toNat x)",
             &mut env,
         );
         assert!(!ok.is_rejected(), "setup island: {:?}", ok.errors);
@@ -13380,9 +13390,9 @@ mod nat_lift_wire_tests {
     /// The measured d1 island: `spec_ge` over `Nat`, `dec_ge` over `UInt16`,
     /// and the bridge theorem the verified lane kernel-discharges.
     const D1_ISLAND: &str = "def spec_ge (n : Nat) : Bool := \
-             Decidable.decide (Nat.le 512 n) (Nat.decLe 512 n)\n\n\
+             @Decidable.decide (Nat.le 512 n) (Nat.decLe 512 n)\n\n\
          def dec_ge (n : UInt16) : Bool := \
-             Decidable.decide (LE.le (UInt16.ofNat 512) n) \
+             @Decidable.decide (LE.le (UInt16.ofNat 512) n) \
                  (instDecidableUInt16Le (UInt16.ofNat 512) n)\n\n\
          theorem dec_is_spec : forall (n : UInt16), \
              Eq (dec_ge n) (spec_ge (UInt16.toNat n)) := \
@@ -13514,7 +13524,7 @@ mod nat_lift_wire_tests {
     fn d1_the_fallback_seeds_a_signed_lift_into_a_clone_and_refuses_a_homonym() {
         let mut env = Environment::with_prelude();
         let outcome = check_clean_island_into(
-            "def spec_nonneg (n : Int) : Bool := Decidable.decide (Int.le 0 n) (Int.decLe 0 n)\n\n\
+            "def spec_nonneg (n : Int) : Bool := @Decidable.decide (Int.le 0 n) (Int.decLe 0 n)\n\n\
              theorem taut_bool : forall (b : Bool), Eq b b := fun b => Eq.refl b",
             &mut env,
         );

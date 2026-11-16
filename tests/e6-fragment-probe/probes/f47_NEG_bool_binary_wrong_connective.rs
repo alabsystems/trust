@@ -13,9 +13,9 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     def wrong_isl (x : BitVec 64) : Bool :=
-        Bool.or (Decidable.decide (Nat.le (key64 (BitVec.ofNat 64 18446744073709551488)) (key64 x))
+        Bool.or (@Decidable.decide (Nat.le (key64 (BitVec.ofNat 64 18446744073709551488)) (key64 x))
                                   (Nat.decLe (key64 (BitVec.ofNat 64 18446744073709551488)) (key64 x)))
-                (Decidable.decide (Nat.le (key64 x) (key64 (BitVec.ofNat 64 127)))
+                (@Decidable.decide (Nat.le (key64 x) (key64 (BitVec.ofNat 64 127)))
                                   (Nat.decLe (key64 x) (key64 (BitVec.ofNat 64 127))))
 }
 pub fn in_range(x: i64) -> bool

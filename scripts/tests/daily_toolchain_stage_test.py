@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Exercise orchestration with real temporary Git histories and fake pipeline owners."""
+import ast
+import contextlib
 import importlib.util
+from contextlib import nullcontext
 import hashlib
+import io
 import json
 import shlex
 import os
 from pathlib import Path
 import plistlib
+import re
 import runpy
 import shutil
 import signal
@@ -29,6 +34,8 @@ LIBRARY_SPEC = importlib.util.spec_from_file_location("verify_sysroot_libraries"
 libraries = importlib.util.module_from_spec(LIBRARY_SPEC)
 LIBRARY_SPEC.loader.exec_module(libraries)
 HOST = "aarch64-apple-darwin"
+# The publisher's program name, spelled here and not read from the runner under test.
+CONTROLLER = "trust-resource-controller"
 OUTCOME_OWNER = SCRIPT.parents[1] / "scripts/tests/fixtures/publication_daily_consumer_outcomes.py"
 
 
@@ -48,6 +55,14 @@ def toolchain(path):
     executable(path / "bin/targo")
     (path / "lib").mkdir()
     (path / "lib/libstd.rlib").write_bytes(b"std")
+
+
+def bootstrap_sysroot(path, source):
+    """A stage sysroot as x.py leaves it: its two source entries link to the building checkout."""
+    toolchain(path)
+    for entry in ("src", "rustc-src"):
+        (path / "lib/rustlib" / entry).mkdir(parents=True)
+        (path / "lib/rustlib" / entry / "rust").symlink_to(source)
 
 
 class SysrootLibrarySurfaceTests(unittest.TestCase):
@@ -203,6 +218,8 @@ class Owners:
         self.interrupt = None
         self.consumer_hook = None
         self.consumer_outputs = {}
+        # What the manager scripts/build-tree-manager.sh builds answers to `--protocol`.
+        self.manager_answer = "trust-build-tree-manager-v2"
 
     def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None):
         if Path(argv[0]).name == "git":
@@ -236,10 +253,12 @@ class Owners:
                 output = ""
         elif name == "native-host":
             output = HOST
+        elif name == "build-tree-manager":
+            executable(cwd / "build-tree-manager.noindex/debug/bootstrap", f"#!/bin/sh\necho {self.manager_answer}\n")
         elif name == "pinned-bootstrap-config":
             (cwd / "bootstrap.toml").write_text("[build]\n")
         elif name == "pinned-bootstrap":
-            toolchain(cwd / "build" / HOST / "stage2")
+            bootstrap_sysroot(cwd / "build" / HOST / "stage2", cwd)
         elif name == "locked-dependency-prewarm":
             index = argv.index("_prewarm-dependencies")
             work, receipt = Path(argv[index + 2]), Path(argv[index + 4])
@@ -264,7 +283,7 @@ class Owners:
         elif name == "sanctioned-mint-and-double-compile":
             commit = git(cwd, "rev-parse", "HEAD")
             mint = cwd / f"build/pack-mint-0.10.0-{HOST}-{commit[:12]}"
-            toolchain(mint / HOST / "stage2")
+            bootstrap_sysroot(mint / HOST / "stage2", cwd)
             dist = mint / "repin/bootstrap/trust-stage0/dist/2026-10-19"
             dist.mkdir(parents=True)
             (dist / "trustc.tar.xz").write_bytes(b"archive")
@@ -278,7 +297,13 @@ class Owners:
             commit = git(cwd, "rev-parse", "HEAD")
             root = Path(env["TRUST_TOOLCHAIN_HOME"])
             root.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(Path(argv[-1]), root / f"trust-{commit[:8]}", symlinks=True)
+            seal = root / f"trust-{commit[:8]}"
+            shutil.copytree(Path(argv[-1]), seal, symlinks=True)
+            # Promotion freezes the live source entries inside the seal.
+            (seal / "lib/rustlib/src/rust").unlink()
+            (seal / "lib/rustlib/src/rust").mkdir()
+            (seal / "lib/rustlib/rustc-src/rust").unlink()
+            (seal / "lib/rustlib/rustc-src/rust").symlink_to("../src/rust")
             private = root / "rustc-private-sysroots"
             private.mkdir(exist_ok=True)
             (private / commit).write_bytes(b"private sysroot")
@@ -323,16 +348,96 @@ class Owners:
 
 
 class TrainOwners(Owners):
-    """The train's owners: a real re-pin commit, and real pushes to the fixture's remote."""
+    """The train's owners: a real re-pin commit, real pushes to the fixture's remote, and a fake channel head.
+
+    `head` is the signed index aterm's publisher reads and writes. `races` makes the next
+    runs of an index-publishing step lose the next index number to another publisher;
+    `refusals` makes every run of a step refuse with that text; `after[step]` runs once,
+    right after that step's command. With `real_submodules`, a submodule pin's acquisition
+    (the Agh on PATH) and scripts/submodule_sync.sh run for real.
+    """
     def __init__(self):
         super().__init__()
+        self.real_submodules = False
         self.push_exits = []
+        self.head = {"index": 40, "pins": {"trust": 1, CONTROLLER: 1}}
+        self.races = {}
+        self.refusals = {}
+        self.after = {}
 
     def __call__(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None):
+        result = self.step(argv, cwd, env, log, timeout, cleanup_owner=cleanup_owner, cancel_event=cancel_event)
+        if Path(argv[0]).name != "git" and (hook := self.after.pop(log.stem.split("-", 1)[1], None)):
+            hook()
+        return result
+
+    def refuse(self, argv, log, text):
+        log.write_text(log.read_text() + f"atpkg-publish: {text}\n")
+        stage.atomic_json(Path(argv[argv.index("_owned-command") + 2]),
+                          {"exit_code": 1, "timed_out": False, "interrupted": False})
+
+    def status(self):
+        lines = [f"atpkg-index-{self.head['index']} — signed by machine fixture under roster_seq 1",
+                 "channel alab (channel_build 1): min_build 1"]
+        lines += [f"  pin {program} = {build}" + (" [rustc]" if program == "trust" else "")
+                  for program, build in sorted(self.head["pins"].items())]
+        return "".join(f"atpkg-publish status: {line}\n" for line in lines)
+
+    def publisher(self, argv, log, name):
+        """aterm's publisher, as far as the train's index steps read and write the channel head."""
+        words = argv[argv.index("atpkg-publish") + 2:]
+        words = words[2:] if words[:1] == ["--host"] else words
+        step = name.rstrip("0123456789").rstrip("-")
+        if step in self.refusals:
+            if words[:1] == ["canary"]:
+                # A refused canary has made its output directory and signed nothing.
+                Path(words[words.index("--out") + 1]).mkdir(exist_ok=True)
+            return self.refuse(argv, log, self.refusals[step])
+        if self.races.get(step):
+            self.races[step] -= 1
+            self.head["index"] += 1
+            return self.refuse(argv, log, f"atpkg-index-{self.head['index']} already exists on fixture/atpkg-index with "
+                               f"DIFFERENT bytes (index.toml) — another publisher took index {self.head['index']}; "
+                               "never clobbered. Re-baseline on it: publish again, and the new publish baselines on the channel head")
+        if words == ["status"]:
+            log.write_text(log.read_text() + self.status())
+        elif words[:1] == ["canary"]:
+            out = Path(words[words.index("--out") + 1])
+            if out.exists():
+                return self.refuse(argv, log, "create fresh canary output: File exists")
+            out.mkdir()
+            (out / "train-receipt.toml").write_text(words[1].replace("trust=", "build = ") + "\n")
+            (out / "train-receipt.toml.sig").write_bytes(b"signature")
+        elif words[:3] == ["publish-group", "rustc", "--publish-staged"]:
+            out = Path(words[words.index("--out") + 1])
+            if not (out / "canary/train-receipt.toml.sig").is_file():
+                return self.refuse(argv, log, "no signed canary receipt")
+            staged = dict(line.split(" = ") for line in (out / "staged-builds.toml").read_text().splitlines())
+            self.head["index"] += 1
+            self.head["pins"].update({program: int(build) for program, build in staged.items()})
+        elif words[:1] == ["pack"]:
+            package = Path(words[words.index("--out") + 1]) / words[1]
+            package.mkdir(parents=True, exist_ok=True)
+            (package / f"pkg-{words[1]}-{words[words.index('--build') + 1]}.toml").write_text("schema = 1\n")
+        elif words[:1] == ["index"]:
+            program, build = words[words.index("--pin") + 1].split("=")
+            self.head["index"] += 1
+            self.head["pins"][program] = int(build)
+
+    def step(self, argv, cwd, env, log, timeout=None, *, cleanup_owner=None, cancel_event=None):
+        if self.real_submodules and log.stem.split("-", 1)[1] in ("acquire-submodule-pin", "submodule-sync"):
+            if log.stem.split("-", 1)[1] == "submodule-sync":
+                # The fixture's Trust source has no copy of the script; run this checkout's.
+                argv = [argv[0], str(SCRIPT.with_name("submodule_sync.sh")), *argv[2:]]
+            return stage.command(argv, cwd, env, log, cleanup_owner=cleanup_owner, cancel_event=cancel_event)
         result = super().__call__(argv, cwd, env, log, timeout, cleanup_owner=cleanup_owner, cancel_event=cancel_event)
         if Path(argv[0]).name == "git":
             return result
         name = log.stem.split("-", 1)[1]
+        if "atpkg-publish" in argv and name not in ("signed-pack-dry-run", "signed-pack-stage-upload") \
+                and not name.endswith("hosts-check"):
+            self.publisher(argv, log, name)
+            return log.read_text()
         if name == "sanctioned-mint-and-double-compile":
             # The mint's re-pin: a child of the cut commit on seed/repin-<C>.
             commit = git(cwd, "rev-parse", "HEAD")
@@ -347,8 +452,16 @@ class TrainOwners(Owners):
         elif "-push-" in name:
             # scripts/prewarm_push.sh: merge main into the branch, then push it to main through the hook.
             git(cwd, "fetch", "-q", "origin", "refs/heads/main:refs/remotes/origin/main")
+            before_merge = git(cwd, "rev-parse", "HEAD")
             git(cwd, "merge", "-q", "--no-edit", "refs/remotes/origin/main")
             code = self.push_exits.pop(0) if self.push_exits else 0
+            # A merge that moved a first-party gitlink is kept, and the helper asks for a build (exit 4).
+            if not code and git(cwd, "diff", "--name-only", before_merge, "HEAD", "--", "first-party", ".gitmodules"):
+                code = 4
+            # Its restore runs without `--fetch`: a child not at the merged pin stops it (exit 7).
+            if not code and any(line[:1] in "+-U" for line in subprocess.check_output(
+                    ["git", "-C", str(cwd), "submodule", "status", "--recursive"], text=True).splitlines()):
+                code = 7
             if code:
                 stage.atomic_json(Path(argv[argv.index("_owned-command") + 2]),
                                   {"exit_code": code, "timed_out": False, "interrupted": False})
@@ -359,6 +472,10 @@ class TrainOwners(Owners):
             commit = Path(argv[argv.index("--seal") + 1]).name.removeprefix("stage-trust-")
             build = git(source, "rev-list", "--count", commit)
             git(source, "push", "-q", "origin", f"{commit}:refs/tags/atpkg-trust-{build}")
+            # The publisher's record of the staged group, which --publish-staged reads.
+            group = Path(argv[argv.index("--out") + 1])
+            group.mkdir(parents=True, exist_ok=True)
+            (group / "staged-builds.toml").write_text(f"trust = {build}\ntrust-cg = 3\ntrust-ir = 2\ntrust-vc = 4\n")
         return result
 
 
@@ -650,6 +767,7 @@ class PrewarmBoundaryTests(unittest.TestCase):
         graph_owner = self.source / "scripts/recreate_bootstrap.py"
         graph_owner.parent.mkdir(parents=True)
         shutil.copy2(repo / "scripts/recreate_bootstrap.py", graph_owner)
+        shutil.copy2(repo / "scripts/source_working_cache.py", graph_owner.with_name("source_working_cache.py"))
         identity_owner = self.source / "src/bootstrap/stage0_identity.py"
         identity_owner.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(repo / "src/bootstrap/stage0_identity.py", identity_owner)
@@ -724,10 +842,103 @@ class PrewarmBoundaryTests(unittest.TestCase):
             self.assertFalse((destination / "registry/src").exists())
         return {"source": "explicit fixture"}
 
-    def prepare(self):
+    def prepare(self, cargo_input=None):
         receipt = self.work / "receipt.json"
-        stage.prewarm_dependencies(self.source, self.work, HOST, receipt, [], None, self.policy_engine)
+        # The fake driver tests cache handoff and environment closure. Darwin
+        # uses the explicit diagnostic test executor, as in the closure suite;
+        # production _fetch still refuses without a resident custodian.
+        executor = (
+            mock.patch.dict(self.closure["dependency_closure"].__globals__,
+                            {"_fetch": self.closure["_fetch_darwin"]})
+            if sys.platform == "darwin" else nullcontext()
+        )
+        with executor:
+            stage.prewarm_dependencies(self.source, self.work, HOST, receipt, [], cargo_input, self.policy_engine)
         return stage.read_json(receipt)
+
+    def locked_git_dependency(self):
+        """A locked Git dependency whose commit a filled Cargo input home's git/db holds, and a
+        stand-in fetch that leaves a Git checkout of each database, made as Cargo makes them:
+        a local clone, which hardlinks the database's objects. Returns the input home."""
+        real_git = shutil.which("git")
+        origin = self.root / "git-probe"
+        subprocess.run([real_git, "init", "-q", str(origin)], check=True)
+        for key, value in (("user.name", "fixture"), ("user.email", "fixture@example.invalid"),
+                           ("core.hooksPath", os.devnull)):
+            git(origin, "config", key, value)
+        (origin / "Cargo.toml").write_text('[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n')
+        (origin / "src").mkdir()
+        (origin / "src/lib.rs").write_text("")
+        git(origin, "add", ".")
+        git(origin, "commit", "-qm", "fixture")
+        oid = git(origin, "rev-parse", "HEAD")
+        url = "https://github.com/Owner/probe"
+        manifest = self.source / "Cargo.toml"
+        manifest.write_text(manifest.read_text() + '[package]\nname="profile-root"\nversion="0.1.0"\n'
+                            '[dependencies]\nprobe={git=' + json.dumps(url) + ', rev=' + json.dumps(oid) + '}\n')
+        (self.source / "Cargo.lock").write_text('version=4\n[[package]]\nname="probe"\nversion="0.1.0"\nsource='
+                                               + json.dumps(f"git+{url}?rev={oid}#{oid}") + '\n')
+        given = self.root / "cargo-inputs"
+        db = given / "git/db/probe-fixture"
+        db.parent.mkdir(parents=True)
+        subprocess.run([real_git, "init", "--bare", "-q", str(db)], check=True)
+        subprocess.run([real_git, "-c", "protocol.file.allow=always", "--git-dir", str(db), "fetch", "--no-tags",
+                        str(origin), f"+{oid}:refs/commit/{oid}"], check=True, capture_output=True)
+        # The owned cache holds the commit, so no run asks Agh for it.
+        self.recreator["_agh_source_fetch"] = lambda *_a, **_k: self.fail("the owned Cargo cache holds the commit")
+        fetch = self.driver.with_name("targo-fetch")
+        self.driver.rename(fetch)
+        executable(self.driver, "#!/bin/sh\n" + "'''exec' " + shlex.quote(sys.executable) + ' "$0" "$@" # ' + "'''\n" +
+            "import os, pathlib, subprocess, sys\n" +
+            f"git = {real_git!r}\n" +
+            "home = pathlib.Path(os.environ.get('CARGO_HOME', '/nonexistent'))\n" +
+            "if sys.argv[1:3] == ['fetch', '--locked'] and '--offline' not in sys.argv and (home / 'git/db').is_dir():\n" +
+            "    for db in sorted((home / 'git/db').iterdir()):\n" +
+            "        refs = subprocess.run([git, '--git-dir', str(db), 'for-each-ref', '--format=%(objectname)', 'refs/commit'],\n" +
+            "                              capture_output=True, text=True, check=True).stdout.split()\n" +
+            "        for oid in refs:\n" +
+            "            checkout = home / 'git/checkouts' / db.name / oid[:7]\n" +
+            "            if not checkout.exists():\n" +
+            "                subprocess.run([git, '-c', 'protocol.file.allow=always', 'clone', '-q', '--local',\n" +
+            "                                '--no-checkout', str(db), str(checkout)], check=True)\n" +
+            "                subprocess.run([git, '-C', str(checkout), 'checkout', '-q', '--detach', oid], check=True)\n" +
+            f"os.execv({str(fetch)!r}, [{str(fetch)!r}, *sys.argv[1:]])\n")
+        return given
+
+    def linked_db_objects(self):
+        objects = self.work / "cargo-home/git/db/probe-fixture/objects"
+        return [path for path in sorted(objects.rglob("*")) if path.is_file() and path.stat().st_nlink != 1]
+
+    def test_a_prewarm_run_twice_on_one_commit_revalidates_its_reused_cache(self):
+        # The 5062 relaunch (2026-11-15) stopped at its prewarm: "dependency Cargo bare DB contains
+        # aliased/special or excessive files", the links being Cargo's own checkout of that database.
+        given = self.locked_git_dependency()
+        first = self.prepare(given)
+        cache = self.work / "cargo-home"
+        self.assertTrue((cache / "git/checkouts/probe-fixture").is_dir())
+        self.assertTrue(self.linked_db_objects(), "the stand-in fetch hardlinks the database, as Cargo does")
+        initial = stage.fingerprint(self.work / "initial-cache.json")
+        second = self.prepare(given)
+        for report in (first, second):
+            self.assertEqual([(row["method"], row["cache_db"]) for row in report["transport"]["acquisitions"]],
+                             [("exact-owned-cargo-cache", str(cache / "git/db/probe-fixture"))])
+        # The same cache, reused: not filled again from the input home.
+        self.assertEqual(stage.fingerprint(self.work / "initial-cache.json"), initial)
+        self.assertNotEqual(first["cargo_home"], second["cargo_home"])
+        self.assertTrue((cache / "git/checkouts/probe-fixture").is_dir())
+
+    def test_a_db_object_linked_from_outside_the_cargo_home_still_refuses_on_reuse(self):
+        given = self.locked_git_dependency()
+        self.prepare(given)
+        loose = next(path for path in self.linked_db_objects() if len(path.parent.name) == 2)
+        outside = self.root / "outside-link"
+        os.link(loose, outside)
+        with self.assertRaisesRegex(RuntimeError, "aliased/special or excessive files"):
+            self.prepare(given)
+        # Cargo's checkouts went first; the database still carries the link from outside.
+        self.assertFalse((self.work / "cargo-home/git/checkouts").exists())
+        self.assertEqual(loose.stat().st_nlink, 2)
+        self.assertEqual(outside.read_bytes(), loose.read_bytes())
 
     def test_actual_owner_fetch_uses_pinned_driver_private_cache_and_closed_environment(self):
         config = self.source / ".cargo/config.toml"
@@ -861,7 +1072,7 @@ class DependencyLocalGitBudgetTests(unittest.TestCase):
         api = self.transport()
         calls = []
         fetch = ["-c", "protocol.file.allow=always", "-c", "fetch.fsckObjects=true", "-C",
-                 "/owned/stage", "fetch", "--no-tags", "/owned/cache",
+                 "/owned/stage", "fetch", "--no-tags", "--depth=1", "/owned/cache",
                  "+" + "a" * 40 + ":refs/agh/trust-daily-dependencies/" + "a" * 40]
         owner = {"_dependency_deadline": 1000,
                  "_provenance_git_environment": lambda: {},
@@ -893,7 +1104,7 @@ class DependencyLocalGitBudgetTests(unittest.TestCase):
     def test_local_acquisition_keeps_original_cleanup_and_exit_refusal(self):
         api = self.transport()
         fetch = ["-c", "protocol.file.allow=always", "--git-dir", "/owned/cache", "fetch",
-                 "--no-tags", "--force", "--update-head-ok", "--recurse-submodules=no", "/owned/stage",
+                 "--no-tags", "--depth=1", "--force", "--update-head-ok", "--recurse-submodules=no", "/owned/stage",
                  "+" + "a" * 40 + ":refs/commit/" + "a" * 40]
         owner = {"_dependency_deadline": time.monotonic() + 900,
                  "_provenance_git_environment": lambda: {},
@@ -947,7 +1158,7 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
             calls.append((url, oid))
             self.acquisition_store = stage.parent
             origin = sources[(url, oid)]
-            subprocess.run(["git", "-c", "protocol.file.allow=always", "-C", str(stage),
+            subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "fetch.unpackLimit=1000000", "-C", str(stage),
                             "fetch", "--no-tags", str(origin), "+" + oid + ":" + ref],
                            check=True, capture_output=True)
             return {"program": {"fixture": "local only"}, "repository": url,
@@ -1110,8 +1321,11 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
         good = ["fetch", "--no-tags", "--force", "--update-head-ok", "--recurse-submodules=no",
                 "https://github.com/Owner/probe", "+" + oid + ":refs/commit/" + oid]
         self.assertEqual(api["parse_fetch"](good)[1], oid)
+        self.assertEqual(api["parse_fetch"]([*good[:2], "--depth=1", *good[2:]])[1], oid)
         for argv in (["-c", "core.sshCommand=evil", *good], [*good[:-1], "+refs/heads/*:refs/remotes/origin/*"],
                      [*good[:-1], "+" + oid + ":refs/heads/main"],
+                     [*good[:1], "--depth=2", *good[1:]], [*good[:1], "--deepen=1", *good[1:]],
+                     [*good[:1], "--unshallow", *good[1:]],
                      [*good[:1], "--tags", *good[2:]], [*good, "--upload-pack=evil"]):
             with self.subTest(argv=argv), self.assertRaises(RuntimeError):
                 api["parse_fetch"](argv)
@@ -1137,6 +1351,101 @@ class DependencyFetchBoundaryTests(unittest.TestCase):
                 (db / "objects/info/alternates").write_text(str(origin / ".git/objects") + "\n")
                 with self.assertRaisesRegex(RuntimeError, "custody"):
                     api["git_entry"](policy, argv)
+        finally:
+            os.chdir(old)
+
+    def test_selected_checkout_transfers_without_obsolete_history_bodies(self):
+        origin, first = self.repository("probe")
+        (origin / "src/lib.rs").write_text("// obsolete, unselected body\n")
+        git(origin, "add", ".")
+        git(origin, "commit", "-qm", "obsolete middle")
+        obsolete = git(origin, "rev-parse", "HEAD:src/lib.rs")
+        (origin / "src/lib.rs").write_text("// selected current body\n")
+        git(origin, "add", ".")
+        git(origin, "commit", "-qm", "current")
+        current = git(origin, "rev-parse", "HEAD")
+        self.declare("https://github.com/Owner/probe", current)
+        (self.source / "Cargo.lock").write_text('version=4\n' + "".join(
+            '[[package]]\nname="probe"\nversion="0.1.0"\n'
+            'source="git+https://github.com/Owner/probe#' + oid + '"\n'
+            for oid in (first, current)))
+        sources = {("https://github.com/Owner/probe.git", oid): origin for oid in (first, current)}
+        other, other_oid = self.repository("unrelated")
+        lock = self.source / "Cargo.lock"
+        lock.write_text(lock.read_text() + '\n[[package]]\nname="unrelated"\nversion="0.1.0"\n'
+            'source="git+https://github.com/Owner/unrelated#' + other_oid + '"\n')
+        sources[("https://github.com/Owner/unrelated.git", other_oid)] = other
+        api, policy, document, _ = self.profile(sources)
+        provider = Path(document["stages"]["https://github.com/Owner/probe.git#" + current]["path"])
+        # Model Agh's complete selected checkouts and retained ancestry metadata,
+        # with an obsolete historical body intentionally outside that closure.
+        body = provider / ".git/objects" / obsolete[:2] / obsolete[2:]
+        self.assertTrue(body.is_file())
+        body.unlink()
+        self.assertFalse((provider / ".git/shallow").exists())
+        db = self.work / "cargo-home/git/db/native-selected-checkouts"
+        db.parent.mkdir(parents=True)
+        subprocess.run(["git", "init", "--bare", "-q", str(db)], check=True)
+        old = Path.cwd()
+        try:
+            os.chdir(db)
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(db)}, clear=True):
+                for oid in (current, first, current):
+                    # Native Cargo reinitializes a shallow DB before another
+                    # request. Each callback must preserve the whole approved
+                    # pin set needed by the later offline handoff.
+                    for path in db.iterdir():
+                        if path.is_dir():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink()
+                    subprocess.run(["git", "init", "--bare", "-q", str(db)], check=True)
+                    api["git_entry"](policy, ["fetch", "--no-tags", "--force", "--update-head-ok",
+                        "--recurse-submodules=no", "https://github.com/Owner/probe",
+                        "+" + oid + ":refs/commit/" + oid])
+                    for pin in (first, current):
+                        self.assertEqual(git(db, "rev-parse", "refs/commit/" + pin), pin)
+                        for path in ("Cargo.toml", "src/lib.rs"):
+                            self.assertEqual(git(db, "show", pin + ":" + path), git(origin, "show", pin + ":" + path))
+                    self.assertNotEqual(subprocess.run(["git", "-C", str(db), "cat-file", "-e", other_oid],
+                        capture_output=True).returncode, 0)
+                    self.assertTrue((db / "FETCH_HEAD").read_text().startswith(oid + "\t"))
+        finally:
+            os.chdir(old)
+        self.assertFalse((provider / ".git/shallow").exists())
+        git(db, "fsck", "--full")
+        # Both same-URL pins survive the next preparation without acquisition
+        # or a guessed Cargo URL-hash directory; the unrelated URL still needs
+        # its own owner acquisition rather than leaking into this DB.
+        _, _, imported, calls = self.profile({("https://github.com/Owner/unrelated.git", other_oid): other})
+        self.assertEqual(calls, [("https://github.com/Owner/unrelated.git", other_oid)])
+        for oid in (first, current):
+            row = imported["stages"]["https://github.com/Owner/probe.git#" + oid]
+            target = Path(row["path"])
+            self.assertEqual(git(target, "rev-parse", row["ref"]), oid)
+            for path in ("Cargo.toml", "src/lib.rs"):
+                self.assertEqual(git(target, "show", oid + ":" + path), git(origin, "show", oid + ":" + path))
+
+    def test_selected_checkout_missing_current_body_still_refuses(self):
+        origin, oid = self.repository("probe")
+        self.declare("https://github.com/Owner/probe", oid)
+        api, policy, document, _ = self.profile({("https://github.com/Owner/probe.git", oid): origin})
+        provider = Path(document["stages"]["https://github.com/Owner/probe.git#" + oid]["path"])
+        current = git(provider, "rev-parse", oid + ":src/lib.rs")
+        body = provider / ".git/objects" / current[:2] / current[2:]
+        self.assertTrue(body.is_file())
+        body.unlink()
+        db = self.work / "cargo-home/git/db/missing-selected-body"
+        db.parent.mkdir(parents=True)
+        subprocess.run(["git", "init", "--bare", "-q", str(db)], check=True)
+        old = Path.cwd()
+        try:
+            os.chdir(db)
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(db)}, clear=True), \
+                    self.assertRaisesRegex(RuntimeError, "did not complete"):
+                api["git_entry"](policy, ["fetch", "--no-tags", "--force", "--update-head-ok",
+                    "--recurse-submodules=no", "https://github.com/Owner/probe",
+                    "+" + oid + ":refs/commit/" + oid])
         finally:
             os.chdir(old)
 
@@ -1208,7 +1517,7 @@ class DependencySourceOwnerTests(unittest.TestCase):
         source = SCRIPT.parents[1]
         names = ("scripts/recreate_bootstrap.py", "scripts/mint_seed_support.py",
                  "scripts/seed_custody_source.py", "src/bootstrap/stage0_identity.py")
-        for name in names:
+        for name in (*names, "scripts/source_working_cache.py"):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source / name, target)
@@ -1431,6 +1740,62 @@ class RegistryHttpBoundaryTests(unittest.TestCase):
         self.assertEqual(gate.events, [{"target": "index.crates.io:443", "accepted": False}])
 
 
+class BuildTreeManagerSourceTests(unittest.TestCase):
+    def test_the_runner_asks_the_managers_x_py_asks_and_the_one_the_script_builds(self):
+        # The runner's probe copies x.py's in-tree lease frontends and the path
+        # scripts/build-tree-manager.sh builds. Were either to move without it, the runner
+        # would report a manager the mint's x.py never asks, and the mint would refuse its
+        # lease after the prewarm, the failure the build-tree-manager step removed.
+        root = SCRIPT.parents[1]
+        frontend = next(node for node in ast.walk(ast.parse((root / "x.py").read_text(encoding="utf-8")))
+                        if isinstance(node, ast.FunctionDef) and node.name == "_trust_build_lock_frontend")
+        in_tree = tuple("/".join(argument.value for argument in call.args[1:])
+                        for loop in ast.walk(frontend) if isinstance(loop, ast.For) and isinstance(loop.iter, ast.Tuple)
+                        for call in loop.iter.elts
+                        if isinstance(call, ast.Call) and ast.unparse(call.func) == "os.path.join"
+                        and ast.unparse(call.args[0]) == "rust_dir")
+        self.assertEqual(in_tree, stage.TREE_MANAGERS)
+        constants = {node.value for node in ast.walk(frontend) if isinstance(node, ast.Constant)}
+        self.assertEqual({value for value in constants if isinstance(value, bytes)}, {stage.MANAGER_PROTOCOL})
+        self.assertLessEqual({"--trust-build-tree-lock", "--protocol"}, constants)
+        script = (root / "scripts/build-tree-manager.sh").read_text(encoding="utf-8")
+        settings = dict(re.findall(r'^(PROTOCOL|target|binary)="([^"]*)"$', script, re.MULTILINE))
+        self.assertEqual(settings["PROTOCOL"].encode() + b"\n", stage.MANAGER_PROTOCOL)
+        built = settings["binary"].replace("$target", settings["target"])
+        self.assertEqual(built, "$root/" + stage.TREE_MANAGERS[-1])
+
+
+class DailyCliTests(unittest.TestCase):
+    def test_dry_run_refuses_other_actions_before_dispatch(self):
+        unsupported = (["run"], ["status"], ["train", "status"],
+                       ["train", "install"], ["train", "remove"])
+        with tempfile.TemporaryDirectory(prefix="daily-cli-dry-run-") as temporary:
+            state = Path(temporary) / "uncreated-state"
+            with mock.patch.object(stage, "Runner", side_effect=AssertionError("runner dispatched")) as runner, \
+                    mock.patch.object(stage, "train_main", side_effect=AssertionError("train dispatched")) as train, \
+                    mock.patch.object(stage, "read_json", side_effect=AssertionError("status dispatched")) as status:
+                for words in unsupported:
+                    with self.subTest(words=words), contextlib.redirect_stderr(io.StringIO()) as diagnostic:
+                        with self.assertRaises(SystemExit) as refused:
+                            stage.main([*words, "--dry-run", "--state-root", str(state)])
+                        self.assertEqual(refused.exception.code, 2)
+                        self.assertIn("--dry-run belongs to train run", diagnostic.getvalue())
+                runner.assert_not_called()
+                train.assert_not_called()
+                status.assert_not_called()
+            self.assertFalse(state.exists())
+
+    def test_dry_run_keeps_explicit_and_default_train_run_dispatch(self):
+        for words in (["train"], ["train", "run"]):
+            with self.subTest(words=words), mock.patch.object(stage, "train_main", return_value=0) as train:
+                self.assertEqual(stage.main([*words, "--dry-run"]), 0)
+                train.assert_called_once()
+                args = train.call_args.args[0]
+                self.assertTrue(args.dry_run)
+                self.assertEqual(args.action, "train")
+                self.assertEqual(args.verb, words[1] if len(words) == 2 else None)
+
+
 class DailyStagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="daily-stage-test-")
@@ -1447,6 +1812,15 @@ class DailyStagingTests(unittest.TestCase):
         self.serial = self.root / "serial/trust-serial-command"
         executable(self.serial)
         self.owners = Owners()
+        # Owners simulates toolchain commands. Discovery must use fixture data
+        # too, rather than depending on whether the host installs rustup.
+        self.rustup = self.root / "consumer-tools/rustup"
+        executable(self.rustup, "#!/bin/sh\necho 'fixture rustup must use Owners' >&2\nexit 97\n")
+        environment = mock.patch.dict(os.environ, {
+            "PATH": str(self.rustup.parent) + os.pathsep + os.environ.get("PATH", ""),
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1459,7 +1833,7 @@ class DailyStagingTests(unittest.TestCase):
         git(repo, "config", "user.name", "fixture")
         git(repo, "config", "core.hooksPath", "/dev/null")
         git(repo, "config", "commit.gpgsign", "false")
-        (repo / ".gitignore").write_text("/bootstrap.toml\n/build/\n")
+        (repo / ".gitignore").write_text("/bootstrap.toml\n/build/\n/build-tree-manager.noindex/\n")
         (repo / "README").write_text(name)
         executable(repo / "scripts/build-slot")
         (repo / "scripts/recreate_bootstrap.py").write_text(
@@ -1883,6 +2257,283 @@ else:
                 self.assertEqual(argv[argv.index("--cargo-home") + 1], expected)
                 self.assertEqual(argv[argv.index("--clean-lean-lib") + 1], record["clean_lean_inputs"]["library_path"])
 
+    def test_the_runner_gives_its_snapshot_a_build_tree_manager_before_the_prewarm(self):
+        # 2026-11-15, in two state roots: the mint's first x.py refused its lease ("native
+        # build-tree manager v2 is unavailable") after the snapshot and the 20-minute prewarm.
+        # A Targo on PATH that answers v2 does not count: the mint's x.py never sees it.
+        path_bin = self.root / "path-bin"
+        executable(path_bin / "targo", "#!/bin/sh\necho trust-build-tree-manager-v2\n")
+        runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), self.owners)
+        runner.env["PATH"] = f"{path_bin}:{runner.env['PATH']}"
+        self.assertEqual(runner.run(), 0, runner.record.get("error"))
+        names = self.names()
+        self.assertLess(names.index("build-tree-manager"), names.index("pinned-bootstrap-config"))
+        self.assertLess(names.index("build-tree-manager"), names.index("locked-dependency-prewarm"))
+        _name, argv, _env = next(row for row in self.owners.calls if row[0] == "build-tree-manager")
+        self.assertEqual(argv[1], "--")  # its own build-slot admission
+        self.assertEqual(argv[-2:], ["bash", str(self.state / "source/scripts/build-tree-manager.sh")])
+        step = next(row for row in runner.record["steps"] if row["name"] == "build-tree-manager")
+        self.assertEqual(step["status"], "passed")
+        self.assertTrue(Path(step["log"]).is_file())
+        manager = self.state / "source/build-tree-manager.noindex/debug/bootstrap"
+        self.assertEqual(runner.record["build_tree_manager"],
+                         {"path": str(manager), "sha256": stage.file_hash(manager), "built": True})
+        # A snapshot whose own manager answers v2 is given nothing more.
+        self.owners.calls.clear()
+        result, record = self.run_pipeline("--aterm-repo", str(self.aterm))
+        self.assertEqual(result, 0, record.get("error"))
+        self.assertNotIn("build-tree-manager", self.names())
+        self.assertEqual(record["build_tree_manager"]["path"], str(manager))
+        self.assertFalse(record["build_tree_manager"]["built"])
+
+    def test_a_snapshot_manager_that_does_not_answer_v2_refuses_before_the_prewarm(self):
+        for outcome in ("answers v1", "script refuses"):
+            with self.subTest(outcome=outcome):
+                self.state = self.root / ("state-manager-" + outcome.replace(" ", "-"))
+                self.owners = Owners()
+                self.owners.manager_answer = "trust-build-tree-manager-v1"
+
+                def execute(argv, cwd, env, log, timeout=None, **kwargs):
+                    result = self.owners(argv, cwd, env, log, timeout, **kwargs)
+                    if outcome == "script refuses" and log.stem.endswith("-build-tree-manager"):
+                        # scripts/build-tree-manager.sh exits 1 when its binary does not answer v2.
+                        stage.atomic_json(Path(argv[argv.index("_owned-command") + 2]),
+                                          {"exit_code": 1, "timed_out": False, "interrupted": False})
+                    return result
+
+                runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), execute)
+                self.assertEqual(runner.run(), 1)
+                record = runner.record
+                self.assertEqual(record["status"], "failed")
+                self.assertIn("the build-tree-manager step", record["error"])
+                self.assertIn("trust-build-tree-manager-v2", record["error"])
+                self.assertEqual(record["steps"][-1]["name"], "build-tree-manager")
+                self.assertNotIn("build_tree_manager", record)
+                for later in ("pinned-bootstrap-config", "locked-dependency-prewarm", "mint-preflight",
+                              "sanctioned-mint-and-double-compile"):
+                    self.assertNotIn(later, self.names())
+
+    def failed_mint_fixture(self):
+        """A seed pin the mint reads, and a stand-in mint that writes its stage receipt, DDC
+        manifests, WORK and dist and then fails; `shape` says how far it got and how it ended."""
+        spec = importlib.util.spec_from_file_location("daily_mint_recovery", SCRIPT.with_name("mint_seed_recovery.py"))
+        recovery = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recovery)
+        support = recovery.load_support()
+        # What the mint reads beside its build: the version and the src/stage0 pin of its seed.
+        pins = ["compiler_git_commit_hash=" + "b" * 40, "compiler_date=2026-10-01",
+                "compiler_version=0.1.0-trust", "dist_server=file://{trust-root}/bootstrap/trust-stage0",
+                "artifacts_server=file://{trust-root}/bootstrap/trust-stage0/artifacts",
+                "artifacts_with_llvm_assertions_server=file://{trust-root}/bootstrap/trust-stage0/artifacts-with-llvm-assertions",
+                "compiler_channel_manifest_hash=" + "d" * 64, "compiler_dist_channel=trust",
+                "git_merge_commit_email=trust@fixture.invalid", "min_stage0_rustc_version=1.100.0",
+                "nightly_branch=main", "rustfmt_channel_manifest_hash=" + "d" * 64,
+                "rustfmt_date=2026-10-01", "rustfmt_dist_channel=trust",
+                "rustfmt_git_commit_hash=" + "b" * 40, "rustfmt_version=0.1.0-trust"]
+        payloads = []
+        for component in support.SEED_COMPONENTS:
+            relative = f"bootstrap/trust-stage0/dist/2026-10-01/{component}.tar.xz"
+            archive = self.repo / relative
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("pinned " + component)
+            digest = stage.file_hash(archive)
+            pins.append(f"dist/2026-10-01/{component}.tar.xz={digest}")
+            payloads.append({"path": relative, "actual_sha256": digest, "pinned_sha256": digest, "matches_pin": True})
+        (self.repo / "src").mkdir()
+        (self.repo / "src/version").write_text("0.10.0\n")
+        (self.repo / "src/stage0").write_text("\n".join(pins) + "\n")
+        (self.repo / "bootstrap/trust-stage0/channel.toml").write_text("pinned channel")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-qm", "seed pin")
+        git(self.repo, "push", "-q", "origin", "main")
+        oracle_root = self.root / "oracle"
+        executable(oracle_root / "bin/rustc", "#!/bin/sh\nexit 1\n")
+        executable(oracle_root / "lib/driver", "#!/bin/sh\nexit 1\n")
+        helper = self.root / "native/helper"
+        executable(helper, "#!/bin/sh\nexit 1\n")
+        configuration = {"fingerprint": "fixture-config-closure", "files": ["bootstrap.toml"]}
+        lineage = {"status": "immutable_release", "errors": [], "closure_sha256": "e" * 64,
+                   "repositories": [{"path": ".", "working_tree_snapshot_sha256": "e" * 64}]}
+        kept = {}
+        # By default: an accepted receipt (status None: none written), build-slot's 36 jobs, a
+        # default DDC seed recorded in ddc-seed.json, and a terminal exit 1.
+        shape = {"status": "internal-release-ready", "jobs": 36, "sysroot": True, "exit_code": 1, "timed_out": False}
+
+        def failed_mint(argv, cwd, env, log, timeout=None, **kwargs):
+            """A mint that reached its stage receipt and then failed, keeping its WORK."""
+            if not log.stem.endswith("-sanctioned-mint-and-double-compile"):
+                return self.owners(argv, cwd, env, log, timeout, **kwargs)
+            owned = argv.index("_owned-command")
+            command = kept["argv"] = argv[owned + 5:]
+            source = support.repository_state(cwd)
+            commit, host = source["commit"], command[command.index("--host") + 1]
+            library = command[command.index("--clean-lean-lib") + 1]
+            lean = kept["lean"] = {"library_path": library, "fingerprint": "fixture-lean",
+                                   "physical_installation": str(Path(library).parents[1]),
+                                   "environment": {"CLEAN_OLEAN_PINNED_LEAN_LIB": library,
+                                                   "CLEAN_OLEAN_REQUIRE_PINNED_LEAN": "1"}}
+            build = cwd / f"build/pack-mint-0.10.0-{host}-{commit[:12]}"
+            stage2, work = build / host / "stage2", cwd / "build/.mint-and-prove.fixture"
+            producer = build / host / "stage3-tools-bin" / host / "targo"
+            for path in (stage2 / "bin/trustc", stage2 / "bin/targo", producer):
+                executable(path, "#!/bin/sh\nexit 0\n")
+            compared = support.stage2_manifest(stage2)
+            oracle = {"commit": "c" * 40, "host": host, "relation": "lineage-disjoint", "sysroot": str(oracle_root),
+                      "compiler": "bin/rustc", "compiler_sha256": stage.file_hash(oracle_root / "bin/rustc"),
+                      "driver": "lib/driver", "driver_sha256": stage.file_hash(oracle_root / "lib/driver")}
+            if not shape["sysroot"]:
+                del oracle["sysroot"]
+            for name, value in (("stage2-pinned-seed.json", compared), ("stage2-ddc-seed.json", compared),
+                                ("ddc-seed.json", oracle), ("ddc-seed-post-build.json", oracle),
+                                ("safe-path.json", {"schema": "trust-sanitized-path-v2", "profile": support.SANITIZED_PATH_PROFILE,
+                                                    "host": host, "python": str(helper), "admitted": {
+                                                        name: support.sanitized_tool_identity(helper)
+                                                        for name in support.build_helper_names(host)}})):
+                stage.atomic_json(work / name, value)
+            (work / "cargo-home").mkdir()
+            declared = {"CARGO_HOME": str(work / "cargo-home"), "CARGO_NET_OFFLINE": "true", "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_GLOBAL": os.devnull, "RUSTUP_HOME": str(work / "environment-mint/rustup-home"),
+                        "SOURCE_DATE_EPOCH": str(source["source_date_epoch"]), **lean["environment"]}
+            accepted = shape["status"] == "internal-release-ready"
+            stage.atomic_json(stage2 / "tool-provenance.json", {
+                "schema": "trust.stage-tool-provenance.v2", "status": shape["status"],
+                "errors": [] if accepted else ["unmapped public stage tool rust-lld"],
+                "writer": "scripts/mint_and_prove_seed.sh", "stage": 2, "host": host, "compiler": {"source_commit": commit},
+                "source_lineage": {**lineage, "pre_build_closure_sha256": lineage["closure_sha256"],
+                                   "post_build_closure_sha256": lineage["closure_sha256"], "stable_across_build": True},
+                "tools": [{"name": "targo", "path": str((stage2 / "bin/targo").relative_to(cwd)),
+                           "sha256": stage.file_hash(stage2 / "bin/targo"),
+                           "producer_path": str(producer.relative_to(cwd)), "producer_sha256": stage.file_hash(producer)}],
+                # build-slot's share, as the mint's --jobs to every x.py; the runner named none.
+                "bootstrap_lineage": {"config_path": "bootstrap.toml", "mint_configuration": {
+                    "host": host, "xpy_config_overrides": {} if shape["jobs"] is None else {"build.jobs": shape["jobs"]},
+                    "configuration_closure": configuration, "clean_lean_inputs": lean},
+                    "validated_seed": {"authority": {
+                        "pins": {key: value for key, value in support.read_stage0_pin(cwd).items() if not key.startswith("dist/")},
+                        "payloads": payloads,
+                        "src_stage0": {"path": "src/stage0", "sha256": stage.file_hash(cwd / "src/stage0")},
+                        "channel_manifest": {"path": "bootstrap/trust-stage0/channel.toml",
+                                             "sha256": stage.file_hash(cwd / "bootstrap/trust-stage0/channel.toml")}}}},
+                "build_authority": {"cargo_environment": {"cargo_home": str(work / "cargo-home")},
+                    "declared_rustup_home": {"selected_local_path": declared["RUSTUP_HOME"], "entries": [], "errors": []},
+                    "clean_lean_inputs": lean,
+                    "declared_environment_sha256": {key: hashlib.sha256(value.encode()).hexdigest()
+                                                    for key, value in declared.items()}}})
+            if shape["status"] is None:
+                (stage2 / "tool-provenance.json").unlink()
+            channel = []
+            for index, component in enumerate(support.SEED_COMPONENTS):
+                prefix = f"{component}-0.10.0-trust{'' if component == 'trust-src' else '-' + host}.tar."
+                gz, xz = build / "dist" / (prefix + "gz"), build / "dist" / (prefix + "xz")
+                gz.parent.mkdir(parents=True, exist_ok=True)
+                gz.write_text("gz " + component)
+                xz.write_text("xz " + component)
+                channel.append(f'[pkg.p{index}.target."{host}"]\nurl="https://trust.invalid/{gz.name}"\n'
+                               f'hash="{stage.file_hash(gz)}"\nxz_url="https://trust.invalid/{xz.name}"\n'
+                               f'xz_hash="{stage.file_hash(xz)}"\n')
+            (build / "dist/channel-rust-trust.toml").write_text("\n".join(channel))
+            (build / "dist/channel-rust-trust-date.txt").write_text(source["commit_date"])
+            (build / "dist/channel-rust-trust-git-commit-hash.txt").write_text(commit)
+            log.write_text(json.dumps({"argv": argv, "cwd": str(cwd)}) + "\n"
+                           "error: seed targo reports duplicate identity field freshness\n")
+            stage.atomic_json(Path(argv[owned + 2]), {"exit_code": shape["exit_code"], "timed_out": shape["timed_out"],
+                                                      "interrupted": False})
+            return log.read_text()
+
+        return types.SimpleNamespace(execute=failed_mint, kept=kept, shape=shape, recovery=recovery, support=support,
+                                     oracle_root=oracle_root, configuration=configuration, lineage=lineage)
+
+    def run_failed_mint(self, mint, label):
+        """One runner run, in its own state root, over the stand-in mint as `mint.shape` says."""
+        self.state, self.owners = self.root / f"state-{label}", Owners()
+        runner = stage.Runner(self.arguments("--aterm-repo", str(self.aterm)), mint.execute)
+        with contextlib.redirect_stderr(io.StringIO()) as printed:
+            self.assertEqual(runner.run(), 1)
+        self.assertEqual(runner.record["status"], "failed")
+        self.assertEqual(runner.record["error"], "owned command did not complete successfully")
+        return runner, printed.getvalue()
+
+    def assert_nothing_kept(self, runner):
+        """The mint's WORK where it left it, and no continuation evidence, whole or partial."""
+        work = self.state / "source/build/.mint-and-prove.fixture"
+        self.assertTrue((work / "cargo-home").is_dir())
+        self.assertFalse(work.with_name("retained" + work.name).exists())
+        self.assertEqual(sorted(path.name for path in runner.invocation.iterdir() if "continuation" in path.name), [])
+        self.assertNotIn("evidence", runner.record.get("mint_continuation", {}))
+
+    def test_a_runner_mint_that_fails_after_provenance_is_inspected_from_what_the_runner_kept(self):
+        # The da63c88b7b cut stopped after 5h58m with an identical DDC and an accepted stage
+        # receipt, and was built again: the continuation read --jobs and --ddc-seed from an argv
+        # the runner never gave them, and nothing wrote the evidence it reads.
+        mint = self.failed_mint_fixture()
+        runner, printed = self.run_failed_mint(mint, "continuable")
+        record, kept = runner.record, mint.kept
+        self.assertNotIn("--jobs", kept["argv"])
+        self.assertNotIn("--ddc-seed", kept["argv"])
+        source = self.state / "source"
+        build = source / f"build/pack-mint-0.10.0-{HOST}-{record['source_commit'][:12]}"
+        continuation = record["mint_continuation"]
+        evidence = Path(continuation["evidence"])
+        self.assertEqual(evidence.parent, runner.invocation)
+        # The continuation makes WORK afresh, so the mint's WORK leaves that name, and stays in
+        # the snapshot's build beside it.
+        retained = source / "build/retained.mint-and-prove.fixture"
+        self.assertFalse((source / "build/.mint-and-prove.fixture").exists())
+        self.assertEqual(continuation["retained_work"], str(retained))
+        self.assertTrue((retained / "cargo-home").is_dir())
+        attributes = dict(vars(mint.support))
+        attributes.update(configuration_closure=lambda *_a: mint.configuration, clean_lean_inputs=lambda *_a: kept["lean"])
+        inspected = mint.recovery.validate(source, build, evidence, support=types.SimpleNamespace(**attributes),
+                                           owner=types.SimpleNamespace(capture_source_lineage=lambda *_a: mint.lineage),
+                                           engine={"commit": "f" * 40})
+        self.assertEqual(inspected["state"], "inspected")
+        self.assertEqual((inspected["original_jobs"], inspected["ddc_seed"]), (36, str(mint.oracle_root)))
+        # The printed continuation passes on what the argv did not name, and keeps all it did.
+        command = continuation["command"]
+        self.assertIn(shlex.join(command), printed)
+        self.assertEqual(command, [str(source / "scripts/build-slot"), "--", *kept["argv"][:2],
+                                   "--resume-after-provenance", str(evidence), "--source-root", str(source),
+                                   "--jobs", "36", *kept["argv"][2:], "--ddc-seed", str(mint.oracle_root)])
+        # In a train this state root is a build directory. Retiring it carries its runs/ into
+        # history/, which keeps eight; the WORK, a full Cargo home on a real cut, goes with the
+        # snapshot instead.
+        train = self.root / "train"
+        (train / "builds").mkdir(parents=True)
+        cut = self.state.rename(train / "builds/cut")
+        (cut / "train-build.json").write_text("{}\n")
+        self.assertEqual(stage.retire_builds(train, None), [])
+        self.assertFalse(cut.exists())
+        history = train / "history/cut"
+        self.assertTrue((history / "runs" / runner.invocation.name / "mint-continuation/mint-result.json").is_file())
+        self.assertEqual([path for path in history.rglob("*") if "mint-and-prove" in path.name or path.name == "cargo-home"], [])
+
+    def test_a_failed_mint_with_no_continuation_value_keeps_nothing_and_leaves_its_work(self):
+        # Every value is read and checked before anything is written or moved.
+        mint = self.failed_mint_fixture()
+        for label, change, missing in (("no-jobs", {"jobs": None}, "build.jobs"),
+                                       ("no-seed", {"sysroot": False}, "sysroot")):
+            with self.subTest(label=label):
+                mint.shape.update(change)
+                runner, _printed = self.run_failed_mint(mint, label)
+                self.assert_nothing_kept(runner)
+                self.assertIn(missing, runner.record["mint_continuation"]["error"])
+                mint.shape.update(jobs=36, sysroot=True)
+
+    def test_only_a_terminal_exit_1_after_an_accepted_receipt_keeps_continuation_evidence(self):
+        mint = self.failed_mint_fixture()
+        for label, change in (("signal", {"exit_code": 143}), ("timeout", {"timed_out": True}),
+                              ("rejected", {"status": "rejected"}), ("no-receipt", {"status": None})):
+            with self.subTest(label=label):
+                mint.shape.update(change)
+                runner, _printed = self.run_failed_mint(mint, label)
+                self.assert_nothing_kept(runner)
+                if "status" in change:
+                    # Failed before its stage provenance: the cut is built again, with nothing to say.
+                    self.assertNotIn("mint_continuation", runner.record)
+                else:
+                    self.assertIn("only a terminal exit 1 is continued", runner.record["mint_continuation"]["error"])
+                mint.shape.update(status="internal-release-ready", exit_code=1, timed_out=False)
+
     def test_failed_fetch_retains_evidence_and_does_not_start_mint(self):
         self.owners.fail = "locked-dependency-prewarm"
         result, record = self.run_pipeline("--aterm-repo", str(self.aterm))
@@ -2027,6 +2678,7 @@ else:
         private_ref = fetch["argv"][-1].split(":", 1)[1]
         self.assertTrue(private_ref.startswith("refs/agh/trust-daily-staging/"))
         self.assertEqual(git(runner.source, "rev-parse", private_ref), original)
+
 
         # Only a separate writer advances the remote; the controller stays put.
         writer = self.root / "writer"
@@ -2210,6 +2862,31 @@ else:
         with self.assertRaisesRegex(stage.Refused, "remote helper"):
             runner.snapshot(self.repo, runner.source, "trust")
         self.assertFalse(sentinel.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native Darwin CoW DATA cache")
+    def test_snapshot_uses_only_working_data_and_keeps_complete_independent_checkout(self):
+        runner = self.snapshot_runner()
+        controller = git(self.repo, "rev-parse", "HEAD")
+        config = (self.repo / ".git/config").read_bytes()
+        head = runner.snapshot(self.repo, runner.source, "trust")
+        receipts = list(runner.invocation.glob("*-trust-working-data.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertGreater(receipt["cloned"], 0)
+        self.assertTrue(receipt["complete_checkout_verified"])
+        self.assertEqual(head, controller)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), controller)
+        self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+        self.assertEqual(git(runner.source, "status", "--porcelain"), "")
+        self.assertEqual(git(runner.source, "ls-files", "--stage"), git(self.repo, "ls-files", "--stage"))
+        import gzip
+        with gzip.open(runner.source / receipt["clone_book"]["path"], "rt") as stream:
+            rows = [json.loads(line) for line in stream]
+        for row in rows:
+            source, cloned = self.repo / row["path"], runner.source / row["path"]
+            self.assertNotEqual(source.stat().st_ino, cloned.stat().st_ino)
+            self.assertEqual(cloned.stat().st_nlink, 1)
+        self.assertNotIn(b"hooksPath", (runner.source / ".git/config").read_bytes())
 
     def test_https_snapshot_uses_owner_routed_agh_without_a_credential_helper(self):
         api = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_https_authority")
@@ -2461,6 +3138,9 @@ else:
         self.assertEqual(data["WorkingDirectory"], str(self.repo))
         self.assertEqual(argv[argv.index("--state-root") + 1], str(self.state))
         self.assertEqual(argv[argv.index("--publisher-host") + 1], "agh-staging")
+        self.assertEqual(argv[argv.index("--index-host") + 1], "agh")
+        self.assertEqual(stage.train_plist(self.train_arguments("--index-host", "none"))["ProgramArguments"][
+            argv.index("--index-host") + 1], "none")
         self.assertEqual(argv[argv.index("--serial-command") + 1], str(self.serial))
         self.assertFalse(self.state.exists())
         self.assertNotIn("KeepAlive", data)
@@ -2618,6 +3298,28 @@ else:
         with self.assertRaisesRegex(stage.Refused, "escapes"):
             stage.fingerprint(tree)
 
+    def test_stage_tree_binds_only_its_bootstrap_source_links_to_the_run_snapshot(self):
+        tree = self.root / "stage2"
+        bootstrap_sysroot(tree, self.repo)
+        with self.assertRaisesRegex(stage.Refused, "escapes"):
+            stage.fingerprint(tree)
+        bound = stage.fingerprint(tree, self.repo)
+        self.assertEqual(stage.fingerprint(tree, self.repo), bound)
+        # The links are bound by their text: another checkout is another identity or a refusal.
+        with self.assertRaisesRegex(stage.Refused, "escapes"):
+            stage.fingerprint(tree, self.root)
+        (tree / "lib/rustlib/src/rust").unlink()
+        (tree / "lib/rustlib/src/rust").symlink_to(self.repo / "README")
+        with self.assertRaisesRegex(stage.Refused, "escapes"):
+            stage.fingerprint(tree, self.repo)
+        (tree / "lib/rustlib/src/rust").unlink()
+        (tree / "lib/rustlib/src/rust").symlink_to(self.repo)
+        self.assertEqual(stage.fingerprint(tree, self.repo), bound)
+        # Only the two named entries: the same target anywhere else still escapes.
+        (tree / "lib/source").symlink_to(self.repo)
+        with self.assertRaisesRegex(stage.Refused, "escapes"):
+            stage.fingerprint(tree, self.repo)
+
     def test_owner_environment_policy_is_used_without_importing_owner(self):
         owner = self.repo / "scripts/recreate_bootstrap.py"
         owner.write_text(owner.read_text() + '\nraise RuntimeError("must not import")\n')
@@ -2664,6 +3366,7 @@ else:
         for name in stage.CONSUMERS:
             accepted = record["consumers"][name]
             self.assertEqual(accepted["status"], "passed")
+            self.assertEqual(accepted["identity"]["rustup"]["path"], str(self.rustup.resolve()))
             self.assertEqual(accepted["source_commit"], git(repositories[name], "rev-parse", "HEAD"))
             _, argv, env = next(call for call in self.owners.calls if call[0] == f"{name}-consumer-check")
             self.assertEqual(argv[1], "--")
@@ -2681,6 +3384,20 @@ else:
         self.assertEqual(len(homes), 4)
         self.assertEqual(len(targets), 4)
         self.assertFalse((self.state / "rustup/toolchains/trust").exists())
+
+    def test_missing_consumer_rustup_refuses_before_running_checks(self):
+        arguments, _ = self.consumer_arguments()
+        discover = shutil.which
+
+        def without_rustup(name, *args, **kwargs):
+            return None if name == "rustup" else discover(name, *args, **kwargs)
+
+        with mock.patch.object(stage.shutil, "which", side_effect=without_rustup):
+            result, record = self.run_pipeline(*arguments)
+        self.assertEqual(result, 1)
+        self.assertFalse(record["consumer_ready"])
+        self.assertIn("consumer acceptance requires rustup", record["error"])
+        self.assertFalse(any(name.endswith("-consumer-check") for name in self.names()))
 
     def test_consumer_red_is_not_excused_by_baseline_text_and_other_checks_finish(self):
         arguments, _ = self.consumer_arguments()
@@ -3085,11 +3802,13 @@ else:
     def foreign_commit(self, text):
         git(self.repo, "pull", "-q", "--ff-only", "origin", "main")
         (self.repo / "README").write_text(text)
-        git(self.repo, "commit", "-qam", text)
+        # Not `-a`: --repo's own worktree leaves a first-party child uninitialized.
+        git(self.repo, "add", "README")
+        git(self.repo, "commit", "-qm", text)
         git(self.repo, "push", "-q", "origin", "main")
         return git(self.repo, "rev-parse", "HEAD")
 
-    def test_train_cuts_when_main_moved_publishes_without_the_index_and_then_waits(self):
+    def test_train_cuts_when_main_moved_publishes_to_the_index_and_then_waits(self):
         self.gated_trust()
         arguments, _ = self.consumer_arguments()
         cut = git(self.repo, "rev-parse", "HEAD")
@@ -3097,7 +3816,10 @@ else:
         self.assertEqual(self.tick(*arguments), 0, self.train_state())
         state = self.train_state()
         self.assertEqual((state["last"]["status"], state["last"]["build"], state["good"]["commit"]), ("published", build, cut))
-        self.assertEqual(state["last"]["report"], "nothing found; docs/OPEN_ISSUES.md holds no FLEET-BUILD-REPORT-1")
+        self.assertEqual(state["published"], {"build": build, "commit": cut, "index": 41, "at": state["good"]["served_at"],
+                                              "found_served": False})
+        self.assertEqual((state["good"]["index"], state["good"]["controller_index"]), (41, 42))
+        self.assertEqual(self.owners.head["pins"]["trust"], build)
         self.assertEqual(self.github.builds(), [build])
         # The re-pin reached main by a push that ran the hook; its branch is gone from origin.
         repin = self.github.main()
@@ -3106,25 +3828,41 @@ else:
         self.assertEqual(self.github.deleted, [f"seed/repin-{cut[:12]}"])
         self.assertEqual(state["settled"], repin)
         names = self.names()
-        order = ["release-signing-ready", "publisher-hosts-check", "trust-repo-admitted", "sanctioned-mint-and-double-compile",
-                 "signed-pack-dry-run", "seed-cut-dry-run", "seed-archives-and-repin-branch", "re-pin-push-1",
-                 "signed-pack-stage-upload"]
+        order = ["release-signing-ready", "publisher-hosts-check", "index-hosts-check", "trust-repo-admitted",
+                 "sanctioned-mint-and-double-compile", "signed-pack-dry-run", "seed-cut-dry-run",
+                 "seed-archives-and-repin-branch", "re-pin-push-1", "signed-pack-stage-upload", "index-status", "canary",
+                 "publish-staged-1", "publish-staged-served", "controller-pack", "controller-index-1",
+                 "controller-index-served"]
         self.assertEqual([name for name in names if name in order], order)
         self.assertFalse([name for name in names if name.startswith("unsigned-")])
-        # Never the index, the public owner, a canary or a withdrawal.
+        # Never the publisher's overrides, a mirror, a lane, a withdrawal or the public release owner of Trust.
         for name, argv, _env in self.owners.calls:
-            self.assertFalse(stage.PUBLISHER_REFUSED.intersection(argv), (name, argv))
+            self.assertFalse(stage.PUBLISHER_NEVER.intersection(argv), (name, argv))
             self.assertNotIn("alabsystems", " ".join(argv))
             self.assertEqual("--publish" in argv, name == "seed-archives-and-repin-branch", name)
-            if "atpkg-publish" in argv and name != "publisher-hosts-check":
+            if name in ("signed-pack-dry-run", "signed-pack-stage-upload"):
                 self.assertEqual(argv[argv.index("atpkg-publish") + 1:][:5],
                                  ["--", "--host", "agh-staging", "publish-group", "rustc"])
-                self.assertEqual(len({"--dry-run", "--stage-upload"}.intersection(argv)), 1)
-        self.assertEqual(json.loads((Path(state["good"]["build_dir"]) / "latest.json").read_text())["published"]["index"], "unchanged")
+            elif "atpkg-publish" in argv and not name.endswith("hosts-check"):
+                self.assertEqual(argv[argv.index("atpkg-publish") + 1:][:3], ["--", "--host", "agh"], name)
+        # Each preflight asks about the host its own steps write through: the stage-upload's, then the index's.
+        hosts = {name: argv[argv.index("atpkg-publish") + 2:] for name, argv, _env in self.owners.calls
+                 if name.endswith("hosts-check")}
+        self.assertEqual(hosts, {"publisher-hosts-check": ["hosts", "check", "--host", "agh-staging"],
+                                 "index-hosts-check": ["hosts", "check", "--host", "agh"]})
+        record = json.loads((Path(state["good"]["build_dir"]) / "latest.json").read_text())
+        self.assertEqual((record["status"], record["published"]["index"], record["published"][CONTROLLER],
+                          record["staged"]["tag"]), ("published", "atpkg-index-41", "atpkg-index-42", f"atpkg-trust-{build}"))
+        self.assertEqual((record["settings"]["publisher_host"], record["settings"]["index_host"]), ("agh-staging", "agh"))
+        # The run's end checks ran after the stage-upload and before anything reached the index.
+        steps = [step["name"] for step in record["steps"]]
+        upload = steps.index("signed-pack-stage-upload")
+        self.assertEqual(steps[upload + 1:steps.index("index-status")], ["source-clean", "final-source"])
         # The landing worktree is left detached and clean, with no branch of the train's.
         landing = self.state / "landing.noindex"
         self.assertEqual(git(landing, "status", "--porcelain"), "")
         self.assertEqual(git(self.repo, "branch", "--list", "trust-train/*"), "")
+        self.assertEqual(state["last"]["report"], "nothing found; docs/OPEN_ISSUES.md holds no FLEET-BUILD-REPORT-1")
 
         # Main holds nothing but the train's own re-pin: the next tick starts nothing.
         calls = len(self.owners.calls)
@@ -3134,8 +3872,8 @@ else:
         self.assertEqual(len(self.owners.calls), calls)
         self.assertEqual(len(list((self.state / "builds").iterdir())), 1)
         status = stage.train_status(self.state, self.train(*arguments).read_main)
-        self.assertRegex(status, rf"^train: last published build {build}, 1 commits behind main \({repin[:12]}, build {build + 1}, ")
-        self.assertIn(f"the last train published build {build} ({cut[:12]})", status)
+        self.assertRegex(status, rf"^train: last published build {build} \(atpkg-index-41\), 1 commits behind main "
+                                 rf"\({repin[:12]}, build {build + 1}, read [^)]*\); the last train published build {build} ")
 
         # Someone lands a commit: the next tick cuts it, and the last good build stays, trimmed.
         first = Path(state["good"]["build_dir"])
@@ -3233,6 +3971,217 @@ else:
         self.assertEqual(git(self.repo, "branch", "--list", "trust-train/*"), "")
         self.assertEqual(git(self.state / "landing.noindex", "status", "--porcelain"), "")
 
+    def submodule_trust(self, refuse_landing=False, local_registration=False, hooks_path=None):
+        """gated_trust with one first-party submodule whose pin a stand-in Agh on PATH serves.
+
+        --repo registers the submodule by its indexed URL, or with `local_registration` by a local
+        path, as a clone made from local stores does (m9, 2026-11-14). With `refuse_landing`, Agh
+        refuses every fetch into the landing worktree; `hooks_path` is --repo's core.hooksPath.
+        Returns the pin, the indexed URL, the local path and Agh's log of destinations.
+        """
+        self.gated_trust()
+        if hooks_path is not None:
+            git(self.repo, "config", "core.hooksPath", hooks_path)
+        server = self.root / "pin-server"
+        server.mkdir()
+        git(server, "init", "--quiet", "--template=", "--initial-branch=main")
+        git(server, "config", "user.name", "fixture")
+        git(server, "config", "user.email", "fixture@example.invalid")
+        (server / "value").write_text("pinned")
+        git(server, "add", "value")
+        git(server, "commit", "-qm", "pinned")
+        pin = git(server, "rev-parse", "HEAD")
+        url = "https://github.com/fixture/pin.git"
+        (self.repo / ".gitmodules").write_text('[submodule "fixture"]\n\tpath = first-party/fixture\n\turl = ' + url + '\n')
+        git(self.repo, "add", ".gitmodules")
+        git(self.repo, "update-index", "--add", "--cacheinfo", "160000", pin, "first-party/fixture")
+        git(self.repo, "commit", "-qm", "a first-party child")
+        git(self.repo, "push", "-q", "origin", "main")
+        self.hook_ran.unlink()
+        git(self.repo, "config", "submodule.fixture.url", str(server) if local_registration else url)
+        owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_landing_agh")
+        fetch = shlex.join([*owner["_controlled_git_command"]([]), "-c", "protocol.file.allow=always"])
+        log = self.root / "agh-destinations"
+        refusal = '*landing.noindex*) exit 1 ;;\n' if refuse_landing else ''
+        # agh repo fetch OWNER/NAME DESTINATION --ref PIN --into PRIVATE-REF ...
+        executable(self.root / "agh-bin/agh",
+                   f"#!/bin/sh\necho \"$4\" >> {shlex.quote(str(log))}\ncase \"$4\" in\n{refusal}esac\n"
+                   f"exec {fetch} -C \"$4\" fetch --quiet --no-tags --recurse-submodules=no "
+                   f"{shlex.quote(str(server))} \"$6:$8\"\n")
+        path = mock.patch.dict(os.environ, {"PATH": f"{self.root / 'agh-bin'}{os.pathsep}{os.environ['PATH']}"})
+        path.start()
+        self.addCleanup(path.stop)
+        self.owners.real_submodules = True
+        return pin, url, server, log
+
+    def test_landing_worktree_submodules_are_at_their_pins_before_the_push(self):
+        pin, url, server, log = self.submodule_trust()
+        self.assertEqual(self.tick(), 0, self.train_state())
+        landing = self.state / "landing.noindex"
+        # A fresh linked worktree had none; the push ran from one with its child at the pin.
+        self.assertEqual(git(landing / "first-party/fixture", "rev-parse", "HEAD"), pin)
+        status = subprocess.check_output(["git", "-C", str(landing), "submodule", "status", "--recursive"], text=True)
+        self.assertRegex(status, rf"^ {pin} first-party/fixture\b")
+        self.assertEqual(git(landing, "status", "--porcelain"), "")
+        # Two pushes ran the hook: the re-pin, then the report (no consumer is configured).
+        self.assertEqual(self.hook_ran.read_text(), "ran\nran\n")
+        # Acquired once for the landing, at the cut, before the mint; the landing found it there.
+        destinations = log.read_text().splitlines()
+        self.assertEqual(len([line for line in destinations if "landing.noindex" in line]), 1)
+        record = json.loads((Path(self.train_state()["good"]["build_dir"]) / "latest.json").read_text())
+        self.assertEqual(set(record["landing_submodules"]), {"cut", "re-pin", "report"})
+        names = [step["name"] for step in record["steps"]]
+        self.assertLess(names.index("landing-cut-pins"), names.index("sanctioned-mint-and-double-compile"))
+        self.assertLess(names.index("re-pin-commit") if "re-pin-commit" in names else names.index("re-pin-branch"),
+                        names.index("landing-re-pin-pins"))
+        self.assertLess(names.index("landing-re-pin-pins"), names.index("re-pin-push-1"))
+
+    def test_registrations_off_the_index_are_read_and_never_rewritten(self):
+        children = {}
+        for name in ("a", "b", "c", "d"):
+            child = self.make_repository(f"child-{name}")
+            children[name] = (child, git(child, "rev-parse", "HEAD"))
+        (self.repo / ".gitmodules").write_text("".join(
+            f'[submodule "{name}"]\n\tpath = first-party/{name}\n\turl = https://github.com/fixture/{name}.git\n'
+            for name in children))
+        git(self.repo, "add", ".gitmodules")
+        for name, (_child, pin) in children.items():
+            git(self.repo, "update-index", "--add", "--cacheinfo", "160000", pin, f"first-party/{name}")
+        git(self.repo, "commit", "-qm", "four first-party children")
+        # a by a local path, b by another remote, c by its indexed URL; d is not registered.
+        git(self.repo, "config", "submodule.a.url", str(children["a"][0]))
+        git(self.repo, "config", "submodule.b.url", "https://github.com/other/b.git")
+        git(self.repo, "config", "submodule.c.url", "https://github.com/fixture/c.git")
+        config = (self.repo / ".git/config").read_bytes()
+        owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_off_index")
+        self.assertEqual(sorted(owner["submodule_registrations_off_index"](self.repo)), [
+            ("a", [str(children["a"][0])], "https://github.com/fixture/a.git"),
+            ("b", ["https://github.com/other/b.git"], "https://github.com/fixture/b.git")])
+        self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+
+    def test_a_local_path_registration_refuses_the_tick_before_the_mint_and_is_left_as_it_was(self):
+        pin, url, server, _log = self.submodule_trust(local_registration=True)
+        cut = git(self.repo, "rev-parse", "HEAD")
+        config = (self.repo / ".git/config").read_bytes()
+        self.assertEqual(self.tick(), 1)
+        error = self.train_state()["last"]["error"]
+        self.assertIn("registers fixture by another URL than the indexed .gitmodules one", error)
+        self.assertEqual((self.repo / ".git/config").read_bytes(), config)
+        names = self.names()
+        self.assertNotIn("sanctioned-mint-and-double-compile", names)
+        self.assertNotIn("seed-archives-and-repin-branch", names)
+        self.assertEqual((self.github.main(), self.github.builds()), (cut, []))
+        # The refusal names the command that registers the indexed URL; after it, the train lands.
+        remedy = error.split("to register the indexed URLs: ", 1)[1]
+        self.assertEqual(shlex.split(remedy),
+                         ["git", "-C", str(self.repo.resolve()), "config", "--replace-all", "submodule.fixture.url", url])
+        subprocess.run(shlex.split(remedy), check=True)
+        self.foreign_commit("moved")
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(git(self.state / "landing.noindex/first-party/fixture", "rev-parse", "HEAD"), pin)
+
+    def test_a_landing_worktree_under_the_main_worktrees_absolute_hooks_path_lands(self):
+        # scripts/install-git-hooks.sh writes the main worktree's absolute scripts/hooks, which
+        # scripts/prewarm_push.sh's hooks_verdict accepts for a linked worktree (main-of-linked).
+        pin, _url, _server, _log = self.submodule_trust(hooks_path=str(self.repo / "scripts/hooks"))
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(git(self.state / "landing.noindex/first-party/fixture", "rev-parse", "HEAD"), pin)
+        self.assertEqual(self.hook_ran.read_text(), "ran\nran\n")
+        # Another repository's hooks are not the maintained path.
+        owner = runpy.run_path(str(SCRIPT.with_name("recreate_bootstrap.py")), run_name="fixture_hooks_path")
+        other = self.make_repository("other-hooks")
+        executable(other / "scripts/hooks/pre-push")
+        landing = self.state / "landing.noindex"
+        for hooks, admitted in ((self.repo / "scripts/hooks", True), (landing / "scripts/hooks", True),
+                                (other / "scripts/hooks", False), (self.root / "nowhere", False)):
+            git(self.repo, "config", "core.hooksPath", str(hooks))
+            with self.subTest(hooks=str(hooks)), owner["admitted_trust_checkout"](landing):
+                if admitted:
+                    owner["_reject_local_git_execution_authority"](landing)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "local:core.hookspath"):
+                        owner["_reject_local_git_execution_authority"](landing)
+        # Outside the block the landing worktree is any other repository.
+        git(self.repo, "config", "core.hooksPath", str(self.repo / "scripts/hooks"))
+        with self.assertRaisesRegex(RuntimeError, "local:core.hookspath"):
+            owner["_reject_local_git_execution_authority"](landing)
+
+    def test_landing_acquires_the_pins_main_moved_to_before_the_helper_runs_again(self):
+        pin, _url, server, _log = self.submodule_trust()
+        (server / "value").write_text("moved")
+        git(server, "commit", "-qam", "moved")
+        moved = git(server, "rev-parse", "HEAD")
+
+        def move_main_gitlink():
+            # Main's first-party gitlink moves while the mint runs.
+            git(self.repo, "pull", "-q", "--ff-only", "origin", "main")
+            git(self.repo, "update-index", "--cacheinfo", "160000", moved, "first-party/fixture")
+            git(self.repo, "commit", "-qm", "a first-party pin moved")
+            git(self.repo, "push", "-q", "origin", "main")
+        self.owners.after["sanctioned-mint-and-double-compile"] = move_main_gitlink
+        # The helper merges that main, keeps the merge and asks for a build (exit 4); then runs again.
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertNotIn("not landed", self.train_state()["last"]["report"])
+        landing = self.state / "landing.noindex"
+        self.assertEqual(git(landing / "first-party/fixture", "rev-parse", "HEAD"), moved)
+        self.assertEqual(git(self.root / "trust.git", "rev-parse", "refs/heads/main:first-party/fixture"), moved)
+        record = json.loads((Path(self.train_state()["good"]["build_dir"]) / "latest.json").read_text())
+        names = [step["name"] for step in record["steps"]]
+        self.assertLess(names.index("re-pin-push-1"), names.index("landing-re-pin-merged-1-pins"))
+        self.assertLess(names.index("landing-re-pin-merged-1-pins"), names.index("re-pin-push-2"))
+        self.assertRegex(record["landing_submodules"]["re-pin-merged-1"], rf"^{moved} first-party/fixture\b")
+        # The report's branch starts at the re-pin, behind main's pin; its merge moves it again.
+        self.assertRegex(record["landing_submodules"]["report"], rf"^{pin} first-party/fixture\b")
+        self.assertRegex(record["landing_submodules"]["report-merged-1"], rf"^{moved} first-party/fixture\b")
+        self.assertNotEqual(pin, moved)
+
+    def test_a_landing_child_left_dirty_names_the_train_owned_worktree_and_its_remedy(self):
+        pin, _url, _server, _log = self.submodule_trust()
+        self.assertEqual(self.tick(), 0, self.train_state())
+        landing = self.state / "landing.noindex"
+        # reset --hard does not reach a child: one left dirty stays in the train's tree.
+        (landing / "first-party/fixture/value").write_text("left behind")
+        self.foreign_commit("moved")
+        before = len(self.owners.calls)
+        self.assertEqual(self.tick(), 1)
+        error = self.train_state()["last"]["error"]
+        self.assertIn("is the train's own landing worktree and holds no one else's work", error)
+        self.assertNotIn("sanctioned-mint-and-double-compile", self.names()[before:])
+        remedy = error.rsplit("once it is gone: ", 1)[1]
+        self.assertEqual(remedy, f"rm -rf {shlex.quote(str(landing))} && git -C {shlex.quote(str(self.repo.resolve()))} worktree prune")
+        subprocess.run(["/bin/sh", "-c", remedy], check=True)
+        self.foreign_commit("moved again")
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(git(landing / "first-party/fixture", "rev-parse", "HEAD"), pin)
+        # A child past its pin with a commit no ref holds: scripts/submodule_sync.sh will not restore it.
+        child = landing / "first-party/fixture"
+        (child / "value").write_text("a local commit")
+        git(child, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "local")
+        self.foreign_commit("moved a third time")
+        self.assertEqual(self.tick(), 1)
+        self.assertTrue(self.train_state()["last"]["error"].endswith(f"once it is gone: {remedy}"),
+                        self.train_state()["last"]["error"])
+
+    def test_landing_submodules_that_cannot_be_materialized_end_the_tick_before_any_push(self):
+        pin, _url, _server, log = self.submodule_trust(refuse_landing=True)
+        cut = git(self.repo, "rev-parse", "HEAD")
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        self.assertEqual(state["last"]["status"], "failed")
+        self.assertIn("Agh source fetch failed", state["last"]["error"])
+        # Nothing was left in the train's worktree, so its removal is not offered as the remedy.
+        self.assertNotIn("is the train's own landing worktree", state["last"]["error"])
+        # The source snapshot got its child; the landing's was refused, before the mint and step 4.
+        self.assertTrue(any("landing.noindex" not in line for line in log.read_text().splitlines()))
+        names = self.names()
+        self.assertNotIn("sanctioned-mint-and-double-compile", names)
+        self.assertNotIn("seed-archives-and-repin-branch", names)
+        self.assertFalse([name for name in names if "-push-" in name])
+        self.assertEqual((self.github.main(), self.github.builds()), (cut, []))
+        self.assertEqual(git(self.root / "trust.git", "branch", "--list", "seed/repin-*"), "")
+        self.assertFalse(self.hook_ran.exists())
+        self.assertFalse((self.state / "landing.noindex/first-party/fixture/.git").exists())
+
     def test_consumer_red_is_reported_after_the_upload_and_never_refuses_it(self):
         self.gated_trust()
         arguments, repositories = self.consumer_arguments()
@@ -3266,6 +4215,394 @@ else:
         self.assertIn("### OTHER-1 — another item\nIts text.\n\n## Later", self.remote_file("docs/OPEN_ISSUES.md"))
         self.assertEqual(self.train_state()["last"]["report"], "nothing found; docs/OPEN_ISSUES.md holds no FLEET-BUILD-REPORT-1")
 
+    def publication_steps(self, names):
+        return [name for name in names if name.startswith(("index-status", "canary", "publish-staged", "controller-"))]
+
+    def test_lost_index_races_are_published_again_on_the_new_head(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.races = {"publish-staged": 2, "controller-index": 1}
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(self.publication_steps(self.names()), [
+            "index-status", "canary", "publish-staged-1", "publish-staged-head-1", "publish-staged-2",
+            "publish-staged-head-2", "publish-staged-3", "publish-staged-served", "controller-pack",
+            "controller-index-1", "controller-index-head-1", "controller-index-2", "controller-index-served"])
+        state = self.train_state()
+        # Index 40, then 41 and 42 to the other publisher, 43 for this build; 44 to the other, 45 for the controller.
+        self.assertEqual((state["last"]["status"], state["good"]["index"], state["good"]["controller_index"]),
+                         ("published", 43, 45))
+        self.assertEqual(self.owners.head["pins"], {"trust": build, CONTROLLER: build,
+                                                    "trust-ir": 2, "trust-cg": 3, "trust-vc": 4})
+        # Every run publishes the same staged group, and the controller under the cut's build number.
+        runs = [argv for name, argv, _env in self.owners.calls if name.removeprefix("publish-staged-").isdigit()]
+        self.assertEqual(len(runs), 3)
+        self.assertEqual(len({tuple(argv[argv.index("atpkg-publish"):]) for argv in runs}), 1)
+        pack = next(argv for name, argv, _env in self.owners.calls if name == "controller-pack")
+        self.assertEqual(pack[pack.index("--build") + 1], str(build))
+        self.assertEqual(pack[pack.index("--checkout") + 1], str(Path(state["good"]["build_dir"]) / "source/crates" / CONTROLLER))
+
+    def test_index_publish_stops_after_three_lost_races_and_retries_no_other_refusal(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.races = {"publish-staged": 3}
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        self.assertEqual(self.publication_steps(self.names()), [
+            "index-status", "canary", "publish-staged-1", "publish-staged-head-1", "publish-staged-2",
+            "publish-staged-head-2", "publish-staged-3", "publish-staged-head-3"])
+        self.assertEqual((state["last"]["status"], state["good"]["build"]), ("staged", build))
+        self.assertIn("another publisher took the next index number under each of 3 runs of publish-staged", state["last"]["error"])
+        self.assertNotIn("published", state)
+        # The consumer report still ran and landed.
+        self.assertIn("finding(s) in docs/OPEN_ISSUES.md", state["last"]["report"])
+        # An orphaned draft is no race: the next tick runs the publish once, reusing the signed canary receipt.
+        self.owners.refusals = {"publish-staged": "atpkg-index-44 exists on fixture/atpkg-index as an orphaned DRAFT "
+                                                  "with DIFFERENT bytes (index.toml) — never clobbered or published"}
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 1)
+        later = self.names()[calls:]
+        self.assertEqual(self.publication_steps(later), ["index-status", "publish-staged-1"])
+        self.assertNotIn("release-signing-ready", later)
+        self.assertIn("orphaned DRAFT", self.train_state()["last"]["error"])
+        self.assertEqual(self.train_state()["good"]["publish_ticks"], 2)
+
+    def test_staged_build_is_published_by_the_next_tick_before_another_cut(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.owners.refusals = {"publish-staged": "could not reach fixture/atpkg-index (agh exited 7)"}
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        first = Path(state["good"]["build_dir"])
+        self.assertEqual((state["last"]["status"], state["good"]["publish_ticks"]), ("staged", 1))
+        self.assertNotIn("index", state["good"])
+        self.assertEqual(json.loads((first / "latest.json").read_text())["status"], "staged")
+        # Neither the status line nor the cut decision counts a build that is only staged.
+        status = stage.train_status(self.state, self.train().read_main)
+        self.assertRegex(status, rf"^train: no published build is known \([0-9a-f]{{12}}, build [0-9]+, read [^)]*\); "
+                                 rf"newest staged build {build}; build {build} is staged and not yet published "
+                                 rf"\(.*could not reach fixture/atpkg-index")
+        self.assertIn(f"the last train staged build {build} ({cut[:12]}) at ", status)
+        # Main moves. The next tick publishes the staged build first, in its own build directory, then cuts main.
+        self.owners.refusals = {}
+        moved = self.foreign_commit("moved")
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 0, self.train_state())
+        later = self.owners.calls[calls:]
+        names = [name for name, _argv, _env in later]
+        self.assertLess(names.index("controller-index-served"), names.index("release-signing-ready"))
+        resumed = next(argv for name, argv, _env in later if name == "publish-staged-1")
+        self.assertEqual(resumed[resumed.index("--out") + 1], str(first / "group"))
+        # The first build's signed canary receipt is reused; the new build gets its own canary.
+        self.assertEqual(names.count("canary"), 1)
+        self.assertLess(names.index("release-signing-ready"), names.index("canary"))
+        record = json.loads((first / "latest.json").read_text())
+        self.assertEqual((record["status"], record["published"]["index"], record["published"][CONTROLLER]),
+                         ("published", "atpkg-index-41", "atpkg-index-42"))
+        state = self.train_state()
+        moved_build = int(git(self.repo, "rev-list", "--count", moved))
+        self.assertEqual((state["published"]["build"], state["published"]["index"], state["last"]["status"]),
+                         (moved_build, 43, "published"))
+
+    def test_publication_refused_for_three_ticks_is_given_up_and_the_train_cuts_again(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.owners.refusals = {"canary": "canary client install refused: digest mismatch"}
+        self.assertEqual(self.tick(), 1)
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 1)
+        self.assertNotIn("release-signing-ready", self.names()[calls:])
+        # A canary that ended early is moved aside; the publisher signs only into a fresh directory.
+        group = Path(self.train_state()["good"]["build_dir"]) / "group"
+        self.assertEqual(len(list(group.glob("canary.*"))), 1)
+        # The tick that gives the build up has failed, though it has nothing to cut.
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train().tick(), 1)
+        self.assertIn("nothing to cut", printed.call_args.args[0])
+        state = self.train_state()
+        self.assertEqual((state["good"]["publish_ticks"], self.names().count("canary")), (3, 3))
+        self.assertIn("given_up", state["good"])
+        self.assertIn("given up after 3 ticks", state["last"]["error"])
+        self.assertIn(f"staged build {build} was not published, given up after 3 ticks (", stage.train_status(self.state))
+        # No fourth try: main moves, and the next tick cuts it and publishes the new build.
+        self.owners.refusals = {}
+        moved = self.foreign_commit("moved")
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 0, self.train_state())
+        later = self.names()[calls:]
+        self.assertLess(later.index("release-signing-ready"), later.index("index-status"))
+        self.assertEqual(self.train_state()["published"]["build"], int(git(self.repo, "rev-list", "--count", moved)))
+
+    def test_index_host_none_stops_each_build_at_the_stage_upload(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.assertEqual(self.tick("--index-host", "none"), 0, self.train_state())
+        state = self.train_state()
+        self.assertEqual(state["last"]["status"], "staged")
+        self.assertEqual(self.publication_steps(self.names()), [])
+        self.assertNotIn("index-hosts-check", self.names())
+        self.assertNotIn("published", state)
+        record = json.loads((Path(state["good"]["build_dir"]) / "latest.json").read_text())
+        self.assertEqual((record["status"], record["settings"]["index_host"], "published" in record), ("staged", "none", False))
+        status = stage.train_status(self.state, self.train("--index-host", "none").read_main)
+        self.assertRegex(status, rf"^train: no published build is known \(.*\); newest staged build {build}; "
+                                 rf"build {build} is staged and not yet published; the last train staged build {build} ")
+        # Given the index host again, the next tick publishes that build; main has not moved, so nothing is cut.
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train().tick(), 0)
+        self.assertIn("nothing to cut", printed.call_args.args[0])
+        state = self.train_state()
+        self.assertEqual((state["last"]["status"], state["published"]["build"]), ("published", build))
+        self.assertIn(f"train: last published build {build} (atpkg-index-41)", stage.train_status(self.state))
+
+    def test_staged_build_an_index_already_passed_is_not_published(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.head["pins"]["trust"] = build + 100
+        self.assertEqual(self.tick(), 0, self.train_state())
+        state = self.train_state()
+        self.assertEqual((state["last"]["status"], state["good"]["superseded_by"]), ("staged", build + 100))
+        self.assertEqual(self.publication_steps(self.names()), ["index-status"])
+        self.assertIn(f"staged build {build} was not published: the index already pins trust {build + 100}",
+                      stage.train_status(self.state))
+
+    def test_publication_interrupted_or_killed_is_finished_by_the_next_tick(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.interrupt = "publish-staged-1"
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        self.assertEqual(state["last"]["status"], "staged")
+        self.assertIn("after the upload: fixture interruption", state["last"]["error"])
+        # A publishing tick killed outright leaves its record running; the next tick reads the head and finishes.
+        self.owners.interrupt = None
+        state["last"].update(status="running", kind="publish")
+        stage.atomic_json(self.state / "train.json", state)
+        self.assertIn("ended without a result; the next tick publishes again", stage.train_status(self.state))
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 0, self.train_state())
+        self.assertEqual(self.publication_steps(self.names()[calls:]), [
+            "index-status", "publish-staged-1", "publish-staged-served", "controller-pack", "controller-index-1",
+            "controller-index-served"])
+        state = self.train_state()
+        self.assertEqual((state["last"]["status"], state["last"]["kind"], state["published"]["build"]),
+                         ("published", "publish", build))
+
+    def test_dry_run_says_it_would_publish_a_staged_build_first_and_does_nothing(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.refusals = {"publish-staged": "refused for the fixture"}
+        self.assertEqual(self.tick(), 1)
+        moved = self.foreign_commit("moved")
+        calls = len(self.owners.calls)
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train("--dry-run").tick(), 0)
+        self.assertEqual(len(self.owners.calls), calls)
+        first, plan = (call.args[0] for call in printed.call_args_list)
+        self.assertTrue(first.startswith(f"train: would first publish staged build {build} ("), first)
+        self.assertIn("tick 2 of 3", first)
+        self.assertIn(f"`canary trust={build} --out <its build>/group/canary`", first)
+        self.assertIn("7. its custody: the source snapshot clean at the cut commit and each artifact the train keeps", first)
+        self.assertIn(f"train: would cut {moved[:12]}", plan)
+        self.assertIn("7. the run's end checks: the source snapshot clean at the cut commit; every artifact, the Lean", plan)
+        self.assertLess(plan.index("never published"), plan.index("--publish-staged"))
+        self.assertIn("`atpkg-publish hosts check --host agh-staging` and `hosts check --host agh`", plan)
+        self.assertIn("`publish-group rustc --publish-staged --out <build>/group`", plan)
+        self.assertIn(f"`index --pin {CONTROLLER}=", plan)
+        self.assertEqual(self.train_state()["good"]["publish_ticks"], 1)
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train("--dry-run", "--index-host", "none").tick(), 0)
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("never published);\n     the index is not changed (--index-host none)", printed.call_args.args[0])
+        self.assertNotIn("canary", printed.call_args.args[0])
+        self.assertEqual(len(self.owners.calls), calls)
+
+    def build_dir(self):
+        """The build directory of the train that is running or ran last."""
+        return Path(self.train_state()["last"]["build_dir"])
+
+    def test_a_build_whose_custody_breaks_after_its_upload_is_never_published(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.owners.after["signed-pack-stage-upload"] = lambda: (
+            self.build_dir() / f"toolchains/stage-trust-{cut}/bin/trustc").write_text("#!/bin/sh\necho changed\n")
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        # Staged, and nothing went to the index: no status read, no canary, no publish.
+        self.assertEqual(self.github.builds(), [build])
+        self.assertEqual(self.publication_steps(self.names()), [])
+        self.assertEqual(self.owners.head, {"index": 40, "pins": {"trust": 1, CONTROLLER: 1}})
+        self.assertNotIn("published", state)
+        self.assertEqual(state["last"]["status"], "staged")
+        self.assertIn("its custody check failed: artifact changed during staging", state["good"]["custody_error"])
+        self.assertIn(f"build {build} is never published: its custody check failed", state["last"]["error"])
+        # The run's own end checks found it again; its record says what the build is, as train.json does.
+        record = json.loads((self.build_dir() / "latest.json").read_text())
+        self.assertEqual(record["status"], "staged")
+        self.assertIn("artifact changed during staging", record["error"])
+        self.assertIn(f"; staged build {build} is never published: its custody check failed", stage.train_status(self.state))
+        # No later tick publishes it: main has not moved, so nothing runs at all.
+        calls = len(self.owners.calls)
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train().tick(), 0)
+        self.assertIn("nothing to cut", printed.call_args.args[0])
+        self.assertEqual(len(self.owners.calls), calls)
+
+    def test_a_resumed_publication_first_checks_the_source_it_reads(self):
+        self.gated_trust()
+        build = int(git(self.repo, "rev-list", "--count", "HEAD"))
+        self.owners.refusals = {"publish-staged": "could not reach fixture/atpkg-index (agh exited 7)"}
+        self.assertEqual(self.tick(), 1)
+        self.owners.refusals = {}
+        # Between ticks, a file appears in the build's source snapshot, which the controller pack reads.
+        (self.build_dir() / "source/crates").mkdir(exist_ok=True)
+        (self.build_dir() / "source/crates/stray.rs").write_text("fn main() {}\n")
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 1)
+        self.assertEqual(self.publication_steps(self.names()[calls:]), [])
+        state = self.train_state()
+        self.assertIn("its custody check failed: refusing to move or build a dirty managed worktree",
+                      state["good"]["custody_error"])
+        self.assertEqual((state["good"]["publish_ticks"], state["last"]["status"]), (2, "staged"))
+        self.assertIn(f"build {build} is never published", state["last"]["error"])
+        # Never tried again.
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(len(self.owners.calls), calls)
+
+    def test_a_source_changed_during_publication_stops_the_controller_pack(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.owners.after["canary"] = lambda: (self.build_dir() / "source/stray.rs").write_text("fn main() {}\n")
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        self.assertEqual(self.publication_steps(self.names()), ["index-status", "canary", "publish-staged-1",
+                                                                 "publish-staged-served"])
+        self.assertEqual(self.owners.head["pins"], {"trust": build, CONTROLLER: 1, "trust-ir": 2, "trust-cg": 3, "trust-vc": 4})
+        self.assertEqual((state["last"]["status"], state["published"]["build"], state["good"]["index"]), ("published", build, 41))
+        self.assertIn(f"{CONTROLLER} {build} is never published: its custody check failed: refusing to move or build "
+                      "a dirty managed worktree", state["last"]["error"])
+        # The run's end checks failed after the index served the build: the tick fails, and the
+        # record keeps the build published with that error, as train.json does.
+        self.assertIn("after the upload: refusing to move or build a dirty managed worktree", state["last"]["error"])
+        record = json.loads((self.build_dir() / "latest.json").read_text())
+        self.assertEqual((record["status"], record["published"]["index"]), ("published", "atpkg-index-41"))
+        self.assertIn("dirty managed worktree", record["error"])
+        self.assertIn(f"; {CONTROLLER} {build} is never published: its custody check failed", stage.train_status(self.state))
+        calls = len(self.owners.calls)
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(len(self.owners.calls), calls)
+
+    def test_an_artifact_changed_after_publication_fails_the_tick_and_stays_recorded(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        # The build and its controller are served; then the staged tree changes, before the run's end checks.
+        self.owners.after["controller-index-1"] = lambda: (
+            self.build_dir() / f"toolchains/stage-trust-{cut}/bin/trustc").write_text("#!/bin/sh\necho changed\n")
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        self.assertEqual((self.owners.head["pins"]["trust"], self.owners.head["pins"][CONTROLLER]), (build, build))
+        self.assertEqual((state["last"]["status"], state["good"]["index"], state["good"]["controller_index"]),
+                         ("published", 41, 42))
+        self.assertIn("after the upload: artifact changed during staging", state["last"]["error"])
+        record = json.loads((self.build_dir() / "latest.json").read_text())
+        self.assertEqual((record["status"], record["published"][CONTROLLER]), ("published", "atpkg-index-42"))
+        self.assertIn("artifact changed during staging", record["error"])
+
+    def test_a_v1_trains_state_is_migrated_and_its_staged_build_published(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        self.assertEqual(self.tick("--index-host", "none"), 0, self.train_state())
+        # What a v1 train left: its stage-upload recorded as `published`, with the index unchanged.
+        state = self.train_state()
+        state["schema"] = "trust.toolchain-train.v1"
+        state["good"]["published_at"] = state["good"].pop("staged_at")
+        state["last"].update(status="published", published_at=state["last"].pop("staged_at"))
+        state["main"]["published"] = state["main"].pop("staged")
+        stage.atomic_json(self.state / "train.json", state)
+        build_dir = Path(state["good"]["build_dir"])
+        record = json.loads((build_dir / "latest.json").read_text())
+        record.update(status="published", published={**record.pop("staged"), "index": "unchanged"})
+        for key in ("publisher_host", "index_host"):
+            del record["settings"][key]
+        stage.atomic_json(build_dir / "latest.json", record)
+        # A later cut trimmed the kept build to what it keeps of one.
+        for relative in stage.TRAIN_INTERMEDIATES:
+            if (build_dir / relative).is_dir():
+                stage.remove_tree(build_dir / relative)
+        self.assertRegex(stage.train_status(self.state), rf"^train: no published build is known .*; build {build} is staged "
+                                                         rf"and not yet published; the last train staged build {build} ")
+        calls = len(self.owners.calls)
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train().tick(), 0, self.train_state())
+        self.assertIn("nothing to cut", printed.call_args.args[0])
+        self.assertEqual(self.publication_steps(self.names()[calls:]), [
+            "index-status", "canary", "publish-staged-1", "publish-staged-served", "controller-pack",
+            "controller-index-1", "controller-index-served"])
+        state = self.train_state()
+        self.assertEqual((state["schema"], state["migrated"]["from"]), (stage.TRAIN_SCHEMA, "trust.toolchain-train.v1"))
+        self.assertEqual((state["last"]["status"], state["published"]["build"], state["good"]["controller_index"]),
+                         ("published", build, 42))
+        record = json.loads((build_dir / "latest.json").read_text())
+        self.assertEqual((record["status"], record["staged"]["tag"], record["published"]["index"]),
+                         ("published", f"atpkg-trust-{build}", "atpkg-index-41"))
+        self.assertIn("a v1 train's record", record["migrated"])
+
+    def test_a_staging_tag_that_counts_main_is_no_reason_not_to_cut(self):
+        self.gated_trust()
+        tip = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", tip))
+        # Another publisher stage-uploaded main's tip; no index serves it; this state root is new.
+        git(self.repo, "push", "-q", "origin", f"{tip}:refs/tags/atpkg-trust-{build}")
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(self.train("--dry-run").tick(), 0)
+        self.assertTrue(printed.call_args.args[0].startswith(
+            f"train: would cut {tip[:12]} (build {build}): main is at {tip[:12]}, past every published build\n"),
+            printed.call_args.args[0])
+        self.assertEqual(self.owners.calls, [])
+        self.assertEqual(self.train_state()["main"]["staged"], build)
+        self.assertRegex(stage.train_status(self.state),
+                         rf"^train: no published build is known \(.*\); newest staged build {build}; no train has run here$")
+
+    def test_an_index_found_serving_the_build_is_recorded_as_found_and_kept(self):
+        self.gated_trust()
+        cut = git(self.repo, "rev-parse", "HEAD")
+        build = int(git(self.repo, "rev-list", "--count", cut))
+        # The tick ends after its index publish, before it read the head back.
+        self.owners.interrupt = "publish-staged-served"
+        self.assertEqual(self.tick(), 1)
+        self.owners.interrupt = None
+        self.assertEqual((self.owners.head["index"], self.owners.head["pins"]["trust"]), (41, build))
+        # Another publisher writes the next index; this train's controller pack is refused once.
+        self.owners.head["index"] += 1
+        self.owners.head["pins"]["trust-ir"] = 9
+        self.owners.refusals = {"controller-pack": "refused for the fixture"}
+        self.assertEqual(self.tick(), 1)
+        state = self.train_state()
+        # Which index first served it is not known: the head the train read is recorded, as found.
+        self.assertEqual((state["good"]["index"], state["good"]["found_served"], state["published"]["found_served"]),
+                         (42, ["trust"], True))
+        status = stage.train_status(self.state)
+        self.assertIn(f"train: last published build {build} (found served by atpkg-index-42), ", status)
+        self.assertIn(f"; {CONTROLLER} {build} is not yet published (controller-pack: refused for the fixture); "
+                      f"the last train found build {build} ({cut[:12]}) served by atpkg-index-42 at ", status)
+        # Another index again. The next tick publishes the controller and keeps the index it recorded.
+        self.owners.refusals = {}
+        self.owners.head["index"] += 1
+        self.assertEqual(self.tick(), 0, self.train_state())
+        state = self.train_state()
+        self.assertEqual((state["good"]["index"], state["published"]["index"], state["good"]["controller_index"]),
+                         (42, 42, 44))
+        record = json.loads((self.build_dir() / "latest.json").read_text())
+        self.assertEqual((record["published"]["index"], record["published"]["found_served"], record["published"][CONTROLLER]),
+                         ("atpkg-index-42", ["trust"], "atpkg-index-44"))
+
     def test_train_that_died_is_recorded_and_its_commit_is_cut_again(self):
         self.gated_trust()
         cut = git(self.repo, "rev-parse", "HEAD")
@@ -3296,22 +4633,86 @@ else:
         self.assertIn("failed: the mint refused", reason)
         # An interrupted train settles nothing, so its commit is cut again.
         self.assertTrue(stage.train_decision({"settled": other, "last": {"status": "interrupted"}}, tip, 7, 9)[0])
+        # A build that is only staged counts for nothing: no index serves build 9.
+        staged = {"settled": other, "last": {"status": "staged", "build": 9}, "good": {"build": 9}}
+        self.assertEqual(stage.train_decision(staged, tip, None, 9), (True, f"main is at {tip[:12]}, past every published build"))
+        self.assertTrue(stage.train_decision(staged, tip, 7, 9)[0])
 
-    def test_fleet_publisher_builds_only_a_dry_run_or_a_stage_upload(self):
-        group = ["publish-group", "rustc", "--seal", "/seal", "--trust-repo", "/trust", "--out", "/out"]
+    def test_fleet_publisher_builds_exactly_the_trains_commands(self):
+        group = ["publish-group", "rustc", "--seal", "/seal", "--trust-repo", "/trust", "--checkout", "trust-ir=/ir",
+                 "--checkout", "trust-cg=/cg", "--checkout", "trust-vc=/vc", "--out", "/out"]
         prefix = ["/bin/targo", "--unverified", "run", "-q", "--locked", "-p", "atpkg-publish", "--"]
-        self.assertEqual(stage.fleet_publisher("/bin/targo", "agh-staging", ["hosts", "check"]),
-                         [*prefix, "hosts", "check", "--host", "agh-staging"])
-        for mode in ("--dry-run", "--stage-upload"):
-            self.assertEqual(stage.fleet_publisher("/bin/targo", "agh-staging", [*group, mode]),
-                             [*prefix, "--host", "agh-staging", *group, mode])
-        for words in ([*group, "--publish-staged"], [*group], [*group, "--dry-run", "--stage-upload"],
-                      [*group, "--stage-upload", "--publish-staged"], [*group, "--stage-upload", "--upload"],
-                      [*group, "--stage-upload", "--force-same-build"], [*group, "--stage-upload", "--allow-build-tree-seal"],
-                      ["canary", "--stage-upload"], ["index", "publish", "--dry-run"], ["lane", "withdraw", "--dry-run"],
-                      ["adopt", "trust=1", "--dry-run"], ["publish-group", "aterm", "--stage-upload"], ["hosts", "check", "x"]):
-            with self.subTest(words=words), self.assertRaisesRegex(stage.Refused, "never publishes the index"):
-                stage.fleet_publisher("/bin/targo", "agh-staging", words)
+        canary = ["canary", "trust=12", "--out", "/out/canary", "--consumer", "aterm=/a", "--consumer", "ay=/b",
+                  "--consumer", "ty=/c", "--consumer", "clean=/d"]
+        controller = [CONTROLLER, "--checkout", "/trust/crates/c", "--toolchain", "/seal/bin", "--trust-repo", "/trust",
+                      "--build", "12", "--out", "/build/controller", "--upload"]
+        index = ["index", "--pin", f"{CONTROLLER}=12", "--out", "/build/controller-index", "--upload"]
+        for host in ("agh-staging", "agh"):
+            self.assertEqual(stage.fleet_publisher("/bin/targo", host, ["hosts", "check"]),
+                             [*prefix, "hosts", "check", "--host", host])
+        for host in ("agh-staging", "agh", "gh"):
+            for mode in ("--dry-run", "--stage-upload"):
+                self.assertEqual(stage.fleet_publisher("/bin/targo", host, [*group, mode]),
+                                 [*prefix, "--host", host, *group, mode])
+        for words in (canary, ["publish-group", "rustc", "--publish-staged", "--out", "/out"], ["status"],
+                      ["pack", *controller], index):
+            self.assertEqual(stage.fleet_publisher("/bin/targo", "agh", words), [*prefix, "--host", "agh", *words])
+            # Writing the index, its evidence or the controller goes only through agh.
+            for host in ("agh-staging", "gh"):
+                with self.subTest(host=host, words=words), self.assertRaisesRegex(stage.Refused, "not a fleet train's"):
+                    stage.fleet_publisher("/bin/targo", host, words)
+        refused = [
+            [*group], [*group, "--dry-run", "--stage-upload"], [*group, "--publish-staged"], [*group, "--stage-upload", "--upload"],
+            [*group, "--stage-upload", "--force-same-build"], [*group[:-2], "--force-same-build", "/out", "--stage-upload"],
+            [*group, "--stage-upload", "--allow-build-tree-seal"], [*group[:-1], "out", "--stage-upload"],
+            ["publish-group", "rustc", "--publish-staged", "--out", "/out", "--force-same-build"],
+            ["publish-group", "rustc", "--publish-staged", "--seal", "/seal", "--out", "/out"],
+            [*canary, "--stage-receipt"], canary[:-2], ["canary", "trust=0", *canary[2:]], ["canary", "trust=x", *canary[2:]],
+            ["pack", "trust", *controller[1:]], ["pack-bundle", *controller], ["pack", *controller[:-1]],
+            ["pack", *controller, "--unsigned"], ["pack", *controller[:-5], "--merge-from", "/m", *controller[-5:]],
+            ["index", "--pin", "trust=12", "--out", "/o", "--upload"], [*index, "--yank", "trust@11"],
+            ["index", "--target-pin", f"aarch64-apple-darwin:{CONTROLLER}=12", "--out", "/o", "--upload"],
+            ["index", "--pin", f"{CONTROLLER}=12", "--upload"], ["mirror", "--upload"], ["status", "--releases"],
+            ["lane", "withdraw", "alab"], ["lane", "run", "alab"], ["adopt", "trust=12"], ["withdraw"],
+            ["publish-group", "aterm", "--stage-upload"], ["hosts", "check", "x"]]
+        for words in refused:
+            for host in ("agh-staging", "agh"):
+                with self.subTest(host=host, words=words), self.assertRaisesRegex(stage.Refused, "not a fleet train's"):
+                    stage.fleet_publisher("/bin/targo", host, words)
+        with self.assertRaisesRegex(stage.Refused, "not a fleet train's"):
+            stage.fleet_publisher("/bin/targo", "gh", ["hosts", "check"])
+
+    def test_index_pins_read_the_channel_head_a_client_on_the_host_installs(self):
+        prefix = "atpkg-publish status: "
+        text = "".join(prefix + line + "\n" for line in (
+            "atpkg-index-57 — signed by machine m86 under roster_seq 4", "producer: something",
+            "channel alab (channel_build 57): min_build 1", "  min_build trust: 3", "  pin trust = 16387 [rustc]",
+            f"  pin {CONTROLLER} = 16300", "  pin trust = 16400 on aarch64-apple-darwin",
+            "  pin trust = 9 on x86_64-unknown-linux-gnu", "  pin ty = 5 on riscv-unknown (not a target this client knows)"))
+        noise = "   Compiling atpkg-publish\natpkg-publish canary: pin trust = 1\n"
+        self.assertEqual(stage.index_pins(noise + text, "aarch64-apple-darwin"),
+                         (57, {"trust": 16400, CONTROLLER: 16300}))
+        self.assertEqual(stage.index_pins(text, "x86_64-apple-darwin"), (57, {"trust": 16387, CONTROLLER: 16300}))
+        with self.assertRaisesRegex(stage.Refused, "no signed index"):
+            stage.index_pins(noise, "aarch64-apple-darwin")
+        with self.assertRaisesRegex(stage.Refused, "two channel heads"):
+            stage.index_pins(text + text, "aarch64-apple-darwin")
+
+    def test_lost_index_race_is_read_from_the_publishers_refusal(self):
+        log = self.root / "publish.log"
+        for text, race in (("…DIFFERENT bytes (index.toml) — another publisher took index 58; never clobbered.", True),
+                           ("creating atpkg-index-58 on o/atpkg-index failed — if it exists now (a racing publisher), re-run", True),
+                           ("atpkg-index-58 exists on o/atpkg-index as an orphaned DRAFT with DIFFERENT bytes (index.toml)", False),
+                           ("the packs atpkg-index-58 pins are not all public", False)):
+            log.write_text('{"argv": []}\n' + text + "\n")
+            self.assertEqual(stage.lost_index_race(log), race, text)
+        self.assertFalse(stage.lost_index_race(self.root / "absent.log"))
+        # A refusal names the publisher's own last error line, not a progress line of a verb.
+        log.write_text('{"argv": []}\natpkg-publish status: atpkg-index-57 — signed\natpkg-publish: REFUSED — first\n'
+                       "  - a problem\natpkg-publish: could not run — agh exited 7\n")
+        self.assertEqual(stage.publisher_refusal(log), "could not run — agh exited 7")
+        log.write_text('{"argv": []}\natpkg-publish canary: Trust 12: installed\n')
+        self.assertIsNone(stage.publisher_refusal(log))
 
     def test_github_reads_refs_and_has_no_write_but_one_branch_delete(self):
         calls = []
@@ -3410,16 +4811,18 @@ else:
 
         def launchctl(argv, **_kwargs):
             calls.append(argv)
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            # `print` of a job launchd no longer runs exits 113.
+            return types.SimpleNamespace(returncode=113 if argv[1] == "print" else 0, stdout="", stderr="")
         agent = stage.train_install(args, launchctl)
         domain = f"gui/{os.getuid()}"
         self.assertEqual(agent, agents / "systems.alab.trust-train.plist")
         self.assertEqual(plistlib.loads(agent.read_bytes()), stage.train_plist(args))
         self.assertEqual(plistlib.loads(agent.read_bytes())["StartInterval"], 1800)
         self.assertEqual(calls, [["launchctl", "bootstrap", domain, str(agent)]])
-        # Installed again, the running agent is stopped and replaced.
+        # Installed again, the running agent is stopped and replaced once launchd no longer runs it.
         stage.train_install(args, launchctl)
         self.assertEqual(calls[1:], [["launchctl", "bootout", f"{domain}/systems.alab.trust-train"],
+                                     ["launchctl", "print", f"{domain}/systems.alab.trust-train"],
                                      ["launchctl", "bootstrap", domain, str(agent)]])
         self.assertEqual([path.name for path in agents.iterdir()], [agent.name])
         self.assertEqual(stage.train_remove(args, launchctl), agent)
@@ -3429,6 +4832,95 @@ else:
         with self.assertRaisesRegex(stage.Refused, "launchctl bootstrap exited 5: Bootstrap failed.*not loaded"):
             stage.train_install(args, lambda argv, **_kwargs: types.SimpleNamespace(
                 returncode=5, stdout="", stderr="Bootstrap failed\n"))
+
+    def test_train_install_waits_for_a_stopping_tick_before_it_starts_the_new_agent(self):
+        agents = self.root / "LaunchAgents"
+        args = self.train_arguments("--launch-agents", str(agents))
+        agents.mkdir()
+        (agents / "systems.alab.trust-train.plist").write_bytes(b"old agent")
+        calls, stopping = [], [2]  # launchd still runs the SIGTERMed tick for two more prints
+
+        def launchctl(argv, **_kwargs):
+            calls.append(argv[1])
+            if argv[1] == "print":
+                stopping[0] -= 1
+                return types.SimpleNamespace(returncode=0 if stopping[0] >= 0 else 113, stdout="", stderr="")
+            if argv[1] == "bootstrap" and stopping[0] >= 0:
+                return types.SimpleNamespace(returncode=5, stdout="", stderr="Bootstrap failed: 5")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(stage.time, "sleep") as slept:
+            stage.train_install(args, launchctl)
+        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap"])
+        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(plistlib.loads((agents / "systems.alab.trust-train.plist").read_bytes()), stage.train_plist(args))
+        # A job launchd never stops refuses the install and leaves the old agent's file.
+        (agents / "systems.alab.trust-train.plist").write_bytes(b"old agent")
+        with mock.patch.object(stage, "TRAIN_BOOTOUT_WAIT", 0), \
+                self.assertRaisesRegex(stage.Refused, "still runs systems.alab.trust-train"):
+            stage.train_install(args, lambda argv, **_kwargs: types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        self.assertEqual((agents / "systems.alab.trust-train.plist").read_bytes(), b"old agent")
+
+    def test_a_tick_fast_forwards_its_own_clean_checkout_on_main_and_nothing_else(self):
+        self.gated_trust()
+        before = git(self.repo, "rev-parse", "HEAD")
+        writer = self.root / "writer"
+        subprocess.run(["git", "clone", "-q", str(self.root / "trust.git"), str(writer)], check=True)
+        git(writer, "config", "user.email", "fixture@example.invalid")
+        git(writer, "config", "user.name", "fixture")
+        (writer / "README").write_text("moved on main")
+        git(writer, "commit", "-qam", "main moved")
+        git(writer, "push", "-q", "origin", "main")
+        moved = git(writer, "rev-parse", "HEAD")
+        train = self.train()
+        with mock.patch("builtins.print") as said:
+            # This runner's bytes did not change, so the tick goes on in this process.
+            self.assertFalse(train.advance())
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
+        self.assertNotEqual(moved, before)
+        said.assert_not_called()
+        # A checkout with uncommitted changes, or on another branch, is left as it is.
+        (writer / "README").write_text("moved again")
+        git(writer, "commit", "-qam", "main moved again")
+        git(writer, "push", "-q", "origin", "main")
+        (self.repo / "README").write_text("an edit of the checkout's own")
+        with mock.patch("builtins.print") as said:
+            self.assertFalse(train.advance())
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
+        self.assertIn("uncommitted changes", said.call_args[0][0])
+        git(self.repo, "checkout", "-q", "--", "README")
+        git(self.repo, "checkout", "-q", "-b", "elsewhere")
+        with mock.patch("builtins.print") as said:
+            self.assertFalse(train.advance())
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), moved)
+        self.assertIn("on elsewhere, not main", said.call_args[0][0])
+        git(self.repo, "checkout", "-q", "main")
+        # A local commit main does not contain is never overwritten.
+        (self.repo / "README").write_text("a local commit")
+        git(self.repo, "commit", "-qam", "local")
+        local = git(self.repo, "rev-parse", "HEAD")
+        with mock.patch("builtins.print") as said:
+            self.assertFalse(train.advance())
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), local)
+        self.assertIn("does not fast-forward", said.call_args[0][0])
+
+    def test_a_tick_whose_runner_changed_on_main_runs_the_new_runner_once(self):
+        self.gated_trust()
+        argv = ["/agent/runner.py", "train", "run", "--state-root", str(self.state)]
+        with mock.patch.object(stage.Train, "advance", return_value=True) as advanced, \
+                mock.patch.object(stage.os, "execv", side_effect=SystemExit("exec")) as execv, \
+                mock.patch.object(stage.sys, "argv", argv), mock.patch.dict(os.environ, clear=False), \
+                mock.patch("builtins.print"):
+            os.environ.pop(stage.TRAIN_ADVANCED, None)
+            with self.assertRaisesRegex(SystemExit, "exec"):
+                self.train().tick()
+            execv.assert_called_once_with(sys.executable, [sys.executable, *argv])
+            self.assertEqual(os.environ[stage.TRAIN_ADVANCED], "1")
+            # The new process does not advance again, and a dry run never advances.
+            advanced.reset_mock()
+            self.train("--dry-run").tick()
+            os.environ.pop(stage.TRAIN_ADVANCED)
+            self.train("--dry-run").tick()
+            advanced.assert_not_called()
 
     def test_run_and_status_keep_their_state_root_and_take_no_train_word(self):
         for argv in (["run"], ["status"], ["run", "install", "--state-root", str(self.state)],

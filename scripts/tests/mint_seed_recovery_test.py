@@ -439,6 +439,33 @@ class RecoveryTests(unittest.TestCase):
         self.f.save_provenance()
         self.refuses("closed environment")
 
+    def test_a_runner_argv_without_jobs_or_seed_takes_both_from_what_the_mint_recorded(self):
+        # The daily runner's mint names neither: build-slot admits its job count and the
+        # mint picks its default DDC seed. The receipt and the kept ddc-seed.json name them.
+        p = self.f.evidence / "mint-result.json"
+        row = recovery.document(p)
+        for name in ("--jobs", "--ddc-seed"):
+            index = row["command"].index(name)
+            del row["command"][index:index + 2]
+        write(p, row)
+        r = self.f.inspect()
+        self.assertEqual((r["original_jobs"], r["ddc_seed"]), (12, str(self.f.oracle)))
+        configuration = self.f.provenance["bootstrap_lineage"]["mint_configuration"]
+        del configuration["xpy_config_overrides"]["build.jobs"]
+        self.f.save_provenance()
+        self.refuses(r"neither the original argv \(--jobs\) nor the stage receipt \(build.jobs\) names a job count")
+        configuration["xpy_config_overrides"]["build.jobs"] = 12
+        self.f.save_provenance()
+        ddc = recovery.document(self.f.ddc_dir / "ddc-seed.json")
+        del ddc["sysroot"]
+        for name in ("ddc-seed.json", "ddc-seed-post-build.json"):
+            write(self.f.ddc_dir / name, ddc)
+        observation = recovery.document(self.f.ddc_dir / "observation.json")
+        for item in observation["captured_manifests"]:
+            item["sha256"] = recovery.digest(self.f.ddc_dir / Path(item["file"]).name)
+        write(self.f.ddc_dir / "observation.json", observation)
+        self.refuses(r"neither the original argv \(--ddc-seed\) nor the kept ddc-seed.json \(sysroot\) names a DDC seed")
+
     def test_unexpected_dist_file_and_channel_hash_refuse(self):
         p = put(self.f.build / "dist/extra.tar.xz", "unexpected")
         self.refuses("dist inventory differs")
@@ -634,6 +661,39 @@ class RetainedAuditTests(unittest.TestCase):
         argv = doc["phases"][-1]["argv"]; argv[argv.index("--jobs") + 1] = "18"
         write(self.f.raw_mint, doc); self.f.refresh_capture()
         self.refuses("original jobs differ")
+
+    def test_an_argv_without_jobs_or_seed_is_audited_from_what_the_mint_recorded_but_still_names_its_config(self):
+        # This mode, too, takes a job count and a DDC seed the argv omits from the rejected receipt
+        # and the retained ddc-seed.json. Its --config selector check stays, so it does not admit
+        # a daily runner mint (whose argv names no --config, and which keeps no RETAINED.json
+        # history and nothing for a rejected receipt); docs/DAILY_TOOLCHAIN_STAGING.md says so.
+        doc = recovery.document(self.f.raw_mint)
+        argv = doc["phases"][-1]["argv"]
+        for name in ("--jobs", "--ddc-seed"):
+            index = argv.index(name)
+            del argv[index:index + 2]
+        write(self.f.raw_mint, doc); self.f.refresh_capture()
+        record = self.f.inspect_audit()
+        self.assertEqual((record["original_jobs"], record["ddc_seed"]), (12, str(self.f.oracle)))
+        oracle = recovery.document(self.f.work / "ddc-seed.json")
+        del oracle["sysroot"]
+        for name in ("ddc-seed.json", "ddc-seed-post-build.json"):
+            write(self.f.work / name, oracle)
+        self.f.refresh_capture()
+        self.refuses(r"neither the original argv \(--ddc-seed\) nor the kept ddc-seed.json \(sysroot\) names a DDC seed")
+        oracle["sysroot"] = str(self.f.oracle)
+        for name in ("ddc-seed.json", "ddc-seed-post-build.json"):
+            write(self.f.work / name, oracle)
+        del self.f.provenance["bootstrap_lineage"]["mint_configuration"]["xpy_config_overrides"]["build.jobs"]
+        write(self.f.stage / "tool-provenance.json", self.f.provenance); self.f.refresh_capture()
+        self.refuses(r"neither the original argv \(--jobs\) nor the stage receipt \(build.jobs\) names a job count")
+        self.f.provenance["bootstrap_lineage"]["mint_configuration"]["xpy_config_overrides"]["build.jobs"] = 12
+        write(self.f.stage / "tool-provenance.json", self.f.provenance); self.f.refresh_capture()
+        self.assertEqual(self.f.inspect_audit()["original_jobs"], 12)
+        index = argv.index("--config")
+        del argv[index:index + 2]
+        write(self.f.raw_mint, doc); self.f.refresh_capture()
+        self.refuses("original configuration selector differs")
 
     def test_partial_tail_output_never_restarts_that_tail(self):
         put(self.f.work / "seed-inputs.json", "earlier partial continuation")

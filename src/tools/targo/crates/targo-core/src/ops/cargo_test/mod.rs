@@ -1505,8 +1505,12 @@ fn load_test_execution_authority(
     else {
         return Ok(None);
     };
-    let session = session.to_str().ok_or_else(|| anyhow::anyhow!("verified test session is not Unicode"))?;
-    let digest = manifest_sha256.to_str().ok_or_else(|| anyhow::anyhow!("test authority digest is not Unicode"))?;
+    let session = session
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("verified test session is not Unicode"))?;
+    let digest = manifest_sha256
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("test authority digest is not Unicode"))?;
     load_test_execution_authority_from_inputs(session, Path::new(&manifest_path), digest).map(Some)
 }
 
@@ -1897,7 +1901,10 @@ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) 
         return Ok(());
     }
     if ws.gctx().has_retained_test() && compilation.test_execution.is_none() {
-        return Err(anyhow::anyhow!("retained verified tests did not execute through their original queue").into());
+        return Err(anyhow::anyhow!(
+            "retained verified tests did not execute through their original queue"
+        )
+        .into());
     }
     let mut errors = if let Some(execution) = compilation.test_execution.take() {
         // Trust: each action carries its own arguments.
@@ -2232,8 +2239,14 @@ fn run_unit_tests(
         if let Err(e) = execution_result {
             // An interrupted/unsettled native direct phase cannot dispatch
             // another bench, even after target0 or with no-fail-fast set.
-            let cannot_continue = e.downcast_ref::<cargo_util::TargetExecutionError>().is_some();
-            let code = if cannot_continue { 101 } else { fail_fast_code(&e) };
+            let cannot_continue = e
+                .downcast_ref::<cargo_util::TargetExecutionError>()
+                .is_some();
+            let code = if cannot_continue {
+                101
+            } else {
+                fail_fast_code(&e)
+            };
             let unit_err = UnitTestError {
                 unit: unit.clone(),
                 kind: test_kind,
@@ -2369,7 +2382,7 @@ fn run_doc_tests(
         // Trust: doctest execution runs rustdoc a third time, after the build
         // reported. Bracket it like the compile and merge spawns.
         compilation.ensure_verified_rustdoc_launcher_current()?;
-        let execution = p.exec();
+        let execution = compilation.prepare_doc_test_execution(p)?.exec();
         // Recheck even when rustdoc itself failed: an endpoint replacement is
         // an integrity failure and must not be hidden behind the child status.
         compilation.ensure_verified_rustdoc_launcher_current()?;

@@ -40,7 +40,7 @@ clean {
 
     theorem trust_battery_island_thm : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 
 /// The Rust half. Named distinctively so its presence in the IR dump is

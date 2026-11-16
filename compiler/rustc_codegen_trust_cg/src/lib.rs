@@ -55,6 +55,7 @@ mod trust_ir_emission;
 mod trust_ir_codegen;
 
 // Trust: opt-in retained object-gate diagnostics; no admission authority.
+mod clean_admission;
 mod compiler_input_capture;
 mod object_replay;
 
@@ -803,7 +804,7 @@ impl TrustCgCodegenBackend {
         use trust_cg_bridge::compiled_object::RelocationModel as CerRelocation;
         use trust_cg_bridge::f1_compile::{
             F1CompileConfig, F1CompileInput, F1OptLevel, F1Refusal, F1Target,
-            census_trust_ir_module, compile_and_verify_trust_ir_module,
+            census_trust_ir_module, compile_and_verify_trust_ir_module_with_clean,
         };
         use trust_ir_frontend::codegen_module::{
             self, CodegenModuleInput, CollectorStatic, ExpectedTarget, WorkItem, WorkState,
@@ -920,6 +921,16 @@ impl TrustCgCodegenBackend {
             (Some(star), _) => Arc::clone(star),
             (None, Some(base)) => Arc::clone(base),
             (None, None) => Arc::new(trust_ir::Module::new(crate_name.clone())),
+        };
+        let clean_candidates = match clean_admission::candidates(tcx, &producer) {
+            Ok(ids) => ids,
+            Err(detail) => {
+                census.record(FrontendRefusal::CodegenModule {
+                    symbol: crate_name.clone(),
+                    detail: format!("current-Session Clean admission refused: {detail}"),
+                });
+                BTreeSet::new()
+            }
         };
 
         // Trust: source-only primitive modules use the same identity-preserving native
@@ -1088,11 +1099,27 @@ impl TrustCgCodegenBackend {
             match source_abi::check_foreign_declarations(tcx, &producer) {
                 Ok(checked) => checked,
                 Err(detail) => {
-                    census.record(FrontendRefusal::CodegenModule { symbol: crate_name.clone(), detail });
+                    census.record(FrontendRefusal::CodegenModule {
+                        symbol: crate_name.clone(),
+                        detail,
+                    });
                     BTreeSet::new()
                 }
             }
-        } else { BTreeSet::new() };
+        } else {
+            BTreeSet::new()
+        };
+        let mut clean_placements = BTreeMap::new();
+        for item in &items {
+            clean_placements.insert(item.func, codegen_module::linkage_of(item.linkage));
+        }
+        for (id, identity) in &residue {
+            if matches!(identity, codegen_module::ResidueIdentity::Local { .. }) {
+                clean_placements
+                    .entry(*id)
+                    .or_insert((trust_ir::Linkage::Internal, trust_ir::Visibility::Default));
+            }
+        }
         let mut out = if native_source {
             let conserved =
                 match trust_thir_lower::effect_conservation::conserved_function_ids(sess) {
@@ -1118,7 +1145,9 @@ impl TrustCgCodegenBackend {
                 },
             )
         } else {
-            codegen_module::build(&CodegenModuleInput {
+            let handoff_extensions = plan.handoff_declaration_extensions();
+            let input = CodegenModuleInput {
+                handoff_extensions: handoff_extensions.as_ref(),
                 producer: &producer,
                 base: if star.is_some() { base.as_deref() } else { None },
                 items: &items,
@@ -1126,7 +1155,12 @@ impl TrustCgCodegenBackend {
                 declarations: &declarations,
                 statics: &statics,
                 target: &expected,
-            })
+            };
+            if clean_candidates.is_empty() {
+                codegen_module::build(&input)
+            } else {
+                codegen_module::build_with_clean_candidates(&input, &clean_candidates)
+            }
         };
         // Trust: aggregate classification requires actual source ABI witnesses for
         // this exact image. The source producer remains unclassified for the gate.
@@ -1248,29 +1282,38 @@ impl TrustCgCodegenBackend {
             policy,
             config: &config,
         };
-        let outcome = if let Some(directory) = sess.opts.unstable_opts.trust_dump.ir.as_deref() {
-            let captured = trust_cg_bridge::f1_compile::compile_and_verify_trust_ir_module_captured(
-                &compiler_input,
-            );
-            // Optional retention precedes a possible ordinary Strict refusal.
-            // Its I/O/capacity outcome never grants or changes any admission.
-            match compiler_input_capture::persist(directory, &name, &captured.capture) {
-                Ok(path) => {
-                    let status = match &captured.capture {
-                        Ok(_) => "complete non-authorizing input data".to_string(),
-                        Err(reason) => format!("capture incomplete: {}", reason.reason),
-                    };
-                    sess.dcx().note(format!(
-                        "trust-cg Compiler CER input data: {} ({status}; independent current inputs required for replay)", path.display()));
+        let outcome = clean_admission::with_admissions(
+            tcx,
+            &compiler_input,
+            &clean_placements,
+            |admissions| {
+                if let Some(directory) = sess.opts.unstable_opts.trust_dump.ir.as_deref() {
+                    let captured = trust_cg_bridge::f1_compile::compile_and_verify_trust_ir_module_with_clean_captured(
+                        &compiler_input,
+                        admissions,
+                    );
+                    // Optional retention precedes a possible ordinary Strict refusal.
+                    // Its I/O/capacity outcome never grants or changes any admission.
+                    match compiler_input_capture::persist(directory, &name, &captured.capture) {
+                        Ok(path) => {
+                            let status = match &captured.capture {
+                                Ok(_) => "complete non-authorizing input data".to_string(),
+                                Err(reason) => format!("capture incomplete: {}", reason.reason),
+                            };
+                            sess.dcx().note(format!(
+                                "trust-cg Compiler CER input data: {} ({status}; independent current inputs required for replay)", path.display()));
+                        }
+                        Err(reason) => sess.dcx().note(format!(
+                            "trust-cg Compiler CER input capture incomplete: {reason}"
+                        )),
+                    }
+                    captured.outcome
+                } else {
+                    compile_and_verify_trust_ir_module_with_clean(&compiler_input, admissions)
                 }
-                Err(reason) => sess
-                    .dcx()
-                    .note(format!("trust-cg Compiler CER input capture incomplete: {reason}")),
-            }
-            captured.outcome
-        } else {
-            compile_and_verify_trust_ir_module(&compiler_input)
-        };
+            },
+        )
+        .unwrap_or_else(|detail| Err(F1Refusal::Binding(detail)));
         let shipped = match outcome {
             Ok(shipped) => shipped,
             Err(F1Refusal::Census(rows)) => {

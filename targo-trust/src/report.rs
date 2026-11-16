@@ -1946,13 +1946,14 @@ impl VerificationReport {
 
     /// The terminal report. With a changed-only view
     /// (`crate::agent_delta::DeltaView`) the per-row listing is narrowed, when
-    /// every package of the view had a base, to the listing's own line of
+    /// `DeltaView::replaces_listing` says so, to the listing's own line of
     /// every row it does not label a plain `PROVED` — whatever package the
     /// row belongs to, keyed or not, with its message, location and backend —
     /// followed by the view's lines; otherwise the view follows the whole
     /// listing. So the view never prints less about a row that is not plainly
     /// proved than the listing does. Every other line, the `Summary:` and gate
-    /// lines included, is the same either way.
+    /// lines and an empty run's `No verification obligations found.` included,
+    /// is the same either way.
     fn terminal_lines_with(&self, delta: Option<&crate::agent_delta::DeltaView>) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.results.len() + 8);
         lines.push(String::new());
@@ -1973,6 +1974,11 @@ impl VerificationReport {
 
         match delta {
             Some(delta) if delta.replaces_listing() => {
+                // The empty-listing line is no plainly proved row: an empty
+                // run says so with a base as without one.
+                if self.results.is_empty() {
+                    lines.push("  No verification obligations found.".to_string());
+                }
                 // Not from the records: a row with no stable key, a row of a
                 // package the run did not select and a second row under one
                 // key are in no view row, and the listing's line carries the
@@ -8177,6 +8183,7 @@ mod tests {
                 listing.iter().all(|row| lines.contains(row)),
                 "run {run} keeps every listing row"
             );
+            assert_eq!(view.commit_pointers(), Vec::<String>::new(), "printed: the pointer moves");
         }
     }
 
@@ -8196,6 +8203,7 @@ mod tests {
 
         let first = crate::agent_delta::publish_run(target.path(), &records, &request, Some("me"));
         let lines = report.terminal_lines_with(Some(&first));
+        assert_eq!(first.commit_pointers(), Vec::<String>::new(), "printed: the pointer moves");
         let summary = first.packages[0].summary_line();
         assert_eq!(
             summary,
@@ -8213,6 +8221,7 @@ mod tests {
 
         let rerun = crate::agent_delta::publish_run(target.path(), &records, &request, Some("me"));
         let lines = report.terminal_lines_with(Some(&rerun));
+        assert_eq!(rerun.commit_pointers(), Vec::<String>::new());
         assert!(
             listing.iter().filter(|row| !open.contains(row)).all(|row| !lines.contains(row)),
             "a base drops the plainly proved rows from the listing"
@@ -8311,7 +8320,95 @@ mod tests {
                 lines.iter().any(|line| line.starts_with("  [UNKNOWN] [transport:")),
                 "run {run}: {lines:#?}"
             );
+            assert_eq!(view.commit_pointers(), Vec::<String>::new());
         }
+    }
+
+    /// A run with no rows says so whether or not its view narrows the listing:
+    /// the narrowed listing drops plainly proved rows only, never the empty
+    /// run's line.
+    #[test]
+    fn an_empty_run_says_so_when_its_view_narrows_the_listing() {
+        let (mut report, _) = endian_report();
+        report.results.clear();
+        let records = real_obligation_records(&report);
+        let target = tempfile::tempdir().unwrap();
+        let request = crate::agent_delta::DeltaRequest::default();
+        for run in 0..2 {
+            let view =
+                crate::agent_delta::publish_run(target.path(), &records, &request, Some("tab"));
+            assert_eq!(view.replaces_listing(), run > 0, "run {run}: {view:?}");
+            let lines = report.terminal_lines_with(Some(&view));
+            assert!(
+                lines.iter().any(|line| line == "  No verification obligations found."),
+                "run {run}: {lines:#?}"
+            );
+            assert_eq!(view.commit_pointers(), Vec::<String>::new());
+        }
+    }
+
+    /// A crate-mode check moves the caller's pointer only once its report
+    /// printed the view (`pipeline::run::render_report_for_run`). A run whose
+    /// report is not printed (its report artifacts cannot be written, or it
+    /// has no valid publication seal) leaves the base at the last token the
+    /// caller was shown, so the next run still shows what changed since then.
+    #[test]
+    fn a_run_whose_report_is_not_printed_leaves_the_callers_base_where_it_was() {
+        use crate::pipeline::run::{ReportRendering, render_report_for_run};
+        let (mut report, records) = endian_report();
+        report.seal_publication_state().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let request = crate::agent_delta::DeltaRequest::default();
+        let render = |report: &VerificationReport,
+                      view: &crate::agent_delta::DeltaView,
+                      report_dir: Option<&str>| {
+            render_report_for_run(
+                report,
+                ReportRendering::Stdout,
+                OutputFormat::Terminal,
+                report_dir,
+                None,
+                false,
+                CompilerResourceReports::default(),
+                Some(view),
+                &mut None,
+            )
+        };
+        let first = crate::agent_delta::publish_run(target.path(), &records, &request, Some("me"));
+        render(&report, &first, None).expect("the report and its view are printed");
+        let shown = first.packages[0].now.clone().unwrap();
+
+        // One row refuted since.
+        let mut edited = report.clone();
+        edited.results[0].outcome = VerificationOutcome::Failed;
+        let edited_records = real_obligation_records(&edited);
+        let blocked = target.path().join("blocked");
+        fs::write(&blocked, b"a file where the report directory goes").unwrap();
+        for (why, report, report_dir) in [
+            ("report artifacts not written", &report, blocked.to_str()),
+            ("no valid publication seal", &edited, None),
+        ] {
+            let view = crate::agent_delta::publish_run(
+                target.path(),
+                &edited_records,
+                &request,
+                Some("me"),
+            );
+            assert_eq!(
+                view.packages[0].since.as_ref().map(|(base, _)| base),
+                Some(&shown),
+                "{why}"
+            );
+            assert_ne!(view.packages[0].now.as_ref(), Some(&shown), "{why}: a new token");
+            assert!(render(report, &view, report_dir).is_err(), "{why}: nothing printed");
+        }
+
+        // The base is still the token the caller saw, so the refuted row is
+        // still a change.
+        let next =
+            crate::agent_delta::publish_run(target.path(), &edited_records, &request, Some("me"));
+        assert_eq!(next.packages[0].since.as_ref().map(|(base, _)| base), Some(&shown));
+        assert!(next.lines().iter().any(|line| line.starts_with("NEW FAILED  ")), "{next:#?}");
     }
 
     #[test]

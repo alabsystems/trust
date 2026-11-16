@@ -5049,6 +5049,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "trust-cg-bridge",
+ "trust-clean-ir-gate",
  "trust-ir",
  "trust-ir-bridge",
  "trust-ir-build",
@@ -6996,7 +6997,7 @@ dependencies = [
 
 [[package]]
 name = "targo-trust"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "build_helper",
@@ -7019,6 +7020,7 @@ dependencies = [
  "trust-binary-parse",
  "trust-bmc",
  "trust-certify",
+ "trust-cg-bridge",
  "trust-clean",
  "trust-clean-ir",
  "trust-clean-ir-gate",
@@ -7284,7 +7286,7 @@ dependencies = [
 
 [[package]]
 name = "tla-lock"
-version = "1.20261110.1"
+version = "1.20261116.1"
 dependencies = [
  "tla-lock-api",
  "tla-lock-core",
@@ -7292,14 +7294,14 @@ dependencies = [
 
 [[package]]
 name = "tla-lock-api"
-version = "1.20261110.1"
+version = "1.20261116.1"
 dependencies = [
  "scopeguard",
 ]
 
 [[package]]
 name = "tla-lock-core"
-version = "1.20261110.1"
+version = "1.20261116.1"
 dependencies = [
  "cfg-if",
  "libc",
@@ -7310,7 +7312,7 @@ dependencies = [
 
 [[package]]
 name = "tla-mc-core"
-version = "1.20261110.1"
+version = "1.20261116.1"
 dependencies = [
  "crossbeam",
  "rustc-hash 2.1.2",
@@ -7322,7 +7324,7 @@ dependencies = [
 
 [[package]]
 name = "tla-smallvec"
-version = "1.20261110.1"
+version = "1.20261116.1"
 
 [[package]]
 name = "tokio"
@@ -7556,11 +7558,11 @@ dependencies = [
 
 [[package]]
 name = "trust-align"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-backprop"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7578,7 +7580,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bignum"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "rustc-std-workspace-alloc 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -7587,7 +7589,7 @@ dependencies = [
 
 [[package]]
 name = "trust-binary-parse"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "thiserror 2.0.17",
  "trust-types",
@@ -7595,18 +7597,18 @@ dependencies = [
 
 [[package]]
 name = "trust-bitfield"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-bits",
 ]
 
 [[package]]
 name = "trust-bits"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-bmc"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -7629,7 +7631,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bridge-closure"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "clean-olean",
@@ -7640,11 +7642,11 @@ dependencies = [
 
 [[package]]
 name = "trust-budget"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-build-cpu"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "jobserver",
@@ -7675,7 +7677,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cache"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "fs2",
  "tempfile",
@@ -7686,14 +7688,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cert-meter"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
 ]
 
 [[package]]
 name = "trust-certify"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7730,7 +7732,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-bridge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ar_archive_writer",
  "ay",
@@ -7744,10 +7746,14 @@ dependencies = [
  "stacker",
  "tempfile",
  "thiserror 2.0.17",
+ "trust-certify",
  "trust-cg-codegen",
  "trust-cg-ir",
  "trust-cg-lower",
  "trust-cg-opt",
+ "trust-clean-ir",
+ "trust-clean-ir-gate",
+ "trust-clean-origin",
  "trust-disasm",
  "trust-ir",
  "trust-ir-bridge",
@@ -7761,7 +7767,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "libc",
  "rayon",
@@ -7783,21 +7789,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7805,7 +7811,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-irmid"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde_json",
  "trust-cg-ir",
@@ -7816,7 +7822,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "thiserror 2.0.17",
@@ -7827,7 +7833,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7839,7 +7845,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "libc",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -7847,7 +7853,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "thiserror 2.0.17",
  "trust-cg-ir",
@@ -7855,7 +7861,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "clean-kernel",
  "clean-olean",
@@ -7877,11 +7883,11 @@ dependencies = [
 
 [[package]]
 name = "trust-checksum"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-clean"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ay",
  "bincode 1.3.3",
@@ -7906,7 +7912,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-carrier"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "trust-symbols",
@@ -7915,9 +7921,10 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
+ "serde_json",
  "trust-certify",
  "trust-clean-carrier",
  "trust-clean-origin",
@@ -7928,7 +7935,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir-gate"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "trust-certify",
@@ -7936,13 +7943,14 @@ dependencies = [
  "trust-clean-ir",
  "trust-clean-origin",
  "trust-ir",
+ "trust-ir-build",
  "trust-spec-elab",
  "trust-types",
 ]
 
 [[package]]
 name = "trust-clean-origin"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7958,7 +7966,7 @@ dependencies = [
 
 [[package]]
 name = "trust-convergence"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7970,7 +7978,7 @@ dependencies = [
 
 [[package]]
 name = "trust-coordinator"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "serde",
@@ -7984,7 +7992,7 @@ dependencies = [
 
 [[package]]
 name = "trust-decompile"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8001,14 +8009,14 @@ dependencies = [
 
 [[package]]
 name = "trust-disasm"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "trust-ed25519"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "trust-sha2",
@@ -8016,7 +8024,7 @@ dependencies = [
 
 [[package]]
 name = "trust-endian"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-exec-policy"
@@ -8034,7 +8042,7 @@ dependencies = [
 
 [[package]]
 name = "trust-file-lock"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "thiserror 2.0.17",
@@ -8042,11 +8050,11 @@ dependencies = [
 
 [[package]]
 name = "trust-fixed"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-floatbits"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-fs-acl"
@@ -8057,7 +8065,7 @@ dependencies = [
 
 [[package]]
 name = "trust-fs-observation"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -8071,19 +8079,19 @@ dependencies = [
 
 [[package]]
 name = "trust-hex"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-index"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-intbound"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-integration-tests"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "jobserver_utils",
  "serde_json",
@@ -8107,11 +8115,11 @@ dependencies = [
 
 [[package]]
 name = "trust-interval"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-ir"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -8122,7 +8130,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-bridge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8139,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -8150,7 +8158,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-conformance"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-ir",
  "trust-ir-build",
@@ -8158,29 +8166,30 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-ir-laws"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-json"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8188,7 +8197,7 @@ dependencies = [
 
 [[package]]
 name = "trust-lift"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ay",
  "serde_json",
@@ -8201,7 +8210,7 @@ dependencies = [
 
 [[package]]
 name = "trust-loop"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "thiserror 2.0.17",
  "trust-convergence",
@@ -8210,7 +8219,7 @@ dependencies = [
 
 [[package]]
 name = "trust-luminal-rows"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde_json",
  "trust-ir",
@@ -8219,7 +8228,7 @@ dependencies = [
 
 [[package]]
 name = "trust-machine-sem"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "thiserror 2.0.17",
  "trust-disasm",
@@ -8275,7 +8284,7 @@ dependencies = [
 
 [[package]]
 name = "trust-mir-extract"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "clean-verify",
@@ -8306,18 +8315,18 @@ dependencies = [
 
 [[package]]
 name = "trust-model-prelude"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-sha2",
 ]
 
 [[package]]
 name = "trust-modular"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-odt"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8328,7 +8337,7 @@ dependencies = [
 
 [[package]]
 name = "trust-os"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -8337,14 +8346,14 @@ dependencies = [
 
 [[package]]
 name = "trust-platform"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "trust-platform-census"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde_json",
  "trust-ir",
@@ -8357,7 +8366,7 @@ dependencies = [
 
 [[package]]
 name = "trust-platform-derive"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rayon",
  "serde_json",
@@ -8383,7 +8392,7 @@ version = "0.1.0"
 
 [[package]]
 name = "trust-proof-cert"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "bincode 1.3.3",
  "proptest",
@@ -8400,7 +8409,7 @@ dependencies = [
 
 [[package]]
 name = "trust-proof-session"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "getrandom 0.4.3",
  "nix 0.31.3",
@@ -8427,11 +8436,11 @@ dependencies = [
 
 [[package]]
 name = "trust-radix64"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-rand"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -8439,18 +8448,18 @@ dependencies = [
 
 [[package]]
 name = "trust-ratio"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-release"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "trust-report"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8483,18 +8492,20 @@ dependencies = [
 
 [[package]]
 name = "trust-router"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ay",
  "ay-bindings",
  "ay-core",
  "clean-auto",
  "clean-kernel",
+ "clean-olean",
  "libc",
  "num-bigint",
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.17",
  "tla-mc-core",
  "tracing",
@@ -8526,7 +8537,7 @@ dependencies = [
 
 [[package]]
 name = "trust-semantics"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-kernel",
  "trust-types",
@@ -8534,14 +8545,14 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "trust-source-contract"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8556,11 +8567,11 @@ dependencies = [
 
 [[package]]
 name = "trust-spec"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-spec-elab"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-auto",
  "clean-kernel",
@@ -8583,7 +8594,7 @@ dependencies = [
 
 [[package]]
 name = "trust-strengthen"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8595,14 +8606,14 @@ dependencies = [
 
 [[package]]
 name = "trust-symbols"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "trust-types",
 ]
 
 [[package]]
 name = "trust-symex"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8614,7 +8625,7 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "tla-mc-core",
  "trust-types",
@@ -8622,11 +8633,11 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal-prelude"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-test-execution"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "getrandom 0.4.3",
  "libc",
@@ -8636,7 +8647,7 @@ dependencies = [
 
 [[package]]
 name = "trust-thir-lower"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rustc_abi",
  "rustc_ast",
@@ -8669,11 +8680,11 @@ dependencies = [
 
 [[package]]
 name = "trust-timearith"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-toml"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -8681,7 +8692,7 @@ dependencies = [
 
 [[package]]
 name = "trust-transval"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "proptest",
  "serde",
@@ -8693,7 +8704,7 @@ dependencies = [
 
 [[package]]
 name = "trust-types"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "ay-bindings",
  "bincode 1.3.3",
@@ -8710,11 +8721,12 @@ dependencies = [
  "trust-ir-contract",
  "trust-sha2",
  "trust-wp-core",
+ "trust-wp-lib",
 ]
 
 [[package]]
 name = "trust-upstream-compat"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "libc",
  "serde",
@@ -8726,19 +8738,19 @@ dependencies = [
 
 [[package]]
 name = "trust-utf"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-varint"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-vc-bitvector"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "trust-vc-bridge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8752,7 +8764,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -8776,7 +8788,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-kernel"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8786,7 +8798,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-merge-contract"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rustdoc-types",
  "serde",
@@ -8796,7 +8808,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-trust-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8810,7 +8822,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vcgen"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "proptest",
  "serde",
@@ -8828,7 +8840,7 @@ dependencies = [
 
 [[package]]
 name = "trust-verifier-api"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -8840,7 +8852,7 @@ dependencies = [
 
 [[package]]
 name = "trust-version"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8849,7 +8861,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wasm-bridge"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clean-compiler",
  "clean-kernel",
@@ -8864,11 +8876,11 @@ dependencies = [
 
 [[package]]
 name = "trust-widthconv"
-version = "0.14.0"
+version = "0.15.0"
 
 [[package]]
 name = "trust-witness"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "rustc_abi",
  "rustc_ast",
@@ -8892,7 +8904,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8907,7 +8919,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-ay"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -8926,18 +8938,19 @@ dependencies = [
 
 [[package]]
 name = "trust-wp-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
  "sha2 0.10.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.17",
+ "trust-ir-contract",
 ]
 
 [[package]]
 name = "trust-wp-lib"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",

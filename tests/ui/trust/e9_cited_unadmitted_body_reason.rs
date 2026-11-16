@@ -34,10 +34,10 @@
 clean {
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
     theorem u32_le_refl : forall (x : UInt32),
         Nat.le (UInt32.toNat x) (UInt32.toNat x) :=
-        fun x => Nat.le.refl (UInt32.toNat x)
+        fun x => @Nat.le.refl (UInt32.toNat x)
 }
 
 // A let-chained xor body: pure and total, but not a kernel-importable shape.

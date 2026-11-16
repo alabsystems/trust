@@ -301,9 +301,28 @@ fn compiler_command() -> Command {
     Command::new(selected_compiler.unwrap_or_else(|| "rustc".into()))
 }
 
+// Trust: a proc macro runs too late for raw descriptor import. Recover only
+// the authenticated original scheduler, retaining it through the probe wait.
+fn compiler_output(argument: &str) -> std::io::Result<std::process::Output> {
+    let mut command = compiler_command();
+    command.arg(argument);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let scheduler = jobserver_utils::Jobserver::from_authenticated_env_handoff()?
+        .map(|scheduler| scheduler.for_descendant())
+        .transpose()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(scheduler) = &scheduler {
+        scheduler.configure_make(&mut command);
+    }
+    command.output()
+}
+
 static VERSION: std::sync::LazyLock<(u32, bool)> = LazyLock::new(|| {
+    // The pinned build seed recognizes this exact bounded metadata query
+    // before requiring compiler-work custody. Its older -V path does not.
+    // Parse only the version token; additional verbose metadata is not input.
     let output = compiler_command()
-        .arg("-V")
+        .arg("-vV")
         .output()
         .expect("rustc should run");
 
@@ -314,7 +333,7 @@ static VERSION: std::sync::LazyLock<(u32, bool)> = LazyLock::new(|| {
         let stderr = std::str::from_utf8(&output.stderr).unwrap_or("<invalid utf8>");
         // On Windows, exit code `0xC0000017` is not very well documented but appears to
         // usually happen when a command length exceeds the windows limit.
-        // Since we are just running `rustc -V` it likely that the PATH got too long.
+        // Since we are just running `rustc -vV` it likely that the PATH got too long.
         // This can happen when Cargo's tests are executed from rustc bootstrap.
         let extra = if exit_code.map(|c| c as u32) == Some(0xC0000017) {
             "This likely indicates that PATH is too large for Windows.\n"
@@ -322,7 +341,7 @@ static VERSION: std::sync::LazyLock<(u32, bool)> = LazyLock::new(|| {
             ""
         };
         panic!(
-            "'rustc -V' exited with non-zero exit code: {exit_code:?}\n{extra}stdout: {stdout}\nstderr: {stderr}",
+            "'rustc -vV' exited with non-zero exit code: {exit_code:?}\n{extra}stdout: {stdout}\nstderr: {stderr}",
         );
     }
 
@@ -350,10 +369,7 @@ fn version() -> (u32, bool) {
 
 fn host_supports_split_debuginfo(split_debuginfo: &str) -> bool {
     static SPLIT_DEBUGINFO: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let output = compiler_command()
-            .arg("--print=split-debuginfo")
-            .output()
-            .expect("rustc should run");
+        let output = compiler_output("--print=split-debuginfo").expect("rustc should run");
 
         let exit_code = output.status.code();
         if exit_code != Some(0) {
@@ -477,6 +493,54 @@ fn requires_external_tools() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_uses_the_seed_supported_verbose_query() {
+        use std::os::unix::fs::PermissionsExt;
+        const ACTOR: &str = "TRUST_TEST_MACRO_VERBOSE_VERSION_ACTOR";
+        if std::env::var_os(ACTOR).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            assert_eq!(version().0, 101);
+            return;
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "targo-macro-version-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        struct Remove(std::path::PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(directory.clone());
+        let compiler = directory.join("selected-compiler");
+        // A protocol fixture, not a compiler or resource authority: reject the
+        // old spelling and extra arguments, then return real-shaped verbose data.
+        std::fs::write(&compiler, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = -vV ] || exit 73\nprintf 'rustc 1.101.0-dev (fixture)\\nbinary: rustc\\nhost: fixture-host\\n'\n").unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "tests::version_probe_uses_the_seed_supported_verbose_query",
+            ])
+            .env(ACTOR, "1")
+            .env("RUSTC", compiler)
+            .env("PATH", directory.join("no-path-compiler"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn selected_compiler_probes_do_not_require_path_rustc() {
         const ACTOR: &str = "TRUST_TEST_MACRO_COMPILER_ACTOR";
@@ -490,7 +554,8 @@ mod tests {
         let compiler =
             std::env::var_os("RUSTC").expect("test requires its actual selected compiler");
         let executable = std::env::current_exe().unwrap();
-        let output = Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .args([
                 "--exact",
                 "tests::selected_compiler_probes_do_not_require_path_rustc",
@@ -498,9 +563,44 @@ mod tests {
             ])
             .env(ACTOR, "1")
             .env("RUSTC", compiler)
-            .env("PATH", executable.join("no-path-compiler"))
-            .output()
-            .unwrap();
+            .env("PATH", executable.join("no-path-compiler"));
+        // Trust: this synchronous fixture lends its own execution, with zero
+        // additional GNU tokens. An inherited advertisement must authenticate;
+        // it may never be replaced by this standalone fixture's transport.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let scheduler = {
+            use jobserver_utils::Jobserver;
+            let original = if let Some(scheduler) =
+                Jobserver::from_authenticated_env_handoff().unwrap()
+            {
+                scheduler
+            } else {
+                for variable in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
+                    assert!(
+                        !std::env::var_os(variable)
+                            .is_some_and(|flags| flags.to_string_lossy().contains("--jobserver-")),
+                        "inherited GNU transport has no authenticated handoff"
+                    );
+                }
+                Jobserver::new(0).unwrap()
+            };
+            original.for_descendant().unwrap()
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Model the unaware spawn that drops descriptors but retains the
+            // authenticated ancestor advertisement. Do not install inheritance.
+            let mut configured = Command::new(&executable);
+            scheduler.configure_make(&mut configured);
+            for (key, value) in configured.get_envs() {
+                if let Some(value) = value {
+                    command.env(key, value);
+                } else {
+                    command.env_remove(key);
+                }
+            }
+        }
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "compiler probe actor failed: {}\n{}",

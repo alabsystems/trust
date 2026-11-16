@@ -18,11 +18,17 @@
 //!
 //! None of these may read `failed`; each is Unknown (a coverage gap, not a
 //! counterexample) until the lanes behind it model the missing definition, except
-//! `alias_match_guard`, which proves since VS-1 (see its note). `no_alias` is the
-//! control that proves.
+//! `alias_match_guard`, which proves since VS-1, and `mm_ok`, whose clause row the body-aware
+//! WP lane proves (see their notes). `no_alias` is the control that proves.
 
+// RE-PIN 2026-11-15: 0 proved / 2 unknown -> 1 proved / 1 unknown. The clause is TRUE. The
+// 2026-11-14 trust-wp pins decide unsigned Select on the body path, so the body-aware WP lane
+// proves the source clause row; the typed-CHC row is still Unknown (its refutation of the
+// encoding is demoted, which is what this file pins). Measured on a stage 1 of main
+// 3f5d1e29d27 and of the landing tree. The same body with a FALSE clause does not prove:
+// `result >= 2` and `result == hot` are refuted and `result <= 4` is Unknown.
 pub fn mm_ok(hot: usize) -> usize
-//~^ NOTE Trust verification: 0 proved, 0 failed, 2 unknown
+//~^ NOTE Trust verification: 1 proved, 0 failed, 1 unknown
     ensures result >= 1
 {
     let h = hot.max(1);

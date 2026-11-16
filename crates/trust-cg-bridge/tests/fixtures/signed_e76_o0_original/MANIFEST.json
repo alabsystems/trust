@@ -1,0 +1,29 @@
+{
+  "scope": "Unmodified actual e76 compiler CER input DATA, generated through explicitly unverified Targo rustc with strict codegen output gate. Not source-extraction, verified-lane, SDK, release or compiler-admission authority. Old b8 fixtures remain immutable and are separately rejected as noncanonical under the current Module codec.",
+  "compiler_source": "e76b0c5c39485a498b4d01e55bd2d1126e7bedb0",
+  "source_verification": "off; explicitly unverified fixture-generation lane, 0 source obligations checked",
+  "codegen_output_gate": "strict; actual producer report8closed-[PROVED], not source verification or new replay authority",
+  "subjects": [
+    "trust_c_i8_id",
+    "trust_c_i8_not",
+    "trust_c_i8_tail",
+    "trust_c_i16_id",
+    "trust_c_i16_not",
+    "trust_c_i16_tail",
+    "trust_c_i8_store",
+    "trust_c_i16_store"
+  ],
+  "profile": {
+    "opt_level": 0,
+    "debug_info": 0,
+    "split_debug_info": "off",
+    "incremental": false,
+    "overflow_checks": true
+  },
+  "capture_record": "<home>/trust-lean-f1-evidence/fresh-main-composition/e76-fixed-profile-signed-input-data/RESULT.json",
+  "files": {
+    "subject.rs": "5a38892e9ce3a7ab89013595096ba861ddf441bea84cd1d92956c48cab748db0",
+    "compiler-input.json": "f8f368beb5df7b2668b1c5f7b1d2ee0b479215e23ef83786d1de630fd8b5180c",
+    "compiler-output.o": "4b3e3bbae12f178bbef99ebc75de82c5f249b66109591cb93e2c5d41c3d4b918"
+  }
+}

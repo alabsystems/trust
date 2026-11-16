@@ -69,7 +69,8 @@ pub struct TrustIrCrateHeader {
     pub entry_schema: u32,
     /// Definitions that carry an entry.
     pub encoded: u32,
-    /// Definitions rustc encodes `optimized_mir` for that carry none, sorted by `def_index`.
+    /// Retained producer definitions and the legacy optimized-MIR inventory
+    /// that carry no entry, sorted by `def_index`.
     pub unencoded: Vec<TrustIrUnencoded>,
     /// A reason that applies to the WHOLE crate (no entry was attempted although the producer
     /// ran), as `<class>(<why>)`: `incremental(..)` (the producer's per-body records do not

@@ -951,21 +951,50 @@ impl FullVerificationEngine {
                     // attempt: eligibility already refuses a `None` fallback,
                     // and a `None` primary (unreachable for a routed batch
                     // item) fails closed the same way instead of panicking.
-                    let eligible = match (primary_engine, fallback_engine) {
-                        (Some(primary_engine), Some(_)) => {
-                            fallback_eligibility(
-                                finished.accepted,
-                                finished.evidence.status,
-                                finished.evidence.decline,
-                                definitive,
-                                Some(fallback),
-                                primary_engine,
-                                fallback_engine,
-                                budget_exceeded,
-                            ) == FallbackEligibility::Eligible
-                        }
-                        _ => false,
-                    };
+                    let eligibility =
+                        |budget_exceeded: bool| match (primary_engine, fallback_engine) {
+                            (Some(primary_engine), Some(_)) => {
+                                fallback_eligibility(
+                                    finished.accepted,
+                                    finished.evidence.status,
+                                    finished.evidence.decline,
+                                    definitive,
+                                    Some(fallback),
+                                    primary_engine,
+                                    fallback_engine,
+                                    budget_exceeded,
+                                ) == FallbackEligibility::Eligible
+                            }
+                            _ => false,
+                        };
+                    let eligible = eligibility(budget_exceeded);
+                    // Trust (HARDENED-PROFILE-UNMEASURED-1, 2026-11-13): a fallback the
+                    // clock alone refused (every other rule admits it) leaves the row
+                    // undecided because of that clock, so the row is published as that
+                    // stop, as `fallback_stop_evidence` publishes a fallback the clock
+                    // ends while it runs. Kept as the primary's undecided row, which
+                    // names no clock, the same obligation read as a reproducible stop on
+                    // a loaded host and could be proved by the fallback on an idle one.
+                    if budget_exceeded
+                        && !eligible
+                        && eligibility(false)
+                        && let Some(stop) = self.fallback_stop_evidence(&item.obligation, context)
+                    {
+                        let original = finished.evidence;
+                        let why = if stop.status == EvidenceStatus::Canceled {
+                            "the run was cancelled"
+                        } else {
+                            "the verification clock had run out"
+                        };
+                        finished = FinishedPrimaryEvidence { evidence: stop, accepted: false };
+                        finished.evidence.diagnostics.push(format!(
+                            "deductive fallback not attempted: {why} after {} from {}; primary \
+                             diagnostics: {}",
+                            status_label(original.status),
+                            item.route.primary.name(),
+                            original.diagnostics.join("; "),
+                        ));
+                    }
                     if let (true, Some(fallback_engine)) = (eligible, fallback_engine) {
                         let alternative_started = Instant::now();
                         let alternative = self.execute_engine_batch(

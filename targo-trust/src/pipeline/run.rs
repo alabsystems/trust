@@ -2985,6 +2985,9 @@ struct TestExecutionAuthority {
     target_directory: String,
     executables: Vec<CertifiedTestExecutableReport>,
     inventory_sha256: String,
+    /// The native prepared plan this authority binds: where each harness's
+    /// per-case results go (`crate::test_results`).
+    plan: Option<trust_test_execution::PreparedTests>,
 }
 
 fn exact_test_executable_identity(path: &Path) -> Result<(PathBuf, String, u64), String> {
@@ -3232,6 +3235,7 @@ fn write_test_execution_authority(
     file.write_all(&serialized)
         .map_err(|error| format!("cannot write private test execution authority: {error}"))?;
     file.sync_all().map_err(|error| format!("cannot persist test execution authority: {error}"))?;
+    let plan = manifest.prepared.clone();
     let executables = manifest
         .executables
         .into_iter()
@@ -3247,6 +3251,7 @@ fn write_test_execution_authority(
         target_directory: manifest.target_directory,
         executables,
         inventory_sha256,
+        plan,
     })
 }
 
@@ -5138,6 +5143,8 @@ fn run_compiler_with_export(
     // Disclosure for the records and the changed-only view only
     // (`crate::obligations`): the compile errors Cargo reported.
     let mut compile_errors = Vec::new();
+    // Disclosure only, likewise: the island rows each unit published.
+    let mut clean_island_rows = BTreeMap::new();
     let mut cargo_proof_inventory = None;
     // Successful-child transport defects are setup/evidence failures, but
     // they must still flow through the canonical failed-report path. Returning
@@ -5223,6 +5230,7 @@ fn run_compiler_with_export(
         test_executables = evidence.test_executables;
         prepared_tests = evidence.prepared_tests;
         compile_errors = evidence.compile_errors;
+        clean_island_rows = evidence.clean_island_rows;
         if let Err(error) = compile_completion.require_receipt(prepared_tests.as_ref()) {
             cargo_evidence_integrity_errors.push(error);
         }
@@ -5755,6 +5763,10 @@ fn run_compiler_with_export(
     // process's CDHash before resume. Unsupported platforms and missing or
     // invalid retained companions fail closed. There is no second execution
     // process or unauthenticated pathname fallback.
+    // The plan native Targo was granted, once a harness started: where each
+    // harness's per-case results are (`crate::test_results`).
+    let mut executed_test_plan: Option<trust_test_execution::PreparedTests> = None;
+    let test_execution_refused = post_phase_a_orchestration_error.is_some();
     if cargo_test_mode && !cargo_test_compile_only && post_phase_a_orchestration_error.is_none() {
         if qualified_test_execution.is_none() {
             let blocker = format!(
@@ -5788,6 +5800,7 @@ fn run_compiler_with_export(
                 execution.target_directory = Some(execution_target_directory.display().to_string());
             }
             let mut phase_b_started = false;
+            let mut granted_plan: Option<trust_test_execution::PreparedTests> = None;
             // A daemon that cannot be established for this phase is the same
             // COULD NOT RUN (3) as at phase A, never flattened into a setup
             // error (2); every other refusal here is a setup error.
@@ -5830,6 +5843,9 @@ fn run_compiler_with_export(
                     );
                     phase_b_started = process.execution_started();
                     if phase_b_started {
+                        granted_plan = execution_authority.plan.clone();
+                    }
+                    if phase_b_started {
                         if let Some(execution) = report.test_execution.as_mut() {
                             execution.phase_b_state = CertifiedTestExecutionPhaseState::Started;
                         }
@@ -5837,6 +5853,7 @@ fn run_compiler_with_export(
                     outcome
                 },
             );
+            executed_test_plan = granted_plan;
             match phase_b {
                 Ok(observed_status) => {
                     execution_status = Some(observed_status);
@@ -5996,25 +6013,96 @@ fn run_compiler_with_export(
                 compile_errors: &compile_errors,
             },
         )
+        // PKG-LIVE-2: the island rows each unit published, by its package,
+        // and the package of every proof unit the run declared, so a unit that
+        // published none is told apart from one with no island. Disclosure for
+        // the records and the changed-only view: the facts, vector, coverage
+        // and every count above are computed without them.
+        .with_clean_islands(
+            cargo_proof_inventory
+                .as_ref()
+                .map(|inventory| {
+                    inventory
+                        .proof_targets
+                        .iter()
+                        .map(|target| target.package_name.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .as_deref(),
+            clean_island_rows.iter().map(|(target, rows)| (target.package_name.as_str(), rows)),
+        )
+    };
+    // Live-edit-loop step 2: a test run that executed (or was refused before
+    // executing) its harnesses carries each case's outcome as its harness
+    // reported it (`crate::test_results`). Disclosure only: the verdict, the
+    // gate and the exit status above never read it.
+    let obligation_records = if cargo_test_mode && !cargo_test_compile_only {
+        let harnesses: Vec<crate::test_results::AuthorizedHarness> = test_executables
+            .iter()
+            .map(|executable| crate::test_results::AuthorizedHarness {
+                package: executable.target.package_name.clone(),
+                key: crate::test_results::harness_key(
+                    &executable.target.target_kinds,
+                    &executable.target.target_name,
+                ),
+                executable: executable
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| executable.path.clone())
+                    .display()
+                    .to_string(),
+            })
+            .collect();
+        let execution = match &executed_test_plan {
+            Some(plan) => {
+                crate::test_results::Execution::Ran { session: &verification_session.id, plan }
+            }
+            None if test_execution_refused => crate::test_results::Execution::NotRun(
+                "test execution could not be set up after compilation".to_string(),
+            ),
+            None if qualified_test_execution.is_none() => crate::test_results::Execution::NotRun(
+                "the frontend proof gate did not pass".to_string(),
+            ),
+            None => crate::test_results::Execution::NotRun(
+                "execution was refused before any harness started".to_string(),
+            ),
+        };
+        // What chose the cases: the executed plan's harness arguments, or,
+        // when no harness ran, the arguments the caller gave after `--`.
+        let arguments = match &executed_test_plan {
+            Some(plan) => crate::test_results::harness_arguments(plan),
+            None => args.iter().skip_while(|arg| *arg != "--").skip(1).cloned().collect(),
+        };
+        obligation_records
+            .with_tests(crate::test_results::collect(&harnesses, execution), arguments)
+    } else {
+        obligation_records
     };
     let mut delta_view: Option<crate::agent_delta::DeltaView> = None;
-    if crate_mode && args.first().is_some_and(|arg| arg == "check") {
+    let check_run = args.first().is_some_and(|arg| arg == "check");
+    if crate_mode && (check_run || obligation_records.tests.is_some()) {
         let target_dir = cargo_target_dir(
             args,
             cargo_selection.as_ref().map(|selection| selection.target_directory.as_path()),
         );
         // Observational artifacts: a write failure is reported, never a
-        // verdict and never an exit status.
-        if let Err(error) = obligation_records.write_records(&target_dir) {
-            eprintln!(
-                "targo trust: warning: could not write the obligation and package records under \
-                 `{}`: {error}",
-                target_dir.join("trust").display()
-            );
+        // verdict and never an exit status. A test run writes none: the files
+        // under `trust/obligations` are a check's, and a test run's record
+        // lives in its snapshot (`crate::agent_delta`).
+        if check_run {
+            if let Err(error) = obligation_records.write_records(&target_dir) {
+                eprintln!(
+                    "targo trust: warning: could not write the obligation and package records \
+                     under `{}`: {error}",
+                    target_dir.join("trust").display()
+                );
+            }
         }
         // Live-edit-loop step 2: snapshot each selected package's record (the
-        // same bytes just written) and compare it with the caller's base.
-        // Observational, like the records: no verdict or exit reads it.
+        // same bytes just written) and compare it with the caller's base; the
+        // caller's pointer moves only once the report printed the view
+        // (`render_report_for_run`). Observational, like the records: no
+        // verdict or exit reads it.
         if let Some(request) = agent_delta {
             delta_view = Some(crate::agent_delta::publish_run(
                 &target_dir,
@@ -6205,6 +6293,15 @@ pub(crate) fn render_report_for_run(
             );
         }
         _ => {}
+    }
+    // The renderer returns `Ok` only after it printed the view (in every
+    // format), so only now does the caller's pointer move to the token it
+    // names (`crate::agent_delta`): a run whose report fails to render leaves
+    // the caller's base where it was.
+    if let (Ok(_), Some(view)) = (&result, delta) {
+        for note in view.commit_pointers() {
+            eprintln!("note: {note}");
+        }
     }
     result
 }
@@ -8083,6 +8180,7 @@ mod selection_and_control_tests {
                 cwd: target.path().to_str().unwrap().into(),
                 args: Vec::new(),
                 env: Default::default(),
+                results: None,
             }],
         };
         let plan_path = session.artifact_root().join("prepared-tests.json");

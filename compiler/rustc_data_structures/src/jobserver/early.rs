@@ -9,6 +9,8 @@ use jobserver_crate::Client as LocalClient;
 
 struct Captured {
     client: Option<LocalClient>,
+    // Trust: retain scoped named witnesses as well as the scheduling client.
+    transport: Option<jobserver_utils::Jobserver>,
     // Refusal condition captured at FIRST entry, never downgraded by later env changes.
     strict: bool,
     // Trust (CUSTODY-EMBEDDED-TEST-LOAN-1): `client` is this process's own
@@ -147,20 +149,25 @@ unsafe fn capture_with(lend_own_execution: bool) -> Result<(), String> {
     // nothing to import. The loan is created where the importer would run: it
     // allocates descriptors, and closes or reuses none.
     let imported = if lend_own_execution && own_execution_owed(|name| std::env::var_os(name)) {
-        LocalClient::new(0)
-            .map(|client| Captured { client: Some(client), strict, lent: true })
+        jobserver_utils::Jobserver::new(0)
+            .map(|server| Captured {
+                client: Some(server.client().clone()),
+                transport: Some(server),
+                strict,
+                lent: true,
+            })
             .map_err(|error| error.to_string())
     } else {
         // SAFETY: the official entry calls us first and only this fixed importer
         // executes after the SDK metadata snapshot, before SDK descriptor capture.
         unsafe { jobserver_utils::Jobserver::from_env_with_handoff() }
-            .map(|server| server.map(|server| server.client().clone()))
             .map_err(|error| error.to_string())
-            .and_then(|client| {
+            .and_then(|transport| {
+                let client = transport.as_ref().map(|server| server.client().clone());
                 if strict && gnu_advertised && client.is_none() {
                     Err("native/scoped compiler custody has no inherited GNU scheduler".into())
                 } else {
-                    Ok(Captured { client, strict, lent: false })
+                    Ok(Captured { client, transport, strict, lent: false })
                 }
             })
     };
@@ -391,6 +398,32 @@ pub(super) fn enter_lent_compile() -> Result<Option<LentCompile>, String> {
                 .into())
         }
     }
+}
+
+// Trust: this is an owned-transport clone, never late environment import.
+// A scoped named FIFO keeps its original witness route. Only a genuinely
+// unscoped initialized client is wrapped from its already-owned descriptions.
+pub(super) fn for_compiler_descendant(
+    local: &LocalClient,
+) -> Result<jobserver_utils::Jobserver, String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if WORKLOAD_CPU.get().is_some_and(|cpu| cpu.selected) {
+        return Err("a native worker child compiler requires an admitted execution profile".into());
+    }
+    if let Some(captured) = CAPTURED.get() {
+        COMPLETE
+            .get()
+            .ok_or("compiler early custody capture is incomplete")?
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let captured = captured.as_ref().map_err(Clone::clone)?;
+        if let Some(transport) = &captured.transport {
+            return transport.for_descendant().map_err(|error| error.to_string());
+        }
+    }
+    jobserver_utils::Jobserver::from_owned_client(local.clone())
+        .and_then(|transport| transport.for_descendant())
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn local(limit: usize, worker_v2: bool) -> Result<LocalClient, String> {

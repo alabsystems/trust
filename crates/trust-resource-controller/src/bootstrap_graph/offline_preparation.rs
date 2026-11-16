@@ -24,6 +24,20 @@ pub use intent::{
     ConfigurationSelection, ConfiguredIntentSelection, INTENT_PURPOSE, Intent, IntentQuery,
     IntentReply, IntentSelection,
 };
+mod cache;
+pub use cache::PreparationCacheReply;
+mod source;
+pub use source::{ArchiveCandidate, MAX_ARCHIVE_CANDIDATES, SourceCapture, SourceCaptureAccepted};
+
+mod output;
+pub use output::{PreparationOutputAttachment, PreparationOutputReply, RIGHTS_MARKER as PREPARATION_OUTPUT_RIGHTS_MARKER};
+
+mod staged_intent;
+pub use staged_intent::{
+    PROGRAM_PURPOSE, ProgramSelection, ProgramSelectionQuery, ProgramSelectionReply,
+    ReservedPrograms, STAGED_INTENT_PURPOSE, StagedIntent, StagedIntentQuery, StagedIntentReply,
+    StagedSelection,
+};
 
 pub const PURPOSE: &str = "native-bootstrap-offline-preparation-v1";
 /// Distinct before-configuration Root purpose. These bytes declare support;
@@ -358,3 +372,5 @@ impl Envelope {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::request as test_request;

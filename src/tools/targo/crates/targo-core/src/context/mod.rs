@@ -73,6 +73,10 @@ pub mod dependency_inputs;
 pub mod bootstrap_full;
 // Trust: synchronous compiler-query execution, never a compilation-unit pool.
 pub(crate) mod compiler_query;
+// Trust: actual original-source physical reads at the maintained loader seams.
+mod configuration_inputs;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod preparation_cache;
 #[cfg(all(test, unix))]
 mod paired_control_tests;
 use std::borrow::Cow;
@@ -274,6 +278,8 @@ struct RetainedTestEndpoint {
 pub struct GlobalContext {
     // Trust: only explicit native root mode installs actual socket custody.
     root_control: Option<root_control::RootControl>,
+    #[cfg(unix)]
+    preparation_configuration: Option<configuration_inputs::Binding>,
     // The original frontend socket is captured before configuration. Presence
     // remains sticky after the queue takes its one owned endpoint.
     #[cfg(unix)]
@@ -382,6 +388,8 @@ pub struct GlobalContext {
     /// A cache of modifications to make to [`GlobalContext::global_cache_tracker`],
     /// saved to disk in a batch to improve performance.
     deferred_global_last_use: OnceLock<Mutex<DeferredGlobalLastUse>>,
+    // Trust: current byte captures with per-command consistency checks.
+    compiler_content_captures: crate::util::rustc::CompilerContentCaptures,
 }
 
 // Trust: capture once, before logger/authentication/argument-file work in native
@@ -494,6 +502,8 @@ impl GlobalContext {
         GlobalContext {
             root_control: None,
             #[cfg(unix)]
+            preparation_configuration: None,
+            #[cfg(unix)]
             retained_test: Mutex::new(RetainedTestEndpoint::default()),
             retained_test_captured: false,
             home_path: Filesystem::new(homedir),
@@ -543,6 +553,7 @@ impl GlobalContext {
             ws_roots: Default::default(),
             global_cache_tracker: Default::default(),
             deferred_global_last_use: Default::default(),
+            compiler_content_captures: Default::default(),
         }
     }
 
@@ -914,6 +925,11 @@ impl GlobalContext {
         args
     }
 
+    // Trust: the compiler-content captures this command has taken.
+    pub(crate) fn compiler_content_captures(&self) -> &crate::util::rustc::CompilerContentCaptures {
+        &self.compiler_content_captures
+    }
+
     /// Gets the path to the `rustc` executable.
     pub fn load_global_rustc(&self, ws: Option<&Workspace<'_>>) -> CargoResult<Rustc> {
         let verified_targo = crate::is_targo_invocation() && crate::trust_verified_targo();
@@ -1116,6 +1132,7 @@ impl GlobalContext {
     /// for checking environment variables. Callers outside of the `config`
     /// module should avoid using this.
     pub fn values(&self) -> CargoResult<&HashMap<String, ConfigValue>> {
+        self.configuration_current()?;
         self.values.try_borrow_with(|| self.load_values())
     }
 
@@ -1132,6 +1149,8 @@ impl GlobalContext {
 
     // Note: this is used by RLS, not Cargo.
     pub fn set_values(&self, values: HashMap<String, ConfigValue>) -> CargoResult<()> {
+        // Trust: caller-authored rows cannot replace the scoped physical parser.
+        self.configuration_override_allowed()?;
         if self.values.get().is_some() {
             bail!("config values already found")
         }
@@ -1328,6 +1347,7 @@ impl GlobalContext {
     /// This does NOT look at environment variables. See `get_cv_with_env` for
     /// a variant that supports environment variables.
     fn get_cv(&self, key: &ConfigKey) -> CargoResult<Option<ConfigValue>> {
+        self.configuration_current()?;
         if let Some(vals) = self.credential_values.get() {
             let val = self.get_cv_helper(key, vals)?;
             if val.is_some() {
@@ -1383,6 +1403,7 @@ impl GlobalContext {
 
     /// This is a helper for getting a CV from a file or env var.
     pub(crate) fn get_cv_with_env(&self, key: &ConfigKey) -> CargoResult<Option<CV>> {
+        self.configuration_current()?;
         // Determine if value comes from env, cli, or file, and merge env if
         // possible.
         let cv = self.get_cv(key)?;
@@ -1555,6 +1576,7 @@ impl GlobalContext {
         &self,
         key: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> CargoResult<OptValue<String>> {
+        self.configuration_current()?;
         self.get::<OptValue<String>>(key)
     }
 
@@ -1665,74 +1687,79 @@ impl GlobalContext {
         unstable_flags: &[String],
         cli_config: &[String],
     ) -> CargoResult<()> {
-        for warning in self
-            .unstable_flags
-            .parse(unstable_flags, self.nightly_features_allowed)?
-        {
-            self.shell().warn(warning)?;
-        }
-        if !unstable_flags.is_empty() {
-            // store a copy of the cli flags separately for `load_unstable_flags_from_config`
-            // (we might also need it again for `reload_rooted_at`)
-            self.unstable_flags_cli = Some(unstable_flags.to_vec());
-        }
-        if !cli_config.is_empty() {
-            self.cli_config = Some(cli_config.iter().map(|s| s.to_string()).collect());
-            self.merge_cli_args()?;
-        }
+        self.configuration_current()?;
+        let result = (|| {
+            for warning in self
+                .unstable_flags
+                .parse(unstable_flags, self.nightly_features_allowed)?
+            {
+                self.shell().warn(warning)?;
+            }
+            if !unstable_flags.is_empty() {
+                // store a copy of the cli flags separately for `load_unstable_flags_from_config`
+                // (we might also need it again for `reload_rooted_at`)
+                self.unstable_flags_cli = Some(unstable_flags.to_vec());
+            }
+            if !cli_config.is_empty() {
+                self.cli_config = Some(cli_config.iter().map(|s| s.to_string()).collect());
+                self.merge_cli_args()?;
+            }
 
-        self.load_unstable_flags_from_config()?;
+            self.load_unstable_flags_from_config()?;
 
-        // Ignore errors in the configuration files. We don't want basic
-        // commands like `cargo version` to error out due to config file
-        // problems.
-        let term = self.get::<TermConfig>(["term"]).unwrap_or_default();
+            // Ignore errors in the configuration files. We don't want basic
+            // commands like `cargo version` to error out due to config file
+            // problems.
+            let term = self.get::<TermConfig>(["term"]).unwrap_or_default();
 
-        // The command line takes precedence over configuration.
-        let extra_verbose = verbose >= 2;
-        let verbose = verbose != 0;
-        let verbosity = match (verbose, quiet) {
-            (true, true) => bail!("cannot set both --verbose and --quiet"),
-            (true, false) => Verbosity::Verbose,
-            (false, true) => Verbosity::Quiet,
-            (false, false) => match (term.verbose, term.quiet) {
-                (Some(true), Some(true)) => {
-                    bail!("cannot set both `term.verbose` and `term.quiet`")
-                }
-                (Some(true), _) => Verbosity::Verbose,
-                (_, Some(true)) => Verbosity::Quiet,
-                _ => Verbosity::Normal,
-            },
-        };
-        self.shell().set_verbosity(verbosity);
-        self.extra_verbose = extra_verbose;
+            // The command line takes precedence over configuration.
+            let extra_verbose = verbose >= 2;
+            let verbose = verbose != 0;
+            let verbosity = match (verbose, quiet) {
+                (true, true) => bail!("cannot set both --verbose and --quiet"),
+                (true, false) => Verbosity::Verbose,
+                (false, true) => Verbosity::Quiet,
+                (false, false) => match (term.verbose, term.quiet) {
+                    (Some(true), Some(true)) => {
+                        bail!("cannot set both `term.verbose` and `term.quiet`")
+                    }
+                    (Some(true), _) => Verbosity::Verbose,
+                    (_, Some(true)) => Verbosity::Quiet,
+                    _ => Verbosity::Normal,
+                },
+            };
+            self.shell().set_verbosity(verbosity);
+            self.extra_verbose = extra_verbose;
 
-        let color = color.or_else(|| term.color.as_deref());
-        self.shell().set_color_choice(color)?;
-        if let Some(hyperlinks) = term.hyperlinks {
-            self.shell().set_hyperlinks(hyperlinks)?;
-        }
-        if let Some(unicode) = term.unicode {
-            self.shell().set_unicode(unicode)?;
-        }
+            let color = color.or_else(|| term.color.as_deref());
+            self.shell().set_color_choice(color)?;
+            if let Some(hyperlinks) = term.hyperlinks {
+                self.shell().set_hyperlinks(hyperlinks)?;
+            }
+            if let Some(unicode) = term.unicode {
+                self.shell().set_unicode(unicode)?;
+            }
 
-        self.progress_config = term.progress.unwrap_or_default();
+            self.progress_config = term.progress.unwrap_or_default();
 
-        self.frozen = frozen;
-        self.locked = locked;
-        self.offline = offline
-            || self
-                .net_config()
-                .ok()
-                .and_then(|n| n.offline)
-                .unwrap_or(false);
-        let cli_target_dir = target_dir.as_ref().map(|dir| Filesystem::new(dir.clone()));
-        self.target_dir = cli_target_dir;
+            self.frozen = frozen;
+            self.locked = locked;
+            self.offline = offline
+                || self
+                    .net_config()
+                    .ok()
+                    .and_then(|n| n.offline)
+                    .unwrap_or(false);
+            let cli_target_dir = target_dir.as_ref().map(|dir| Filesystem::new(dir.clone()));
+            self.target_dir = cli_target_dir;
 
-        self.shell()
-            .set_unstable_flags_rustc_unicode(self.unstable_flags.rustc_unicode)?;
+            self.shell()
+                .set_unstable_flags_rustc_unicode(self.unstable_flags.rustc_unicode)?;
 
-        Ok(())
+            Ok(())
+
+        })();
+        self.configuration_result(result)
     }
 
     fn load_unstable_flags_from_config(&mut self) -> CargoResult<()> {
@@ -1803,17 +1830,23 @@ impl GlobalContext {
     ///
     /// This is primarily crafted for `cargo config` command.
     pub(crate) fn load_values_unmerged(&self) -> CargoResult<Vec<ConfigValue>> {
-        let mut result = Vec::new();
-        let mut seen = HashSet::default();
-        let home = self.home_path.clone().into_path_unlocked();
-        self.walk_tree(&self.cwd, &home, |path| {
-            let mut cv = self._load_file(path, &mut seen, false, WhyLoad::FileDiscovery)?;
-            self.load_unmerged_include(&mut cv, &mut seen, &mut result)?;
-            result.push(cv);
-            Ok(())
-        })
-        .context("could not load Cargo configuration")?;
-        Ok(result)
+        self.configuration_current()?;
+        let result = (|| {
+            let mut result = Vec::new();
+            let mut seen = HashSet::default();
+            let home = self.home_path.clone().into_path_unlocked();
+            self.walk_tree(&self.cwd, &home, |path| {
+                let mut cv = self._load_file(path, &mut seen, false, WhyLoad::FileDiscovery)?;
+                self.load_unmerged_include(&mut cv, &mut seen, &mut result)?;
+                result.push(cv);
+                Ok(())
+            })
+            .context("could not load Cargo configuration")?;
+            Ok(result)
+
+
+        })();
+        self.configuration_result(result)
     }
 
     /// Like [`load_includes`](GlobalContext::load_includes) but without merging config values.
@@ -1827,7 +1860,7 @@ impl GlobalContext {
     ) -> CargoResult<()> {
         let includes = self.include_paths(cv, false)?;
         for include in includes {
-            let Some(abs_path) = include.resolve_path(self) else {
+            let Some(abs_path) = include.resolve_path(self)? else {
                 continue;
             };
 
@@ -1848,24 +1881,30 @@ impl GlobalContext {
 
     /// Start a config file discovery from a path and merges all config values found.
     fn load_values_from(&self, path: &Path) -> CargoResult<HashMap<String, ConfigValue>> {
-        // The root config value container isn't from any external source,
-        // so its definition should be built-in.
-        let mut cfg = CV::Table(HashMap::default(), Definition::BuiltIn);
-        let home = self.home_path.clone().into_path_unlocked();
+        self.configuration_current()?;
+        let result = (|| {
+            // The root config value container isn't from any external source,
+            // so its definition should be built-in.
+            let mut cfg = CV::Table(HashMap::default(), Definition::BuiltIn);
+            let home = self.home_path.clone().into_path_unlocked();
 
-        self.walk_tree(path, &home, |path| {
-            let value = self.load_file(path)?;
-            cfg.merge(value, false).with_context(|| {
-                format!("failed to merge configuration at `{}`", path.display())
-            })?;
-            Ok(())
-        })
-        .context("could not load Cargo configuration")?;
+            self.walk_tree(path, &home, |path| {
+                let value = self.load_file(path)?;
+                cfg.merge(value, false).with_context(|| {
+                    format!("failed to merge configuration at `{}`", path.display())
+                })?;
+                Ok(())
+            })
+            .context("could not load Cargo configuration")?;
 
-        match cfg {
-            CV::Table(map, _) => Ok(map),
-            _ => unreachable!(),
-        }
+            match cfg {
+                CV::Table(map, _) => Ok(map),
+                _ => unreachable!(),
+            }
+
+
+        })();
+        self.configuration_result(result)
     }
 
     /// Loads a config value from a path.
@@ -1912,24 +1951,30 @@ impl GlobalContext {
     ///
     /// * `why_load` tells why a config is being loaded.
     fn load_layer(&self, path: &Path, why_load: WhyLoad) -> CargoResult<ConfigValue> {
-        tracing::debug!(?path, ?why_load, "load config from file");
+        self.configuration_current()?;
+        let result = (|| {
+            tracing::debug!(?path, ?why_load, "load config from file");
 
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
-        let toml = contents.parse::<toml::Table>().with_context(|| {
-            format!("could not parse TOML configuration in `{}`", path.display())
-        })?;
-        let def = match why_load {
-            WhyLoad::Cli => Definition::Cli(Some(path.into())),
-            WhyLoad::FileDiscovery => Definition::Path(path.into()),
-        };
-        let value = CV::from_toml(def, toml::Value::Table(toml)).with_context(|| {
-            format!(
-                "failed to load TOML configuration from `{}`",
-                path.display()
-            )
-        })?;
-        Ok(value)
+            let contents = self.configuration_read_to_string(path)
+                .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
+            let toml = contents.parse::<toml::Table>().with_context(|| {
+                format!("could not parse TOML configuration in `{}`", path.display())
+            })?;
+            let def = match why_load {
+                WhyLoad::Cli => Definition::Cli(Some(path.into())),
+                WhyLoad::FileDiscovery => Definition::Path(path.into()),
+            };
+            let value = CV::from_toml(def, toml::Value::Table(toml)).with_context(|| {
+                format!(
+                    "failed to load TOML configuration from `{}`",
+                    path.display()
+                )
+            })?;
+            Ok(value)
+
+
+        })();
+        self.configuration_result(result)
     }
 
     /// Load any `include` files listed in the given `value`.
@@ -1950,7 +1995,7 @@ impl GlobalContext {
         // Accumulate all values here.
         let mut root = CV::Table(HashMap::default(), value.definition().clone());
         for include in includes {
-            let Some(abs_path) = include.resolve_path(self) else {
+            let Some(abs_path) = include.resolve_path(self)? else {
                 continue;
             };
 
@@ -2069,6 +2114,7 @@ impl GlobalContext {
         let mut seen = HashSet::default();
         for arg in cli_args {
             let arg_as_path = self.cwd.join(arg);
+            if !arg.is_empty() { self.configuration_probe(&arg_as_path)?; }
             let tmp_table = if !arg.is_empty() && arg_as_path.exists() {
                 // --config path_to_file
                 self._load_file(&arg_as_path, &mut seen, true, WhyLoad::Cli)
@@ -2143,6 +2189,8 @@ impl GlobalContext {
     ) -> CargoResult<Option<PathBuf>> {
         let possible = dir.join(filename_without_extension);
         let possible_with_extension = dir.join(format!("{}.toml", filename_without_extension));
+        self.configuration_probe(&possible)?;
+        self.configuration_probe(&possible_with_extension)?;
 
         if let Ok(possible_handle) = same_file::Handle::from_path(&possible) {
             if warn {
@@ -2194,11 +2242,15 @@ impl GlobalContext {
                 walk(&path)?;
             }
 
+            self.configuration_probe(&config_root)?;
             let canonical_root = config_root.canonicalize().unwrap_or(config_root);
+            self.configuration_current()?;
             seen_dir.insert(canonical_root);
         }
 
+        self.configuration_probe(home)?;
         let canonical_home = home.canonicalize().unwrap_or(home.to_path_buf());
+        self.configuration_current()?;
 
         // Once we're done, also be sure to walk the home directory even if it's not
         // in our history to be sure we pick up that standard location for
@@ -2264,47 +2316,53 @@ impl GlobalContext {
     ///
     /// If the credentials are already loaded, this function does nothing.
     pub fn load_credentials(&self) -> CargoResult<()> {
-        if self.credential_values.filled() {
-            return Ok(());
-        }
-
-        let home_path = self.home_path.clone().into_path_unlocked();
-        let Some(credentials) = self.get_file_path(&home_path, "credentials", true)? else {
-            return Ok(());
-        };
-
-        let mut value = self.load_layer(&credentials, WhyLoad::FileDiscovery)?;
-        // Backwards compatibility for old `.cargo/credentials` layout.
-        {
-            let (value_map, def) = value.table_mut("<root>")?;
-
-            if let Some(token) = value_map.remove("token") {
-                value_map.entry("registry".into()).or_insert_with(|| {
-                    let map = HashMap::from_iter([("token".into(), token)]);
-                    CV::Table(map, def.clone())
-                });
+        self.configuration_current()?;
+        let result = (|| {
+            if self.credential_values.filled() {
+                return Ok(());
             }
-        }
 
-        let mut credential_values = HashMap::default();
-        if let CV::Table(map, _) = value {
-            let base_map = self.values()?;
-            for (k, v) in map {
-                let entry = match base_map.get(&k) {
-                    Some(base_entry) => {
-                        let mut entry = base_entry.clone();
-                        entry.merge(v, true)?;
-                        entry
-                    }
-                    None => v,
-                };
-                credential_values.insert(k, entry);
+            let home_path = self.home_path.clone().into_path_unlocked();
+            let Some(credentials) = self.get_file_path(&home_path, "credentials", true)? else {
+                return Ok(());
+            };
+
+            let mut value = self.load_layer(&credentials, WhyLoad::FileDiscovery)?;
+            // Backwards compatibility for old `.cargo/credentials` layout.
+            {
+                let (value_map, def) = value.table_mut("<root>")?;
+
+                if let Some(token) = value_map.remove("token") {
+                    value_map.entry("registry".into()).or_insert_with(|| {
+                        let map = HashMap::from_iter([("token".into(), token)]);
+                        CV::Table(map, def.clone())
+                    });
+                }
             }
-        }
-        self.credential_values
-            .set(credential_values)
-            .expect("was not filled at beginning of the function");
-        Ok(())
+
+            let mut credential_values = HashMap::default();
+            if let CV::Table(map, _) = value {
+                let base_map = self.values()?;
+                for (k, v) in map {
+                    let entry = match base_map.get(&k) {
+                        Some(base_entry) => {
+                            let mut entry = base_entry.clone();
+                            entry.merge(v, true)?;
+                            entry
+                        }
+                        None => v,
+                    };
+                    credential_values.insert(k, entry);
+                }
+            }
+            self.credential_values
+                .set(credential_values)
+                .expect("was not filled at beginning of the function");
+            Ok(())
+
+
+        })();
+        self.configuration_result(result)
     }
 
     /// Looks for a path for `tool` in an environment variable or the given config, and returns
@@ -2479,6 +2537,7 @@ impl GlobalContext {
     }
 
     pub fn http(&self) -> CargoResult<&Mutex<Easy>> {
+        self.configuration_current()?;
         let http = self
             .easy
             .try_borrow_with(|| http_handle(self).map(Into::into))?;
@@ -2492,6 +2551,7 @@ impl GlobalContext {
     }
 
     pub fn http_async(&self) -> CargoResult<&http_async::Client> {
+        self.configuration_current()?;
         self.http_async.try_borrow_with(|| {
             let handle_config = HandleConfiguration::new(&self)?;
             Ok(http_async::Client::new(handle_config))
@@ -2499,6 +2559,7 @@ impl GlobalContext {
     }
 
     pub fn http_config(&self) -> CargoResult<&CargoHttpConfig> {
+        self.configuration_current()?;
         self.http_config.try_borrow_with(|| {
             let mut http = self.get::<CargoHttpConfig>(["http"])?;
             let curl_v = curl::Version::get();
@@ -2508,16 +2569,19 @@ impl GlobalContext {
     }
 
     pub fn future_incompat_config(&self) -> CargoResult<&CargoFutureIncompatConfig> {
+        self.configuration_current()?;
         self.future_incompat_config
             .try_borrow_with(|| self.get::<CargoFutureIncompatConfig>(["future-incompat-report"]))
     }
 
     pub fn net_config(&self) -> CargoResult<&CargoNetConfig> {
+        self.configuration_current()?;
         self.net_config
             .try_borrow_with(|| self.get::<CargoNetConfig>(["net"]))
     }
 
     pub fn build_config(&self) -> CargoResult<&CargoBuildConfig> {
+        self.configuration_current()?;
         self.build_config
             .try_borrow_with(|| self.get::<CargoBuildConfig>(["build"]))
     }
@@ -2529,6 +2593,7 @@ impl GlobalContext {
     /// Get the env vars from the config `[env]` table which
     /// are `force = true` or don't exist in the env snapshot [`GlobalContext::get_env`].
     pub fn env_config(&self) -> CargoResult<&Arc<HashMap<String, OsString>>> {
+        self.configuration_current()?;
         let env_config = self.env_config.try_borrow_with(|| {
             CargoResult::Ok(Arc::new({
                 let env_config = self.get::<EnvConfig>(["env"])?;
@@ -2608,11 +2673,13 @@ impl GlobalContext {
     ///
     /// The list is sorted by the table name.
     pub fn target_cfgs(&self) -> CargoResult<&Vec<(String, TargetCfgConfig)>> {
+        self.configuration_current()?;
         self.target_cfgs
             .try_borrow_with(|| target::load_target_cfgs(self))
     }
 
     pub fn doc_extern_map(&self) -> CargoResult<&RustdocExternMap> {
+        self.configuration_current()?;
         // Note: This does not support environment variables. The `Unit`
         // fundamentally does not have access to the registry name, so there is
         // nothing to query. Plumbing the name into SourceId is quite challenging.
@@ -2640,6 +2707,7 @@ impl GlobalContext {
     /// This is the main cargo registry by default, but it can be overridden in
     /// a `.cargo/config.toml`.
     pub fn crates_io_source_id(&self) -> CargoResult<SourceId> {
+        self.configuration_current()?;
         let source_id = self.crates_io_source_id.try_borrow_with(|| {
             self.check_registry_index_not_set()?;
             let url = CRATES_IO_INDEX.into_url().unwrap();
@@ -2680,12 +2748,13 @@ impl GlobalContext {
 
         key: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> CargoResult<T> {
+        self.configuration_current()?;
         let d = Deserializer {
             gctx: self,
             key: ConfigKey::from_parts(key),
             env_prefix_ok: true,
         };
-        T::deserialize(d).map_err(|e| e.into())
+        self.configuration_result(T::deserialize(d).map_err(Into::into))
     }
 
     /// Obtain a [`Path`] from a [`Filesystem`], verifying that the
@@ -2763,14 +2832,20 @@ impl GlobalContext {
 }
 
 pub fn homedir(cwd: &Path) -> Option<PathBuf> {
+    homedir_with_environment(cwd, &Env::new(), ::home::home_dir)
+}
+
+// Trust: the scoped parser uses this SAME selection over its retained snapshot.
+fn homedir_with_environment(
+    cwd: &Path, env: &Env, os_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
     // Trust: native TARGO_HOME is imported only in the frontend-aware snapshot.
     // The raw home crate lookup bypasses that import. Select the compatibility
     // value before filtering emptiness, so explicit CARGO_HOME="" still wins
     // over TARGO_HOME and falls back to the OS home, just as Cargo does.
-    let env = Env::new();
     let home = match env.get_env_os("CARGO_HOME").filter(|home| !home.is_empty()) {
         Some(home) => cwd.join(home),
-        None => ::home::home_dir()?.join(".cargo"),
+        None => os_home()?.join(".cargo"),
     };
     // https://github.com/rust-lang/cargo/issues/15981
     // This is so everything shares one spelling and
@@ -2940,7 +3015,7 @@ impl ConfigInclude {
     ///
     /// Returns `None` if this is an optional include and the file doesn't exist.
     /// Otherwise returns `Some(PathBuf)` with the absolute path.
-    fn resolve_path(&self, gctx: &GlobalContext) -> Option<PathBuf> {
+    fn resolve_path(&self, gctx: &GlobalContext) -> CargoResult<Option<PathBuf>> {
         let abs_path = match &self.def {
             Definition::Path(p) | Definition::Cli(Some(p)) => p.parent().unwrap(),
             Definition::Environment(_) | Definition::Cli(None) | Definition::BuiltIn => gctx.cwd(),
@@ -2948,6 +3023,7 @@ impl ConfigInclude {
         .join(&self.path);
         let abs_path = paths::normalize_path(&abs_path);
 
+        if self.optional { gctx.configuration_probe(&abs_path)?; }
         if self.optional && !abs_path.exists() {
             tracing::info!(
                 "skipping optional include `{}` in `{}`:  file not found at `{}`",
@@ -2955,9 +3031,11 @@ impl ConfigInclude {
                 self.def,
                 abs_path.display(),
             );
-            None
+            gctx.configuration_current()?;
+            Ok(None)
         } else {
-            Some(abs_path)
+            gctx.configuration_current()?;
+            Ok(Some(abs_path))
         }
     }
 }

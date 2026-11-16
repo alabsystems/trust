@@ -5,8 +5,8 @@ LL | /     def ident_isl (x : UInt64) : UInt64 := x
 LL | |
 LL | |     theorem degree_le_self : forall (d : UInt64) (k : UInt64),
 LL | |         Nat.le (UInt64.toNat d) (UInt64.toNat d) :=
-LL | |         fun d k => Nat.le.refl (UInt64.toNat d)
-   | |_______________________________________________^
+LL | |         fun d k => @Nat.le.refl (UInt64.toNat d)
+   | |________________________________________________^
 
 note: island definition `ident_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_field_projection_discharge::degree_of`
   --> $DIR/e9_field_projection_discharge.rs:51:13

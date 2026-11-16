@@ -18,6 +18,9 @@
 //!   `const` carries a pending-const SENTINEL (the crate module resolves it at finalize, after the
 //!   candidate was captured), and is recorded `not-lowered(pending-const sentinel)`, never written
 //!   with the placeholder in it.
+//! * THE COMPLETE PRODUCER INVENTORY: the KEY initializer now retains its own
+//!   not-a-function refusal even though optimized MIR for it is not exported.
+//!   All previous functions, callee guards and sentinel refusals remain required.
 //!
 //! * NO ICE WITHOUT A DIAGNOSTIC: run-make compiles with `TRUST_VANILLA_ANNOUNCED=1` (as bootstrap
 //!   and targo do), so the dependency's build emits no diagnostic at all. The guard's refusal
@@ -94,7 +97,7 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
 }
 
 /// Every trust-ir entry blob in an rmeta file (the framing `trust-ir-rmeta-entry-roundtrip`
-/// documents): schema-5 magic/version/digest plus a length-framed owner/mode/module/evidence
+/// documents): schema-6 magic/version/digest plus a length-framed owner/mode/module/evidence
 /// payload. Mode is the actual producing session setting, not inferred from instructions.
 fn entries(rmeta: &[u8]) -> Vec<Vec<u8>> {
     let u64_at = |at: usize| u64::from_le_bytes(rmeta[at..at + 8].try_into().unwrap()) as usize;
@@ -102,8 +105,8 @@ fn entries(rmeta: &[u8]) -> Vec<Vec<u8>> {
     let mut at = 0;
     while let Some(found) = rmeta[at..].windows(8).position(|w| w == b"TRIRENTR") {
         let start = at + found;
-        // Trust: entry schema 5 frames the complete owner/mode/module/evidence payload.
-        assert_eq!(u32::from_le_bytes(rmeta[start + 8..start + 12].try_into().unwrap()), 5);
+        // Trust: entry schema 6 frames the complete owner/mode/module/evidence payload.
+        assert_eq!(u32::from_le_bytes(rmeta[start + 8..start + 12].try_into().unwrap()), 6);
         let p = start + 56 + u64_at(start + 48);
         out.push(rmeta[start..p].to_vec());
         at = p;
@@ -137,9 +140,9 @@ fn main() {
     let stats = format!("{}{}", out.stdout_utf8(), out.stderr_utf8());
     assert!(
         stats.contains(
-            "meta-stats trust-ir entries: 3 encoded; 3 unencoded: not-lowered=1 unnamed-callee=2"
+            "meta-stats trust-ir entries: 3 encoded; 4 unencoded: not-a-function=1 not-lowered=1 unnamed-callee=2"
         ),
-        "three bodies travel; the guard refuses two, the sentinel one:\n{stats}"
+        "three bodies travel; the two callee guards, sentinel, and constant body each retain their refusal:\n{stats}"
     );
 
     // The recorded reasons, as the crate header carries them into rmeta.
@@ -151,6 +154,7 @@ fn main() {
         ),
         ("the self edge", "`rec`: a self edge (a recursive call is linked by the body's own name)"),
         ("the sentinel", "not-lowered(pending-const sentinel)"),
+        ("the constant body", "not-a-function(a const or static initializer: CTFE stays on MIR)"),
     ] {
         assert!(contains(&rmeta, needle), "{what}: the header records `{needle}`");
     }

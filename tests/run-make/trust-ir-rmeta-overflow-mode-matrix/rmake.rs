@@ -1,4 +1,4 @@
-//! Actual canonical producer/consumer schema-5 overflow-mode protocol matrix.
+//! Actual canonical producer/consumer schema-6 overflow-mode protocol matrix.
 //! This reads channel C; it grants no F1 admission or codegen proof authority.
 //@ ignore-cross-compile
 

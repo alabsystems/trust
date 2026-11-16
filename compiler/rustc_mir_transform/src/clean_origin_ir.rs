@@ -248,7 +248,9 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>, lane: RecorderLane) -> Vec<Clean
             ),
         );
     };
-    let env = &*env;
+    // Trust: pending call assembly must retain this same immutable source snapshot.
+    let shared_environment = env;
+    let env = &*shared_environment;
 
     let mut out = Vec::with_capacity(defs.len());
     let mut planner_emitted = rustc_data_structures::fx::FxHashSet::default();
@@ -411,7 +413,11 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>, lane: RecorderLane) -> Vec<Clean
                         def_path,
                         link_symbol,
                         clean_name: name,
-                        plan,
+                        // Trust: data retention does not grant native gate authority.
+                        source: trust_clean_ir_gate::rust_calls::RetainedRustCallSource::retain(
+                            shared_environment.clone(),
+                            std::sync::Arc::new(plan),
+                        ),
                         callees,
                         mir_gate,
                     }))

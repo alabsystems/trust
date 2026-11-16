@@ -39,7 +39,9 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "trust_f1_ladder.py"
@@ -66,6 +68,11 @@ if "--print=supported-crate-types" in argv:
 if "-o" in argv:  # driver link
     rlib = [a for a in argv if a.startswith("rung=")][0][len("rung="):]
     value = open(rlib).read()
+    if "-Zprint-mono-items=yes" in argv and "driverblank" not in rlib:
+        if "driverregen" in rlib:
+            print("MONO_ITEM fn rung::rung @@ fake[Internal]")
+        else:
+            print("MONO_ITEM fn main @@ fake[External]")
     exe = argv[argv.index("-o") + 1]
     with open(exe, "w") as f:
         f.write("#!/bin/sh\n%secho %s-$1\n" % ("sleep 30\n" if "slow" in rlib else "", value))
@@ -85,6 +92,10 @@ if cg and "refuse" in name:
 if cg and "fatal" in name:
     sys.stderr.write("error: codegen backend trust-cg cannot emit crate type bin\n")
     sys.exit(1)
+if cg and os.path.basename(os.path.dirname(src)) == "lean":
+    if "missing" not in name:
+        counts = (int("mirread" in name), int("inventoryread" in name), int("recorderread" in name))
+        sys.stderr.write("`clean_origin_mir` reached: codegen %d, inventory %d, recorder %d (plan step 3)\n" % counts)
 value = "wrong" if (cg and "wrong" in name) else "right"
 if cg and "unknown" in name and "-Ztrust-cg-output-gate=allow-unknown" not in argv:
     sys.stderr.write("error: strict gate\n     1 (100.0%) [f1-output-gate] Unknown\n")
@@ -95,6 +106,102 @@ with open(os.path.join(out, "librung.rlib"), "w") as f:
 
 
 class LadderTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "process-group ownership is Unix-only")
+    def test_run_retires_descendants_on_timeout_and_normal_exit(self) -> None:
+        import fcntl
+
+        program = self.tmp / "descendant.py"
+        program.write_text('''
+import fcntl, subprocess, sys, time
+from pathlib import Path
+mode, lock, ready, stop = sys.argv[1:]
+lock, ready, stop = map(Path, (lock, ready, stop))
+if mode == "child":
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        ready.write_text("locked")
+        deadline = time.monotonic() + 15
+        while not stop.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+else:
+    subprocess.Popen([sys.executable, __file__, "child", str(lock), str(ready), str(stop)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 5
+    while not ready.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("descendant never acquired its lock")
+        time.sleep(.02)
+    print("captured stdout", flush=True)
+    print("captured stderr", file=sys.stderr, flush=True)
+    if mode == "timeout":
+        time.sleep(60)
+''')
+        for mode in ("timeout", "exit"):
+            with self.subTest(mode=mode):
+                lock = self.tmp / (mode + ".lock")
+                ready = self.tmp / (mode + ".ready")
+                stop = self.tmp / (mode + ".stop")
+
+                def released() -> bool:
+                    with lock.open("a") as held:
+                        try:
+                            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return False
+                        return True
+
+                try:
+                    rc, stdout, stderr = ladder.run(
+                        [sys.executable, str(program), mode, str(lock), str(ready), str(stop)],
+                        2 if mode == "timeout" else 5,
+                    )
+                    self.assertTrue(ready.exists(), "the actual descendant must have run")
+                    self.assertEqual(rc, None if mode == "timeout" else 0)
+                    self.assertEqual(stdout, "" if mode == "timeout" else "captured stdout\n")
+                    self.assertIn("captured stderr", stderr)
+                    deadline = time.monotonic() + 1
+                    while not released() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(released(), "run returned with its descendant still alive")
+                finally:
+                    # Release this fixture even against the broken runner. No
+                    # numeric PID is signalled, and the fixture is self-bounded.
+                    stop.write_text("stop")
+                    deadline = time.monotonic() + 2
+                    while not released() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(released(), "fixture descendant did not finish")
+
+    @unittest.skipUnless(os.name == "posix", "descriptor transport is Unix-only")
+    def test_run_preserves_original_scheduler_and_closes_unadvertised_fds(self) -> None:
+        read, write = os.pipe()
+        unrelated_read, unrelated_write = os.pipe()
+        try:
+            env = {"CARGO_MAKEFLAGS": f"-j --jobserver-auth={read},{write}"}
+            probe = r"""
+import os, stat, sys
+r, w, unrelated = map(int, sys.argv[1:])
+a, b = os.fstat(r), os.fstat(w)
+assert stat.S_ISFIFO(a.st_mode) and stat.S_ISFIFO(b.st_mode)
+try: os.fstat(unrelated)
+except OSError: pass
+else: raise AssertionError("unadvertised descriptor leaked")
+print(a.st_dev, a.st_ino, b.st_dev, b.st_ino)
+"""
+            with patch.dict(os.environ, env, clear=True):
+                rc, stdout, stderr = ladder.run(
+                    [sys.executable, "-c", probe, str(read), str(write), str(unrelated_read)], 10
+                )
+            self.assertEqual(rc, 0, stderr)
+            original_read, original_write = os.fstat(read), os.fstat(write)
+            self.assertEqual(
+                stdout.strip(),
+                f"{original_read.st_dev} {original_read.st_ino} {original_write.st_dev} {original_write.st_ino}",
+            )
+        finally:
+            for fd in (read, write, unrelated_read, unrelated_write):
+                os.close(fd)
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
@@ -106,6 +213,8 @@ class LadderTest(unittest.TestCase):
         self.corpus = self.tmp / "corpus"
         (self.corpus / "programs").mkdir(parents=True)
         (self.corpus / "micro").mkdir()
+        (self.corpus / "lean").mkdir()
+        (self.corpus / "lean" / "l0_good.rs").write_text("// fake\n")
         (self.corpus / "driver.rs").write_text("fn main() {}\n")
 
     def tearDown(self) -> None:
@@ -232,10 +341,10 @@ class LadderTest(unittest.TestCase):
         self.rung("programs", "p1_good")
         self.rung("programs", "p2_refuse")
         self.rung("micro", "m1_good")
-        self.assertEqual(self.go("--mode", "fixture", "--expect", "f1-strict=2")[0], 0)
-        rc, _, stderr, _ = self.go("--mode", "fixture", "--expect", "f1-strict=3")
+        self.assertEqual(self.go("--mode", "fixture", "--expect", "f1-strict=3")[0], 0)
+        rc, _, stderr, _ = self.go("--mode", "fixture", "--expect", "f1-strict=4")
         self.assertEqual(rc, 1)
-        self.assertIn("f1-strict: 2 OK, expected 3", stderr)
+        self.assertIn("f1-strict: 3 OK, expected 4", stderr)
         self.assertEqual(self.go("--mode", "fixture", "--expect", "f1-strict=1")[0], 1, "an unrecorded improvement also fails the pin")
         self.assertEqual(self.go("--expect", "f1-allow-unknown=1")[0], 2, "a lane the mode does not run is a usage error")
         self.assertEqual(self.go("--mode", "fixture", "--expect", "programs:f1-strict=1", "--expect", "micro:f1-strict=1")[0], 0)
@@ -255,6 +364,21 @@ class LadderTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("cannot load the trust-cg backend", stderr)
         self.assertEqual(results, {}, "nothing is measured")
+
+    def test_lean_requires_direct_path_evidence(self) -> None:
+        self.rung("lean", "l1_missing")
+        self.rung("lean", "l2_mirread")
+        self.rung("lean", "l3_driverregen")
+        self.rung("lean", "l4_driverblank")
+        self.rung("lean", "l5_inventoryread")
+        self.rung("lean", "l6_recorderread")
+        rc, _, stderr, results = self.go("--set", "lean")
+        self.assertEqual(rc, 1)
+        self.assertIn("PATH", stderr)
+        self.assertEqual(results["summary"]["f1-strict"]["sets"]["lean"],
+                         {"total": 7, "OK": 1, "PATH": 6})
+        self.assertEqual(results["summary"]["llvm-verified"]["sets"]["lean"],
+                         {"total": 7, "OK": 7})
 
     def test_empty_corpus_is_a_usage_error(self) -> None:
         self.rung("programs", "p1_good")

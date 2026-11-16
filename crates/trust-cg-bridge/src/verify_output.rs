@@ -43,6 +43,7 @@ use std::collections::{HashMap, HashSet};
 use ay::{BigInt, Logic, Solver, Term};
 use trust_disasm::{Condition, Opcode, decode_aarch64};
 use trust_machine_sem::{Aarch64Semantics, Effect, MachineState, Semantics, condition_to_formula};
+use trust_types::determinism::{EffortScale, QueryEffort, StopCause};
 use trust_types::grade::GradeRecord;
 use trust_types::{
     BinOp, BlockId, ConstValue, Formula, Operand, Place, Projection, RoundingMode, Rvalue, Sort,
@@ -5830,64 +5831,125 @@ fn formula_has_fp(f: &Formula) -> bool {
     found
 }
 
-/// Per-query wall-clock budget for the gate's ay discharges, in milliseconds.
+/// The two bounds every gate ay query runs under (DECISION_QUEUE BUDGET-1).
 ///
-/// WHY: the callee seam inflates whole-function obligations (an inlined call
-/// chain is one big byte-equality), and a single `check_sat` was MEASURED
-/// grinding >20 minutes at 100% CPU on one trust-timearith function — with no
-/// bound, `allow-unknown` still waits on every proof ATTEMPT, so one hard
-/// obligation stalls a whole crate's compile. A budget converts the grind
-/// into a fast, counted `Unknown` — a COMPLETENESS cost, never soundness
-/// (Unknown refuses under strict and emits-uncertified under allow-unknown),
-/// the same posture as the verifier's own `-Ztrust-verify-function-budget-ms`.
+/// THE COUNT decides where an undecided search stops. Each gate check-sat is
+/// sent `(set-option :rlimit N)`, `N = min(100000, max(1, k · size))` SAT
+/// conflicts, where `size` is `trust_types::determinism::query_size` of the one
+/// assertion the solver holds: the formula and the code are
+/// `trust_types::determinism::EffortScale`'s, the count the MIR verifier's
+/// router lanes send under `-Ztrust-verify-effort`. `k` is
+/// `EffortScale::BUILTIN`, that option's default. A query whose search spends
+/// its effort in counted SAT solves stops at the same point on every host at
+/// any load: it is `Unknown` with `[stop:effort]`, a completeness cost and
+/// never a proof. Not every query is such a query; see the backstop.
 ///
-/// `TCG_TRUST_IR_GATE_TIMEOUT_MS` overrides; `0` disables the budget. Read
-/// fresh per solver construction (no OnceLock). A test varies the budget
-/// through `with_gate_budget_ms` (test builds only) instead, which takes
-/// precedence over both on its own thread.
-fn gate_solver_config() -> ay::SolverConfig {
-    const DEFAULT_MS: u64 = 120_000;
+/// What the count replaces (ay at the pin, `pipeline_fns.rs` and
+/// `model_helpers/resource_budget.rs`): with no `:rlimit`, ay's default ground
+/// budget (400,000 conflicts and 24,000,000 decisions per SAT solve) bounds its
+/// ground-pipeline CDCL solves, but its bit-blast lanes, which carry the gate's
+/// QF_ABV and QF_ABVFP queries, take no default count at all. `:rlimit`
+/// replaces the 400,000-conflict allowance and bounds the bit-blast solves too;
+/// ay's 24,000,000-decision allowance stays in force beside it.
+///
+/// THE BACKSTOP is a wall clock behind the count, kept because the count does
+/// not reach all of ay's work (`EffortScale`'s docs: `:rlimit` bounds each SAT
+/// solve, not the whole check, and ay's preprocessing and residual clocks
+/// spend time no count reaches). A query that is slow per conflict, or that
+/// spends its time outside counted SAT solves, can reach the clock before its
+/// count: it is `Unknown` with `[stop:wall-backstop]`, and that stop is NOT
+/// reproducible (the machine's load decided it), never an ordinary `Unknown`.
+/// The clock is how the gate came to have any bound: the callee seam inflates
+/// whole-function obligations (an inlined call chain is one big
+/// byte-equality), and a single `check_sat` was MEASURED grinding >20 minutes
+/// at 100% CPU on one trust-timearith function; with no bound,
+/// `allow-unknown` still waits on every proof attempt. Neither bound can make
+/// anything Proven; only ay's own UNSAT does (Unknown refuses under strict and
+/// emits uncertified under allow-unknown).
+///
+/// Overrides, each read fresh per query: `TCG_TRUST_IR_GATE_EFFORT` sets `k`
+/// (`EffortScale::parse`: 1 through 100000; any other value makes every gate
+/// query `Unknown`, never unbounded), `TCG_TRUST_IR_GATE_TIMEOUT_MS` the clock
+/// in ms (default 120000, `0` = no clock, the count still applies). A test sets
+/// either on its own thread through `with_gate_effort` / `with_gate_budget_ms`
+/// (test builds only), which take precedence there.
+const GATE_BACKSTOP_DEFAULT_MS: u64 = 120_000;
+
+/// The wall-clock backstop of a gate query in ms, `None` for no clock.
+fn gate_backstop_ms() -> Option<u64> {
     let ms = gate_budget_set_by_test().unwrap_or_else(|| {
         std::env::var("TCG_TRUST_IR_GATE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MS)
+            .unwrap_or(GATE_BACKSTOP_DEFAULT_MS)
     });
-    let config = ay::SolverConfig::default();
-    if ms == 0 { config } else { config.with_timeout(std::time::Duration::from_millis(ms)) }
+    (ms != 0).then_some(ms)
 }
 
-// TEST-ONLY BUDGET SEAM. `Some(ms)` replaces the per-query budget above for
-// every gate solver built on THIS thread (`0` = no budget). Thread-local, never
-// the process environment: every test running beside it reads
-// `TCG_TRUST_IR_GATE_TIMEOUT_MS`, and `set_var` races those reads. Never set
-// outside tests.
+/// The scale `k` of the gate's effort count, or why it cannot be read.
+fn gate_effort_scale() -> Result<EffortScale, String> {
+    if let Some(scale) = gate_effort_set_by_test() {
+        return Ok(scale);
+    }
+    match std::env::var("TCG_TRUST_IR_GATE_EFFORT") {
+        Ok(raw) => EffortScale::parse(&raw).map_err(|e| format!("TCG_TRUST_IR_GATE_EFFORT: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(EffortScale::BUILTIN),
+        Err(e) => Err(format!("TCG_TRUST_IR_GATE_EFFORT: {e}")),
+    }
+}
+
+/// The effort count of the gate query whose one assertion is `asserted`.
+pub(crate) fn gate_query_effort(asserted: &Formula) -> Result<QueryEffort, String> {
+    Ok(gate_effort_scale()?.for_query(&[asserted]))
+}
+
+// TEST-ONLY SEAMS. `Some(..)` replaces the clock (`0` = no clock) or the effort
+// scale for every gate solver built on THIS thread. Thread-local, never the
+// process environment: every test running beside it reads the variables
+// above, and `set_var` races those reads. `GATE_EFFORTS_SENT`, while
+// `record_gate_efforts` has it `Some`, collects the effort of every
+// `:rlimit` this thread's gate queries hand to ay; it observes and changes
+// nothing. Never set outside tests.
 #[cfg(test)]
 thread_local! {
     static GATE_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static GATE_EFFORT: std::cell::Cell<Option<EffortScale>> = const { std::cell::Cell::new(None) };
+    static GATE_EFFORTS_SENT: std::cell::RefCell<Option<Vec<QueryEffort>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The per-query budget a test set on this thread through `with_gate_budget_ms`,
-/// if any. A function rather than a `let` bound to a cfg'd literal, so the
-/// non-test build's `None` is not a literal the `unwrap_or_else` above reads
-/// through (`unnecessary_literal_unwrap`).
+/// The clock a test set on this thread through `with_gate_budget_ms`, if any.
+/// A function rather than a `let` bound to a cfg'd literal, so the non-test
+/// build's `None` is not a literal the `unwrap_or_else` above reads through
+/// (`unnecessary_literal_unwrap`).
 #[cfg(not(test))]
 fn gate_budget_set_by_test() -> Option<u64> {
     None
 }
 
-/// The per-query budget a test set on this thread through `with_gate_budget_ms`,
-/// if any.
+/// The clock a test set on this thread through `with_gate_budget_ms`, if any.
 #[cfg(test)]
 fn gate_budget_set_by_test() -> Option<u64> {
     GATE_BUDGET_MS.get()
 }
 
+/// The effort scale a test set on this thread through `with_gate_effort`, if any.
+#[cfg(not(test))]
+fn gate_effort_set_by_test() -> Option<EffortScale> {
+    None
+}
+
+/// The effort scale a test set on this thread through `with_gate_effort`, if any.
+#[cfg(test)]
+fn gate_effort_set_by_test() -> Option<EffortScale> {
+    GATE_EFFORT.get()
+}
+
 /// TEST HOOK: run `body` with every gate solver built on THIS thread under a
-/// per-query budget of `ms` milliseconds (`0` = none). The gate's discharges
-/// run on the calling thread, so this covers every solver one gate call builds.
-/// The budget in force before the call is restored when `body` returns or
-/// unwinds, so a nested or panicking use leaves the thread as it found it.
+/// wall clock of `ms` milliseconds (`0` = none). The gate's discharges run on
+/// the calling thread, so this covers every solver one gate call builds. The
+/// clock in force before the call is restored when `body` returns or unwinds,
+/// so a nested or panicking use leaves the thread as it found it.
 #[cfg(test)]
 fn with_gate_budget_ms<R>(ms: u64, body: impl FnOnce() -> R) -> R {
     struct Restore(Option<u64>);
@@ -5900,10 +5962,126 @@ fn with_gate_budget_ms<R>(ms: u64, body: impl FnOnce() -> R) -> R {
     body()
 }
 
-/// Construct the gate's solver with the per-query budget applied.
-fn gate_solver(logic: Logic) -> Result<Solver, String> {
-    Solver::try_new_with_config(logic, gate_solver_config())
+/// TEST HOOK: run `body` with every gate solver built on THIS thread under the
+/// effort scale `scale`, restored as [`with_gate_budget_ms`] restores the clock.
+#[cfg(test)]
+pub(crate) fn with_gate_effort<R>(scale: EffortScale, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<EffortScale>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GATE_EFFORT.set(self.0);
+        }
+    }
+    let _restore = Restore(GATE_EFFORT.replace(Some(scale)));
+    body()
+}
+
+/// TEST HOOK: run `body` and return, with its result, the effort of every
+/// `(set-option :rlimit N)` a gate query on THIS thread handed to ay while it
+/// ran, in order. The recorder in force before the call is restored when
+/// `body` returns or unwinds. It observes; it changes no query and no verdict.
+#[cfg(test)]
+pub(crate) fn record_gate_efforts<R>(body: impl FnOnce() -> R) -> (R, Vec<QueryEffort>) {
+    struct Restore(Option<Option<Vec<QueryEffort>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                GATE_EFFORTS_SENT.with(|sent| *sent.borrow_mut() = outer);
+            }
+        }
+    }
+    let mut restore =
+        Restore(Some(GATE_EFFORTS_SENT.with(|sent| sent.borrow_mut().replace(Vec::new()))));
+    let result = body();
+    let outer = restore.0.take().unwrap_or_default();
+    let sent = GATE_EFFORTS_SENT.with(|sent| std::mem::replace(&mut *sent.borrow_mut(), outer));
+    (result, sent.unwrap_or_default())
+}
+
+/// Note, for [`record_gate_efforts`], that `effort` is being handed to ay as
+/// `(set-option option value)`. The option and value are checked to be the
+/// ones `effort` spells, so a record is the `:rlimit` actually sent.
+#[cfg(test)]
+fn note_gate_effort_sent(effort: QueryEffort, option: &str, value: &str) {
+    assert_eq!(
+        (option, value),
+        (":rlimit", effort.conflicts.to_string().as_str()),
+        "the gate sends its effort as :rlimit"
+    );
+    GATE_EFFORTS_SENT.with(|sent| {
+        if let Some(sent) = sent.borrow_mut().as_mut() {
+            sent.push(effort);
+        }
+    });
+}
+
+#[cfg(test)]
+#[path = "verify_output/effort_tests.rs"]
+mod effort_tests;
+
+/// Construct the gate's solver, with the wall-clock backstop applied when
+/// `backstop_ms` names one.
+fn gate_solver(logic: Logic, backstop_ms: Option<u64>) -> Result<Solver, String> {
+    let config = ay::SolverConfig::default();
+    let config = match backstop_ms {
+        Some(ms) => config.with_timeout(std::time::Duration::from_millis(ms)),
+        None => config,
+    };
+    Solver::try_new_with_config(logic, config)
         .map_err(|e| format!("ay Solver::try_new_with_config failed: {e:?}"))
+}
+
+/// Install `effort` and run the check-sat of a gate query: UNSAT is Proven,
+/// SAT a counterexample, anything else Unknown with the stop that ended it.
+///
+/// The count reaches ay as `(set-option :rlimit N)` immediately before the
+/// check-sat, as the router's lanes send it; failing to install it is Unknown,
+/// never an unbounded solve. An undecided search ended by one of ay's
+/// deterministic counts (ay code `resource_limit`) states `[stop:effort]`: the
+/// gate's `:rlimit` is one of them, but ay reports its 24,000,000-decision
+/// allowance and its internal size limits with the same code, so the reason
+/// names the gate's count as one candidate and never as the cause. One ended
+/// by the clock (`backstop_ms`; ay's `timeout`, or an `interrupted` a clock
+/// raised) states `[stop:wall-backstop]`. Any other undecided answer names
+/// ay's code and states no stop (`StopCause::from_reason` reads it as
+/// unclassified, never as reproducible).
+pub(crate) fn gate_check_sat(
+    solver: &mut Solver,
+    effort: QueryEffort,
+    backstop_ms: Option<u64>,
+) -> Discharge {
+    let (option, value) = effort.smt2_option();
+    #[cfg(test)]
+    note_gate_effort_sent(effort, option, &value);
+    if let Err(e) = solver.try_set_option(option, &value) {
+        return Discharge::Unknown(solver_err("set-option :rlimit", &e));
+    }
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        return Discharge::Proven;
+    }
+    if result.is_sat() {
+        return Discharge::CounterExample;
+    }
+    let code = solver.unknown_reason().map_or("none", |reason| reason.code());
+    let (size, conflicts) = (effort.size, effort.conflicts);
+    let detail = format!("ay returned unknown: {result:?} (ay reason {code})");
+    Discharge::Unknown(match code {
+        "resource_limit" => StopCause::Effort.stamp(&format!(
+            "{detail}: one of ay's deterministic counts ran out, which ay does not say: the \
+             gate's :rlimit of {conflicts} SAT conflicts (a query of {size} terms), ay's own \
+             decision allowance, or an ay size limit"
+        )),
+        "timeout" | "interrupted" => {
+            let clock =
+                backstop_ms.map_or_else(|| "a wall clock".to_string(), |ms| format!("{ms} ms"));
+            StopCause::WallBackstop.stamp(&format!(
+                "{detail}: the wall-clock backstop ({clock}) ended the search before its effort \
+                 count ({conflicts} SAT conflicts for a query of {size} terms)"
+            ))
+        }
+        _ => detail,
+    })
 }
 
 /// Discharge the VALIDITY of a boolean formula `f`: assert `NOT(f)` and check.
@@ -5915,7 +6093,13 @@ pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
     #[cfg(test)]
     crate::original_conjunction_certificate::require_production_allowed();
     let logic = if formula_has_fp(f) { Logic::QfAbvfp } else { Logic::QfAbv };
-    let mut solver = match gate_solver(logic) {
+    // The effort count is sized over the one assertion made below, `NOT(f)`.
+    let effort = match gate_query_effort(&Formula::Not(b(f.clone()))) {
+        Ok(effort) => effort,
+        Err(e) => return Discharge::Unknown(e),
+    };
+    let backstop_ms = gate_backstop_ms();
+    let mut solver = match gate_solver(logic, backstop_ms) {
         Ok(s) => s,
         Err(e) => return Discharge::Unknown(e),
     };
@@ -5936,14 +6120,7 @@ pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
     if let Err(e) = solver.try_assert_term(neg) {
         return Discharge::Unknown(format!("ay try_assert_term failed: {e:?}"));
     }
-    let result = solver.check_sat();
-    if result.is_unsat() {
-        Discharge::Proven
-    } else if result.is_sat() {
-        Discharge::CounterExample
-    } else {
-        Discharge::Unknown(format!("ay returned unknown: {result:?}"))
-    }
+    gate_check_sat(&mut solver, effort, backstop_ms)
 }
 
 /// Discharge `(pre AND NOT(a == b))`: UNSAT => Proven, SAT => CounterExample,
@@ -5963,7 +6140,21 @@ pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula
     } else {
         Logic::QfAbv
     };
-    let mut solver = match gate_solver(logic) {
+    // The effort count is sized over the one assertion made below,
+    // `pre AND NOT(a == c)` (`NOT(a == c)` without a precondition).
+    let effort = {
+        let differ = Formula::Not(b(Formula::Eq(b(a.clone()), b(c.clone()))));
+        gate_query_effort(&match pre {
+            Some(p) => Formula::And(vec![p.clone(), differ]),
+            None => differ,
+        })
+    };
+    let effort = match effort {
+        Ok(effort) => effort,
+        Err(e) => return Discharge::Unknown(e),
+    };
+    let backstop_ms = gate_backstop_ms();
+    let mut solver = match gate_solver(logic, backstop_ms) {
         Ok(s) => s,
         Err(e) => return Discharge::Unknown(e),
     };
@@ -5991,14 +6182,7 @@ pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula
     if let Err(e) = solver.try_assert_term(goal) {
         return Discharge::Unknown(solver_err("assert", &e));
     }
-    let result = solver.check_sat();
-    if result.is_unsat() {
-        Discharge::Proven
-    } else if result.is_sat() {
-        Discharge::CounterExample
-    } else {
-        Discharge::Unknown(format!("ay returned unknown: {result:?}"))
-    }
+    gate_check_sat(&mut solver, effort, backstop_ms)
 }
 
 // ===========================================================================
@@ -9020,22 +9204,25 @@ mod tests {
     ///
     /// A HANG DETECTOR, not a latency budget. `gate_accepts_mem_store_load_roundtrip`
     /// runs past 60 s at load average 25-60 (docs/VALIDATION_LADDER.md). Under the
-    /// gate's own 120 s per-query budget the machine's load could decide its verdict: a
-    /// proof slowed past the budget comes back `Unknown`, and the test fails for the
-    /// load, not for the gate. Ten minutes is five times that budget and far past the
+    /// gate's own 120 s per-query backstop the machine's load could decide its verdict: a
+    /// proof slowed past the clock comes back `Unknown`, and the test fails for the
+    /// load, not for the gate. Ten minutes is five times that backstop and far past the
     /// recorded slow runs, so a run still going then is a hang whatever the load. Raise
     /// it only for a measured run that finished; never tighten it into a speed claim.
     const GATE_HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-    /// The output gate on `func` with the per-query wall-clock budget LIFTED, so the
-    /// solver decides the verdict and the clock never does, run on a worker thread that
-    /// the test waits on for at most [`GATE_HANG_DETECTOR`].
+    /// The output gate on `func` with the per-query wall-clock backstop LIFTED, so the
+    /// clock never decides the verdict, run on a worker thread that the test waits on for
+    /// at most [`GATE_HANG_DETECTOR`]. The gate's effort count (`:rlimit`, DECISION_QUEUE
+    /// BUDGET-1) still applies: ay decides within it, and a query it stops is `Unknown`
+    /// `[stop:effort]` here as in production, so the verdict is the one the count reaches.
     ///
-    /// For a test asserting a verdict the gate must reach. With no budget, a solver that
-    /// never answers would hang the test binary rather than fail a test, so the worker
-    /// is watched: past the detector this panics naming the function, and the worker,
-    /// which nothing can stop, ends with the test process. A panic on the worker is
-    /// re-raised here, so it fails the test exactly as it would have inline.
+    /// For a test asserting a verdict the gate must reach. With no clock, work the count
+    /// does not reach (ay's preprocessing, its residual clocks) could still run on, and a
+    /// solver that never answers would hang the test binary rather than fail a test, so
+    /// the worker is watched: past the detector this panics naming the function, and the
+    /// worker, which nothing can stop, ends with the test process. A panic on the worker
+    /// is re-raised here, so it fails the test exactly as it would have inline.
     fn verify_output_preserved_hang_detected(func: &VerifiableFunction) -> OutputVerdict {
         use std::sync::mpsc::{self, RecvTimeoutError};
 
@@ -9063,9 +9250,9 @@ mod tests {
             },
             Err(RecvTimeoutError::Timeout) => panic!(
                 "HANG: the output gate gave no verdict on `{name}` within {GATE_HANG_DETECTOR:?} \
-                 with its per-query budget lifted. This is a hang detector, not a latency \
-                 budget: look for a discharge or kernel re-check that does not terminate on \
-                 this obligation"
+                 with its per-query clock lifted (its effort count in force). This is a hang \
+                 detector, not a latency budget: look for a discharge or kernel re-check that \
+                 does not terminate on this obligation"
             ),
         }
     }

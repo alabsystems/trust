@@ -18,6 +18,7 @@ clean-kernel = { workspace = true }
 trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-clean-origin = { path = "../trust-clean-origin" }
 trust-ir = { workspace = true }
+trust-ir-build = { workspace = true }
 trust-types = { path = "../trust-types", default-features = false }
 trust-certify = { path = "../trust-certify" }
 # Plan step 3.1: the family gate reflects through the SAME side-B producers the MIR lane uses.

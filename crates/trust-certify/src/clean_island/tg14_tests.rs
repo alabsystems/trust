@@ -231,8 +231,8 @@ fn signed_computed_subtraction_uses_modular_bits_and_signed_order() {
         let source = format!(
             r#"
             def subbits (a b : BitVec {width}) : BitVec {width} :=
-                BitVec.ofNat {width} (Nat.sub (Nat.add (BitVec.toNat {width} a) (Nat.pow 2 {width})) (BitVec.toNat {width} b))
-            def orderkey (a : BitVec {width}) : Nat := Nat.xor (BitVec.toNat {width} a) {pivot}
+                BitVec.ofNat {width} (Nat.sub (Nat.add (@BitVec.toNat {width} a) (Nat.pow 2 {width})) (@BitVec.toNat {width} b))
+            def orderkey (a : BitVec {width}) : Nat := Nat.xor (@BitVec.toNat {width} a) {pivot}
             theorem exact_signed (cost limit held : BitVec {width}) :
                 trust_import_crate__budget cost limit held = decide (Nat.le (orderkey cost) (orderkey (subbits limit held))) := rfl
         "#

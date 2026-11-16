@@ -2660,7 +2660,9 @@ fn modeled_successors(inst: &Inst) -> Option<Vec<BlockId>> {
 /// `None` means "do not memoize" (and, for a function with loops, "no cut
 /// points" — the evaluator then refuses the backedge as before), which is
 /// always safe.
-fn live_in_sets(blocks: &HashMap<u32, &trust_ir::Block>) -> Option<HashMap<u32, Vec<ValueId>>> {
+pub(crate) fn live_in_sets(
+    blocks: &HashMap<u32, &trust_ir::Block>,
+) -> Option<HashMap<u32, Vec<ValueId>>> {
     // refs / defs / succs per block, bailing on anything not enumerable.
     let mut refs: HashMap<u32, HashSet<ValueId>> = HashMap::new();
     let mut defs: HashMap<u32, HashSet<ValueId>> = HashMap::new();
@@ -2799,7 +2801,10 @@ fn live_in_sets(blocks: &HashMap<u32, &trust_ir::Block>) -> Option<HashMap<u32, 
 /// case is refused by name.
 ///
 /// Headers are returned in ascending block-id order.
-fn loop_headers(blocks: &HashMap<u32, &trust_ir::Block>, entry: u32) -> Result<Vec<u32>, String> {
+pub(crate) fn loop_headers(
+    blocks: &HashMap<u32, &trust_ir::Block>,
+    entry: u32,
+) -> Result<Vec<u32>, String> {
     let mut succs: HashMap<u32, Vec<u32>> = HashMap::new();
     for (id, blk) in blocks {
         let Some(terminator) = blk.body.last() else {

@@ -416,10 +416,12 @@ pub use table::{
 // type its own accessors return.
 pub use trust_clean_carrier::{CleanOriginPrecondition, PreconditionOperand, PreconditionRelation};
 
-/// The planner's side-A expansion of transparent Lean helper calls, with no Rust
-/// callees in scope: every application whose head is a fully kernel-checked
-/// `Definition` at a carrier signature is unfolded, within the planner's work
-/// envelope. `Ok(None)` when nothing was unfolded.
+/// The planner's side-A candidate expansion of transparent Lean helper calls
+/// and beta/zeta reductions, with no Rust callees in scope. Helper applications
+/// whose heads are fully kernel-checked `Definition`s at carrier signatures
+/// are unfolded within the planner's work envelope. A complete candidate is
+/// returned when a named helper was unfolded or beta/zeta reduction changed
+/// the body; `Ok(None)` otherwise.
 ///
 /// Trust (2026-09-28): exported for the kernel-TV SOURCE side
 /// (`rustc_mir_transform::clean_origin_ir::mint_kernel_tv`). A `def` whose body

@@ -24,7 +24,7 @@
 clean {
     theorem degree_le_self : forall (d : UInt64) (k : UInt64),
         Nat.le (UInt64.toNat d) (UInt64.toNat d) :=
-        fun d k => Nat.le.refl (UInt64.toNat d)
+        fun d k => @Nat.le.refl (UInt64.toNat d)
 }
 
 pub struct Cst {

@@ -2,8 +2,8 @@ note: Clean island kernel-checked: 1 declaration(s) registered (self_le)
   --> $DIR/trust-spec-attribute-citation.rs:30:5
    |
 LL | /     theorem self_le : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-LL | |         fun x => Nat.le.refl (UInt64.toNat x)
-   | |_____________________________________________^
+LL | |         fun x => @Nat.le.refl (UInt64.toNat x)
+   | |______________________________________________^
 
 
 === Trust Verification Report (trust_spec_attribute_citation) ===

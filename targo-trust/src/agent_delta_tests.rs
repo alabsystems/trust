@@ -1,6 +1,10 @@
 // Unit tests for the changed-only view: the row words and labels, the rows that
-// print on every run, grade changes, the per-caller pointers, the snapshot's
-// hash check and the 7-day pruning.
+// print on every run (with a base and without one, and once with `--all-rows`),
+// what `N` and `M` count, grade and basis changes, the per-caller pointers and
+// when they move, `--since` for one package, an unusable `--since` or pointer,
+// the snapshot's hash check, the 7-day pruning, the pointer that outlives it and
+// the one that expires, a view with nowhere to store, and the records delta
+// refuses.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -43,6 +47,10 @@ fn package(rows: &[(&str, &str, &str)], coverage_complete: bool) -> PackageOblig
             .collect(),
         obligations,
         compile_errors: Vec::new(),
+        tests: None,
+        test_harnesses: Vec::new(),
+        test_cases: Vec::new(),
+        clean_islands: Default::default(),
     }
 }
 
@@ -55,6 +63,29 @@ const E: &str = "demo::e#0000000000000005";
 /// The first word of each line (`STILL`, `NEW FAILED`, …).
 fn words(changes: &Changes) -> Vec<&str> {
     changes.lines.iter().map(|line| line.split("  ").next().unwrap().trim()).collect()
+}
+
+/// [`publish`] for a view that was printed: its caller's pointers move.
+fn shown(
+    target_dir: &Path,
+    records: &[(String, String)],
+    request: &DeltaRequest,
+    caller: Option<&str>,
+    list_rows: bool,
+) -> DeltaView {
+    publish_shown(target_dir, records, request, caller, list_rows)
+}
+
+/// [`publish_run`] for a view that was printed: its caller's pointers move.
+fn shown_run(
+    target_dir: &Path,
+    records: &crate::obligations::ObligationRecords,
+    request: &DeltaRequest,
+    caller: Option<&str>,
+) -> DeltaView {
+    let view = publish_run(target_dir, records, request, caller);
+    assert_eq!(view.commit_pointers(), Vec::<String>::new(), "{view:?}");
+    view
 }
 
 #[test]
@@ -142,6 +173,64 @@ fn a_row_that_is_not_proved_prints_on_every_run_and_nothing_is_collapsed() {
     assert_eq!(changed_rows(&open, &open, false), Changes::default());
 }
 
+/// `N` counts obligation rows, not lines: a `REMOVED` function counts its
+/// obligations, and a `MOVED` line counts none (its rows are compared, and
+/// counted, on their own lines). `M` counts the base's rows that are gone as
+/// well as this run's, so `N` never exceeds it.
+#[test]
+fn n_counts_obligation_rows_not_lines() {
+    const B2: &str = "demo::b#0000000000000006";
+    const B3: &str = "demo::b#0000000000000007";
+    // `demo::a` renamed `demo::z`, paired by its proved id; `demo::b` removed.
+    const Z: &str = "demo::z#0000000000000001";
+    let base = package(
+        &[
+            (A, "proved", "solved"),
+            (B, "unknown", "not-dispatched"),
+            (B2, "unknown", "not-dispatched"),
+            (B3, "unknown", "not-dispatched"),
+        ],
+        true,
+    );
+    let now = package(&[(Z, "proved", "solved")], true);
+    let changes = changed_rows(&base, &now, true);
+    assert_eq!(words(&changes), ["MOVED", "REMOVED"], "{changes:?}");
+    assert!(changes.lines[0].contains("demo::a -> demo::z  (paired by ids)"), "{changes:?}");
+    assert!(changes.lines[1].contains("demo::b  (3 obligation(s))"), "{changes:?}");
+    assert_eq!(changes.rows, 3, "{changes:?}");
+    assert_eq!(changes.gone, 3, "{changes:?}");
+    let delta = PackageDelta {
+        package: "demo".to_string(),
+        total: now.obligations.len(),
+        compile_errors: 0,
+        concluded: true,
+        now: Some("t".to_string()),
+        since: Some(("b".to_string(), changes)),
+        errors: Vec::new(),
+        all: Vec::new(),
+        tests: Vec::new(),
+        test_summary: None,
+        islands: Vec::new(),
+        island_summary: None,
+    };
+    assert_eq!(delta.summary_line(), "demo  3 of 4 changed since b  (now t)");
+}
+
+/// The proved-id rule pairs a base function only with a function that holds
+/// no other unpaired base function's majority: two renamed functions whose
+/// proved ids both landed in one function now are both `REMOVED`, and its rows
+/// print as new.
+#[test]
+fn a_function_two_base_functions_claim_by_ids_pairs_with_neither() {
+    const C1: &str = "demo::c#0000000000000001";
+    const C2: &str = "demo::c#0000000000000002";
+    let base = package(&[(A, "proved", "solved"), (B, "proved", "solved")], true);
+    let now = package(&[(C1, "proved", "solved"), (C2, "proved", "solved")], true);
+    let changes = changed_rows(&base, &now, true);
+    assert_eq!(words(&changes), ["GAINED", "GAINED", "REMOVED", "REMOVED"], "{changes:?}");
+    assert_eq!((changes.rows, changes.gone), (4, 2), "{changes:?}");
+}
+
 /// A grade or failure-basis change with the same status and stop is a
 /// `CHANGED` row: a proof that now rests on a new premise, or a failure that
 /// is no longer a refutation, is not what the base recorded.
@@ -182,8 +271,76 @@ fn a_grade_or_basis_change_is_a_changed_row() {
     );
 }
 
+/// A failed row whose label does not show its basis (`ASSUMED`, `CONTRACT`,
+/// `CONDITIONAL`) and whose basis alone changed says what it was.
+#[test]
+fn a_basis_change_the_label_does_not_show_is_named() {
+    let mut refuted = package(&[(A, "failed", "solved")], true);
+    refuted.obligations[0].kind = "assumption:extern-call".to_string();
+    let mut closed = refuted.clone();
+    closed.obligations[0].basis = Some("unproved_fail_closed".to_string());
+    assert_eq!(refuted.obligations[0].listing_label(), closed.obligations[0].listing_label());
+    let changes = changed_rows(&refuted, &closed, true);
+    assert_eq!(words(&changes), ["CHANGED"], "{changes:?}");
+    assert_eq!(changes.rows, 1);
+    assert!(
+        changes.lines[0].starts_with("CHANGED     [ASSUMED]  demo::a#")
+            && changes.lines[0].contains("failed (was basis refuted)  solved"),
+        "{changes:?}"
+    );
+}
+
+/// `GAINED` is a proof the base did not have: a row proved on both sides
+/// whose stop changed (a record handed to `targo trust delta` can say so) is
+/// `CHANGED`.
+#[test]
+fn a_stop_change_of_a_row_proved_on_both_sides_is_changed_not_gained() {
+    let base = package(&[(A, "proved", "solved")], true);
+    let now = package(&[(A, "proved", "wall-backstop")], true);
+    let changes = changed_rows(&base, &now, true);
+    assert_eq!(words(&changes), ["CHANGED"], "{changes:?}");
+    assert!(changes.lines[0].contains("proved (was stopped by solved)"), "{changes:?}");
+    assert_eq!(changes.rows, 1);
+    let unproved = package(&[(A, "unknown", "wall-backstop")], true);
+    assert_eq!(words(&changed_rows(&unproved, &now, true)), ["GAINED"]);
+}
+
+/// A proved key that vanished is `LOST` when its function's source digest is
+/// the same on both sides or is not stated on one of them (a def path several
+/// Lean `example`s share states none), and the line says which: a digest not
+/// stated shows no edit, but does not show the source unchanged.
+#[test]
+fn a_lost_row_says_whether_its_functions_source_digest_was_stated() {
+    let mut base = package(&[(A, "proved", "solved"), (B, "proved", "solved")], true);
+    let mut now = package(&[(B, "proved", "solved")], true);
+    now.functions.insert("demo::a".to_string(), None);
+    let unstated = changed_rows(&base, &now, true);
+    assert_eq!(words(&unstated), ["LOST"], "{unstated:?}");
+    assert!(
+        unstated.lines[0].contains(
+            "vanished (was proved; its function's source digest is not stated on both sides)"
+        ),
+        "{unstated:?}"
+    );
+    let digest = Some("0123456789abcdef".repeat(4));
+    base.functions.insert("demo::a".to_string(), digest.clone());
+    now.functions.insert("demo::a".to_string(), digest);
+    let same = changed_rows(&base, &now, true);
+    assert_eq!(words(&same), ["LOST"], "{same:?}");
+    assert!(
+        same.lines[0].contains("vanished (was proved; its function's source did not change)"),
+        "{same:?}"
+    );
+}
+
 fn ndjson(rows: &[(&str, &str, &str)]) -> String {
-    let record = package(rows, true);
+    ndjson_named("demo", rows)
+}
+
+/// The record of package `name`.
+fn ndjson_named(name: &str, rows: &[(&str, &str, &str)]) -> String {
+    let mut record = package(rows, true);
+    record.package = name.to_string();
     let functions = functions_of(&record);
     crate::obligations::render_package_ndjson(
         &crate::obligations::RecordHeader {
@@ -210,31 +367,31 @@ fn each_caller_diffs_against_its_own_last_run_only() {
     let first = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
     let second = vec![("demo".to_string(), ndjson(&[(A, "failed", "solved")]))];
 
-    let alpha = publish(target.path(), &first, &request, Some("alpha"), false);
+    let alpha = shown(target.path(), &first, &request, Some("alpha"), false);
     assert!(alpha.packages[0].since.is_none(), "no base on a first run");
-    let beta = publish(target.path(), &second, &request, Some("beta"), false);
+    let beta = shown(target.path(), &second, &request, Some("beta"), false);
     assert!(beta.packages[0].since.is_none(), "beta never reads alpha's pointer");
-    let alpha_again = publish(target.path(), &second, &request, Some("alpha"), false);
+    let alpha_again = shown(target.path(), &second, &request, Some("alpha"), false);
     let (base, changes) = alpha_again.packages[0].since.clone().expect("alpha's base");
     assert_eq!(Some(base), alpha.packages[0].now);
     assert_eq!(changes.rows, 1);
-    let beta_again = publish(target.path(), &second, &request, Some("beta"), false);
+    let beta_again = shown(target.path(), &second, &request, Some("beta"), false);
     assert_eq!(beta_again.packages[0].since.as_ref().unwrap().1.rows, 0);
     assert!(beta_again.replaces_listing());
     // Nothing changed. A check's own listing keeps the failed row
     // (`crate::report`), so its view is the summary line alone; with no
     // listing of the command's own the failed row prints again before it.
     assert_eq!(beta_again.lines().len(), 1, "{beta_again:?}");
-    let standalone = publish(target.path(), &second, &request, Some("beta"), true);
+    let standalone = shown(target.path(), &second, &request, Some("beta"), true);
     let lines = standalone.lines();
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines[0].starts_with("STILL       [FAILED]  demo::a#"), "{lines:?}");
-    publish(target.path(), &first, &request, Some("gamma"), false);
-    let unchanged = publish(target.path(), &first, &request, Some("gamma"), false);
+    shown(target.path(), &first, &request, Some("gamma"), false);
+    let unchanged = shown(target.path(), &first, &request, Some("gamma"), false);
     assert_eq!(unchanged.lines().len(), 1, "an all-proved rerun is one line");
 
     // No caller: no base, and nothing to point at.
-    let anonymous = publish(target.path(), &second, &request, None, false);
+    let anonymous = shown(target.path(), &second, &request, None, false);
     assert!(anonymous.packages[0].since.is_none() && !anonymous.replaces_listing());
 
     // A pointer is per caller and per measurement.
@@ -244,6 +401,32 @@ fn each_caller_diffs_against_its_own_last_run_only() {
     let mut other_lane = record.clone();
     other_lane.lane = "certify".to_string();
     assert_ne!(pointer_path(&dir, "alpha", &record), pointer_path(&dir, "alpha", &other_lane));
+}
+
+/// `publish` stores the snapshot but moves no pointer: the view holds the move
+/// until it was printed, so a run whose view is never printed leaves the
+/// caller's base at the last token it was shown.
+#[test]
+fn a_pointer_moves_only_once_its_view_was_printed() {
+    let target = tempfile::tempdir().unwrap();
+    let request = DeltaRequest::default();
+    let proved = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
+    let failed = vec![("demo".to_string(), ndjson(&[(A, "failed", "solved")]))];
+
+    let unprinted = publish(target.path(), &proved, &request, Some("me"), false);
+    let token = unprinted.packages[0].now.clone().unwrap();
+    assert!(snapshots_dir(target.path()).join(&token).is_file(), "the snapshot is stored");
+    let first = publish(target.path(), &proved, &request, Some("me"), false);
+    assert!(first.packages[0].since.is_none(), "still a first run: {first:?}");
+    assert!(first.notes.is_empty(), "{first:?}");
+    assert_eq!(first.commit_pointers(), Vec::<String>::new());
+
+    // A changed run whose view is not printed moves nothing.
+    let lost = publish(target.path(), &failed, &request, Some("me"), false);
+    assert_eq!(lost.packages[0].since.as_ref().map(|(base, _)| base), Some(&token));
+    let again = publish(target.path(), &failed, &request, Some("me"), false);
+    assert_eq!(again.packages[0].since.as_ref().map(|(base, _)| base), Some(&token));
+    assert_eq!(again.packages[0].since.as_ref().unwrap().1.rows, 1, "the change still shows");
 }
 
 #[test]
@@ -290,22 +473,22 @@ fn a_snapshot_whose_bytes_do_not_hash_to_its_token_is_refused() {
     let dir = snapshots_dir(target.path());
     let record = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
     let request = DeltaRequest::default();
-    let first = publish(target.path(), &record, &request, Some("me"), false);
+    let first = shown(target.path(), &record, &request, Some("me"), false);
     let token = first.packages[0].now.clone().unwrap();
     // Replace the snapshot's bytes with another valid record.
     std::fs::write(dir.join(&token), ndjson(&[(A, "failed", "solved")])).unwrap();
     let since = DeltaRequest { since: Some(token.clone()), all_rows: false };
-    let view = publish(target.path(), &record, &since, None, false);
+    let view = shown(target.path(), &record, &since, None, false);
     assert!(view.packages[0].since.is_none(), "{view:?}");
     assert!(view.notes[0].contains("refused"), "{view:?}");
     // That run stored the record again, over the bytes that did not match.
-    let view = publish(target.path(), &record, &request, Some("me"), false);
+    let view = shown(target.path(), &record, &request, Some("me"), false);
     assert!(view.packages[0].since.is_some(), "re-storing the record repaired it: {view:?}");
 
     // A pointer holding a path, not a token.
     let parsed = parse_package_ndjson(&record[0].1).unwrap();
     std::fs::write(pointer_path(&dir, "me", &parsed), "../../escape\n").unwrap();
-    let view = publish(target.path(), &record, &request, Some("me"), false);
+    let view = shown(target.path(), &record, &request, Some("me"), false);
     assert!(view.packages[0].since.is_none(), "{view:?}");
     assert!(view.notes[0].contains("is not a snapshot token"), "{view:?}");
 }
@@ -467,7 +650,7 @@ fn a_compile_error_is_a_row_keyed_by_file_code_and_message_and_prints_on_every_r
     let target = tempfile::tempdir().unwrap();
     let request = DeltaRequest::default();
     // No base: every error row prints, then the summary line, which counts them.
-    let first = publish_run(target.path(), &records, &request, Some("me"));
+    let first = shown_run(target.path(), &records, &request, Some("me"));
     let lines = first.lines();
     let token = first.packages[0].now.clone().unwrap();
     assert_eq!(lines.len(), 3, "{lines:#?}");
@@ -481,7 +664,7 @@ fn a_compile_error_is_a_row_keyed_by_file_code_and_message_and_prints_on_every_r
     // A rerun with no edit: nothing changed, and both errors print again.
     // No run of this caller compiled, so the obligations have no base and
     // the check's own listing stays.
-    let again = publish_run(target.path(), &records, &request, Some("me"));
+    let again = shown_run(target.path(), &records, &request, Some("me"));
     let lines = again.lines();
     assert!(!again.replaces_listing());
     assert_eq!(lines.len(), 3, "{lines:#?}");
@@ -494,7 +677,7 @@ fn a_compile_error_is_a_row_keyed_by_file_code_and_message_and_prints_on_every_r
 
     // Lines inserted above the error: its key is the same and its line moved,
     // and so did the record's token.
-    let moved = publish_run(target.path(), &broken(9), &request, Some("me"));
+    let moved = shown_run(target.path(), &broken(9), &request, Some("me"));
     let lines = moved.lines();
     assert_eq!(lines.len(), 3, "{lines:#?}");
     assert_eq!(
@@ -508,7 +691,7 @@ fn a_compile_error_is_a_row_keyed_by_file_code_and_message_and_prints_on_every_r
     let one = record_of_cargo_stream(
         &[cargo_error(Some("E0425"), UNRESOLVED, 11, 5), cargo_failure_tail()].join("\n"),
     );
-    let fixed = publish_run(target.path(), &one, &request, Some("me"));
+    let fixed = shown_run(target.path(), &one, &request, Some("me"));
     let lines = fixed.lines();
     assert_eq!(lines.len(), 3, "{lines:#?}");
     assert!(lines[0].starts_with("STILL       [ERROR E0425]  "), "{lines:#?}");
@@ -524,7 +707,7 @@ fn a_dependency_that_did_not_compile_is_in_the_view_under_its_own_name() {
         .replace(ERROR_PACKAGE_ID, "path+file:///work/dep#helper@0.2.0");
     let records = record_of_cargo_stream(&[dependency, cargo_failure_tail()].join("\n"));
     let target = tempfile::tempdir().unwrap();
-    let view = publish_run(target.path(), &records, &DeltaRequest::default(), Some("me"));
+    let view = shown_run(target.path(), &records, &DeltaRequest::default(), Some("me"));
     let packages: Vec<&str> = view.packages.iter().map(|p| p.package.as_str()).collect();
     assert_eq!(packages, ["delta-errors", "helper"], "{view:?}");
     assert_eq!(view.packages[1].compile_errors, 1);
@@ -565,7 +748,7 @@ fn an_internal_compiler_error_is_an_error_row_on_every_run() {
     let target = tempfile::tempdir().unwrap();
     let request = DeltaRequest::default();
     for (run, label) in [(0, "[ERROR]  src/lib.rs#error-"), (1, "STILL       [ERROR]  ")] {
-        let lines = publish_run(target.path(), &records, &request, Some("me")).lines();
+        let lines = shown_run(target.path(), &records, &request, Some("me")).lines();
         assert_eq!(lines.len(), 2, "run {run}: {lines:#?}");
         let row = if run == 0 { lines[0].trim_start() } else { lines[0].as_str() };
         assert!(row.starts_with(label), "run {run}: {lines:#?}");
@@ -683,9 +866,9 @@ fn a_verifier_refusal_does_not_stop_the_obligations_being_compared() {
 
     let target = tempfile::tempdir().unwrap();
     let request = DeltaRequest::default();
-    let first = publish_run(target.path(), &base, &request, Some("me"));
+    let first = shown_run(target.path(), &base, &request, Some("me"));
     let base_token = first.packages[0].now.clone().unwrap();
-    let view = publish_run(target.path(), &now, &request, Some("me"));
+    let view = shown_run(target.path(), &now, &request, Some("me"));
     let lines = view.lines();
     assert_eq!(lines.len(), 4, "{lines:#?}");
     assert!(lines[0].starts_with("NEW ERROR   [ERROR]  src/lib.rs#error-"), "{lines:#?}");
@@ -697,15 +880,16 @@ fn a_verifier_refusal_does_not_stop_the_obligations_being_compared() {
         "{lines:#?}"
     );
     let token = view.packages[0].now.clone().unwrap();
+    // `M` is this run's two rows and the base's `LOST` row, which has none now.
     assert_eq!(
         lines[3],
         format!(
-            "delta-errors  1 compiler error(s); 2 of 2 changed since {base_token}  (now {token})"
+            "delta-errors  1 compiler error(s); 2 of 3 changed since {base_token}  (now {token})"
         )
     );
     // The run concluded, so it is the next run's base: a rerun prints the
     // error again and changes nothing.
-    let again = publish_run(target.path(), &now, &request, Some("me")).lines();
+    let again = shown_run(target.path(), &now, &request, Some("me")).lines();
     assert_eq!(again.len(), 2, "{again:#?}");
     assert!(again[0].starts_with("STILL       [ERROR]  "), "{again:#?}");
     assert_eq!(
@@ -780,4 +964,262 @@ fn a_misplaced_compile_error_line_is_refused() {
     assert!(parse_package_ndjson(&format!("{header}{}{}", line("a"), line("a"))).is_err());
     let after = format!("{}{}", ndjson(&[(A, "proved", "solved")]), line("a"));
     assert!(parse_package_ndjson(&after).is_err());
+}
+
+/// With no base, where the command prints no listing of its own, every row
+/// that is not plainly proved prints, as a row of its own; beside a listing of
+/// the command's own the listing keeps them; `--all-rows` prints every row.
+#[test]
+fn with_no_base_every_row_not_plainly_proved_still_prints() {
+    let target = tempfile::tempdir().unwrap();
+    let request = DeltaRequest::default();
+    let record = vec![(
+        "demo".to_string(),
+        ndjson(&[
+            (A, "proved", "solved"),
+            (B, "failed", "solved"),
+            (C, "unknown", "not-dispatched"),
+        ]),
+    )];
+    let standalone = shown(target.path(), &record, &request, None, true);
+    let lines = standalone.lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].starts_with("[FAILED]  demo::b#"), "{lines:?}");
+    assert!(lines[1].starts_with("[UNKNOWN]  demo::c#"), "{lines:?}");
+    assert!(lines[2].starts_with("demo  3 obligation(s)  (now "), "{lines:?}");
+    // A caller's first run has no base either.
+    let first = shown(target.path(), &record, &request, Some("me"), true);
+    assert_eq!(first.lines(), lines, "{first:?}");
+    let checked = shown(target.path(), &record, &request, None, false);
+    assert_eq!(checked.lines().len(), 1, "{checked:?}");
+    let all = DeltaRequest { since: None, all_rows: true };
+    assert_eq!(shown(target.path(), &record, &all, None, true).lines().len(), 4);
+}
+
+/// A `--since` whose snapshot cannot be read leaves the run without a base:
+/// the caller's pointer does not stand in for the base the caller named.
+#[test]
+fn a_since_that_names_no_readable_snapshot_leaves_the_run_without_a_base() {
+    let target = tempfile::tempdir().unwrap();
+    let record = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
+    shown(target.path(), &record, &DeltaRequest::default(), Some("me"), false);
+    let missing = DeltaRequest { since: Some("0123456789abcdef".to_string()), all_rows: false };
+    let view = shown(target.path(), &record, &missing, Some("me"), false);
+    assert!(view.packages[0].since.is_none(), "{view:?}");
+    assert_eq!(view.notes.len(), 1, "{view:?}");
+    // A token never stored here (mistyped, say) is not said to have expired.
+    assert!(view.notes[0].contains("(never stored there, or removed since;"), "{view:?}");
+    assert!(view.notes[0].ends_with("no base"), "{view:?}");
+}
+
+/// A pointer that is there but cannot be read is noted, never silently
+/// dropped; one that is not there is a first run and says nothing.
+#[test]
+fn a_pointer_that_cannot_be_read_is_noted() {
+    let target = tempfile::tempdir().unwrap();
+    let record = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
+    let request = DeltaRequest::default();
+    let first = shown(target.path(), &record, &request, Some("me"), false);
+    assert!(first.notes.is_empty(), "{first:?}");
+    let parsed = parse_package_ndjson(&record[0].1).unwrap();
+    let pointer = pointer_path(&snapshots_dir(target.path()), "me", &parsed);
+    std::fs::write(&pointer, [0xff, 0xfe, b'\n']).unwrap();
+    let view = shown(target.path(), &record, &request, Some("me"), false);
+    assert!(view.packages[0].since.is_none(), "{view:?}");
+    assert!(view.notes[0].starts_with("your pointer `"), "{view:?}");
+    assert!(view.notes[0].contains("cannot be read") && view.notes[0].ends_with("no base"));
+}
+
+/// Every base of a run is read before any snapshot is stored, so one
+/// package's store (and the pruning it does) never removes another package's
+/// base before it is compared with.
+#[test]
+fn every_base_of_a_run_is_read_before_any_snapshot_is_stored() {
+    let target = tempfile::tempdir().unwrap();
+    let dir = snapshots_dir(target.path());
+    let request = DeltaRequest::default();
+    let run = |status: &str| {
+        vec![
+            ("alpha".to_string(), ndjson_named("alpha", &[(A, status, "solved")])),
+            ("beta".to_string(), ndjson_named("beta", &[(A, status, "solved")])),
+        ]
+    };
+    let first = shown(target.path(), &run("proved"), &request, Some("me"), false);
+    let beta_base = first.packages[1].now.clone().unwrap();
+    // beta's base has not been used for more than the retention.
+    let week_ago = SystemTime::now() - SNAPSHOT_RETENTION - Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join(&beta_base))
+        .unwrap()
+        .set_modified(week_ago)
+        .unwrap();
+    // alpha's new snapshot is stored first and prunes; beta's base was read.
+    let second = shown(target.path(), &run("failed"), &request, Some("me"), false);
+    assert!(second.notes.is_empty(), "{second:?}");
+    assert_eq!(second.packages[1].since.as_ref().map(|(token, _)| token), Some(&beta_base));
+}
+
+/// With `--all-rows` and a base, where the command prints no listing of its
+/// own, the full listing already shows each unchanged row that is not plainly
+/// proved, so it prints once, not again as `STILL`.
+#[test]
+fn with_all_rows_and_a_base_each_row_prints_once() {
+    let target = tempfile::tempdir().unwrap();
+    let record =
+        vec![("demo".to_string(), ndjson(&[(A, "proved", "solved"), (B, "failed", "solved")]))];
+    let all = DeltaRequest { since: None, all_rows: true };
+    shown(target.path(), &record, &all, Some("me"), true);
+    let again = shown(target.path(), &record, &all, Some("me"), true);
+    assert!(again.packages[0].since.is_some(), "{again:?}");
+    let lines = again.lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].starts_with("[PROVED]  demo::a#"), "{lines:?}");
+    assert!(lines[1].starts_with("[FAILED]  demo::b#"), "{lines:?}");
+    assert!(lines.iter().all(|line| !line.starts_with("STILL")), "{lines:?}");
+}
+
+/// `--since` gives its snapshot's package that base and every other package of
+/// the run none: no pointer stands in for a base the caller did not name.
+#[test]
+fn a_since_for_one_package_leaves_the_others_without_a_base() {
+    let target = tempfile::tempdir().unwrap();
+    let run = vec![
+        ("alpha".to_string(), ndjson_named("alpha", &[(A, "proved", "solved")])),
+        ("beta".to_string(), ndjson_named("beta", &[(A, "proved", "solved")])),
+    ];
+    let first = shown(target.path(), &run, &DeltaRequest::default(), Some("me"), false);
+    let alpha = first.packages[0].now.clone().unwrap();
+    let since = DeltaRequest { since: Some(alpha.clone()), all_rows: false };
+    let view = shown(target.path(), &run, &since, Some("me"), false);
+    assert_eq!(view.packages[0].since.as_ref().map(|(token, _)| token), Some(&alpha));
+    assert!(view.packages[1].since.is_none(), "beta's pointer is not used: {view:?}");
+    assert!(!view.replaces_listing());
+    assert_eq!(view.notes.len(), 1, "{view:?}");
+    assert!(view.notes[0].ends_with("the run's other packages have no base"), "{view:?}");
+
+    // A snapshot of a package the run does not snapshot gives no package a base.
+    let only_beta = vec![run[1].clone()];
+    let view = shown(target.path(), &only_beta, &since, Some("me"), false);
+    assert!(view.packages[0].since.is_none(), "{view:?}");
+    assert!(view.notes[0].contains("which this run does not snapshot; no base"), "{view:?}");
+}
+
+fn age(path: &Path, by: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - by)
+        .unwrap();
+}
+
+/// A pointer is kept longer than the snapshot it names, so a base the 7-day
+/// pruning removed is named in a note; a pointer nobody wrote for 30 days is
+/// removed by the next prune, and its caller starts again with no base and no
+/// note.
+#[test]
+fn a_pointer_outlives_its_pruned_snapshot_so_the_loss_is_noted() {
+    let target = tempfile::tempdir().unwrap();
+    let dir = snapshots_dir(target.path());
+    let request = DeltaRequest::default();
+    let mine = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
+    let parsed = parse_package_ndjson(&mine[0].1).unwrap();
+    let pointer = pointer_path(&dir, "me", &parsed);
+    let token =
+        shown(target.path(), &mine, &request, Some("me"), false).packages[0].now.clone().unwrap();
+    // Neither the snapshot nor the pointer was used for 8 days; another
+    // caller's new snapshot prunes the snapshot only.
+    let eight_days = SNAPSHOT_RETENTION + Duration::from_secs(24 * 60 * 60);
+    age(&dir.join(&token), eight_days);
+    age(&pointer, eight_days);
+    let theirs = vec![("demo".to_string(), ndjson(&[(A, "failed", "solved")]))];
+    shown(target.path(), &theirs, &request, Some("other"), false);
+    assert!(!dir.join(&token).exists() && pointer.is_file());
+    let view = shown(target.path(), &mine, &request, Some("me"), false);
+    assert!(view.packages[0].since.is_none(), "{view:?}");
+    assert_eq!(
+        view.notes,
+        [format!("your previous snapshot {token} of `demo` was removed; no base")],
+        "{view:?}"
+    );
+
+    // Thirty-one days without a run: the pointer goes too, silently.
+    let month = POINTER_RETENTION + Duration::from_secs(24 * 60 * 60);
+    age(&dir.join(&token), month);
+    age(&pointer, month);
+    let newer = vec![("demo".to_string(), ndjson(&[(A, "unknown", "not-dispatched")]))];
+    shown(target.path(), &newer, &request, Some("other"), false);
+    assert!(!pointer.exists(), "a pointer nobody wrote for 30 days is removed");
+    let view = shown(target.path(), &mine, &request, Some("me"), false);
+    assert!(view.packages[0].since.is_none() && view.notes.is_empty(), "{view:?}");
+}
+
+/// A pointer nobody wrote for 30 days is not read even when no prune has
+/// removed it: a caller alone in its target directory, whose pointer and
+/// snapshot are both still there, starts again with no base and no note, and
+/// so does one whose snapshot alone was pruned.
+#[test]
+fn a_pointer_nobody_wrote_for_thirty_days_is_not_read_before_any_prune() {
+    let target = tempfile::tempdir().unwrap();
+    let dir = snapshots_dir(target.path());
+    let request = DeltaRequest::default();
+    let mine = vec![("demo".to_string(), ndjson(&[(A, "proved", "solved")]))];
+    let pointer = pointer_path(&dir, "me", &parse_package_ndjson(&mine[0].1).unwrap());
+    let token =
+        shown(target.path(), &mine, &request, Some("me"), false).packages[0].now.clone().unwrap();
+    let month = POINTER_RETENTION + Duration::from_secs(24 * 60 * 60);
+    age(&pointer, month);
+    assert!(pointer.is_file() && dir.join(&token).is_file(), "nothing was pruned");
+    let view = publish(target.path(), &mine, &request, Some("me"), false);
+    assert!(view.packages[0].since.is_none() && view.notes.is_empty(), "{view:?}");
+
+    // The snapshot alone was pruned (another caller's write, between 7 and 30
+    // days): the expired pointer gives no `was removed` note either.
+    std::fs::remove_file(dir.join(&token)).unwrap();
+    let view = publish(target.path(), &mine, &request, Some("me"), false);
+    assert!(view.packages[0].since.is_none() && view.notes.is_empty(), "{view:?}");
+}
+
+/// With nowhere to keep the records (a `.lean` check that can name no target
+/// directory), the view still lists every row that is not plainly proved, with
+/// a summary line that names no token, and moves no pointer.
+#[test]
+fn a_view_with_nowhere_to_store_still_lists_the_rows_not_plainly_proved() {
+    let record = vec![(
+        "demo".to_string(),
+        ndjson(&[
+            (A, "proved", "solved"),
+            (B, "failed", "solved"),
+            (C, "unknown", "not-dispatched"),
+        ]),
+    )];
+    let view = unstored(&record, &DeltaRequest::default());
+    assert_eq!(
+        view.lines(),
+        [
+            row("", &obligation(B, "failed", "solved"), None, false),
+            row("", &obligation(C, "unknown", "not-dispatched"), None, false),
+            "demo  3 obligation(s)  (now not stored)".to_string(),
+        ],
+        "{view:?}"
+    );
+    assert!(view.lines()[0].starts_with("[FAILED]  demo::b#"), "{view:?}");
+    assert_eq!(view.commit_pointers(), Vec::<String>::new());
+    let all = unstored(&record, &DeltaRequest { since: None, all_rows: true });
+    assert_eq!(all.lines().len(), 4, "{all:?}");
+}
+
+/// `targo trust delta` refuses a record whose rows the view could not show:
+/// a key that does not split into def path and id, or a key held twice.
+#[test]
+fn a_record_with_a_key_that_cannot_be_matched_is_refused() {
+    let good = parse_package_ndjson(&ndjson(&[(A, "failed", "solved")])).unwrap();
+    assert_eq!(keyed_once(&good), Ok(()));
+    let mut unsplit = good.clone();
+    unsplit.obligations[0].key = "demo::a#zz".to_string();
+    assert!(keyed_once(&unsplit).unwrap_err().contains("`demo::a#zz` is not"));
+    let mut twice = good.clone();
+    twice.obligations.push(twice.obligations[0].clone());
+    assert!(keyed_once(&twice).unwrap_err().ends_with("appears twice"));
 }

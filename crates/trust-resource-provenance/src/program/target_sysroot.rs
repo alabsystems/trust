@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 use sha2::Digest as _;
-use sha2::Sha256;
+use sha2::{NativeSha256, Sha256};
 
 use super::*;
 
@@ -517,7 +517,10 @@ impl NamespacePlan {
                 }
                 package_header(hash, &path, &selected, &before, false)?;
             }
-            let mut hash = Sha256::new();
+            // The same SHA-256 digest as the portable package aggregate. Use the
+            // existing native compression for complete target file observations,
+            // as HeldProgram already does for the compiler/runtime images.
+            let mut hash = NativeSha256::new();
             let mut offset = 0u64;
             let mut buffer = [0u8; 65536];
             while offset < before.len() {
@@ -965,3 +968,7 @@ fn selection(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "target_sysroot/native_hash_tests.rs"]
+mod native_hash_tests;

@@ -2,7 +2,7 @@
 # TyEncodable MIR wire layout under the METADATA_VERSION below. Re-record
 # ONLY after bumping METADATA_VERSION:
 #   ./x.py test compiler/rustc_metadata --bless
-METADATA_VERSION 23
+METADATA_VERSION 24
 Statement/Nop: span u32:1 u8:10 u8:0 u8:0
 Statement/Nop+debuginfos: span u32:1 u8:10 u8:1 usize:2 u8:0 u32:2 u32:3 usize:0 u8:1 u32:4 u8:0
 Statement/Assign(BinaryOp)+trust_modular_arith: span u32:1 u8:0 u32:1 usize:0 u8:6 u8:2 u8:0 u32:2 usize:0 u8:1 u32:3 usize:0 u8:0 u8:1

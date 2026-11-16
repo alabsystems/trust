@@ -60,6 +60,13 @@ const BOOL_VALUE_SUBJECT_MODULE_NAME: &str =
 /// In-memory standalone Lean admission from an accepted, retained source batch.
 pub mod standalone;
 
+/// Reauthenticate a published carrier subject after identity-ABI codegen relocation.
+/// This reader does not change any backend's admission policy.
+pub mod codegen;
+/// Independent, non-authorizing reflection of actual direct-call SSA bodies.
+pub mod rust_calls;
+pub use codegen::{CodegenRelocation, authenticate_codegen};
+
 /// Plan step 3.1: the select, comparison-value and Bool-value families (coverage; not join
 /// targets — see the module docs).
 pub mod family;

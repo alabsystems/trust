@@ -87,13 +87,13 @@ inductive SMWrite : Type
 def sm_read_slot (t : SMTy) (s : SMSlot) : SMRead :=
   match s with
   | SMSlot.uninitialized => SMRead.fault SMFault.uninitialized
-  | SMSlot.value v => Bool.rec (fun _ => SMRead)
+  | SMSlot.value v => @Bool.rec (fun _ => SMRead)
       (SMRead.fault SMFault.typeMismatch) (SMRead.value v) (sm_has_type t v)
 
 def sm_read (frame : SMFrame) (index : Nat) : SMRead :=
-  SMFrame.rec (fun _ => Nat → SMRead)
+  @SMFrame.rec (fun _ => Nat → SMRead)
     (fun _ => SMRead.fault SMFault.badLocal)
-    (fun t s rest ih => fun i => Nat.rec (fun _ => SMRead)
+    (fun t s rest ih => fun i => @Nat.rec (fun _ => SMRead)
       (sm_read_slot t s) (fun n _ => ih n) i) frame index
 
 def sm_prepend_write (t : SMTy) (s : SMSlot) (w : SMWrite) : SMWrite :=
@@ -102,10 +102,10 @@ def sm_prepend_write (t : SMTy) (s : SMSlot) (w : SMWrite) : SMWrite :=
   | SMWrite.fault fault => SMWrite.fault fault
 
 def sm_write (frame : SMFrame) (index : Nat) (value : SMValue) : SMWrite :=
-  SMFrame.rec (fun _ => Nat → SMValue → SMWrite)
+  @SMFrame.rec (fun _ => Nat → SMValue → SMWrite)
     (fun _ _ => SMWrite.fault SMFault.badLocal)
-    (fun t s rest ih => fun i v => Nat.rec (fun _ => SMWrite)
-      (Bool.rec (fun _ => SMWrite) (SMWrite.fault SMFault.typeMismatch)
+    (fun t s rest ih => fun i v => @Nat.rec (fun _ => SMWrite)
+      (@Bool.rec (fun _ => SMWrite) (SMWrite.fault SMFault.typeMismatch)
         (SMWrite.frame (SMFrame.cons t (SMSlot.value v) rest)) (sm_has_type t v))
       (fun n _ => sm_prepend_write t s (ih n v)) i) frame index value
 
@@ -116,7 +116,7 @@ def sm_widen (value : SMValue) : SMRead :=
 
 def sm_add8 (checked : Bool) (a : UInt8) (right : SMValue) : SMRead :=
   match right with
-  | SMValue.u8 b => Bool.rec (fun _ => SMRead)
+  | SMValue.u8 b => @Bool.rec (fun _ => SMRead)
       (SMRead.value (SMValue.u8 (UInt8.add a b)))
       (SMRead.value (SMValue.pair8 (UInt8.add a b)
         (Nat.ble 256 (Nat.add (UInt8.toNat a) (UInt8.toNat b))))) checked
@@ -124,7 +124,7 @@ def sm_add8 (checked : Bool) (a : UInt8) (right : SMValue) : SMRead :=
 
 def sm_add16 (checked : Bool) (a : UInt16) (right : SMValue) : SMRead :=
   match right with
-  | SMValue.u16 b => Bool.rec (fun _ => SMRead)
+  | SMValue.u16 b => @Bool.rec (fun _ => SMRead)
       (SMRead.value (SMValue.u16 (UInt16.add a b)))
       (SMRead.value (SMValue.pair16 (UInt16.add a b)
         (Nat.ble 65536 (Nat.add (UInt16.toNat a) (UInt16.toNat b))))) checked
@@ -221,7 +221,7 @@ def sm_assign (pc : Nat) (rest : SMProgram) (frame : SMFrame)
 def sm_assert_value (pc : Nat) (rest : SMProgram) (frame : SMFrame)
     (trace : SMTrace) (expected : Bool) (value : SMValue) : SMState :=
   match value with
-  | SMValue.bool actual => Bool.rec (fun _ => SMState)
+  | SMValue.bool actual => @Bool.rec (fun _ => SMState)
       (SMState.halted SMOutcome.panic frame trace)
       (SMState.running pc rest frame trace) (Bool.beq actual expected)
   | _ => SMState.halted (SMOutcome.fault SMFault.typeMismatch) frame trace
@@ -260,7 +260,7 @@ def sm_step (state : SMState) : SMState :=
   | SMState.halted outcome frame trace => SMState.halted outcome frame trace
 
 def sm_run (fuel : Nat) (initial : SMState) : SMState :=
-  Nat.rec (fun _ => SMState) initial (fun _ previous => sm_step previous) fuel
+  @Nat.rec (fun _ => SMState) initial (fun _ previous => sm_step previous) fuel
 
 inductive SMObservation : Type
 | mk : SMOutcome → SMFrame → SMTrace → SMObservation

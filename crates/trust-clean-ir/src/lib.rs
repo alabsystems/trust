@@ -4,6 +4,10 @@
 
 //! Clean -> TrustIR.
 //!
+//! [`closure_proposal`] separately produces untrusted candidate DATA from
+//! actual CIC definitions. Every proposed body is explicitly Ungated; this
+//! API neither consumes nor mints a carrier plan or source-refinement token.
+//!
 //! The two-language design makes Rust and Clean co-equal authoritative
 //! languages and names TrustIR the target universal IR. Rust already reaches
 //! TrustIR (the THIR frontend behind `-Ztrust-ir-lower`, plus the MIR-derived
@@ -393,6 +397,8 @@
 //! and nothing is released at all. That is what the kernel-agreement harness
 //! does when its executable substitute models `Nat` as a VALUE — there is no
 //! allocation to release, and the shapes that leak leak identically either way.
+
+pub mod closure_proposal;
 
 use trust_clean_carrier::{CarrierSignature, CleanType};
 use trust_clean_origin::{BoolExpr, UIntConditional, UINT_CONDITIONAL_MAX_DECISIONS};

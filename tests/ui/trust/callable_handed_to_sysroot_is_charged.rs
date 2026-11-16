@@ -1,4 +1,5 @@
 //@ revisions: fnptr_foreign fold_fnitem map_unwrap sort split map_some local_item reify_local
+//@ revisions: reify_reassigned
 //@ revisions: trim_numeric map_abs
 //@ revisions: fold_div_ceil reduce_pow fold_signed_pow try_fold_checked_pow fold_wrapping_pow
 //@ revisions: fold_div_operator fold_rem_operator_ref fold_wrapping_div_operator
@@ -26,7 +27,8 @@
 //@[split] check-pass
 //@[map_some] check-pass
 //@[local_item] check-pass
-//@[reify_local] check-fail
+//@[reify_local] check-pass
+//@[reify_reassigned] check-fail
 //@[fold_div_ceil] check-fail
 //@[reduce_pow] check-fail
 //@[fold_signed_pow] check-fail
@@ -308,16 +310,35 @@ pub fn f(v: &[u32]) -> bool {
     v.iter().any(is_even)
 }
 
-#[cfg(reify_local)]
+#[cfg(any(reify_local, reify_reassigned))]
 fn g(a: u32, b: u32) -> u32 {
     a.wrapping_add(b)
 }
 #[cfg(reify_local)]
-// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
-//[reify_local]~vv ERROR Trust strict verification failed for `callable_handed_to_sysroot_is_charged::f`
-//[reify_local]~v NOTE this function has no obligation of its own
+// ZERO-ROW-GATE (2026-10-10) refused this zero-row body: a call no authenticated registry
+// discharged published an `unknown` row. Since 53f0e0fee89 (2026-11-14, DECISION_QUEUE
+// REIFIED-FNPTR-CHARGE-1) a pointer with one dominating constant reification is bound to that
+// exact target, and the call is discharged when the target is in the unconditional panic-free
+// registry, as the total `g` is: it builds (one row, proved). `reify_reassigned` is the control
+// that is still refused.
 pub fn f(b: u32) -> u32 {
     let p: fn(u32, u32) -> u32 = g;
+    p(100, b)
+}
+
+#[cfg(reify_reassigned)]
+fn h(a: u32, b: u32) -> u32 {
+    a.wrapping_mul(b)
+}
+#[cfg(reify_reassigned)]
+// Both targets are total, but the pointer has two reaching reifications, so neither is the
+// unique dominating one and the call stays an unresolved indirect call: refused.
+//[reify_reassigned]~v ERROR Trust strict verification failed for `callable_handed_to_sysroot_is_charged::f`
+pub fn f(b: u32, c: bool) -> u32 {
+    let mut p: fn(u32, u32) -> u32 = g;
+    if c {
+        p = h;
+    }
     p(100, b)
 }
 

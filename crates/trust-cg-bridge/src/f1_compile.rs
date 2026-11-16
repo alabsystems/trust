@@ -12,8 +12,8 @@
 //
 // WHAT IT DOES, in order, on ONE thread of its own (`GATE_STACK_BYTES`):
 //   1. BOUNDARY — a body trust-cg must not see is refused before trust-cg sees
-//      it: a Clean-origin body (step 3 owns admitting those), a body of a
-//      deprecated producer (tSwift, tC), and any body carrying a check with no
+//      it: a Clean-origin body without an explicit authenticated admission,
+//      a body of a deprecated producer (tSwift, tC), and any body carrying a check with no
 //      faithful panic to deliver: an `Assert` without a `PanicSite` (there is
 //      no entry to call and no location to report), a sited `Assert` whose
 //      kind is `Unspecified` (the check names no Rust panic), and every
@@ -37,7 +37,10 @@
 //      `trust-direct-lane-structural` and `trust-instance-lane-structural`,
 //      plus `trust-upstream-mir-lane` only when the caller says that flag is
 //      set; a claim-less body is REFUSED). Every row is reported; nothing is
-//      compiled when there is one.
+//      compiled when there is one. The explicit `clean-codegen` API recognizes
+//      `clean-carrier-gate` only after checking every Clean body's live token,
+//      identity-ABI relocation and exact output-gate producer binding. A copied
+//      stamp, an omitted permission or a stamp on another producer refuses.
 //   3. COMPILE — `Compiler::compile` with the configuration of design §3.2:
 //      proofs, debug info, unwind tables, the superoptimizer, the artifact
 //      cache and the parallel pipeline all off.
@@ -58,8 +61,9 @@
 //
 // WHAT IT DOES NOT DO. It does not build M_cg, S or P (the rustc plugin does,
 // from rustc's FnAbi, at step 5.4.2); it trusts none of them either — the gate
-// reads the producer bodies and P against the bytes. Nothing in the rustc
-// plugin calls this module at 5.4.1, so nothing ships through it yet.
+// reads the producer bodies and P against the bytes. The rustc plugin calls
+// the ordinary API; the explicit Clean API is not yet wired to
+// rustc's current-Session ledger. A library admission is never a Session check.
 //
 // FAIL-CLOSED. A panic anywhere on the gate thread is a refusal
 // (`F1Refusal::Gate`); a stack overflow aborts the process before an object
@@ -91,6 +95,10 @@ use crate::call_event::{
 use crate::compiled_object::{ObjectRefusal, RelocationModel, hex};
 use crate::verify_output::EmitPolicy;
 
+mod clean_admission;
+use clean_admission::CleanBoundary;
+#[cfg(feature = "clean-codegen")]
+pub use clean_admission::{CleanCodegenAdmission, StandaloneCodegenAdmission};
 #[path = "f1_compile/native_questions.rs"]
 mod native_questions;
 pub use native_questions::{F1NativeQuestionCompilation, NativeQuestionFunctionBinding};
@@ -258,6 +266,14 @@ impl F1CompileConfig {
     }
 
     fn compiler_with_config(&self, effective: CompilerConfig) -> Result<Compiler, F1Refusal> {
+        self.compiler_with_clean(effective, CleanBoundary::none())
+    }
+
+    fn compiler_with_clean(
+        &self,
+        effective: CompilerConfig,
+        clean: CleanBoundary<'_>,
+    ) -> Result<Compiler, F1Refusal> {
         let spec = TargetSpec::parse(self.target.triple()).map_err(|e| {
             F1Refusal::Compile(CensusRow {
                 func: None,
@@ -267,7 +283,7 @@ impl F1CompileConfig {
             })
         })?;
         Ok(Compiler::new_for_target_spec(effective, spec)
-            .with_codegen_license(f1_codegen_license(self.upstream_mir_lane)))
+            .with_codegen_license(clean.license(f1_codegen_license(self.upstream_mir_lane))))
     }
 }
 
@@ -440,6 +456,25 @@ pub fn census_trust_ir_module(
         .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
 }
 
+/// Preflight the same explicit Clean boundary used by the shipping consumer.
+#[cfg(feature = "clean-codegen")]
+pub fn census_trust_ir_module_with_clean(
+    input: &F1CompileInput<'_>,
+    admissions: &[CleanCodegenAdmission<'_>],
+) -> Result<Vec<CensusRow>, F1Refusal> {
+    on_gate_thread(|| {
+        let clean = CleanBoundary::new(admissions);
+        let mut rows = boundary_rows(input.m_cg, clean);
+        rows.extend(clean.check_input(input));
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        let compiler = input.config.compiler_with_clean(input.config.compiler_config(), clean)?;
+        Ok(census_rows(input.m_cg, &compiler))
+    })
+    .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
+}
+
 fn census_rows(m_cg: &Module, compiler: &Compiler) -> Vec<CensusRow> {
     compiler.preflight(m_cg).iter().map(|(id, e)| row_for(m_cg, Some(*id), e)).collect()
 }
@@ -451,8 +486,41 @@ pub fn compile_and_verify_trust_ir_module(
     input: &F1CompileInput<'_>,
 ) -> Result<F1Shipped, F1Refusal> {
     let mut unused = None;
-    on_gate_thread(|| compile_and_verify(input, false, &mut unused))
+    on_gate_thread(|| compile_and_verify(input, false, &mut unused, CleanBoundary::none()))
         .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
+}
+
+/// Compile with in-memory Clean permissions. Each permission must bind both
+/// the actual M_cg body and the producer body the output gate will read.
+/// Callers in rustc must obtain the published tokens from the current Session's
+/// authenticated ledger. This API never reads a serialized stamp as authority.
+#[cfg(feature = "clean-codegen")]
+pub fn compile_and_verify_trust_ir_module_with_clean(
+    input: &F1CompileInput<'_>,
+    admissions: &[CleanCodegenAdmission<'_>],
+) -> Result<F1Shipped, F1Refusal> {
+    let mut unused = None;
+    on_gate_thread(|| compile_and_verify(input, false, &mut unused, CleanBoundary::new(admissions)))
+        .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
+}
+
+/// Compile exact standalone Lean publications with their distinct typed custody.
+/// The same strict output gate decides shipping; this adds no runtime or caller rule.
+#[cfg(feature = "clean-codegen")]
+pub fn compile_and_verify_trust_ir_module_with_standalone(
+    input: &F1CompileInput<'_>,
+    admissions: &[StandaloneCodegenAdmission<'_>],
+) -> Result<F1Shipped, F1Refusal> {
+    if !matches!(input.policy, EmitPolicy::StrictProvenOnly) {
+        return Err(F1Refusal::Policy(
+            "standalone object emission requires StrictProvenOnly; unknown rows never ship".into(),
+        ));
+    }
+    let mut unused = None;
+    on_gate_thread(|| {
+        compile_and_verify(input, false, &mut unused, CleanBoundary::standalone(admissions))
+    })
+    .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
 }
 
 /// Bind diagnostic native questions to the exact module the ordinary F1
@@ -466,7 +534,7 @@ pub fn compile_and_verify_trust_ir_module_with_native_questions(
     on_gate_thread(|| {
         let correspondence = native_questions::bind(input.m_cg, questions)?;
         let mut unused = None;
-        let shipped = compile_and_verify(input, false, &mut unused)?;
+        let shipped = compile_and_verify(input, false, &mut unused, CleanBoundary::none())?;
         Ok(F1NativeQuestionCompilation::new(shipped, correspondence))
     })
     .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)))
@@ -486,8 +554,21 @@ pub struct F1Captured {
 /// and gate run once, including on a later Strict refusal. No capture is made
 /// by the normal API. Capture refusal leaves the ordinary outcome unchanged.
 pub fn compile_and_verify_trust_ir_module_captured(input: &F1CompileInput<'_>) -> F1Captured {
+    compile_captured(input, CleanBoundary::none())
+}
+
+/// Capture the same non-authorizing data while retaining explicit Clean admission.
+#[cfg(feature = "clean-codegen")]
+pub fn compile_and_verify_trust_ir_module_with_clean_captured(
+    input: &F1CompileInput<'_>,
+    admissions: &[CleanCodegenAdmission<'_>],
+) -> F1Captured {
+    compile_captured(input, CleanBoundary::new(admissions))
+}
+
+fn compile_captured(input: &F1CompileInput<'_>, clean: CleanBoundary<'_>) -> F1Captured {
     let mut retained = None;
-    let outcome = on_gate_thread(|| compile_and_verify(input, true, &mut retained))
+    let outcome = on_gate_thread(|| compile_and_verify(input, true, &mut retained, clean))
         .unwrap_or_else(|panic| Err(F1Refusal::Gate(panic)));
     F1Captured {
         outcome,
@@ -508,11 +589,13 @@ fn compile_and_verify(
             crate::compiler_input_capture::CaptureIncomplete,
         >,
     >,
+    clean: CleanBoundary<'_>,
 ) -> Result<F1Shipped, F1Refusal> {
     let m_cg = input.m_cg;
 
     // 1. Boundary.
-    let boundary = boundary_rows(m_cg);
+    let mut boundary = boundary_rows(m_cg, clean);
+    boundary.extend(clean.check_input(input));
     if !boundary.is_empty() {
         return Err(F1Refusal::Boundary(boundary));
     }
@@ -526,7 +609,7 @@ fn compile_and_verify(
             &effective,
         )
     });
-    let compiler = input.config.compiler_with_config(effective)?;
+    let compiler = input.config.compiler_with_clean(effective, clean)?;
     let census = census_rows(m_cg, &compiler);
     if !census.is_empty() {
         return Err(F1Refusal::Census(census));
@@ -595,7 +678,7 @@ fn compile_and_verify(
 }
 
 /// F1's own codegen boundary over M_cg's bodies.
-fn boundary_rows(m_cg: &Module) -> Vec<CensusRow> {
+fn boundary_rows(m_cg: &Module, clean: CleanBoundary<'_>) -> Vec<CensusRow> {
     let mut rows = Vec::new();
     for f in m_cg.functions.iter().filter(|f| !f.is_declaration()) {
         let mut push = |variant: &str, detail: String| {
@@ -607,7 +690,7 @@ fn boundary_rows(m_cg: &Module) -> Vec<CensusRow> {
             });
         };
         match &f.producer {
-            Some(Producer::Clean) => push(
+            Some(Producer::Clean) if !clean.contains(f.id) => push(
                 "CleanOriginBelowCodegenGate",
                 "a Clean-origin body is not admitted to F1 codegen (step 3 owns admitting it)"
                     .into(),

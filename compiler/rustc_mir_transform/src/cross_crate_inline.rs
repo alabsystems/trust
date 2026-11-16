@@ -15,19 +15,25 @@ pub(super) fn provide(providers: &mut Providers) {
 }
 
 fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    // Trust: (I7, plan S6) — a Clean-origin def is ALWAYS cross-crate inlinable.
-    // Its gated MIR always travels (`should_encode_mir`'s registry arm), and
-    // `true` here is what excludes it from `reachable_non_generics` — the
-    // mechanism is symbol_export's cross_crate_inlinable filter (the I7 review's
-    // corrected chain), NOT absence from `reachable_set` (in a `pub mod` of an
-    // rlib the def IS reachable). Consequence: an importing crate codegens ITS
-    // OWN copy through the guarded extern decode arms — the readmission
-    // chokepoint — instead of linking an upstream symbol its own readmission
-    // never saw and which the exporter (whose mono roots are HIR-driven) never
-    // emits. Registry lookup first, before `codegen_fn_attrs`: a Clean-origin
-    // def is exactly what HIR-derived inventories cannot see, and this def's
-    // attrs are a fed empty map.
+    // Clean definitions outside the Compiler F1 rlib lane remain cross-crate
+    // inlinable: their gated MIR travels and the importer produces its own
+    // copy through readmission. Synthetic definitions have no HIR body, so
+    // consult the registry before the ordinary attribute-driven policy.
     if clean_origin_mir::is_clean_origin(tcx, def_id) {
+        // The Compiler F1 rlib inventories public synthetic definitions and
+        // emits their native symbols. Preserve those bytes across a Rust
+        // consumer instead of asking its backend to compile another copy.
+        // The collector re-admits imported Clean definitions before linking;
+        // the metadata's gated MIR remains available for CTFE/readmission.
+        if matches!(
+            tcx.sess.opts.unstable_opts.codegen_backend.as_deref(),
+            Some("trust-cg" | "trust_cg")
+        ) && tcx.sess.trust_cg_frontend_is_trust_ir()
+            && tcx.sess.trust_cg_f1_backend_is_compiler()
+            && tcx.crate_types().contains(&rustc_structures::CrateType::Rlib)
+        {
+            return false;
+        }
         return true;
     }
     let codegen_fn_attrs = tcx.codegen_fn_attrs(def_id);

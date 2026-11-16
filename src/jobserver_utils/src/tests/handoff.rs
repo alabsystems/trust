@@ -709,8 +709,7 @@ fn endpoint_debug_never_discloses_its_capability() {
 // Trust: actual sockets, byte-length selection, private custody and cleanup.
 #[test]
 fn oversized_temp_paths_keep_private_bounded_endpoints() {
-    let base = PathBuf::from("/tmp").join(format!("tjs-path-{}", hex(&random().unwrap()[..8])));
-    std::fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+    let base = short_base("path");
     for component in ["x".repeat(128), "é".repeat(64)] {
         let long = base.join(component);
         std::fs::create_dir(&long).unwrap();
@@ -735,7 +734,7 @@ fn oversized_temp_paths_keep_private_bounded_endpoints() {
     // Short explicit bases still control placement. A missing long base must
     // not get silently repaired by selecting the system temporary directory.
     let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
-    assert_eq!(endpoint._directory.path.parent().unwrap(), base);
+    assert_eq!(endpoint._directory.path.parent().unwrap(), &*base);
     drop(endpoint);
     let missing = base.join("m".repeat(128));
     assert_eq!(
@@ -750,11 +749,58 @@ fn oversized_temp_paths_keep_private_bounded_endpoints() {
 // destructor run, and a refused folder or socket names its operation and path.
 
 /// A private fixture under the short `/tmp`, so the branch a test takes does
-/// not depend on the length of the runner's TMPDIR.
-fn short_base(tag: &str) -> PathBuf {
+/// not depend on the length of the runner's TMPDIR. A test that passes finds
+/// it empty and removes it; one that fails first leaves it to this guard,
+/// which removes it with whatever it still holds.
+struct ShortBase(PathBuf);
+
+impl std::ops::Deref for ShortBase {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for ShortBase {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<OsStr> for ShortBase {
+    fn as_ref(&self) -> &OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for ShortBase {
+    fn drop(&mut self) {
+        remove_tree(&self.0);
+    }
+}
+
+/// Remove what is at `path`, a folder with all it holds. It does what it can
+/// and never panics: it runs while a failed test unwinds.
+fn remove_tree(path: &std::path::Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else { return };
+    if !metadata.is_dir() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    if let Ok(listing) = std::fs::read_dir(path) {
+        for entry in listing.flatten() {
+            remove_tree(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
+
+fn short_base(tag: &str) -> ShortBase {
     let base = PathBuf::from("/tmp").join(format!("tjs-{tag}-{}", hex(&random().unwrap()[..8])));
     std::fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
-    base
+    ShortBase(base)
 }
 
 fn entries(base: &std::path::Path) -> Vec<PathBuf> {
@@ -762,6 +808,11 @@ fn entries(base: &std::path::Path) -> Vec<PathBuf> {
         std::fs::read_dir(base).unwrap().map(|entry| entry.unwrap().path()).collect();
     entries.sort();
     entries
+}
+
+/// What a live endpoint's folder holds (RL-65): the marker and the socket.
+fn marked(folder: &std::path::Path) -> [PathBuf; 2] {
+    [folder.join("l"), folder.join("s")]
 }
 
 const EXIT_TEST: &str = "handoff::tests::process_exit_removes_a_parked_endpoint_folder";
@@ -798,8 +849,12 @@ fn process_exit_removes_a_parked_endpoint_folder() {
     run("_exit");
     let left = entries(&base);
     assert_eq!(left.len(), 1, "{left:?}");
-    assert_eq!(entries(&left[0]), [left[0].join("s")]);
-    std::fs::remove_file(left[0].join("s")).unwrap();
+    assert_eq!(entries(&left[0]), marked(&left[0]));
+    // Removed by hand, so that the next run's sweep (RL-65) finds nothing and
+    // the exit handler alone is what leaves the base empty.
+    for entry in marked(&left[0]) {
+        std::fs::remove_file(entry).unwrap();
+    }
     std::fs::remove_dir(&left[0]).unwrap();
     run("exit");
     assert_eq!(entries(&base), Vec::<PathBuf>::new(), "exit(3) left a job-server folder");
@@ -961,7 +1016,7 @@ fn explicit_removal_takes_a_live_folder_and_a_later_drop_is_harmless() {
         let base = short_base("remove");
         let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
         let folder = endpoint._directory.path.clone();
-        assert_eq!(entries(&folder), [folder.join("s")]);
+        assert_eq!(entries(&folder), marked(&folder));
         remove_endpoint_directories();
         assert_eq!(entries(&base), Vec::<PathBuf>::new());
         // What now has the folder's name is someone else's, and stays.
@@ -1026,4 +1081,554 @@ fn a_folder_that_cannot_be_opened_is_removed_and_named() {
         assert_eq!(entries(&base), Vec::<PathBuf>::new(), "the unopened folder was left");
         std::fs::remove_dir(base).unwrap();
     });
+}
+
+// Trust (RL-65): a folder whose owner was killed goes when the next endpoint
+// is made beside it. A live owner's folder, a folder without the marker and a
+// folder of any other shape stay.
+
+const HELD_BASE: &str = "TJS_HELD_FOLDER_BASE";
+
+/// In the child that `held_owner` starts: park an endpoint in the base it
+/// names, as Targo parks its compiler-query scheduler, say where, and wait for
+/// standard input to close. It does not return there.
+fn hold_an_endpoint_if_asked() {
+    let Some(base) = std::env::var_os(HELD_BASE) else { return };
+    static PARKED: Mutex<Option<Endpoint>> = Mutex::new(None);
+    let endpoint = Endpoint::new(Arc::new(pipe()), std::path::Path::new(&base)).unwrap();
+    // libtest has already written `test <name> ... ` on this line.
+    println!("\nHELD {}", endpoint._directory.path.display());
+    std::io::stdout().flush().unwrap();
+    *PARKED.lock().unwrap() = Some(endpoint);
+    let _ = std::io::stdin().read(&mut [0]);
+    std::process::exit(0);
+}
+
+/// How long a test waits for an owner process to do what it must: a hang
+/// detector, as `isolated_assertions`' minute is, and no budget.
+const OWNER_WAIT: Duration = Duration::from_secs(60);
+
+/// Another process that owns one folder in `base`. It ends by itself, through
+/// exit(3), when its standard input closes. Dropping this closes that input
+/// and waits for the owner, so a failed test leaves no process behind and its
+/// fixture is not removed under an owner that still runs.
+struct HeldOwner {
+    child: std::process::Child,
+    folder: PathBuf,
+}
+
+/// Whether `descriptor` has something to read, or its end, before `deadline`.
+fn readable_by(descriptor: RawFd, deadline: Instant) -> bool {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let timeout = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut poll = libc::pollfd { fd: descriptor, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one initialized pollfd is writable for this call.
+        match unsafe { libc::poll(&mut poll, 1, timeout) } {
+            0 => return false,
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            -1 => panic!("{}", io::Error::last_os_error()),
+            _ => return true,
+        }
+    }
+}
+
+/// `test` is the calling test's own name; it starts with
+/// `hold_an_endpoint_if_asked`.
+fn held_owner(test: &str, base: &std::path::Path) -> HeldOwner {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(HELD_BASE, base)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut owner = HeldOwner { child, folder: PathBuf::new() };
+    let deadline = Instant::now() + OWNER_WAIT;
+    // Read as the bytes come: libtest leaves `test <name> ... ` without its
+    // newline while the test runs, and a read for a whole line would wait on
+    // an owner that never says more.
+    let mut said = Vec::new();
+    loop {
+        let held = said
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_suffix(b"\n")?.strip_prefix(b"HELD "))
+            .next();
+        if let Some(folder) = held {
+            owner.folder = PathBuf::from(OsStr::from_bytes(folder));
+            return owner;
+        }
+        // An owner that waits, on a lock for one, says nothing and does not end.
+        if !readable_by(output.as_raw_fd(), deadline) {
+            let _ = owner.child.kill();
+            panic!("the owner held no folder in {OWNER_WAIT:?}");
+        }
+        let mut bytes = [0; 4096];
+        let count = output.read(&mut bytes).unwrap();
+        assert_ne!(count, 0, "the owner ended with no folder");
+        said.extend_from_slice(&bytes[..count]);
+    }
+}
+
+impl HeldOwner {
+    /// Let the owner end by exit(3), which removes its folder.
+    fn finish(mut self) {
+        drop(self.child.stdin.take());
+        let status = self.ended().expect("the owner did not end once its input closed");
+        assert!(status.success(), "{status:?}");
+        assert!(!self.folder.exists(), "the owner's own exit left its folder");
+    }
+
+    /// The owner's status once it has ended. An owner that has not ended by
+    /// the deadline is killed, and this is `None`.
+    fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + OWNER_WAIT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for HeldOwner {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.ended();
+    }
+}
+
+/// The folder is whole and its owner's lock is held: a second description of
+/// it, such as a sweep opens, is refused.
+fn assert_live(folder: &std::path::Path) {
+    assert!(folder.exists(), "a live owner's folder {} was removed", folder.display());
+    assert_eq!(entries(folder), marked(folder), "not the marker and the socket");
+    let marker = std::fs::symlink_metadata(folder.join("l")).unwrap();
+    assert!(marker.is_file(), "{marker:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(folder.join("l")).unwrap()),
+        String::from_utf8_lossy(&own_record(folder)),
+        "the marker does not say where the owner's lock lives"
+    );
+    let probe = open_folder(folder).unwrap();
+    assert!(matches!(try_liveness_lock(probe.as_fd()), Ok(false)), "the owner's lock is not held");
+}
+
+/// A folder no process owns: mode 0700, the socket an endpoint leaves, and
+/// whatever `marker` puts beside it.
+fn ownerless_folder(
+    base: &std::path::Path,
+    name: &str,
+    marker: impl FnOnce(&std::path::Path),
+) -> PathBuf {
+    let folder = base.join(name);
+    std::fs::DirBuilder::new().mode(0o700).create(&folder).unwrap();
+    drop(UnixListener::bind(folder.join("s")).unwrap());
+    marker(&folder);
+    folder
+}
+
+/// What the marker of `folder` holds when a process under this kernel made
+/// the folder: this kernel's identity and the folder's device and inode.
+fn own_record(folder: &std::path::Path) -> Vec<u8> {
+    let metadata = std::fs::metadata(folder).unwrap();
+    liveness_record(&kernel_identity().unwrap(), metadata.dev(), metadata.ino())
+}
+
+fn marker_with(folder: &std::path::Path, record: &[u8]) {
+    std::fs::write(folder.join("l"), record).unwrap();
+}
+
+fn plain_marker(folder: &std::path::Path) {
+    marker_with(folder, &own_record(folder));
+}
+
+fn make_fifo(path: &std::path::Path) {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: this fresh pathname is NUL-terminated and owned by this test.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
+}
+
+fn remove_fixture(folder: &std::path::Path) {
+    std::fs::set_permissions(folder, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
+const KILLED_TEST: &str =
+    "handoff::tests::a_killed_owners_folder_goes_when_the_next_endpoint_is_made";
+
+#[test]
+fn a_killed_owners_folder_goes_when_the_next_endpoint_is_made() {
+    use std::os::unix::process::ExitStatusExt;
+    hold_an_endpoint_if_asked();
+    let base = short_base("killed");
+    let mut owner = held_owner(KILLED_TEST, &base);
+    assert_eq!(entries(&base), [owner.folder.clone()]);
+    assert_live(&owner.folder);
+    // `wait` closes the child's standard input before it waits, and an owner
+    // the signal has not ended yet reads that end and starts its own exit,
+    // which unlinks the socket. Held past the wait, the signal alone ends it.
+    let input = owner.child.stdin.take();
+    owner.child.kill().unwrap();
+    assert_eq!(owner.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    drop(input);
+    // The kernel ended the owner, which ran nothing: the folder is as it was.
+    assert_eq!(entries(&base), [owner.folder.clone()]);
+    assert_eq!(entries(&owner.folder), marked(&owner.folder));
+    let next = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert_eq!(entries(&base), [next._directory.path.clone()], "the killed owner's folder stayed");
+    drop(next);
+    assert_eq!(entries(&base), Vec::<PathBuf>::new());
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_folder_whose_owner_was_killed_while_removing_it_goes_too() {
+    let base = short_base("partial");
+    // Removal unlinks the socket first: an owner killed straight after that
+    // leaves the marker alone in its folder.
+    let stale = ownerless_folder(&base, "tjs-00000000000000cc", |folder| {
+        plain_marker(folder);
+        std::fs::remove_file(folder.join("s")).unwrap();
+    });
+    assert_eq!(entries(&stale), [stale.join("l")]);
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert_eq!(
+        entries(&base),
+        [endpoint._directory.path.clone()],
+        "the folder that held the marker alone stayed"
+    );
+    drop(endpoint);
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_live_owners_folder_survives_endpoints_made_by_its_own_process() {
+    let base = short_base("own");
+    let first = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    let folder = first._directory.path.clone();
+    assert_live(&folder);
+    let second = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    let third = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert_live(&folder);
+    assert_live(&second._directory.path);
+    // It still serves: the socket is where its advertisement says.
+    let advertisement = Advertisement::parse(&first.advertisement).unwrap();
+    drop(connect(&advertisement.path, Instant::now() + TIMEOUT).unwrap());
+    drop((second, third));
+    assert_eq!(entries(&base), [folder]);
+    drop(first);
+    assert_eq!(entries(&base), Vec::<PathBuf>::new());
+    std::fs::remove_dir(base).unwrap();
+}
+
+const OTHER_PROCESS_TEST: &str =
+    "handoff::tests::a_live_owners_folder_survives_endpoints_made_by_another_process";
+
+#[test]
+fn a_live_owners_folder_survives_endpoints_made_by_another_process() {
+    hold_an_endpoint_if_asked();
+    let base = short_base("other");
+    // Another process owns a folder while this one makes an endpoint beside it,
+    // and this one owns a folder while a third process makes one beside both.
+    let other = held_owner(OTHER_PROCESS_TEST, &base);
+    let own = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert_live(&other.folder);
+    let third = held_owner(OTHER_PROCESS_TEST, &base);
+    assert_live(&own._directory.path);
+    assert_live(&other.folder);
+    assert_eq!(entries(&base).len(), 3);
+    other.finish();
+    third.finish();
+    assert_eq!(entries(&base), [own._directory.path.clone()]);
+    drop(own);
+    assert_eq!(entries(&base), Vec::<PathBuf>::new());
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_folder_without_the_marker_is_never_swept() {
+    let base = short_base("unmarked");
+    // As a pack before RL-65 leaves one: mode 0700, the socket, nothing else.
+    let old = ownerless_folder(&base, "tjs-00000000000000aa", |_| {});
+    // The control differs by the marker alone, and goes.
+    let stale = ownerless_folder(&base, "tjs-00000000000000bb", plain_marker);
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert!(!stale.exists(), "the marked folder beside it was not swept");
+    assert!(old.exists(), "the folder without the marker was swept");
+    assert_eq!(entries(&old), [old.join("s")]);
+    drop(endpoint);
+    assert_eq!(entries(&base), [old.clone()]);
+    remove_fixture(&old);
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_folder_of_any_other_shape_is_never_swept() {
+    let base = short_base("shape");
+    // The control has the shape, and goes.
+    let stale = ownerless_folder(&base, "tjs-0123456789abcdef", plain_marker);
+    let mut kept = Vec::new();
+    // Other permission bits: someone else could have written the marker.
+    let open = ownerless_folder(&base, "tjs-1000000000000000", plain_marker);
+    std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    kept.push(open);
+    // A marker that is a symlink to a regular file holding the folder's
+    // record, one that is a folder, and one that is a FIFO from which the
+    // record can be read.
+    kept.push(ownerless_folder(&base, "tjs-2000000000000000", |folder| {
+        std::fs::write(folder.join("target"), own_record(folder)).unwrap();
+        std::os::unix::fs::symlink("target", folder.join("l")).unwrap();
+    }));
+    kept.push(ownerless_folder(&base, "tjs-3000000000000000", |folder| {
+        std::fs::create_dir(folder.join("l")).unwrap();
+    }));
+    let piped =
+        ownerless_folder(&base, "tjs-b000000000000000", |folder| make_fifo(&folder.join("l")));
+    let mut feed = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(piped.join("l"))
+        .unwrap();
+    feed.write_all(&own_record(&piped)).unwrap();
+    kept.push(piped);
+    // Names that are not `tjs-` and sixteen lowercase hexadecimal digits:
+    // fifteen digits, seventeen, uppercase, a suffix, another prefix.
+    for name in [
+        "tjs-400000000000000",
+        "tjs-50000000000000000",
+        "tjs-6ABCDEF000000000",
+        "tjs-7000000000000000.old",
+        "tjx-8000000000000000",
+    ] {
+        kept.push(ownerless_folder(&base, name, plain_marker));
+    }
+    // A matching name that is no folder: a regular file, a link to a folder
+    // that has the shape in everything but its own name, and a FIFO, whose
+    // open as a folder is refused without a wait for a writer.
+    let file = base.join("tjs-9000000000000000");
+    std::fs::write(&file, b"").unwrap();
+    let link = base.join("tjs-a000000000000000");
+    std::os::unix::fs::symlink(base.join("tjs-50000000000000000"), &link).unwrap();
+    let fifo = base.join("tjs-c000000000000000");
+    make_fifo(&fifo);
+
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert!(!stale.exists(), "the folder of the exact shape was not swept");
+    for folder in &kept {
+        assert!(folder.join("s").exists(), "{} was swept", folder.display());
+        assert!(std::fs::symlink_metadata(folder.join("l")).is_ok(), "{}", folder.display());
+    }
+    assert!(file.is_file() && link.is_symlink());
+    assert!(std::fs::symlink_metadata(&fifo).is_ok());
+    drop(endpoint);
+    drop(feed);
+    assert_eq!(entries(&base).len(), kept.len() + 3);
+    for folder in &kept {
+        remove_fixture(folder);
+    }
+    std::fs::remove_file(file).unwrap();
+    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(fifo).unwrap();
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn a_marker_of_another_kernel_or_another_folder_is_never_swept() {
+    let base = short_base("where");
+    let kernel = kernel_identity().unwrap();
+    let place = |folder: &std::path::Path| {
+        let metadata = std::fs::metadata(folder).unwrap();
+        (metadata.dev(), metadata.ino())
+    };
+    // The control's marker says this kernel keeps the lock on this folder,
+    // and it goes.
+    let stale = ownerless_folder(&base, "tjs-00000000000000a0", plain_marker);
+    let kept = [
+        // Another kernel's lock: a second host that shares the folder, a
+        // guest or its host, or this host before its last restart. Its
+        // identity differs from this kernel's in one character.
+        ownerless_folder(&base, "tjs-00000000000000a1", |folder| {
+            let mut other = kernel.clone();
+            other[0] = if other[0] == b'1' { b'2' } else { b'1' };
+            let (device, inode) = place(folder);
+            marker_with(folder, &liveness_record(&other, device, inode));
+        }),
+        // This kernel's lock on the folder as another file system shows it.
+        ownerless_folder(&base, "tjs-00000000000000a2", |folder| {
+            let (device, inode) = place(folder);
+            marker_with(folder, &liveness_record(&kernel, device + 1, inode));
+        }),
+        // This kernel's lock on another folder: a copy of a marked folder.
+        ownerless_folder(&base, "tjs-00000000000000a3", |folder| {
+            let (device, inode) = place(folder);
+            marker_with(folder, &liveness_record(&kernel, device, inode + 1));
+        }),
+        // An owner killed before it wrote the record.
+        ownerless_folder(&base, "tjs-00000000000000a4", |folder| marker_with(folder, b"")),
+        // The record cut short, and with a byte after it.
+        ownerless_folder(&base, "tjs-00000000000000a5", |folder| {
+            let record = own_record(folder);
+            marker_with(folder, &record[..record.len() - 1]);
+        }),
+        ownerless_folder(&base, "tjs-00000000000000a6", |folder| {
+            let mut record = own_record(folder);
+            record.push(b'\n');
+            marker_with(folder, &record);
+        }),
+    ];
+    let endpoint = Endpoint::new(Arc::new(pipe()), &base).unwrap();
+    assert!(!stale.exists(), "the folder this kernel marked was not swept");
+    for folder in &kept {
+        assert_eq!(entries(folder), marked(folder), "{} was swept", folder.display());
+    }
+    drop(endpoint);
+    assert_eq!(entries(&base), kept);
+    for folder in &kept {
+        remove_fixture(folder);
+    }
+    std::fs::remove_dir(base).unwrap();
+}
+
+#[test]
+fn this_kernel_names_itself_and_only_a_name_is_an_identity() {
+    // Without it no marker is made and nothing is swept, and every test here
+    // that expects a marker or a sweep fails for that one reason.
+    let identity = kernel_identity().expect("this kernel's identity cannot be read");
+    assert_eq!(kernel_identity(), Some(identity.clone()), "two reads differ");
+    assert!(is_kernel_identity(&identity) && identity.len() <= KERNEL_IDENTITY_BYTES);
+    // The longest record still fits what a sweep reads of a marker.
+    let longest = liveness_record(&[b'f'; KERNEL_IDENTITY_BYTES], u64::MAX, u64::MAX);
+    assert_eq!(longest.len(), MARKER_BYTES);
+    assert!(is_kernel_identity(b"7BD6DC21-FBAC-480E-ABE2-28C34320639D"));
+    assert!(is_kernel_identity(b"9f0c7e7c-0e42-4b6b-8f5e-2f3c1c5d6a7b"));
+    assert!(is_kernel_identity(&[b'f'; KERNEL_IDENTITY_BYTES]));
+    for refused in [
+        &b""[..],
+        b"00000000-0000-0000-0000-000000000000",
+        b"9f0c7e7c 0e42",
+        b"9f0c7e7c\n",
+        b"9f0c7e7c/0e42",
+        &[b'f'; KERNEL_IDENTITY_BYTES + 1],
+    ] {
+        assert!(!is_kernel_identity(refused), "{:?}", String::from_utf8_lossy(refused));
+    }
+}
+
+#[test]
+fn more_folders_than_one_sweep_opens_cannot_hide_a_stale_one() {
+    let base = short_base("bound");
+    // Unmarked folders, which no sweep removes, one more than a sweep opens.
+    for index in 0..=SWEEP_FOLDERS {
+        ownerless_folder(&base, &format!("tjs-{index:016x}"), |_| {});
+    }
+    // The listing's order is the filesystem's and stays while nothing is added
+    // to the base or removed from it. The stale folder is the one a sweep
+    // from the listing's start does not reach.
+    let listed: Vec<PathBuf> =
+        std::fs::read_dir(&base).unwrap().map(|entry| entry.unwrap().path()).collect();
+    assert_eq!(listed.len(), SWEEP_FOLDERS + 1);
+    let stale = &listed[SWEEP_FOLDERS];
+    plain_marker(stale);
+    sweep_stale_folders(&base, 0);
+    assert!(stale.exists(), "one sweep opened more folders than its bound");
+    assert_eq!(entries(stale), marked(stale));
+    sweep_stale_folders(&base, SWEEP_FOLDERS);
+    assert!(!stale.exists(), "a sweep that starts at the stale folder left it");
+    assert_eq!(entries(&base).len(), SWEEP_FOLDERS);
+    for folder in &listed[..SWEEP_FOLDERS] {
+        remove_fixture(folder);
+    }
+    std::fs::remove_dir(base).unwrap();
+}
+
+/// What one sweep costs, printed for docs/STATUS.md ("Job-server folder
+/// removal"): the median and the least of `ROUNDS` calls for each parent. Run
+/// it alone, by name, with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement for docs/STATUS.md, not a regression"]
+fn sweep_costs() {
+    const ROUNDS: usize = 21;
+    fn summary(mut samples: Vec<Duration>) -> String {
+        samples.sort();
+        format!("median {:?}, least {:?}", samples[samples.len() / 2], samples[0])
+    }
+    fn timed(base: &std::path::Path) -> Duration {
+        let start = Instant::now();
+        sweep_stale_folders(base, 0);
+        start.elapsed()
+    }
+    fn row(label: &str, base: &std::path::Path) {
+        println!("{label}: {}", summary((0..ROUNDS).map(|_| timed(base)).collect()));
+    }
+    fn folders(base: &std::path::Path, marker: fn(&std::path::Path)) -> Vec<PathBuf> {
+        (0..SWEEP_FOLDERS)
+            .map(|index| ownerless_folder(base, &format!("tjs-{index:016x}"), marker))
+            .collect()
+    }
+    fn remove_all(folders: &[PathBuf]) {
+        folders.iter().for_each(|folder| remove_fixture(folder));
+    }
+    // libtest has already written `test <name> ... ` on this line.
+    println!();
+    let base = short_base("cost");
+    row("nothing", &base);
+    for index in 0..SWEEP_ENTRIES {
+        if index == 2_000 {
+            row("2,000 unrelated files", &base);
+        }
+        drop(File::create(base.join(format!("unrelated-{index}"))).unwrap());
+    }
+    row(&format!("{SWEEP_ENTRIES} unrelated files"), &base);
+    for index in 0..SWEEP_ENTRIES {
+        std::fs::remove_file(base.join(format!("unrelated-{index}"))).unwrap();
+    }
+
+    let unmarked = folders(&base, |_| {});
+    row(&format!("{SWEEP_FOLDERS} folders without the marker"), &base);
+    remove_all(&unmarked);
+
+    let foreign = folders(&base, |folder| {
+        let metadata = std::fs::metadata(folder).unwrap();
+        let record = liveness_record(b"another-kernel", metadata.dev(), metadata.ino());
+        marker_with(folder, &record);
+    });
+    row(&format!("{SWEEP_FOLDERS} folders marked by another kernel"), &base);
+    remove_all(&foreign);
+
+    let marked = folders(&base, plain_marker);
+    let owners: Vec<File> = marked
+        .iter()
+        .map(|folder| {
+            let owner = open_folder(folder).unwrap();
+            assert!(matches!(try_liveness_lock(owner.as_fd()), Ok(true)));
+            owner
+        })
+        .collect();
+    row(&format!("{SWEEP_FOLDERS} marked folders whose lock is held"), &base);
+    assert_eq!(entries(&base), marked, "a sweep removed a folder whose lock was held");
+    drop(owners);
+
+    let mut removals = vec![timed(&base)];
+    assert_eq!(entries(&base), Vec::<PathBuf>::new(), "one sweep left a stale folder");
+    while removals.len() < ROUNDS {
+        folders(&base, plain_marker);
+        removals.push(timed(&base));
+        assert_eq!(entries(&base), Vec::<PathBuf>::new(), "one sweep left a stale folder");
+    }
+    println!("{SWEEP_FOLDERS} stale folders, all removed by one sweep: {}", summary(removals));
+    std::fs::remove_dir(base).unwrap();
 }

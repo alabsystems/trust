@@ -408,7 +408,9 @@ impl CompletedProcess {
     /// Checks that `stderr` doesn't contain the Internal Compiler Error message.
     #[track_caller]
     pub fn assert_not_ice(&self) -> &Self {
-        self.assert_stderr_not_contains("error: the compiler unexpectedly panicked. this is a bug");
+        // Trust: rustdoc's native ICE report capitalizes the following sentence.
+        // Match the shared diagnostic prefix, independent of that wording.
+        self.assert_stderr_not_contains("error: the compiler unexpectedly panicked.");
         self
     }
 
@@ -435,3 +437,8 @@ impl From<Output> for CompletedProcess {
         Self { output }
     }
 }
+
+// Trust: actual native rustdoc diagnostic variants, not an implementation regex.
+#[cfg(all(test, unix))]
+#[path = "command/tests.rs"]
+mod ice_tests;

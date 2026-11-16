@@ -263,8 +263,9 @@ sys.exit(1 if behaviour.get("exit") else 0)
 
 
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", *args],
-                          check=True, capture_output=True, text=True, env=GIT_ENV).stdout.strip()
+    command = driver.refresh.git_command(repo, "-c", "protocol.file.allow=always", *args)
+    return subprocess.run(command, check=True, capture_output=True,
+                          text=True, env=GIT_ENV).stdout.strip()
 
 
 def put(path: Path, text: str, mode: int = 0o644) -> Path:
@@ -591,6 +592,30 @@ class RootCase(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_git_mutations_keep_automatic_maintenance_in_the_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            git(root, "init", "-q", "-b", "main")
+            runners = [("fixture", git), ("refresh", driver.refresh.git),
+                       ("seed", lambda repo, *words: driver.git_text(
+                           repo, *words, what="maintenance ownership control", env=GIT_ENV))]
+            for name, run in runners:
+                with self.subTest(name):
+                    trace = root / (name + ".trace.jsonl")
+                    with mock.patch.dict(GIT_ENV, {"GIT_TRACE2_EVENT": str(trace)}):
+                        with mock.patch.dict(os.environ, GIT_ENV):
+                            run(root, "commit", "--allow-empty", "-qm", name)
+                    # The invoking Git records its child_start before returning.
+                    # A detached child's later trace records are not completion.
+                    data = trace.read_text()
+                    events = [json.loads(line) for line in data[:data.rfind("\n")].splitlines()]
+                    children = [event["argv"] for event in events
+                                if event.get("event") == "child_start" and
+                                event.get("argv", [])[:2] in (["git", "maintenance"], ["git", "gc"])]
+                    self.assertTrue(children, "automatic maintenance must still execute")
+                    self.assertFalse([argv for argv in children if "--detach" in argv],
+                                     f"Git returned after dispatching detached maintenance: {children}")
+
     def test_a_path_that_names_the_account_is_found_by_home_or_by_login(self):
         account = ("/home/somebody", "somebody")
         self.assertEqual(driver.names_account("scripts", account), "/home/somebody")
@@ -5444,7 +5469,8 @@ class RebuildTests(VerifyCase):
         beside = sorted(driver.ROOT_PARENT.iterdir()) if driver.ROOT_PARENT.is_dir() else []
         code, _out, err = CommandLineTests.main(
             self, "verify", "--repo", str(clone), "--commit", SOURCE.commit, "--host", HOST, "--rebuild",
-            "--root", str(self.root), "--produced", str(produced), "--work", str(self.parent / "w3"), "--lean-library",
+            "--root", str(self.root), "--produced", str(produced),
+            "--work", str(self.parent / "w3"), "--lean-library",
             str(self.plan.lean_library), "--ninja", str(SOURCE.ninja), "--jobs", "3", plan=self.cli_plan())
         llc.write_bytes(original)
         self.assertEqual(code, 3, err)
@@ -5675,8 +5701,7 @@ class RebuildRuleTests(VerifyCase):
                                                   "sha256": sha(self.parent / "w" / "exit-test.json")})
 
 
-AGH = r'''#!{python}
-import hashlib, json, pathlib, shutil, sys
+AGH = r'''import hashlib, json, pathlib, shutil, sys
 state, store, log = pathlib.Path({state!r}), pathlib.Path({store!r}), pathlib.Path({log!r})
 argv = sys.argv[1:]
 with open(log, "a") as handle:
@@ -5728,9 +5753,27 @@ def agh_stand_in(case) -> tuple[Path, Path, Path]:
     base = case.parent / "agh"
     base.mkdir()
     state, behaviour = base / "state.json", base / "behaviour.json"
-    case.plan.args.agh = put(base / "agh", AGH.format(python=sys.executable, state=str(state), store=str(base / "store"),
-                                                      log=str(base / "log"), behaviour=str(behaviour)), 0o755)
+    payload = put(base / "agh.py", AGH.format(state=str(state), store=str(base / "store"),
+                                             log=str(base / "log"), behaviour=str(behaviour)))
+    launcher = f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(payload))} "$@"\n'
+    case.plan.args.agh = put(base / "agh", launcher, 0o755)
     return state, behaviour, base / "log"
+
+
+class AghStandInTests(unittest.TestCase):
+    def test_interpreter_path_with_spaces_and_quote_preserves_arguments(self):
+        with tempfile.TemporaryDirectory(prefix="seed interpreter's ") as temporary:
+            parent = Path(temporary).resolve()
+            interpreter = parent / "python interpreter's executable"
+            interpreter.symlink_to(sys.executable)
+            case = argparse.Namespace(parent=parent, plan=argparse.Namespace(args=argparse.Namespace()))
+            with mock.patch.object(sys, "executable", str(interpreter)):
+                _state, _behaviour, log = agh_stand_in(case)
+            arguments = ["release", "assets", "fixture/trust", "fixture tag's name", "--format", "json"]
+            result = subprocess.run([str(case.plan.args.agh), *arguments], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [])
+            self.assertEqual(json.loads(log.read_text()), arguments)
 
 
 class PublishCase(CommitCase):

@@ -1,0 +1,11 @@
+[package]
+name="rust-source-word64-metadata-observer"
+version="0.0.0"
+edition="2021"
+[workspace]
+[[bin]]
+name="source-entry-observer"
+path="@TRUST_ROOT@/crates/trust-thir-lower/probes/source_word64_metadata.rs"
+[profile.dev]
+debug=0
+incremental=false

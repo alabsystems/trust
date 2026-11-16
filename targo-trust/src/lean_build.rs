@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Standalone Lean library artifacts, not executable or cross-crate authority.
+//! Standalone checked Lean artifacts, not executable or cross-crate authority.
 //!
 //! The LIBRARY output is a versioned JSON envelope containing canonical binary
 //! Trust-IR and the exact checked local sources. `--census` writes one further
@@ -19,7 +19,9 @@
 //! a library. It REQUIRES `--census`, and writes that census AFTER lowering —
 //! the census carries the lowering's own diagnostic record — but still before
 //! the module is published, so a refusal there also leaves the census as the
-//! only output.
+//! only output. `--emit=object` is the third mode, owned by [`object`]: the
+//! same complete scalar source population reaches the existing strict object
+//! checker through exact private publication custody. No executable is linked.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,6 +38,7 @@ use trust_ir::value::{FuncId, FuncTyId};
 use trust_ir::{Function, Module, Producer};
 
 mod runtime;
+mod object;
 
 const SCHEMA: &str = "trust.lean.ir-library/v1";
 const AUTHORITY: &str = "recheck-sources-and-re-earn-gate-on-import";
@@ -1015,6 +1018,10 @@ fn ensure_new_output(path: &Path) -> Result<(), String> {
 }
 
 fn build(request: &Request) -> Result<usize, BuildError> {
+    build_artifact(request, false)
+}
+
+fn build_artifact(request: &Request, object: bool) -> Result<usize, BuildError> {
     ensure_new_output(&request.output)?;
     let tool_before = if let Some(path) = &request.census_output {
         crate::lean_cli::preflight_census(path)?;
@@ -1090,6 +1097,9 @@ fn build(request: &Request) -> Result<usize, BuildError> {
     let mut bytes = serde_json::to_vec_pretty(&envelope).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     let module = decode_and_revalidate(&context, &bytes)?;
+    if object {
+        bytes = object::compile(&context, &module, &envelope.bodies)?;
+    }
     for source in context.sources() {
         let current = std::fs::read(&source.path).map_err(|error| {
             format!("checked source `{}` can no longer be read: {error}", source.path)
@@ -1130,17 +1140,20 @@ fn build(request: &Request) -> Result<usize, BuildError> {
     Ok(module.functions.len())
 }
 
-/// The help for `targo trust build FILE.lean`: BOTH lanes, always together.
+/// The help for `targo trust build FILE.lean`: all modes, always together.
 ///
 /// `--entry` and `--entry-json` are real options of this command, defined by
 /// `runtime`'s own parser. The library parser refuses them by name, so the usage
 /// printed beside that refusal must not be one that hides the lane defining
 /// them — which is why the refusal path prints this and not `USAGE` alone.
 fn full_usage() -> String {
-    format!("{USAGE}\n\n{}", runtime::USAGE)
+    format!("{USAGE}\n\n{}\n\n{}", runtime::USAGE, object::USAGE)
 }
 
 pub(crate) fn run(args: &[String]) -> ExitCode {
+    if object::requested(args) {
+        return object::run(args);
+    }
     if runtime::requested(args) {
         return runtime::run(args);
     }
@@ -2907,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_argument_is_answered_with_the_help_for_both_build_lanes() {
+    fn a_refused_argument_is_answered_with_the_help_for_all_build_modes() {
         // `--entry` IS an option of `targo trust build`; only the diagnostic
         // lane's parser defines it. The library parser refuses it by name, so
         // the usage printed beside that refusal must not be one in which the
@@ -2920,10 +2933,12 @@ mod tests {
         assert_eq!(run(&args), ExitCode::from(2));
         let help = full_usage();
         assert!(help.starts_with(USAGE), "{help}");
-        assert!(help.ends_with(runtime::USAGE), "{help}");
+        assert!(help.contains(runtime::USAGE), "{help}");
+        assert!(help.ends_with(object::USAGE), "{help}");
         for clause in [
             "--emit=trust-ir",
             "--emit=diagnostic-runtime-trust-ir",
+            "--emit=object",
             "--entry NAME",
             "--entry-json",
         ] {

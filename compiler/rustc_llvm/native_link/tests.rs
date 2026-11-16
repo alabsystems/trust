@@ -282,15 +282,14 @@ fn static_system_archive_is_bound_to_provider_metadata_and_whole_paths() {
                 "--variable=libdir" => libdir.display().to_string(),
                 "--path" => metadata.display().to_string(),
                 "--modversion" => "1.5.7".to_owned(),
-                "--libs-only-L" => {
+                "--libs" => {
                     if quoted {
-                        format!("-L'{}'", libdir.display())
+                        format!("-L'{}' -lzstd", libdir.display())
                     } else {
-                        format!("-L{}", libdir.display())
+                        format!("-L{} -lzstd", libdir.display())
                     }
                 }
                 "--libs-only-l" => "-lzstd".to_owned(),
-                "--libs-only-other" => String::new(),
                 _ => panic!("unexpected query: {args:?}"),
             })
         })
@@ -328,7 +327,7 @@ fn static_provider_refuses_missing_metadata_or_archive_and_relative_libdir() {
             ["--path", "libzstd"] => metadata.display().to_string(),
             ["--modversion", "libzstd"] => "1.5.7".to_owned(),
             ["--libs-only-l", "--static", "libzstd"] => "-lzstd".to_owned(),
-            ["--libs-only-L" | "--libs-only-other", "--static", "libzstd"] => String::new(),
+            ["--libs", "--static", "libzstd"] => "-lzstd".to_owned(),
             _ => panic!("unexpected query: {args:?}"),
         })
     };
@@ -410,8 +409,7 @@ fn whole_path_zstd_queries_still_refuse_other_native_dependencies() {
                     "--path" => metadata.display().to_string(),
                     "--modversion" => "1.5.7".to_owned(),
                     "--libs-only-l" => libraries.to_owned(),
-                    "--libs-only-other" => other.to_owned(),
-                    "--libs-only-L" => search.to_owned(),
+                    "--libs" => format!("{search} {libraries} {other}"),
                     _ => panic!("unexpected query: {args:?}"),
                 })
             })
@@ -486,4 +484,80 @@ fn actual_declared_zstd_provider_preserves_whole_metadata_paths() {
     assert_eq!(selected.library.name, "zstd");
     assert_eq!(selected.metadata.file_name().unwrap(), "libzstd.pc");
     assert!(static_zstd_in(&provider, &target, &directory.join("missing")).is_err());
+}
+
+#[test]
+fn complete_raw_link_flags_keep_whole_paths_and_reject_extra_tokens() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("provider with spaces");
+    std::fs::create_dir(&directory).unwrap();
+    let canonical = directory.canonicalize().unwrap();
+    let search = format!("-L{}", directory.display());
+    let flags = zstd_link_flags(&format!("{search} -lzstd"), &directory, &canonical).unwrap();
+    assert_eq!(flags, [search.clone(), "-lzstd".to_owned()]);
+    assert!(validate_zstd_flags(&flags, &canonical).is_ok());
+    for suffix in ["-llz4", "-pthread", "-Wl,-rpath,/elsewhere"] {
+        let flags =
+            zstd_link_flags(&format!("{search} -lzstd {suffix}"), &directory, &canonical).unwrap();
+        assert!(validate_zstd_flags(&flags, &canonical).is_err());
+    }
+    let decoy = format!("{search}-different -lzstd");
+    let flags = zstd_link_flags(&decoy, &directory, &canonical).unwrap();
+    assert!(validate_zstd_flags(&flags, &canonical).is_err());
+    assert!(zstd_link_flags("-L'unterminated", &directory, &canonical).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn shorter_declared_alias_keeps_the_longer_canonical_zstd_operand_whole() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().canonicalize().unwrap();
+    for (index, suffix) in [" extra", " -pthread"].into_iter().enumerate() {
+        let parent = base.join(format!("case-{index}"));
+        std::fs::create_dir(&parent).unwrap();
+        let canonical = parent.join(format!("lib{suffix}"));
+        std::fs::create_dir(&canonical).unwrap();
+        let declared = parent.join("lib");
+        std::os::unix::fs::symlink(&canonical, &declared).unwrap();
+        assert_eq!(declared.canonicalize().unwrap(), canonical);
+        let archive = file(&canonical, "libzstd.a");
+        let metadata = file(&canonical.join("pkgconfig"), "libzstd.pc");
+        let provider = file(&parent, "pkg-config");
+        let resolve = |flags: &str| {
+            static_zstd_with(&provider, "aarch64-apple-darwin", |args| {
+                Ok(match args {
+                    ["--variable=libdir", "libzstd"] => declared.display().to_string(),
+                    ["--path", "libzstd"] => metadata.display().to_string(),
+                    ["--modversion", "libzstd"] => "1.5.7".to_owned(),
+                    ["--libs-only-l", "--static", "libzstd"] => "-lzstd".to_owned(),
+                    ["--libs", "--static", "libzstd"] => flags.to_owned(),
+                    _ => panic!("unexpected query: {args:?}"),
+                })
+            })
+        };
+        let search = format!("-L{}", canonical.display());
+        let flags = zstd_link_flags(&format!("{search} -lzstd"), &declared, &canonical).unwrap();
+        assert_eq!(flags, [search.clone(), "-lzstd".to_owned()]);
+        // Both actual spellings select the SAME archive, not another provider.
+        for flags in [
+            format!("{search} -lzstd"),
+            format!("-L{} -lzstd", declared.display()),
+            format!("-L'{}' -lzstd", canonical.display()),
+        ] {
+            let selected = resolve(&flags).unwrap();
+            assert_eq!(selected.library.path, archive);
+            assert_eq!(selected.metadata, metadata);
+            assert_eq!(selected.provider, provider);
+        }
+        // The flag-like suffix above is real pathname DATA. Another flag
+        // AFTER that whole operand must remain a refused dependency/option.
+        for extra in ["-pthread", "-llz4", "-Wl,-rpath,/elsewhere"] {
+            assert!(resolve(&format!("{search} -lzstd {extra}")).is_err());
+        }
+        assert!(resolve(&format!("{search} -lzstd 'unterminated")).is_err());
+        assert!(resolve(&format!("{search}-different -lzstd")).is_err());
+        let unrelated = parent.join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        assert!(resolve(&format!("-L{} -lzstd", unrelated.display())).is_err());
+    }
 }

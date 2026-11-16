@@ -6,7 +6,8 @@ use std::time::Duration;
 use std::{env, fs};
 
 use super::identity::{self, CompilerProbe, Identity, ProcessProbe};
-use super::run::{self, CaseExit, CaseRunner, CaseSpec, CompilerProcess};
+use super::judge::{Ground, Judge};
+use super::run::{CaseRunner, CompilerProcess};
 use super::table::{self, Corpus, TABLE, Table};
 use super::{
     CaseRecord, Comparison, EXIT_COULD_NOT_RUN, EXIT_LOSS, EXIT_USAGE, RankFn, Verdict,
@@ -20,17 +21,31 @@ const USAGE: &str = "\
 Usage: targo trust gate corpus-delta --old TRUSTC --new TRUSTC [--corpora LIST]
            [--keep DIR] [--fail-on-loss] [--case-seconds N] [--repo-root DIR]
 
-Compile this checkout's daily-driver corpora once with each of two compilers and
+Compile this checkout's daily-driver corpora with each of two compilers and
 print every case whose verdict moved against its pin.
 
 The corpora are the rows of tests/corpora.toml (schema trust.corpora.v1): for
 each, its case files, the compiler's arguments, and what each case is pinned to
-(`verifies`, `refuses`, or nothing). A case's verdict is the compiler's own exit
-status: `verifies` (0), `refuses` (1), or `crash:<status>` (anything else; a
-compiler ended by a signal is 128 plus the signal). A verdict is ranked against
-its pin: matching it is best, a crash is below a clean miss, and verifying a
-case pinned `refuses` (a possible false proof) is worst. With no pin, `verifies`
-is best.
+(`verifies`, `refuses`, `conditional`, or nothing). A case's verdict is the
+compiler's own exit status: `verifies` (0), `refuses` (1), or `crash:<status>`
+(anything else; a compiler ended by a signal is 128 plus the signal). Where a
+case's row asks more than an exit status, its verdict says whether that was met:
+
+  conditional  Exit 0 with the row's disclosure in the output, and the same
+               compile with the corpus's certify arguments exits non-zero with
+               the certify refusal in its output. Asked only of a case pinned
+               `conditional`; one that exits 0 without the rest is `verifies`
+  verifies-otherwise, refuses-otherwise
+               The pinned exit status, without the text the row says the
+               compiler's output holds
+  blocked      Not compiled: the dependency crate the case is built against
+               refused, or left no rlib. A dependency is built once for each
+               compiler, before the first case that uses it, and is not a case
+
+A verdict is ranked against its pin: matching it is best, a crash is below a
+clean miss, and an exit 0 the pin does not allow is worst (a possible false
+proof: `verifies` where `refuses` is pinned, or where `conditional` is pinned
+and the rest is not shown). With no pin, `verifies` is best.
 
   LOSS  a case whose rank fell, or one the old compiler had as pinned and the
         new compiler did not record
@@ -52,13 +67,14 @@ Options:
   --keep DIR        Keep the run in DIR, which must be empty or absent:
                     {old,new}/record.ndjson (schema trust.corpus-record.v1:
                     corpus, case, verdict, cause, pin), each compiler's `-vV`
-                    output, every case's log, flips.txt and summary.txt. The
+                    output, every compile's log, flips.txt and summary.txt. The
                     run names DIR by its resolved path (no `..`, no symlink)
   --fail-on-loss    Exit 1 when there is a LOSS
-  --case-seconds N  A case with no verdict after N seconds is stopped and is
-                    NOT JUDGED (default 1800). A side stops at its third such
-                    case. A run with one compares nothing, and does not start
-                    the new compiler when it was the old one's
+  --case-seconds N  A compile with no exit after N seconds is stopped and its
+                    case is NOT JUDGED (default 1800; a case's dependency and
+                    its certify compile are each a compile). A side stops at
+                    its third such case. A run with one compares nothing, and
+                    does not start the new compiler when it was the old one's
   --repo-root DIR   The checkout whose table and corpora to use (default: the
                     nearest directory at or above the current one that holds
                     tests/corpora.toml)
@@ -73,8 +89,8 @@ JUDGED, a corpus recorded no case, or the run's own files cannot be written.
 --corpora names the daily-driver corpora it did not compare, whatever its exit:
 those the table has no row for yet, and those --corpora left out. A run refused
 before that (on its arguments, on a table that does not load, or on a --corpora
-list the table does not accept) names none. This compares exit statuses: it is
-not a proof and grants nothing.
+list the table does not accept) names none. This compares exit statuses and
+texts in compiler output: it is not a proof and grants nothing.
 ";
 
 const DEFAULT_CASE_SECONDS: u64 = 1800;
@@ -485,46 +501,24 @@ fn collect(
         ));
         let work = side.work.join(&corpus.id);
         create(&work)?;
+        let mut judge = Judge::new(Ground {
+            compiler: side.compiler,
+            corpus,
+            out: side.out.join(&corpus.id),
+            work,
+            bound,
+            kept: side.kept,
+        });
         let recorded_before = records.len();
         for case in &corpus.cases {
-            let log = side.out.join(&corpus.id).join(format!("{}.log", case.id));
-            if let Some(parent) = log.parent() {
-                create(parent)?;
-            }
-            let spec = CaseSpec {
-                compiler: side.compiler.to_path_buf(),
-                corpus: corpus.id.clone(),
-                case: case.id.clone(),
-                args: case.args.clone(),
-                source: case.source.clone(),
-                work: work.clone(),
-                log: log.clone(),
-                bound,
-            };
-            let verdict = match host.runner.run(&spec) {
-                Some(CaseExit::Exited(code)) => Verdict::of_exit(code),
-                Some(CaseExit::Signalled(signal)) => Verdict::Crash(128 + signal),
-                Some(CaseExit::PastBound) => Verdict::NotJudged,
-                Some(CaseExit::Failed(error)) => {
-                    return Err(format!("{label}: {}/{}: {error}", spec.corpus, spec.case));
-                }
-                None => continue,
-            };
-            let cause = match verdict {
-                Verdict::Verifies => String::new(),
-                // Without `--keep` the log goes with the run's scratch, so the
-                // line names how to hold it, not a path that is gone.
-                Verdict::NotJudged if side.kept => {
-                    format!("no verdict within {}s (log: {})", bound.as_secs(), log.display())
-                }
-                Verdict::NotJudged => {
-                    format!("no verdict within {}s (--keep DIR holds its log)", bound.as_secs())
-                }
-                Verdict::Refuses | Verdict::Crash(_) => run::first_error_line(&log),
+            let judged =
+                judge.case(case, &mut *host.runner).map_err(|error| format!("{label}: {error}"))?;
+            let Some((verdict, cause)) = judged else {
+                continue;
             };
             records.push(CaseRecord {
-                corpus: spec.corpus,
-                case: spec.case,
+                corpus: corpus.id.clone(),
+                case: case.id.clone(),
                 verdict,
                 cause,
                 pin: case.pin,

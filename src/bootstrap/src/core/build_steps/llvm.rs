@@ -2437,7 +2437,7 @@ fn lld_cmake_config(
     cfg.out_dir(output)
         .profile(profile)
         .define_input_path("LLVM_CMAKE_DIR", llvm_cmake)
-        .define_input_path("LLVM_DIR", llvm_cmake)
+        .define_input_path("LLVM_DIR:PATH", llvm_cmake)
         .define("LLVM_INCLUDE_TESTS", "OFF");
 
     if !builder.config.is_host_target(target) {

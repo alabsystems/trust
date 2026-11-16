@@ -28,10 +28,10 @@ __doc__ = """Stage origin/main locally, or run one tick of the standing fleet tr
 `run` stages origin/main in a state directory and stops there: no upload, no channel
 admission, no deletion. `train` cuts main's tip with the same stage path whenever the
 previous train has ended and main has moved, publishes the seed archives, lands the
-re-pin and stage-uploads the signed pack; the consumer checks and the proof comparison
-run after the upload and are reported in docs/OPEN_ISSUES.md. Neither moves the package
-index, writes the public release owner or claims proof completeness. See
-docs/DAILY_TOOLCHAIN_STAGING.md.
+re-pin, stage-uploads the signed pack and publishes it to the signed atpkg index with
+trust-resource-controller from the same commit; the consumer checks and the proof
+comparison run after that and are reported in docs/OPEN_ISSUES.md. Neither claims proof
+completeness. See docs/DAILY_TOOLCHAIN_STAGING.md.
 """
 
 import argparse
@@ -70,15 +70,33 @@ MAX_QUERY_BYTES = 1024 * 1024
 # while those inputs were small: with the 28 GB of Git databases today's locks
 # name, m86 reached offline fetch 32 of the first 55 when it expired.
 DEPENDENCY_PREWARM_SECONDS = 3600
+# x.py takes its build lease only from a manager that answers this to `--protocol`
+# (x.py, _trust_build_lock_frontend). The tree's own managers, in x.py's order: the
+# Bootstrap bootstrap.py builds, then the one scripts/build-tree-manager.sh builds for
+# a tree that has none yet.
+MANAGER_PROTOCOL = b"trust-build-tree-manager-v2\n"
+TREE_MANAGERS = ("build/bootstrap/debug/bootstrap", "build/bootstrap/release/bootstrap",
+                 "build-tree-manager.noindex/debug/bootstrap")
+# The DDC observations a failed mint retains in its WORK, which a continuation reads from
+# its evidence directory's ddc-equality-evidence/ (mint_seed_recovery.validate).
+MINT_DDC_EVIDENCE = ("stage2-pinned-seed.json", "stage2-ddc-seed.json", "ddc-seed.json", "ddc-seed-post-build.json")
 WP_BINS = ("trust-wp", "trust-wp-driver", "trust-wp-rustc", "targo-trust-wp", "cargo-trust-wp")
 CONSUMERS = ("aterm", "ay", "ty", "clean")
 REQUIREMENTS = [
-    "A fleet build needs no decision entry: `train`, on a Mac whose `aterm secrets status` says release signing is ready, publishes the seed archives, lands the re-pin and stage-uploads the signed pack.",
+    "A fleet build needs no decision entry: `train`, on a Mac whose `aterm secrets status` says release signing is ready, publishes the seed archives, lands the re-pin, stage-uploads the signed pack and publishes it to the signed atpkg index (the lab tracker's decisions RL-D14 and RL-D15).",
     "A public seal (P5b) needs the aterm, ay, ty and clean checks at their origin/main on this exact staged toolchain, with the results committed.",
     "A public seal (P5b) also needs SEAL-1's four clauses with committed evidence, the staging canary and the index publish (docs/CUTTING-A-TOOLCHAIN.md).",
 ]
-TRAIN_SCHEMA = "trust.toolchain-train.v1"
+# v2: `published` is a build an index serves. A v1 train stage-uploaded and called that
+# published; load_train migrates its state (migrate_train_v1).
+TRAIN_SCHEMA = "trust.toolchain-train.v2"
+TRAIN_SCHEMA_V1 = "trust.toolchain-train.v1"
 TRAIN_LABEL = "systems.alab.trust-train"
+# Set in a tick that advanced --repo and re-executed itself, so it does not advance twice.
+TRAIN_ADVANCED = "TRUST_TRAIN_ADVANCED"
+# `launchctl bootout` returns while launchd is still stopping a running tick, and a
+# bootstrap before the old job is gone fails (exit 5). Seconds an install waits for it.
+TRAIN_BOOTOUT_WAIT = 600
 TRAIN_ISSUE = "FLEET-BUILD-REPORT-1"
 TRAIN_ISSUE_FILE = "docs/OPEN_ISSUES.md"
 TRAIN_ISSUE_SECTION = "## Toolchain, bootstrap and release"
@@ -86,9 +104,41 @@ TRAIN_HISTORY = 8
 # What a build regenerates; the last good build is kept without it.
 TRAIN_INTERMEDIATES = ("source/build", "targets", "dependencies", "consumer-targets", "consumer-rustup")
 BUILD_TAG = re.compile(r"atpkg-trust-([0-9]+)")
-# A fleet train stage-uploads. These publisher words publish, pin or withdraw.
-PUBLISHER_REFUSED = frozenset({"--publish-staged", "--upload", "--force-same-build", "--allow-build-tree-seal",
-                               "canary", "index", "mirror", "lane", "pack", "pack-bundle", "adopt"})
+CONTROLLER = "trust-resource-controller"
+# Every publisher command a fleet train runs, word for word: (the global --host values it
+# may run under, one pattern per word). Nothing else is built (fleet_publisher).
+_PATH, _BUILD = r"/[^\n]*", r"[1-9][0-9]{0,15}"
+_GROUP = ("publish-group", "rustc", "--seal", _PATH, "--trust-repo", _PATH, "--checkout", "trust-ir=" + _PATH,
+          "--checkout", "trust-cg=" + _PATH, "--checkout", "trust-vc=" + _PATH, "--out", _PATH)
+PUBLISHER_COMMANDS = {
+    # Reads this Mac's agh configuration; `hosts check` takes no global --host.
+    "hosts check": (("agh-staging", "agh"), ("hosts", "check")),
+    "publisher preflight": (("agh-staging", "agh", "gh"), (*_GROUP, "--dry-run")),
+    "stage-upload": (("agh-staging", "agh", "gh"), (*_GROUP, "--stage-upload")),
+    # Installs and runs the staged pack in a scratch prefix and signs train-receipt.toml.
+    "canary": (("agh",), ("canary", "trust=" + _BUILD, "--out", _PATH, "--consumer", "aterm=" + _PATH,
+                          "--consumer", "ay=" + _PATH, "--consumer", "ty=" + _PATH, "--consumer", "clean=" + _PATH)),
+    "publish staged": (("agh",), ("publish-group", "rustc", "--publish-staged", "--out", _PATH)),
+    "status": (("agh",), ("status",)),
+    "controller pack": (("agh",), ("pack", CONTROLLER, "--checkout", _PATH, "--toolchain", _PATH, "--trust-repo", _PATH,
+                                   "--build", _BUILD, "--out", _PATH, "--upload")),
+    "controller index": (("agh",), ("index", "--pin", f"{CONTROLLER}={_BUILD}", "--out", _PATH, "--upload")),
+}
+# Never a fleet train's, whatever the shape: each overrides a publisher refusal, takes a
+# build back, writes outside the index's own publish, or adopts for a consumer.
+PUBLISHER_NEVER = frozenset({"--force-same-build", "--allow-build-tree-seal", "mirror", "lane", "adopt",
+                             "pack-bundle", "withdraw"})
+# How many times one tick publishes an index again after another publisher took the
+# next index number, and how many ticks try a staged build before the train moves on.
+INDEX_ATTEMPTS = 3
+PUBLISH_TICKS = 3
+# aterm's compare-and-swap (crates/atpkg-publish/src/channel/index.rs, compare_and_swap)
+# refuses with exit 1 when another publisher took the next index number; its words are
+# the only signal. An orphaned draft is not a race and is not retried.
+INDEX_RACE = ("another publisher took index", "(a racing publisher), re-run")
+STATUS_PREFIX = "atpkg-publish status: "
+STATUS_PIN = re.compile(r"  pin (?P<program>\S+) = (?P<build>[0-9]+)"
+                        r"(?: on (?P<target>\S+)(?: \(not a target this client knows\))?| \[[^\]]+\])?")
 _CLEANUP_APIS: dict[tuple[str, str], dict] = {}
 _CLEANUP_API_LOCK = threading.Lock()
 
@@ -102,6 +152,10 @@ class CommandFailed(Refused):
         super().__init__(message)
         self.exit_code = exit_code
         self.timed_out = timed_out
+
+
+class CustodyBroken(Refused):
+    """A train's build failed a custody check before publication: it is never published."""
 
 
 class Unanswered(Refused):
@@ -149,8 +203,18 @@ def read_json(path: Path) -> dict:
     return value
 
 
-def fingerprint(path: Path) -> dict:
-    """Hash names, kinds, modes, links and bytes, without following directory links."""
+# Bootstrap's Sysroot step links every stage sysroot's two source entries to the checkout
+# that built it (upstream src/bootstrap compile.rs); promote-toolchain.sh freezes both into
+# the seal. An unsealed stage tree (the mint's pack source, a prepared stage2) carries them.
+BOOTSTRAP_SOURCE_LINKS = frozenset({"./lib/rustlib/src/rust", "./lib/rustlib/rustc-src/rust"})
+
+
+def fingerprint(path: Path, source: Path | None = None) -> dict:
+    """Hash names, kinds, modes, links and bytes, without following directory links.
+
+    With ``source``, the tree's two bootstrap source entries may name exactly that
+    checkout (the run's own commit-bound snapshot); they are bound by their link text and
+    never followed. Every other link that leaves the tree is refused."""
     if path.is_symlink() or not path.exists():
         raise Refused(f"artifact absent or its root is a symlink: {path}")
     root = path.resolve()
@@ -163,7 +227,8 @@ def fingerprint(path: Path) -> dict:
         mode = stat.S_IMODE(info.st_mode)
         if stat.S_ISLNK(info.st_mode):
             target = os.readlink(item)
-            if not item.resolve().is_relative_to(root):
+            source_entry = source is not None and name in BOOTSTRAP_SOURCE_LINKS and target == str(source)
+            if not source_entry and not item.resolve().is_relative_to(root):
                 raise Refused(f"artifact link escapes its hashed tree: {item} -> {target}")
             row = [name, "link", mode, target]
         elif stat.S_ISREG(info.st_mode):
@@ -431,6 +496,30 @@ def owned_command(engine: Path, result_path: Path, timeout: int | None, argv: li
         atomic_json(result_path, result)
 
 
+def tree_build_manager(source: Path, env: dict[str, str]) -> Path | None:
+    """The first of the tree's own build-tree managers that answers protocol v2, asked in
+    x.py's order and as x.py asks it, or None.
+
+    x.py's list also names an explicit TRUST_BUILD_TREE_MANAGER_TARGO and then `targo trust
+    repo lock` on PATH. Neither reaches the x.py a cut runs: the runner drops every ambient
+    TRUST_* setting, and the mint runs each x.py under `env -i` with a PATH of its reviewed
+    helper profile, which admits no Rust-family tool (mint_seed_support.rust_family_name).
+    Only the tree's own manager can serve the mint, so only it is asked: an installed Targo
+    that answers v2 is no reason to skip building one."""
+    for relative in TREE_MANAGERS:
+        executable = source / relative
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            continue
+        try:
+            probe = subprocess.run([str(executable), "--trust-build-tree-lock", "--protocol"], cwd=source,
+                                   env=env, timeout=10, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0 and probe.stdout == MANAGER_PROTOCOL:
+            return executable
+    return None
+
+
 def bootstrap_environment(env: dict[str, str], owner: Path) -> dict[str, str]:
     """Read the owner's literal policy, without executing/importing its module."""
     policy = {}
@@ -630,6 +719,51 @@ def cargo_config_inputs(work: Path, environment: dict[str, str]) -> dict:
     return result
 
 
+def consumer_environment(base: dict[str, str], staged: Path, rustup_home: Path,
+                         target: Path, inherited_path: str) -> dict[str, str]:
+    """The ordinary consumer's explicit, private full-SDK selection.
+
+    This constructs environment data only. It neither links a toolchain nor
+    attests a compiler, SDK, command result or publication outcome.
+    """
+    return {**base, "RUSTUP_HOME": str(rustup_home), "CARGO_TARGET_DIR": str(target),
+            "TARGO": str(staged / "bin/targo"),
+            "PATH": f"{rustup_home / 'bin'}:{staged / 'bin'}:{inherited_path}"}
+
+
+def full_sdk_gates(call, stage: Path, source: Path, host: str, python: Path,
+                   promotion_env: dict) -> None:
+    """Run the unchanged complete staged-SDK contracts, preserving their order."""
+    before = fingerprint(stage, source)
+    call("toolchain-output-contract", ["sh", str(source / "tools/verify-toolchain.sh"), str(stage)])
+    call("sysroot-library-contract", [str(python), "-I", "-S", "-B",
+         str(source / "scripts/verify_sysroot_libraries.py"),
+         "--sysroot", str(stage), "--target", host])
+    call("staged-ui-and-tool-start", ["bash", str(source / "scripts/promote-toolchain.sh"),
+         "--gate-only", str(stage)], heavy=True, env=promotion_env)
+    if fingerprint(stage, source) != before:
+        raise Refused("staged tree changed while its gates were running")
+
+
+def owned_step_argv(slot: Path, python: Path, driver: Path, cleanup_owner: Path,
+                    result: Path, timeout: int | None, argv: list[str],
+                    admission: list[str] | None = None) -> list[str]:
+    """The same original process/cleanup owner, inside original admission."""
+    return [str(slot), *(admission or []), "--", str(python), str(driver),
+            "_owned-command", str(cleanup_owner), str(result), str(timeout or 0), "--", *argv]
+
+
+def bind_owned_failure(step: dict, error: BaseException, detail: dict) -> None:
+    """Preserve the wrapper wait separately from its original actual child."""
+    step["owned_result"] = detail
+    if isinstance(error, CommandFailed):
+        step["wrapper_exit_code"] = error.exit_code
+        error.exit_code, error.timed_out = detail["exit_code"], detail["timed_out"]
+    elif isinstance(error, (KeyboardInterrupt, InterruptedError)):
+        step["wrapper_exit_code"] = getattr(error, "child_exit_code", None)
+        error.child_exit_code = detail["exit_code"]
+
+
 def bound_dependency_owner(source_owner, path: Path, name: str):
     """Use the same captured-source loader for every dependency owner."""
     module = source_owner.module(name, path)
@@ -650,7 +784,7 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
     loader_owner, loader_sha256 = transport_owner["source_owner"](loader_path, "daily_dependency_source_loader")
     owner_inputs = {str(helper): helper_sha256, str(loader_path): loader_sha256}
     relative_owners = ("scripts/seed_staircase.py", "scripts/bootstrap_dependency_closure.py",
-        "scripts/mint_seed_support.py", "scripts/recreate_bootstrap.py", "scripts/daily_registry_proxy.py",
+        "scripts/mint_seed_support.py", "scripts/recreate_bootstrap.py", "scripts/source_working_cache.py", "scripts/daily_registry_proxy.py",
         "src/bootstrap/stage0_identity.py", "scripts/lib/seed_linux.py", "scripts/lib/seal_content_identity.py")
     expected_owners = {name: file_hash(source / name) for name in relative_owners}
     policy_file = policy_engine / "bin/pub-relock"
@@ -706,6 +840,19 @@ def prewarm_dependencies(source: Path, work: Path, host: str, output: Path,
     if not cache.exists():
         initial = mint["cargo_home_inputs"](cargo_input, cache)
         atomic_json(work / "initial-cache.json", initial)
+    else:
+        # A reused home holds the Git checkouts Cargo made in it. Cargo makes them by a local
+        # clone of git/db, which hardlinks the database's objects, and validate_bare_db
+        # refuses any database file with another link: a home used once could never be
+        # revalidated (the 5062 relaunch, 2026-11-15). They are derived state, no tree the
+        # mint imports (CARGO_HOME_INPUT_TREES) and nothing its handoff copies, so they go
+        # before anything validates or uses the home. A database file linked from anywhere
+        # else still refuses.
+        for path in (cache / "git", cache / "git/checkouts"):
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise Refused(f"reused dependency Cargo home has a linked or non-directory {path}")
+        if (cache / "git/checkouts").exists():
+            shutil.rmtree(cache / "git/checkouts")
     for name in mint["CARGO_HOME_INPUT_TREES"]:
         tree = cache / name
         if tree.exists() or tree.is_symlink():
@@ -907,6 +1054,15 @@ def validate_dependency_preparation(preparation: dict) -> None:
             raise Refused(f"dependency preparation cache input changed: {path}")
 
 
+def trust_checkout(label: str) -> bool:
+    """Whether a synchronize label names a checkout of the Trust source.
+
+    Those are the snapshot the cut builds and the train's landing worktree (`landing-<step>`),
+    the only ones with the first-party gitlinks a --source-object-cache declares.
+    """
+    return label == "source" or label.startswith("landing-")
+
+
 class Runner:
     def __init__(self, args: argparse.Namespace, execute: Callable = command, train=None):
         self.args = args
@@ -996,8 +1152,8 @@ class Runner:
         result_file = None
         if heavy:
             result_file = log.with_suffix(".result.json")
-            argv = [str(self.slot), "--", str(self.python), str(Path(__file__).resolve()),
-                    "_owned-command", str(cleanup_owner), str(result_file), str(timeout or 0), "--", *argv]
+            argv = owned_step_argv(self.slot, self.python, Path(__file__).resolve(),
+                                   cleanup_owner, result_file, timeout, argv)
         step = {"name": name, "argv": argv, "cwd": str(cwd or self.source),
                 "log": str(log), "status": "running", "started_at": now()}
         if timeout is not None:
@@ -1024,13 +1180,7 @@ class Runner:
             with self.record_lock:
                 if result_file and result_file.exists():
                     detail = read_json(result_file)
-                    step["owned_result"] = detail
-                    if isinstance(error, CommandFailed):
-                        step["wrapper_exit_code"] = error.exit_code
-                        error.exit_code, error.timed_out = detail["exit_code"], detail["timed_out"]
-                    elif isinstance(error, (KeyboardInterrupt, InterruptedError)):
-                        step["wrapper_exit_code"] = getattr(error, "child_exit_code", None)
-                        error.child_exit_code = detail["exit_code"]
+                    bind_owned_failure(step, error, detail)
                 step.update(status="failed", error=str(error), finished_at=now())
                 if isinstance(error, CommandFailed):
                     step.update(exit_code=error.exit_code, timed_out=error.timed_out)
@@ -1171,7 +1321,9 @@ class Runner:
         if marker.exists():
             old = query("previous-source", destination, "rev-parse", "HEAD")
             query("source-fast-forward", destination, "merge-base", "--is-ancestor", old, commit)
+        working_cache = recreator["_prepare_source_working_cache"](destination, commit, repository)
         query("select-main", destination, "-c", "submodule.recurse=false", "checkout", "--detach", commit)
+        self.write_json(self.invocation / f"{suffix}-{label}-working-data.json", working_cache.verify())
         self.snapshot_custody(destination, origin, query)
         self.write_json(marker, ownership)
         return commit
@@ -1218,14 +1370,15 @@ class Runner:
 
     def milestone(self, name: str, outputs: list[Path], action: Callable[[], None]) -> None:
         cached = self.checkpoint.get("milestones", {}).get(name)
+        # A stage tree's bootstrap source links name this run's snapshot (see fingerprint).
         if cached:
-            expected = {str(p): fingerprint(p) for p in outputs}
+            expected = {str(p): fingerprint(p, self.source) for p in outputs}
             if cached != expected:
                 raise Refused(f"{name} artifacts changed since their successful gates; retained for investigation")
             self.record["reused"].append(name)
         else:
             action()
-            expected = {str(p): fingerprint(p) for p in outputs}
+            expected = {str(p): fingerprint(p, self.source) for p in outputs}
             self.checkpoint.setdefault("milestones", {})[name] = expected
             self.write_json(self.checkpoint_path, self.checkpoint)
         self.record["artifacts"].update(expected)
@@ -1264,7 +1417,7 @@ class Runner:
         # cannot meet; with a cache it takes the exact checkout closure instead and
         # reads the objects a local repository already holds.
         caches = (owner["_first_party_checkout_caches"](path, self.args.source_object_cache)
-                  if label == "source" and self.args.source_object_cache else {})
+                  if trust_checkout(label) and self.args.source_object_cache else {})
         if caches:
             owner["ensure_submodules"](path, checkout_caches=caches)
         else:
@@ -1323,6 +1476,30 @@ class Runner:
 
     def pinned_source(self) -> None:
         self.record["submodules"] = self.synchronize(self.source, "source")
+        self.save()
+
+    def build_tree_manager(self) -> None:
+        """Give the snapshot the build-tree manager its x.py runs take their lease from.
+
+        A fresh snapshot has none, and until 2026-11-15 only the mint's first x.py noticed,
+        after the dependency prewarm: "native build-tree manager v2 is unavailable". So it is
+        asked here, before any prewarm or build, and built by the snapshot's own
+        scripts/build-tree-manager.sh when none answers (docs/BUILD_AND_INSTALL.md)."""
+        manager = tree_build_manager(self.source, self.env)
+        built = manager is None
+        if built:
+            try:
+                self.call("build-tree-manager", ["bash", str(self.source / "scripts/build-tree-manager.sh")],
+                          heavy=True)
+            except CommandFailed as error:
+                raise Refused("the build-tree-manager step built no manager that answers "
+                              f"{MANAGER_PROTOCOL.decode().strip()}; see {self.last_step()['log']}") from error
+            manager = tree_build_manager(self.source, self.env)
+            if manager is None:
+                raise Refused("the build-tree-manager step left no manager that answers "
+                              f"{MANAGER_PROTOCOL.decode().strip()}, so the mint's x.py would refuse "
+                              f"its build lease; see {self.last_step()['log']}")
+        self.record["build_tree_manager"] = {"path": str(manager), "sha256": file_hash(manager), "built": built}
         self.save()
 
     def consumers(self, staged: Path) -> list[str]:
@@ -1387,9 +1564,8 @@ class Runner:
                     shim.symlink_to(rustup)
                 if not shim.is_symlink() or shim.resolve(strict=True) != rustup:
                     raise Refused("consumer rustup shim changed")
-                environment = {**base_environment, "RUSTUP_HOME": str(rustup_home), "CARGO_TARGET_DIR": str(target),
-                               "TARGO": str(staged / "bin/targo"),
-                               "PATH": f"{private_bin}:{staged / 'bin'}:{self.env.get('PATH', '')}"}
+                environment = consumer_environment(base_environment, staged, rustup_home,
+                                                   target, self.env.get("PATH", ""))
                 for oracle, targets in policy["cross_target_oracles"].items():
                     install = [str(rustup), "toolchain", "install", oracle, "--profile", "minimal", "--no-self-update"]
                     install += ["--target", ",".join(targets)]
@@ -1543,15 +1719,7 @@ class Runner:
         return {**self.env, "TRUST_TOOLCHAIN_SERIAL_COMMAND": str(self.serial)}
 
     def gates(self, stage: Path) -> None:
-        before = fingerprint(stage)
-        self.call("toolchain-output-contract", ["sh", str(self.source / "tools/verify-toolchain.sh"), str(stage)])
-        self.call("sysroot-library-contract", [str(self.python), "-I", "-S", "-B",
-                  str(self.source / "scripts/verify_sysroot_libraries.py"),
-                  "--sysroot", str(stage), "--target", self.host])
-        self.call("staged-ui-and-tool-start", ["bash", str(self.source / "scripts/promote-toolchain.sh"),
-                                               "--gate-only", str(stage)], heavy=True, env=self.promotion_env())
-        if fingerprint(stage) != before:
-            raise Refused("staged tree changed while its gates were running")
+        full_sdk_gates(self.call, stage, self.source, self.host, self.python, self.promotion_env())
 
     def stage(self) -> None:
         helper = self.source / "scripts/mint_seed_support.py"
@@ -1585,6 +1753,9 @@ class Runner:
         archives = mint / "repin/bootstrap/trust-stage0/dist"
         mint_command = ["bash", str(self.source / "scripts/mint_and_prove_seed.sh"), "--host", self.host]
         mint_command += ["--clean-lean-lib", lean["library_path"]]
+        # No --jobs: the mint takes build-slot's share, and its receipt records it for a
+        # continuation (mint_seed_recovery.py), which also reads a default DDC seed from
+        # the kept ddc-seed.json.
         # The cache is input data. It carries no compiled artifacts or user config.
         dependency_work = self.state / "dependencies" / self.commit
         if self.args.ddc_seed:
@@ -1596,7 +1767,11 @@ class Runner:
             prepared_cache = self.prepare_dependencies(dependency_work)
             command = [*mint_command, "--cargo-home", str(prepared_cache)]
             self.call("mint-preflight", [*command, "--check-only"])
-            self.call("sanctioned-mint-and-double-compile", command, heavy=True)
+            try:
+                self.call("sanctioned-mint-and-double-compile", command, heavy=True)
+            except CommandFailed as error:
+                self.keep_mint_continuation(mint, command, error)
+                raise
 
         self.milestone("mint", [stage2, archives, mint / "trust-seed-mint"], mint_action)
         preparation = self.checkpoint.get("dependency_preparation")
@@ -1704,6 +1879,112 @@ class Runner:
         if consumer_errors:
             raise Refused("consumer acceptance incomplete: " + "; ".join(consumer_errors))
 
+    def keep_mint_continuation(self, mint: Path, command: list[str], failure: CommandFailed) -> None:
+        """Keep what continuing a mint that failed after its stage provenance reads.
+
+        mint_seed_recovery.py continues such a mint (`--resume-after-provenance`) instead of
+        rebuilding it, about 6 hours, from: the terminal result with the original argv, the
+        accepted stage receipt, the saved helper profile and the DDC observations. The mint
+        retains its WORK when it fails. These are copied from it into this run's directory.
+        WORK is then renamed beside itself in the source's build, out of the `.mint-and-prove.*`
+        name the continuation recreates and refuses to find: it stays as long as the snapshot
+        does, as it would have, and never rides the run's records into the train's history/.
+        Every value is read and checked before anything is written, and the evidence directory
+        appears whole or not at all; on any refusal WORK stays where the mint left it.
+        A mint that failed before an accepted stage receipt, timed out or did not exit 1 keeps
+        nothing here; it is built again. The original failure stays the run's error."""
+        receipt_path = mint / self.host / "stage2/tool-provenance.json"
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return
+        evidence = self.invocation / "mint-continuation"
+        partial = self.invocation / ".mint-continuation.partial"
+
+        def kept(path: Path) -> bytes:
+            if path.is_symlink() or not path.is_file():
+                raise Refused(f"the mint's WORK holds no regular {path.name}: {path}")
+            return path.read_bytes()
+
+        try:
+            receipt_bytes = receipt_path.read_bytes()
+            receipt = json.loads(receipt_bytes)
+            if (receipt.get("status") != "internal-release-ready" or receipt.get("errors") != []
+                    or receipt["compiler"]["source_commit"] != self.commit):
+                return
+            if failure.exit_code != 1 or failure.timed_out:
+                # The recovery continues only a mint's terminal exit 1; a timeout or a signal is rebuilt.
+                raise Refused(f"the mint exited {failure.exit_code}{' on its timeout' if failure.timed_out else ''}, "
+                              "and only a terminal exit 1 is continued")
+            work = Path(receipt["build_authority"]["cargo_environment"]["cargo_home"]).parent
+            if (work.parent != self.source / "build" or not work.name.startswith(".mint-and-prove.")
+                    or work.is_symlink() or not work.is_dir()):
+                raise Refused(f"the stage receipt names no retained mint WORK in the source's build: {work}")
+            safe_path = kept(work / "safe-path.json")
+            manifests = {name: kept(work / name) for name in MINT_DDC_EVIDENCE}
+            pinned = json.loads(manifests["stage2-pinned-seed.json"])
+            oracle = json.loads(manifests["ddc-seed.json"])
+            # The mint writes an accepted stage receipt only after its double compile found the
+            # two stage2 trees identical (mint_and_prove_seed.sh); inspect compares them again.
+            ddc_state = {"stage2_tree_sha256": pinned["sha256"], "oracle_commit": oracle["commit"],
+                         "relation": oracle["relation"]}
+            # What the original argv did not name, the continuation is given from what the mint
+            # recorded: the job count it ran with, and the default DDC seed it chose.
+            jobs = receipt["bootstrap_lineage"]["mint_configuration"]["xpy_config_overrides"].get("build.jobs")
+            if type(jobs) is not int or jobs < 1:
+                raise Refused("the stage receipt records no job count (build.jobs) for the continuation's --jobs")
+            continuation = [str(self.slot), "--", *command[:2], "--resume-after-provenance", str(evidence),
+                            "--source-root", str(self.source), "--jobs", str(jobs), *command[2:]]
+            if "--ddc-seed" not in command:
+                seed = oracle.get("sysroot")
+                if not isinstance(seed, str) or not Path(seed).is_absolute():
+                    raise Refused("the kept ddc-seed.json names no DDC seed (sysroot) for the continuation's --ddc-seed")
+                continuation += ["--ddc-seed", seed]
+            retained = work.with_name("retained" + work.name)
+            for path in (evidence, partial, retained):
+                if os.path.lexists(path):
+                    raise Refused(f"a continuation output already exists: {path}")
+            after = self.git("mint-source-after", self.source, "rev-parse", "HEAD")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as problem:
+            self.record["mint_continuation"] = {"error": f"continuation evidence not kept: {problem}"}
+            self.save()
+            return
+        try:
+            ddc = partial / "ddc-equality-evidence"
+            ddc.mkdir(parents=True)
+            captured = partial / "canonical-stage-provenance-before-selfhost.json"
+            captured.write_bytes(receipt_bytes)
+            (partial / "safe-path-v3-initial.json").write_bytes(safe_path)
+            for name, data in manifests.items():
+                (ddc / name).write_bytes(data)
+            atomic_json(ddc / "observation.json", {
+                "state": "actual_canonical_DDC_equality_observed", "source": self.commit, **ddc_state,
+                "captured_manifests": [{"file": str(work / name), "sha256": file_hash(ddc / name)}
+                                       for name in MINT_DDC_EVIDENCE]})
+            atomic_json(partial / "state.json", {
+                "source": self.commit, "canonical_stage_provenance": {"sha256": file_hash(captured)},
+                "native_profile": {"source": self.commit, "sha256": file_hash(partial / "safe-path-v3-initial.json")},
+                "ddc": ddc_state})
+            atomic_json(partial / "mint-result.json", {"source": self.commit, "source_after": after,
+                                                       "exit": failure.exit_code, "command": command})
+            partial.rename(evidence)
+            try:
+                work.rename(retained)
+            except OSError:
+                # Evidence that names a continuation the still-present WORK would refuse is not kept.
+                remove_tree(evidence)
+                raise
+        except OSError as problem:
+            if partial.is_dir() and not partial.is_symlink():
+                with contextlib.suppress(OSError):
+                    remove_tree(partial)
+            self.record["mint_continuation"] = {"error": f"continuation evidence not kept: {problem}"}
+            self.save()
+            return
+        self.record["mint_continuation"] = {"evidence": str(evidence), "retained_work": str(retained),
+                                            "command": continuation}
+        self.save()
+        print(f"the mint failed after its stage provenance; its continuation evidence is {evidence}; "
+              f"continue it with:\n  {shlex.join(continuation)}", file=sys.stderr)
+
     def prepare_dependencies(self, work: Path) -> Path:
         if work.is_symlink():
             raise Refused("dependency workspace must not be a symlink")
@@ -1767,10 +2048,10 @@ class Runner:
         self.save()
         try:
             self.python = Path(sys.executable).resolve(strict=True)
-            python_alias = private_python(self.state, self.python)
+            self.python_alias = private_python(self.state, self.python)
             self.env["PATH"] = python_search_path(self.state, self.env.get("PATH", os.defpath))
             self.record["python"] = {"path": str(self.python), "sha256": file_hash(self.python),
-                                     "python3_alias": str(python_alias)}
+                                     "python3_alias": str(self.python_alias)}
             self.save()
             self.commit = self.snapshot(self.repo, self.source, "trust")
             self.slot = (self.args.build_slot.resolve(strict=True) if self.args.build_slot
@@ -1798,11 +2079,17 @@ class Runner:
                         "ddc_seed_identity": fingerprint(self.args.ddc_seed.resolve(strict=True)) if self.args.ddc_seed else None,
                         "seed_dylib_path": {str(p.resolve(strict=True)): fingerprint(p.resolve(strict=True))
                                             for p in self.args.seed_dylib_path}}
+            if self.train is not None:
+                # The host a fleet build is stage-uploaded through, and where it goes after
+                # its stage-upload: the index, or nowhere.
+                settings["publisher_host"] = self.args.publisher_host
+                settings["index_host"] = self.args.index_host
             self.checkpoint_path = self.state / "checkpoints" / f"{self.commit}-{self.args.mode}.json"
             self.checkpoint = read_json(self.checkpoint_path) if self.checkpoint_path.exists() else {"settings": settings}
             if self.checkpoint.get("settings") != settings:
                 raise Refused("checkpoint settings differ; retain it and use a fresh state root")
             self.record["settings"] = settings
+            self.build_tree_manager()
             self.call("pinned-bootstrap-config", self.bootstrap(False))
             if self.args.mode == "prepare":
                 stage = self.source / "build" / self.host / "stage2"
@@ -1817,45 +2104,121 @@ class Runner:
                 self.record["deployment_requirements"].insert(0, "Run --mode stage: preparation is not a seed mint or a deployable staging result.")
             else:
                 self.stage()
+                # A train's build is published only when an index serves it.
                 self.record["status"] = ("published" if self.record.get("published")
+                                         else "staged" if self.record.get("staged")
                                          else "consumer_ready" if self.record["consumer_ready"] else "local_staged")
-            self.clean(self.source)
-            if self.git("final-source", self.source, "rev-parse", "HEAD") != self.commit:
-                raise Refused("source HEAD changed during staging")
-            # Rehash after the final gates, including earlier milestones and packages.
-            for path, expected in self.record["artifacts"].items():
-                if fingerprint(Path(path)) != expected:
-                    raise Refused(f"artifact changed during staging: {path}")
-            if self.record.get("dependency_preparation"):
-                validate_dependency_preparation(self.record["dependency_preparation"])
-            if elan_home_identity(self.elan_home) != self.elan_identity:
-                raise Refused("selected Lean installation changed during staging")
-            if (not python_alias.is_symlink() or python_alias.resolve(strict=True) != self.python
-                    or file_hash(self.python) != self.record["python"]["sha256"]):
-                raise Refused("controller interpreter or its private python3 alias changed during staging")
-            if (self.serial.is_symlink() or not self.serial.is_file()
-                    or file_hash(self.serial) != settings["serial_command"]["sha256"]):
-                raise Refused("promotion's serial command changed during staging")
+            self.custody()
             self.record["finished_at"] = now()
             self.save()
             return 0
         except (Exception, KeyboardInterrupt) as error:
-            self.record.update(status="failed", consumer_ready=False, error=str(error) or "interrupted", finished_at=now(),
+            # A train's build stays what it is when a later step fails: staged, or served by an index.
+            self.record.update(status=("published" if self.record.get("published") else "staged"
+                                       if self.record.get("staged") else "failed"),
+                               consumer_ready=False, error=str(error) or "interrupted", finished_at=now(),
                                interrupted=isinstance(error, (KeyboardInterrupt, InterruptedError)))
             self.save()
             return 1
+
+    def source_at_cut(self) -> None:
+        """The source snapshot is clean and still at the cut commit."""
+        self.clean(self.source)
+        if self.git("final-source", self.source, "rev-parse", "HEAD") != self.commit:
+            raise Refused("source HEAD changed during staging")
+
+    def artifacts_unchanged(self, skip: tuple[Path, ...] = ()) -> None:
+        """Every artifact the run recorded, but those under `skip`, hashes as recorded."""
+        for path, expected in self.record["artifacts"].items():
+            if any(Path(path).is_relative_to(directory) for directory in skip):
+                continue
+            if fingerprint(Path(path), self.source) != expected:
+                raise Refused(f"artifact changed during staging: {path}")
+
+    def custody(self) -> None:
+        """A run's end checks: its source and every artifact unchanged, and its own inputs too.
+
+        A run makes them last. A train makes them before it publishes a build it cut as well,
+        so a build reaches the fleet only from a cut whose custody held through its upload.
+        """
+        self.source_at_cut()
+        # Rehash after the final gates, including earlier milestones and packages.
+        self.artifacts_unchanged()
+        if self.record.get("dependency_preparation"):
+            validate_dependency_preparation(self.record["dependency_preparation"])
+        if elan_home_identity(self.elan_home) != self.elan_identity:
+            raise Refused("selected Lean installation changed during staging")
+        if (not self.python_alias.is_symlink() or self.python_alias.resolve(strict=True) != self.python
+                or file_hash(self.python) != self.record["python"]["sha256"]):
+            raise Refused("controller interpreter or its private python3 alias changed during staging")
+        if (self.serial.is_symlink() or not self.serial.is_file()
+                or file_hash(self.serial) != self.record["settings"]["serial_command"]["sha256"]):
+            raise Refused("promotion's serial command changed during staging")
+
+    def resumed_custody(self) -> None:
+        """Before a resumed publication: what it reads is what the cut recorded.
+
+        That is the source snapshot at the cut commit and each recorded artifact the train keeps
+        of a build. What a build regenerates (TRAIN_INTERMEDIATES) is no input of publication,
+        and the train removes it from its last good build. The cut's own inputs (the Lean
+        installation, the interpreter, the serial command) were checked by the cut itself.
+        """
+        self.source_at_cut()
+        self.artifacts_unchanged(tuple(self.state / relative for relative in TRAIN_INTERMEDIATES))
 
     def run(self) -> int:
         with single_run(self.state):
             return self.run_locked()
 
+    def resume(self, action: Callable[["Runner"], None]) -> None:
+        """Run `action` in a new invocation of this state root's staged cut, with its commit and host.
+
+        A train uses it to publish a build an earlier tick stage-uploaded. Nothing is cut or
+        gated again, and the Trust and aterm snapshots stay as the cut left them; `action`
+        checks what it reads (resumed_custody). Its error is recorded and raised.
+        """
+        with single_run(self.state):
+            previous = read_json(self.state / "latest.json")
+            legacy = previous.get("published") or {}
+            if not previous.get("staged") and legacy.get("index") == "unchanged" and BUILD_TAG.fullmatch(str(legacy.get("tag"))):
+                # A v1 train (trust.toolchain-train.v1) called its stage-upload `published`
+                # and wrote no index: the tag is the staging, and nothing serves the build.
+                previous = {key: value for key, value in previous.items() if key != "published"}
+                previous["staged"] = {key: legacy[key] for key in ("build", "tag", "repository", "at") if key in legacy}
+                previous["migrated"] = "a v1 train's record: its `published` (index unchanged) is this `staged`"
+            self.invocation = self.state / "runs" / (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{os.getpid()}")
+            self.invocation.mkdir(parents=True)
+            self.record = {**previous, "status": "running", "steps": [], "resumed_at": now()}
+            for key in ("error", "interrupted", "finished_at"):
+                self.record.pop(key, None)
+            self.save()
+            try:
+                if not previous.get("staged") or not previous.get("source_commit"):
+                    raise Refused(f"{self.state} holds no stage-uploaded cut to resume")
+                self.python = Path(sys.executable).resolve(strict=True)
+                private_python(self.state, self.python)
+                self.env["PATH"] = python_search_path(self.state, self.env.get("PATH", os.defpath))
+                self.commit, self.host = previous["source_commit"], previous["settings"]["host"]
+                self.slot = (self.args.build_slot.resolve(strict=True) if self.args.build_slot
+                             else self.source / "scripts/build-slot")
+                action(self)
+            except (Exception, KeyboardInterrupt) as error:
+                self.record.update(status="published" if self.record.get("published") else "staged",
+                                   error=str(error) or type(error).__name__, finished_at=now(),
+                                   interrupted=isinstance(error, (KeyboardInterrupt, InterruptedError)))
+                self.save()
+                raise
+            self.record.update(status="published" if self.record.get("published") else "staged", finished_at=now())
+            self.save()
+
 
 # ----------------------------------------------------------------------------------------
-# The fleet train. One tick: when the previous train has ended and main has moved, cut
-# main's tip, publish the seed archives, land the re-pin through the push gate,
-# stage-upload the signed pack, then run the consumer checks and the row-count comparison
-# and land what they found as one item of docs/OPEN_ISSUES.md. Nothing below publishes
-# the package index.
+# The fleet train. One tick: first publish what an earlier tick staged and no index serves
+# yet; then, when the previous train has ended and main has moved, cut main's tip, publish
+# the seed archives, land the re-pin through the push gate, stage-upload the signed pack,
+# publish it to the signed atpkg index with trust-resource-controller from the same commit,
+# then run the consumer checks and the row-count comparison and land what they found as
+# one item of docs/OPEN_ISSUES.md.
 
 
 def github_slug(origin: str) -> str:
@@ -1929,7 +2292,10 @@ class GitHub:
         return sha
 
     def builds(self) -> list[int]:
-        """Every published trust build, oldest first: the `atpkg-trust-<N>` tags."""
+        """Every stage-uploaded trust build, oldest first: the `atpkg-trust-<N>` tags.
+
+        A tag says a pack was staged, not that an index serves it.
+        """
         return sorted({int(match[1]) for ref in self.refs()
                        if (match := BUILD_TAG.fullmatch(ref.removeprefix("refs/tags/"))) and ref.startswith("refs/tags/")})
 
@@ -1950,20 +2316,65 @@ class GitHub:
 
 
 def fleet_publisher(targo: str, host: str, words: list[str]) -> list[str]:
-    """aterm's publisher, for the two things a fleet train asks of it.
+    """aterm's publisher, for exactly the commands of PUBLISHER_COMMANDS.
 
-    `hosts check` reads files. `publish-group rustc` runs as a dry run or a stage-upload,
-    which leaves the index alone. Every other verb and flag is refused here.
+    Each is matched word for word under the hosts it names, so a path is absolute, a build
+    is a decimal number and no flag is added, dropped or moved; PUBLISHER_NEVER is refused
+    besides. Every other command is refused here.
     """
-    if words == ["hosts", "check"]:
-        # The publisher refuses a global --host before `hosts`.
-        return [targo, "--unverified", "run", "-q", "--locked", "-p", "atpkg-publish", "--",
-                "hosts", "check", "--host", host]
-    modes = [word for word in words if word in ("--dry-run", "--stage-upload")]
-    if words[:2] != ["publish-group", "rustc"] or len(modes) != 1 or PUBLISHER_REFUSED.intersection(words):
-        raise Refused("a fleet train stage-uploads and never publishes the index; refused publisher command: "
-                      + " ".join(words))
-    return [targo, "--unverified", "run", "-q", "--locked", "-p", "atpkg-publish", "--", "--host", host, *words]
+    shape = next((name for name, (hosts, patterns) in PUBLISHER_COMMANDS.items()
+                  if host in hosts and len(words) == len(patterns)
+                  and all(re.fullmatch(pattern, word) for pattern, word in zip(patterns, words))), None)
+    if shape is None or PUBLISHER_NEVER.intersection(words):
+        raise Refused(f"not a fleet train's publisher command under --host {host}: " + " ".join(words))
+    prefix = [targo, "--unverified", "run", "-q", "--locked", "-p", "atpkg-publish", "--"]
+    if shape == "hosts check":
+        return [*prefix, *words, "--host", host]
+    return [*prefix, "--host", host, *words]
+
+
+def index_pins(text: str, target: str) -> tuple[int, dict[str, int]]:
+    """The channel head `atpkg-publish status` printed: its index number and each program's pin.
+
+    A pin `on <target>` replaces the channel's pin for a client on that target, so the pins
+    are the ones a client on `target` installs.
+    """
+    index, pins, overlay = None, {}, {}
+    for line in text.splitlines():
+        if not line.startswith(STATUS_PREFIX):
+            continue
+        line = line[len(STATUS_PREFIX):]
+        if match := re.fullmatch(r"atpkg-index-([0-9]+) — signed by .*", line):
+            if index is not None:
+                raise Refused("the publisher's status named two channel heads")
+            index = int(match[1])
+        elif match := STATUS_PIN.fullmatch(line):
+            if match["target"] is None:
+                pins[match["program"]] = int(match["build"])
+            elif match["target"] == target:
+                overlay[match["program"]] = int(match["build"])
+    if index is None:
+        raise Refused("the publisher's status named no signed index")
+    return index, {**pins, **overlay}
+
+
+def publisher_refusal(log: Path) -> str | None:
+    """The last refusal aterm's publisher printed (`atpkg-publish: REFUSED — …`), shortened, if any."""
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    found = [line.removeprefix("atpkg-publish: ") for line in lines if line.startswith("atpkg-publish: ")]
+    return found[-1][:500] if found else None
+
+
+def lost_index_race(log: Path) -> bool:
+    """Whether a refused index publish lost the next index number to another publisher."""
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(marker in text for marker in INDEX_RACE)
 
 
 @contextlib.contextmanager
@@ -1987,8 +2398,31 @@ def load_train(root: Path) -> dict:
     if not path.exists():
         return {"schema": TRAIN_SCHEMA}
     state = read_json(path)
+    if state.get("schema") == TRAIN_SCHEMA_V1:
+        return migrate_train_v1(state)
     if state.get("schema") != TRAIN_SCHEMA:
         raise Refused(f"not a train's state: {path}")
+    return state
+
+
+def migrate_train_v1(state: dict) -> dict:
+    """A v1 train's state, as v2.
+
+    A v1 train stopped every build at its stage-upload and recorded that as `published`. Its
+    last good build is staged and served by no index, so the next tick publishes it; its last
+    tick's `published` status is `staged`; its reading of main named the newest staging tag
+    `published`. The migration is recorded in the state.
+    """
+    state = {**state, "schema": TRAIN_SCHEMA, "migrated": {"from": TRAIN_SCHEMA_V1, "at": now()}}
+    for key in ("good", "last"):
+        if state.get(key):
+            entry = state[key] = dict(state[key])
+            if "published_at" in entry:
+                entry["staged_at"] = entry.pop("published_at")
+            if entry.get("status") == "published":
+                entry["status"] = "staged"
+    if state.get("main") and "published" in state["main"]:
+        state["main"] = {("staged" if key == "published" else key): value for key, value in state["main"].items()}
     return state
 
 
@@ -1997,7 +2431,8 @@ def train_decision(state: dict, tip: str, published: int | None, count: int | No
 
     Main has not moved when its tip is the commit the last train settled on (the commit it
     cut, or that commit under nothing but the train's own re-pin and report), or when the
-    newest published build already counts every commit of main.
+    newest published build already counts every commit of main. `published` is a build an
+    index serves; a build that is only staged counts for nothing here.
     """
     last = state.get("last") or {}
     if tip == state.get("settled"):
@@ -2115,7 +2550,7 @@ def issue_block(build: int, commit: str, date: str, findings: list[str], previou
         f"### {TRAIN_ISSUE} — fleet build {build}: what the consumer checks and the proof comparison found",
         f"Written by `scripts/daily_toolchain_stage.py train` after it stage-uploaded build {build} (commit",
         f"`{commit[:12]}`, {date}). The next train replaces this item, and removes it when it finds nothing.",
-        "None of this held the upload: a fleet build is published on the cut's own gates",
+        "None of this held the publication: a fleet build is published on the cut's own gates",
         f"(docs/DECISION_QUEUE.md SEAL-1, D27). {compared}, each at that",
         "consumer's main of its day; the same-tree comparison (`targo trust gate compare-seal`,",
         "docs/PLAN.md PKG-V4) is not on yet.",
@@ -2144,17 +2579,45 @@ def train_activity(state: dict, running: bool) -> str:
         doing = f": step {step['name']} for {elapsed(step.get('started_at'))}" if step else ""
         return f"a train has been running for {elapsed(last.get('started_at'))}: {last.get('phase')} {commit}{doing}"
     if last.get("status") == "running":
-        return f"the train that started {last.get('started_at')} at {commit} ended without a result; the next tick cuts again"
+        return (f"the train that started {last.get('started_at')} at {commit} ended without a result; the next tick "
+                + ("publishes again" if last.get("kind") == "publish" else "cuts again"))
+    problem = f"; {last['error']}" if last.get("error") else ""
+    report = f"report: {last.get('report', 'not written')}"
     if last.get("status") == "published":
-        problem = f"; {last['error']}" if last.get("error") else ""
-        return (f"the last train published build {last.get('build')} ({commit}) at {last.get('published_at')}; "
-                f"report: {last.get('report', 'not written')}{problem}")
+        # Found served: the train's first reading of the channel head already pinned the build,
+        # so the index named is that head, not necessarily the first index that served it.
+        served = "found build {} ({}) served by" if last.get("found_served") else "published build {} ({}) in"
+        return (f"the last train {served.format(last.get('build'), commit)} atpkg-index-{last.get('index')} "
+                f"at {last.get('published_at')}; {report}{problem}")
+    if last.get("status") == "staged":
+        return (f"the last train staged build {last.get('build')} ({commit}) at {last.get('staged_at')} and no index "
+                f"serves it{problem}; {report}")
     return f"the last train {last.get('status')} at {commit or 'no commit'} ({last.get('finished_at')}): {last.get('error')}"
 
 
-def train_status(root: Path, read: Callable[[dict], dict] | None = None) -> str:
-    """One line: the newest published build, how far main is past it, and what the train is doing.
+def train_publication(state: dict) -> str:
+    """What is left of publishing the last build the train staged, or nothing."""
+    good = state.get("good") or {}
+    if not good or ("index" in good and "controller_index" in good):
+        return ""
+    build, why = good.get("build"), f" ({good['publish_error']})" if good.get("publish_error") else ""
+    # Once an index serves the build, what is left is its controller.
+    what = f"{CONTROLLER} {build}" if "index" in good else f"staged build {build}"
+    if good.get("custody_error"):
+        return f"; {what} is never published: {good['custody_error']}"
+    if good.get("superseded_by"):
+        return f"; {what} was not published: the index already pins trust {good['superseded_by']}"
+    if good.get("given_up"):
+        return f"; {what} was not published, given up after {good.get('publish_ticks')} ticks{why}"
+    if "index" in good:
+        return f"; {CONTROLLER} {build} is not yet published{why}"
+    return f"; build {build} is staged and not yet published{why}"
 
+
+def train_status(root: Path, read: Callable[[dict], dict] | None = None) -> str:
+    """One line: the newest build an index served, how far main is past it, and what the train is doing.
+
+    A build is published when the train saw an index serve it, never for its staging tag.
     `read` asks GitHub now (Train.read_main); without it, or when it is refused, the
     line is the last tick's reading.
     """
@@ -2167,23 +2630,28 @@ def train_status(root: Path, read: Callable[[dict], dict] | None = None) -> str:
             main = read(state)
         except (Refused, OSError) as error:
             main["stale"] = f"GitHub was not read now ({error})"
-    published, count, tip = main.get("published"), main.get("count"), main.get("commit")
-    if published is None:
+    published = state.get("published") or {}
+    count, tip = main.get("count"), main.get("commit")
+    if not published:
         head = "no published build is known"
     else:
-        age = str(count - published) if count is not None else "an unknown number of"
-        head = f"last published build {published}, {age} commits behind main"
+        age = str(count - published["build"]) if count is not None else "an unknown number of"
+        found = "found served by " if published.get("found_served") else ""
+        head = f"last published build {published['build']} ({found}atpkg-index-{published['index']}), {age} commits behind main"
     if tip:
         head += f" ({tip[:12]}" + (f", build {count}" if count is not None else "") + f", read {main.get('read_at')})"
+    if main.get("staged") is not None and main["staged"] != published.get("build"):
+        head += f"; newest staged build {main['staged']}"
     if main.get("stale"):
         head += f"; {main['stale']}"
-    return f"train: {head}; {train_activity(state, running)}"
+    return f"train: {head}{train_publication(state)}; {train_activity(state, running)}"
 
 
 class Train:
     """One tick of the standing train. `Runner.stage` calls before_cut and after_cut."""
 
-    BOUND = 4 * 3600  # one publisher step: pack, smoke, hello world and the upload
+    BOUND = 4 * 3600  # one publisher step: pack, smoke, hello world and the upload, or a canary or index publish
+    STATUS_BOUND = 1800  # one `atpkg-publish status`: building the publisher and reading the channel head
     LAND_BOUND = 2 * 3600  # one run of scripts/prewarm_push.sh: its merges and the push hook
     LAND_ATTEMPTS = 4
 
@@ -2225,7 +2693,7 @@ class Train:
         return text.replace(str(self.root), "<train state>").replace(str(Path.home()), "~")
 
     def read_main(self, state: dict | None = None) -> dict:
-        """Main's tip, its build number where that can be counted, and the newest published build."""
+        """Main's tip, its build number where that can be counted, and the newest staged build (its tag)."""
         github, state = self.remote(), self.state if state is None else state
         tip, builds = github.main(), github.builds()
         # Counted in --repo when it already holds the tip (nothing is fetched into it), else
@@ -2238,14 +2706,54 @@ class Train:
         elif anchor:
             ahead = 0 if anchor["commit"] == tip else github.ahead(anchor["commit"])
             count = None if ahead is None else anchor["count"] + ahead
-        return {"commit": tip, "count": count, "published": builds[-1] if builds else None, "read_at": now()}
+        return {"commit": tip, "count": count, "staged": builds[-1] if builds else None, "read_at": now()}
 
     def tick(self) -> int:
         with train_lock(self.root) as owned:
             if not owned:
                 print("train: nothing started: " + train_activity(load_train(self.root), True))
                 return 0
+            if not self.args.dry_run and TRAIN_ADVANCED not in os.environ and self.advance():
+                # The tick runs the runner main now holds. The lock's descriptor is not
+                # inherited, so exec releases it and the new process takes it again.
+                print(f"train: {Path(__file__).name} changed on main; this tick runs the new one", flush=True)
+                sys.stderr.flush()
+                os.environ[TRAIN_ADVANCED] = "1"
+                os.execv(sys.executable, [sys.executable, *sys.argv])
             return self.locked()
+
+    def advance(self) -> bool:
+        """Fast-forward --repo to origin's main between ticks; whether this runner's bytes changed.
+
+        The train's agent runs this file from --repo's working tree, and nothing else moves
+        that tree, so without this a fix to the runner on main never reaches a standing
+        train. The caller holds the train's lock, so no tick is running. Only a clean
+        checkout on main moves, and only forward; anything else is said and the tick runs
+        the checkout as it is. The source a tick cuts comes from origin either way.
+        """
+        repo, runner = self.args.repo.resolve(strict=True), Path(__file__).resolve()
+
+        def git(*argv: str, timeout: int = 600) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True,
+                                  timeout=timeout, stdin=subprocess.DEVNULL)
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+        if branch != "main":
+            print(f"train: {repo} is on {branch or 'a detached HEAD'}, not main; the tick runs it as it is")
+            return False
+        if git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all").stdout.strip():
+            print(f"train: {repo} has uncommitted changes; the tick runs it as it is")
+            return False
+        before = file_hash(runner)
+        fetched = git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "origin", "main", timeout=1800)
+        if fetched.returncode:
+            print(f"train: main was not fetched into {repo} ({fetched.stderr.strip()[-300:]}); the tick runs it as it is")
+            return False
+        merged = git("merge", "--quiet", "--ff-only", "FETCH_HEAD")
+        if merged.returncode:
+            print(f"train: {repo}'s main does not fast-forward to origin's ({merged.stderr.strip()[-300:]}); "
+                  "the tick runs it as it is")
+            return False
+        return file_hash(runner) != before
 
     def locked(self) -> int:
         if not self.args.aterm_repo:
@@ -2255,7 +2763,10 @@ class Train:
         if last and last.get("status") == "running":
             # This process holds the lock, so the train that wrote "running" is gone.
             if last.get("build") is not None:
-                last.update(status="published", finished_at=now())
+                last["finished_at"] = now()
+                self.settle()
+                if last["status"] == "staged":
+                    last.setdefault("error", "the train's process ended before an index served the build")
                 last.setdefault("report", "not written: the train's process ended first")
             else:
                 last.update(status="interrupted", finished_at=now(),
@@ -2264,24 +2775,41 @@ class Train:
         github = self.remote()
         self.state["main"] = self.read_main()
         self.save()
-        tip, count, published = (self.state["main"][key] for key in ("commit", "count", "published"))
+        tip, count = self.state["main"]["commit"], self.state["main"]["count"]
+        # What an earlier tick staged and no index serves is published before another cut.
+        pending, abandoned = self.pending(), None
+        if pending and self.args.dry_run:
+            print(f"train: would first publish staged build {pending['build']} ({pending['commit'][:12]}), "
+                  f"tick {pending.get('publish_ticks', 0) + 1} of {PUBLISH_TICKS}:\n"
+                  + "\n".join(self.publication_plan(pending["build"], "<its build>/group", True)))
+        elif pending:
+            ended = self.finish(pending)
+            if ended is not None:
+                return ended
+            # This tick gave the build up, or found its custody broken: the tick has failed,
+            # though a cut may follow.
+            abandoned = pending.get("given_up") or pending.get("custody_error")
+        published = (self.state.get("published") or {}).get("build")
         cut, reason = train_decision(self.state, tip, published, count)
         if not cut:
             print(f"train: nothing to cut: {reason}")
-            return 0
+            return 1 if abandoned else 0
         if self.args.dry_run:
             consumers = ", ".join(sorted(consumer_mappings(self.args.consumer))) or "none configured"
-            host = self.args.publisher_host
+            host, checked = self.args.publisher_host, self.index_hosts_check()
             print(f"train: would cut {tip[:12]}" + (f" (build {count})" if count is not None else "") + f": {reason}\n"
-                  f"  1. ask first: `aterm secrets status` says release signing is ready; aterm's `atpkg-publish hosts check --host {host}`;\n"
-                  f"     `agh repo check-local` admits the source snapshot; `agh can {github.slug} push`; --repo's pushes run scripts/hooks/pre-push\n"
+                  f"  1. ask first: `aterm secrets status` says release signing is ready; aterm's `atpkg-publish hosts check --host {host}`"
+                  + (f" and `hosts check --host {checked}`" if checked else "") + ";\n"
+                  f"     `agh repo check-local` admits the source snapshot; `agh can {github.slug} push`; --repo's pushes run scripts/hooks/pre-push;\n"
+                  "     the landing worktree at the cut commit, its submodules materialized at the cut's pins\n"
                   "  2. cut: the mint (double compile, self-host proof), the seal, the trust-wp drivers, the staged tree's gates\n"
                   f"  3. aterm's `atpkg-publish --host {host} publish-group rustc --dry-run`: its preflight, before anything is published\n"
                   "  4. scripts/publish_seed_cut.sh --publish: the seed archives' release and the re-pin branch\n"
                   "  5. scripts/prewarm_push.sh from the landing worktree: the re-pin reaches main through the push hook; its branch is deleted\n"
-                  "  6. `publish-group rustc --stage-upload`; the index is not changed\n"
-                  f"  7. after the upload: the consumer checks ({consumers}) and the row-count comparison; what they find is\n"
-                  f"     {TRAIN_ISSUE} in {TRAIN_ISSUE_FILE}, landed the same way")
+                  f"  6. `atpkg-publish --host {host} publish-group rustc --stage-upload`: the signed packs reach the staging owner\n"
+                  + "\n".join(self.publication_plan(count if count is not None else "<N>", "<build>/group", False)) + "\n"
+                  f"  {9 if self.args.index_host != 'none' else 8}. then: the consumer checks ({consumers}) and the row-count "
+                  f"comparison; what they find is\n     {TRAIN_ISSUE} in {TRAIN_ISSUE_FILE}, landed the same way")
             return 0
         good = self.state.get("good")
         for problem in retire_builds(self.root, Path(good["build_dir"]) if good else None):
@@ -2303,15 +2831,16 @@ class Train:
                 last.update(status="interrupted" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "failed",
                             error=str(error) or type(error).__name__)
             else:
-                last.update(status="published", error=f"after the upload: {error}")
+                self.settle()
+                last["error"] = "; ".join(filter(None, [last.get("error"), f"after the upload: {error}"]))
             self.note(finished_at=now())
             raise
         commit = runner.record.get("source_commit")
         last.update(commit=commit, finished_at=now())
         if last["build"] is not None:
-            last["status"] = "published"
+            self.settle()
             if result:
-                last["error"] = f"after the upload: {runner.record.get('error')}"
+                last["error"] = "; ".join(filter(None, [last.get("error"), f"after the upload: {runner.record.get('error')}"]))
         elif runner.record.get("interrupted"):
             last.update(status="interrupted", error=runner.record.get("error"))
         else:
@@ -2321,7 +2850,109 @@ class Train:
                 self.state["settled"] = last["landed"] or commit
         self.save()
         print("train: " + train_activity(self.state, False))
-        return 0 if last["status"] == "published" else 1
+        # Done is published, or staged where this train publishes nothing more (--index-host
+        # none, or an index already past the build), from a run whose every check passed. A
+        # publication left over is the next tick's; a build whose custody broke is never published.
+        good = self.state.get("good") or {}
+        refused = good.get("publish_error") or good.get("custody_error")
+        done = last["status"] in ("published", "staged") and self.pending() is None and not refused
+        return 0 if done and result == 0 and not abandoned else 1
+
+    def settle(self) -> None:
+        """The last tick's status from its build: published once an index serves it, else staged."""
+        last, good = self.state["last"], self.state.get("good") or {}
+        if good.get("build") == last.get("build") and "index" in good:
+            last.update(status="published", index=good["index"], published_at=good["served_at"])
+            if "trust" in good.get("found_served", []):
+                last["found_served"] = True
+        else:
+            last["status"] = "staged"
+
+    def pending(self) -> dict | None:
+        """The last build this train staged, while an index is still to serve it or its controller."""
+        good = self.state.get("good")
+        if (self.args.index_host == "none" or not good or good.get("given_up") or good.get("superseded_by")
+                or good.get("custody_error") or ("index" in good and "controller_index" in good)):
+            return None
+        return good
+
+    def index_hosts_check(self) -> str | None:
+        """The host the index is written through, when the publisher host's check does not cover it."""
+        host = self.args.index_host
+        return None if host in ("none", self.args.publisher_host) else host
+
+    def publication_plan(self, build, group: str, resumed: bool) -> list[str]:
+        """The dry run's lines for what follows a stage-upload, or for publishing a build an earlier tick staged."""
+        host = self.args.index_host
+        custody = ("  7. its custody: the source snapshot clean at the cut commit and each artifact the train keeps of a build"
+                   if resumed else "  7. the run's end checks: the source snapshot clean at the cut commit; every artifact, the Lean"
+                   "\n     installation, the interpreter and the serial command unchanged") + \
+            " (a build that fails is never published);"
+        if host == "none":
+            return [custody, "     the index is not changed (--index-host none): the build stays staged"]
+        return [custody, f"     then through `atpkg-publish --host {host}`: `canary trust={build} --out {group}/canary` installs and runs the",
+                "     staged pack and signs its receipt; `publish-group rustc --publish-staged --out "
+                f"{group}` publishes the index that pins the group,",
+                f"     run again on the new head when another publisher took the next index number, at most {INDEX_ATTEMPTS} "
+                f"runs; `status` then shows trust {build} served",
+                f"  8. `pack {CONTROLLER} --build {build} --upload` from the cut commit, its source checked again, then "
+                f"`index --pin {CONTROLLER}={build} --upload`, the same way;",
+                f"     a refused publication is tried again by the next tick, at most {PUBLISH_TICKS} ticks, before another cut"]
+
+    def finish(self, good: dict) -> int | None:
+        """Publish a build an earlier tick staged and no index serves yet, before anything is cut.
+
+        Returns the tick's exit when the tick ends here, or None to go on to the cut: the build
+        is published, an index already pins a newer one, PUBLISH_TICKS ticks were refused, or
+        its custody broke.
+        """
+        previous = self.state.get("last") or {}
+        self.state["last"] = {"status": "running", "kind": "publish", "phase": f"publishing staged build {good['build']}",
+                              "build_dir": good["build_dir"], "main": self.state["main"]["commit"],
+                              "commit": good["commit"], "build": good["build"], "landed": None,
+                              "staged_at": good.get("staged_at"), "started_at": now(), "pid": os.getpid()}
+        if previous.get("build") == good["build"] and previous.get("report"):
+            self.state["last"]["report"] = previous["report"]
+        self.begin_publication()
+        arguments = copy.copy(self.args)
+        arguments.state_root, arguments.mode = Path(good["build_dir"]), "stage"
+        try:
+            Runner(arguments, self.execute, train=self).resume(self.publish_resumed)
+        except (KeyboardInterrupt, InterruptedError) as error:
+            self.settle()
+            self.note(error=f"interrupted while publishing: {error}", finished_at=now())
+            raise
+        except Exception as error:
+            self.publish_failed(error)
+        self.settle()
+        self.note(finished_at=now())
+        print("train: " + train_activity(self.state, False))
+        return None if self.pending() is None else 1
+
+    def begin_publication(self) -> None:
+        good = self.state["good"]
+        good["publish_ticks"] = good.get("publish_ticks", 0) + 1
+        good.pop("publish_error", None)
+        self.save()
+
+    def publish_failed(self, error: BaseException) -> None:
+        """Record a refused publication; after PUBLISH_TICKS ticks the train moves on to the next cut.
+
+        A broken custody is no refusal to try again: the build, or its controller, is never published.
+        """
+        good, last = self.state["good"], self.state["last"]
+        what = f"{CONTROLLER} {good['build']}" if "index" in good else f"build {good['build']}"
+        if isinstance(error, CustodyBroken):
+            good["custody_error"] = str(error)
+            last["error"] = f"{what} is never published: {error}"
+            self.save()
+            return
+        good["publish_error"] = str(error) or type(error).__name__
+        last["error"] = f"{what} was not published: {good['publish_error']}"
+        if good["publish_ticks"] >= PUBLISH_TICKS:
+            good["given_up"] = now()
+            last["error"] += f"; given up after {good['publish_ticks']} ticks, the next cut supersedes it"
+        self.save()
 
     def git_here(self, runner: Runner, name: str, cwd: Path, *argv: str) -> str:
         """Git as this Mac's agents run it, in a checkout of --repo with its own configuration."""
@@ -2353,6 +2984,67 @@ class Train:
             raise Refused(f"{hook} is not an executable file, so a push from this Mac runs no hook")
         return landing
 
+    def clear_landing(self, runner: Runner, name: str, landing: Path) -> None:
+        """Detach the landing worktree, clean; a landing that ended early left its branch and merge here."""
+        left = subprocess.run(["git", "-C", str(landing), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+        self.git_here(runner, f"{name}-clear", landing, "reset", "--quiet", "--hard")
+        self.git_here(runner, f"{name}-detach", landing, "checkout", "--quiet", "--detach")
+        if left.startswith("trust-train/"):
+            self.git_here(runner, f"{name}-drop-left-branch", landing, "branch", "--quiet", "-D", left)
+
+    @staticmethod
+    def landing_left_state(landing: Path) -> bool:
+        """Whether the landing worktree holds a path Git does not track or a child with changed files."""
+        status = subprocess.run(["git", "-C", str(landing), "status", "--porcelain=v2", "--untracked-files=normal",
+                                 "--ignore-submodules=none"], capture_output=True, text=True, timeout=300)
+        for line in status.stdout.splitlines():
+            fields = line.split(" ")
+            # `1 XY S<c><m><u> ...`: a submodule's tracked changes (m) or untracked files (u).
+            if line.startswith("?") or (fields[0] in ("1", "2") and len(fields) > 2 and fields[2].startswith("S")
+                                        and (fields[2][2] == "M" or fields[2][3] == "U")):
+                return True
+        return False
+
+    def landing_submodules(self, runner: Runner, landing: Path, name: str) -> None:
+        """The landing worktree's submodules, initialized and at the pins of its HEAD.
+
+        A linked worktree starts with none, and on such a tree the pre-push hook's pin lanes
+        are red. They are materialized by the owner that materializes the snapshots'
+        (recreate_bootstrap.py's ensure_submodules, through Agh). The worktree's registrations
+        are --repo's own, shared with every other worktree of that clone, so the train only
+        reads them: one that is not the indexed .gitmodules URL, which that owner refuses (a
+        clone made from local stores registers local paths, and Git will not clone a submodule
+        from one), refuses the tick with the commands that set it.
+        """
+        owner = runner.git_owner()
+        repo = self.args.repo.resolve(strict=True)
+        # The worktree keeps --repo's hooks path: its pushes run the hook.
+        with owner["admitted_trust_checkout"](landing):
+            off = owner["submodule_registrations_off_index"](landing)
+            if off:
+                raise Refused(
+                    f"{repo} registers {', '.join(module for module, _values, _url in off)} by another URL than the "
+                    "indexed .gitmodules one, and the train's landing worktree shares those registrations and does "
+                    "not rewrite them; to register the indexed URLs: "
+                    + "; ".join(shlex.join(["git", "-C", str(repo), "config", "--replace-all", f"submodule.{module}.url", url])
+                                for module, _values, url in off))
+            try:
+                pins = runner.synchronize(landing, f"landing-{name}")
+            except Refused as error:
+                # reset --hard does not reach the children: a child left dirty or past its pin
+                # with commits no local ref holds (scripts/submodule_sync.sh exit 2), or a
+                # staging directory a failed acquisition kept, stays in the train's tree.
+                restore_refused = (isinstance(error, CommandFailed) and error.exit_code == 2
+                                   and runner.record["steps"][-1]["name"] == "submodule-sync")
+                if not (restore_refused or self.landing_left_state(landing)):
+                    raise
+                raise Refused(f"{error}; {landing} is the train's own landing worktree and holds no one else's "
+                              f"work, and the next tick makes it again once it is gone: "
+                              f"rm -rf {shlex.quote(str(landing))} && git -C {shlex.quote(str(repo))} worktree prune") from error
+        runner.record.setdefault("landing_submodules", {})[name] = pins
+        runner.save()
+
     def land(self, runner: Runner, name: str, branch: str, change: Callable[[Path], str | None] | None = None) -> bool:
         """Land the re-pin, and the commit `change` makes on it, on main; whether anything was pushed.
 
@@ -2364,13 +3056,7 @@ class Train:
 
         def git(step: str, *argv: str) -> str:
             return self.git_here(runner, f"{name}-{step}", landing, *argv)
-        # The worktree is the train's own: a landing that ended early left its branch and merge here.
-        left = subprocess.run(["git", "-C", str(landing), "symbolic-ref", "--quiet", "--short", "HEAD"],
-                              capture_output=True, text=True, timeout=60).stdout.strip()
-        git("clear", "reset", "--quiet", "--hard")
-        git("detach", "checkout", "--quiet", "--detach")
-        if left.startswith("trust-train/"):
-            git("drop-left-branch", "branch", "--quiet", "-D", left)
+        self.clear_landing(runner, name, landing)
         git("fetch-re-pin", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
             str(runner.source), f"+refs/heads/{source_branch}:refs/trust-train/re-pin")
         if git("re-pin", "rev-parse", "--verify", "refs/trust-train/re-pin^{commit}") != repin:
@@ -2384,6 +3070,9 @@ class Train:
                 return False
             git("add", "add", "--", TRAIN_ISSUE_FILE)
             git("commit", "commit", "--quiet", "-m", message)
+        # What is pushed is pushed with its submodules at its own pins, which before_cut
+        # showed this Mac can materialize for the cut commit.
+        self.landing_submodules(runner, landing, name)
         push = ["bash", str(landing / "scripts/prewarm_push.sh"), "--max-rounds", str(self.LAND_ATTEMPTS),
                 "--log-dir", str(runner.invocation / f"{name}-push")]
         # The helper takes its source lease with `targo trust repo lock`, which the Mac's
@@ -2403,6 +3092,11 @@ class Train:
                 # first build (docs/CUTTING-A-TOOLCHAIN.md). So the helper runs again.
                 if error.exit_code not in (4, 6):
                     raise
+                # The merge the helper kept for exit 4 can move first-party gitlinks; its
+                # next run only restores children offline (no `--fetch`) and stops (exit 7)
+                # at a pin the landing worktree lacks. Acquire the merged pins first.
+                if error.exit_code == 4:
+                    self.landing_submodules(runner, landing, f"{name}-merged-{attempt}")
         else:
             raise Refused(f"main moved under {self.LAND_ATTEMPTS} runs of scripts/prewarm_push.sh for {branch}")
         # Main holds only the cut commit and the train's own commits when every commit
@@ -2419,30 +3113,181 @@ class Train:
         """Ask what would stop the upload, before the mint."""
         self.note(phase="asking whether this Mac can publish", commit=runner.commit)
         github = self.remote()
-        # The Mac's own toolchain and Git: the runner's environment without the cut's scratch homes.
-        self.machine = bootstrap_environment(runner.env, runner.source / "scripts/recreate_bootstrap.py")
-        self.machine["PYTHON"] = str(runner.python)
+        self.attach(runner)
         # No line of the answer is kept: the log holds the command and its exit.
         runner.call("release-signing-ready", ["/bin/sh", "-c", '"$0" secrets status | grep -q "^release signing: ready"',
                                               self.tool("aterm")], timeout=300)
-        self.aterm = runner.state / "aterm-source"
         commit = runner.snapshot(self.args.aterm_repo.resolve(strict=True), self.aterm, "aterm")
         pins = runner.synchronize(self.aterm, "package-producer")
         runner.record["package_producer"] = {"commit": commit, "path": str(self.aterm), "submodules": pins}
         # The publisher is built by the Mac's own toolchain, not by the build being cut.
-        runner.call("publisher-hosts-check", fleet_publisher(self.tool("targo"), self.args.publisher_host, ["hosts", "check"]),
-                    self.aterm, heavy=True, env=self.machine, timeout=self.BOUND)
+        self.publisher(runner, "publisher-hosts-check", ["hosts", "check"], self.args.publisher_host)
+        if self.index_hosts_check():
+            self.publisher(runner, "index-hosts-check", ["hosts", "check"], self.index_hosts_check())
         # The publisher reads the source snapshot as its Trust checkout, through this guard.
         runner.call("trust-repo-admitted", [self.tool("agh"), "repo", "check-local", github.slug, str(runner.source)],
                     timeout=300)
         if github.can_push() is None:
             runner.record.setdefault("train_notes", []).append("`agh can push` was not answered for a rate limit")
-        self.landing_checkout(runner)
+        # The landing worktree at the cut commit, its submodules at the cut's pins: a Mac that
+        # cannot materialize them ends the tick here, before the mint and before step 4 pushes
+        # the seed re-pin, rather than at a red push gate after it.
+        landing = self.landing_checkout(runner)
+        self.clear_landing(runner, "landing", landing)
+        self.git_here(runner, "landing-fetch-cut", landing, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+                      "--no-recurse-submodules", str(runner.source), "+HEAD:refs/trust-train/cut")
+        if self.git_here(runner, "landing-cut", landing, "rev-parse", "--verify", "refs/trust-train/cut^{commit}") != runner.commit:
+            raise Refused("the source snapshot's HEAD is not the cut commit")
+        self.git_here(runner, "landing-at-cut", landing, "checkout", "--quiet", "--detach", runner.commit)
+        self.landing_submodules(runner, landing, "cut")
         self.note(phase="cutting")
 
+    def attach(self, runner: Runner) -> None:
+        """The publisher's checkout and this Mac's own toolchain and Git, for a cut or a resumed publication.
+
+        The Mac's environment is the runner's without the cut's scratch homes.
+        """
+        self.machine = bootstrap_environment(runner.env, runner.source / "scripts/recreate_bootstrap.py")
+        self.machine["PYTHON"] = str(runner.python)
+        self.aterm = runner.state / "aterm-source"
+
+    def publisher(self, runner: Runner, name: str, words: list[str], host: str | None = None,
+                  timeout: int | None = None) -> str:
+        """One command of aterm's publisher (fleet_publisher), built by this Mac's targo; its output.
+
+        A refusal carries the publisher's own last `atpkg-publish: …` line.
+        """
+        try:
+            return runner.call(name, fleet_publisher(self.tool("targo"), host or self.args.index_host, words),
+                               self.aterm, heavy=True, env=self.machine, timeout=timeout or self.BOUND)
+        except CommandFailed as error:
+            why = publisher_refusal(Path(runner.last_step()["log"]))
+            if why is None:
+                raise
+            raise CommandFailed(f"{name}: {why}", error.exit_code, error.timed_out) from error
+
+    def serving(self, runner: Runner, name: str) -> tuple[int, dict[str, int]]:
+        """The channel head's index number and the pins a client on the cut's host installs."""
+        return index_pins(self.publisher(runner, name, ["status"], timeout=self.STATUS_BOUND), runner.host)
+
+    def publish_index(self, runner: Runner, name: str, words: list[str], program: str, build: int) -> tuple[int, dict[str, int]]:
+        """One index publish, run again on the new channel head when another publisher took the next number.
+
+        The publisher reads the head afresh on each run; the train reads it too between runs,
+        and stops when that head already pins `program` at `build` or later. At most
+        INDEX_ATTEMPTS runs; any other refusal is raised at once.
+        """
+        for attempt in range(1, INDEX_ATTEMPTS + 1):
+            try:
+                self.publisher(runner, f"{name}-{attempt}", words)
+            except CommandFailed:
+                if not lost_index_race(Path(runner.last_step()["log"])):
+                    raise
+                index, pins = self.serving(runner, f"{name}-head-{attempt}")
+                if pins.get(program, 0) >= build:
+                    return index, pins
+                continue
+            return self.serving(runner, f"{name}-served")
+        raise Refused(f"another publisher took the next index number under each of {INDEX_ATTEMPTS} runs of {name}")
+
+    def hold_custody(self, check: Callable[[], None]) -> None:
+        """Run one of the runner's custody checks; a failure is CustodyBroken, and the build is never published."""
+        try:
+            check()
+        except InterruptedError:
+            raise
+        except (Refused, OSError) as error:
+            raise CustodyBroken(f"its custody check failed: {error}") from error
+
+    def publish_resumed(self, runner: Runner) -> None:
+        self.attach(runner)
+        self.hold_custody(runner.resumed_custody)
+        self.publish(runner)
+
+    def publish(self, runner: Runner) -> None:
+        """Have the signed index serve the staged build, then trust-resource-controller from its commit.
+
+        Each part starts from the channel head that `atpkg-publish status` reads, so a tick
+        after a refusal, a lost race or a restart does only what is left. The index recorded
+        for a part is the head read after its own publish; a part the first reading finds
+        already served records that head and says so (`found_served`), since which index
+        first served it is not known. Once recorded, it is not read again.
+        """
+        good = self.state["good"]
+        build, root = good["build"], Path(good["build_dir"])
+        group = root / "group"
+        if runner.commit != good["commit"]:
+            raise CustodyBroken(f"its custody check failed: {root} holds a cut of {runner.commit}, not {good['commit']}")
+        self.note(phase=f"publishing build {build} to the index")
+        index, pins = self.serving(runner, "index-status")
+        if "index" not in good:
+            if pins.get("trust") == build:
+                # A tick that ended after its index publish, or another publisher, got here first.
+                good["found_served"] = ["trust"]
+            elif pins.get("trust", 0) < build:
+                canary = group / "canary"
+                if not all((canary / name).is_file() for name in ("train-receipt.toml", "train-receipt.toml.sig")):
+                    if canary.exists():
+                        # A canary that ended early: the publisher signs only into a fresh directory.
+                        canary.rename(group / ("canary." + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")))
+                    # The canary judges the installed pack's integrity. Its consumer keys get
+                    # directories that do not exist, so it builds in no developer checkout; the
+                    # consumers are this train's own checks, run after publication.
+                    absent = root / "canary-consumers"
+                    self.note(phase=f"running the canary of build {build}")
+                    self.publisher(runner, "canary", ["canary", f"trust={build}", "--out", str(canary),
+                                                      *[word for name in CONSUMERS
+                                                        for word in ("--consumer", f"{name}={absent / name}")]])
+                self.note(phase=f"publishing build {build} to the index")
+                index, pins = self.publish_index(runner, "publish-staged", ["publish-group", "rustc", "--publish-staged",
+                                                                            "--out", str(group)], "trust", build)
+            if pins.get("trust", 0) > build:
+                good["superseded_by"] = pins["trust"]
+                self.note(error=f"build {build} was not published: atpkg-index-{index} already pins trust {pins['trust']}")
+                return
+            if pins.get("trust") != build:
+                raise Refused(f"the index publish ended and atpkg-index-{index} pins trust {pins.get('trust')}, not {build}")
+            good.update(index=index, served_at=now())
+            self.state["published"] = {"build": build, "commit": good["commit"], "index": index, "at": good["served_at"],
+                                       "found_served": "found_served" in good}
+            runner.record["published"] = {"build": build, "index": f"atpkg-index-{index}", "at": good["served_at"],
+                                          "found_served": list(good.get("found_served", []))}
+            runner.save()
+            self.note(index=index, published_at=good["served_at"])
+        elif pins.get("trust", 0) > build:
+            # Served earlier; an index now pins a newer trust, so this build's controller is not published.
+            good["superseded_by"] = pins["trust"]
+            self.note(error=f"{CONTROLLER} {build} was not published: atpkg-index-{index} already pins trust {pins['trust']}")
+            return
+        self.note(phase=f"publishing {CONTROLLER} {build}")
+        if pins.get(CONTROLLER, 0) >= build:
+            good.setdefault("found_served", []).append(CONTROLLER)
+            runner.record["published"]["found_served"] = list(good["found_served"])
+        else:
+            if not good.get("controller_staged"):
+                # What the pack reads: the source snapshot, still clean at the cut commit.
+                self.hold_custody(runner.source_at_cut)
+                # Packed from the cut commit with the staged toolchain, under the cut's build number.
+                self.publisher(runner, "controller-pack", [
+                    "pack", CONTROLLER, "--checkout", str(runner.source / "crates" / CONTROLLER),
+                    "--toolchain", str(Path(runner.record["staged_toolchain"]) / "bin"), "--trust-repo", str(runner.source),
+                    "--build", str(build), "--out", str(root / "controller"), "--upload"])
+                good["controller_staged"] = now()
+                self.save()
+            index, pins = self.publish_index(runner, "controller-index", [
+                "index", "--pin", f"{CONTROLLER}={build}", "--out", str(root / "controller-index"), "--upload"],
+                CONTROLLER, build)
+            if pins.get(CONTROLLER, 0) < build:
+                raise Refused(f"the index publish ended and atpkg-index-{index} pins {CONTROLLER} "
+                              f"{pins.get(CONTROLLER)}, not {build}")
+        good["controller_index"] = index
+        runner.record["published"][CONTROLLER] = f"atpkg-index-{index}"
+        runner.save()
+        self.save()
+
     def after_cut(self, runner: Runner, staged: Path, mint: Path) -> None:
-        """Publish the cut, then report on it."""
-        github, targo, commit = self.remote(), self.tool("targo"), runner.commit
+        """Stage and publish the cut, then report on it."""
+        github, commit = self.remote(), runner.commit
         build = int(runner.git("build-number", runner.source, "rev-list", "--count", commit))
         self.state["anchor"] = {"commit": commit, "count": build}
         group = ["publish-group", "rustc", "--seal", str(staged), "--trust-repo", str(runner.source)]
@@ -2450,13 +3295,9 @@ class Train:
             # The siblings at the commits this source pins.
             group += ["--checkout", f"{name}={runner.source / 'first-party' / name}"]
         group += ["--out", str(runner.state / "group")]
-
-        def publisher(name: str, mode: str) -> None:
-            runner.call(name, fleet_publisher(targo, self.args.publisher_host, [*group, mode]),
-                        self.aterm, heavy=True, env=self.machine, timeout=self.BOUND)
         # The publisher's preflight (key, roster, receipt, floor, siblings) before any act.
         self.note(phase="asking the publisher's preflight")
-        publisher("signed-pack-dry-run", "--dry-run")
+        self.publisher(runner, "signed-pack-dry-run", [*group, "--dry-run"], self.args.publisher_host)
 
         self.note(phase="publishing the seed archives")
         seed = ["bash", str(runner.source / "scripts/publish_seed_cut.sh"),
@@ -2480,18 +3321,37 @@ class Train:
         self.save()
 
         self.note(phase="uploading the signed pack")
-        publisher("signed-pack-stage-upload", "--stage-upload")
+        self.publisher(runner, "signed-pack-stage-upload", [*group, "--stage-upload"], self.args.publisher_host)
         if build not in github.builds():
             raise Refused(f"the stage-upload exited 0 and {github.slug} has no tag atpkg-trust-{build}")
 
-        # Published. Nothing after this line can take that back or fail the train.
-        published_at = now()
-        self.state["good"] = {"build": build, "commit": commit, "build_dir": str(runner.state), "published_at": published_at}
+        # Staged. Nothing after this line takes that back: a refused publication is recorded,
+        # and the next tick publishes before it cuts again; a broken custody is recorded, and
+        # the build is never published.
+        staged_at = now()
+        self.state["good"] = {"build": build, "commit": commit, "build_dir": str(runner.state), "staged_at": staged_at}
         self.state["settled"] = self.state["last"]["landed"] or commit
-        self.note(build=build, published_at=published_at, phase="running the consumer checks")
-        runner.record["published"] = {"build": build, "tag": f"atpkg-trust-{build}", "repository": github.slug,
-                                      "at": published_at, "index": "unchanged"}
+        self.note(build=build, staged_at=staged_at)
+        runner.record["staged"] = {"build": build, "tag": f"atpkg-trust-{build}", "repository": github.slug, "at": staged_at}
         runner.save()
+        try:
+            # The run's end checks, now: a build reaches the fleet only from a cut whose custody
+            # held through its upload. A build that fails them is never published, by this tick
+            # or a later one; the run makes them again after the report.
+            self.note(phase="checking the cut's custody")
+            self.hold_custody(runner.custody)
+        except CustodyBroken as error:
+            self.publish_failed(error)
+        else:
+            if self.pending():
+                self.begin_publication()
+                try:
+                    self.publish(runner)
+                except InterruptedError:
+                    raise
+                except Exception as error:
+                    self.publish_failed(error)
+        self.note(phase="running the consumer checks")
         self.report(runner, staged, build, commit)
 
     def report(self, runner: Runner, staged: Path, build: int, commit: str) -> None:
@@ -2559,7 +3419,8 @@ def train_plist(args: argparse.Namespace) -> dict:
     root = args.state_root.resolve()
     argv = [str(Path(sys.executable).resolve(strict=True)), str(Path(__file__).resolve()), "train", "run",
             "--repo", str(args.repo.resolve(strict=True)), "--state-root", str(root),
-            "--consumer-jobs", str(args.consumer_jobs), "--publisher-host", args.publisher_host]
+            "--consumer-jobs", str(args.consumer_jobs), "--publisher-host", args.publisher_host,
+            "--index-host", args.index_host]
     for name in ("host", "cargo_home", "ddc_seed", "aterm_repo", "build_slot", "serial_command",
                  "publication_repo", "github_repo"):
         value = getattr(args, name)
@@ -2597,6 +3458,12 @@ def train_install(args: argparse.Namespace, launchctl: Callable = subprocess.run
     agent.parent.mkdir(parents=True, exist_ok=True)
     if agent.exists():
         launchctl(["launchctl", "bootout", f"{domain}/{TRAIN_LABEL}"], capture_output=True, text=True)
+        deadline = time.monotonic() + TRAIN_BOOTOUT_WAIT
+        while launchctl(["launchctl", "print", f"{domain}/{TRAIN_LABEL}"], capture_output=True, text=True).returncode == 0:
+            if time.monotonic() >= deadline:
+                raise Refused(f"launchd still runs {TRAIN_LABEL} {TRAIN_BOOTOUT_WAIT} s after its bootout (a tick "
+                              f"still stopping); {agent} is left as it was")
+            time.sleep(1)
     temporary = agent.with_name(agent.name + f".{os.getpid()}.tmp")
     with temporary.open("xb") as stream:
         plistlib.dump(data, stream, sort_keys=True)
@@ -2668,9 +3535,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--source-object-cache", action="append", default=[], metavar="GITLINK=REPOSITORY",
                         help="a local repository Agh reads one first-party gitlink's exact checkout objects from "
                              "(first-party/NAME=/absolute/repository, outside the snapshot); the commit history "
-                             "still comes from origin, and without one the complete sibling is fetched")
+                             "still comes from origin; exact regular working bytes are also optional native CoW DATA "
+                             "hints, and without one the complete sibling is fetched")
     result.add_argument("--publisher-host", choices=("agh-staging", "agh", "gh"), default="agh-staging",
-                        help="train: the host aterm's publisher writes through (default: agh-staging, all a stage-upload needs)")
+                        help="train: the host aterm's publisher stage-uploads through (default: agh-staging, all a stage-upload needs)")
+    result.add_argument("--index-host", choices=("agh", "none"), default="agh",
+                        help="train: the host aterm's publisher writes the canary evidence, the controller pack and the "
+                             "signed index through after the stage-upload (default: agh, both owners through agh); "
+                             "none stops each build at the stage-upload")
     result.add_argument("--github-repo", metavar="OWNER/NAME",
                         help="train: the Trust repository agh reads (default: --repo's origin)")
     result.add_argument("--interval", type=int, default=3600,
@@ -2678,7 +3550,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--launch-agents", type=Path,
                         help="train install and remove: the agents directory (default: ~/Library/LaunchAgents)")
     result.add_argument("--dry-run", action="store_true",
-                        help="train run: read main and the published builds, say what this tick would do, and do none of it")
+                        help="train run: read main and the staged builds, say what this tick would do, and do none of it")
     return result
 
 
@@ -2691,6 +3563,27 @@ def main(argv: list[str] | None = None) -> int:
         error = InterruptedError(f"staging interrupted by signal {signum}")
         error.signal = signum
         raise error
+    if argv[:1] in (["diagnose"], ["_sdk-diagnostic-worker"]):
+        # This owner is lazy: the original full stage/train and four-consumer
+        # capture closures do not load a diagnostic producer or change grade.
+        import types
+        path = Path(__file__).resolve().with_name("sdk_diagnostic.py")
+        module = types.ModuleType("trust_sdk_diagnostic")
+        module.__file__ = str(path)
+        raw = path.read_bytes()
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        previous = signal.signal(signal.SIGTERM, terminate)
+        try:
+            if argv[0] == "_sdk-diagnostic-worker":
+                if len(argv) != 2:
+                    raise Refused("diagnostic worker requires its original request")
+                return module.worker(Path(argv[1]), globals())
+            return module.main(argv[1:], globals())
+        except (OSError, ValueError, Refused) as error:
+            print(f"SDK diagnostic refused: {error}", file=sys.stderr)
+            return 1
+        finally:
+            signal.signal(signal.SIGTERM, previous)
     if argv and argv[0] == "_prewarm-dependencies":
         try:
             if len(argv) < 7:
@@ -2736,6 +3629,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     options = parser()
     args = options.parse_args(argv)
+    if args.dry_run and (args.action != "train" or args.verb not in (None, "run")):
+        options.error("--dry-run belongs to train run (or train without a second word)")
     if args.action != "train" and (args.verb or args.state_root is None):
         options.error(f"{args.action} takes --state-root and no second word")
     if args.source_commit is not None and args.action != "run":

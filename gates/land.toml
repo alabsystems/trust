@@ -7,8 +7,13 @@
 # VALIDATION_TEST_SUBJECTS, VALIDATION_UNJUDGED_MODULES and VALIDATION_UNMAPPED_RED from it (they
 # were dict literals in that file until 2026-11-14), and refuses to load a table that breaks a
 # rule below, or that is not a regular file in a real directory (a symbolic link here would name
-# a file the gate neither hashes nor watches). No `targo trust land` engine reads this file yet;
-# that is not on yet (PKG-LIVE-4).
+# a file the gate neither hashes nor watches). `targo trust land --check` (targo-trust/src/land/)
+# reads it too, by the same rules, and runs the rows a change selects; no gate calls that verb
+# yet, and the landing itself is not in Targo: both are not on yet (PKG-LIVE-4). Two readers of
+# one table stay until the Python reader goes. targo-trust/tests/fixtures/land_select_cases.json
+# holds them to the same answers on the cases it lists: each reader's tests assert every case,
+# so a listed rule changed in one reader and not the other is a red test, and a row whose
+# selection moves is a case to update there.
 # Editing this file selects what editing land_select.py selects (docs/LANDING_GATE.md).
 #
 #   schema   "trust.land-rows.v1". A reader refuses any other value, and any key it does not know.
@@ -64,6 +69,7 @@ schema = "trust.land-rows.v1"
 covered = ["scripts/tests/*_test.py"]
 
 [validation_programs]
+"scripts/sdk_diagnostic.py" = ["validation.sdk_diagnostic_test"]
 "scripts/check_pin_regression.sh" = ["validation.pin_regression_ancestry_test", "validation.preflight_test"]
 "scripts/tests/pin_regression_ancestry_test.py" = ["validation.pin_regression_ancestry_test"]
 "tests/trust-soundness-corpus/README.md" = ["validation.trust_soundness_corpus_test"]
@@ -128,6 +134,7 @@ covered = ["scripts/tests/*_test.py"]
 ]
 "scripts/lib/native_checkout.py" = ["validation.native_checkout_test"]
 "scripts/tests/native_checkout_test.py" = ["validation.native_checkout_test"]
+"scripts/tests/source_working_cache_test.py" = ["validation.source_working_cache_test"]
 "scripts/tests/landing_targo_test.py" = ["validation.landing_targo_test"]
 # check_ledger_pins.py judges each row by land_select's audit_row_ok/not_path_row_ok.
 "scripts/lib/land_select.py" = [
@@ -146,6 +153,7 @@ covered = ["scripts/tests/*_test.py"]
     "validation.remote_tips_process_test",
     "validation.remote_tips_advertisement_test",
     "validation.push_destination_test",
+    "validation.github_source_transport_test",
 ]
 "scripts/lib/remote_operation.py" = ["validation.remote_tips_process_test"]
 "scripts/tests/remote_tips_process_test.py" = ["validation.remote_tips_process_test"]
@@ -418,6 +426,7 @@ id = "validation.check_bootstrap_script_tests_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.check_bootstrap_script_tests_test"]
 selects_on = [
     "scripts/bootstrap_dependency_closure.py",
+    "scripts/bootstrap_dependency_preparation.py",
     "scripts/bootstrap_xpy.py",
     "scripts/build-slot",
     "scripts/check_bootstrap_script_tests.sh",
@@ -441,6 +450,7 @@ selects_on = [
     "scripts/native_sdk_tools.py",
     "scripts/promote-toolchain.sh",
     "scripts/prune_seal_symlinks.py",
+    "scripts/qualify_targo_resource.py",
     "scripts/recreate_bootstrap.py",
     "scripts/sdk_frontend_component.py",
     "scripts/sdk_targo_component.py",
@@ -452,6 +462,7 @@ selects_on = [
     "scripts/seed_input_archives.py",
     "scripts/seed_input_records.py",
     "scripts/seed_root_initialization.py",
+    "scripts/source_working_cache.py",
     "scripts/submodule_sync.sh",
     "scripts/tests/bootstrap_xpy_environment_test.py",
     "scripts/tests/build_slot_cpu_bridge_test.py",
@@ -797,20 +808,27 @@ id = "validation.daily_toolchain_stage_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.daily_toolchain_stage_test"]
 selects_on = [
     "scripts/bootstrap_dependency_closure.py",
+    # The manager-source test reads the script's PROTOCOL and output path as a named subject.
+    "scripts/build-tree-manager.sh",
     "scripts/daily_dependency_git.py",
     "scripts/daily_registry_proxy.py",
     "scripts/daily_toolchain_stage.py",
     "scripts/lib/seal_content_identity.py",
     "scripts/lib/seed_linux.py",
+    # The failed-mint test inspects what the runner kept with the recovery's own validate.
+    "scripts/mint_seed_recovery.py",
     "scripts/mint_seed_support.py",
     "scripts/recreate_bootstrap.py",
     "scripts/seed_custody_source.py",
     "scripts/seed_staircase.py",
+    "scripts/source_working_cache.py",
     "scripts/submodule_sync.sh",
     "scripts/tests/daily_toolchain_stage_test.py",
     "scripts/tests/fixtures/publication_daily_consumer_outcomes.py",
     "scripts/verify_sysroot_libraries.py",
     "src/bootstrap/stage0_identity.py",
+    # The manager-source test parses x.py's in-tree lease frontends as a named subject.
+    "x.py",
 ]
 catches = "Exercise orchestration with real temporary Git histories and fake pipeline owners."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
@@ -951,6 +969,17 @@ catches = "No shell script may hand `trustc` an environment variable `trustc` re
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.github_source_transport_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.github_source_transport_test"]
+selects_on = [
+    "scripts/lib/github_source_transport.py",
+    "scripts/lib/remote_tips.py",
+    "scripts/tests/github_source_transport_test.py",
+]
+catches = "GitHub aliases or embedded credentials escaping owner-routed Agh source reads, malformed or conflicting pin advertisements being accepted, or a provider refusal falling through to another authority."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.host_budget_admission_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.host_budget_admission_test"]
 selects_on = [
@@ -1017,6 +1046,7 @@ selects_on = [
     "scripts/lib/land_select.py",
     "scripts/lib/rust_lex.py",
     "scripts/tests/land_gate_test.py",
+    "targo-trust/tests/fixtures/land_select_cases.json",
 ]
 catches = "The landing gate selecting too little for a change or reusing a result it should not: the selector (scripts/lib/land_select.py, its lexer and the row table gates/land.toml) missing a reader of a changed path, the cache key (scripts/land_gate.py) not moving with an input, or the host scaler (scripts/lib/host_budget.py) sizing a leg wrongly; each test names the mutant it kills."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
@@ -1451,6 +1481,16 @@ catches = "scripts/prune_seal_symlinks.py, the helper promotion invokes, keeping
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.publish_first_party_pins_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.publish_first_party_pins_test"]
+selects_on = [
+    "publish/transforms.sh",
+    "scripts/tests/publish_first_party_pins_test.py",
+]
+catches = "publish/transforms.sh T5 writing first-party/PINS.txt although the export names a path into a first-party sibling (trust's clean-reflect) that the sibling's mapped publication omits, so the stage failed only later at T5c's re-lock (RL-129); or T5 refusing an export whose sibling paths the publications hold."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.publish_strip_machine_paths_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.publish_strip_machine_paths_test"]
 selects_on = [
@@ -1706,6 +1746,22 @@ catches = "Regression test: the shell-scoped push lanes judge WHAT IS PUSHED."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
+id = "validation.sdk_diagnostic_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_diagnostic_test"]
+selects_on = [
+    "scripts/daily_toolchain_stage.py",
+    "scripts/lib/trust_toolchain_surface.sh",
+    "scripts/recreate_bootstrap.py",
+    "scripts/sdk_diagnostic.py",
+    "scripts/sdk_frontend_component.py",
+    "scripts/tests/sdk_diagnostic_test.py",
+    "src/bootstrap/stage0_identity.py",
+    "tools/verify-toolchain.sh",
+]
+catches = "Partial, changed or foreign SDKs, configuration movers or a refused/no-op native lease must not execute the requested command or acquire SDK/publication authority. Exact fixture child exits and cleanup remain observable."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
 id = "validation.sdk_frontend_component_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.sdk_frontend_component_test"]
 selects_on = [
@@ -1834,9 +1890,13 @@ id = "validation.seed_native_pair_test"
 command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.seed_native_pair_test"]
 selects_on = [
     "scripts/mint_seed_support.py",
+    "scripts/seed_custody_source.py",
     "scripts/tests/seed_native_pair_test.py",
+    "src/bootstrap/stage0_identity.py",
+    # The pair test parses targo's actual version block (the keys it prints twice) as a named subject.
+    "src/tools/targo/src/bin/cargo/cli.rs",
 ]
-catches = "Native seed pair identity controls; all process probes are inert stand-ins."
+catches = "Canonical static/probe DATA, captured-source/end refusal and ordinary fixed probe/loader/fingerprint ordering; all process probes are inert stand-ins."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
@@ -1881,6 +1941,19 @@ selects_on = [
     "scripts/tests/seed_staircase_linux_test.py",
 ]
 catches = "Real native ELF and checksum-pinned archive controls; no Trust build credit."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.source_working_cache_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.source_working_cache_test"]
+selects_on = [
+    "scripts/recreate_bootstrap.py",
+    "scripts/seed_custody_source.py",
+    "scripts/source_working_cache.py",
+    "scripts/tests/source_working_cache_test.py",
+    "src/bootstrap/stage0_identity.py",
+]
+catches = "Working DATA custody and native temporary Git/Darwin copy-on-write checkout controls: complete cold/warm equality, independent Git state, changed donor bytes and timestamps, attributes/modes/ACLs, path replacement, complete fallback, and custody refusal without removing independently owned data. No compiler, proof or SDK qualification."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]
@@ -2217,6 +2290,16 @@ selects_on = [
     "scripts/trust_f1_ladder.py",
 ]
 catches = "scripts/trust_f1_ladder.py misjudging a rung: a mismatch between the trust-cg and oracle values not failing the run, a lane judged when the oracle failed or could not finish, or the default mode not being verification on and strict only."
+not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
+
+[[row]]
+id = "validation.trust_floatbits_twin_parity_test"
+command = ["python3", "-B", "scripts/land_gate.py", "validation-tests", "scripts.tests.trust_floatbits_twin_parity_test"]
+selects_on = [
+    "scripts/tests/trust_floatbits_twin_parity_test.py",
+    "scripts/trust_floatbits_twin_parity.py",
+]
+catches = "The float-bits twin parity reader: a crate with no build.rs is accepted, a [package] build key naming another program is refused, and its controls mutate the program it reads."
 not_yet_targo = "a Python unittest module that land_gate.py's validation-tests runner loads; it retires when its subject is a targo verb or a test target"
 
 [[row]]

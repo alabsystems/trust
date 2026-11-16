@@ -1950,6 +1950,7 @@ Q_PROVIDER="$TMP_ROOT/q-provider"
 mkdir -p "$Q_PROVIDER"
 printf '%s\n' "$SUPER_Q" >"$Q_PROVIDER/root"
 printf '%s\n' "$C4" >"$Q_PROVIDER/pin"
+$GIT -C "$SUPER_Q/atpin" cat-file commit "$C4" >"$Q_PROVIDER/commit"
 printf 'objects/%s/%s\n' "${O_TREE:0:2}" "${O_TREE:2}" >"$Q_PROVIDER/object-relative"
 for name in behind atpin; do
   cp "$TMP_ROOT/o_saved_tree_$name" "$Q_PROVIDER/tree-$name"
@@ -1967,7 +1968,7 @@ set -eu
 base="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 printf 'call\n%s\n' "$@" >>"$base/trace"
 root="$(cat "$base/root")"; pin="$(cat "$base/pin")"
-[ "$#" -eq 8 ] && [ "$1" = repo ] && [ "$2" = fetch ] && [ "$3" = fixture/source ]
+[ "$#" -eq 9 ] && [ "$9" = --checkout-closure ] && [ "$1" = repo ] && [ "$2" = fetch ] && [ "$3" = fixture/source ]
 [ "$5" = --ref ] && [ "$6" = "$pin" ] && [ "$7" = --into ]
 [ "$8" = "refs/agh/trust-source-pins/$pin" ]
 case "$4" in "$root/behind") name=behind ;; "$root/atpin") name=atpin ;; *) exit 98 ;; esac
@@ -1975,10 +1976,11 @@ case "$(cat "$base/mode")" in
   refuse) echo 'fixture owner-routed Agh refusal' >&2; exit 73 ;;
   no-objects) ;;
   repair)
+    git -C "$4" hash-object -w -t commit "$base/commit" >/dev/null
     gitdir="$(git -C "$4" rev-parse --absolute-git-dir)"
     object="$(cat "$base/object-relative")"
     mkdir -p "$(dirname "$gitdir/$object")"
-    cp "$base/tree-$name" "$gitdir/$object"
+    [ -e "$gitdir/$object" ] || cp "$base/tree-$name" "$gitdir/$object"
     ;;
   *) exit 97 ;;
 esac
@@ -2060,6 +2062,22 @@ if [ "$RC_P" -ne 0 ] && grep -q 'FAILED (git exit' "$TMP_ROOT/p_restore.log" &&
   pass "a failed real checkout preserves native lock stderr, exit status, HEAD and bytes"
 else
   fail "native checkout failure collapsed to an unexplained FAILED: $(cat "$TMP_ROOT/p_restore.log")"
+fi
+
+# Missing commit acquisition must use the same Agh-only exact closure path.
+Q_GITDIR="$($GIT -C "$SUPER_Q/atpin" rev-parse --absolute-git-dir)"
+$GIT -C "$SUPER_Q/atpin" update-ref -d "refs/agh/trust-source-pins/$C4"
+rm "$Q_GITDIR/objects/${C4:0:2}/${C4:2}"
+if $GIT -C "$SUPER_Q/atpin" cat-file -e "${C4}^{commit}" 2>/dev/null; then
+  fail "missing GitHub commit fixture did not remove the selected commit"
+else
+  PATH="$Q_PROVIDER:$PATH" SUBMODULE_SYNC_TRACE_NET=1 bash "$SYNC" --root "$SUPER_Q" --fetch --restore --force \
+    >"$Q_PROVIDER/missing-commit.log" 2>&1
+  if [ "$?" -eq 0 ] && $GIT -C "$SUPER_Q/atpin" cat-file -e "${C4}^{commit}" &&
+     grep -q 'repaired exact pin' "$Q_PROVIDER/missing-commit.log" &&
+     ! grep -q '^net: fetch ' "$Q_PROVIDER/missing-commit.log"; then
+    pass "a wholly missing GitHub pin is materialized through Agh without a Git fetch"
+  else fail "missing GitHub commit did not use the exact Agh acquisition"; fi
 fi
 
 # ---------------------------------------------------------------------------

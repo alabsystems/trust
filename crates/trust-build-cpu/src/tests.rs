@@ -711,6 +711,7 @@ mod unix {
         "native_domain::tests::",
         "retained_tests::",
         "retained::candidate_tests::",
+        "retained::recovery::reservation_tests::",
         "external_debt::tests::",
         "legacy_retirement::tests::",
         "fence::tests::",
@@ -746,20 +747,68 @@ mod unix {
         // descriptor of this process, other tests' leases included, until its
         // exec.
         let fixture = kernel_fixture();
-        let output = Command::new("/bin/sh")
+        let mut child = Command::new("/bin/sh")
             .args(["-c", "umask 002 && umask && exec \"$0\" \"$@\""])
             .arg(std::env::current_exe().unwrap())
             .args(UMASK_RERUN)
             .args(["--skip", TEST])
             .env(RERUN, "1")
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        type Drained = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+        fn drain(mut pipe: impl Read + Send + 'static) -> (Drained, std::thread::JoinHandle<()>) {
+            let bytes = Drained::default();
+            let sink = std::sync::Arc::clone(&bytes);
+            let reader = std::thread::spawn(move || {
+                let mut chunk = [0; 4096];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => sink.lock().unwrap().extend_from_slice(&chunk[..read]),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            (bytes, reader)
+        }
+        fn text(bytes: &Drained) -> String {
+            String::from_utf8_lossy(&bytes.lock().unwrap()).into_owned()
+        }
+        let (stdout, stdout_reader) = drain(child.stdout.take().unwrap());
+        let (stderr, stderr_reader) = drain(child.stderr.take().unwrap());
+        // The re-run takes seconds. A stalled one is killed and fails here,
+        // with what it printed, rather than holding the kernel fixture, and
+        // with it every other fixture test, forever.
+        let end = Instant::now() + Duration::from_secs(300);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         drop(fixture);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let report = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        let Some(status) = status else {
+            panic!(
+                "the umask re-run did not end within its hang detector:\n{}{}",
+                text(&stdout),
+                text(&stderr)
+            );
+        };
+        stdout_reader.join().unwrap();
+        stderr_reader.join().unwrap();
+        let stdout = text(&stdout);
+        let report = format!("{stdout}{}", text(&stderr));
         assert_eq!(stdout.lines().next(), Some("0002"), "the re-run had another umask:\n{report}");
-        assert!(output.status.success(), "fixtures failed under umask 002:\n{report}");
+        assert!(status.success(), "fixtures failed under umask 002:\n{report}");
         for module in UMASK_RERUN {
             let prefix = format!("test {module}");
             assert!(

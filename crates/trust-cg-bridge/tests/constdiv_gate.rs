@@ -28,7 +28,9 @@
 // branch routes are called once and decline.
 //
 // THE OLD PATH: with the hook off (`without_const_div_rewrite`), every positive cell is Unknown
-// at step (4) with the budget spent, exactly as before the hook, and step (5) is never reached.
+// at step (4), ended on one of ay's deterministic counts (`[stop:effort]`, DECISION_QUEUE
+// BUDGET-1; the gate's `:rlimit` among them), exactly as before the hook, and step (5) is never
+// reached.
 //
 // R01 (`x / 3 + (x ^ 0x55) * 2`, shifted, or-ed, …): measured and pinned as observed: Proven
 // [VALIDATED] on the rewrite, the branch routes called once and declining (the CONSTDIV walk
@@ -45,9 +47,10 @@
 // divisor mutants are asserted rewritten and then Refuted by ay on the rewritten item, so a
 // miscompile stays caught through the hook; the magic + 2 mutants are asserted not rewritten.
 //
-// BUDGET: the gate reads its per-query ay budget from `TCG_TRUST_IR_GATE_TIMEOUT_MS` (the build
-// refuses `TCG_*` in its own environment, and the frozen gate's thread-local seam is `cfg(test)`
-// only), so [`init`] sets it once for this binary before any test does anything else.
+// BUDGET: every gate query runs under its effort count (`:rlimit`, sized to the query) and a
+// wall-clock backstop the gate reads from `TCG_TRUST_IR_GATE_TIMEOUT_MS` (the build refuses
+// `TCG_*` in its own environment, and the frozen gate's thread-local seam is `cfg(test)` only),
+// so [`init`] sets the backstop once for this binary before any test does anything else.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -72,13 +75,17 @@ use trust_cg_bridge::verify_output_instantiate::{
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_ir::Module;
 use trust_types::Formula;
+use trust_types::determinism::StopCause;
 
 // ===========================================================================
 // helpers
 // ===========================================================================
 
-/// The per-query ay budget of every gate solver in this binary, in ms.
-const GATE_BUDGET_MS: u64 = 10_000;
+/// The per-query wall-clock backstop of every gate solver in this binary, in ms: the
+/// production value. The old-path cells end on their effort count (3.6 to 8.3 s each in a debug
+/// build, measured 2026-11-15), so a shorter clock would let the machine's load decide which
+/// stop they report.
+const GATE_BUDGET_MS: u64 = 120_000;
 
 /// The bound on one positive gate run (debug build), far below the production budget and
 /// the ladder's timeout (both 120 s).
@@ -612,9 +619,10 @@ fn old_path(label: &str, ir: &str) {
                 r.calls.iter().all(|(_, _, n)| n.is_none()) && !r.calls.is_empty(),
                 "{label} {triple} {opt:?}: the hook was not consulted, or rewrote while off"
             );
-            assert!(
-                r.ms >= u128::from(GATE_BUDGET_MS),
-                "{label}: Unknown before the budget ran out"
+            assert_eq!(
+                StopCause::from_reason(o4),
+                Some(StopCause::Effort),
+                "{label} {triple} {opt:?}: Unknown, but not on its effort count: {o4}"
             );
             assert!(r.routes.is_empty(), "{label}: step (5) was reached: {:?}", r.routes);
             seen.push(format!("{label} {triple} {opt:?}: Unknown in {} ms: {o4}", r.ms));

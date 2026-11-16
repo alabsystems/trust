@@ -269,7 +269,6 @@ fn recovery_child(
 #[test]
 #[ignore = "re-executed closed-descriptor transport fixture, not a standalone regression"]
 fn recovery_child_entry() {
-    use std::os::fd::AsFd as _;
     let advertisement = std::env::var_os("TRUST_JOBSERVER_TEST_RECOVERY_AD").unwrap();
     let flags = std::env::var_os("TRUST_JOBSERVER_TEST_RECOVERY_FLAGS").unwrap();
     let pair = flags
@@ -284,17 +283,18 @@ fn recovery_child_entry() {
         assert_eq!(unsafe { libc::fcntl(number, libc::F_GETFD) }, -1);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
-    let recovered = super::handoff::recover(&advertisement, &flags);
+    let recovered = Jobserver::from_authenticated_handoff(&advertisement, &flags);
     if std::env::var("TRUST_JOBSERVER_TEST_REFUSED").unwrap() == "1" {
         assert!(recovered.is_err());
         return;
     }
     let recovered = recovered.unwrap();
+    let descriptors = recovered.pipe_descriptors().unwrap();
     assert_eq!(
-        pipe_identity(&recovered),
+        pipe_identity(descriptors),
         std::env::var("TRUST_JOBSERVER_TEST_PIPE_IDENTITY").unwrap()
     );
-    let client = jobserver::Client::from_pipe(recovered[0].as_fd(), recovered[1].as_fd()).unwrap();
+    let client = recovered.client();
     let available =
         std::env::var("TRUST_JOBSERVER_TEST_AVAILABLE").unwrap().parse::<usize>().unwrap();
     assert_eq!(client.available().unwrap(), available);
@@ -304,6 +304,20 @@ fn recovery_child_entry() {
         drop(token);
         assert_eq!(client.available().unwrap(), available);
     }
+}
+
+#[test]
+fn owned_client_retention_preserves_the_original_pipe_and_credit() {
+    let original = Jobserver::new(2).unwrap();
+    let borrowed = original.client().acquire().unwrap();
+    let identity = pipe_identity(original.pipe_descriptors().unwrap());
+    let retained = Jobserver::from_owned_client(original.client().clone()).unwrap();
+    assert_eq!(pipe_identity(retained.pipe_descriptors().unwrap()), identity);
+    assert_eq!(retained.client().available().unwrap(), 1);
+    drop(original);
+    assert_eq!(retained.client().available().unwrap(), 1);
+    drop(borrowed);
+    assert_eq!(retained.client().available().unwrap(), 2);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

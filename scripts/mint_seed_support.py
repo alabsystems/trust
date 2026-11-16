@@ -72,6 +72,12 @@ SEMVER_RE = re.compile(
 )
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{2,127}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40,64}")
+# `targo --version --verbose` keys that list independent software capabilities, one
+# line each (src/tools/targo/src/bin/cargo/cli.rs). They grant no pair authority, so
+# the seed pair reader skips them; every other key is scalar identity and may appear
+# once. scripts/tests/seed_native_pair_test.py derives the keys targo repeats from
+# that source and requires each to be named here.
+TARGO_REPEATABLE_CAPABILITIES = frozenset({"cache-integrity", "freshness"})
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 MAX_METADATA_BYTES = 4096
@@ -2299,10 +2305,10 @@ def native_seed_tool_pair(compiler_verbose: str, targo_verbose: str,
         for line in output.splitlines():
             name, separator, value = line.partition(": ")
             if separator:
-                # Targo lists independent cache capabilities under one repeatable
-                # metadata key. They grant no pair authority; retain the full
-                # verbose output elsewhere, but never parse them as scalar identity.
-                if description == "targo" and name == "cache-integrity":
+                # Targo lists independent freshness and cache capabilities under
+                # repeatable metadata keys. They grant no pair authority; retain the
+                # full verbose output elsewhere, but never parse them as scalar identity.
+                if description == "targo" and name in TARGO_REPEATABLE_CAPABILITIES:
                     continue
                 if name in result:
                     fail(f"seed {description} reports duplicate identity field {name}")
@@ -2354,6 +2360,21 @@ def _seed_probe_semantics(seed: Path, version: str, host: str, probe):
     return native_pair, tool_versions
 
 
+def _native_seed_stdout(streams, label: str) -> str:
+    if type(streams) is not tuple or len(streams) != 2 or any(
+            type(raw) is not bytes or len(raw) > 64 * 1024 for raw in streams):
+        fail(f"{label} output needs both bounded original byte streams")
+    raw, stderr = streams
+    # Separate pipes establish no inter-stream ordering. Never silently omit
+    # stderr or fabricate the trace ordinary subprocess.STDOUT would produce.
+    if stderr:
+        fail(f"{label} stderr cannot be discarded or reordered")
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        fail(f"{label} output is not UTF-8")
+
+
 def native_seed_probe_data(seed: Path, version: str, host: str,
                            observations: dict[tuple[str, tuple[str, ...]],
                                               tuple[bytes, bytes]]) -> dict[str, object]:
@@ -2377,20 +2398,7 @@ def native_seed_probe_data(seed: Path, version: str, host: str,
         fail("native seed probe data needs exactly the four fixed query outputs")
     texts = {}
     for key, streams in observations.items():
-        if type(streams) is not tuple or len(streams) != 2 or any(
-                type(raw) is not bytes or len(raw) > 64 * 1024 for raw in streams):
-            fail("native seed probe output needs both bounded original byte streams")
-        raw, stderr = streams
-        # Ordinary validation merges stderr into the probe text. Separate
-        # native pipes prove no inter-stream order, so accepting only stdout
-        # could hide contradictory identity/error text. This closed route
-        # refuses stderr instead of discarding it or inventing a merged trace.
-        if stderr:
-            fail("native seed probe stderr cannot be discarded or reordered")
-        try:
-            texts[key] = raw.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            fail("native seed probe output is not UTF-8")
+        texts[key] = _native_seed_stdout(streams, "native seed probe")
 
     def read(name, *arguments):
         return texts[(name, arguments)]
@@ -2399,9 +2407,13 @@ def native_seed_probe_data(seed: Path, version: str, host: str,
     return {"native_tool_pair": native_pair, "tool_versions": tool_versions}
 
 
-def validate_seed(seed: Path, version: str, host: str) -> dict[str, object]:
-    version = canonical_version_value(version)
-    host = canonical_host(host)
+def seed_static_data(seed: Path) -> dict[str, object]:
+    """Read the ordinary pre-probe surface without executing candidate tools.
+
+    This is partial DATA, not a validated seed or an ownership capability. The
+    real original probes, loader checks and final tree fingerprint remain
+    separate obligations, alongside native source/output/resource custody.
+    """
     if seed.is_symlink() or not seed.is_dir():
         fail(f"seed sysroot must be a non-symlink directory: {seed}")
     required = ("trustc", "rustc", "trustdoc", "targo", "cargo", "trustfmt")
@@ -2426,6 +2438,92 @@ def validate_seed(seed: Path, version: str, host: str) -> dict[str, object]:
                 except OSError as exc:
                     fail(f"seed contains a broken symlink: {path}: {exc}")
                 ensure_within(seed, target, f"seed symlink {path}")
+
+    return {"entrypoint_sha256": identities}
+
+
+SEED_LOADER_PROGRAMS = ("trustc", "targo", "trustfmt")
+
+
+def _seed_loader_program():
+    return (shutil.which("otool") if platform.system() == "Darwin"
+            else None if platform.system() == "Linux" else shutil.which("ldd"))
+
+
+def _seed_loader_evidence(seed: Path, name: str, evidence: str) -> str:
+    lowered = evidence.lower().replace("\\", "/")
+    if "/.rustup/" in lowered or "/genesis-stage0/" in lowered:
+        fail(f"seed {name} retains a forbidden stock-toolchain dependency: {evidence}")
+    return evidence.replace(str(seed), "{seed}")
+
+
+def _seed_surface(seed, version, host, identities, tool_versions, native_pair,
+                  loader_evidence, linux_runtime=None):
+    result: dict[str, object] = {
+        "schema": "trust-self-host-seed-surface-v1",
+        "source_version": version,
+        "host": host,
+        "entrypoint_sha256": identities,
+        "tool_versions": tool_versions,
+        "native_tool_pair": native_pair,
+        "loader_evidence": loader_evidence,
+        "tree": seed_tree_fingerprint(seed),
+    }
+    if linux_runtime is not None:
+        result["linux_runtime_closure"] = linux_runtime
+    return result
+
+
+def native_seed_loader_plan() -> dict[str, object]:
+    """Ordinary Darwin loader selection DATA, never native input ownership.
+
+    The resident must bind and retain the actual search/read-set and selected
+    native command before dispatch. This neither opens an input nor authorizes
+    argv, child execution, a Seed, SDK or READY. Other native hosts are not
+    implemented by this separate capture route.
+    """
+    if platform.system() != "Darwin":
+        fail("native seed loader capture supports only Darwin")
+    loader = _seed_loader_program()
+    if loader is not None and (type(loader) is not str or not loader
+            or "\0" in loader or len(os.fsencode(loader)) > 4096):
+        fail("native seed loader selection is not bounded path DATA")
+    return {"loader": loader, "programs": list(SEED_LOADER_PROGRAMS) if loader else []}
+
+
+def native_seed_surface_data(seed: Path, version: str, host: str, observations,
+                             selected_loader, loader_observations) -> dict[str, object]:
+    """Reuse the entire ordinary Darwin seed surface on closed-probe DATA.
+
+    No process is launched here. Only the native caller can supply the SAME
+    actual closed four probes, selected loader and all three loader closures,
+    original source/output/cache/SDK/GNU owners and endpoint. Freely fabricated
+    bytes can call this reducer but cannot thereby acquire any such owner or a
+    semantic Seed. Separate stderr refuses rather than inventing merged order.
+    """
+    plan = native_seed_loader_plan()
+    if (type(selected_loader) not in (str, type(None))
+            or selected_loader != plan["loader"]):
+        fail("native seed loader selection changed")
+    if (type(loader_observations) is not dict
+            or loader_observations.keys() != set(plan["programs"])):
+        fail("native seed loader data needs its complete original population")
+    version = canonical_version_value(version)
+    host = canonical_host(host)
+    static = seed_static_data(seed)
+    probes = native_seed_probe_data(seed, version, host, observations)
+    evidence = {name: _seed_loader_evidence(
+        seed, name, _native_seed_stdout(loader_observations[name], "native seed loader"))
+        for name in plan["programs"]}
+    return _seed_surface(seed, version, host, static["entrypoint_sha256"],
+                         probes["tool_versions"], probes["native_tool_pair"], evidence)
+
+
+def validate_seed(seed: Path, version: str, host: str) -> dict[str, object]:
+    version = canonical_version_value(version)
+    host = canonical_host(host)
+    static = seed_static_data(seed)
+    identities = static["entrypoint_sha256"]
 
     # Inspect every packaged native ELF (including libexec and transitive
     # providers) before executing any candidate tool. The final surface includes
@@ -2461,11 +2559,10 @@ def validate_seed(seed: Path, version: str, host: str) -> dict[str, object]:
 
     native_pair, tool_versions = _seed_probe_semantics(seed, version, host, probe)
 
-    loader = (shutil.which("otool") if platform.system() == "Darwin"
-              else None if platform.system() == "Linux" else shutil.which("ldd"))
+    loader = _seed_loader_program()
     loader_evidence: dict[str, str] = {}
     if loader:
-        for name in ("trustc", "targo", "trustfmt"):
+        for name in SEED_LOADER_PROGRAMS:
             try:
                 completed = subprocess.run(
                     [loader, "-L", str(seed / "bin" / name)]
@@ -2483,23 +2580,9 @@ def validate_seed(seed: Path, version: str, host: str) -> dict[str, object]:
             evidence = completed.stdout.strip()
             if completed.returncode != 0:
                 fail(f"cannot inspect seed {name} loader dependencies: {evidence}")
-            lowered = evidence.lower().replace("\\", "/")
-            if "/.rustup/" in lowered or "/genesis-stage0/" in lowered:
-                fail(f"seed {name} retains a forbidden stock-toolchain dependency: {evidence}")
-            loader_evidence[name] = evidence.replace(str(seed), "{seed}")
-    result: dict[str, object] = {
-        "schema": "trust-self-host-seed-surface-v1",
-        "source_version": version,
-        "host": host,
-        "entrypoint_sha256": identities,
-        "tool_versions": tool_versions,
-        "native_tool_pair": native_pair,
-        "loader_evidence": loader_evidence,
-        "tree": seed_tree_fingerprint(seed),
-    }
-    if linux_runtime is not None:
-        result["linux_runtime_closure"] = linux_runtime
-    return result
+            loader_evidence[name] = _seed_loader_evidence(seed, name, evidence)
+    return _seed_surface(seed, version, host, identities, tool_versions, native_pair,
+                         loader_evidence, linux_runtime)
 
 
 def write_json_exclusive(path: Path, value: object) -> None:

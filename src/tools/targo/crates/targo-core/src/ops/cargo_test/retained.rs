@@ -216,9 +216,14 @@ impl Authorized {
             &mut || signals.interrupted(),
             Some(scheduling),
         );
-        // Preserve the existing post-execution substitution refusal too.
-        self.authority.validate_executable(path)?;
-        result
+        // Preserve the existing post-execution substitution refusal too; it
+        // runs before the exit record is written, so a refused harness never
+        // has its exit recorded as an exit.
+        let validated = self.authority.validate_executable(path);
+        // Trust: how the harness ended, beside its per-case result file.
+        let recorded = prepared::record_harness_end(&self.plan.session, test, &result, &validated);
+        validated?;
+        result.and(recorded)
     }
 }
 
@@ -265,6 +270,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            results: None,
         };
         let plan = PreparedTests {
             schema: trust_test_execution::PLAN_SCHEMA.into(),

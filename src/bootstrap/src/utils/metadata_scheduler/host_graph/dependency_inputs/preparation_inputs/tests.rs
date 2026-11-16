@@ -107,6 +107,56 @@ fn original_configuration_bytes_feed_the_existing_parser_and_preserve_ofd() {
 }
 
 #[test]
+fn actual_output_lock_and_source_scope_survive_early_physical_custody_and_path_refusal() {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::net::UnixStream;
+    use trust_resource_controller::bootstrap_graph::{offline_preparation, transport};
+
+    // Genuine independent source/output guards. No Graph, native Root or
+    // acceptance/retirement owner is fabricated by this physical caller test.
+    let world = world();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let output = build_helper::trust_output_lock::OutputLock::try_acquire(&root).unwrap().unwrap();
+    // SAFETY: fixture receiver and every actual duplicate are close-only.
+    // This guard outlives the complete physical exchange and all duplicates.
+    let descriptions = unsafe { output.original_descriptions() }.unwrap();
+    let request = offline_preparation::PreparationOutputAttachment {
+        key: query::OperationKey { graph: world.inputs.key.clone(), sequence: 1, operation: [4; 16] },
+        root: fd_identity(descriptions.directory()).unwrap(),
+        lock: fd_identity(descriptions.lock()).unwrap(),
+    };
+    let (left, right) = UnixStream::pair().unwrap();
+    let mut sender = trust_resource_controller::Channel::new(left).unwrap();
+    let mut receiver = trust_resource_controller::Channel::new(right).unwrap();
+    let end = world.inputs.deadline().unwrap();
+    let cursor = unsafe { libc::lseek(descriptions.lock().as_raw_fd(), 0, libc::SEEK_CUR) };
+    transport::send_preparation_output(&mut sender, &request,
+        &[descriptions.directory(), descriptions.lock()], end, || {
+            world.inputs.check_current()?;
+            output.check_current()
+        }).unwrap();
+    let delivered = transport::receive_preparation_output_delivery(&mut receiver, end).unwrap();
+    let mut retained = Vec::new(); assert!(delivered.into_parts(&mut retained));
+    transport::check_output(&request.physical_binding(),
+        &[retained[0].as_fd(), retained[1].as_fd()]).unwrap();
+    assert_eq!(unsafe { libc::lseek(descriptions.lock().as_raw_fd(), 0, libc::SEEK_CUR) }, cursor);
+    assert!(build_helper::trust_output_lock::OutputLock::try_acquire_existing(&root).unwrap().is_none());
+    sender.send(b"same source handler", end).unwrap();
+    assert_eq!(receiver.receive(end).unwrap(), b"same source handler");
+    fs::rename(root.join("lock"), root.join("held-original-lock")).unwrap();
+    fs::write(root.join("lock"), b"metadata cannot replace the held lock").unwrap();
+    assert!(output.check_current().is_err());
+    let competitor = fs::OpenOptions::new().read(true).write(true)
+        .open(root.join("held-original-lock")).unwrap();
+    assert!(matches!(competitor.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+    world.inputs.check_current().unwrap();
+    assert!(!Manager::open(world.source.path()).unwrap().status().unwrap().is_free());
+    drop((sender, receiver, retained));
+    // Physical fixture teardown supplies no native closure/Manager release.
+}
+
+#[test]
 fn observed_configuration_drift_keeps_the_original_and_quarantines_scope_aliases() {
     let world = world();
     let alias = Arc::clone(&world.source);
@@ -278,6 +328,9 @@ fn source_world() -> SourceWorld {
     let root = directory.path().canonicalize().unwrap();
     // An invalid Bootstrap config is unrelated to the closed source/output lane.
     fs::write(root.join("bootstrap.toml"), b"this is not Bootstrap TOML [").unwrap();
+    fs::create_dir(root.join(".cargo")).unwrap();
+    fs::write(root.join(".cargo/config.toml"), b"[net]\noffline = true\n").unwrap();
+    symlink("config.toml", root.join(".cargo/config")).unwrap();
     let output = root.join("output");
     let end = Instant::now() + Duration::from_secs(30);
     let owners = Arc::new(OwnedInputs::acquire(&root, &output, end).unwrap());
@@ -301,9 +354,10 @@ fn before_config_source_stage_retains_real_managers_and_exact_tool_selection() {
     let original = Arc::clone(&world.original);
     let root = original.source().unwrap().path();
     original.check_current().unwrap();
-    assert_eq!(original.selection.source_root, root.as_os_str().as_bytes());
-    assert_eq!(original.selection.configured_targo, b"/existing-configured-seed/bin/cargo");
-    assert_eq!(original.selection.configured_compiler, b"/existing-configured-seed/bin/trustc");
+    let SourceSelection::Complete(selection) = &original.selection else { unreachable!() };
+    assert_eq!(selection.source_root, root.as_os_str().as_bytes());
+    assert_eq!(selection.configured_targo, b"/existing-configured-seed/bin/cargo");
+    assert_eq!(selection.configured_compiler, b"/existing-configured-seed/bin/trustc");
     assert!(!Manager::open(root).unwrap().status().unwrap().is_free());
     assert!(
         build_helper::trust_output_lock::OutputLock::try_acquire(&root.join("output"))
@@ -354,7 +408,10 @@ fn before_config_endpoint_never_extends_actual_owners_and_expiry_is_sticky() {
     let later = world.original.owners.deadline + Duration::from_secs(30);
     let mut original = SourceStage::new(
         Arc::clone(&world.original.owners),
-        world.original.selection.clone(),
+        match &world.original.selection {
+            SourceSelection::Complete(selection) => selection.clone(),
+            SourceSelection::Staged(_) => unreachable!(),
+        },
         later,
     );
     assert_eq!(original.end, original.owners.deadline);
@@ -365,4 +422,155 @@ fn before_config_endpoint_never_extends_actual_owners_and_expiry_is_sticky() {
     assert!(original.check_current().is_err());
     assert!(world.original.check_current().is_err());
     assert!(source.directory().is_err());
+}
+
+#[test]
+fn source_configuration_capture_retains_actual_nested_bytes_and_revokes_aliases_on_drift() {
+    let world = source_world();
+    let source = Arc::clone(world.original.owners.source.get().unwrap());
+    let path = source.path().join(".cargo/config.toml");
+    let observed = world.original.capture_configuration_input(&path).unwrap();
+    assert!(
+        matches!(observed, SourceRead::File { bytes, .. } if bytes == b"[net]\noffline = true\n")
+    );
+    fs::write(&path, b"[net]\noffline = false\n").unwrap();
+    assert!(world.original.check_current().is_err());
+    fs::write(&path, b"[net]\noffline = true\n").unwrap();
+    assert!(source.directory().is_err());
+    assert!(world.original.capture_configuration_input(&path).is_err());
+}
+
+#[test]
+fn source_configuration_negative_discovery_is_not_reinterpreted_after_restore() {
+    let world = source_world();
+    let root = world.original.source().unwrap().path();
+    let path = root.join(".cargo/missing-parent/optional.toml");
+    assert!(world.original.capture_configuration_input(&path).unwrap() == SourceRead::Absent);
+    fs::create_dir(root.join(".cargo/missing-parent")).unwrap();
+    assert!(world.original.check_current().is_err());
+    fs::remove_dir(root.join(".cargo/missing-parent")).unwrap();
+    assert!(world.original.capture_configuration_input(&path).is_err());
+    assert!(world.original.source().unwrap().check_current().is_err());
+}
+
+#[test]
+fn source_configuration_never_opens_an_unowned_home_ancestor_or_link_root() {
+    for link in [false, true] {
+        let world = source_world();
+        let source = Arc::clone(world.original.owners.source.get().unwrap());
+        let path = if link {
+            source.path().join(".cargo/config")
+        } else {
+            source.path().parent().unwrap().join("unowned-config-not-opened")
+        };
+        assert!(world.original.capture_configuration_input(&path).is_err());
+        assert!(world.original.check_current().is_err());
+        assert!(source.close_only_offer().is_err());
+        assert!(!Manager::open(source.path()).unwrap().status().unwrap().is_free());
+    }
+}
+
+
+fn staged_source_world() -> (SourceWorld, Arc<SourceStage>) {
+    let world = source_world();
+    let SourceSelection::Complete(prior) = &world.original.selection else { unreachable!() };
+    let selection = StagedSelection {
+        source_root: prior.source_root.clone(), output_root: prior.output_root.clone(),
+        environment: prior.environment.clone(), budget_ns: prior.budget_ns,
+    };
+    let staged = Arc::new(SourceStage::from_selection(
+        Arc::clone(&world.original.owners), SourceSelection::Staged(selection), world.original.end,
+    ));
+    staged.capture_root().unwrap();
+    (world, staged)
+}
+
+#[test]
+fn staged_source_refuses_config_before_any_payload_capture_and_revokes_real_aliases() {
+    let (_world, original) = staged_source_world();
+    let source = Arc::clone(original.owners.source.get().unwrap());
+    let path = source.path().join(".cargo/config.toml");
+    let population = original.selected.lock().unwrap().as_ref().unwrap().selected_population();
+    assert!(original.capture_configuration_input(&path).is_err());
+    assert_eq!(original.selected.lock().unwrap().as_ref().unwrap().selected_population(), population);
+    assert!(original.check_current().is_err());
+    assert!(source.directory().is_err());
+    assert!(!Manager::open(source.path()).unwrap().status().unwrap().is_free());
+    assert!(original.owners.scope.lock().unwrap().as_ref().unwrap().dispatcher().register_launch().is_err());
+    // No staged bit, name or DATA reply was promoted to native acceptance.
+    assert!(!original.programs_finalized.load(Ordering::Acquire));
+}
+
+#[test]
+fn finalized_staged_program_data_cannot_replace_native_caller_cache_custody() {
+    let (_world, original) = staged_source_world();
+    // Private restriction-state fixture only; no Program/137/Root owner minted.
+    original.programs_finalized.store(true, Ordering::Release);
+    let source=Arc::clone(original.owners.source.get().unwrap());
+    let population=original.selected.lock().unwrap().as_ref().unwrap().selected_population();
+    assert!(original.capture_configuration_input(&source.path().join(".cargo/config.toml")).is_err());
+    assert_eq!(original.selected.lock().unwrap().as_ref().unwrap().selected_population(),population);
+    assert!(source.directory().is_err());
+    assert!(!original.caller_cache.lock().unwrap().bound);
+    assert!(!Manager::open(source.path()).unwrap().status().unwrap().is_free());
+}
+
+#[test]
+fn staged_root_narrowing_retains_both_actual_descriptions_and_the_shorter_bound() {
+    let (_world, original) = staged_source_world();
+    let source = Arc::clone(original.owners.source.get().unwrap());
+    let end = Instant::now() + Duration::from_secs(5);
+    original.narrow_root_before_configuration(end).unwrap();
+    assert_eq!(original.selected.lock().unwrap().as_ref().unwrap().original_deadline(), end);
+    assert_eq!(original.retained_roots.lock().unwrap().len(), 1);
+    original.check_current().unwrap();
+    source.directory().unwrap();
+    // Narrowing physical custody is not final program ACK or permission to parse.
+    assert!(!original.programs_finalized.load(Ordering::Acquire));
+    assert!(original.narrow_root_before_configuration(end).is_err());
+    assert_eq!(original.retained_roots.lock().unwrap().len(), 1);
+    assert!(source.directory().is_err());
+}
+
+#[test]
+fn pending_source_capture_data_blocks_config_and_preserves_actual_source_guards() {
+    let world = source_world();
+    let original = &world.original;
+    let source = Arc::clone(original.owners.source.get().unwrap());
+    let population = original.selected.lock().unwrap().as_ref().unwrap().selected_population();
+    // Restriction DATA only. No138/139, native worker, live Graph or cache-lock
+    // authority is fabricated by this existing physical Source/Scope fixture.
+    *original.source_capture.lock().unwrap() = Some(Arc::new(vec![
+        trust_resource_controller::bootstrap_graph::offline_preparation::ArchiveCandidate {
+            relative: b"bootstrap/trust-stage0/dist/day/seed.tar.xz".to_vec(), sha256: [7; 32],
+        }
+    ]));
+    assert!(original.capture_configuration_input(&source.path().join(".cargo/config.toml")).is_err());
+    assert_eq!(original.selected.lock().unwrap().as_ref().unwrap().selected_population(), population);
+    assert!(source.directory().is_err());
+    assert!(!Manager::open(source.path()).unwrap().status().unwrap().is_free());
+    assert!(original.source_capture.lock().unwrap().is_some());
+}
+
+#[test]
+fn private_program_spelling_is_closed_explicit_data_under_the_observed_namespace() {
+    let world = world();
+    let reserved = ReservedPrograms {
+        query: trust_resource_controller::bootstrap_graph::offline_preparation::ProgramSelectionQuery {
+            key: query::OperationKey { graph: world.inputs.key.clone(), sequence: 1, operation: [91; 16] },
+        },
+        namespace: b"/output/native-child".to_vec(), remaining_root_ns: 1_000_000_000,
+    }; // DATA fixture only: no actual reserved namespace or private program owner.
+    for targo in ["targo", "cargo"] {
+        for compiler in ["trustc", "rustc"] {
+            let selected = program_selection(&reserved, targo.as_ref(), compiler.as_ref()).unwrap();
+            assert_eq!(selected.configured_targo, format!("/output/native-child/bin/{targo}").as_bytes());
+            assert_eq!(selected.configured_compiler, format!("/output/native-child/bin/{compiler}").as_bytes());
+            assert!(selected.key == reserved.query.key);
+        }
+    }
+    for bad in ["/canonical82/bin/cargo", "../cargo", "targo/", "cargo.exe", ""] {
+        assert!(program_selection(&reserved, bad.as_ref(), "trustc".as_ref()).is_err());
+    }
+    assert!(program_selection(&reserved, "cargo".as_ref(), "/canonical82/bin/trustc".as_ref()).is_err());
 }

@@ -86,15 +86,15 @@ inductive RMBridgeObservation : Type
 | mk : RMObservation → RMObservation → SMObservation → RMBridgeObservation
 
 def rm_overlap_fields (a : Nat) (b : Nat) : Bool :=
-  Bool.rec (fun _ => Bool)
-    (Bool.rec (fun _ => Bool) (Nat.beq a b) true (Nat.beq b 0)) true (Nat.beq a 0)
+  @Bool.rec (fun _ => Bool)
+    (@Bool.rec (fun _ => Bool) (Nat.beq a b) true (Nat.beq b 0)) true (Nat.beq a 0)
 def rm_overlap (a : RMPlace) (b : RMPlace) : Bool :=
   match a with
   | RMPlace.mk ai af => match b with
-    | RMPlace.mk bi bf => Bool.rec (fun _ => Bool) false (rm_overlap_fields af bf) (Nat.beq ai bi)
+    | RMPlace.mk bi bf => @Bool.rec (fun _ => Bool) false (rm_overlap_fields af bf) (Nat.beq ai bi)
 def rm_blocked (places : RMPlaces) (place : RMPlace) : Bool :=
-  RMPlaces.rec (fun _ => Bool) false
-    (fun previous rest ih => Bool.rec (fun _ => Bool) ih true (rm_overlap previous place)) places
+  @RMPlaces.rec (fun _ => Bool) false
+    (fun previous rest ih => @Bool.rec (fun _ => Bool) ih true (rm_overlap previous place)) places
 def rm_project (field : Nat) (read : SMRead) : SMRead :=
   match field with
   | 0 => read
@@ -111,10 +111,10 @@ def rm_scalar_read (read : SMRead) (moves : RMPlaces) : RMRead :=
 def rm_loaded (read : SMRead) (moves : RMPlaces) (place : RMPlace) (moving : Bool) : RMRead :=
   match read with
   | SMRead.value value => RMRead.value value
-      (Bool.rec (fun _ => RMPlaces) moves (RMPlaces.cons place moves) moving)
+      (@Bool.rec (fun _ => RMPlaces) moves (RMPlaces.cons place moves) moving)
   | SMRead.fault failure => RMRead.fault (RMFailure.scalar failure) moves
 def rm_load (frame : SMFrame) (moves : RMPlaces) (place : RMPlace) (moving : Bool) : RMRead :=
-  Bool.rec (fun _ => RMRead)
+  @Bool.rec (fun _ => RMRead)
     (rm_loaded (rm_read_place frame place) moves place moving)
     (RMRead.fault RMFailure.moved moves) (rm_blocked moves place)
 def rm_operand (frame : SMFrame) (moves : RMPlaces) (operand : RMOperand) : RMRead :=
@@ -182,9 +182,9 @@ def rm_rvalue (frame : SMFrame) (moves : RMPlaces) (rvalue : RMRvalue) : RMRead 
   | RMRvalue.unsupported => RMRead.fault RMFailure.unsupported moves
 
 def rm_forget_local (moves : RMPlaces) (destination : Nat) : RMPlaces :=
-  RMPlaces.rec (fun _ => RMPlaces) RMPlaces.nil
+  @RMPlaces.rec (fun _ => RMPlaces) RMPlaces.nil
     (fun place rest ih => match place with
-      | RMPlace.mk loc field => Bool.rec (fun _ => RMPlaces)
+      | RMPlace.mk loc field => @Bool.rec (fun _ => RMPlaces)
           (RMPlaces.cons place ih) ih (Nat.beq loc destination)) moves
 def rm_finish_write (bb : Nat) (pc : Nat) (before : SMFrame) (moves : RMPlaces)
     (trace : RMTrace) (destination : Nat) (write : SMWrite) : RMState :=
@@ -210,7 +210,7 @@ def rm_statement (bb : Nat) (pc : Nat) (frame : SMFrame) (moves : RMPlaces)
 def rm_assert_bool (frame : SMFrame) (moves : RMPlaces) (trace : RMTrace)
     (expected : Bool) (target : Nat) (unwind : RMUnwind) (value : SMValue) : RMState :=
   match value with
-  | SMValue.bool actual => Bool.rec (fun _ => RMState)
+  | SMValue.bool actual => @Bool.rec (fun _ => RMState)
       (RMState.halted (RMOutcome.unwind unwind) frame moves trace)
       (RMState.running target 0 frame moves trace) (Bool.beq actual expected)
   | _ => RMState.halted (RMOutcome.fault (RMFailure.scalar SMFault.typeMismatch)) frame moves trace
@@ -236,18 +236,18 @@ def rm_terminal (bb : Nat) (pc : Nat) (frame : SMFrame) (moves : RMPlaces)
 
 def rm_code (bb : Nat) (pc : Nat) (frame : SMFrame) (moves : RMPlaces)
     (trace : RMTrace) (code : RMCode) (index : Nat) : RMState :=
-  RMCode.rec (fun _ => Nat → RMState)
-    (fun statement rest ih => fun i => Nat.rec (fun _ => RMState)
+  @RMCode.rec (fun _ => Nat → RMState)
+    (fun statement rest ih => fun i => @Nat.rec (fun _ => RMState)
       (rm_statement bb pc frame moves trace statement) (fun n _ => ih n) i)
-    (fun terminal => fun i => Nat.rec (fun _ => RMState)
+    (fun terminal => fun i => @Nat.rec (fun _ => RMState)
       (rm_terminal bb pc frame moves trace terminal)
       (fun _ _ => RMState.halted (RMOutcome.fault RMFailure.badPc) frame moves trace) i) code index
 def rm_block (bb : Nat) (pc : Nat) (frame : SMFrame) (moves : RMPlaces)
     (trace : RMTrace) (blocks : RMBlocks) : RMState :=
-  RMBlocks.rec (fun _ => Nat → RMState)
+  @RMBlocks.rec (fun _ => Nat → RMState)
     (fun _ => RMState.halted (RMOutcome.fault RMFailure.badBlock) frame moves trace)
-    (fun cleanup code rest ih => fun index => Nat.rec (fun _ => RMState)
-      (Bool.rec (fun _ => RMState) (rm_code bb pc frame moves trace code pc)
+    (fun cleanup code rest ih => fun index => @Nat.rec (fun _ => RMState)
+      (@Bool.rec (fun _ => RMState) (rm_code bb pc frame moves trace code pc)
         (RMState.halted (RMOutcome.fault RMFailure.cleanup) frame moves trace) cleanup)
       (fun n _ => ih n) index) blocks bb
 def rm_step (body : RMBody) (state : RMState) : RMState :=
@@ -256,16 +256,16 @@ def rm_step (body : RMBody) (state : RMState) : RMState :=
   | RMState.running bb pc frame moves trace => match body with
     | RMBody.mk abi arguments types blocks => rm_block bb pc frame moves trace blocks
 def rm_run (fuel : Nat) (body : RMBody) (initial : RMState) : RMState :=
-  Nat.rec (fun _ => RMState) initial (fun _ previous => rm_step body previous) fuel
+  @Nat.rec (fun _ => RMState) initial (fun _ previous => rm_step body previous) fuel
 def rm_observe (state : RMState) : RMObservation :=
   match state with
   | RMState.halted outcome frame moves trace => RMObservation.mk outcome frame moves trace
   | RMState.running bb pc frame moves trace => RMObservation.mk RMOutcome.outOfFuel frame moves trace
 def rm_frame (types : RMTypes) (input : UInt8) : SMFrame :=
-  RMTypes.rec (fun _ => Nat → SMFrame)
+  @RMTypes.rec (fun _ => Nat → SMFrame)
     (fun _ => SMFrame.nil)
     (fun ty rest ih => fun index => SMFrame.cons ty
-      (Bool.rec (fun _ => SMSlot) SMSlot.uninitialized (SMSlot.value (SMValue.u8 input))
+      (@Bool.rec (fun _ => SMSlot) SMSlot.uninitialized (SMSlot.value (SMValue.u8 input))
         (Nat.beq index 1)) (ih (Nat.succ index))) types 0
 def rm_initial (body : RMBody) (input : UInt8) : RMState :=
   match body with

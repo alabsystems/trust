@@ -90,6 +90,9 @@ fn actual_native_questions_and_compiled_function_share_ir_owned_digests() {
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|row| row.status == VerifyBundleStatus::Verified));
     replay_trust_ir_body_contracts(&native, &results).unwrap();
+    let strict = compile(&native.module, &native, EmitPolicy::StrictProvenOnly).unwrap_err();
+    assert!(matches!(strict, F1Refusal::Policy(_)), "{strict}");
+    assert!(strict.to_string().contains("not closed-[PROVED]"), "{strict}");
     let output = compile(&native.module, &native, EmitPolicy::AllowUnknown).unwrap();
     assert!(!output.shipped.object.is_empty());
     assert_eq!(output.native_bundle_digest(), native.stable_digest());

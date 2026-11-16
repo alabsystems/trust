@@ -59,6 +59,7 @@ os_info.workspace = true
 pathdiff.workspace = true
 portable-atomic.workspace = true
 rand.workspace = true
+rayon.workspace = true
 regex.workspace = true
 rusqlite = { workspace = true, features = ["fallible_uint"] }
 rustc-hash.workspace = true

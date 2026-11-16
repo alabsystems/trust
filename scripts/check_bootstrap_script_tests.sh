@@ -15,7 +15,7 @@
 # files by hand. It is the hole that let a tippy that could not start sit on
 # main for three days: a subject no push lane exercises.
 #
-# WHAT IT RUNS. The four files in TESTS, each exactly as the aggregate runs it
+# WHAT IT RUNS. The files in TESTS, each exactly as the aggregate runs it
 # (`python -B <file>`, `bash <file>`, stdin at /dev/null), under the newest
 # Python >= 3.11 on PATH. The daily suite executes production snapshot boundaries
 # with real isolated Git and the unchanged recreator audit. Retain each actual
@@ -66,6 +66,7 @@ cd "$REPO_ROOT" || exit 2
 
 # The tests, as a fixed list: a glob would pick up or drop a file on a rename.
 TESTS=(
+  scripts/tests/github_source_transport_test.py
   scripts/tests/recreate_bootstrap_test.py
   scripts/tests/promote_toolchain_test.sh
   scripts/tests/daily_toolchain_stage_test.py
@@ -101,6 +102,8 @@ TESTS=(
 #       promote test copies it (its `for rel in` list, line 13)
 #   scripts/verify_sysroot_libraries.py  promote-toolchain.sh verify_surface()
 #       checks full host/installed std targets; copied by the promote test
+#   scripts/qualify_targo_resource.py   tools/verify-toolchain.sh runs it for the
+#       targo resource discovery of a sysroot; copied by the promote test
 #   scripts/lib/trust_toolchain_surface.sh   sourced by tools/verify-toolchain.sh:519
 #       and required by promote-toolchain.sh:166; same list
 #   scripts/lib/trust_build_provenance.py    promote-toolchain.sh:720 runs it;
@@ -116,6 +119,8 @@ TESTS=(
 #   scripts/freeze_toolchain_sources.py  promotion freezes the committed std
 #       closure with it; the promote suite also runs its dedicated Git controls
 #   scripts/tests/freeze_toolchain_sources_test.py  invoked by the promote suite
+#   src/tools/trust-stage0-dist/bootstrap_steps.py
+#       prepare.py loads the sibling explicitly for its Rust source audits
 #   src/tools/trust-stage0-dist/prepare.py  supplies the existing TOML writer
 #       used by source-manifest normalization; copied by the promote fixture
 #   scripts/bootstrap_dependency_closure.py  recreate_bootstrap.py
@@ -131,8 +136,18 @@ TESTS=(
 #       promote-toolchain.sh runs native SDK and frontend identity checks.
 #   scripts/seed_custody_source.py and scripts/lib/seed_linux.py
 #       daily_toolchain_stage.py and its tests load the custody/platform adapters.
+#   scripts/bootstrap_dependency_preparation.py  seed_custody_source.py names
+#       the captured native dependency-preparation source module.
+#   scripts/qualify_targo_resource.py  promotion copies and executes the shipped
+#       native-admission probe with the fixture frontend.
+#   scripts/source_working_cache.py  recreate_bootstrap.py loads it for optional
+#       exact working DATA clones; daily staging reaches the same source owner.
 #   scripts/daily_dependency_git.py and scripts/daily_registry_proxy.py
 #       daily_toolchain_stage.py and its tests load dependency/registry transport.
+#   scripts/bootstrap_dependency_preparation.py
+#       seed_custody_source.py's BoundSourceLoader loads it by path
+#       (select_dependencies_from_capture and its projection), as one of the
+#       six code files a native dependency selection captures.
 #   Incremental reclamation runs the native build-tree library through an
 #       actual Bootstrap/Targo frontend; its Rust tests own that policy.
 # Named by the subjects and NOT loaded, so not here: scripts/check_driver_extra_symbols.py,
@@ -153,7 +168,13 @@ SCOPE=(
   scripts/seed_input_records.py
   scripts/tests/fixtures/publication_daily_consumer_outcomes.py
   scripts/submodule_sync.sh
+  scripts/lib/github_source_transport.py
+  scripts/lib/remote_tips.py
+  scripts/lib/remote_operation.py
+  scripts/bootstrap_dependency_preparation.py
+  scripts/tests/github_source_transport_test.py
   scripts/recreate_bootstrap.py
+  scripts/source_working_cache.py
   scripts/bootstrap_xpy.py
   scripts/tests/bootstrap_xpy_environment_test.py
   scripts/tests/seed_runtime_prerequisite_test.py
@@ -169,6 +190,7 @@ SCOPE=(
   scripts/seed_fixed_point.py
   scripts/seed_root_initialization.py
   scripts/seed_custody_source.py
+  scripts/bootstrap_dependency_preparation.py
   scripts/lib/seed_linux.py
   scripts/daily_dependency_git.py
   scripts/daily_registry_proxy.py
@@ -187,6 +209,7 @@ SCOPE=(
   tools/preflight.py
   tools/verify-toolchain.sh
   scripts/verify_sysroot_libraries.py
+  scripts/qualify_targo_resource.py
   scripts/lib/trust_toolchain_surface.sh
   scripts/lib/trust_build_provenance.py
   scripts/lib/seal_content_identity.py
@@ -197,6 +220,8 @@ SCOPE=(
   src/tools/trust-stage0-dist/prepare.py
   src/tools/trust-stage0-dist/bootstrap_steps.py
   scripts/bootstrap_dependency_closure.py
+  scripts/bootstrap_dependency_preparation.py
+  scripts/qualify_targo_resource.py
   x.py
 )
 

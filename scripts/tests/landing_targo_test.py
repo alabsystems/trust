@@ -321,6 +321,22 @@ class CapabilityGapTests(unittest.TestCase):
         # A command that does not run targo is not asked, whatever PATH holds.
         self.assertIsNone(handoff.capability_gap([sys.executable, 'x.py', 'test'], {'PATH': empty}, REPO))
 
+    def test_a_relative_compiled_python_directory_is_refused_and_nothing_is_cached(self):
+        # Review of the after-leg branch: the gate handed the probe its key's
+        # placeholder for PYTHONPYCACHEPREFIX, a relative path, and the probe
+        # (this fixture targo is a Python program) cached under its cwd.
+        new = self.targo(TARGO_OPTIONS)
+        cwd = Path(tempfile.mkdtemp(prefix='targo-capability-cwd.'))
+        self.addCleanup(shutil.rmtree, cwd, True)
+        env = dict(os.environ, PATH=new + os.pathsep + os.environ['PATH'])
+        self.assertIsNone(handoff.capability_gap(handoff.COMMAND, env, cwd), 'the control: this targo is ready')
+        why = handoff.capability_gap(handoff.COMMAND, dict(env, PYTHONPYCACHEPREFIX='<a key placeholder>'), cwd)
+        self.assertIsNotNone(why)
+        for part in ("'<a key placeholder>'", 'not an absolute path', 'no test ran'):
+            self.assertIn(part, why)
+        self.assertEqual(list(cwd.iterdir()), [], 'nothing ran there')
+        self.assertIsNone(handoff.capability_gap(handoff.COMMAND, dict(env, PYTHONPYCACHEPREFIX=str(cwd / 'abs')), cwd))
+
 
 def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args], text=True,

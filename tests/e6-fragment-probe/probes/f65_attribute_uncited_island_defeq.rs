@@ -39,7 +39,7 @@ clean {
     def sextWide (v : BitVec 64) : BitVec 128 :=
         ofInt128 (toInt64 v)
     def eq_ok_isl (m : BitVec 64) (t : BitVec 128) : Bool :=
-        Decidable.decide (Eq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
+        @Decidable.decide (Eq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
                          (Nat.decEq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
 }
 #[trust::ensures(result == eq_ok_isl(machine, truth))]

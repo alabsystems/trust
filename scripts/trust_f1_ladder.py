@@ -9,8 +9,10 @@ the same source prints.
 
 The corpus is `tests/trust-f1-ladder/`: `programs/` (20 rungs from integer
 arithmetic to a small tokenizer) and `micro/` (28 single-construct rungs that
-locate the frontier). Each rung is an rlib exporting
-`extern "C" fn rung(u64) -> u64`; `driver.rs` links it into an LLVM-built
+locate the frontier), and `lean/` (an island and calls in both directions).
+Each Rust rung exports `extern "C" fn rung(u64) -> u64`; the island-only
+rung exposes a Lean `rung` with the same input and result types.
+`driver.rs` links each rlib into an LLVM-built
 executable. That shape is forced: the builtin trust-cg backend emits rlibs at
 `-Cpanic=abort` only, so no program can be a trust-cg executable yet. The
 script passes both and records that it did.
@@ -50,12 +52,15 @@ Per rung the result is one of
   REFUSED   the compiler exited nonzero; the bracketed refusal classes it
             printed are tallied
   MISMATCH  compiled and linked, and an output or exit code differs from LLVM
+  PATH      a Lean F1 compile omitted its MIR reach counters or read MIR for
+            codegen, inventory or recording; or the LLVM driver rebuilt a subject
+            body from metadata (compiler and driver diagnostics are retained)
   TIMEOUT   the compile ran past --timeout seconds
   LINK      compiled, but the driver did not link against it
   ORACLE    the LLVM build of the rung itself failed (a harness or corpus
             defect; no lane is judged)
 
-Exit status: 1 if any rung is MISMATCH or ORACLE (emitted code is wrong, or
+Exit status: 1 if any rung is MISMATCH, ORACLE or PATH (emitted code is wrong, or
 the instrument is broken), 2 on a usage error or when the trustc cannot load
 the trust-cg backend, else 0. REFUSED is a
 measurement, not a failure of this script. With `--expect LANE=N` the script
@@ -78,16 +83,27 @@ Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_transport_spec = importlib.util.spec_from_file_location(
+    "f1_ladder_resource_transport", REPO_ROOT / "scripts/lib/landing_targo.py"
+)
+if _transport_spec is None or _transport_spec.loader is None:
+    raise ImportError("cannot load local resource descriptor transport")
+_resource_transport = importlib.util.module_from_spec(_transport_spec)
+_transport_spec.loader.exec_module(_resource_transport)
 DEFAULT_CORPUS = REPO_ROOT / "tests" / "trust-f1-ladder"
-SETS = ("programs", "micro")
+SETS = ("programs", "micro", "lean")
 
 # Inputs each built rung is run on. The LLVM build's (exit code, stdout) on the
 # same input is the expected value. They stay small on purpose: several rungs
@@ -137,7 +153,33 @@ CLASS_TAG = re.compile(r"\[[a-z][a-z0-9:-]*\]")
 
 
 def run(cmd: list[str], timeout: float) -> tuple[int | None, str, str]:
-    """Run `cmd`; a `None` return code means it timed out."""
+    """Run `cmd`; a `None` return code means it timed out.
+
+    On Unix, retire the owned group before releasing its leader's identity.
+    Temporary captures avoid a descendant retaining an output pipe or either
+    captured stream filling while the other stream is being read.
+    """
+    if os.name == "posix":
+        # Preserve only advertised live transports. Native owners still
+        # authenticate custody; this creates no pool or resource authority.
+        transport = {"pass_fds": _resource_transport.resource_fds(os.environ)}
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            with _resource_transport.owned_process(
+                cmd, stdout=stdout, stderr=stderr, **transport
+            ) as child:
+                timed_out = not child.exited.wait(timeout)
+                if timed_out:
+                    # No wait/poll has reaped the leader. Its owned observer
+                    # retains the group pin even if exit races this timeout.
+                    _resource_transport.signal_owned_group(child.pid, signal.SIGKILL)
+                status = child.wait()
+            stdout.seek(0)
+            stderr.seek(0)
+            return (
+                None if timed_out else status,
+                "" if timed_out else stdout.read().decode(errors="replace"),
+                stderr.read().decode(errors="replace"),
+            )
     try:
         done = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
@@ -172,7 +214,7 @@ def refusal_classes(stderr: str) -> dict[str, int]:
     return {"(unclassified) no error line": 1}
 
 
-def build_and_run(trustc: str, rung: Path, driver: Path, out: Path, flags: tuple[str, ...], opt: str, timeout: float) -> dict:
+def build_and_run(trustc: str, rung: Path, driver: Path, out: Path, flags: tuple[str, ...], opt: str, timeout: float, require_clean_path: bool = False) -> dict:
     """Compile `rung` with `flags`, link the driver against it, run every input."""
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
@@ -183,11 +225,27 @@ def build_and_run(trustc: str, rung: Path, driver: Path, out: Path, flags: tuple
         return {"status": "TIMEOUT"}
     if rc != 0 or not rlib.exists():
         return {"status": "REFUSED", "classes": refusal_classes(err)}
+    if require_clean_path:
+        reaches = re.findall(
+            r"`clean_origin_mir` reached: codegen (\d+), inventory (\d+), recorder (\d+)", err
+        )
+        if not reaches or any(any(int(n) for n in counts) for counts in reaches):
+            return {"status": "PATH", "clean_origin_mir": reaches}
     exe = out / "driver"
-    rc, _, err = run([trustc, str(driver), *DRIVER_FLAGS, "--extern", f"rung={rlib}", "-o", str(exe)], timeout)
+    driver_evidence = ("-Zprint-mono-items=yes",) if require_clean_path else ()
+    rc, driver_stdout, err = run(
+        [trustc, str(driver), *DRIVER_FLAGS, *driver_evidence, "--extern", f"rung={rlib}", "-o", str(exe)], timeout
+    )
+    (out / "link.stderr").write_text(err)
+    (out / "link.stdout").write_text(driver_stdout)
     if rc != 0 or not exe.exists():
-        (out / "link.stderr").write_text(err)
         return {"status": "LINK"}
+    if require_clean_path:
+        mono_items = [line for line in driver_stdout.splitlines() if line.startswith("MONO_ITEM ")]
+        rebuilt = [line for line in mono_items if re.match(r"MONO_ITEM fn rung::", line)]
+        if not mono_items or rebuilt:
+            return {"status": "PATH", "driver_recompiled_subject": rebuilt,
+                    "driver_inventory_present": bool(mono_items)}
     runs = {}
     for value in INPUTS:
         rc, stdout, _ = run([str(exe), value], 20)
@@ -211,7 +269,8 @@ def measure(trustc: str, corpus: Path, sets: tuple[str, ...], mode: str, opt: st
                     row["lanes"][lane] = {"status": "ORACLE", "oracle": oracle["status"]}
                     continue
                 flags = MODE_FLAGS[mode] + LANES[lane] + (consumer_flag if LANES[lane] else ())
-                got = build_and_run(trustc, rung, driver, base / lane, flags, opt, timeout)
+                got = build_and_run(trustc, rung, driver, base / lane, flags, opt, timeout,
+                                    require_clean_path=set_name == "lean" and bool(LANES[lane]))
                 if got["status"] == "BUILT":
                     diff = {k: [oracle["runs"][k], got["runs"][k]] for k in INPUTS if oracle["runs"][k] != got["runs"][k]}
                     got = {"status": "MISMATCH", "diff": diff} if diff else {"status": "OK"}
@@ -326,8 +385,8 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     for row in results:
         for lane, got in row["lanes"].items():
-            if got["status"] in ("MISMATCH", "ORACLE"):
-                print(f"trust_f1_ladder: {row['set']}/{row['rung']} {lane}: {got['status']} {got.get('diff') or got.get('oracle')}", file=sys.stderr)
+            if got["status"] in ("MISMATCH", "ORACLE", "PATH"):
+                print(f"trust_f1_ladder: {row['set']}/{row['rung']} {lane}: {got['status']} {got.get('diff') or got.get('oracle') or got.get('clean_origin_mir') or got.get('driver_recompiled_subject') or []}", file=sys.stderr)
                 failed = True
     for (set_name, lane), want in expect.items():
         got_count = ok_count(summary, lane, set_name)

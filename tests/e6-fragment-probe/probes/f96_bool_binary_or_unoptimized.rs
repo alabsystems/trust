@@ -15,9 +15,9 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     def axis_outside_isl (p : BitVec 64) (lo : BitVec 64) (hi : BitVec 64) : Bool :=
-        Bool.or (Decidable.decide (Nat.lt (key64 p) (key64 lo))
+        Bool.or (@Decidable.decide (Nat.lt (key64 p) (key64 lo))
                                   (Nat.decLt (key64 p) (key64 lo)))
-                (Decidable.decide (Nat.lt (key64 hi) (key64 p))
+                (@Decidable.decide (Nat.lt (key64 hi) (key64 p))
                                   (Nat.decLt (key64 hi) (key64 p)))
 }
 pub fn axis_outside(p: i64, lo: i64, hi: i64) -> bool

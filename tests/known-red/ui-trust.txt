@@ -81,3 +81,17 @@
 [ui] tests/ui/trust/vec_u8_extend_from_slice_seq_axiom.rs#pinned  # trust-mc guard (8862c94337) on the bridge grow summary's FreshSymbolicHavoc lengths and receiver havoc (VEC-U8-GROW-HAVOC-GATE-1): `grow` runtime-checked, 9 OperandConsumption constructs
 [ui] tests/ui/trust/vec_u8_extend_from_slice_under_live_alloc_axiom.rs#global  # as vec_u8_extend_from_slice_seq_axiom.rs#pinned, for `push_all`
 [ui] tests/ui/trust/vec_u8_grow_alloc_error_handler_declines.rs#plain  # as vec_u8_extend_from_slice_seq_axiom.rs#pinned
+
+# UI-TRUST-V70-LOST-PROOFS-1 (2026-11-15, docs/OPEN_ISSUES.md): four revisions
+# that lose a panic-freedom proof on main. Each is a LOST PROOF, not a false
+# one: the `[assert]` row reads runtime-checked ("the proof is not yet static")
+# where the test pins it proved, so the strict or certify revision no longer
+# builds. Measured on a stage 1 of main 3f5d1e29d27 (the four fail the same way
+# there and on the landing tree); none is in MAIN-UI-BLIND-WINDOW-REDS-1's
+# 2026-11-09 measurement, so the loss came with a later pin move, not bisected.
+# The tests still state the proof they exist to witness. Owner: the trust-mc
+# native panic-freedom lane. Delete a row in the commit that makes it pass.
+[ui] tests/ui/trust/admitted_destructor_record_survives_nested_verdict.rs#dyn  # lost proof: `f`'s panic-freedom row runtime-checked, 1 skipped; the strict build fails
+[ui] tests/ui/trust/async-layout-no-cycle/static_type_array_len.rs#strict  # lost proof: `f` and `g` each report one more unproved obligation than pinned (1->2, 2->3 L0; 3->4 strict)
+[ui] tests/ui/trust/chunks_mut_payload_len.rs#certify  # lost proof: `chex_mut`, `chex_mut_read`, `len_and_index`, `whilelet_mut` each have the `split_at_mut_unchecked` panic-freedom row runtime-checked
+[ui] tests/ui/trust/drop_credit_crate_name_shared_stamp_kept.rs#certify  # lost proof: `take`'s panic-freedom row runtime-checked; trust-mc refuses 2 OperandConsumption constructs

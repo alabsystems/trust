@@ -10,7 +10,9 @@ use trust_ir::{
 use trust_verifier_api::{
     EvidenceArtifactKind, ObligationEvidence, TrustContractBundle, TrustObligation,
 };
-use trust_wp_lib::trust_ir_body::{TRUST_IR_BODY_WP_SCHEMA, replay_trust_ir_body_contracts};
+use trust_wp_lib::trust_ir_body::{
+    NativeBodyWpTranslationWitness, TRUST_IR_BODY_WP_SCHEMA, replay_trust_ir_body_request_validated,
+};
 
 #[derive(Debug)]
 pub(super) struct NativeWpReplay {
@@ -58,6 +60,8 @@ struct Statement {
     module_digest: ProofDigest,
     source_digest: Option<ProofDigest>,
     results: Vec<trust_wp_lib::VerifyBundleResult>,
+    #[serde(default)]
+    translation_witness: Option<NativeBodyWpTranslationWitness>,
 }
 
 impl NativeWpReplay {
@@ -76,6 +80,12 @@ impl NativeWpReplay {
         if !self.accepts(public, obligation, evidence, request_id, proof_id) {
             return None;
         }
+        // Read only the same hash-checked, obligation-bound certificate that
+        // accepts() just independently replayed. A producer's standalone
+        // witness cannot populate a checked fact; absence retains native-only
+        // evidence without mathematical translation authority.
+        let bytes = bound_certificate_bytes(evidence, obligation)?;
+        let certificate = decode_certificate(bytes)?;
         let digest = public.canonical_obligation_semantic_digest_sha256(obligation).ok()?;
         super::CheckedNativeWpProof::new(
             Arc::clone(&self.bundle),
@@ -83,6 +93,7 @@ impl NativeWpReplay {
             evidence,
             request_id,
             proof_id,
+            certificate.statement.translation_witness,
         )
     }
 
@@ -110,20 +121,13 @@ impl NativeWpReplay {
         {
             return false;
         }
-        let mut certificates = evidence
+        let Some(bytes) = bound_certificate_bytes(evidence, obligation) else {
+            return false;
+        };
+        let Some(artifact) = evidence
             .artifacts
             .iter()
-            .filter(|artifact| artifact.kind == EvidenceArtifactKind::ProofCertificate);
-        let Some(artifact) = certificates.next() else { return false };
-        if certificates.next().is_some() {
-            return false;
-        }
-        let Some(materialization) = artifact.materialization.as_ref() else { return false };
-        if !materialization.matches_hash(&artifact.hash) {
-            return false;
-        }
-        let Some(bytes) =
-            materialization.bound_payload_bytes(artifact.kind, &obligation.obligation_id)
+            .find(|artifact| artifact.kind == EvidenceArtifactKind::ProofCertificate)
         else {
             return false;
         };
@@ -145,7 +149,9 @@ impl NativeWpReplay {
         request_id: u32,
         proof_id: u32,
     ) -> bool {
-        let Ok(certificate) = serde_json::from_slice::<Certificate>(bytes) else { return false };
+        let Some(certificate) = decode_certificate(bytes) else {
+            return false;
+        };
         let statement = certificate.statement;
         if !certificate.accepted
             || certificate.replay
@@ -178,12 +184,53 @@ impl NativeWpReplay {
         }) {
             return false;
         }
-        let mut scoped = self.bundle.as_ref().clone();
-        scoped.requests.retain(|request| {
-            matches!(request, NativeVerificationRequest::TrustWp(native) if native == &statement.request)
-        });
-        replay_trust_ir_body_contracts(&scoped, &statement.results).is_ok()
+        let Ok(admitted) = trust_ir::ValidatedNativeBundle::new(self.bundle.as_ref()) else {
+            return false;
+        };
+        replay_trust_ir_body_request_validated(
+            &admitted,
+            statement.request.id,
+            &statement.results[0],
+            statement.translation_witness.as_ref(),
+        )
+        .is_ok()
     }
+}
+
+// Use one typed certificate decoder for independent replay, checked-fact
+// retention and the producer's optional-witness representation check.
+fn decode_certificate(bytes: &[u8]) -> Option<Certificate> {
+    if bytes.len() > trust_verifier_api::MAX_EVIDENCE_ARTIFACT_MATERIALIZATION_BYTES {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
+
+/// Decodability grants no evidence authority. In particular this does not
+/// replace selected-request derivation, public bindings or native pure replay.
+pub(crate) fn native_wp_certificate_is_decodable(bytes: &[u8]) -> bool {
+    decode_certificate(bytes).is_some()
+}
+
+/// Preserve the existing single-certificate, materialization-size, hash and
+/// public-obligation binding checks for both cache admission and retention.
+fn bound_certificate_bytes<'a>(
+    evidence: &'a ObligationEvidence,
+    obligation: &TrustObligation,
+) -> Option<&'a [u8]> {
+    let mut certificates = evidence
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == EvidenceArtifactKind::ProofCertificate);
+    let artifact = certificates.next()?;
+    if certificates.next().is_some() {
+        return None;
+    }
+    let materialization = artifact.materialization.as_ref()?;
+    if !materialization.matches_hash(&artifact.hash) {
+        return None;
+    }
+    materialization.bound_payload_bytes(artifact.kind, &obligation.obligation_id)
 }
 
 #[cfg(test)]

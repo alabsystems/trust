@@ -88,19 +88,16 @@ class NativeSurfaceTests(unittest.TestCase):
         r=self.run_surface();self.assertNotEqual(r.returncode,0)
         self.assertIn('lacks paired',r.stderr);self.assertNotIn('RECORDED',r.stderr)
 
-    def test_rust_lld_without_dsymutil_is_recorded_not_refused(self):
-        # What every cut with LLD enabled produces (2026-11-15): the root rust-lld
-        # copy_lld_artifacts places, and no dsymutil. The linker is started; the
-        # debug half is recorded and never reads as a pass.
+    def test_rust_lld_without_dsymutil_is_refused(self):
         self.helpers();(self.root/'bin/dsymutil').unlink()
-        r=self.run_surface();self.assertEqual(r.returncode,0,r.stderr)
-        self.assertIn('    RECORDED  fixture publishes bin/rust-lld (it starts) and no bin/dsymutil',r.stderr)
-        self.assertIn('The pair is not passed (DARWIN-NATIVE-TOOLS-PRODUCER-1).',r.stderr)
+        r=self.run_surface();self.assertNotEqual(r.returncode,0,r.stderr)
+        self.assertIn('lacks paired',r.stderr)
+        self.assertNotIn('RECORDED',r.stderr)
 
     def test_rust_lld_alone_that_cannot_start_is_refused(self):
         self.helpers();(self.root/'bin/dsymutil').unlink()
         (self.root/'bin/rust-lld').write_text('#!/bin/sh\nexit 1\n')
-        r=self.run_surface();self.assertNotEqual(r.returncode,0);self.assertIn('paired rust-lld cannot start',r.stderr)
+        r=self.run_surface();self.assertNotEqual(r.returncode,0);self.assertIn('lacks paired',r.stderr)
         self.assertNotIn('RECORDED',r.stderr)
 
     def test_a_dangling_helper_link_is_refused(self):
@@ -665,7 +662,7 @@ class GatePassSaysWhatItChecked(GateFixture):
         self.assertNotIn("paired native-tool surface passed", result.stdout)
         self.assertNotIn("paired native-tool surface FAILED", result.stdout)
 
-    def test_a_darwin_sdk_with_rust_lld_alone_is_partial_never_passed(self):
+    def test_a_darwin_sdk_with_rust_lld_alone_is_refused(self):
         trustc = self.toolchain / "bin" / "trustc"
         trustc.write_text(trustc.read_text().replace("host: test-host", "host: aarch64-apple-darwin"))
         lld = self.toolchain / "bin" / "rust-lld"
@@ -673,11 +670,10 @@ class GatePassSaysWhatItChecked(GateFixture):
         lld.chmod(0o755)
         result = self.promote("--gate-only")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("    RECORDED  gate-only SDK publishes bin/rust-lld (it starts) and no bin/dsymutil", result.stdout)
-        self.assertIn("paired native-tool surface PARTIAL (recorded, not refused: bin/rust-lld starts, "
-                      "this SDK has no bin/dsymutil)", result.stdout)
-        self.assertNotIn("paired native-tool surface passed", result.stdout)
-        self.assertNotIn("paired native-tool surface FAILED", result.stdout)
+        self.assertIn("native Darwin SDK lacks paired bin/rust-lld or bin/dsymutil", result.stdout)
+        self.assertIn("paired native-tool surface FAILED", result.stdout)
+        self.assertNotIn("paired native-tool surface PARTIAL", result.stdout)
+        self.assertNotIn("gate-only: PASS", result.stdout)
 
 
 if __name__ == '__main__':

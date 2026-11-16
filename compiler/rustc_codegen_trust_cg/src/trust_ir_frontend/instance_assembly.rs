@@ -1187,6 +1187,10 @@ pub(crate) mod declaration_binding;
 
 struct UpstreamAssemblyInput<'tcx> {
     installed: FuncId,
+    /// Present only when the sole appender filled an authenticated original
+    /// declaration. Keep its exact installation premise with the sealed body;
+    /// an appended body without a binding gains no replacement authority.
+    declaration_binding: Option<declaration_binding::BoundDeclaration>,
     input: upstream_entry::UpstreamBody<'tcx>,
     edges: BTreeMap<FuncId, FuncId>,
     installed_image: Function,
@@ -1194,7 +1198,10 @@ struct UpstreamAssemblyInput<'tcx> {
 }
 
 impl UpstreamAssemblyInput<'_> {
-    fn check(&self, module: &Module) -> Result<(), String> {
+    fn check(&self, base: &Module, module: &Module) -> Result<(), String> {
+        if let Some(binding) = &self.declaration_binding {
+            binding.check_retained(base, self.input.module(), self.installed)?;
+        }
         if self.input.original_module().functions.len() != self.input.module().functions.len()
             || self.input.retained_evidence().ledger.len() != self.edges.len()
         {
@@ -1206,6 +1213,66 @@ impl UpstreamAssemblyInput<'_> {
             return Err("installed upstream body differs from its retained exact image".into());
         }
         call_edges_match(module, self.installed, self.input.module(), &self.edges)
+    }
+}
+
+/// Opaque, borrowed evidence for exact authenticated declaration installation.
+/// Only the successful retained Plan projects these entries. Borrowing its
+/// immutable payloads keeps their genuine sealed owners alive; codegen cannot
+/// supply a constructor, name resolver, approval bit or replacement whitelist.
+/// This licenses no body: ordinary producer/gate/ABI checks still apply.
+pub(crate) struct HandoffDeclarationExtensions<'a> {
+    base: &'a Module,
+    star: &'a Module,
+    installations: Vec<RetainedDeclarationInstallation<'a>>,
+}
+
+struct RetainedDeclarationInstallation<'a> {
+    binding: &'a declaration_binding::BoundDeclaration,
+    original: &'a Module,
+    guest: &'a Module,
+    evidence: &'a trust_thir_lower::rmeta_entry::Evidence,
+    installed: FuncId,
+    image: &'a Function,
+    signature: &'a FuncTy,
+    edges: &'a BTreeMap<FuncId, FuncId>,
+}
+
+impl std::fmt::Debug for HandoffDeclarationExtensions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandoffDeclarationExtensions").finish_non_exhaustive()
+    }
+}
+
+impl HandoffDeclarationExtensions<'_> {
+    /// Recheck one changed original declaration against the ACTUAL input images.
+    /// The producer may be the compiler's content-identical clone of star; the
+    /// original base allocation must itself be retained. A transformed producer
+    /// needs its own checked transformation relation and does not pass here.
+    pub(crate) fn check(
+        &self,
+        base: &Module,
+        producer: &Module,
+        id: FuncId,
+    ) -> Result<(), String> {
+        if !std::ptr::eq(self.base, base) || self.star != producer {
+            return Err("declaration extension names another original base or producer image".into());
+        }
+        let mut matching = self.installations.iter().filter(|entry| entry.installed == id);
+        let entry = matching.next().ok_or("no authenticated declaration installation for this slot")?;
+        if matching.next().is_some() {
+            return Err("ambiguous authenticated declaration installations for this slot".into());
+        }
+        entry.binding.check_retained(base, entry.guest, id)?;
+        if entry.original.functions.len() != entry.guest.functions.len()
+            || entry.evidence.ledger.len() != entry.edges.len()
+            || entry.image.is_declaration()
+            || producer.function_by_id(id) != Some(entry.image)
+            || producer.func_type(entry.image.ty) != Some(entry.signature)
+        {
+            return Err("retained declaration extension body, signature or sealed input population differs".into());
+        }
+        call_edges_match(producer, id, entry.guest, entry.edges)
     }
 }
 
@@ -1462,7 +1529,8 @@ impl<'tcx> Assembler<'tcx> {
         let installed_signature = self.star.func_type(installed_image.ty)
             .cloned().ok_or_else(|| assembly("installed upstream signature vanished".into()))?;
         self.upstream_inputs.push(UpstreamAssemblyInput {
-            installed: id, input: guest, edges, installed_image, installed_signature,
+            installed: id, declaration_binding: binding, input: guest, edges,
+            installed_image, installed_signature,
         });
         self.spliced.push((symbol.into(), id, Spliced::UpstreamEntry(disclosure)));
         Ok(CompletedSlot::Upstream { id, disclosure })
@@ -1646,6 +1714,35 @@ impl<'tcx> Plan<'tcx> {
         }
     }
 
+    /// Project private installation witnesses only from a successfully checked
+    /// assembler. Every reference for an entry comes from that same retained
+    /// upstream input; callers cannot choose or replace any of its premises.
+    pub(crate) fn handoff_declaration_extensions(&self) -> Option<HandoffDeclarationExtensions<'_>> {
+        let (Some(assembler), None) = (&self.assembler, &self.star_refused) else {
+            return None;
+        };
+        let installations = assembler.upstream_inputs.iter().filter_map(|entry| {
+            Some(RetainedDeclarationInstallation {
+                binding: entry.declaration_binding.as_ref()?,
+                original: entry.input.original_module(),
+                guest: entry.input.module(),
+                evidence: entry.input.retained_evidence(),
+                installed: entry.installed,
+                image: &entry.installed_image,
+                signature: &entry.installed_signature,
+                edges: &entry.edges,
+            })
+        }).collect::<Vec<_>>();
+        if installations.is_empty() {
+            return None;
+        }
+        Some(HandoffDeclarationExtensions {
+            base: &assembler.base,
+            star: &assembler.star,
+            installations,
+        })
+    }
+
     /// Whether item `index` lowers from the instance-keyed codegen module.
     pub(crate) fn is_instance_item(&self, index: usize) -> bool {
         matches!(self.items.get(index), Some(ItemPlan::Instance))
@@ -1817,7 +1914,7 @@ pub(crate) fn plan<'tcx>(
         }
         if star_refused.is_none() {
             for retained in &assembler.upstream_inputs {
-                if let Err(why) = retained.check(&assembler.star) {
+                if let Err(why) = retained.check(&assembler.base, &assembler.star) {
                     star_refused = Some(why);
                     break;
                 }

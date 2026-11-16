@@ -10,6 +10,88 @@ use std::time::Instant;
 use super::{Enrollment, GNU_RIGHTS_MARKER, GnuIdentity, OUTPUT_RIGHTS_MARKER, OutputAttachment};
 use crate::{Channel, FileIdentity};
 
+/// Unclassified actual kernel-delivered descriptions. No public constructor:
+/// flags/status DATA cannot manufacture the native receiver's FD population.
+/// The Host must install even malformed delivery in its SAME State before any
+/// peer/semantic postchecks. This type is NOT OriginalPreparationOutput.
+#[must_use = "retain even malformed delivered descriptions through actual native quarantine"]
+pub struct PreparationOutputDelivery {
+    descriptions: Option<Vec<OwnedFd>>,
+    valid: bool,
+}
+impl PreparationOutputDelivery {
+    pub(crate) fn received(descriptions: Vec<OwnedFd>, valid: bool) -> Self {
+        Self {
+            descriptions: Some(descriptions),
+            valid,
+        }
+    }
+
+    /// Unique explicit takeover into the actual native State's unclassified
+    /// population. Reserve while this SAME guard still owns every FD; even an
+    /// allocation unwind cannot close uncertain descriptions. No intermediate
+    /// unguarded Vec escapes, and no descriptor is cloned or reconstructed.
+    pub fn into_parts(mut self, retained: &mut Vec<OwnedFd>) -> bool {
+        retained.reserve(
+            self.descriptions
+                .as_ref()
+                .expect("same unconsumed delivery")
+                .len(),
+        );
+        retained.append(
+            self.descriptions
+                .as_mut()
+                .expect("same uniquely owned delivery"),
+        );
+        drop(self.descriptions.take()); // empty after the unique append
+        self.valid
+    }
+}
+impl Drop for PreparationOutputDelivery {
+    fn drop(&mut self) {
+        // An actor queue/host/caller unwind is not native retirement. Keep the
+        // SAME actual population on every unconsumed path, including foreign
+        // process Drop; no saved FD numbers can reconstruct a later owner.
+        if let Some(originals) = self.descriptions.take() {
+            std::mem::forget(originals);
+        }
+    }
+}
+
+pub fn receive_preparation_output_delivery(
+    channel: &mut Channel,
+    deadline: Instant,
+) -> io::Result<PreparationOutputDelivery> {
+    channel.receive_preparation_output_delivery(deadline)
+}
+
+/// The sender retains its actual original OutputLock under the same selected
+/// SDK contract as ordinary output transfer. DATA/fstat never creates that lock.
+pub fn send_preparation_output(
+    channel: &mut Channel,
+    request: &super::offline_preparation::PreparationOutputAttachment,
+    fds: &[BorrowedFd<'_>; 2],
+    deadline: Instant,
+    revalidate: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    request.validate()?;
+    let binding = request.physical_binding();
+    send(
+        channel,
+        fds,
+        super::offline_preparation::PREPARATION_OUTPUT_RIGHTS_MARKER,
+        deadline,
+        || check_output(&binding, fds),
+        revalidate,
+    )
+}
+
+mod preparation_cache;
+pub use preparation_cache::{
+    PREPARATION_CACHE_DIRECTORY_RIGHTS_MARKER, PreparationCacheDirectoryDelivery,
+    receive_preparation_cache_directory, send_preparation_cache_directory,
+};
+
 mod source;
 pub use source::{check_source, receive_source, send_source};
 mod configuration;

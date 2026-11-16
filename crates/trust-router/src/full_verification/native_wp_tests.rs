@@ -463,6 +463,62 @@ fn native_body_wp_preserves_false_contract_and_definitive_primary() {
     }
 }
 
+/// Regression (2026-11-15): the body question is the bare postcondition. With
+/// unsigned Select on the body path, `fn rmax(a, b) requires b <= a ensures
+/// result <= a { if a < b { b } else { a } }` came back `[postcond] FAILED`
+/// from a state the precondition excludes (ui `e9_requires_hypothesis_*`,
+/// `call_dest_bounding_contract_held`). A function with a precondition keeps a
+/// body proof and loses only the body refutation.
+#[test]
+fn native_body_wp_withholds_a_counterexample_found_without_the_precondition() {
+    let requires = |kind| TrustContract {
+        contract_id: "boolean-precondition".into(),
+        kind,
+        predicate: ContractPredicate::CanonicalJson {
+            schema: "trust-wp.pure-expr.v1".into(),
+            value: serde_json::Value::String("(x : bool)".into()),
+        },
+        source: SourceLocation::default(),
+        metadata: Vec::new(),
+    };
+    for kind in [ContractKind::Requires, ContractKind::Assumes] {
+        // The false contract: refuted without a precondition (the control
+        // above), withheld with one.
+        let (mut public, native) = fixture(true);
+        public.contracts.push(requires(kind.clone()));
+        let result = engine(EvidenceStatus::Unknown)
+            .verify_obligations_with_native_trust_ir_bundle(
+                &public,
+                &public.obligations,
+                &native,
+                &VerifierExecutionContext::new("native-body-wp-conditional-false"),
+            );
+        assert_eq!(result.summary.proved, 0, "{result:#?}");
+        assert_eq!(result.summary.failed, 0, "{result:#?}");
+        assert!(
+            result.evidence.iter().all(|row| row.status != EvidenceStatus::Failed),
+            "{result:#?}"
+        );
+        assert!(
+            format!("{result:?}").contains("body-aware WP counterexample withheld"),
+            "the withheld counterexample must be the stated reason: {result:#?}"
+        );
+
+        // The true contract still proves: a proof of the bare clause proves
+        // the conditional one.
+        let (mut public, native) = fixture(false);
+        public.contracts.push(requires(kind));
+        let result = engine(EvidenceStatus::Unknown)
+            .verify_obligations_with_native_trust_ir_bundle(
+                &public,
+                &public.obligations,
+                &native,
+                &VerifierExecutionContext::new("native-body-wp-conditional-true"),
+            );
+        assert_eq!(result.summary.proved, 1, "{result:#?}");
+    }
+}
+
 #[test]
 fn native_body_wp_rejects_swapped_public_request_identity() {
     let (mut public, native) = fixture(false);
@@ -1189,8 +1245,173 @@ fn native_body_wp_warm_replay_and_cloned_fact_check_original_program_bindings() 
 #[path = "input_capture_tests.rs"]
 mod input_capture_tests;
 
+/// A trust-mc primary with a fixed answer that, when told to, answers only once
+/// the native solve cutoff has passed, or cancels the run while it answers.
+struct LatePrimary {
+    inner: UnitEngine,
+    answers_after: Option<Instant>,
+    cancels: Option<trust_verifier_api::CancellationToken>,
+}
+
+impl VerificationEngine for LatePrimary {
+    fn manifest(&self) -> &EngineManifest {
+        self.inner.manifest()
+    }
+    fn supports(&self, obligation: &TrustObligation) -> SupportLevel {
+        self.inner.supports(obligation)
+    }
+    fn verify_validated(
+        &self,
+        request: ValidatedVerificationRequest<'_>,
+    ) -> Vec<ObligationEvidence> {
+        if let Some(at) = self.answers_after {
+            std::thread::sleep(
+                at.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+        }
+        if let Some(token) = &self.cancels {
+            token.cancel(trust_verifier_api::CancellationReason::UserRequested);
+        }
+        self.inner.verify_validated(request)
+    }
+}
+
+/// HARDENED-PROFILE-UNMEASURED-1: a postcondition the primary leaves undecided
+/// after the native solve cutoff has passed (the function's own deadline far
+/// off) is published as the clock stop it is: the deductive fallback that could
+/// decide it was refused by that clock alone. Before, the row stayed the
+/// primary's `unknown`, which names no clock. A run cancelled while the primary
+/// answers is published as cancelled the same way. Controls: the same primary
+/// inside the cutoff is discharged by the fallback; a definitive primary that
+/// answers late keeps its verdict, and so does a row no rule lets the fallback
+/// take (a terminal refusal, or no fallback engine): the clock decided nothing
+/// there.
+#[test]
+fn a_fallback_refused_by_the_clock_alone_publishes_the_clock_stop() {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Stop {
+        None,
+        Late,
+        Cancelled,
+    }
+    let run = |status: EvidenceStatus, stop: Stop, with_fallback: bool| {
+        let (public, native) = fixture(false);
+        let late = stop == Stop::Late;
+        let cutoff = Instant::now()
+            + if late { Duration::from_millis(300) } else { Duration::from_secs(3600) };
+        let context = VerifierExecutionContext::new("fallback-clock")
+            .with_deadline(Instant::now() + Duration::from_secs(7200))
+            .with_native_solve_cutoff(Some(cutoff));
+        let mut engines = configured_engines(status);
+        if !with_fallback {
+            engines.retain(|engine| engine.manifest().name != "trust-wp");
+        }
+        let slot = engines.iter().position(|engine| engine.manifest().name == "trust-mc").unwrap();
+        engines[slot] = Box::new(LatePrimary {
+            inner: UnitEngine::new(
+                "trust-mc",
+                EngineKind::Reachability,
+                ObligationKind::Postcondition,
+                SupportLevel::Supported,
+                UnitEvidenceMode::Evidence {
+                    status,
+                    proof_strength: None,
+                    artifacts: vec![],
+                    diagnostics: vec!["controlled primary outcome".into()],
+                },
+            ),
+            answers_after: late.then_some(cutoff),
+            cancels: (stop == Stop::Cancelled).then(|| context.cancellation.clone()),
+        });
+        let configured = FullVerificationEngine::new(engines, FullVerificationPolicy::default());
+        let result = configured.verify_obligations_with_native_trust_ir_bundle(
+            &public,
+            &public.obligations,
+            &native,
+            &context,
+        );
+        assert!(!context.budget_exceeded(), "the function's own deadline never passes here");
+        result
+    };
+    let names_the_refused_fallback = |result: &VerificationRunResult, why: &str| {
+        result.evidence[0].diagnostics.iter().any(|text| {
+            text.contains(&format!("deductive fallback not attempted: {why}"))
+                && text.contains("controlled primary outcome")
+        })
+    };
+    let names_no_refused_fallback = |result: &VerificationRunResult| {
+        !result
+            .evidence
+            .iter()
+            .flat_map(|evidence| &evidence.diagnostics)
+            .any(|text| text.contains("deductive fallback not attempted"))
+    };
+    const CLOCK: &str = "the verification clock had run out";
+    const CANCEL: &str = "the run was cancelled";
+
+    let late = run(EvidenceStatus::Unknown, Stop::Late, true);
+    assert_eq!(late.evidence[0].status, EvidenceStatus::Timeout, "{late:#?}");
+    assert_eq!(late.summary.proved, 0, "{late:#?}");
+    assert!(
+        names_the_refused_fallback(&late, CLOCK),
+        "the clock is named and the primary's own diagnostics are kept: {late:#?}"
+    );
+
+    let cancelled = run(EvidenceStatus::Unknown, Stop::Cancelled, true);
+    assert_eq!(cancelled.evidence[0].status, EvidenceStatus::Canceled, "{cancelled:#?}");
+    assert_eq!(cancelled.summary.proved, 0, "{cancelled:#?}");
+    assert!(
+        names_the_refused_fallback(&cancelled, CANCEL),
+        "the cancellation is named, not a clock: {cancelled:#?}"
+    );
+
+    let in_time = run(EvidenceStatus::Unknown, Stop::None, true);
+    assert_eq!(
+        in_time.summary.proved, 1,
+        "control: inside the cutoff the fallback decides: {in_time:#?}"
+    );
+
+    let definitive = run(EvidenceStatus::Failed, Stop::Late, true);
+    assert_eq!(definitive.evidence[0].status, EvidenceStatus::Failed, "{definitive:#?}");
+    assert!(names_no_refused_fallback(&definitive), "{definitive:#?}");
+
+    // Rows the fallback is refused for a reason other than the clock keep the
+    // primary's answer under an expired cutoff: a refusal with no stated decline
+    // is terminal, and with no trust-wp engine there is no fallback to refuse.
+    let terminal = run(EvidenceStatus::Unsupported, Stop::Late, true);
+    assert_eq!(terminal.evidence[0].status, EvidenceStatus::Unsupported, "{terminal:#?}");
+    assert!(names_no_refused_fallback(&terminal), "{terminal:#?}");
+
+    let no_fallback = run(EvidenceStatus::Unknown, Stop::Late, false);
+    assert_eq!(no_fallback.evidence[0].status, EvidenceStatus::Unknown, "{no_fallback:#?}");
+    assert!(names_no_refused_fallback(&no_fallback), "{no_fallback:#?}");
+}
+
 #[path = "native_wp_input_tests.rs"]
 mod input_identity;
 
 #[path = "native_wp_captured_tests.rs"]
 mod captured_native;
+
+#[cfg(feature = "native-wp-mathematics")]
+#[path = "native_wp_execution_tests.rs"]
+mod execution_mathematics;
+
+#[cfg(feature = "native-wp-mathematics")]
+#[path = "native_wp_translation_tests.rs"]
+mod translation_mathematics;
+
+#[path = "native_wp_tests/selected_boundary.rs"]
+mod selected_boundary;
+
+#[path = "native_wp_tests/current_self_use.rs"]
+mod current_self_use;
+
+#[path = "native_wp_tests/solver_budget_self_use.rs"]
+mod solver_budget_self_use;
+
+#[path = "native_wp_tests/budget_division_self_use.rs"]
+mod budget_division_self_use;
+
+#[path = "native_wp_tests/eager_definedness.rs"]
+mod eager_definedness;

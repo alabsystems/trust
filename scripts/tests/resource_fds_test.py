@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Effective GNU transport regressions; native mode uses a real retained owner.
+"""Fixed/GNU descriptor transport regressions; native GNU mode retains its owner.
 
 Pure OS parser fixtures below grant no SDK/CPU/GNU authority. --native adds
 actual same-pipe forwarding through the existing maintained Rust importer.
@@ -121,6 +121,67 @@ class EffectiveAdvertisementTests(unittest.TestCase):
         for name in SETS:
             with self.assertRaises(RuntimeError):
                 transport.resource_fds({name: f"{self.read},{self.read}"})
+
+
+class FixedAdvertisementTests(unittest.TestCase):
+    """OS transport data only; the native importer still authenticates custody."""
+
+    def setUp(self):
+        self.read, self.write = os.pipe()
+        self.addCleanup(os.close, self.read)
+        self.addCleanup(os.close, self.write)
+
+    def test_original_fixed_pipe_reaches_the_custodied_child(self):
+        env = {"TRUST_FIXED_ADMISSION_FD_V1": str(self.read)}
+        original = dict(env)
+        os.write(self.write, b"original fixed transport")
+        result = native_serial.run_custodied_command(
+            [sys.executable, "-I", "-B", "-c",
+             "import json,os; fd=int(os.environ['TRUST_FIXED_ADMISSION_FD_V1']); "
+             "s=os.fstat(fd); print(json.dumps({'identity':[s.st_dev,s.st_ino,s.st_mode,s.st_rdev],"
+             "'payload':os.read(fd,64).decode()}))"],
+            env=env, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["identity"], identity(self.read))
+        self.assertEqual(observed["payload"], "original fixed transport")
+        self.assertEqual(env, original)
+
+    def test_malformed_or_closed_fixed_descriptor_refuses_before_launch(self):
+        closed = os.dup(self.read)
+        os.close(closed)
+        for value in ("", "0", "2", "-1", "01", "+3", "3,4", "9999999999",
+                      str(closed), "requires-live-ancestor-v2"):
+            env = {"TRUST_FIXED_ADMISSION_FD_V1": value}
+            with self.subTest(value=value), mock.patch.object(native_serial.subprocess, "Popen") as launch:
+                with self.assertRaises(RuntimeError):
+                    native_serial.run_custodied_command(["/unreachable"], env=env)
+                launch.assert_not_called()
+
+    def test_ancestor_locator_stays_opaque_and_never_becomes_a_descriptor(self):
+        for courier in ("opaque-native-owner-data", "{not JSON}", " "):
+            env = {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1",
+                   "TRUST_FIXED_CLAIM_HANDOFF_V1": courier}
+            original = dict(env)
+            with self.subTest(courier=courier), mock.patch.object(
+                    transport.os, "fstat", side_effect=AssertionError("opaque locator parsed as FD")):
+                self.assertEqual(transport.resource_fds(env), ())
+            self.assertEqual(env, original)
+
+    def test_ancestor_marker_without_its_original_locator_refuses_before_launch(self):
+        for extra in ({}, {"TRUST_FIXED_CLAIM_HANDOFF_V1": ""}):
+            env = {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1", **extra}
+            with self.subTest(extra=extra), mock.patch.object(native_serial.subprocess, "Popen") as launch:
+                with self.assertRaises(RuntimeError):
+                    native_serial.run_custodied_command(["/unreachable"], env=env)
+                launch.assert_not_called()
+
+    def test_fixed_descriptor_joins_existing_transports_without_duplicates(self):
+        env = {"TRUST_FIXED_ADMISSION_FD_V1": str(self.read),
+               "ATERM_SDK_LEASE_V3": str(self.read),
+               "CARGO_MAKEFLAGS": f"--jobserver-auth={self.read},{self.write}",
+               "MAKEFLAGS": "--jobserver-auth=closed,obsolete"}
+        self.assertEqual(transport.resource_fds(env), (self.read, self.write))
 
 
 def identity(fd):

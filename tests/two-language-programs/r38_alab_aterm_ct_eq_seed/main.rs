@@ -160,7 +160,7 @@ theorem scan_len_covers_left : forall (a : UInt64) (b : UInt64),
             Nat.le (UInt64.toNat a) (UInt64.toNat (Decidable.casesOn
                 (motive := fun _ => UInt64) d (fun _ => a) (fun _ => b))))
         (instDecidableUInt64Lt a b)
-        (fun _ => Nat.le.refl (UInt64.toNat a))
+        (fun _ => @Nat.le.refl (UInt64.toNat a))
         (fun h => Nat.le_of_lt h)
 }
 

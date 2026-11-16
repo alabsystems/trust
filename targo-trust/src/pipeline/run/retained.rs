@@ -508,6 +508,7 @@ mod tests {
             target_directory: root.path().display().to_string(),
             executables: Vec::new(),
             inventory_sha256: "c".repeat(64),
+            plan: None,
         };
         assert!(process.grant_and_wait(&qualified, SESSION, &authority).unwrap().success());
         assert!(process.execution_started());
@@ -537,6 +538,7 @@ mod tests {
             target_directory: root.path().display().to_string(),
             executables: Vec::new(),
             inventory_sha256: "c".repeat(64),
+            plan: None,
         };
         assert!(process.grant_and_wait(&qualified, &foreign, &authority).is_err());
         assert!(!process.execution_started());
@@ -588,6 +590,7 @@ mod tests {
                 target_directory: root.path().display().to_string(),
                 executables: Vec::new(),
                 inventory_sha256: "c".repeat(64),
+                plan: None,
             };
             let error = process
                 .grant_and_wait(&qualified, SESSION, &authority)

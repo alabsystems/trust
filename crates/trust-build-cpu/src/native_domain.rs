@@ -149,10 +149,19 @@ pub struct NativeDomain {
 /// Even `Published` requires `open_canonical` before any resource use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeMigrationStatus {
+    /// No migration record and no new native pool directory.
     NotStarted,
+    /// The record is written (phase 0): the legacy launchers are retired, but
+    /// the old native pool's permissions are not yet removed.
     Prepared,
+    /// The old native pool was closed (mode 000, its directory 0500) during
+    /// this kernel boot (phase 1), so publishing the new pool waits for a
+    /// later boot.
     AwaitingLaterBoot,
+    /// The old native pool was closed during an earlier boot (phase 1), so
+    /// `resume_canonical` may publish the new pool.
     ReadyToResume,
+    /// The new pool is published (phase 2).
     Published,
 }
 

@@ -42,7 +42,7 @@
 clean {
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 
     theorem min2_le_left : forall (x : UInt64) (y : UInt64),
         Nat.le (UInt64.toNat (if x < y then x else y)) (UInt64.toNat x) :=
@@ -52,7 +52,7 @@ clean {
                     d (fun _ => y) (fun _ => x))) (UInt64.toNat x))
             (instDecidableUInt64Lt x y)
             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
-            (fun h => Nat.le.refl (UInt64.toNat x))
+            (fun h => @Nat.le.refl (UInt64.toNat x))
 }
 
 pub fn ident(x: u64) -> u64 { x }

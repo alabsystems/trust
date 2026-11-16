@@ -1843,6 +1843,7 @@ def _agh_source_fetch(
     *,
     execute=None,
     checkout_cache: Path | None = None,
+    checkout_closure: bool = False,
 ) -> dict[str, object]:
     """Fetch through Agh's owner routing, then independently read its exact ref.
 
@@ -1874,10 +1875,17 @@ def _agh_source_fetch(
     repository = canonical_url[len("https://github.com/") : -len(".git")]
     command = [str(executable), "repo", "fetch", repository, str(destination),
                "--ref", source_ref, "--into", private_ref]
+    exact_source = re.fullmatch(r"[0-9a-f]{40}", source_ref) is not None
+    if checkout_closure and not exact_source:
+        raise RuntimeError("Agh checkout closure requires an exact immutable source commit")
+    if checkout_cache is not None and not exact_source:
+        raise RuntimeError("Agh checkout cache requires an exact immutable source commit")
+    # Exact pinned compilers need the complete selected checkout, with or
+    # without a cache. Explicit closure requests never accept a mutable ref.
+    if exact_source:
+        command.append("--checkout-closure")
     if checkout_cache is not None:
-        if not re.fullmatch(r"[0-9a-f]{40}", source_ref):
-            raise RuntimeError("Agh checkout cache requires an exact immutable source commit")
-        command.extend(("--checkout-closure", "--checkout-cache", str(checkout_cache)))
+        command.extend(("--checkout-cache", str(checkout_cache)))
     environment = _agh_source_environment()
     try:
         if execute is None:
@@ -1939,7 +1947,11 @@ def fetch_source_pin_main(argv: list[str]) -> int:
             )
             if selected.stdout.strip() != args.pin:
                 raise RuntimeError("selected private source-pin ref is unreadable or names another commit")
-        _agh_source_fetch(args.url, args.directory, args.pin, private_ref)
+        # Source repair needs the exact selected checkout and ancestry metadata,
+        # not every historical checkout's blobs. Keep Agh's authenticated owner,
+        # immutable/private-ref readback and the same bounded refusal behavior.
+        _agh_source_fetch(args.url, args.directory, args.pin, private_ref,
+                          checkout_closure=True)
         tree = subprocess.run(
             _controlled_git_command(["-C", str(args.directory), "cat-file", "-t", args.pin + "^{tree}"]),
             env=environment, capture_output=True, text=True, check=False, timeout=30,
@@ -2868,6 +2880,70 @@ def _git_config_key_for_diagnostic(key: str) -> str:
     return f"{parts[0]}.<redacted>.{parts[-1]}"
 
 
+_ADMITTED_TRUST_CHECKOUTS: set[Path] = set()
+
+
+@contextmanager
+def admitted_trust_checkout(root: Path):
+    """Within the block, judge `root` as this recreator's own source root is judged.
+
+    For a caller's other checkout of the Trust source whose pushes must run its
+    tracked hooks: the fleet train's landing worktree, a linked worktree of its
+    --repo, keeps that clone's maintained hooks path. Its children are judged as
+    any other repository.
+    """
+    resolved = root.resolve(strict=True)
+    if resolved in _ADMITTED_TRUST_CHECKOUTS:
+        raise RuntimeError(f"{root} is already an admitted Trust checkout")
+    _ADMITTED_TRUST_CHECKOUTS.add(resolved)
+    try:
+        yield
+    finally:
+        _ADMITTED_TRUST_CHECKOUTS.discard(resolved)
+
+
+def _maintained_absolute_hooks_path(repository: Path, value: str) -> bool:
+    """Whether an absolute core.hooksPath names the maintained hooks of `repository`.
+
+    The two that scripts/prewarm_push.sh's `hooks_verdict` accepts, compared
+    physically: the checkout's own scripts/hooks, or, for a linked worktree, the
+    scripts/hooks of the main worktree of the same repository (the shared
+    absolute path scripts/install-git-hooks.sh writes).
+    """
+    hooks = Path(value)
+    if not hooks.is_dir():
+        return False
+    hooks = hooks.resolve()
+    own = repository / "scripts/hooks"
+    if own.is_dir() and own.resolve() == hooks:
+        return True
+
+    def read(*arguments: str, at: Path = repository) -> str | None:
+        result = subprocess.run(
+            _controlled_git_command(["-C", str(at), *arguments]),
+            capture_output=True,
+            check=False,
+            env=_provenance_git_environment(),
+            timeout=30,
+        )
+        return os.fsdecode(result.stdout).rstrip("\n") if result.returncode == 0 else None
+
+    git_dir = read("rev-parse", "--path-format=absolute", "--git-dir")
+    common = read("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not git_dir or not common or Path(git_dir).resolve() == Path(common).resolve():
+        return False
+    # `git worktree list` names the main worktree first.
+    listing = read("worktree", "list", "--porcelain") or ""
+    first = listing.split("\n", 1)[0]
+    if not first.startswith("worktree "):
+        return False
+    main = Path(first[len("worktree "):])
+    main_hooks = main / "scripts/hooks"
+    main_common = read("rev-parse", "--path-format=absolute", "--git-common-dir", at=main) if main.is_dir() else None
+    return (main_hooks.is_dir() and main_hooks.resolve() == hooks
+            and main_common is not None and Path(main_common).resolve() == Path(common).resolve())
+
+
 def _reject_local_git_execution_authority(
     repository: Path, *, require_https_submodules: bool = False
 ) -> None:
@@ -2877,12 +2953,14 @@ def _reject_local_git_execution_authority(
     `_provenance_git_environment`. Local config is required for worktree and
     submodule bookkeeping, so inspect it with includes disabled before any
     status/update/provenance command can consume it. Only this recreator's
-    source root may retain the maintained hooks path and an empty worktree
-    scope or disabled sparse controls. Every other worktree scope is rejected
+    source root may retain the maintained hooks path (`scripts/hooks`,
+    `scripts/hooks-pin`, or an absolute path `_maintained_absolute_hooks_path`
+    admits) and an empty worktree scope or disabled sparse controls, as may a
+    checkout admitted by `admitted_trust_checkout`. Every other worktree scope is rejected
     after inspection; command-line overrides remain the final boundary.
     """
     records = _repository_git_config_records(repository)
-    source_root = repository.resolve() == repo_root().resolve()
+    source_root = repository.resolve() in {repo_root().resolve(), *_ADMITTED_TRUST_CHECKOUTS}
     harmless_worktree_scope = source_root and all(
         scope != "worktree"
         or (
@@ -2915,7 +2993,7 @@ def _reject_local_git_execution_authority(
                 and not (
                     source_root
                     and scope == "local"
-                    and value in {"scripts/hooks", "scripts/hooks-pin"}
+                    and (value in {"scripts/hooks", "scripts/hooks-pin"} or os.path.isabs(value))
                 )
             )
             # Git gives URL-specific HTTP/credential keys precedence over a
@@ -2955,6 +3033,15 @@ def _reject_local_git_execution_authority(
                 f"{scope}:{_git_config_key_for_diagnostic(key)}"
             )
 
+    # An absolute hooks path is judged once nothing else in the scope can run:
+    # it must name the hooks a push from this checkout runs under
+    # scripts/prewarm_push.sh's verdict.
+    if source_root and not hostile and any(
+        scope == "local" and key == "core.hookspath" and value not in {"", "/dev/null"}
+        and os.path.isabs(value) and not _maintained_absolute_hooks_path(repository, value)
+        for scope, key, value in records
+    ):
+        hostile.append("local:core.hookspath")
     if hostile:
         raise RuntimeError(
             "repository-local Git configuration contains hidden execution, update, "
@@ -3331,6 +3418,42 @@ def _local_submodule_git(arguments: list[str], *, bounded: bool = False, absent_
     return result
 
 
+def _prepare_source_working_cache(repository: Path, commit: str, donor: Path | None):
+    if donor is None or sys.platform != "darwin":
+        return SimpleNamespace(verify=lambda: {"schema": 1, "method": "normal-checkout", "cloned": 0})
+    # Load support source explicitly, without importing a donor or cached bytecode.
+    namespace = {"__name__": "trust_source_working_cache", "__file__": str(Path(__file__).with_name("source_working_cache.py"))}
+    support = Path(namespace["__file__"])
+    if "__trust_source_loader__" in globals():
+        namespace = vars(__trust_source_loader__.module("trust_source_working_cache", support))
+    else:
+        source = support.read_bytes()
+        exec(compile(source, str(support), "exec"), namespace)
+        if support.read_bytes() != source:
+            raise RuntimeError("source working cache support changed while loading")
+    environment = _provenance_git_environment()
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
+    return namespace["prepare_checkout"](
+        repository, commit, donor,
+        git_command=_controlled_git_command(["-c", "submodule.recurse=false"]),
+        environment=environment, timeout=SUBMODULE_UPDATE_TIMEOUT_SECONDS,
+        verify_physical=_source_working_cache_physical)
+
+
+def _source_working_cache_physical(repository: Path) -> dict:
+    # Reuse the producer's existing complete physical-byte/mode/normalization
+    # owner. Index stat caches cannot establish complete source bytes.
+    errors = []
+    entries = _parse_index_entries(_local_submodule_git(
+        ["-C", str(repository), "ls-files", "--stage", "-z"]).stdout, errors, "working DATA cache")
+    object_format = _local_submodule_git(["-C", str(repository), "rev-parse", "--show-object-format"]).stdout.decode().strip()
+    digest, mismatches, normalized = _capture_working_tree_snapshot(
+        repository, entries, object_format, errors, "working DATA cache")
+    if errors or mismatches:
+        raise RuntimeError("complete working DATA cache physical source audit refused: " + repr(errors + mismatches))
+    return {"sha256": digest, "entries": len(entries), "attribute_normalized": normalized}
+
+
 def _submodule_destination(repository: Path, path: Path):
     current = repository
     parents = [(repository, _submodule_file_identity(repository))]
@@ -3517,8 +3640,127 @@ def _submodule_owner_lock(root: Path):
             lock.unlink()
 
 
+def _materialize_bridge_source_witnesses(root: Path) -> int:
+    """Restore exact historical object DATA under the existing submodule owner.
+
+    The normal selected checkout supplies the producer subtree. A rewritten
+    source publication can omit the original commit and root tree that bind
+    that subtree to the unchanged bridge provenance. These tiny raw witnesses
+    supply only those objects; the existing bridge verifier remains authority
+    for the original anchor, full producer/reader closure and artifact bytes.
+    """
+    import tomllib
+
+    environment = _provenance_git_environment()
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="", GIT_GRAFT_FILE=os.devnull)
+
+    def git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
+        result = subprocess.run(
+            _controlled_git_command(["-C", str(repository), *args]),
+            input=data, capture_output=True, check=False, env=environment, timeout=30,
+        )
+        if result.returncode:
+            raise RuntimeError(f"bridge source DATA Git operation refused (exit {result.returncode})")
+        return result.stdout
+
+    prefix = "data/bridge-source-witnesses/trust-ir/objects"
+    if not git(root, "ls-files", "--", prefix).strip():
+        return 0
+    _reject_local_git_execution_authority(root, require_https_submodules=True)
+    index = _submodule_index_identity(root)
+
+    def indexed_blob(path: str) -> bytes:
+        # write-tree updates the index's cache-tree extension even with
+        # optional locks disabled. Read its exact stage-0 blob instead, with
+        # the original index identity held across every read and object write.
+        listing = git(root, "ls-files", "--stage", "-z", "--", path)
+        match = re.fullmatch(rb"100(?:644|755) ([0-9a-f]{40}) 0\t" + re.escape(path.encode()) + b"\0", listing)
+        if match is None:
+            raise RuntimeError("bridge source witness must be one exact indexed regular blob")
+        raw = git(root, "cat-file", "blob", match[1].decode("ascii"))
+        if len(raw) > 1024 * 1024 or hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest().encode() != match[1]:
+            raise RuntimeError("bridge source witness blob has a different original hash or exceeds its bound")
+        return raw
+
+    manifest = tomllib.loads(indexed_blob("crates/trust-clean/fixtures/trustir-oleans/MANIFEST.toml").decode("utf-8"))
+    if "source_reuse" not in manifest:
+        return 0
+    original = manifest.get("provenance", {}).get("trustir_commit")
+    selected = manifest["source_reuse"].get("selected_trustir_commit")
+    if not all(isinstance(value, str) and re.fullmatch("[0-9a-f]{40}", value) for value in (original, selected)):
+        raise RuntimeError("bridge source witness requires exact original and selected IR identities")
+    commit_path = f"{prefix}/commit/{original}"
+    # A witness is optional source DATA, never a substitute for a missing
+    # verifier input. Other source revisions retain their normal acquisition.
+    if not git(root, "ls-files", "--stage", "-z", "--", commit_path):
+        return 0
+    commit = indexed_blob(commit_path)
+    header = re.match(rb"tree ([0-9a-f]{40})\n", commit)
+    if header is None:
+        raise RuntimeError("bridge source witness commit has no exact root tree")
+    root_tree = header[1].decode("ascii")
+    objects = [("commit", original, commit), ("tree", root_tree, indexed_blob(f"{prefix}/tree/{root_tree}"))]
+    for kind, oid, raw in objects:
+        if hashlib.sha1(f"{kind} {len(raw)}\0".encode() + raw).hexdigest() != oid:
+            raise RuntimeError("bridge source witness canonical type/object hash differs")
+    declarations = {entry.path.as_posix(): entry for entry in _indexed_submodules(root)}
+    entry = declarations.get("first-party/trust-ir")
+    if entry is None or entry.oid != selected:
+        raise RuntimeError("bridge source witness selection differs from indexed IR gitlink")
+    child = root / "first-party/trust-ir"
+    if child.resolve(strict=True) != child:
+        raise RuntimeError("bridge source witness destination must be its exact physical root")
+    _reject_local_git_execution_authority(child, require_https_submodules=True)
+    if Path(os.fsdecode(git(child, "rev-parse", "--show-toplevel")).strip()).resolve() != child:
+        raise RuntimeError("bridge source witness destination is not the selected IR repository")
+    if git(child, "rev-parse", "HEAD").decode().strip() != selected:
+        raise RuntimeError("bridge source witness requires the exact selected IR checkout")
+
+    def book(repository: Path):
+        config_name = os.fsdecode(git(repository, "rev-parse", "--git-path", "config")).strip()
+        config = Path(config_name)
+        if not config.is_absolute():
+            config = repository / config
+        if config.is_symlink() or not config.is_file():
+            raise RuntimeError("bridge source witness configuration is not a regular file")
+        return (git(repository, "rev-parse", "HEAD"), git(repository, "for-each-ref"),
+                config.read_bytes(), _submodule_index_identity(repository),
+                git(repository, "status", "--porcelain=v1", "--untracked-files=no"))
+
+    before = (book(root), book(child))
+    if _submodule_index_identity(root) != index:
+        raise RuntimeError("bridge source witness index changed before object writes")
+    added = 0
+    try:
+        for kind, oid, raw in objects:
+            observed = git(child, "cat-file", "--batch-check", data=(oid + "\n").encode())
+            if observed == (oid + " missing\n").encode():
+                written = git(child, "hash-object", "-w", "-t", kind, "--stdin", data=raw).decode().strip()
+                if written != oid:
+                    raise RuntimeError("bridge source witness wrote a different object")
+                added += 1
+            elif observed != f"{oid} {kind} {len(raw)}\n".encode():
+                raise RuntimeError("bridge source witness existing object has a different type or size")
+            if git(child, "cat-file", kind, oid) != raw:
+                raise RuntimeError("bridge source witness original object bytes differ")
+    finally:
+        if _submodule_index_identity(root) != index or (book(root), book(child)) != before:
+            raise RuntimeError("bridge source witness source/destination bookends changed")
+    if added:
+        print(f"  restored {added} exact bridge provenance source DATA object(s); no history or refs")
+    return added
+
+
+def materialize_bridge_source_witnesses(root: Path) -> int:
+    """Explicit local source-DATA restoration, sharing submodule exclusion."""
+    root = root.resolve(strict=True)
+    with _submodule_owner_lock(root):
+        return _materialize_bridge_source_witnesses(root)
+
+
 def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
-                               *, checkout_cache: Path | None = None) -> None:
+                               *, checkout_cache: Path | None = None,
+                               working_cache: Path | None = None) -> None:
     index = _submodule_index_identity(repository)
     indexed_before = _indexed_submodules(repository)
     if indexed not in indexed_before:
@@ -3561,8 +3803,11 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
         kind = _local_submodule_git(["-C", str(stage), "cat-file", "-t", indexed.oid]).stdout.strip()
         if kind != b"commit":
             raise RuntimeError("indexed submodule OID is not the exact commit object")
+        working = _prepare_source_working_cache(
+            stage, indexed.oid, working_cache if working_cache is not None else checkout_cache)
         _local_submodule_git(["-C", str(stage), "checkout", "--quiet", "--detach",
                               "--no-recurse-submodules", indexed.oid, "--"], bounded=True)
+        working.verify()
         _validate_staged_submodule(stage, identity)
         head = _local_submodule_git(["-C", str(stage), "rev-parse", "HEAD"]).stdout.decode().strip()
         detached = _local_submodule_git(["-C", str(stage), "symbolic-ref", "--quiet", "HEAD"], absent_ok=True)
@@ -3612,7 +3857,10 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
             if os.path.lexists(stage):
                 if stage.is_symlink() or _submodule_file_identity(stage)[:2] != identity[:2]:
                     raise RuntimeError("refusing cleanup of replaced submodule staging directory")
-                shutil.rmtree(stage)
+                if getattr(failure, "retain_source_working_cache", False):
+                    _add_exception_note(failure, f"ambiguous working DATA cache custody retained at {stage}")
+                else:
+                    shutil.rmtree(stage)
             if not any(container.iterdir()):
                 container.rmdir()  # Unknown/preserved entries are NEVER removed.
         except BaseException as cleanup:
@@ -3625,7 +3873,8 @@ def _install_missing_submodule(repository: Path, indexed: IndexedSubmodule,
 
 def _initialize_missing_submodules(repository: Path, display_prefix: str = "", *, depth: int = 0,
                                    population: list[int] | None = None,
-                                   checkout_caches: dict[str, Path] | None = None) -> int:
+                                   checkout_caches: dict[str, Path] | None = None,
+                                   working_caches: dict[str, Path] | None = None) -> int:
     """Agh-acquire only truly missing children; never move an existing worktree."""
     if depth > 64:
         raise RuntimeError("indexed submodule recursion exceeds64 levels")
@@ -3642,11 +3891,15 @@ def _initialize_missing_submodules(repository: Path, display_prefix: str = "", *
         if state.marker == "-":
             print(f"  Agh acquiring exact indexed commit for {state.display_path}")
             cache = (checkout_caches or {}).get(state.display_path)
-            if cache is None:
-                _install_missing_submodule(repository, indexed[state.path])
-            else:
+            options = {}
+            if cache is not None:
                 print("    using Agh exact checkout closure with an explicit immutable object cache")
-                _install_missing_submodule(repository, indexed[state.path], checkout_cache=cache)
+                options["checkout_cache"] = cache
+            working = (working_caches or {}).get(state.display_path)
+            if working is not None:
+                print("    using a separate byte-checked native CoW working DATA donor")
+                options["working_cache"] = working
+            _install_missing_submodule(repository, indexed[state.path], **options)
             initialized += 1
         elif state.needs_registration:
             before = _submodule_index_identity(repository)
@@ -3656,11 +3909,13 @@ def _initialize_missing_submodules(repository: Path, display_prefix: str = "", *
                 raise RuntimeError("parent index changed while registering an existing child")
         initialized += _initialize_missing_submodules(repository / state.path, state.display_path,
                          depth=depth + 1, population=population,
-                         checkout_caches=checkout_caches)
+                         checkout_caches=checkout_caches,
+                         **({"working_caches": working_caches} if working_caches else {}))
     return initialized
 
 
-def ensure_submodules(root: Path, *, checkout_caches: dict[str, Path] | None = None) -> None:
+def ensure_submodules(root: Path, *, checkout_caches: dict[str, Path] | None = None,
+                      working_caches: dict[str, Path] | None = None) -> None:
     """Acquire missing indexed commits through Agh only, preserving existing children.
 
     Every known indexed URL/OID is validated before acquisition. New children
@@ -3672,16 +3927,49 @@ def ensure_submodules(root: Path, *, checkout_caches: dict[str, Path] | None = N
     if not any(state.marker == "-" or state.needs_registration for state in before):
         print("  complete indexed recursive submodule graph already materialized")
         scrub_pat_from_remotes(root)
+        materialize_bridge_source_witnesses(root)
         return
-    _materialize_missing_submodules(root, checkout_caches=checkout_caches)
+    _materialize_missing_submodules(root, checkout_caches=checkout_caches,
+                                   **({"working_caches": working_caches} if working_caches else {}))
 
 
-def _materialize_missing_submodules(root: Path, *, checkout_caches: dict[str, Path] | None = None) -> None:
+def submodule_registrations_off_index(root: Path) -> list[tuple[str, list[str], str]]:
+    """Each registration of `root`'s direct submodules that is not its indexed URL: name, values, URL.
+
+    Reads only. A linked worktree shares these registrations with its clone and
+    every other worktree of it, and ensure_submodules acquires only the indexed
+    URL through Agh, so a caller that must not change its clone's configuration
+    asks first. An absent registration is not listed: ensure_submodules adds it
+    with the indexed URL, as `git submodule init` does.
+    """
+    # The registrations are read as recorded: the URL policy of the reads that
+    # validate the indexed declarations would refuse a local path before naming it.
+    _reject_local_git_execution_authority(root)
+    if not _local_submodule_git(["-C", str(root), "ls-files", "--", ".gitmodules"]).stdout.strip():
+        return []
+    registered: dict[str, list[str]] = {}
+    for scope, key, value in _repository_git_config_records(root):
+        if scope == "local" and key.startswith("submodule.") and key.endswith(".url"):
+            registered.setdefault(key, []).append(value)
+    off: list[tuple[str, list[str], str]] = []
+    for key, values in registered.items():
+        indexed = _local_submodule_git(["-C", str(root), "config", "--no-includes", "--null", "--blob",
+                                        ":.gitmodules", "--get-all", key], absent_ok=True)
+        urls = indexed.stdout.decode("utf-8", errors="strict").split("\0")[:-1] if indexed.returncode == 0 else []
+        # A registration with no single indexed URL is left for ensure_submodules to judge.
+        if len(urls) == 1 and values != urls:
+            off.append((key[len("submodule."):-len(".url")], values, urls[0]))
+    return off
+
+
+def _materialize_missing_submodules(root: Path, *, checkout_caches: dict[str, Path] | None = None,
+                                   working_caches: dict[str, Path] | None = None) -> None:
     """Hold one owner through acquisition, cleanup and complete reinspection."""
     with _submodule_owner_lock(root):
         try:
             refuse_dirty_submodule_lockfiles(_inspect_submodule_tree(root))
-            initialized = _initialize_missing_submodules(root, checkout_caches=checkout_caches)
+            initialized = _initialize_missing_submodules(root, checkout_caches=checkout_caches,
+                             **({"working_caches": working_caches} if working_caches else {}))
         except BaseException as materialization_error:
             try:
                 scrub_pat_from_remotes(root)
@@ -3693,6 +3981,7 @@ def _materialize_missing_submodules(root: Path, *, checkout_caches: dict[str, Pa
         refuse_dirty_submodule_lockfiles(after)
         if any(state.marker == "-" or state.needs_registration for state in after):
             raise RuntimeError("recursive indexed submodule acquisition did not complete")
+        _materialize_bridge_source_witnesses(root)
         print(f"  materialized {initialized} missing indexed submodule(s) through Agh")
 
 
@@ -12078,6 +12367,18 @@ CLEAN_LEAN_ENV_NAMES = frozenset({
     "CLEAN_OLEAN_PINNED_LEAN_LIB", "CLEAN_OLEAN_REQUIRE_PINNED_LEAN",
 })
 
+# These are existing native resource locators, not compiler/SDK selections.
+# Keep their original values together with their live descriptors. The native
+# owner still authenticates their custody; strict provenance's ambient-input
+# refusal below is deliberately unchanged.
+XPY_RESOURCE_ENV_NAMES = frozenset({
+    "ATERM_SDK_LEASE_V3", "ATERM_WORKLOAD_HOST_STORE_FD_V1",
+    "ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS",
+    "TRUST_CPU_IMPLICIT_FD", "TRUST_CPU_HANDOFF",
+    "TRUST_FIXED_ADMISSION_FD_V1", "TRUST_FIXED_CLAIM_HANDOFF_V1",
+    "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "CARGO_JOBSERVER_HANDOFF",
+})
+
 
 @dataclass(frozen=True)
 class CleanLeanSelection:
@@ -12136,6 +12437,12 @@ def xpy_environment(
 ) -> dict[str, str]:
     """One actual producer environment for normal build and support commands."""
     env = os.environ.copy()
+    # Validate the original advertisements before scrubbing build authority.
+    # In particular, a malformed/closed locator must not disappear and make
+    # the child attempt fresh admission. GNU priority remains with the shared
+    # parser; do not inspect or resurrect a lower-priority advertisement.
+    _seed_transport().landing_targo.resource_fds(env)
+    resource_environment = {name: env[name] for name in XPY_RESOURCE_ENV_NAMES if name in env}
     lean_environment = clean_lean.environment(root) if clean_lean is not None else {}
     for name in CLEAN_LEAN_ENV_NAMES:
         if name in env and env[name] != lean_environment.get(name):
@@ -12161,6 +12468,7 @@ def xpy_environment(
     # override. Strict native authority capture keeps its separate rules.
     if selected_manager is not None:
         env[manager_selector] = selected_manager
+    env.update(resource_environment)
     if admitted_share is not None:
         env["CARGO_BUILD_JOBS"] = admitted_share
     # Only independently selected, fully revalidated Lean inputs survive scrub.
@@ -12253,7 +12561,11 @@ def run_xpy(
         # Environment preparation may probe inputs; recheck just before dispatch.
         normal_config.require_normal_source_identity()
     print(f"\n$ {' '.join(cmd)}\n")
-    result = subprocess.run(cmd, env=env, cwd=str(root))
+    descriptors = _seed_transport().landing_targo.resource_fds(env)
+    if sys.platform == "win32" and descriptors:
+        raise RuntimeError("Windows x.py cannot inherit native POSIX custody")
+    descriptor_arguments = {"pass_fds": descriptors} if descriptors else {}
+    result = subprocess.run(cmd, env=env, cwd=str(root), **descriptor_arguments)
     if normal_config is not None:
         normal_config.require_normal_source_identity()
     if clean_lean is not None:
@@ -12550,7 +12862,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--tool-source-inspector", type=Path, default=None,
                    help="Explicit existing native Targo used only for selected tool Cargo graph inspection.")
     p.add_argument("--source-object-cache", action="append", default=[], metavar="GITLINK=REPOSITORY",
-                   help="Give Agh a read-only exact-object cache for one indexed first-party checkout.")
+                   help="Give Agh a read-only exact-object cache for one indexed first-party checkout; "
+                        "matching regular working bytes are optional native CoW DATA hints too.")
+    p.add_argument("--source-working-cache", action="append", default=[], metavar="GITLINK=DIRECTORY",
+                   help="Use a separate read-only regular-file DATA donor for native CoW source "
+                        "materialization; never Git or publication authority. Every reused byte is "
+                        "checked against the independently acquired target, with normal Git fallback.")
     p.add_argument(
         "--no-build",
         action="store_true",
@@ -12638,7 +12955,7 @@ def inspect_tool_source_graph(root: Path, tool: str, inspector: Path) -> None:
     (target / (tool + ".json")).write_text(json.dumps(state, sort_keys=True) + "\n")
 
 
-def _first_party_checkout_caches(root: Path, declarations: list[str]) -> dict[str, Path]:
+def _first_party_checkout_caches(root: Path, declarations: list[str], *, working: bool = False) -> dict[str, Path]:
     if not declarations:
         return {}
     paths = {entry.path.as_posix() for entry in _indexed_submodules(root)
@@ -12649,17 +12966,24 @@ def _first_party_checkout_caches(root: Path, declarations: list[str]) -> dict[st
         cache = Path(location)
         if (not separator or path not in paths or path in caches or not cache.is_absolute()
                 or not cache.is_dir() or cache.resolve(strict=True).is_relative_to(root.resolve())):
-            raise RuntimeError("source object cache must name one indexed first-party path and an external absolute repository")
+            role = "working cache" if working else "object cache"
+            kind = "directory" if working else "repository"
+            raise RuntimeError(f"source {role} must name one indexed first-party path and an external absolute {kind}")
+        if working and (root.resolve().is_relative_to(cache.resolve(strict=True))
+                        or any(parent.is_symlink() for parent in (cache, *cache.parents))):
+            raise RuntimeError("source working cache must be a disjoint real directory without symlink ancestors")
         caches[path] = cache
     return caches
 
 
 def prepare_first_party_sources(root: Path, *, no_build: bool,
                                 tool: str | None = None, inspector: Path | None = None,
-                                checkout_caches: dict[str, Path] | None = None) -> None:
+                                checkout_caches: dict[str, Path] | None = None,
+                                working_caches: dict[str, Path] | None = None) -> None:
     if tool is not None:
-        if checkout_caches:
-            raise RuntimeError("source object caches apply only to full indexed source preparation")
+        if checkout_caches or working_caches:
+            role = "working" if working_caches else "object"
+            raise RuntimeError(f"source {role} caches apply only to full indexed source preparation")
         if not no_build or inspector is None:
             raise RuntimeError("explicit tool preparation requires --no-build and its source inspector")
         inspect_tool_source_graph(root, tool, inspector)
@@ -12667,8 +12991,11 @@ def prepare_first_party_sources(root: Path, *, no_build: bool,
               "This is not full compiler-source readiness.")
         return
     print("\nEnsuring first-party submodules are materialized:")
-    if checkout_caches:
-        ensure_submodules(root, checkout_caches=checkout_caches)
+    if checkout_caches or working_caches:
+        options = {"checkout_caches": checkout_caches} if checkout_caches else {}
+        if working_caches:
+            options["working_caches"] = working_caches
+        ensure_submodules(root, **options)
     else:
         ensure_submodules(root)
     # Trust: retire only our own previous deferred-scope control after the
@@ -12683,6 +13010,12 @@ def main(argv: list[str] | None = None) -> int:
     invocation = list(sys.argv[1:] if argv is None else argv)
     if invocation[:1] == ["fetch-source-pin"]:
         return fetch_source_pin_main(invocation[1:])
+    if invocation[:1] == ["materialize-source-witnesses"]:
+        parser = argparse.ArgumentParser(description="Restore exact local bridge source DATA under submodule ownership")
+        parser.add_argument("--root", type=Path, required=True)
+        options = parser.parse_args(invocation[1:])
+        materialize_bridge_source_witnesses(options.root)
+        return 0
     args = parse_args(invocation)
     root = repo_root()
     host = args.host or host_triple()
@@ -12753,6 +13086,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.source_object_cache and (args.prepare_tool is not None
             or args.check or args.verify_stage_provenance):
         print("\n--source-object-cache requires full indexed source materialization.")
+        return 2
+    if args.source_working_cache and (args.prepare_tool is not None
+            or args.check or args.verify_stage_provenance):
+        print("\n--source-working-cache requires full indexed source materialization.")
         return 2
     if args.tool_source_inspector is not None and args.prepare_tool is None:
         print("\n--tool-source-inspector requires an explicit --prepare-tool.")
@@ -12916,9 +13253,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     checkout_caches = _first_party_checkout_caches(root, args.source_object_cache)
-    if checkout_caches:
+    working_caches = _first_party_checkout_caches(root, args.source_working_cache, working=True)
+    if checkout_caches or working_caches:
         prepare_first_party_sources(root, no_build=args.no_build, tool=args.prepare_tool,
-                                    inspector=args.tool_source_inspector, checkout_caches=checkout_caches)
+                                    inspector=args.tool_source_inspector, checkout_caches=checkout_caches,
+                                    **({"working_caches": working_caches} if working_caches else {}))
     else:
         prepare_first_party_sources(root, no_build=args.no_build, tool=args.prepare_tool,
                                     inspector=args.tool_source_inspector)

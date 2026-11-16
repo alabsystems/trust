@@ -1388,8 +1388,12 @@ fn compiler_lane_ships_only_through_cer_ships() {
     let lane = &lib[lib.find("fn codegen_crate_via_compiler_lane<").expect("the lane")..];
     let lane = &lane[..lane.find("\n    }\n").expect("its end")];
     assert!(
-        lane.contains("compile_and_verify_trust_ir_module("),
+        lane.contains("compile_and_verify_trust_ir_module_with_clean("),
         "the lane ships through the consumer"
+    );
+    assert!(
+        lane.contains("clean_admission::with_admissions("),
+        "the consumer is scoped to live Session admissions"
     );
     // The join takes the unit out of the ongoing codegen (5db55304711) rather than borrowing it.
     let join = "if let Some(unit) = ongoing.compiler_lane.take() {";

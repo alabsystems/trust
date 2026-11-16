@@ -345,6 +345,14 @@ pub fn provide(providers: &mut Providers) {
         // 2026-09-29-spawn-census-by-construction), and its per-body projection.
         trust_spawn_census: trust_verify::trust_spawn_census,
         trust_spawn_sites: trust_verify::trust_spawn_sites,
+        // Trust (PKG-C5d): the span-free `mentioned_items` of a body's optimized
+        // MIR; the extern half reads the producer's `trust_mentioned_items` table.
+        trust_mentioned_items: |tcx, def| {
+            tcx.optimized_mir(def)
+                .mentioned_items
+                .as_ref()
+                .map(|items| items.iter().map(|item| item.node).collect())
+        },
         trust_mir_once_body_facts: trust_once_reentrancy::trust_mir_once_body_facts,
         mir_for_ctfe,
         mir_coroutine_witnesses: coroutine::mir_coroutine_witnesses,

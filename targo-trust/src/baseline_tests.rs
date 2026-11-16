@@ -65,6 +65,9 @@ fn run(functions: &[FunctionSpec<'_>]) -> ObligationRecords {
         conflicting_functions: Vec::new(),
         units: BTreeMap::new(),
         compile_errors: BTreeMap::new(),
+        tests: None,
+        test_arguments: Vec::new(),
+        clean_islands: BTreeMap::new(),
     }
 }
 

@@ -6501,6 +6501,13 @@ pub enum TransportMessage {
     /// Resource observations only; never contributes a proof row or grade.
     #[serde(rename = "native_admission_census")]
     NativeAdmissionCensus(crate::native_admission::NativeAdmissionCensus),
+    /// The per-declaration rows of the unit's `clean { … }` islands
+    /// ([`crate::clean_island_rows`]). Disclosure only: never a proof row, a
+    /// proof count or a coverage entry. A consumer validates it
+    /// ([`crate::clean_island_rows::CleanIslandRowsTransport::validate`])
+    /// before reading any row.
+    #[serde(rename = "clean_island_rows")]
+    CleanIslandRows(crate::clean_island_rows::CleanIslandRowsTransport),
 }
 
 /// Structured verification results for a single function, emitted by the
@@ -7942,6 +7949,7 @@ pub fn parse_transport_payload(payload: &str) -> Result<TransportMessage, serde_
         "native_admission_census" => {
             serde_json::from_str(payload).map(TransportMessage::NativeAdmissionCensus)
         }
+        "clean_island_rows" => serde_json::from_str(payload).map(TransportMessage::CleanIslandRows),
         _ => Err(<serde_json::Error as de::Error>::custom(format!(
             "unknown Trust transport message type {:?}",
             tag.r#type

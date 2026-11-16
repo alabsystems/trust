@@ -95,13 +95,18 @@ fn absolute_system_helper_keeps_strict_command_profile_and_original_custody_dist
         }
         std::fs::write(
             &path,
-            image(true, imports, vec![command(0x8000_001c, "@loader_path/../lib", 12)]),
+            image(
+                true,
+                imports,
+                vec![command(0x8000_001c, "@loader_path/../lib/atpkg-vendored", 12)],
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
     };
     materialize(&["/usr/lib/libSystem.B.dylib"]);
     assert!(HeldSystemCommand::open(&path, deadline()).is_err());
+    assert!(super::super::macho::commands(&std::fs::read(&path).unwrap(), true).is_err());
     let held = HeldSystemCommand::open_absolute_system_imports(&path, deadline()).unwrap();
     assert_eq!(held.observation().policy, "native-command/macho-arm64-absolute-system-imports-v1");
     assert!(held.observation().loader_paths.is_empty());

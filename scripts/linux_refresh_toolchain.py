@@ -98,8 +98,16 @@ def host_triple(system: str | None = None, machine: str | None = None) -> str:
     return f"{arch}-unknown-linux-gnu"
 
 
+def git_command(repo: Path, *args: str) -> list[str]:
+    # Automatic maintenance must finish inside the command that owns this
+    # checkout. Detached GC can keep writing after temporary-source cleanup.
+    # Keep maintenance enabled; both current and older Git run it synchronously.
+    return ["git", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+            "-C", str(repo), *args]
+
+
 def git(repo: Path, *args: str) -> str:
-    done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    done = subprocess.run(git_command(repo, *args), capture_output=True, text=True)
     if done.returncode:
         raise Refusal(f"git -C {repo} {' '.join(args)}: {done.stderr.strip() or done.returncode}")
     return done.stdout.strip()

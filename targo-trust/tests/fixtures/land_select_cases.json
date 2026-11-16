@@ -1,0 +1,2261 @@
+{
+ "schema": "trust.land-select-cases.v1",
+ "what": "Conformance cases for the two readers of gates/land.toml: targo-trust/src/land/ (targo trust land --check) and scripts/lib/land_select.py. Every expected value is the Python reader's own answer; scripts/tests/land_gate_test.py recomputes each one and targo-trust/src/land/tests.rs asserts the Rust reader gives the same. When a case moves with the table, the Python test prints the selector's answer: put that here.",
+ "real_table": [
+  {
+   "name": "an empty change",
+   "changed": [],
+   "rows": []
+  },
+  {
+   "name": "an exact subject path (additive)",
+   "changed": [
+    "tests/run_trust_comprehensive_harness.sh"
+   ],
+   "rows": [
+    "validation.check_bootstrap_script_tests_test",
+    "validation.check_exception_lanes_test",
+    "validation.luminal_domination_test",
+    "validation.pre_push_coverage_test",
+    "validation.python_floor_test",
+    "validation.trust_e2e_receipt_test",
+    "validation.upstream_revision_consistency_test"
+   ]
+  },
+  {
+   "name": "a validation program",
+   "changed": [
+    "scripts/hooks/pre-push"
+   ],
+   "rows": [
+    "validation.coordination_harness_reporting_test",
+    "validation.gate_lane_coverage_test",
+    "validation.land_gate_test",
+    "validation.landing_targo_test",
+    "validation.pre_push_contracts_test",
+    "validation.pre_push_coverage_test"
+   ]
+  },
+  {
+   "name": "the table itself",
+   "changed": [
+    "gates/land.toml"
+   ],
+   "rows": [
+    "validation.check_ledger_pins_test",
+    "validation.land_development_test",
+    "validation.land_gate_test"
+   ]
+  },
+  {
+   "name": "the table's Python reader",
+   "changed": [
+    "scripts/lib/land_select.py"
+   ],
+   "rows": [
+    "validation.check_ledger_pins_test",
+    "validation.land_development_test",
+    "validation.land_gate_test"
+   ]
+  },
+  {
+   "name": "this fixture",
+   "changed": [
+    "targo-trust/tests/fixtures/land_select_cases.json"
+   ],
+   "rows": [
+    "validation.land_gate_test"
+   ]
+  },
+  {
+   "name": "an unmapped path",
+   "changed": [
+    "tests/zz-no-such-directory/unmapped.txt"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a docs-only change that a row names",
+   "changed": [
+    "docs/STATUS.md",
+    "docs/PLAN.md"
+   ],
+   "rows": [
+    "validation.luminal_domination_test"
+   ]
+  },
+  {
+   "name": "a docs-only change that no row names",
+   "changed": [
+    "docs/TCB.md",
+    "README.md"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a module's own file under scripts/tests",
+   "changed": [
+    "scripts/tests/land_manifest_test.py"
+   ],
+   "rows": [
+    "validation.land_manifest_test"
+   ]
+  },
+  {
+   "name": "a [[not_run]] module's file under scripts/tests",
+   "changed": [
+    "scripts/tests/xpy_explicit_manager_test.py"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a shell test under scripts/tests that a row names",
+   "changed": [
+    "scripts/tests/pre_push_shadow_test.sh"
+   ],
+   "rows": [
+    "validation.pre_push_contracts_test"
+   ]
+  },
+  {
+   "name": "a path under scripts/tests that no row names",
+   "changed": [
+    "scripts/tests/zz_no_such_helper.py"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a Cargo.toml in a package",
+   "changed": [
+    "crates/trust-types/Cargo.toml"
+   ],
+   "rows": [
+    "validation.mir_test_oracle_feature_test"
+   ]
+  },
+  {
+   "name": "the root Cargo.toml",
+   "changed": [
+    "Cargo.toml"
+   ],
+   "rows": [
+    "validation.mir_test_oracle_feature_test"
+   ]
+  },
+  {
+   "name": "a Cargo.toml in another letter case",
+   "changed": [
+    "vendor/x/CARGO.TOML",
+    "y/cargo.Toml"
+   ],
+   "rows": [
+    "validation.mir_test_oracle_feature_test"
+   ]
+  },
+  {
+   "name": "names that only resemble Cargo.toml",
+   "changed": [
+    "a/Cargo.toml.orig",
+    "a/Cargo.toml/b",
+    "a/xCargo.toml",
+    "a/Cargo.lock",
+    "a/\u212aargo.toml",
+    "a/Cargo.toml\u0301"
+   ],
+   "rows": []
+  },
+  {
+   "name": "an exact path in another letter case",
+   "changed": [
+    "Scripts/hooks/pre-push",
+    "scripts/hooks/Pre-Push"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a directory that holds a selecting path",
+   "changed": [
+    "scripts/hooks",
+    "scripts/hooks/"
+   ],
+   "rows": []
+  },
+  {
+   "name": "a selecting path under another root",
+   "changed": [
+    "x/scripts/hooks/pre-push",
+    "./scripts/hooks/pre-push"
+   ],
+   "rows": []
+  },
+  {
+   "name": "several at once, one of them twice",
+   "changed": [
+    "scripts/lib/land_manifest.py",
+    "docs/STATUS.md",
+    "gates/land.toml",
+    "crates/trust-types/Cargo.toml",
+    "scripts/lib/land_manifest.py"
+   ],
+   "rows": [
+    "validation.check_ledger_pins_test",
+    "validation.land_development_test",
+    "validation.land_gate_test",
+    "validation.land_manifest_test",
+    "validation.mir_test_oracle_feature_test"
+   ]
+  }
+ ],
+ "base_table": "schema = \"trust.land-rows.v1\"\ncovered = [\"scripts/tests/*_test.py\"]\n\n[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n[[row]]\nid = \"validation.alpha_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]\nselects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]\ncatches = \"alpha's defect\"\nnot_yet_targo = \"alpha is a Python unittest\"\n\n[[row]]\nid = \"validation.beta_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.beta_test\"]\nselects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]\ncatches = \"beta's defect\"\nnot_yet_targo = \"beta is a Python unittest\"\n\n[[not_run]]\nid = \"validation.delta_test\"\npath = \"scripts/tests/delta_test.py\"\nkind = \"unjudgeable\"\nwhy = \"delta is an argparse driver\"\n\n[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma: 1 FAIL\"\n",
+ "tables": [
+  {
+   "name": "the base table",
+   "edits": [],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "scripts/alpha.py"
+     ],
+     "rows": [
+      "validation.alpha_test",
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "proofs/Beta.lean"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "src/alpha.rs"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    },
+    {
+     "changed": [
+      "src/alpha.rs",
+      "proofs/Beta.lean"
+     ],
+     "rows": [
+      "validation.alpha_test",
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "gates/land.toml"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "scripts/lib/land_select.py"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "a/Cargo.toml"
+     ],
+     "rows": [
+      "validation.mir_test_oracle_feature_test"
+     ]
+    },
+    {
+     "changed": [
+      "scripts/tests/delta_test.py"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "scripts/tests/alpha_test.py"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    },
+    {
+     "changed": [],
+     "rows": []
+    }
+   ]
+  },
+  {
+   "name": "accepted: the reader is a validation program, so the table selects its rows",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\"scripts/lib/land_select.py\" = [\"validation.alpha_test\"]\n\n"
+    ],
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"scripts/alpha.py\", \"scripts/lib/land_select.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "gates/land.toml"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    },
+    {
+     "changed": [
+      "scripts/lib/land_select.py"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    },
+    {
+     "changed": [
+      "gates/land.toml",
+      "x.py"
+     ],
+     "rows": [
+      "validation.alpha_test",
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: the table is a subject of a row",
+   "edits": [
+    [
+     "selects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]",
+     "selects_on = [\"gates/land.toml\", \"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "gates/land.toml"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "scripts/lib/land_select.py"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "gates/land.toml",
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: the table is listed as a validation program, which selects only what its reader lists",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\"gates/land.toml\" = [\"validation.beta_test\"]\n\n"
+    ],
+    [
+     "selects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]",
+     "selects_on = [\"gates/land.toml\", \"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "gates/land.toml"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "scripts/lib/land_select.py"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "gates/land.toml",
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: the reader is a subject and not a program",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"scripts/alpha.py\", \"scripts/lib/land_select.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "gates/land.toml"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "scripts/lib/land_select.py"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    },
+    {
+     "changed": [
+      "gates/land.toml",
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: the manifest rule's row exists",
+   "edits": [
+    [
+     "[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma: 1 FAIL\"\n",
+     "[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma: 1 FAIL\"\n\n[[row]]\nid = \"validation.mir_test_oracle_feature_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.mir_test_oracle_feature_test\"]\nselects_on = [\"scripts/tests/mir_test_oracle_feature_test.py\"]\ncatches = \"a feature edge\"\nnot_yet_targo = \"a Python unittest\"\n"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "a/Cargo.toml"
+     ],
+     "rows": [
+      "validation.mir_test_oracle_feature_test"
+     ]
+    },
+    {
+     "changed": [
+      "CARGO.TOML",
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test",
+      "validation.mir_test_oracle_feature_test"
+     ]
+    },
+    {
+     "changed": [
+      "scripts/tests/mir_test_oracle_feature_test.py"
+     ],
+     "rows": [
+      "validation.mir_test_oracle_feature_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: no validation programs",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     "[validation_programs]\n\n"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "scripts/alpha.py"
+     ],
+     "rows": [
+      "validation.alpha_test",
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "scripts/tests/alpha_test.py"
+     ],
+     "rows": [
+      "validation.alpha_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: validation_programs as an inline table",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     "validation_programs = {}\n\n"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "scripts/alpha.py"
+     ],
+     "rows": [
+      "validation.alpha_test",
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: no [[not_run]]",
+   "edits": [
+    [
+     "[[not_run]]\nid = \"validation.delta_test\"\npath = \"scripts/tests/delta_test.py\"\nkind = \"unjudgeable\"\nwhy = \"delta is an argparse driver\"\n\n[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma: 1 FAIL\"\n",
+     ""
+    ],
+    [
+     "covered = [\"scripts/tests/*_test.py\"]\n",
+     "covered = [\"scripts/tests/*_test.py\"]\nnot_run = []\n"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: no row at all",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n[[row]]\nid = \"validation.alpha_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]\nselects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]\ncatches = \"alpha's defect\"\nnot_yet_targo = \"alpha is a Python unittest\"\n\n[[row]]\nid = \"validation.beta_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.beta_test\"]\nselects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]\ncatches = \"beta's defect\"\nnot_yet_targo = \"beta is a Python unittest\"\n\n",
+     "[validation_programs]\n\n"
+    ],
+    [
+     "covered = [\"scripts/tests/*_test.py\"]\n",
+     "covered = [\"scripts/tests/*_test.py\"]\nrow = []\n"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "x.py"
+     ],
+     "rows": []
+    },
+    {
+     "changed": [
+      "a/Cargo.toml"
+     ],
+     "rows": [
+      "validation.mir_test_oracle_feature_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: two covered globs, sorted",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = [\"scripts/tests/*_test.py\", \"scripts/tests/*_test.sh\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "x.py"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: an id that starts with an underscore",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation._alpha\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests._alpha\"]"
+    ],
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation._alpha\"]"
+    ],
+    [
+     "\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]",
+     "\"scripts/tests/alpha_test.py\" = [\"validation._alpha\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "scripts/alpha.py"
+     ],
+     "rows": [
+      "validation._alpha",
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: ids sorted by code point, an upper-case letter before a lower-case one",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.Zeta_test\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.Zeta_test\"]"
+    ],
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.Zeta_test\"]"
+    ],
+    [
+     "\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]",
+     "\"scripts/tests/alpha_test.py\" = [\"validation.Zeta_test\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "scripts/alpha.py"
+     ],
+     "rows": [
+      "validation.Zeta_test",
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: selects_on sorted by code point across planes",
+   "edits": [
+    [
+     "selects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]",
+     "selects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\", \"\\uFFFF\", \"\\U00010000\"]"
+    ]
+   ],
+   "accepted": true,
+   "select": [
+    {
+     "changed": [
+      "\uffff"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    },
+    {
+     "changed": [
+      "\ud800\udc00"
+     ],
+     "rows": [
+      "validation.beta_test"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "accepted: a catches that is one character Python does not strip",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"",
+     "catches = \"\\u200B\""
+    ]
+   ],
+   "accepted": true,
+   "select": []
+  },
+  {
+   "name": "refused: not TOML",
+   "edits": [
+    [
+     "why = \"gamma: 1 FAIL\"\n",
+     "why = \"gamma: 1 FAIL\"\n[[row\n"
+    ]
+   ],
+   "accepted": false,
+   "says": "not TOML"
+  },
+  {
+   "name": "refused: a byte-order mark",
+   "edits": [
+    [
+     "schema = \"trust.land-rows.v1\"",
+     "\ufeffschema = \"trust.land-rows.v1\""
+    ]
+   ],
+   "accepted": false,
+   "says": "not TOML"
+  },
+  {
+   "name": "refused: another schema",
+   "edits": [
+    [
+     "schema = \"trust.land-rows.v1\"",
+     "schema = \"trust.land-rows.v2\""
+    ]
+   ],
+   "accepted": false,
+   "says": "schema is"
+  },
+  {
+   "name": "refused: unknown key, top level",
+   "edits": [
+    [
+     "covered =",
+     "owner = \"x\"\ncovered ="
+    ]
+   ],
+   "accepted": false,
+   "says": "unknown key"
+  },
+  {
+   "name": "refused: missing key, top level (no not_run)",
+   "edits": [
+    [
+     "[[not_run]]\nid = \"validation.delta_test\"\npath = \"scripts/tests/delta_test.py\"\nkind = \"unjudgeable\"\nwhy = \"delta is an argparse driver\"\n\n[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma: 1 FAIL\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: missing key, top level (no row)",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n[[row]]\nid = \"validation.alpha_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]\nselects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]\ncatches = \"alpha's defect\"\nnot_yet_targo = \"alpha is a Python unittest\"\n\n[[row]]\nid = \"validation.beta_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.beta_test\"]\nselects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]\ncatches = \"beta's defect\"\nnot_yet_targo = \"beta is a Python unittest\"\n\n",
+     "[validation_programs]\n\n"
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: missing key, top level (no validation_programs)",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: mistyped key, top level",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = \"scripts/tests/*_test.py\""
+    ]
+   ],
+   "accepted": false,
+   "says": "is not an array"
+  },
+  {
+   "name": "refused: schema is not a string",
+   "edits": [
+    [
+     "schema = \"trust.land-rows.v1\"",
+     "schema = 1"
+    ]
+   ],
+   "accepted": false,
+   "says": "schema is"
+  },
+  {
+   "name": "refused: nothing covered",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = []"
+    ]
+   ],
+   "accepted": false,
+   "says": ": empty"
+  },
+  {
+   "name": "refused: covered not sorted",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = [\"scripts/tests/*_test.sh\", \"scripts/tests/*_test.py\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "not sorted"
+  },
+  {
+   "name": "refused: covered glob listed twice",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = [\"scripts/tests/*_test.py\", \"scripts/tests/*_test.py\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is listed twice"
+  },
+  {
+   "name": "refused: a blank covered glob",
+   "edits": [
+    [
+     "covered = [\"scripts/tests/*_test.py\"]",
+     "covered = [\" \", \"scripts/tests/*_test.py\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a non-empty string"
+  },
+  {
+   "name": "refused: unknown key, row",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]\ninputs = [\"scripts/alpha.py\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "unknown key"
+  },
+  {
+   "name": "refused: missing key, row (catches)",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: mistyped key, row",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"",
+     "catches = 7"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a string"
+  },
+  {
+   "name": "refused: a date for a string",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"",
+     "catches = 2026-11-14"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a string"
+  },
+  {
+   "name": "refused: row without an id",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "no string id"
+  },
+  {
+   "name": "refused: row id that is not a string",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = 7"
+    ]
+   ],
+   "accepted": false,
+   "says": "no string id"
+  },
+  {
+   "name": "refused: an id of another kind",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"push.alpha_test\""
+    ]
+   ],
+   "accepted": false,
+   "says": "the id is not validation.<module>"
+  },
+  {
+   "name": "refused: an id that starts with a digit",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.9alpha\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.9alpha\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "the id is not validation.<module>"
+  },
+  {
+   "name": "refused: an id with a letter outside ASCII",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.\u00e1lpha\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.\u00e1lpha\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "the id is not validation.<module>"
+  },
+  {
+   "name": "refused: an id that ends in a newline",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.alpha_test\\n\""
+    ]
+   ],
+   "accepted": false,
+   "says": "the id is not validation.<module>"
+  },
+  {
+   "name": "refused: an id with nothing after the dot",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "the id is not validation.<module>"
+  },
+  {
+   "name": "refused: duplicate row id",
+   "edits": [
+    [
+     "[[not_run]]\nid = \"validation.delta_test\"\npath = \"scripts/tests/delta_test.py\"\nkind = \"unjudgeable\"\nwhy = \"delta is an argparse driver\"\n\n",
+     "[[row]]\nid = \"validation.beta_test\"\ncommand = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.beta_test\"]\nselects_on = [\"proofs/Beta.lean\", \"scripts/alpha.py\", \"scripts/tests/beta_test.py\", \"x.py\"]\ncatches = \"beta's defect\"\nnot_yet_targo = \"beta is a Python unittest\"\n\n[[not_run]]\nid = \"validation.delta_test\"\npath = \"scripts/tests/delta_test.py\"\nkind = \"unjudgeable\"\nwhy = \"delta is an argparse driver\"\n\n"
+    ]
+   ],
+   "accepted": false,
+   "says": "duplicate id"
+  },
+  {
+   "name": "refused: unsorted row ids",
+   "edits": [
+    [
+     "id = \"validation.alpha_test\"",
+     "id = \"validation.calpha_test\""
+    ],
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.calpha_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "ids are not sorted"
+  },
+  {
+   "name": "refused: another command",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-m\", \"unittest\", \"scripts.tests.alpha_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "command is not this row's validation runner"
+  },
+  {
+   "name": "refused: another module's command",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.beta_test\"] "
+    ]
+   ],
+   "accepted": false,
+   "says": "command is not this row's validation runner"
+  },
+  {
+   "name": "refused: the runner with one more argument",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\", \"-v\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "command is not this row's validation runner"
+  },
+  {
+   "name": "refused: a command that is not all strings",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"python3\", 7, \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "command is not this row's validation runner"
+  },
+  {
+   "name": "refused: a targo command (neither reader knows one yet)",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"targo\", \"--unverified\", \"test\", \"-p\", \"alpha\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "command is not this row's validation runner"
+  },
+  {
+   "name": "refused: a targo command without not_yet_targo",
+   "edits": [
+    [
+     "command = [\"python3\", \"-B\", \"scripts/land_gate.py\", \"validation-tests\", \"scripts.tests.alpha_test\"]",
+     "command = [\"targo\", \"--unverified\", \"test\", \"-p\", \"alpha\"]"
+    ],
+    [
+     "not_yet_targo = \"alpha is a Python unittest\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: empty selects_on",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = []"
+    ]
+   ],
+   "accepted": false,
+   "says": "empty selects_on"
+  },
+  {
+   "name": "refused: unsorted selects_on",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"scripts/tests/alpha_test.py\", \"scripts/alpha.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "not sorted"
+  },
+  {
+   "name": "refused: repeated selects_on path",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"scripts/alpha.py\", \"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is listed twice"
+  },
+  {
+   "name": "refused: empty selects_on path",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [\"\", \"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a non-empty string"
+  },
+  {
+   "name": "refused: a selects_on path that is not a string",
+   "edits": [
+    [
+     "selects_on = [\"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]",
+     "selects_on = [7, \"scripts/alpha.py\", \"scripts/tests/alpha_test.py\", \"src/alpha.rs\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a non-empty string"
+  },
+  {
+   "name": "refused: empty catches",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"",
+     "catches = \" \""
+    ]
+   ],
+   "accepted": false,
+   "says": "empty catches"
+  },
+  {
+   "name": "refused: a catches of only a character Python strips and Unicode does not call white space",
+   "edits": [
+    [
+     "catches = \"alpha's defect\"",
+     "catches = \"\\u001F\""
+    ]
+   ],
+   "accepted": false,
+   "says": "empty catches"
+  },
+  {
+   "name": "refused: no not_yet_targo",
+   "edits": [
+    [
+     "not_yet_targo = \"alpha is a Python unittest\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: empty not_yet_targo",
+   "edits": [
+    [
+     "not_yet_targo = \"alpha is a Python unittest\"",
+     "not_yet_targo = \"\""
+    ]
+   ],
+   "accepted": false,
+   "says": "empty not_yet_targo"
+  },
+  {
+   "name": "refused: blank not_yet_targo",
+   "edits": [
+    [
+     "not_yet_targo = \"alpha is a Python unittest\"",
+     "not_yet_targo = \"\\t\\u00A0\""
+    ]
+   ],
+   "accepted": false,
+   "says": "empty not_yet_targo"
+  },
+  {
+   "name": "refused: unknown key, not_run",
+   "edits": [
+    [
+     "kind = \"red\"",
+     "kind = \"red\"\nseconds = 900"
+    ]
+   ],
+   "accepted": false,
+   "says": "unknown key"
+  },
+  {
+   "name": "refused: missing key, not_run",
+   "edits": [
+    [
+     "kind = \"red\"\n",
+     ""
+    ]
+   ],
+   "accepted": false,
+   "says": "missing key"
+  },
+  {
+   "name": "refused: a module that is both",
+   "edits": [
+    [
+     "id = \"validation.gamma_test\"",
+     "id = \"validation.beta_test\""
+    ],
+    [
+     "path = \"scripts/tests/gamma_test.py\"",
+     "path = \"scripts/tests/beta_test.py\""
+    ],
+    [
+     "id = \"validation.delta_test\"",
+     "id = \"validation.aaa_test\""
+    ],
+    [
+     "path = \"scripts/tests/delta_test.py\"",
+     "path = \"scripts/tests/aaa_test.py\""
+    ]
+   ],
+   "accepted": false,
+   "says": "also a [[row]]"
+  },
+  {
+   "name": "refused: not_run kind",
+   "edits": [
+    [
+     "kind = \"red\"",
+     "kind = \"slow\""
+    ]
+   ],
+   "accepted": false,
+   "says": "kind is"
+  },
+  {
+   "name": "refused: not_run empty why",
+   "edits": [
+    [
+     "why = \"gamma: 1 FAIL\"",
+     "why = \"\""
+    ]
+   ],
+   "accepted": false,
+   "says": "empty why"
+  },
+  {
+   "name": "refused: not_run path of another file",
+   "edits": [
+    [
+     "path = \"scripts/tests/gamma_test.py\"",
+     "path = \"scripts/tests/other_test.py\""
+    ]
+   ],
+   "accepted": false,
+   "says": "path is"
+  },
+  {
+   "name": "refused: duplicate not_run id",
+   "edits": [
+    [
+     "why = \"gamma: 1 FAIL\"\n",
+     "why = \"gamma: 1 FAIL\"\n\n[[not_run]]\nid = \"validation.gamma_test\"\npath = \"scripts/tests/gamma_test.py\"\nkind = \"red\"\nwhy = \"gamma again\"\n"
+    ]
+   ],
+   "accepted": false,
+   "says": "duplicate id"
+  },
+  {
+   "name": "refused: unsorted not_run ids",
+   "edits": [
+    [
+     "id = \"validation.delta_test\"",
+     "id = \"validation.zeta_test\""
+    ],
+    [
+     "path = \"scripts/tests/delta_test.py\"",
+     "path = \"scripts/tests/zeta_test.py\""
+    ]
+   ],
+   "accepted": false,
+   "says": "ids are not sorted"
+  },
+  {
+   "name": "refused: program row that is no row",
+   "edits": [
+    [
+     "\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]",
+     "\"scripts/tests/alpha_test.py\" = [\"validation.omega_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is not a [[row]]"
+  },
+  {
+   "name": "refused: program rows short of its selectors",
+   "edits": [
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = [\"validation.alpha_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "its rows are not exactly the rows whose selects_on names the path"
+  },
+  {
+   "name": "refused: program rows beyond its selectors",
+   "edits": [
+    [
+     "\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]",
+     "\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\", \"validation.beta_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "its rows are not exactly the rows whose selects_on names the path"
+  },
+  {
+   "name": "refused: program row listed twice",
+   "edits": [
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\", \"validation.beta_test\"]"
+    ]
+   ],
+   "accepted": false,
+   "says": "is listed twice"
+  },
+  {
+   "name": "refused: program without rows",
+   "edits": [
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = []"
+    ]
+   ],
+   "accepted": false,
+   "says": ": empty"
+  },
+  {
+   "name": "refused: program that is not an array",
+   "edits": [
+    [
+     "\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]",
+     "\"scripts/alpha.py\" = \"validation.alpha_test\""
+    ]
+   ],
+   "accepted": false,
+   "says": "not an array of row ids"
+  },
+  {
+   "name": "refused: a program no row's selects_on names",
+   "edits": [
+    [
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\n",
+     "[validation_programs]\n\"scripts/alpha.py\" = [\"validation.beta_test\", \"validation.alpha_test\"]\n\"scripts/tests/alpha_test.py\" = [\"validation.alpha_test\"]\n\"scripts/other.py\" = [\"validation.alpha_test\"]\n\n"
+    ]
+   ],
+   "accepted": false,
+   "says": "its rows are not exactly the rows whose selects_on names the path"
+  }
+ ],
+ "coverage": [
+  {
+   "name": "the rule holds",
+   "tracked": [
+    "scripts/tests/alpha_test.py",
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py",
+    "scripts/tests/gamma_test.py",
+    "scripts/alpha.py",
+    "README.md"
+   ],
+   "problems": []
+  },
+  {
+   "name": "a covered file with no entry",
+   "tracked": [
+    "scripts/tests/alpha_test.py",
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py",
+    "scripts/tests/gamma_test.py",
+    "scripts/tests/zz_test.py"
+   ],
+   "problems": [
+    "scripts/tests/zz_test.py: neither a [[row]] nor a [[not_run]]"
+   ]
+  },
+  {
+   "name": "a covered file whose name is all suffix",
+   "tracked": [
+    "scripts/tests/alpha_test.py",
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py",
+    "scripts/tests/gamma_test.py",
+    "scripts/tests/_test.py"
+   ],
+   "problems": [
+    "scripts/tests/_test.py: neither a [[row]] nor a [[not_run]]"
+   ]
+  },
+  {
+   "name": "files the glob does not cover",
+   "tracked": [
+    "scripts/tests/alpha_test.py",
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py",
+    "scripts/tests/gamma_test.py",
+    "scripts/tests/sub/zz_test.py",
+    "scripts/tests/zz_test.pyc",
+    "scripts/tests/zz_test.sh",
+    "x/scripts/tests/zz_test.py",
+    "scripts/tests/zz_Test.py",
+    "scripts/zz_test.py"
+   ],
+   "problems": []
+  },
+  {
+   "name": "a [[not_run]] whose file is not tracked",
+   "tracked": [
+    "scripts/tests/alpha_test.py",
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py"
+   ],
+   "problems": [
+    "[[not_run]] validation.gamma_test: scripts/tests/gamma_test.py is not a tracked file"
+   ]
+  },
+  {
+   "name": "a [[row]] whose file is not tracked",
+   "tracked": [
+    "scripts/tests/beta_test.py",
+    "scripts/tests/delta_test.py",
+    "scripts/tests/gamma_test.py"
+   ],
+   "problems": [
+    "[[row]] validation.alpha_test: scripts/tests/alpha_test.py is not a tracked file"
+   ]
+  },
+  {
+   "name": "nothing tracked",
+   "tracked": [],
+   "problems": [
+    "[[row]] validation.alpha_test: scripts/tests/alpha_test.py is not a tracked file",
+    "[[row]] validation.beta_test: scripts/tests/beta_test.py is not a tracked file",
+    "[[not_run]] validation.delta_test: scripts/tests/delta_test.py is not a tracked file",
+    "[[not_run]] validation.gamma_test: scripts/tests/gamma_test.py is not a tracked file"
+   ]
+  },
+  {
+   "name": "several at once",
+   "tracked": [
+    "scripts/tests/zz_test.py",
+    "scripts/tests/aa_test.py",
+    "scripts/tests/beta_test.py"
+   ],
+   "problems": [
+    "scripts/tests/aa_test.py: neither a [[row]] nor a [[not_run]]",
+    "scripts/tests/zz_test.py: neither a [[row]] nor a [[not_run]]",
+    "[[row]] validation.alpha_test: scripts/tests/alpha_test.py is not a tracked file",
+    "[[not_run]] validation.delta_test: scripts/tests/delta_test.py is not a tracked file",
+    "[[not_run]] validation.gamma_test: scripts/tests/gamma_test.py is not a tracked file"
+   ]
+  }
+ ],
+ "covered_match": [
+  {
+   "pattern": "a",
+   "matches": [
+    "a"
+   ]
+  },
+  {
+   "pattern": "*",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "ab",
+    "abc",
+    "a-c",
+    "",
+    "A",
+    "*",
+    "?",
+    "a\nb",
+    "x_test.py",
+    "_test.py",
+    "\u00e9",
+    "[a",
+    "q",
+    "x",
+    "z",
+    "d",
+    "a]",
+    "xaz",
+    "xqz"
+   ]
+  },
+  {
+   "pattern": "?",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "a*",
+   "matches": [
+    "a",
+    "ab",
+    "abc",
+    "a-c",
+    "a\nb",
+    "a]"
+   ]
+  },
+  {
+   "pattern": "*a",
+   "matches": [
+    "a",
+    "[a"
+   ]
+  },
+  {
+   "pattern": "*b*",
+   "matches": [
+    "b",
+    "ab",
+    "abc",
+    "a\nb"
+   ]
+  },
+  {
+   "pattern": "a?c",
+   "matches": [
+    "abc",
+    "a-c"
+   ]
+  },
+  {
+   "pattern": "??",
+   "matches": [
+    "ab",
+    "[a",
+    "a]"
+   ]
+  },
+  {
+   "pattern": "*/*",
+   "matches": [
+    "a/b",
+    "ab/c"
+   ]
+  },
+  {
+   "pattern": "a/*",
+   "matches": [
+    "a/b"
+   ]
+  },
+  {
+   "pattern": "*/b",
+   "matches": [
+    "a/b"
+   ]
+  },
+  {
+   "pattern": "*_test.py",
+   "matches": [
+    "x_test.py",
+    "_test.py"
+   ]
+  },
+  {
+   "pattern": "[abc]",
+   "matches": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "pattern": "[!abc]",
+   "matches": [
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[a-c]",
+   "matches": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "pattern": "[!a-c]",
+   "matches": [
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[c-a]",
+   "matches": []
+  },
+  {
+   "pattern": "[!c-a]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[a-]",
+   "matches": [
+    "a",
+    "-"
+   ]
+  },
+  {
+   "pattern": "[-a]",
+   "matches": [
+    "a",
+    "-"
+   ]
+  },
+  {
+   "pattern": "[]a]",
+   "matches": [
+    "a",
+    "]"
+   ]
+  },
+  {
+   "pattern": "[!]a]",
+   "matches": [
+    "b",
+    "c",
+    "-",
+    "[",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[a",
+   "matches": [
+    "[a"
+   ]
+  },
+  {
+   "pattern": "[!",
+   "matches": []
+  },
+  {
+   "pattern": "[]",
+   "matches": []
+  },
+  {
+   "pattern": "[!]",
+   "matches": []
+  },
+  {
+   "pattern": "a[",
+   "matches": []
+  },
+  {
+   "pattern": "[a-c-e]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-"
+   ]
+  },
+  {
+   "pattern": "[--a]",
+   "matches": [
+    "a",
+    "-",
+    "[",
+    "]",
+    "^",
+    "\\",
+    "A",
+    "?"
+   ]
+  },
+  {
+   "pattern": "[a-b-]",
+   "matches": [
+    "a",
+    "b",
+    "-"
+   ]
+  },
+  {
+   "pattern": "[xc-ay]",
+   "matches": [
+    "x"
+   ]
+  },
+  {
+   "pattern": "[b-ac-d]",
+   "matches": [
+    "c",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[^a]",
+   "matches": [
+    "a",
+    "^"
+   ]
+  },
+  {
+   "pattern": "[[]",
+   "matches": [
+    "["
+   ]
+  },
+  {
+   "pattern": "[\\]",
+   "matches": [
+    "\\"
+   ]
+  },
+  {
+   "pattern": "[a\\-c]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "]",
+    "^",
+    "\\"
+   ]
+  },
+  {
+   "pattern": "**",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "ab",
+    "abc",
+    "a-c",
+    "",
+    "A",
+    "*",
+    "?",
+    "a\nb",
+    "x_test.py",
+    "_test.py",
+    "\u00e9",
+    "[a",
+    "q",
+    "x",
+    "z",
+    "d",
+    "a]",
+    "xaz",
+    "xqz"
+   ]
+  },
+  {
+   "pattern": "a**c",
+   "matches": [
+    "abc",
+    "a-c"
+   ]
+  },
+  {
+   "pattern": "[*]",
+   "matches": [
+    "*"
+   ]
+  },
+  {
+   "pattern": "[?]",
+   "matches": [
+    "?"
+   ]
+  },
+  {
+   "pattern": "\\a",
+   "matches": []
+  },
+  {
+   "pattern": "A",
+   "matches": [
+    "A"
+   ]
+  },
+  {
+   "pattern": "[a-c][a-c]",
+   "matches": [
+    "ab"
+   ]
+  },
+  {
+   "pattern": "a\nb",
+   "matches": [
+    "a\nb"
+   ]
+  },
+  {
+   "pattern": "a?b",
+   "matches": [
+    "a\nb"
+   ]
+  },
+  {
+   "pattern": "\u00e9",
+   "matches": [
+    "\u00e9"
+   ]
+  },
+  {
+   "pattern": "[\u00e0-\u00ff]",
+   "matches": [
+    "\u00e9"
+   ]
+  },
+  {
+   "pattern": "[b-a!x]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[z-a!]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[b-a!-z]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[!b-a]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[b-a!]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[b-a]",
+   "matches": []
+  },
+  {
+   "pattern": "[b-a^x]",
+   "matches": [
+    "^",
+    "x"
+   ]
+  },
+  {
+   "pattern": "[b-a[x]",
+   "matches": [
+    "[",
+    "x"
+   ]
+  },
+  {
+   "pattern": "[b-a!c-e]",
+   "matches": [
+    "a",
+    "b",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z"
+   ]
+  },
+  {
+   "pattern": "[a-b!x]",
+   "matches": [
+    "a",
+    "b",
+    "!",
+    "x"
+   ]
+  },
+  {
+   "pattern": "[]-A]",
+   "matches": []
+  },
+  {
+   "pattern": "[!]-A]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[!x-a-c]",
+   "matches": [
+    "a",
+    "b",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[c-ab-a!x]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[b-a!!]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[x-a!b-a]",
+   "matches": [
+    "a",
+    "b",
+    "c",
+    "-",
+    "[",
+    "]",
+    "!",
+    "^",
+    "\\",
+    "A",
+    "*",
+    "?",
+    "\u00e9",
+    "q",
+    "x",
+    "z",
+    "d"
+   ]
+  },
+  {
+   "pattern": "[b-a!]]",
+   "matches": [
+    "a]"
+   ]
+  },
+  {
+   "pattern": "x[b-a!q]z",
+   "matches": [
+    "xaz"
+   ]
+  }
+ ],
+ "python_whitespace": [
+  9,
+  10,
+  11,
+  12,
+  13,
+  28,
+  29,
+  30,
+  31,
+  32,
+  133,
+  160,
+  5760,
+  8192,
+  8193,
+  8194,
+  8195,
+  8196,
+  8197,
+  8198,
+  8199,
+  8200,
+  8201,
+  8202,
+  8232,
+  8233,
+  8239,
+  8287,
+  12288
+ ],
+ "covered_match_paths": [
+  "a",
+  "b",
+  "c",
+  "-",
+  "[",
+  "]",
+  "!",
+  "^",
+  "\\",
+  "ab",
+  "abc",
+  "a-c",
+  "a/b",
+  "ab/c",
+  "a/b/c",
+  "",
+  "A",
+  "*",
+  "?",
+  "a\nb",
+  "x_test.py",
+  "_test.py",
+  "\u00e9",
+  "[a",
+  "q",
+  "x",
+  "z",
+  "d",
+  "a]",
+  "xaz",
+  "xqz"
+ ]
+}

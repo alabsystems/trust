@@ -105,6 +105,9 @@ pub(crate) fn parse(stderr: &[u8], expected_session: &str) -> Result<PairedTrans
                 )?;
                 summary = Some(row);
             }
+            // Island rows are disclosure: never a proof row, a count or a
+            // lifecycle step of this profile.
+            TransportMessage::CleanIslandRows(_) => {}
             // This profile has no lossy or unsupported transport fallback.
             _ => {
                 return Err(

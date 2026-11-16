@@ -1,14 +1,14 @@
 schema = "trust.trust-clean.trustir-oleans.manifest.v2"
 
 [provenance]
-trustir_commit = "bd313b4fbfae2c2826bade463e23224f1df9a61a"
+trustir_commit = "042df1cf3972240329916fd132508bac9d3b2b97"
 # The first-party/clean revision these bytes are staged against — the olean
 # reader that decodes them and the kernel that admits the decoded declarations
 # both live there, so a clean pin bump changes what "the bridge replays" means
 # just as surely as a trust-ir bump changes what it replays. Kept equal to the
 # indexed gitlink by scripts/check_bridge_pin.sh; the replay itself is
 # validated by crates/trust-clean/tests/lean_clean_bridge.rs.
-clean_commit = "e64e4b790176872bf21d83ef41242f313c207447"
+clean_commit = "8dbf02ac4650d6a13709526efe63396ee46b99a5"
 lean_toolchain = "leanprover/lean4:v4.8.0"
 root_module = "TrustIr.Semantics.Compare"
 root_modules = ["TrustIr.Semantics.Compare", "TrustIr.Semantics.Cast", "TrustIr.Semantics.Step", "TrustIr.Semantics.Eval", "TrustIr.Proofs.ByteMemory"]
@@ -62,8 +62,8 @@ build_command = "lake build +TrustIr.Semantics.Compare:olean +TrustIr.Semantics.
 
 [platforms."aarch64-apple-darwin"]
 lean_version = "Lean (version 4.8.0, aarch64-apple-darwin, commit df668f00e6c0, Release)"
-built_on = "2026-11-14"
-built_from_trustir_commit = "bd313b4fbfae2c2826bade463e23224f1df9a61a"
+built_on = "2026-11-15"
+built_from_trustir_commit = "042df1cf3972240329916fd132508bac9d3b2b97"
 [platforms."aarch64-apple-darwin".files]
 "TrustIr/CompilerCompat.olean" = "b2c8707462f938af804bf650ce3fc31de51ea66f32e3780d3abea367b8a047e2"
 "TrustIr/Layout/Alignment.olean" = "1ed7e6fe9be8b4210079a2a21167530e21342c41dfbccc8031d44b65abb26f23"
@@ -157,3 +157,9 @@ built_from_trustir_commit = "33ba0405c069c5380153c83ca02cf5521c57376e"
 "TrustIr/State/MachineState.olean" = "10e0b336774a41b797c0bad2644f7179b6d6b34c498dc98a1c05387cfc4a9536"
 "TrustIr/State/Memory.olean" = "05901fa5683d4cdce02688e9bad6dd8639090407db13ea362784979c574386dc"
 "TrustIr/State/ValueMap.olean" = "339b627d40783ebcf8873a104ff910aab75095e2545e9408c61deda8dd2b69d0"
+
+[source_reuse]
+schema = "trust.bridge-source-reuse.v1"
+anchor_commit = "47e21619dea651957a21a6015e768bbccca1b754"
+selected_trustir_commit = "c21e77c0c56b11fb436794d6ccd69fee6c3383c1"
+selected_clean_commit = "8dbf02ac4650d6a13709526efe63396ee46b99a5"

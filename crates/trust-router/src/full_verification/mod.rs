@@ -31,6 +31,12 @@ pub use input_capture::{
     CapturedVerifierInputs, VERIFIER_INPUT_PAIRED_SUBDIRECTORY, VerifierInputCapture,
     VerifierInputCaptureFile, decode_verifier_input_pair, encode_verifier_input_pair,
 };
+#[cfg(feature = "native-wp-mathematics")]
+pub use native_trust_ir::{
+    CheckedNativeWpInputMathematics, CheckedNativeWpTranslationMathematics,
+    check_native_wp_input_mathematics, check_native_wp_translation_mathematics,
+    native_wp_execution_subject, native_wp_translation_subject,
+};
 pub use native_trust_ir::{
     CheckedNativeWpProof, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
     FreshWholeFunctionChcPdrReceipt, NATIVE_BUNDLE_REPLAY_FORMULA_REF_ENCODING,

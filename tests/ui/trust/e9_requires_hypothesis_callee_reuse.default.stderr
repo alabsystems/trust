@@ -6,7 +6,7 @@ LL | |     theorem rmax_cap_le : forall (a : UInt64) (b : UInt64),
 LL | |         Nat.le (UInt64.toNat b) (UInt64.toNat a) ->
 LL | |         Nat.le (cap (UInt64.toNat (if a < b then b else a))) (UInt64.toNat a) :=
 ...  |
-LL | |             (fun _ => Nat.le.refl (UInt64.toNat a))
+LL | |             (fun _ => @Nat.le.refl (UInt64.toNat a))
 LL | |             (fun _ => h)
    | |________________________^
 
@@ -71,8 +71,8 @@ LL | | }
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
-note: Trust verification: 1 proved, 1 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
-  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:135:1
+note: Trust verification: 1 proved, 2 failed, 1 unknown, 0 timed out, 0 runtime-checked out of 4 obligation(s)
+  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:141:1
    |
 LL | / pub fn use_outside() -> u64
 ...  |
@@ -80,12 +80,12 @@ LL | |     rmax(0, 5)
 LL | | }
    | |_^
    |
-   = note: [postcond] UNKNOWN (trust-exact-source-clause-discharge): the `ensures` clause #0 (`trust-contract:e9_requires_hypothesis_callee_reuse::use_outside:ensures:0`) was not discharged because 1 of its 1 body row(s) did not qualify: `vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0` (at $DIR/e9_requires_hypothesis_callee_reuse.rs:135:0) is UNKNOWN, not proved — generic solver counterexample withheld: query depends on the unmodeled return of same-crate `e9_requires_hypothesis_callee_reuse::rmax` (`_0`)… (see that row's own note). Options: state the clause so each return path discharges on its own (an atomic clause over the same body proves where a conditional one does not), reduce the function to fewer return paths, prove the clause with a `by <theorem>` citation against a `clean { .. }` island, or to record this gap as a warning and continue in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: [postcond] FAILED (trust-full-verifier)
    = note: [postcond] UNKNOWN (trust-full-verifier): generic solver counterexample withheld: query depends on the unmodeled return of same-crate `e9_requires_hypothesis_callee_reuse::rmax` (`_0`); no summary determines that value at this call (a bound such as `ensures result <= a`, or any clause guarded by a `requires`, leaves the solver free to choose it), so an `ensures result == …` on `e9_requires_hypothesis_callee_reuse::rmax` without `requires` is what lets callers use it; a solver model over an unconstrained call result is not an execution; the original obligation remains unproved; native result before the provenance hold: (native full verifier evidence status: Unknown; constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-1-proof-1, function=use_outside, kind=Assertion, relations=1, clauses=1; native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-1-proof-1; native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-1-proof-1; refusing to emit proof evidence; direct SMT confirmed a satisfiable typed query fact; refuted obligation via acyclic error derivation before PDR; native trust_mc typed CHC/PDR solver refuted the encoded VC; refutation demoted to unknown: the submitted ChcVc has no positive producer fidelity attestation; fresh solver-level replay proves only the encoded request, not correspondence to the source obligation. A refutation of an over-approximating encoding is a refutation of the ENCODING, not of the program — a satisfying model may assign a value the program can never produce — so it is not evidence even when its conclusion happens to be true. The obligation is UNPROVED, not disproved, by this lane: the demotion reports a gap in the CHC construction's attested fidelity and says nothing about whether the code is correct; another lane's verdict on the same row stands on that lane's own authority; withheld 1 solver counterexample artifact(s): the verdict is unknown, not failed, so the solver's model is a model of the encoded VC and is not published as a counterexample to the program; exact direct typed CHC formula was not proved by its standalone query; refusing to replace that result with a whole-function native TrustIr transport proof whose translated proof unit does not contain that formula; native trust_mc TrustIr CHC/PDR direct typed input consumed: request_id=1, proof_ids=[1], lineage_roots=[0], function_id=0, native_id=trust_ir-native-trust_mc-request-1-proof-1, translation_diagnostics=0; primary owner trust-mc@$ENGINE produced rejected evidence trust-mc:trust-contracts:e9_requires_hypothesis_callee_reuse__use_outside:rustc-crate:674411a2ce332173:vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0 for "Postcondition": primary evidence was unknown; deductive fallback did not discharge the obligation: missing matching trust_wp native TrustIr request for request_id=any proof_obligation_id=1; primary owner trust-wp@$ENGINE produced rejected evidence trust-wp:body:vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0 for "Postcondition": primary evidence was unsupported) [stop:unclassified]
    = note: [precond] FAILED (ay-in-process); counterexample: 
 
 error: Trust strict verification failed for `e9_requires_hypothesis_callee_reuse::use_outside`: 3 obligation(s) were not fully verified
-  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:135:1
+  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:141:1
    |
 LL | / pub fn use_outside() -> u64
 ...  |
@@ -93,13 +93,12 @@ LL | |     rmax(0, 5)
 LL | | }
    | |_^
    |
-   = note: summary: 1 trusted, 0 certified, 1 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 4
+   = note: summary: 1 trusted, 0 certified, 2 failed, 1 unknown, 0 runtime-checked, 0 skipped out of 4
    = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
    = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
-   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
-   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one UNPROVED non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
    = note: --- native verifier detail (24 line(s) below; engine internals, not required to act on this error) ---
-   = note: native full verifier status: Inconclusive; requested=4, proved=1, failed=0, unknown=2, timed_out=0, unsupported=1, skipped=0, insufficient_strength=0
+   = note: native full verifier status: Failed; requested=4, proved=1, failed=1, unknown=2, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
    = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=8 bundle_digest=sha256:$DIGEST requests=6
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:$DIGEST
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:$DIGEST
@@ -108,9 +107,9 @@ LL | | }
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=4 proof_obligations=[4] request_digest=sha256:$DIGEST
    = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-wp request_id=5 proof_obligations=[0] request_digest=sha256:$DIGEST
    = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@$ENGINE+native-trust-ir-bundle obligations=5 elapsed_ms=$TIME worker_threads=unbounded
-   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: native trust-mc has no encoding for this exactly bound raw source postcondition
-   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
-   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: body-aware WP refuted the original postcondition over the supported body fragment
+   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: primary owner trust-wp@$ENGINE produced rejected evidence trust-wp:body:obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0 for "Postcondition": primary evidence found a counterexample
+   = note: native full verifier evidence `obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: deductive fallback followed unsupported from trust-mc; primary diagnostics: native trust-mc has no encoding for this exactly bound raw source postcondition; direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata; native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority; adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation; typed-input-required: trust-verifier-api obligations must carry trust-mc.typed-chc-obligation.v1 data for the direct typed trust_mc CHC/PDR path; serialized FullVerificationVerdict metadata is diagnostic-only and is not proof evidence; trust-mc proof-grade admission requires a live opaque native-bundle authority whose diagnostic candidate has shape FullVerificationVerdict::Proved { evidence: FullProofEvidence::ChcPdr(ChcPdrProofEvidence { kind: ChcPdrProofKind::ChcValidity | ChcPdrProofKind::PdrInvariant, metadata: FullProofEvidenceMetadata { normalized_input_hash: Some(SHA-256), transcript_hashes: non-empty, replay_log_hashes: non-empty, checked_report_hashes: non-empty, ... }, artifacts: digest-backed input, transcript, replay, and checked-report artifacts, and native typed CHC/TrustIr metadata, ... }) }; the serialized shape alone is diagnostic-only and never sufficient for Proved; primary owner trust-mc@$ENGINE produced rejected evidence trust-mc:trust-contracts:e9_requires_hypothesis_callee_reuse__use_outside:rustc-crate:674411a2ce332173:obligation:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0 for "Postcondition": primary evidence was unsupported
    = note: native full verifier evidence `vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-1-proof-1, function=use_outside, kind=Assertion, relations=1, clauses=1
    = note: native full verifier evidence `vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-1-proof-1
    = note: native full verifier evidence `vc:e9_requires_hypothesis_callee_reuse__use_outside:postcondition:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-1-proof-1; refusing to emit proof evidence
@@ -125,7 +124,7 @@ LL | | }
    = note: native full verifier evidence `vc:e9_requires_hypothesis_callee_reuse__use_outside:assertion:panic-freedom:0`: private structural derivation found no Horn rule for typed CHC query target `error`; public evidence remains a candidate
 
 note: Trust verification: 0 proved, 1 failed, 1 unknown, 0 timed out, 1 runtime-checked out of 3 obligation(s)
-  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:144:1
+  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:151:1
    |
 LL | / pub fn use_outside_sub() -> u64 {
 ...  |
@@ -138,7 +137,7 @@ LL | | }
    = note: [precond] FAILED (ay-in-process); counterexample: _0 = 0, _1 = 3
 
 error: Trust Level 0 safety verification incomplete for `e9_requires_hypothesis_callee_reuse::use_outside_sub`: 2 obligation(s) were not proved
-  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:144:1
+  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:151:1
    |
 LL | / pub fn use_outside_sub() -> u64 {
 ...  |
@@ -152,7 +151,7 @@ LL | | }
    = help: guidance — must hold: the `Sub` result must fit in its integer type. | fix: use `checked_*`/`saturating_*`/`try_into` and handle the overflow case, or constrain the operands with a precondition.
 
 error: Trust strict verification failed for `e9_requires_hypothesis_callee_reuse::use_outside_sub`: 3 obligation(s) were not fully verified
-  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:144:1
+  --> $DIR/e9_requires_hypothesis_callee_reuse.rs:151:1
    |
 LL | / pub fn use_outside_sub() -> u64 {
 ...  |

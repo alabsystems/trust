@@ -115,15 +115,15 @@ fn actual_signed_o0_capture_closes_two_stores_and_replays_without_producer() {
     use crate::call_event::{replay_original_certificates, verify_compiled_module};
     use crate::compiler_input_capture::CompilerInputCapture;
     use crate::object_replay::artifact_digest;
-    let data = include_bytes!("../../../tests/fixtures/signed_o0_original/compiler-input.json");
-    let object = include_bytes!("../../../tests/fixtures/signed_o0_original/compiler-output.o");
+    let data = include_bytes!("../../../tests/fixtures/signed_e76_o0_original/compiler-input.json");
+    let object = include_bytes!("../../../tests/fixtures/signed_e76_o0_original/compiler-output.o");
     assert_eq!(
         artifact_digest(data),
-        "8b0fea9f81e69a36adab955bcb2bb3ad158aaaf1ebe63c20439da1944199f104"
+        "f8f368beb5df7b2668b1c5f7b1d2ee0b479215e23ef83786d1de630fd8b5180c"
     );
     assert_eq!(
         artifact_digest(object),
-        "6f730f51bd83601d193a141525e57bc57524eb4ca3f3a8d4e8c5ba543eb44742"
+        "4b3e3bbae12f178bbef99ebc75de82c5f249b66109591cb93e2c5d41c3d4b918"
     );
     let decoded = CompilerInputCapture::from_bytes(data).unwrap().decode_inputs().unwrap();
     assert_eq!(decoded.object, object);

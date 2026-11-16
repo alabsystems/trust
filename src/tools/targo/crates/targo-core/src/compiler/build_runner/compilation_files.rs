@@ -373,6 +373,17 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             layout.release_compile_leases();
         }
     }
+    /// Trust: DC-12b. The profiles' `incremental/` folders no other build
+    /// can be using now: those of the layouts whose build directory lock
+    /// this build took exclusively and still holds
+    /// (`Layout::excludes_other_builds`).
+    pub(super) fn exclusive_incremental_dirs(&self) -> Vec<PathBuf> {
+        std::iter::once(&self.host)
+            .chain(self.target.values())
+            .filter(|layout| layout.excludes_other_builds())
+            .map(|layout| layout.build_dir().incremental().to_path_buf())
+            .collect()
+    }
 
     pub(super) fn new(
         build_runner: &BuildRunner<'a, 'gctx>,

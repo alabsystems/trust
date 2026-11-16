@@ -23,11 +23,11 @@ clean {
     theorem doubled_unfolds (n : Nat) : Doubled n = Nat.add n n := rfl
 
     theorem le_refl_nat : forall (n : Nat), Nat.le n n :=
-        fun n => Nat.le.refl n
+        fun n => @Nat.le.refl n
 
     theorem u64_le_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 
 pub fn rust_side_still_compiles(x: u64) -> u64 {

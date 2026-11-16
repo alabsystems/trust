@@ -76,8 +76,10 @@ fn text(bytes: &[u8]) -> String {
 /// first, and `--check` exits 0. The Lean record lives in a target directory
 /// with no package record, so the Rust record is left out of this run. The
 /// gate run's legs that ran are each one check (its push-rows leg was not
-/// judged, so it waited for nothing), and its checkout worker start-up is a
-/// row of its own. Each hook lane is marked with the phase that ran it.
+/// judged, so it waited for nothing), and its checkout worker start-up, which
+/// runs before the run's clock starts, is a row of its own added to the gate's
+/// wait, not taken from `gate other`. Each hook lane is marked with the phase
+/// that ran it.
 #[test]
 fn a_lean_run_a_gate_run_and_a_hook_log_fully_measured_give_the_table_and_check_passes() {
     let dir = workspace();
@@ -104,11 +106,11 @@ fn a_lean_run_a_gate_run_and_a_hook_log_fully_measured_give_the_table_and_check_
     let expected = format!(
         "\
 targo trust meter: read 3 source(s)
-Waited: gate 27m 09s · push 31.0 s · lean 900 ms
-No source read here records: compile, tests, tool rebuilds
+Waited: gate 27m 16s · push 31.0 s · lean 900 ms
+No source read here records: compiles outside the gate and the hook, test runs outside the gate and the hook, tool rebuilds, the gate's waits before its run clock starts (such as build-slot admission and `land`'s publication lease, but not its checkout start-up), gate runs that end before making their run directory, the pre-push hook's time outside its `TIMING:` lines (a run refused before its `phase=prepare` line, and the steps after `hook-before-verdict`: the shadow launch and, when `land` hands the hook its `targo-trust` leg, `landing-hook-finish`'s checkout read)
 
      WAIT  PHASE                         ITEM                 SOURCE
-  21m 23s  gate other (derived)          -                    {gate}
+  21m 31s  gate other (derived)          -                    {gate}
    3m 38s  gate checkout reads           3 reads              {gate}
    1m 20s  gate leg                      tcb-panic-ratchet    {gate}
    38.9 s  gate leg                      ir-cohort            {gate}
@@ -161,7 +163,9 @@ fn the_default_table_is_bounded_and_names_what_it_left_out() {
 }
 
 /// A Rust package record yields its proof time, and the five compiler phases
-/// no timer measures yet are named: `--check` exits 1 naming each.
+/// no timer measures yet are named: `--check` exits 1 naming each. Those
+/// phases are waits of the package's that its row `time_ms` sum leaves out,
+/// so the proof wait is never called totalled.
 #[test]
 fn a_rust_package_record_names_the_compiler_phases_not_measured_and_check_fails() {
     let dir = workspace();
@@ -170,7 +174,13 @@ fn a_rust_package_record_names_the_compiler_phases_not_measured_and_check_fails(
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("Waited: proof 4.2 s\n"), "{stdout}");
+    assert!(stdout.contains("Waited: proof 4.2 s + untotalled\n"), "{stdout}");
+    let json = meter(dir.path(), &["--target-dir", "target", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        value["waited"]["proof"],
+        serde_json::json!({"every_source_totalled": false, "wait_us": 4_200_000})
+    );
     assert!(
         stdout.contains(
             "    4.2 s  rust proof (row time_ms sum)  demo  target/trust/packages/demo.json\n"
@@ -223,7 +233,21 @@ fn the_json_carries_rows_missing_phases_and_landed_changes() {
     let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["schema"], "trust.meter.v1");
     assert_eq!(value["complete"], false);
-    assert_eq!(value["not_recorded"], serde_json::json!(["compile", "tests", "tool rebuilds"]));
+    assert_eq!(
+        value["not_recorded"],
+        serde_json::json!([
+            "compiles outside the gate and the hook",
+            "test runs outside the gate and the hook",
+            "tool rebuilds",
+            "the gate's waits before its run clock starts (such as build-slot admission and \
+             `land`'s publication lease, but not its checkout start-up)",
+            "gate runs that end before making their run directory",
+            "the pre-push hook's time outside its `TIMING:` lines (a run refused before its \
+             `phase=prepare` line, and the steps after `hook-before-verdict`: the shadow launch \
+             and, when `land` hands the hook its `targo-trust` leg, `landing-hook-finish`'s \
+             checkout read)"
+        ])
+    );
     let rows = value["rows"].as_array().unwrap();
     let waits: Vec<u64> = rows.iter().map(|row| row["wait_us"].as_u64().unwrap()).collect();
     assert!(waits.windows(2).all(|pair| pair[0] >= pair[1]), "largest wait first: {waits:?}");
@@ -232,7 +256,7 @@ fn the_json_carries_rows_missing_phases_and_landed_changes() {
         serde_json::json!({
             "category": "gate", "count": 1, "derived": true, "item": "-",
             "phase": "gate other (derived)", "source": "runs/gate-complete/record.json",
-            "wait_us": 1_283_986_239u64,
+            "wait_us": 1_291_183_422u64,
         })
     );
     let row = |phase: &str, item: &str| {
@@ -254,7 +278,8 @@ fn the_json_carries_rows_missing_phases_and_landed_changes() {
         .unwrap();
     assert_eq!(landed_other["wait_us"], 178_100_000);
     // gate-complete's checkout worker start-up: python 0.023644 s + native
-    // 7.173539 s, taken out of its derived remainder.
+    // 7.173539 s, before the run's clock, so outside `seconds` and its
+    // derived remainder (1629.6 s less 80.6, 38.9 and 218.916578 s of reads).
     assert_eq!(row("gate checkout start-up", "-")["wait_us"], 7_197_183);
     assert_eq!(row("push prepare", "-")["wait_us"], 4_000_000);
     assert_eq!(
@@ -280,7 +305,9 @@ fn the_json_carries_rows_missing_phases_and_landed_changes() {
     let row_times: Vec<&(String, String)> =
         missing.iter().filter(|(phase, _)| phase == "gate row time").collect();
     assert_eq!(row_times.len(), 4, "{missing:?}");
-    assert_eq!(missing.len(), 11, "{missing:?}");
+    // gate-landed has no `checkout_startup`.
+    assert!(missing.contains(&("gate checkout start-up".into(), "-".into())), "{missing:?}");
+    assert_eq!(missing.len(), 12, "{missing:?}");
     assert_eq!(value["landed"]["gate_runs"], 3);
     assert_eq!(value["landed"]["through_gate"], 1);
     assert_eq!(value["landed"]["window"]["from_unix_s"], FIXTURE_MTIME_S);
@@ -310,7 +337,7 @@ fn an_unavailable_hook_clock_and_an_untimed_push_fail_check_by_name() {
         stderr.contains("gate ordinary push - (runs/gate-landed/record.json): record.json keeps")
     );
     assert!(
-        stderr.starts_with("targo trust meter --check: 2 phase(s) not measured:\n"),
+        stderr.starts_with("targo trust meter --check: 3 phase(s) not measured:\n"),
         "{stderr}"
     );
 }
@@ -335,12 +362,13 @@ fn a_gate_leg_of_several_rows_fails_check_on_its_per_row_time() {
         stderr,
         format!(
             "targo trust meter --check: 3 phase(s) not measured:\n  gate row time crates-tests \
-             (runs/gate-rows/record.json): it runs 3 target(s), each one row or more; \
-             {why}\n  gate row time push-rows (runs/gate-rows/record.json): it runs every \
-             push-profile row (`bash tests/run_trust_comprehensive_harness.sh --list push`) and \
+             (runs/gate-rows/record.json): its plan names 3 target(s), each one row or more; \
+             {why}\n  gate row time push-rows (runs/gate-rows/record.json): it runs \
+             push-profile rows (`bash tests/run_trust_comprehensive_harness.sh --list push`), and \
              its log has no per-row time; {why}\n  gate row time ui-trust \
-             (runs/gate-rows/record.json): it is not one check: it runs a suite or a set of \
-             rows; {why}\n"
+             (runs/gate-rows/record.json): it is not a leg the meter knows to be one check \
+             (compiler-check, tidy, tcb-panic-ratchet, ir-cohort, olean-audit), so it may run \
+             several rows; {why}\n"
         )
     );
     // Each leg's total is still a row; 700 s less 120, 300, 200, 30 and 20.
@@ -360,6 +388,25 @@ fn a_gate_leg_of_several_rows_fails_check_on_its_per_row_time() {
     assert!(stdout.contains("   30.0 s  gate other (derived)  "), "{stdout}");
     assert!(!stdout.contains("compiler-unit-tests"), "{stdout}");
     assert!(!stdout.contains("gate checkout start-up"), "a run with no pool: {stdout}");
+
+    // `targets` is the leg's plan, written before the cache answers for some
+    // members: the reason counts those, and never says the leg ran them all.
+    let record = dir.path().join("runs/gate-rows/record.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    value["legs"]["crates-tests"]["cached_members"] = serde_json::json!(["crates/b", "crates/z"]);
+    fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+    let output = meter(dir.path(), &["--gate-record", "runs/gate-rows/record.json", "--check"]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "gate row time crates-tests (runs/gate-rows/record.json): its plan names 3 target(s), \
+             1 of them answered by a cached PASS, each one row or more; "
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("it runs 3 target(s)"), "{stderr}");
 }
 
 /// A `--gate-record` named on the command line but written before the
@@ -504,8 +551,8 @@ fn set_mtime(path: &Path, time: std::time::SystemTime) {
 /// The gate writes record.json only when a run ends, so a run that was
 /// interrupted or is still running leaves a directory of logs and no record.
 /// Its wait is real: `--gate-runs` names that directory as not measured, so
-/// `--check` fails where it passed on the complete run alone, and the landed
-/// line says the run is not counted.
+/// `--check` fails where it passed on the complete run alone, the landed line
+/// says the run is not counted, and the gate wait is not called totalled.
 #[test]
 fn a_gate_run_that_left_no_record_fails_check_by_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,6 +562,7 @@ fn a_gate_run_that_left_no_record_fails_check_by_name() {
         .unwrap();
     let output = meter(dir.path(), &["--gate-runs", "runs", "--check"]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("Waited: gate 27m 16s\n"), "{}", text(&output.stdout));
 
     fs::create_dir(runs.join("b")).unwrap();
     fs::write(runs.join("b/push-rows.log"), "push-rows: running fast.seed-freshness\n").unwrap();
@@ -525,7 +573,8 @@ fn a_gate_run_that_left_no_record_fails_check_by_name() {
     assert_eq!(
         stderr,
         "targo trust meter --check: 1 phase(s) not measured:\n  records - (runs/b): run left no \
-         record.json (interrupted or still running); its time is not measured\n"
+         record.json (interrupted, still running, or stopped by an error before writing it); \
+         its time is not measured\n"
     );
     assert!(
         stdout.contains(
@@ -534,10 +583,99 @@ fn a_gate_run_that_left_no_record_fails_check_by_name() {
         ),
         "{stdout}"
     );
+    assert!(stdout.contains("Waited: gate 27m 16s + untotalled\n"), "{stdout}");
     let output = meter(dir.path(), &["--gate-runs", "runs", "--json"]);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["landed"]["runs_without_record"], 1);
     assert_eq!(value["complete"], false);
+    assert_eq!(value["waited"]["gate"]["every_source_totalled"], false, "{value}");
+}
+
+/// A record or log the meter cannot read, or one that names another schema,
+/// is a source whose wait is in no total: it is named as not measured, and
+/// its category's wait is not called totalled, even when it is the only one.
+#[test]
+fn a_source_the_meter_cannot_read_leaves_its_category_untotalled() {
+    let dir = workspace();
+    fs::remove_dir_all(dir.path().join("target/trust/packages")).unwrap();
+    fs::write(dir.path().join("target/trust/lean/Broken-0000000000000000.json"), "{").unwrap();
+    fs::write(dir.path().join("other-schema.json"), "{\"schema\":\"trust-land-gate/1\"}\n")
+        .unwrap();
+    let output = meter(
+        dir.path(),
+        &[
+            "--target-dir",
+            "target",
+            "--gate-record",
+            "other-schema.json",
+            "--hook-log",
+            "no-such-hook.txt",
+            "--json",
+        ],
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for category in ["lean", "gate", "push"] {
+        assert_eq!(
+            value["waited"][category]["every_source_totalled"], false,
+            "{category}: {value}"
+        );
+    }
+    // The readable Lean record's own total is still summed.
+    assert_eq!(value["waited"]["lean"]["wait_us"], 900_000, "{value}");
+    let unread: Vec<&str> = value["not_measured"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|missing| missing["phase"] == "records")
+        .map(|missing| missing["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        unread,
+        ["other-schema.json", "target/trust/lean/Broken-0000000000000000.json", "no-such-hook.txt"],
+        "{value}"
+    );
+    let output = meter(dir.path(), &["--hook-log", "no-such-hook.txt"]);
+    assert!(text(&output.stdout).contains("Waited: push 0 us + untotalled\n"));
+}
+
+/// When `land` hands the `targo-trust` leg to the ordinary push, the leg has
+/// no exit or time in the record, and the push that ran it leaves
+/// `live_targo`: the leg's time is named as not measured, not read as a leg
+/// that waited for nothing. The same leg with no `live_targo` (no push ran)
+/// did not run and is neither a row nor a missing phase.
+#[test]
+fn a_leg_land_handed_to_the_ordinary_push_names_its_time_not_measured() {
+    let dir = workspace();
+    let record = dir.path().join("runs/gate-landed/record.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    value["legs"]["targo-trust"] = serde_json::json!({
+        "selected": true, "reasons": ["fixture"], "command": ["true"], "targets": null,
+        "outcome": "PENDING (ordinary pre-push execution, not a PASS)",
+    });
+    fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+    let run = || {
+        let output =
+            meter(dir.path(), &["--gate-record", "runs/gate-landed/record.json", "--check"]);
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+        text(&output.stderr)
+    };
+    let stderr = run();
+    assert!(!stderr.contains("targo-trust"), "{stderr}");
+
+    value["legs"]["targo-trust"]["outcome"] = "PASS (executed by ordinary pre-push)".into();
+    value["live_targo"] = serde_json::json!({"mode": "ordinary push mandatory suite",
+                                             "state": "complete", "error": null});
+    fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+    let stderr = run();
+    assert!(
+        stderr.contains(
+            "  gate leg targo-trust (runs/gate-landed/record.json): `land` handed the leg to the \
+             ordinary push (`live_targo`), whose pre-push hook runs it; record.json keeps no exit \
+             or time for it, so any time it took is inside the push's, in `gate other`\n"
+        ),
+        "{stderr}"
+    );
 }
 
 /// `--window` judges a run directory without a record by its newest file: a
@@ -565,7 +703,8 @@ fn the_window_judges_a_run_without_a_record_by_its_newest_file() {
     assert_eq!(
         stderr,
         "targo trust meter --check: 1 phase(s) not measured:\n  records - (runs/new): run left \
-         no record.json (interrupted or still running); its time is not measured\n"
+         no record.json (interrupted, still running, or stopped by an error before writing \
+         it); its time is not measured\n"
     );
 
     fs::remove_dir_all(runs.join("new")).unwrap();
@@ -615,7 +754,7 @@ fn a_lean_run_that_times_some_declarations_fails_check_naming_the_untimed() {
         "{stderr}"
     );
     // Some declarations are timed, so the reason never says none is.
-    assert!(stderr.contains("timed only some of the declarations it registered"), "{stderr}");
+    assert!(stderr.contains("did not time every declaration it registered"), "{stderr}");
     assert!(!stderr.contains("times no declaration"), "{stderr}");
     assert!(
         stdout.contains("lean other incl. untimed elaboration+kernel check (derived)"),
@@ -668,7 +807,7 @@ fn a_lean_run_whose_timed_set_is_not_the_registered_set_fails_check_by_name() {
         "{stderr}"
     );
     // Some declarations are timed, so the reason never says none is.
-    assert!(stderr.contains("timed only some of the declarations it registered"), "{stderr}");
+    assert!(stderr.contains("did not time every declaration it registered"), "{stderr}");
     assert!(!stderr.contains("times no declaration"), "{stderr}");
     assert!(
         stdout.contains("lean other incl. untimed elaboration+kernel check (derived)"),
@@ -680,6 +819,42 @@ fn a_lean_run_whose_timed_set_is_not_the_registered_set_fails_check_by_name() {
             && line.contains("Basics.refused_by_strict_policy")),
         "{stdout}"
     );
+
+    // Every registered declaration untimed, but others timed: still "did not
+    // time every declaration", never "times no declaration".
+    fs::write(&record, original.replace(names, "\"registered\":[\"Basics.half\"],")).unwrap();
+    let output = meter(dir.path(), &["--target-dir", "target", "--top", "0", "--check"]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("did not time every declaration it registered"), "{stderr}");
+    assert!(stderr.ends_with(" (1 of 1 registered declaration(s) untimed: Basics.half)\n"));
+    assert!(!stderr.contains("times no declaration"), "{stderr}");
+    assert!(stdout.contains("lean other incl. untimed elaboration+kernel check (derived)"));
+
+    // Nothing registered and nothing timed, but a session start recorded:
+    // the batch may have elaborated and refused each declaration, so the
+    // remainder says it may hold that time, and the reason does not say
+    // nothing was elaborated, nor that the session surely started (the
+    // producer records a failed start's time too).
+    let refused = original
+        .replace(names, "\"registered\":[],")
+        .replace("\"kind\":\"declaration\"", "\"kind\":\"command\"");
+    fs::write(&record, refused).unwrap();
+    let output = meter(dir.path(), &["--target-dir", "target", "--top", "0", "--check"]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.ends_with(
+            ": the batch registered no declaration after its recorded session start (it refused \
+             each one or had none, or the session failed to start), so any declaration's \
+             elaboration and kernel check is untimed and inside the `lean other incl. \
+             elaboration+kernel check (derived)` row\n"
+        ),
+        "{stderr}"
+    );
+    assert!(stdout.contains("lean other incl. elaboration+kernel check (derived)"), "{stdout}");
 
     // A count is not names: the meter cannot say which declarations it covers.
     fs::write(&record, original.replace(names, "\"registered\":2,")).unwrap();
@@ -772,7 +947,7 @@ fn reused_checkout_boundaries_are_counted_apart_from_reads() {
         "\
 targo trust meter: read 1 source(s)
 Waited: gate 6m 40s
-No source read here records: compile, tests, tool rebuilds
+No source read here records: compiles outside the gate and the hook, test runs outside the gate and the hook, tool rebuilds, the gate's waits before its run clock starts (such as build-slot admission and `land`'s publication lease, but not its checkout start-up), gate runs that end before making their run directory, the pre-push hook's time outside its `TIMING:` lines (a run refused before its `phase=prepare` line, and the steps after `hook-before-verdict`: the shadow launch and, when `land` hands the hook its `targo-trust` leg, `landing-hook-finish`'s checkout read)
 
      WAIT  PHASE                 ITEM                          SOURCE
    2m 15s  gate checkout reads   3 reads, 5 reused boundaries  {gate}
@@ -831,4 +1006,188 @@ Unread work: not derivable yet (no record says which computed results an agent r
     );
     assert!(stdout.contains("3 reads, 5 reused boundaries"), "{stdout}");
     assert!(stdout.contains("7 guarded boundaries"), "{stdout}");
+}
+
+/// A record's `seconds` longer than any run since gate records began (the
+/// epoch-minus-uptime the gate wrote before its run-clock fix) is not a wall
+/// time: `--check` names the gate total as not measured, with that one reason
+/// and not a second, false "has no `seconds`", and no `gate other` row is
+/// derived from it. A `seconds` that is no non-negative number and an absent
+/// one each give their own single reason.
+#[test]
+fn a_gate_record_whose_seconds_is_not_a_wall_time_fails_check() {
+    let dir = workspace();
+    let record = dir.path().join("runs/gate-complete/record.json");
+    let original = fs::read_to_string(&record).unwrap();
+    assert!(original.contains("\"seconds\": 1629.6,"), "{original}");
+    let mtime = fs::metadata(&record).unwrap().modified().unwrap();
+    let check_with = |replacement: &str| {
+        fs::write(&record, original.replace("\"seconds\": 1629.6,", replacement)).unwrap();
+        fs::File::options().write(true).open(&record).unwrap().set_modified(mtime).unwrap();
+        let output = meter(
+            dir.path(),
+            &["--gate-record", "runs/gate-complete/record.json", "--top", "0", "--check"],
+        );
+        let stdout = text(&output.stdout);
+        let stderr = text(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(!stdout.contains("gate other (derived)"), "{stdout}");
+        assert!(stdout.contains("gate leg"), "the legs are still rows: {stdout}");
+        assert!(stdout.contains("Waited: gate 0 us + untotalled\n"), "{stdout}");
+        stderr
+    };
+    let one_reason = |why: &str| {
+        format!(
+            "targo trust meter --check: 1 phase(s) not measured:\n  gate total - \
+             (runs/gate-complete/record.json): {why}\n"
+        )
+    };
+    assert_eq!(
+        check_with("\"seconds\": 1794570000.0,"),
+        one_reason(
+            "`seconds` is 1794570000 s, longer than any run since gate records began (2026-01-01 \
+             00:00 UTC); not a wall time (scripts/land_gate.py before its run-clock fix wrote \
+             epoch minus uptime there in development and source-diagnostic runs)"
+        )
+    );
+    assert_eq!(
+        check_with("\"seconds\": -5.0,"),
+        one_reason("the record's `seconds` is `-5.0`, not a non-negative number of seconds")
+    );
+    assert_eq!(
+        check_with("\"seconds\": \"1629.6\","),
+        one_reason("the record's `seconds` is `\"1629.6\"`, not a non-negative number of seconds")
+    );
+    assert_eq!(check_with(""), one_reason("the record has no `seconds`"));
+}
+
+/// A gate run's checkout worker start-up is outside `seconds`, so when the
+/// record's `checkout_startup` is unreadable, absent or not an object, the
+/// phase is named, `--check` fails, and the gate's wait is not called totalled.
+#[test]
+fn a_gate_record_with_an_unreadable_checkout_start_up_is_not_totalled() {
+    let dir = workspace();
+    let record = dir.path().join("runs/gate-complete/record.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    assert!(original["checkout_startup"]["native_seconds"].is_number(), "{original}");
+    let mut unreadable = original.clone();
+    unreadable["checkout_startup"]["native_seconds"] = serde_json::json!("unavailable");
+    let mut absent = original.clone();
+    absent.as_object_mut().unwrap().remove("checkout_startup");
+    let mut not_an_object = original.clone();
+    not_an_object["checkout_startup"] = serde_json::json!("pending");
+    for (case, value) in [("unreadable", unreadable), ("absent", absent), ("text", not_an_object)] {
+        fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+        let args = ["--gate-record", "runs/gate-complete/record.json"];
+        let output = meter(dir.path(), &[&args[..], &["--json"]].concat());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["waited"]["gate"]["every_source_totalled"], false, "{case}: {value}");
+        assert_eq!(value["not_measured"][0]["phase"], "gate checkout start-up", "{case}: {value}");
+        let output = meter(dir.path(), &[&args[..], &["--check"]].concat());
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", text(&output.stderr));
+    }
+}
+
+/// A hook log whose last run stopped before its verdict: the earlier run's
+/// total is read, `--check` names the last run's total as not measured, and
+/// the push wait is not called totalled.
+#[test]
+fn a_hook_log_whose_last_run_has_no_verdict_fails_check() {
+    let dir = workspace();
+    let log = dir.path().join("push-hook.txt");
+    let mut text_of_log = fs::read_to_string(&log).unwrap();
+    text_of_log.push_str("pre-push: development main push hook\n");
+    text_of_log.push_str("TIMING: phase=prepare lane=- elapsed_s=6 exit=- clock=bash-seconds\n");
+    fs::write(&log, text_of_log).unwrap();
+    let output = meter(dir.path(), &["--hook-log", "push-hook.txt", "--check"]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "targo trust meter --check: 1 phase(s) not measured:\n  push hook total - \
+         (push-hook.txt): the last hook run stopped before its verdict: 1 `TIMING:` line(s) \
+         follow the last `phase=hook-before-verdict`, and its total is not in the hook total\n"
+    );
+    assert!(stdout.contains("Waited: push 31.0 s + untotalled\n"), "{stdout}");
+}
+
+/// The hook writes `phase=prepare` first in every run, so a `prepare` line
+/// after lines with no verdict between starts a new run: the run before it
+/// stopped before its verdict. Every such run is named, not only the last,
+/// and a lane it left with no phase line after it is marked unfinished, not
+/// filed under the next run's `prepare`.
+#[test]
+fn a_hook_log_with_an_earlier_run_stopped_before_its_verdict_fails_check() {
+    let dir = workspace();
+    let log = dir.path().join("push-hook.txt");
+    let complete = fs::read_to_string(&log).unwrap();
+    let stopped = "pre-push: development main push hook\n\
+                   TIMING: phase=prepare lane=- elapsed_s=2 exit=- clock=bash-seconds\n\
+                   TIMING: phase=lane lane=lane.a elapsed_s=1 exit=0 clock=bash-seconds\n";
+    fs::write(&log, format!("{stopped}{complete}")).unwrap();
+    let output = meter(dir.path(), &["--hook-log", "push-hook.txt", "--top", "0", "--check"]);
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        stderr,
+        "targo trust meter --check: 1 phase(s) not measured:\n  push hook total - \
+         (push-hook.txt): 1 hook run(s) stopped before their verdict, so their totals are not in \
+         the hook total: 1 run(s) end at the next run's `phase=prepare` line with no \
+         `phase=hook-before-verdict` before it\n"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("  push lane (in an unfinished phase)  ")
+            && line.contains("lane.a")),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("(in prepare)"), "{stdout}");
+    assert!(stdout.contains("Waited: push 31.0 s + untotalled\n"), "{stdout}");
+
+    // The last run stopped too: both runs are counted in the one reason.
+    fs::write(&log, format!("{stopped}{complete}{stopped}")).unwrap();
+    let output = meter(dir.path(), &["--hook-log", "push-hook.txt", "--check"]);
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        "targo trust meter --check: 1 phase(s) not measured:\n  push hook total - \
+         (push-hook.txt): 2 hook run(s) stopped before their verdict, so their totals are not in \
+         the hook total: 1 run(s) end at the next run's `phase=prepare` line with no \
+         `phase=hook-before-verdict` before it, and the last run, 2 `TIMING:` line(s), ends the \
+         log without one\n"
+    );
+}
+
+/// `targo trust help` names the meter with the meter's own synopsis (the
+/// opening lines of `targo trust meter --help`, joined), so the index lists
+/// every option the meter takes, each repeatable source as repeatable, and
+/// says `--check` exits 1.
+#[test]
+fn the_help_index_carries_the_meters_own_synopsis() {
+    let run = |args: &[&str]| {
+        let output = Command::new(targo_trust_binary())
+            .args(["trust"])
+            .args(args)
+            .output()
+            .expect("run targo trust");
+        assert!(output.status.success(), "{args:?}: {}", text(&output.stderr));
+        text(&output.stdout)
+    };
+    let own = run(&["meter", "--help"]);
+    let synopsis: Vec<&str> =
+        own.lines().take_while(|line| !line.is_empty()).map(str::trim).collect();
+    let synopsis = synopsis.join(" ");
+    let synopsis = synopsis.strip_prefix("Usage: ").expect("the meter's help opens with its usage");
+    let index = run(&["help"]);
+    let line = index
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("targo trust meter "))
+        .expect("the help index names the meter");
+    let (named, summary) = line.split_once("  ").expect("a synopsis, then the summary");
+    assert_eq!(named, synopsis);
+    assert!(summary.contains("--check exits 1 naming every phase not measured"), "{summary}");
 }

@@ -352,6 +352,28 @@ fn shape(text: &str) -> Option<(String, String, String)> {
     Some((keyword_text.to_string(), join(text, &statement), lowercase_hex(&hasher.finalize())))
 }
 
+/// The source text of each command Clean listed in `text`, in authored order:
+/// `spans` are Clean's `(start, end)` byte offsets of each command (its
+/// keyword), and a command's text runs from its start to the line the next
+/// listed command starts on (the end of the text for the last), which leaves
+/// that command's attributes and `set_option … in` to it. `None` for a
+/// command whose span does not lie in `text`: a command no record can read,
+/// never a guess. One copy, shared by a `.lean` file's records and a crate's
+/// island rows, so the two lanes slice a declaration alike.
+#[must_use]
+pub fn lean_command_texts<'a>(text: &'a str, spans: &[(usize, usize)]) -> Vec<Option<&'a str>> {
+    spans
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, end))| {
+            let next = spans.get(index + 1).map_or(text.len(), |next| next.0);
+            let line_of_next = text.get(..next)?.rfind('\n').map_or(0, |at| at + 1);
+            let stop = if line_of_next > end { line_of_next } else { next };
+            text.get(start..stop.max(end))
+        })
+        .collect()
+}
+
 /// Name the commands of one file, in authored order. Each command is the
 /// canonical name Clean gave it (`None` for an `example`, a `mutual` block, a
 /// lexical command) and its source text as Clean's span covers it. The result

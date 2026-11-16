@@ -1,0 +1,11 @@
+{"version": 7,
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"type": "path",
+   "name": "trust_irSemantics",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "./../../../../first-party/trust-ir/lean/trust_ir-semantics",
+   "configFile": "lakefile.lean"}],
+ "name": "pointerPartsOperational",
+ "lakeDir": ".lake"}

@@ -932,3 +932,284 @@ fn a_compile_error_key_ignores_the_positions_in_closure_and_coroutine_types() {
         "mail@host: 12 is not one either"
     );
 }
+
+// --- Clean islands --------------------------------------------------------------
+
+/// One unit's island rows of crate `demo`: `(name, status, stop, basis)`.
+fn island_unit(
+    phase: trust_types::clean_island_rows::CleanIslandPhase,
+    problems: &[&str],
+    rows: &[(&str, &str, &str, Option<&str>)],
+) -> trust_types::clean_island_rows::CleanIslandRowsTransport {
+    let mut rows: Vec<trust_types::clean_island_rows::CleanIslandRow> = rows
+        .iter()
+        .map(|(name, status, stop, basis)| trust_types::clean_island_rows::CleanIslandRow {
+            key: format!("demo::{name}#{:016x}", name.len()),
+            kind: "lean:theorem".to_string(),
+            status: (*status).to_string(),
+            stop: (*stop).to_string(),
+            basis: basis.map(str::to_string),
+            file: "src/lib.rs".to_string(),
+            line: 3,
+            col: 1,
+            source: None,
+        })
+        .collect();
+    rows.sort();
+    let unit = trust_types::clean_island_rows::CleanIslandRowsTransport {
+        schema: trust_types::clean_island_rows::CLEAN_ISLAND_ROWS_SCHEMA_V1.to_string(),
+        crate_name: "demo".to_string(),
+        package_name: "demo".to_string(),
+        verification_session: "session".to_string(),
+        primary_package: true,
+        phase,
+        islands: 1,
+        complete: problems.is_empty(),
+        problems: problems.iter().map(|problem| (*problem).to_string()).collect(),
+        rows,
+    };
+    unit.validate().expect("a unit an honest producer writes");
+    unit
+}
+
+const P: (&str, &str, Option<&str>) = ("proved", "solved", None);
+const F: (&str, &str, Option<&str>) = ("failed", "solver-incomplete", Some("unproved_fail_closed"));
+const U: (&str, &str, Option<&str>) = ("unknown", "not-dispatched", None);
+
+fn r<'a>(
+    name: &'a str,
+    (s, t, b): (&'a str, &'a str, Option<&'a str>),
+) -> (&'a str, &'a str, &'a str, Option<&'a str>) {
+    (name, s, t, b)
+}
+
+#[test]
+fn island_rows_are_a_section_that_reads_back_and_moves_no_fact_vector_or_baseline() {
+    use trust_types::clean_island_rows::CleanIslandPhase::Verified;
+    let rows = [row("demo", "demo::f", 0, VerificationOutcome::Proved)];
+    let without = records_of(&rows);
+    // The library proves `Lib.a` and `Lib.b`; its own test unit refused `Lib.b`'s
+    // proof and has a declaration of its own.
+    let lib = island_unit(Verified, &[], &[r("Lib.a", P), r("Lib.b", P)]);
+    let test = island_unit(Verified, &[], &[r("Lib.b", F), r("Lib.c", P)]);
+    let with = without
+        .clone()
+        .with_clean_islands(Some(&["demo", "demo"]), [("demo", &lib), ("demo", &test)]);
+    let section = &with.clean_islands["demo"].sections["demo"];
+    let statuses: Vec<(&str, &str)> = section
+        .rows
+        .values()
+        .map(|decl| (decl.record.key.as_str(), decl.record.status.as_str()))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("demo::Lib.a#0000000000000005", "proved"),
+            ("demo::Lib.b#0000000000000005", "failed"),
+            ("demo::Lib.c#0000000000000005", "proved"),
+        ]
+    );
+    // Disclosure: the facts, the package record and the baseline are the
+    // run's without islands; the record's other lines are the same lines.
+    assert_eq!(with.units, without.units);
+    assert_eq!(with.package_record_json("demo"), without.package_record_json("demo"));
+    assert_eq!(
+        crate::baseline::Baseline::project(&with),
+        crate::baseline::Baseline::project(&without)
+    );
+    let bytes = with.package_ndjson("demo").unwrap();
+    let plain = without.package_ndjson("demo").unwrap();
+    let is_island = |line: &&str| {
+        line.contains("\"clean_island_units\":")
+            || line.contains("\"clean_islands\":")
+            || line.contains("\"clean_decl\":")
+    };
+    let island_lines: Vec<&str> = bytes.lines().filter(is_island).collect();
+    assert_eq!(island_lines.len(), 5, "{bytes}");
+    let rest: Vec<&str> = bytes.lines().filter(|line| !is_island(line)).collect();
+    assert_eq!(rest, plain.lines().collect::<Vec<_>>());
+    // After the header and before the first function line: the units line,
+    // then the crate's.
+    assert_eq!(
+        bytes.lines().nth(1).unwrap(),
+        "{\"clean_island_units\":2,\"proof_units\":2}",
+        "{bytes}"
+    );
+    assert!(bytes.lines().nth(2).unwrap().contains("\"clean_islands\":\"demo\""), "{bytes}");
+    let read = parse_package_ndjson(&bytes).unwrap();
+    let plain = parse_package_ndjson(&plain).unwrap();
+    assert_eq!(read.clean_islands, with.clean_islands["demo"]);
+    assert_eq!(
+        (read.vector, read.coverage_complete, read.obligations),
+        (plain.vector, plain.coverage_complete, plain.obligations)
+    );
+}
+
+#[test]
+fn a_merge_with_a_unit_that_is_not_a_measurement_proves_nothing() {
+    use trust_types::clean_island_rows::CleanIslandPhase::{FrontEndError, Verified};
+    let lib = island_unit(Verified, &[], &[r("Lib.a", P), r("Lib.b", P)]);
+    let incomplete = island_unit(Verified, &["island 2 was not enumerated"], &[r("Lib.b", U)]);
+    let records = records_of(&[])
+        .with_clean_islands(Some(&["demo", "demo"]), [("demo", &lib), ("demo", &incomplete)]);
+    let section = &records.clean_islands["demo"].sections["demo"];
+    assert!(!section.complete);
+    assert!(section.rows.values().all(|decl| !decl.record.is_proved()), "{section:?}");
+    let stopped = island_unit(FrontEndError, &[], &[r("Lib.a", F)]);
+    let records = records_of(&[])
+        .with_clean_islands(Some(&["demo", "demo"]), [("demo", &lib), ("demo", &stopped)]);
+    let section = &records.clean_islands["demo"].sections["demo"];
+    assert_eq!(section.phase, FrontEndError);
+    assert!(section.rows.values().all(|decl| !decl.record.is_proved()), "{section:?}");
+}
+
+#[test]
+fn an_island_line_no_writer_writes_is_refused() {
+    use trust_types::clean_island_rows::CleanIslandPhase::Verified;
+    let lib = island_unit(Verified, &[], &[r("Lib.a", P), r("Lib.b", F)]);
+    let good = records_of(&[row("demo", "demo::f", 0, VerificationOutcome::Proved)])
+        .with_clean_islands(Some(&["demo"]), [("demo", &lib)])
+        .package_ndjson("demo")
+        .unwrap();
+    assert!(parse_package_ndjson(&good).is_ok());
+    let section = good.lines().find(|line| line.contains("\"clean_islands\":")).unwrap();
+    let proved = good
+        .lines()
+        .find(|line| line.contains("\"status\":\"proved\"") && line.contains("\"clean_decl\":"))
+        .unwrap();
+    let refuse = |text: String, why: &str| {
+        let error = parse_package_ndjson(&text).expect_err(why);
+        assert!(error.contains(why), "{why}: {error}");
+    };
+    // A proved row in a section that is not a measurement.
+    refuse(
+        good.replace(
+            section,
+            &section.replace("\"phase\":\"verified\"", "\"phase\":\"front-end-error\""),
+        ),
+        "is a proved island declaration in a section that is front-end-error",
+    );
+    refuse(
+        good.replace(
+            section,
+            &section
+                .replace("\"complete\":true", "\"complete\":false")
+                .replace("\"problems\":[]", "\"problems\":[\"x\"]"),
+        ),
+        "is a proved island declaration in a section that is verified and incomplete",
+    );
+    refuse(
+        good.replace(section, &section.replace("\"complete\":true", "\"complete\":false")),
+        "problems do not match `complete`",
+    );
+    // A verdict no island row states.
+    for (from, to) in [
+        ("\"stop\":\"solved\"", "\"stop\":\"timeout\""),
+        ("\"status\":\"proved\"", "\"status\":\"runtime_checked\""),
+    ] {
+        refuse(good.replace(proved, &proved.replace(from, to)), "which no island row can state");
+    }
+    refuse(
+        good.replace(proved, &proved.replace("\"status\":\"proved\"", "\"status\":\"failed\"")),
+        "which no island row can state",
+    );
+    // A row before its crate's line, of another crate, or out of order.
+    refuse(good.replace(&format!("{section}\n"), ""), "before any island-section line");
+    refuse(
+        good.replace(proved, &proved.replace("demo::Lib.a", "other::Lib.a")),
+        "names no declaration of crate `demo`",
+    );
+    let rows: Vec<&str> = good.lines().filter(|line| line.contains("\"clean_decl\":")).collect();
+    refuse(
+        good.replace(&format!("{}\n{}", rows[0], rows[1]), &format!("{}\n{}", rows[1], rows[0])),
+        "out of key order",
+    );
+    // After a function line.
+    let is_island =
+        |line: &&str| line.contains("\"clean_islands\":") || line.contains("\"clean_decl\":");
+    let moved: Vec<&str> = good
+        .lines()
+        .filter(|line| !is_island(line))
+        .chain(good.lines().filter(is_island))
+        .collect();
+    refuse(moved.join("\n") + "\n", "is an island line after a function line");
+}
+
+#[test]
+fn a_package_a_unit_of_which_published_no_island_row_proves_none_and_says_so() {
+    use trust_types::clean_island_rows::CleanIslandPhase::Verified;
+    // The library and a binary of `demo` are proof units; the binary stopped
+    // on a Rust parse error before its islands were read, so it published
+    // nothing. The library's rows are no measurement of the package: a key
+    // the binary shares is not proved by the library alone.
+    let lib = island_unit(Verified, &[], &[r("Lib.a", P), r("Lib.b", F)]);
+    let records = records_of(&[row("demo", "demo::f", 0, VerificationOutcome::Proved)])
+        .with_clean_islands(Some(&["demo", "demo"]), [("demo", &lib)]);
+    let islands = &records.clean_islands["demo"];
+    assert_eq!(
+        islands.units,
+        Some(super::clean_islands::CleanIslandUnits { published: 1, proof_units: Some(2) })
+    );
+    assert!(!islands.units_whole() && !islands.measured());
+    assert_eq!(
+        islands.units_problem().as_deref(),
+        Some("1 of 2 compilation unit(s) of the package published no island rows")
+    );
+    let statuses: Vec<&str> =
+        islands.sections["demo"].rows.values().map(|decl| decl.record.status.as_str()).collect();
+    assert_eq!(statuses, ["unknown", "failed"]);
+    let bytes = records.package_ndjson("demo").unwrap();
+    assert_eq!(parse_package_ndjson(&bytes).unwrap().clean_islands, *islands);
+    // Every unit published: the same rows are a measurement, and a verified,
+    // complete unit with no island adds its count and no section.
+    let mut none = island_unit(Verified, &[], &[]);
+    none.islands = 0;
+    let records = records_of(&[])
+        .with_clean_islands(Some(&["demo", "demo"]), [("demo", &lib), ("demo", &none)]);
+    let islands = &records.clean_islands["demo"];
+    assert!(islands.measured(), "{islands:?}");
+    assert_eq!(islands.sections.len(), 1);
+    assert!(islands.sections["demo"].rows.values().any(|decl| decl.record.is_proved()));
+    // A run that declared no proof unit cannot say its units are whole.
+    let records = records_of(&[]).with_clean_islands(None, [("demo", &lib)]);
+    assert!(!records.clean_islands["demo"].units_whole());
+}
+
+#[test]
+fn an_island_units_line_no_writer_writes_is_refused() {
+    use trust_types::clean_island_rows::CleanIslandPhase::Verified;
+    let lib = island_unit(Verified, &[], &[r("Lib.a", P)]);
+    let good = records_of(&[row("demo", "demo::f", 0, VerificationOutcome::Proved)])
+        .with_clean_islands(Some(&["demo"]), [("demo", &lib)])
+        .package_ndjson("demo")
+        .unwrap();
+    assert!(parse_package_ndjson(&good).is_ok());
+    let units = "{\"clean_island_units\":1,\"proof_units\":1}";
+    assert!(good.contains(units), "{good}");
+    let refuse = |text: String, why: &str| {
+        let error = parse_package_ndjson(&text).expect_err(why);
+        assert!(error.contains(why), "{why}: {error}");
+    };
+    // No units line: a section is not read without it.
+    refuse(good.replace(&format!("{units}\n"), ""), "before the island-units line");
+    // Twice, or after a section line.
+    refuse(good.replace(units, &format!("{units}\n{units}")), "is not the first island line");
+    // No unit, or more published than the package has.
+    refuse(
+        good.replace(units, "{\"clean_island_units\":0,\"proof_units\":1}"),
+        "counting 0 published unit(s)",
+    );
+    refuse(
+        good.replace(units, "{\"clean_island_units\":2,\"proof_units\":1}"),
+        "counting 2 published unit(s)",
+    );
+    // A proved row in a package whose units are not whole.
+    refuse(
+        good.replace(units, "{\"clean_island_units\":1,\"proof_units\":2}"),
+        "in a package whose units did not all publish island rows",
+    );
+    refuse(
+        good.replace(units, "{\"clean_island_units\":1,\"proof_units\":null}"),
+        "in a package whose units did not all publish island rows",
+    );
+}

@@ -1,12 +1,26 @@
-error: Clean island batch has no source-local recovery boundary: the publish audit refused this batch; nothing was registered
-         - `arith_debt` reaches the incomplete-proof marker `trustedArith`. Finish the proof, or state the missing step as an `axiom` so it is disclosed by name in the certification closure.
-         - `ay_debt` reaches the incomplete-proof marker `trustedAy`. Finish the proof, or state the missing step as an `axiom` so it is disclosed by name in the certification closure.
-  --> $DIR/clean_island_no_verify_trusted.rs:9:5
+error: `arith_debt` did not elaborate: Unknown identifier: trustedArith
+  --> $DIR/clean_island_no_verify_trusted.rs:14:5
    |
 LL |     theorem arith_debt : True := trustedArith
-   |     ^
+   |     ^^^^^^^
    |
    = note: the Clean island was rejected during resolver checking (two-language design E10)
+   = note: `trustedArith` is not a Rust `fn` next to this island (no free `fn trustedArith` in the crate root).
+           options:
+           - define `fn trustedArith(..)` in the same module as the island, with `u8`/`u16`/`u32`/`u64`/`bool` parameters and result;
+           - or declare it in Clean (`def trustedArith …`).
 
-error: aborting due to 1 previous error
+error: `ay_debt` did not elaborate: Unknown identifier: trustedAy
+  --> $DIR/clean_island_no_verify_trusted.rs:15:5
+   |
+LL |     theorem ay_debt : True := trustedAy
+   |     ^^^^^^^
+   |
+   = note: the Clean island was rejected during resolver checking (two-language design E10)
+   = note: `trustedAy` is not a Rust `fn` next to this island (no free `fn trustedAy` in the crate root).
+           options:
+           - define `fn trustedAy(..)` in the same module as the island, with `u8`/`u16`/`u32`/`u64`/`bool` parameters and result;
+           - or declare it in Clean (`def trustedAy …`).
+
+error: aborting due to 2 previous errors
 

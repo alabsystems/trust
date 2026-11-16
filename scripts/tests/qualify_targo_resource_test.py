@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'qualify_targo_resource.py'
 qualify = runpy.run_path(str(SCRIPT))['qualify']
@@ -27,6 +28,8 @@ class ShippedTargoResourceTests(unittest.TestCase):
 
     def frontend(self, response, *, mutate=False, action=None):
         program = '''import json, pathlib, sys
+sys.argv = sys.argv[1:]
+__file__ = sys.argv[0]
 if sys.argv[1] == '--resource-capabilities':
     assert sys.argv[2] == '--'
     assert sys.argv[3] == '--unverified'
@@ -42,17 +45,41 @@ elif sys.argv[1:] == ['trust', 'doctor', '--format', 'json']:
 else:
     raise SystemExit('unexpected invocation; no compiler may be started')
 '''.replace('RESPONSE', repr(response)).replace(
-            'MUTATE', action or (f"pathlib.Path({str(self.root / 'bin/trustc')!r}).write_text('changed compiler')" if mutate else 'pass'))
-        # The fixture body sits outside bin/ (the qualifier inventories bin/targo, trustc and
-        # rustc) and bin/targo is a /bin/sh launcher: a `#!` line cannot name an interpreter
-        # whose path holds a space (atpkg's python lives under "Application Support"), and
-        # the kernel then reports the launcher itself as missing.
-        body = self.root.parent / 'targo-fixture.py'
-        body.write_text(program)
+            'MUTATE', action or ("pathlib.Path(__file__).with_name('trustc').write_text('changed compiler')" if mutate else 'pass'))
         path = self.root / 'bin/targo'
-        path.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(body))} "$@"\n')
+        # A kernel shebang cannot quote an interpreter path containing spaces.
+        # Keep the complete fixture in the cohort-bound frontend file and let
+        # the shell pass the selected Python, argv and source pathname exactly.
+        path.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -c '
+                        + shlex.quote(program) + ' "$0" "$@"\n')
         path.chmod(0o755)
         return path
+
+    def test_new_scratch_parent_is_removed_after_success_and_refusal(self):
+        for version in (3, 2):
+            with self.subTest(version=version):
+                parent = self.root.parent / ('scratch-' + str(version))
+                parent.mkdir()
+                self.frontend(json.dumps(dict(version=version, cpu_workers=True, supports_invocation=False)))
+                with mock.patch('tempfile.gettempdir', return_value=str(parent)):
+                    result = qualify(self.root)
+                self.assertEqual(result['passed'], version == 3, result)
+                self.assertEqual(list(parent.iterdir()), [])
+
+    def test_existing_scratch_parent_and_other_job_data_are_preserved(self):
+        parent = self.root.parent / 'existing-scratch'
+        shared = parent / '.ubd'
+        shared.mkdir(parents=True)
+        sentinel = shared / 'other-job'
+        sentinel.write_text('retained')
+        before = shared.stat()
+        self.frontend(json.dumps(dict(version=3, cpu_workers=True, supports_invocation=False)))
+        with mock.patch('tempfile.gettempdir', return_value=str(parent)):
+            result = qualify(self.root)
+        self.assertTrue(result['passed'], result)
+        self.assertEqual(sentinel.read_text(), 'retained')
+        self.assertEqual(shared.stat().st_ino, before.st_ino)
+        self.assertEqual(list(shared.iterdir()), [sentinel])
 
     def test_stale_frontend_passes_lane_and_doctor_but_not_resource_contract(self):
         path = self.frontend('{"version":2,"cpu_workers":true,"supports_invocation":true}')
@@ -67,6 +94,19 @@ else:
         self.assertTrue(result['observations'][0]['capture_complete'])
         response = base64.b64decode(result['observations'][0]['stdout_base64'])
         self.assertEqual(json.loads(response)['version'], 2)
+
+    def test_fixture_frontend_in_spaced_sdk_preserves_argv_and_source_mutation(self):
+        spaced = self.root.with_name('sdk with spaces')
+        self.root.rename(spaced)
+        self.root = spaced
+        path = self.frontend(json.dumps(dict(version=3, cpu_workers=True, supports_invocation=False)))
+        result = qualify(self.root)
+        self.assertTrue(result['passed'], result)
+        self.assertEqual(result['observations'][0]['argv'][0], str(path))
+        self.frontend(json.dumps(dict(version=3, cpu_workers=True, supports_invocation=False)), mutate=True)
+        refused = qualify(self.root)
+        self.assertFalse(refused['passed'])
+        self.assertIn('cohort changed', refused['refusal'])
 
     def test_malformed_duplicate_untyped_unknown_and_old_replies_refuse(self):
         for response in ('not json', '[]', '{}',

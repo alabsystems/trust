@@ -104,6 +104,7 @@ def owner_api(source: Path, expected: str | None = None, identity_expected: str 
     loader_path = source / "scripts/seed_custody_source.py"
     loader_owner, _loader_digest = source_owner(loader_path, "daily_dependency_source_loader", loader_expected)
     manifest = {"scripts/recreate_bootstrap.py": expected if expected is not None else digest(path),
+                "scripts/source_working_cache.py": digest(source / "scripts/source_working_cache.py"),
                 "src/bootstrap/stage0_identity.py": identity_before}
     loader = loader_owner["BoundSourceLoader"](source, manifest)
     result = loader.module("daily_dependency_git_owner", path).__dict__
@@ -114,15 +115,15 @@ def owner_api(source: Path, expected: str | None = None, identity_expected: str 
     return result
 
 def local_acquisition_command(args):
-    """Only the two fixed local source-copy fetch forms may use the bulk limit."""
-    if (len(args) == 10 and args[:5] == ["-c", "protocol.file.allow=always", "-c",
-            "fetch.fsckObjects=true", "-C"] and args[6:8] == ["fetch", "--no-tags"]):
-        return (Path(args[5]).is_absolute() and Path(args[8]).is_absolute()
-                and re.fullmatch(r"\+([0-9a-f]{40}):refs/agh/trust-daily-dependencies/\1", args[9]) is not None)
-    if (len(args) == 11 and args[:3] == ["-c", "protocol.file.allow=always", "--git-dir"]
-            and args[4:9] == ["fetch", "--no-tags", "--force", "--update-head-ok", "--recurse-submodules=no"]):
-        return (Path(args[3]).is_absolute() and Path(args[9]).is_absolute()
-                and re.fullmatch(r"\+([0-9a-f]{40}):refs/commit/\1", args[10]) is not None)
+    """Only the two fixed exact-checkout fetch forms may use the bulk limit."""
+    if (len(args) == 11 and args[:5] == ["-c", "protocol.file.allow=always", "-c",
+            "fetch.fsckObjects=true", "-C"] and args[6:9] == ["fetch", "--no-tags", "--depth=1"]):
+        return (Path(args[5]).is_absolute() and Path(args[9]).is_absolute()
+                and re.fullmatch(r"\+([0-9a-f]{40}):refs/agh/trust-daily-dependencies/\1", args[10]) is not None)
+    if (len(args) == 12 and args[:3] == ["-c", "protocol.file.allow=always", "--git-dir"]
+            and args[4:10] == ["fetch", "--no-tags", "--depth=1", "--force", "--update-head-ok", "--recurse-submodules=no"]):
+        return (Path(args[3]).is_absolute() and Path(args[10]).is_absolute()
+                and re.fullmatch(r"\+([0-9a-f]{40}):refs/commit/\1", args[11]) is not None)
     return False
 
 
@@ -140,7 +141,7 @@ def local_git(owner, args, *, cwd=None, bounded=False, input_bytes=None, acquisi
         ["-c", "protocol.allow=never", "-c", "protocol.https.allow=never",
          "-c", "gc.autoDetach=false", "-c", "maintenance.auto=false", *args])
     if bounded:
-        # A local source acquisition can validate a large complete Git history.
+        # A local acquisition can validate a large exact selected checkout.
         # Give these two fixed fetch sites the same finite ceiling as Agh, while
         # retaining the enclosing preparation deadline and process-tree cleanup.
         limit = 600 if acquisition else 120
@@ -294,7 +295,7 @@ def prepare_profile(source: Path, work: Path, cache: Path, closure, owner, envir
             receipt["method"] = "owner-routed-agh"
         else:
             local_git(owner, ["-c", "protocol.file.allow=always", "-c", "fetch.fsckObjects=true",
-                "-C", str(stage), "fetch", "--no-tags", str(cached), "+" + oid + ":" + ref], bounded=True, acquisition=True)
+                "-C", str(stage), "fetch", "--no-tags", "--depth=1", str(cached), "+" + oid + ":" + ref], bounded=True, acquisition=True)
             validate_bare_db(owner, cached)
             receipt = {"method": "exact-owned-cargo-cache", "source": oid, "private_ref": ref,
                        "commit": oid, "repository": url, "cache_db": str(cached)}
@@ -339,7 +340,9 @@ def parse_fetch(argv: list[str]):
     if args[:1] != ["fetch"]:
         raise Refused("dependency Git CLI only admits version and exact fetch requests")
     args.pop(0)
-    allowed = {"--no-tags", "--verbose", "--progress", "--porcelain", "--quiet", "--no-show-forced-updates", "--force", "--update-head-ok", "--recurse-submodules=no"}
+    # Native Targo adds this exact depth when it reuses the shallow DB created
+    # by the first selected-checkout transfer. No variable depth is admitted.
+    allowed = {"--no-tags", "--depth=1", "--verbose", "--progress", "--porcelain", "--quiet", "--no-show-forced-updates", "--force", "--update-head-ok", "--recurse-submodules=no"}
     options = []
     while args and args[0].startswith("--"):
         value = args.pop(0)
@@ -447,18 +450,40 @@ def git_entry(policy_path: Path, argv: list[str]):
         if regular(policy_path) != before:
             raise Refused("dependency transport policy changed during local gc")
         return
-    stage = policy["stages"][key]
-    origin = Path(stage["path"])
-    identity = owner["_submodule_file_identity"](origin)
-    if list(identity[:3]) != stage["identity"]:
-        raise Refused("dependency inspected source stage changed")
-    owner["_validate_staged_submodule"](origin, identity)
-    if local_git(owner, ["-C", str(origin), "rev-parse", "--verify", stage["ref"]]).stdout.decode().strip() != oid:
-        raise Refused("dependency inspected source ref changed")
-    result = local_git(owner, ["-c", "protocol.file.allow=always", "--git-dir", str(db), "fetch",
-                        "--no-tags", "--force", "--update-head-ok", "--recurse-submodules=no", str(origin), refspec], bounded=True, acquisition=True)
-    actual = local_git(owner, ["--git-dir", str(db), "rev-parse", "--verify", "refs/commit/" + oid]).stdout.decode().strip()
-    if actual != oid or not (db / "FETCH_HEAD").read_text().startswith(oid + "\t"):
+    # Agh retains ancestry metadata and the selected checkout bodies, not every
+    # historical body. Let native Git export that exact checkout with its own
+    # fresh shallow boundary; a full-history upload-pack would demand omitted
+    # obsolete objects. Missing selected bodies still make the native fetch fail.
+    # Native Cargo can reinitialize a shallow DB before each requested pin.
+    # Restore every already-inspected pin for this URL on each callback so its
+    # final DB covers the original whole offline envelope. Fetch the requested
+    # pin last to retain Cargo's precise FETCH_HEAD contract. Other URLs and
+    # uninspected commits are outside this transfer, not a second resolver.
+    pins = []
+    for stage_key, stage in policy["stages"].items():
+        if stage_key.startswith(url + "#"):
+            pin = exact_oid(stage_key[len(url) + 1:])
+            if stage["oid"] != pin:
+                raise Refused("dependency inspected source pin differs from its policy key")
+            pins.append((pin, stage))
+    if not pins or len(pins) > MAX_REPOSITORIES:
+        raise Refused("dependency inspected source pin set exceeds its finite bounds")
+    for pin, stage in sorted(pins, key=lambda row: (row[0] == oid, row[0])):
+        origin = Path(stage["path"])
+        identity = owner["_submodule_file_identity"](origin)
+        if list(identity[:3]) != stage["identity"]:
+            raise Refused("dependency inspected source stage changed")
+        owner["_validate_staged_submodule"](origin, identity)
+        if local_git(owner, ["-C", str(origin), "rev-parse", "--verify", stage["ref"]]).stdout.decode().strip() != pin:
+            raise Refused("dependency inspected source ref changed")
+        local_git(owner, ["-c", "protocol.file.allow=always", "--git-dir", str(db), "fetch",
+            "--no-tags", "--depth=1", "--force", "--update-head-ok", "--recurse-submodules=no",
+            str(origin), "+" + pin + ":refs/commit/" + pin], bounded=True, acquisition=True)
+    for pin, _stage in pins:
+        actual = local_git(owner, ["--git-dir", str(db), "rev-parse", "--verify", "refs/commit/" + pin]).stdout.decode().strip()
+        if actual != pin:
+            raise Refused("dependency local self-fetch did not preserve every inspected source ref")
+    if not (db / "FETCH_HEAD").read_text().startswith(oid + "\t"):
         raise Refused("dependency local self-fetch did not preserve the exact Cargo ref/FETCH_HEAD")
     if regular(policy_path) != before:
         raise Refused("dependency transport policy changed during local self-fetch")

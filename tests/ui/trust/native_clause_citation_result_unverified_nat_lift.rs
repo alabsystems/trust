@@ -51,9 +51,9 @@
 
 clean {
     def spec_ge (n : Nat) : Bool :=
-        Decidable.decide (Nat.le 512 n) (Nat.decLe 512 n)
+        @Decidable.decide (Nat.le 512 n) (Nat.decLe 512 n)
     def dec_ge (n : UInt16) : Bool :=
-        Decidable.decide (LE.le (UInt16.ofNat 512) n) (instDecidableUInt16Le (UInt16.ofNat 512) n)
+        @Decidable.decide (LE.le (UInt16.ofNat 512) n) (instDecidableUInt16Le (UInt16.ofNat 512) n)
     theorem dec_is_spec : forall (n : UInt16),
         Eq (dec_ge n) (spec_ge (UInt16.toNat n)) :=
         fun n => Eq.refl (dec_ge n)
@@ -63,9 +63,9 @@ clean {
         fun x => Eq.refl (UInt16.toNat x)
 
     def spec_small (n : Nat) : Bool :=
-        Decidable.decide (Nat.lt n 4096) (Nat.decLt n 4096)
+        @Decidable.decide (Nat.lt n 4096) (Nat.decLt n 4096)
     def dec_small (n : UInt64) : Bool :=
-        Decidable.decide (LT.lt n (UInt64.ofNat 4096)) (instDecidableUInt64Lt n (UInt64.ofNat 4096))
+        @Decidable.decide (LT.lt n (UInt64.ofNat 4096)) (instDecidableUInt64Lt n (UInt64.ofNat 4096))
     theorem dec_small_is_spec : forall (n : UInt64),
         Eq (dec_small n) (spec_small (UInt64.toNat n)) :=
         fun n => Eq.refl (dec_small n)

@@ -203,6 +203,9 @@ struct DrainState<'gctx> {
     // Trust: explicit dispatch/terminal observations, independent of legacy
     // timing events which omit fresh/no-op jobs and are not outcome verdicts.
     execution: ExecutionSummary,
+    // Trust: DC-12a. Each compile unit dispatched, and whether it was fresh or
+    // built, which the runner's end-of-build receipt names.
+    ran: super::build_receipt::Ledger<Unit>,
     // This is the length of the DependencyQueue when starting out
     total_units: usize,
 
@@ -697,6 +700,8 @@ impl<'gctx> JobQueue<'gctx> {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             workload_script: None,
             execution: ExecutionSummary::default(),
+            // Trust: DC-12a, the units this queue runs.
+            ran: super::build_receipt::Ledger::default(),
             // Trust: compile timing and lifecycle denominators stay compile-only.
             total_units: self.queued_units.len(),
             queue: self.queue,
@@ -1380,6 +1385,14 @@ impl<'gctx> DrainState<'gctx> {
             Message::RecheckFreshness { id, force, reply } => {
                 let unit = self.active[&id].clone();
                 let result = super::fingerprint::recheck_after_lock(build_runner, &unit, force);
+                // Trust: DC-12a. The recheck under the lock found the unit
+                // fresh: this build used it and did not build it. (A build that
+                // waited for another's lease plans again before dispatch, so
+                // such a unit is usually dispatched fresh and never rechecked;
+                // tests/build_receipt.rs holds the receipt to that outcome.)
+                if matches!(result, Ok(true)) {
+                    self.ran.found_fresh(unit);
+                }
                 // A failed check goes back to the worker and follows the same
                 // Finish/error path as a failed compiler invocation.
                 reply
@@ -2081,6 +2094,9 @@ impl<'gctx> DrainState<'gctx> {
         let native = build_runner.native_inputs().is_some();
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let native = false;
+        // Trust: DC-12a. The runner keeps the build's receipt from what this
+        // queue ran as it retires the compile leases.
+        build_runner.units_ran = Some(std::mem::take(&mut self.ran));
         let finalized = if workload || native {
             build_runner.finish_compilation_with_workload_leases(compile_succeeded)
         } else {
@@ -2372,6 +2388,9 @@ impl<'gctx> DrainState<'gctx> {
 
         let messages = self.messages.clone();
         let is_fresh = job.freshness().is_fresh();
+        // Trust: DC-12a. A dirty job may still turn fresh under its lock, which
+        // `Message::RecheckFreshness` then records.
+        self.ran.dispatched(unit.clone(), is_fresh);
         let record_workload_output =
             build_runner.records_workload_output() && !unit.mode.is_run_custom_build();
         let rmeta_required = build_runner.rmeta_required(unit);
@@ -2589,6 +2608,19 @@ impl<'gctx> DrainState<'gctx> {
             .into_iter()
             .filter_map(QueueNode::as_compile)
             .collect();
+        // Trust: DC-12b. The compile of `unit` has ended: note the
+        // incremental folders it wrote, which only the compiler names, for
+        // the build's receipt. The queue's dispatch already asked whether this
+        // is targo, so asking again cannot panic.
+        if artifact == Artifact::All
+            && let Some(since) = self.ran.compiling_since(unit)
+            && crate::is_targo_invocation()
+            && let Some(dir) = build_runner.profile_incremental_dir(unit)
+            && let Some(folders) =
+                super::incremental_trim::written_by(&dir, &unit.target.crate_name(), since)
+        {
+            self.ran.wrote(unit.clone(), folders);
+        }
         match artifact {
             Artifact::All => self.timings.unit_finished(build_runner, id, unblocked),
             Artifact::Metadata => self

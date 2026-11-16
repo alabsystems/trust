@@ -49,13 +49,16 @@
 //! The bundle that is now kept is the same bundle the gate would have admitted had
 //! the member no Asserts: every row it publishes is judged by the ordinary
 //! success-path gates. What the disposition adds is only the debit above, and it is
-//! written by one seam: rows claiming [`STD_MEMBER_RUNTIME_CHECK_REASON`] that this
-//! seam did not mint are stripped (staleness/forgery defense, as the coroutine,
-//! global-alloc, entry-`Termination` and D9 seams do).
+//! written by one seam: rows claiming the kind (its solver label, or a reason that
+//! begins with [`STD_MEMBER_RUNTIME_CHECK_REASON`]) that this seam did not mint are
+//! stripped (staleness/forgery defense, as the coroutine, global-alloc,
+//! entry-`Termination` and D9 seams do). Each row it mints states why its
+//! obligation was left undecided as a stop token ([`std_member_stop`]).
 
 use rustc_middle::mir::Body;
 use rustc_middle::ty::TyCtxt;
 use trust_ir_bridge::MemberAssertRefusalClass;
+use trust_types::determinism::StopCause;
 use trust_types::{Outcome, SourceSpan, TransportObligationResult, VcKind};
 
 use super::{PreparedDiagnostic, PreparedDiagnosticChild, PreparedLocatedDiagnostic, RuntimeCheckedStdMember};
@@ -64,8 +67,9 @@ use super::{PreparedDiagnostic, PreparedDiagnosticChild, PreparedLocatedDiagnost
 /// records a disposition, not a verdict.
 pub(super) const STD_MEMBER_RUNTIME_CHECK_ROW_SOLVER: &str = "trust-std-member-runtime-check";
 
-/// The exact reason string of a runtime-checked std-member row, and the key the
-/// strip in [`rows_with_runtime_checked_std_members`] recognizes.
+/// The reason a runtime-checked std-member row begins with; its stop token
+/// ([`std_member_stop`]) follows. A reason that begins with it is one of the keys
+/// the strip in [`rows_with_runtime_checked_std_members`] recognizes.
 pub(super) const STD_MEMBER_RUNTIME_CHECK_REASON: &str = "bundled std/core/alloc member runtime \
      check (policy B): an internal Assert of an authentic sysroot member that no row of this \
      function discharges is left to rustc's runtime check under vanilla Rust semantics; the \
@@ -97,12 +101,32 @@ fn class_phrase(class: MemberAssertRefusalClass) -> &'static str {
     }
 }
 
+/// Trust (RUNTIME-CHECKED-NO-STOP-CAUSE-1, 2026-11-13): why a member row's
+/// obligation was left undecided, written as its reason's stop token. A
+/// runtime-checked row whose reason states no stop reads as `unclassified`
+/// (`StopCause::of_outcome`), which is not reproducible, so a unit whose rows
+/// are otherwise clean could not show a reproducible result. No engine is asked
+/// to decide a member's Assert: `not-dispatched`. The one clock that reaches
+/// the member set is the per-function deadline declining this run's native
+/// lowering (`native_run_lowering_declined_by_deadline`): the members kept then
+/// are what a construction the deadline cut recorded, so the row states
+/// `wall-backstop`, as the run's gap row does
+/// (`transport_native_lowering_gap_row`).
+fn std_member_stop(run: Option<&trust_verifier_api::VerificationRunResult>) -> StopCause {
+    if run.is_some_and(super::native_run_lowering_declined_by_deadline) {
+        StopCause::WallBackstop
+    } else {
+        StopCause::NotDispatched
+    }
+}
+
 /// One member's row. Built without a `TyCtxt` so the whole shape is unit-tested;
 /// the message renders only the stored `def_path` (never a `Ty`, never a trimmed
 /// path — the X2 `must_produce_diag` ICE class).
 fn member_row(
     location: Option<SourceSpan>,
     member: &RuntimeCheckedStdMember,
+    stop: StopCause,
 ) -> TransportObligationResult {
     let kind = VcKind::Assertion {
         message: format!(
@@ -128,7 +152,7 @@ fn member_row(
         time_ms: 0,
         counterexample: None,
         counterexample_model: None,
-        reason: Some(STD_MEMBER_RUNTIME_CHECK_REASON.to_string()),
+        reason: Some(stop.stamp(STD_MEMBER_RUNTIME_CHECK_REASON)),
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
@@ -136,25 +160,50 @@ fn member_row(
     }
 }
 
-/// Is `row` claiming to be a runtime-checked std-member row?
+/// Is `row` claiming to be a runtime-checked std-member row? By the row's solver
+/// label, or by a reason that begins with [`STD_MEMBER_RUNTIME_CHECK_REASON`],
+/// whatever follows it (the stop token this seam writes, or anything else): only
+/// this seam writes either.
 fn claims_std_member_runtime_check(row: &TransportObligationResult) -> bool {
-    row.reason.as_deref() == Some(STD_MEMBER_RUNTIME_CHECK_REASON)
+    row.solver == STD_MEMBER_RUNTIME_CHECK_ROW_SOLVER
+        || row
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(STD_MEMBER_RUNTIME_CHECK_REASON))
 }
 
-/// `rows` with every pre-existing row claiming [`STD_MEMBER_RUNTIME_CHECK_REASON`]
-/// removed and one row per member appended. `None` — use `rows` unchanged — when
-/// there is no member and nothing to strip, so an ordinary body allocates nothing.
+/// `rows` with every pre-existing row claiming the kind
+/// ([`claims_std_member_runtime_check`]) removed and one row per member of this
+/// body's `artifacts` appended, each stating the stop its own native run gives
+/// ([`std_member_stop`]). `None` — use `rows` unchanged — when there is no member
+/// and nothing to strip, so an ordinary body allocates nothing. Both publication
+/// branches read the members and the run here, from the artifacts they publish,
+/// so neither can state a stop of its own (RUNTIME-CHECKED-NO-STOP-CAUSE-1).
 pub(super) fn rows_with_runtime_checked_std_members(
     rows: &[TransportObligationResult],
     location: Option<SourceSpan>,
+    artifacts: &super::VerificationArtifacts,
+) -> Option<Vec<TransportObligationResult>> {
+    rows_with_members(
+        rows,
+        location,
+        &artifacts.runtime_checked_std_members,
+        std_member_stop(artifacts.full_verification.as_ref()),
+    )
+}
+
+fn rows_with_members(
+    rows: &[TransportObligationResult],
+    location: Option<SourceSpan>,
     members: &[RuntimeCheckedStdMember],
+    stop: StopCause,
 ) -> Option<Vec<TransportObligationResult>> {
     if members.is_empty() && !rows.iter().any(claims_std_member_runtime_check) {
         return None;
     }
     let mut out: Vec<TransportObligationResult> =
         rows.iter().filter(|row| !claims_std_member_runtime_check(row)).cloned().collect();
-    out.extend(members.iter().map(|member| member_row(location.clone(), member)));
+    out.extend(members.iter().map(|member| member_row(location.clone(), member, stop)));
     Some(out)
 }
 
@@ -168,14 +217,30 @@ pub(super) fn zero_obligation_rows(
     native_vacuously_clean: bool,
     transport_results: &[TransportObligationResult],
     location: Option<SourceSpan>,
+    artifacts: &super::VerificationArtifacts,
+) -> Vec<TransportObligationResult> {
+    zero_obligation_rows_with_members(
+        native_vacuously_clean,
+        transport_results,
+        location,
+        &artifacts.runtime_checked_std_members,
+        std_member_stop(artifacts.full_verification.as_ref()),
+    )
+}
+
+fn zero_obligation_rows_with_members(
+    native_vacuously_clean: bool,
+    transport_results: &[TransportObligationResult],
+    location: Option<SourceSpan>,
     members: &[RuntimeCheckedStdMember],
+    stop: StopCause,
 ) -> Vec<TransportObligationResult> {
     let base = if !native_vacuously_clean && transport_results.is_empty() {
         vec![super::transport_native_verification_gap_row()]
     } else {
         transport_results.to_vec()
     };
-    rows_with_runtime_checked_std_members(&base, location, members).unwrap_or(base)
+    rows_with_members(&base, location, members, stop).unwrap_or(base)
 }
 
 const DISCLOSURE_NOTE: &str = "published as a runtime-checked row; this function is not counted \

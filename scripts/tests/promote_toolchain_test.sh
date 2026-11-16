@@ -3,6 +3,60 @@
 # These fixtures test shell orchestration, not compiler or proof correctness.
 set -euo pipefail
 
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+# Count case identities, including explicitly NOT RUN root-only cases. Never
+# reuse a case directory or count a duplicate identity as additional coverage.
+CASE_COUNT=0
+CASES_NOT_RUN=0
+CASE_NAMES=()
+record_case() {
+    local name="$1" disposition="$2" seen index
+    [[ -n "$name" && "$name" != */* && "$name" != . && "$name" != .. ]] \
+        || fail "case name is not one directory: $name"
+    for seen in "${CASE_NAMES[@]-}"; do
+        [[ "$seen" != "$name" ]] || fail "duplicate case name: $name"
+    done
+    index=$((CASE_COUNT + CASES_NOT_RUN))
+    case "$disposition" in
+        run) CASE_COUNT=$((CASE_COUNT + 1)) ;;
+        not_run) CASES_NOT_RUN=$((CASES_NOT_RUN + 1)) ;;
+        *) fail "unknown case disposition: $disposition" ;;
+    esac
+    CASE_NAMES[$index]="$name"
+}
+assert_case_count() {
+    [[ "$((CASE_COUNT + CASES_NOT_RUN))" -eq "$1" ]] \
+        || fail "expected $1 cases, ran $CASE_COUNT and did not run $CASES_NOT_RUN"
+}
+expect_ledger_refusal() {
+    local expected="$1" output
+    shift
+    if output="$("$@" 2>&1)"; then fail "ledger accepted $expected"; fi
+    [[ "$output" == "FAIL: $expected" ]] || fail "unexpected ledger refusal: $output"
+}
+case_ledger_selftest() {
+    record_case alpha run
+    record_case 'case with spaces' not_run
+    assert_case_count 2
+    [[ "$CASE_COUNT" -eq 1 && "$CASES_NOT_RUN" -eq 1 ]] || fail 'ledger lost run/NOT RUN accounting'
+    expect_ledger_refusal 'duplicate case name: alpha' record_case alpha run
+    expect_ledger_refusal 'duplicate case name: alpha' record_case alpha not_run
+    expect_ledger_refusal 'duplicate case name: case with spaces' record_case 'case with spaces' run
+    expect_ledger_refusal 'case name is not one directory: alpha/../beta' record_case 'alpha/../beta' run
+    expect_ledger_refusal 'expected 1 cases, ran 1 and did not run 1' assert_case_count 1
+    expect_ledger_refusal 'expected 3 cases, ran 1 and did not run 1' assert_case_count 3
+    record_case beta run
+    assert_case_count 3
+    [[ "$CASE_COUNT" -eq 2 && "$CASES_NOT_RUN" -eq 1 ]] || fail 'ledger changed after refused reuse'
+}
+# A subshell keeps these controls out of the promotion-case denominator.
+(case_ledger_selftest)
+if [[ "${1:-}" == --selftest-case-ledger ]]; then
+    echo 'Promotion case-ledger controls passed'
+    exit 0
+fi
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # Keep the scoped lane's selected interpreter across the shell boundary. Direct
 # callers use the same supported-version search; an explicit selection is never
@@ -32,7 +86,6 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/promote-toolchain-test.XXXXXX")"
 WORK="$(cd "$WORK" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
-fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # Every case runs fixture tools written for it a moment before, and on a busy
 # Mac the first exec of a new file can wait 10-61 s (KNOWN_HAZARDS
 # TRUST-KI-1014-3), past the 30 s bound tools/verify-toolchain.sh puts on each
@@ -494,11 +547,10 @@ done
 printf 'synthetic private driver\n' > "$WORK/template/lib/librustc_driver-fixture.dylib"
 printf 'synthetic rustc-dev metadata\n' > "$WORK/template/lib/rustlib/test-host/lib/librustc_public-fixture.rmeta"
 
-CASE_COUNT=0
-CASES_NOT_RUN=0
 new_case() {
-    CASE_COUNT=$((CASE_COUNT + 1))
+    record_case "$1" run
     CASE="$WORK/$1"
+    [[ ! -e "$CASE" && ! -L "$CASE" ]] || fail "case directory already exists: $1"
     SRC="$CASE/build/test-host/stage2"
     SEAL="$CASE/sealed/trust-${COMMIT:0:8}"
     PRIVATE="$CASE/build/test-host/rustc-private-sysroots/fixture-key"
@@ -755,7 +807,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
     [[ ! -e "$CASE/sealed" ]] || fail 'a candidate whose lock could not be asked was copied'
 else
     # root opens any file: the case cannot be staged. Said, and not counted as run.
-    CASES_NOT_RUN=$((CASES_NOT_RUN + 1))
+    record_case lock-cannot-be-asked not_run
     echo 'NOT RUN: lock-cannot-be-asked (root opens any file, so a lock that cannot be opened cannot be staged)' >&2
 fi
 # A stage2 whose rustlib cannot be listed is refused before anything is spent on
@@ -776,7 +828,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
         || fail 'a stage2 whose rustlib could not be listed moved the channel'
 else
     # root lists any directory: the case cannot be staged. Said, and not counted as run.
-    CASES_NOT_RUN=$((CASES_NOT_RUN + 1))
+    record_case stdlib-listing-fails not_run
     echo 'NOT RUN: stdlib-listing-fails (root lists any directory, so a listing that fails cannot be staged)' >&2
 fi
 new_case unrelated-helper-build
@@ -1982,7 +2034,11 @@ cp "$FIXTURE_REPO/library/fixture.rs" "$CASE/checkout-as-it-was/library-fixture.
 cp "$FIXTURE_REPO/compiler/fixture.rs" "$CASE/checkout-as-it-was/compiler-fixture.rs"
 [[ ! -e "$FIXTURE_REPO/build" ]] || mv "$FIXTURE_REPO/build" "$CASE/checkout-as-it-was/build"
 git -C "$FIXTURE_REPO" checkout -q -- library/fixture.rs compiler/fixture.rs
-[[ -z "$(git -C "$FIXTURE_REPO" status --porcelain)" ]] || fail 'the fixture checkout is not at its commit for a completed stamp'
+fixture_status="$(git -C "$FIXTURE_REPO" status --porcelain)"
+if [[ -n "$fixture_status" ]]; then
+    printf '%s\n' "$fixture_status" >&2
+    fail 'the fixture checkout is not at its commit for a completed stamp'
+fi
 write_completed_stamp
 PROMOTE_OPTS=(--no-flip --require-provenance)
 if run_promotion; then sealed_unasked=1; else sealed_unasked=0; fi
@@ -2994,7 +3050,7 @@ unset PROMOTE_OPTS
 ! grep -qF 'NOT RUN' "$CASE/output" || { cat "$CASE/output" >&2; fail 'a row was NOT RUN under a relative TMPDIR'; }
 [[ "$(cat "$CASE/probe-run-sysroots")" == "$(cd "$SRC" && pwd -P)"$'\n'"$(cd "$SRC" && pwd -P)"$'\n'"$(cd "$SEAL" && pwd -P)" ]] \
     || { cat "$CASE/probe-run-sysroots" >&2; fail 'the rustc-dev consumer did not run three times under a relative TMPDIR'; }
-[[ -z "$(ls -A "$CASE/reltmp")" ]] || fail 'a passing run left scratch under a relative TMPDIR'
+[[ -z "$(ls -A "$CASE/reltmp")" ]] || { ls -la "$CASE/reltmp" >&2; fail 'a passing run left scratch under a relative TMPDIR'; }
 # ...and a refused one names the directory it kept from the root, so that the
 # line can be followed from any directory.
 new_case relative-tmpdir-names-what-it-kept
@@ -3173,7 +3229,10 @@ terminated_in_step_6 seal-terminated-in-z-help trustc '"-Z help"'
 terminated_in_step_6 seal-terminated-in-a-tool-start-row tippy-driver '*--out-dir*'
 terminated_in_step_6 seal-terminated-in-the-ay-probe trustc '*/ay_probe.rs'
 
-[[ "$((CASE_COUNT + CASES_NOT_RUN))" -eq 236 ]] || fail "expected 236 cases, ran $CASE_COUNT and did not run $CASES_NOT_RUN"
+# 938085f952 accounted for 236 cases. a78e0f3708 then added the distinct
+# gate-only-native-tools-half refusal control without updating this total.
+# Keep that control and every earlier case: the exact roster is now 237.
+assert_case_count 237
 NOT_RUN_NOTE=""
 [[ "$CASES_NOT_RUN" -eq 0 ]] || NOT_RUN_NOTE="; $CASES_NOT_RUN NOT RUN as root: lock-cannot-be-asked, stdlib-listing-fails"
 echo "Promotion toolchain tests: $CASE_COUNT cases passed (synthetic tools; no installed channel changes$NOT_RUN_NOTE)"

@@ -71,10 +71,12 @@ fn assert_released(directory: &Path, name: &str) {
 }
 
 /// The copies made by one validation. `copies` is declared first, so every
-/// copy is killed and reaped before the kernel fixture is released.
+/// copy is killed and reaped before the kernel fixture is released. `fail`
+/// injects the inherited lock's failure at the first copy.
 struct Armed {
     copies: Vec<Unexecuted>,
     fixture: KernelFixture,
+    fail: bool,
 }
 
 thread_local! {
@@ -83,23 +85,24 @@ thread_local! {
 
 /// `from_inherited`'s hook: on a thread that `while_copied` armed, copy the
 /// descriptor table while a probe holds its shared lock, then fail as the
-/// inherited description's lock can.
+/// inherited description's lock can, when armed to.
 pub(super) fn probe_locked() -> io::Result<()> {
     ARMED.with_borrow_mut(|armed| {
         let Some(armed) = armed else { return Ok(()) };
         let copy = Unexecuted::copy(&armed.fixture);
         armed.copies.push(copy);
-        Err(io::Error::other("injected inherited lock failure"))
+        if armed.fail { Err(io::Error::other("injected inherited lock failure")) } else { Ok(()) }
     })
 }
 
-/// Runs `validate` with the first probe lock it takes copied into an
-/// unexecuted fork and refused, then `observe` with its result while the copy
-/// still lives. Every copy is killed and reaped, and the fixture released,
-/// before this returns or unwinds. Returns the observation and the number of
-/// probe locks copied.
+/// Runs `validate` with each probe lock it takes copied into an unexecuted
+/// fork, the first refused when `fail`, then `observe` with its result while
+/// the copies still live. Every copy is killed and reaped, and the fixture
+/// released, before this returns or unwinds. Returns the observation and the
+/// number of probe locks copied.
 fn while_copied<T, O>(
     fixture: KernelFixture,
+    fail: bool,
     validate: impl FnOnce() -> T,
     observe: impl FnOnce(T) -> O,
 ) -> (O, usize) {
@@ -109,7 +112,7 @@ fn while_copied<T, O>(
             drop(ARMED.with_borrow_mut(Option::take));
         }
     }
-    ARMED.with_borrow_mut(|armed| *armed = Some(Armed { copies: Vec::new(), fixture }));
+    ARMED.with_borrow_mut(|armed| *armed = Some(Armed { copies: Vec::new(), fixture, fail }));
     let disarm = Disarm;
     let validated = validate();
     // Stop copying, but keep the copies alive while observing.
@@ -134,12 +137,40 @@ fn a_refused_inherited_lock_unlocks_its_probe_while_a_spawn_holds_a_copy() {
     let slot = directory.path().join("slot-0");
     let ((refused, relocked), copied) = while_copied(
         kernel,
+        true,
         || LegacyFence::from_inherited(directory.path(), 2, copies(&files)),
         |validated| (validated.err().map(|error| error.kind()), relockable(&slot)),
     );
     assert_eq!(copied, 1, "validation did not stop at its first probe lock");
     assert_eq!(refused, Some(io::ErrorKind::Other));
     assert!(relocked, "a refused validation kept its probe's lock through a spawn's copy");
+}
+
+#[test]
+fn a_validated_fence_unlocks_its_probe_while_a_spawn_holds_a_copy() {
+    // Each copy holds every open description: own the descriptor table.
+    let kernel = crate::tests::kernel_fixture();
+    let (directory, files) = fixture();
+    for file in &files {
+        file.unlock().unwrap();
+    }
+    let slot = directory.path().join("slot-0");
+    let (relocked, copied) = while_copied(
+        kernel,
+        false,
+        || LegacyFence::from_inherited(directory.path(), 2, copies(&files)),
+        |validated| {
+            // Release the inherited shared locks, which the copies share, so
+            // only a probe's lock that its exit kept can refuse an exclusive one.
+            let fence = validated.unwrap();
+            for file in fence.files() {
+                file.unlock().unwrap();
+            }
+            relockable(&slot)
+        },
+    );
+    assert_eq!(copied, 4, "validation did not copy at each probe lock");
+    assert!(relocked, "a validated fence kept its probe's lock through a spawn's copy");
 }
 
 #[test]

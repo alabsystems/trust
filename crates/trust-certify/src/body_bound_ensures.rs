@@ -574,10 +574,12 @@ fn prove(prop: &ClaimProp) -> Option<Expr> {
 /// and its lemmas, `Bool`, the propositional connectives, and one opaque
 /// constant per claim variable.
 ///
-/// `init_bool` also installs Clean's ambient `sorryAx` oracle. That is exactly why
-/// [`proof_axiom_closure_is_clean`] below is not optional: typing alone would
-/// accept a one-node inhabitant of any goal, so admissibility is decided by the
-/// term's transitive constant closure, not by the environment's contents.
+/// This environment holds no `sorryAx`: since Clean bcacce6e0 the oracle lives
+/// in the explicit admission fragment (`init_admission_stub_theory`), which this
+/// builder does not opt into. [`proof_axiom_closure_is_clean`] below is still not
+/// optional: admissibility is decided by the term's transitive constant closure,
+/// not by what the environment happens to contain, so an environment that does
+/// carry an oracle (or any other axiom) cannot make an oracle-rooted term pass.
 fn build_claim_env(variables: &[(String, ClaimSort)]) -> Option<Environment> {
     // Memoized: the lemma environment is identical across standalone
     // compatibility checks of historical body-bound envelopes.
@@ -922,28 +924,39 @@ mod tests {
         );
     }
 
-    /// RED. `init_bool` puts Clean's ambient `sorryAx` in the environment, so
-    /// the kernel WILL type an oracle-rooted inhabitant of the goal. The closure
-    /// audit is the gate that refuses it; this pins that the gate, not the type
-    /// checker, is what stops an oracle proof.
+    /// RED. In an environment that carries Clean's `sorryAx` the kernel WILL
+    /// type an oracle-rooted inhabitant of the goal. The closure audit is the
+    /// gate that refuses it; this pins that the gate, not the type checker, is
+    /// what stops an oracle proof. The claim environment itself no longer holds
+    /// the oracle (Clean bcacce6e0 moved it to the explicit admission fragment),
+    /// so the control opts into that fragment to keep the oracle typeable.
     #[test]
     fn a_sorry_rooted_proof_is_refused_by_the_closure_audit() {
         let claim = decode_body_bound_claim(
             &serde_json::from_str(&ge_refl_payload()).expect("valid claim JSON"),
         )
         .expect("the ge_refl claim decodes");
-        let env = build_claim_env(&claim.variables).expect("environment builds");
+        let claim_env = build_claim_env(&claim.variables).expect("environment builds");
         let goal = prop_to_expr(&claim.body).expect("the goal is constructible");
 
-        // `sorryAx : {α : Sort u} → Bool → α` — the ambient oracle `init_bool`
-        // pulls in. Instantiated at the goal it inhabits anything.
+        // `sorryAx : {α : Sort u} → Bool → α`. Instantiated at the goal it
+        // inhabits anything.
         let forged = Expr::apps(
             Expr::const_(Name::from_string("sorryAx"), vec![Level::zero()]),
             [goal.clone(), Expr::const_(Name::from_string("Bool.true"), Vec::new())],
         );
         assert!(
+            TypeChecker::with_context(&claim_env, LocalContext::new())
+                .check_type(&forged, &goal)
+                .is_err(),
+            "the claim environment holds no oracle, so the kernel cannot type the forged term"
+        );
+        let mut env = claim_env;
+        env.init_admission_stub_theory()
+            .expect("explicit admission fragment for the oracle control");
+        assert!(
             TypeChecker::with_context(&env, LocalContext::new()).check_type(&forged, &goal).is_ok(),
-            "the ambient oracle really does type-check, which is why the audit exists"
+            "with the oracle in the environment it really does type-check, which is why the audit exists"
         );
         assert!(
             !proof_axiom_closure_is_clean(&env, &forged, &claim.variables),

@@ -22,13 +22,60 @@ pub(super) fn validate_checkout_name(name: &OsStr, repository_root: bool) -> Car
     Ok(())
 }
 
-pub(super) struct Checkout {
+pub(in crate::sources::git::local_import::custody) struct Checkout {
     source: ObjectSource,
 }
 impl Checkout {
-    pub(super) fn check_current(&self) -> CargoResult<()> {
+    pub(in crate::sources::git::local_import::custody) fn check_current(&self) -> CargoResult<()> {
         self.source.check_current()
     }
+}
+
+// Trust: retain original names/HEAD before reading checkout object DATA. The
+// recovery profile also requires the actual ready marker and no repository
+// indirection; neither marker nor abbreviated directory name grants authority.
+pub(in crate::sources::git::local_import::custody) fn capture_original_checkout(
+    root: Directory,
+    revision: git2::Oid,
+    recovery: bool,
+) -> CargoResult<Checkout> {
+    let mut actual = Checkout {
+        source: ObjectSource {
+            root,
+            directories: BTreeMap::new(),
+            files: Vec::new(),
+            forbidden: Vec::new(),
+            failed: Cell::new(false),
+            depth_limit: MAX_DEPTH + 4,
+        },
+    };
+    actual.source.directories.insert(
+        actual.source.root.path.clone(),
+        actual.source.root.before.clone(),
+    );
+    check_head(&mut actual, revision)?;
+    if recovery {
+        let root = Directory::open(&actual.source.root.path)?;
+        ensure!(
+            original_reference(&mut actual, &root, OsStr::new(".cargo-ok"))?.is_empty(),
+            "unsupported original checkout ready marker"
+        );
+        for relative in [
+            ".git/shallow",
+            ".git/commondir",
+            ".git/config.worktree",
+            ".git/info/grafts",
+            ".git/refs/replace",
+        ] {
+            ensure!(
+                actual.source.root.missing_relative(Path::new(relative))?,
+                "unsupported checkout recovery indirection: {relative}"
+            );
+            actual.source.forbidden.push(PathBuf::from(relative));
+        }
+    }
+    actual.check_current()?;
+    Ok(actual)
 }
 
 pub(super) fn copy_selected(
@@ -45,8 +92,10 @@ pub(super) fn copy_selected(
             .get(&crate::sources::git::source::ident(source))
             .context("checkout forecast lost selected ODB")?;
         let revision = locked_oid(*source)?;
-        let short =
-            crate::sources::git::utils::checkout_short_id(&database.input.odb()?, revision)?;
+        let short = crate::sources::git::utils::checkout_short_id(&database.input.odb()?, revision)
+            .with_context(|| {
+                crate::sources::git::source::object_source_context(*source, revision)
+            })?;
         let missing = cache.home.missing_relative(
             &PathBuf::from("git/checkouts")
                 .join(crate::sources::git::source::ident(source))
@@ -99,8 +148,10 @@ pub(super) fn copy_selected(
         let database = databases
             .get(&ident)
             .context("checkout lost selected source ODB")?;
-        let short =
-            crate::sources::git::utils::checkout_short_id(&database.input.odb()?, revision)?;
+        let short = crate::sources::git::utils::checkout_short_id(&database.input.odb()?, revision)
+            .with_context(|| {
+                crate::sources::git::source::object_source_context(*source, revision)
+            })?;
         let relative = PathBuf::from("git/checkouts").join(&ident).join(&short);
         if cache.home.missing_relative(&relative)? {
             continue; // Ordinary Cargo materialization remains unchanged.
@@ -112,22 +163,8 @@ pub(super) fn copy_selected(
             .child(OsStr::new(&ident))?
             .child(OsStr::new(&short))?;
         root.current()?;
-        let mut actual = Checkout {
-            source: ObjectSource {
-                root,
-                directories: BTreeMap::new(),
-                files: Vec::new(),
-                forbidden: Vec::new(),
-                failed: Cell::new(false),
-                depth_limit: MAX_DEPTH + 4,
-            },
-        };
+        let mut actual = capture_original_checkout(root, revision, false)?;
         let root_path = actual.source.root.path.clone();
-        actual
-            .source
-            .directories
-            .insert(root_path.clone(), actual.source.root.before.clone());
-        check_head(&mut actual, revision)?;
         output.depth_limit = MAX_DEPTH + 4;
         let id = submodules::Source {
             id: *source,
@@ -255,6 +292,20 @@ struct Walk<'a> {
     children: &'a BTreeMap<PathBuf, submodules::Source>,
 }
 fn copy_repository(
+    actual: &mut Checkout,
+    original: &Path,
+    prefix: &Path,
+    source: &submodules::Source,
+    context: &Context<'_>,
+    transfer: &mut Transfer<'_>,
+    depth: usize,
+) -> CargoResult<()> {
+    let revision = locked_oid(source.id)?;
+    copy_repository_inner(actual, original, prefix, source, context, transfer, depth)
+        .with_context(|| crate::sources::git::source::object_source_context(source.id, revision))
+}
+
+fn copy_repository_inner(
     actual: &mut Checkout,
     original: &Path,
     prefix: &Path,
@@ -608,6 +659,18 @@ struct Forecast {
     missing_bytes: u64,
 }
 fn forecast_repository(
+    source: &submodules::Source,
+    databases: &BTreeMap<String, Database>,
+    forecast: &mut Forecast,
+    missing: bool,
+    depth: usize,
+) -> CargoResult<()> {
+    let revision = locked_oid(source.id)?;
+    forecast_repository_inner(source, databases, forecast, missing, depth)
+        .with_context(|| crate::sources::git::source::object_source_context(source.id, revision))
+}
+
+fn forecast_repository_inner(
     source: &submodules::Source,
     databases: &BTreeMap<String, Database>,
     forecast: &mut Forecast,

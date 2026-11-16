@@ -22,6 +22,8 @@ const LOCKS: [&str; 2] = [".package-cache-mutate", ".package-cache"];
 pub(super) mod snapshot;
 mod view;
 pub(super) use view::OwnedView;
+mod recovery;
+pub(in crate::sources::git) use recovery::recover_missing_database;
 
 /// Per-invocation limit on fallback stream bytes, shared across every view.
 /// This is neither allocated-space accounting nor a storage reservation.
@@ -227,22 +229,7 @@ impl Cache {
             "cache input is not an owner-controlled directory"
         );
         trust_resource_provenance::require_no_acl_grants(&home.file)?;
-        let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: live descriptor and writable statfs; the kernel retains neither.
-        ensure!(
-            unsafe { libc::fstatfs(home.file.as_raw_fd(), fs.as_mut_ptr()) } == 0,
-            "cannot identify source cache filesystem"
-        );
-        // SAFETY: successful fstatfs initialized the complete value.
-        let fs = unsafe { fs.assume_init() };
-        #[cfg(target_os = "macos")]
-        let nfs = fs.f_fstypename[..4] == [b'n' as _, b'f' as _, b's' as _, 0];
-        #[cfg(target_os = "linux")]
-        let nfs = fs.f_type as u64 == libc::NFS_SUPER_MAGIC as u64;
-        ensure!(
-            !nfs,
-            "strict local source-cache locks are unavailable on NFS"
-        );
+        require_local_filesystem(&home.file)?;
         let mut result = Self {
             home,
             locks: Vec::new(),
@@ -1027,6 +1014,26 @@ impl Stage {
         })();
         completion.context("source-data home has been published; post-commit observation/durability failed, no rollback attempted")
     }
+}
+
+fn require_local_filesystem(file: &File) -> CargoResult<()> {
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: live descriptor and writable statfs; the kernel retains neither.
+    ensure!(
+        unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } == 0,
+        "cannot identify source cache filesystem"
+    );
+    // SAFETY: successful fstatfs initialized the complete value.
+    let fs = unsafe { fs.assume_init() };
+    #[cfg(target_os = "macos")]
+    let nfs = fs.f_fstypename[..4] == [b'n' as _, b'f' as _, b's' as _, 0];
+    #[cfg(target_os = "linux")]
+    let nfs = fs.f_type as u64 == libc::NFS_SUPER_MAGIC as u64;
+    ensure!(
+        !nfs,
+        "strict local source-cache locks are unavailable on NFS"
+    );
+    Ok(())
 }
 
 fn ancestor_security(directory: &Directory, child: Option<&Directory>) -> CargoResult<()> {

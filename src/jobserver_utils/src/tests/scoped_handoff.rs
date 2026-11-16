@@ -173,9 +173,8 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
     const EXACT: &str = "handoff::scoped_tests::scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement";
     #[cfg(feature = "client")]
     if std::env::var_os(NAMED).as_deref() == Some(OsStr::new("leaf")) {
-        // SAFETY: this fresh descendant imports only the original named pool.
-        let inherited = unsafe { super::super::InheritedJobserver::from_env() }.unwrap();
-        assert!(inherited.is_present());
+        let inherited = super::super::Jobserver::from_authenticated_env_handoff().unwrap().unwrap();
+        assert_eq!(inherited.client().available().unwrap(), 1);
         return;
     }
     if std::env::var_os(NAMED).is_some() {
@@ -184,6 +183,8 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
         #[cfg(feature = "client")]
         // SAFETY: this fixture advertises only named metadata, no reusable slots.
         assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
+        #[cfg(feature = "client")]
+        assert!(super::super::Jobserver::from_authenticated_env_handoff().is_err());
         #[cfg(feature = "client")]
         // SAFETY: same fresh named-only fixture; the shim must check scope too.
         assert!(unsafe { super::super::InheritedJobserver::from_env() }.is_err());
@@ -231,6 +232,8 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
         #[cfg(feature = "client")]
         // SAFETY: named-only metadata as above, now pointing at a replaced node.
         assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
+        #[cfg(feature = "client")]
+        assert!(super::super::Jobserver::from_authenticated_env_handoff().is_err());
         #[cfg(feature = "client")]
         // SAFETY: same fresh named-only fixture; the shim must check scope too.
         assert!(unsafe { super::super::InheritedJobserver::from_env() }.is_err());

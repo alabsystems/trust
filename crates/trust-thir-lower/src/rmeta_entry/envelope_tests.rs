@@ -7,14 +7,14 @@ use crate::rmeta_entry::{
     decode_entry_for_overflow, decode_evidence, encode_evidence, frame_entry,
 };
 
-// These offsets are the schema-5 wire contract, not pointers into an implementation struct.
+// These offsets are the schema-6 wire contract, not pointers into an implementation struct.
 const HEADER: usize = 56;
 const MODE: usize = HEADER + 16;
 const MODULE_DIGEST: usize = MODE + 1;
 const MODULE_LENGTH: usize = MODULE_DIGEST + 32;
 
 fn module() -> Module {
-    let mut m = Module::new("schema5_mode_control");
+    let mut m = Module::new("schema6_mode_control");
     let signature = m
         .intern_func_type(FuncTy {
             params: vec![Ty::U32],
@@ -161,10 +161,10 @@ fn an_inner_trailing_byte_is_refused_even_after_resealing() {
 
 #[test]
 fn old_entry_schemas_refuse_and_the_complete_evidence_schema_is_unchanged() {
-    assert_eq!(ENTRY_SCHEMA, 5);
+    assert_eq!(ENTRY_SCHEMA, 6);
     assert_eq!(EVIDENCE_SCHEMA, 4);
     let good = frame(true);
-    for schema in 0u32..5 {
+    for schema in 0u32..6 {
         let mut old = good.clone();
         old[8..12].copy_from_slice(&schema.to_le_bytes());
         assert_eq!(decode_entry(&old).unwrap_err(), EntryDecodeError::Schema(schema));
@@ -183,7 +183,7 @@ fn old_entry_schemas_refuse_and_the_complete_evidence_schema_is_unchanged() {
 fn schema_errors_name_the_separate_entry_and_evidence_expectations() {
     let mut old_entry = frame(true);
     old_entry[8..12].copy_from_slice(&4u32.to_le_bytes());
-    assert_eq!(decode_entry(&old_entry).unwrap_err().to_string(), "schema(4, expected 5)");
+    assert_eq!(decode_entry(&old_entry).unwrap_err().to_string(), "schema(4, expected 6)");
     let mut old_evidence = encode_evidence(&Evidence::default());
     old_evidence[8..12].copy_from_slice(&3u32.to_le_bytes());
     assert_eq!(decode_evidence(&old_evidence).unwrap_err(), EntryDecodeError::EvidenceSchema(3),);

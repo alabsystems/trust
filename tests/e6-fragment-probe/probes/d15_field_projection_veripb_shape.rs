@@ -31,7 +31,7 @@ clean {
 
     theorem sat_degree_le : forall (d : BitVec 64) (c : BitVec 64),
         Nat.le (key64 d) (key64 d) :=
-        fun d c => Nat.le.refl (key64 d)
+        fun d c => @Nat.le.refl (key64 d)
 }
 
 pub struct Constraint {

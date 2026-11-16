@@ -262,7 +262,7 @@ clean {
     -- naming trust_import_ here defers the whole island suffix past the walk
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 }
 
 pub fn keep(x: u64) -> u64

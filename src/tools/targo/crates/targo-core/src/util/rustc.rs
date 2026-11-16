@@ -170,28 +170,40 @@ impl Rustc {
         let jobserver = gctx.jobserver_from_env()?.cloned();
         let mut compiler_inputs = CompilerInputs::default();
         let content_identity = crate::is_targo_invocation().then(|| {
-            let global_sysroot = compiler_sysroot(&path, wrapper.as_deref(), None, gctx)
-                .context("failed to query the compiler sysroot")?;
-            let workspace_sysroot = if workspace_wrapper.is_some() {
-                compiler_sysroot(
-                    &path,
-                    wrapper.as_deref(),
-                    workspace_wrapper.as_deref(),
-                    gctx,
-                )?
-            } else {
-                global_sysroot.clone()
+            let launch = CompilerLaunch {
+                path: path.clone(),
+                wrapper: wrapper.clone(),
+                workspace_wrapper: workspace_wrapper.clone(),
+                rustup_rustc: rustup_rustc.to_path_buf(),
             };
-            compiler_content_identity_with_inputs(
-                &path,
-                wrapper.as_deref(),
-                workspace_wrapper.as_deref(),
-                rustup_rustc,
-                Some((&global_sysroot, &workspace_sysroot)),
-                gctx,
+            gctx.compiler_content_captures().capture(
+                launch,
                 &mut compiler_inputs,
+                |compiler_inputs| {
+                    let global_sysroot = compiler_sysroot(&path, wrapper.as_deref(), None, gctx)
+                        .context("failed to query the compiler sysroot")?;
+                    let workspace_sysroot = if workspace_wrapper.is_some() {
+                        compiler_sysroot(
+                            &path,
+                            wrapper.as_deref(),
+                            workspace_wrapper.as_deref(),
+                            gctx,
+                        )?
+                    } else {
+                        global_sysroot.clone()
+                    };
+                    compiler_content_identity_with_inputs(
+                        &path,
+                        wrapper.as_deref(),
+                        workspace_wrapper.as_deref(),
+                        rustup_rustc,
+                        Some((&global_sysroot, &workspace_sysroot)),
+                        gctx,
+                        compiler_inputs,
+                    )
+                    .context("failed to capture compiler content")
+                },
             )
-            .context("failed to capture compiler content")
         });
         let artifact_identity = content_identity.as_ref().map(|identity| {
             identity
@@ -672,7 +684,7 @@ impl Drop for Cache {
 /// Content supplied by the launcher, known runtime libraries, wrappers and
 /// reported sysroot libraries. This does not establish complete loader
 /// authority, arbitrary wrapper reads or flag-selected sysroot inputs.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompilerContentIdentity {
     global: u64,
     workspace: u64,
@@ -731,9 +743,60 @@ impl Hasher for CompilerIdentityHasher {
     }
 }
 
+/// The compiler launch a content capture describes.
+#[derive(Debug, PartialEq, Eq)]
+struct CompilerLaunch {
+    path: PathBuf,
+    wrapper: Option<PathBuf>,
+    workspace_wrapper: Option<PathBuf>,
+    rustup_rustc: PathBuf,
+}
+
+/// One command's compiler-content consistency records, kept by `GlobalContext`.
+/// Every construction captures current compiler/sysroot bytes and selection
+/// again. A previous observation is only a consistency guard, never a digest
+/// cache or an immutable-input owner. Same-launch content or inventory drift
+/// refuses the capture; the caller cannot attach its prior identity to it.
+/// Nothing is persisted or shared between commands. A failed capture is not kept.
+#[derive(Debug, Default)]
+pub(crate) struct CompilerContentCaptures(
+    std::sync::Mutex<Vec<(CompilerLaunch, CompilerContentIdentity, CompilerInputs)>>,
+);
+
+impl CompilerContentCaptures {
+    fn capture(
+        &self,
+        launch: CompilerLaunch,
+        inputs: &mut CompilerInputs,
+        capture: impl FnOnce(&mut CompilerInputs) -> CargoResult<CompilerContentIdentity>,
+    ) -> CargoResult<CompilerContentIdentity> {
+        let mut captures = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = capture(inputs)?;
+        if let Some((_, previous, recorded)) = captures.iter().find(|(kept, ..)| *kept == launch) {
+            if identity != *previous || inputs != recorded {
+                anyhow::bail!("compiler input content or inventory changed within one command");
+            }
+        } else {
+            captures.push((launch, identity, inputs.clone()));
+        }
+        Ok(identity)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 /// The paths whose contents formed the compiler identity. Confinement must
 /// grant these exact inputs, not the entire SDK containing them.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompilerInputs {
     pub files: std::collections::BTreeSet<PathBuf>,
     pub executables: std::collections::BTreeSet<PathBuf>,
@@ -904,15 +967,29 @@ fn hash_sysroot_libraries_with_inputs(
     root.hash(hasher);
     let paths = sysroot_library_paths(root)?;
     paths.len().hash(hasher);
+    let mut directories = std::collections::BTreeSet::new();
     for path in &paths {
         if std::fs::symlink_metadata(&path)?.is_dir() {
+            directories.insert(path);
+        }
+    }
+    let files: Vec<PathBuf> = paths
+        .iter()
+        .filter(|path| !directories.contains(path))
+        .cloned()
+        .collect();
+    let mut captured = capture_executable_contents(&files, contents, "sysroot input")?.into_iter();
+    for path in &paths {
+        if directories.contains(path) {
             inputs.record_directory(path)?;
             "directory".hash(hasher);
             path.hash(hasher);
         } else {
             "file".hash(hasher);
-            hash_executable_content_with_cache(&path, hasher, contents)
-                .with_context(|| format!("failed to capture sysroot input {}", path.display()))?;
+            captured
+                .next()
+                .context("sysroot capture lost an input")?
+                .hash_into(hasher);
             inputs.files.insert(path.clone());
         }
     }
@@ -1049,11 +1126,11 @@ fn compiler_content_identity_with_inputs(
     "runtime libraries".hash(&mut hasher);
     libraries.len().hash(&mut hasher);
     let mut contents = Vec::new();
-    for library in libraries {
-        hash_executable_content_with_cache(&library, &mut hasher, &mut contents)
-            .with_context(|| format!("failed to capture compiler library {}", library.display()))?;
-        inputs.files.insert(library);
+    let libraries: Vec<PathBuf> = libraries.into_iter().collect();
+    for captured in capture_executable_contents(&libraries, &mut contents, "compiler library")? {
+        captured.hash_into(&mut hasher);
     }
+    inputs.files.extend(libraries);
     if let Some(wrapper) = wrapper {
         let path = hash_executable_content(wrapper, &mut hasher)?;
         inputs.files.insert(path.clone());
@@ -1140,7 +1217,174 @@ fn hash_executable_content_with_cache(
     hasher: &mut impl Hasher,
     contents: &mut Vec<CapturedCompilerContent>,
 ) -> CargoResult<PathBuf> {
+    let retain = std::sync::atomic::AtomicUsize::new(64usize.saturating_sub(contents.len()));
+    let (captured, retained) = capture_executable_content(path, contents, &retain)?;
+    captured.hash_into(hasher);
+    contents.extend(retained);
+    Ok(captured.canonical)
+}
+
+/// What one compiler input contributes to the identity.
+struct CapturedInput {
+    resolved: PathBuf,
+    canonical: PathBuf,
+    digest: [u8; 32],
+}
+
+impl CapturedInput {
+    // Preserve launch spelling and resolved location: relative runtime-library
+    // lookup is not a demonstrated relocation axis yet. Ignore mere timestamps.
+    fn hash_into(&self, hasher: &mut impl Hasher) {
+        self.resolved.hash(hasher);
+        self.canonical.hash(hasher);
+        self.digest.hash(hasher);
+    }
+}
+
+/// Capture `paths` on a bounded pool and return them in `paths` order, so the
+/// identity hashes exactly what a serial capture hashes. Every file still gets
+/// the whole open, read and recheck protocol and every byte is read:
+/// parallelism changes when bytes are read, never which. Digests are reused
+/// only for an opened object already captured by an earlier batch of the same
+/// capture (COMPILER-CONTENT-ONCE-1), never across captures.
+fn capture_executable_contents(
+    paths: &[PathBuf],
+    contents: &mut Vec<CapturedCompilerContent>,
+    what: &str,
+) -> CargoResult<Vec<CapturedInput>> {
+    use rayon::prelude::*;
+    // OpenedFileIdentity retains a handle on Unix: at most 64 are retained
+    // across the capture, so concurrent workers hold a bounded descriptor set.
+    let retain = std::sync::atomic::AtomicUsize::new(64usize.saturating_sub(contents.len()));
+    let prior: &[CapturedCompilerContent] = contents;
+    let capture = |path: &PathBuf| {
+        capture_executable_content(path, prior, &retain)
+            .with_context(|| format!("failed to capture {what} {}", path.display()))
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let pool = (threads > 1 && paths.len() > 1)
+        .then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|index| format!("targo-compiler-capture-{index}"))
+                .build()
+                .ok()
+        })
+        .flatten();
+    let started = std::time::Instant::now();
+    let captured: Vec<_> = match pool {
+        Some(pool) => pool.install(|| paths.par_iter().map(capture).collect()),
+        None => paths.iter().map(capture).collect(),
+    };
+    tracing::debug!(
+        files = paths.len(),
+        threads,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "captured {what} content"
+    );
+    let mut inputs = Vec::with_capacity(captured.len());
+    let mut retained = Vec::new();
+    for result in captured {
+        let (input, entry) = result?;
+        inputs.push(input);
+        retained.extend(entry);
+    }
+    contents.extend(retained);
+    Ok(inputs)
+}
+
+/// A file longer than this is read and digested as BLAKE3 subtrees on the
+/// capture pool's threads, each subtree read at its own offset, so the largest
+/// compiler library (the 625 MB driver) is not one thread's serial read.
+const PARALLEL_DIGEST_FILE: u64 = 8 << 20;
+/// The subtree a capture worker reads and digests in one piece.
+const PARALLEL_DIGEST_LEAF: u64 = 4 << 20;
+
+fn digest_regular_file(file: &mut std::fs::File, len: u64) -> CargoResult<[u8; 32]> {
+    // Only a capture pool's worker splits a file: a serial capture must not
+    // start rayon's global pool.
+    #[cfg(unix)]
+    {
+        if len > PARALLEL_DIGEST_FILE && rayon::current_thread_index().is_some() {
+            return digest_file_subtrees(file, len, PARALLEL_DIGEST_LEAF);
+        }
+    }
     use std::io::Read as _;
+    let mut digest = blake3::Hasher::new();
+    let mut bytes = vec![0; len.clamp(64 * 1024, 4 << 20) as usize];
+    let mut total = 0;
+    loop {
+        let n = file.read(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > len {
+            anyhow::bail!("compiler input grew while hashing");
+        }
+        digest.update(&bytes[..n]);
+    }
+    if total != len {
+        anyhow::bail!("compiler input shrank while hashing");
+    }
+    Ok(*digest.finalize().as_bytes())
+}
+
+/// The BLAKE3 hash of the first `len` bytes of `file`, computed as the tree
+/// BLAKE3 defines: every subtree is split where `left_subtree_len` says, each
+/// leaf is read with `pread` at its offset, and children join on the current
+/// rayon pool. The result equals `blake3::hash` of the same bytes. A file that
+/// shrinks fails a read; one that grows or changes is refused by the caller's
+/// metadata recheck, exactly as for a serial read.
+#[cfg(unix)]
+fn digest_file_subtrees(file: &std::fs::File, len: u64, leaf: u64) -> CargoResult<[u8; 32]> {
+    use blake3::hazmat::{
+        ChainingValue, HasherExt as _, Mode, left_subtree_len, merge_subtrees_non_root,
+        merge_subtrees_root,
+    };
+    use std::os::unix::fs::FileExt as _;
+    fn subtree(
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+        leaf: u64,
+    ) -> CargoResult<ChainingValue> {
+        if len <= leaf {
+            let mut bytes = vec![0; len as usize];
+            file.read_exact_at(&mut bytes, offset)
+                .context("compiler input shrank while hashing")?;
+            return Ok(blake3::Hasher::new()
+                .set_input_offset(offset)
+                .update(&bytes)
+                .finalize_non_root());
+        }
+        let left = left_subtree_len(len);
+        let (l, r) = rayon::join(
+            || subtree(file, offset, left, leaf),
+            || subtree(file, offset + left, len - left, leaf),
+        );
+        Ok(merge_subtrees_non_root(&l?, &r?, Mode::Hash))
+    }
+    assert!(leaf >= blake3::CHUNK_LEN as u64 && leaf % blake3::CHUNK_LEN as u64 == 0);
+    if len <= leaf {
+        let mut bytes = vec![0; len as usize];
+        file.read_exact_at(&mut bytes, 0)
+            .context("compiler input shrank while hashing")?;
+        return Ok(*blake3::hash(&bytes).as_bytes());
+    }
+    let left = left_subtree_len(len);
+    let (l, r) = rayon::join(
+        || subtree(file, 0, left, leaf),
+        || subtree(file, left, len - left, leaf),
+    );
+    Ok(*merge_subtrees_root(&l?, &r?, Mode::Hash).as_bytes())
+}
+
+fn capture_executable_content(
+    path: &Path,
+    contents: &[CapturedCompilerContent],
+    retain: &std::sync::atomic::AtomicUsize,
+) -> CargoResult<(CapturedInput, Option<CapturedCompilerContent>)> {
     let resolved = paths::resolve_executable(path)
         .with_context(|| format!("failed to resolve compiler input {}", path.display()))?;
     let canonical = resolved
@@ -1170,24 +1414,7 @@ fn hash_executable_content_with_cache(
     let digest = if let Some(entry) = previous {
         entry.digest
     } else {
-        let mut digest = blake3::Hasher::new();
-        let mut bytes = [0; 64 * 1024];
-        let mut total = 0;
-        loop {
-            let n = file.read(&mut bytes)?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            if total > before.len() {
-                anyhow::bail!("compiler input grew while hashing");
-            }
-            digest.update(&bytes[..n]);
-        }
-        if total != before.len() {
-            anyhow::bail!("compiler input shrank while hashing");
-        }
-        *digest.finalize().as_bytes()
+        digest_regular_file(&mut file, before.len())?
     };
     let after = file.metadata()?;
     let rebound = options
@@ -1212,21 +1439,32 @@ fn hash_executable_content_with_cache(
             );
         }
     }
-    // Preserve launch spelling and resolved location: relative runtime-library
-    // lookup is not a demonstrated relocation axis yet. Ignore mere timestamps.
-    resolved.hash(hasher);
-    canonical.hash(hasher);
-    digest.hash(hasher);
     // OpenedFileIdentity retains a handle on Unix. Bound descriptor use;
     // additional files are still hashed and validated, simply without reuse.
-    if previous.is_none() && contents.len() < 64 {
-        contents.push(CapturedCompilerContent {
-            identity: opened,
-            metadata: after,
+    let take_slot = || {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut left = retain.load(Relaxed);
+        while left > 0 {
+            match retain.compare_exchange_weak(left, left - 1, Relaxed, Relaxed) {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+        false
+    };
+    let retained = (previous.is_none() && take_slot()).then_some(CapturedCompilerContent {
+        identity: opened,
+        metadata: after,
+        digest,
+    });
+    Ok((
+        CapturedInput {
+            resolved,
+            canonical,
             digest,
-        });
-    }
-    Ok(canonical)
+        },
+        retained,
+    ))
 }
 
 fn rustc_fingerprint(
@@ -1682,6 +1920,258 @@ mod compiler_content_tests {
         assert_ne!(before.global, after.global);
         filetime::set_file_mtime(&library, FileTime::from_unix_time(1, 0)).unwrap();
         assert_eq!(after.global, capture().global);
+    }
+
+    #[test]
+    fn same_launch_must_not_reuse_content_after_compiler_input_mutation() {
+        let mut stale = Vec::new();
+        for changed in [
+            "bin/compiler",
+            "lib/driver.dylib",
+            "lib/rustlib/native/lib/libcore.rlib",
+            "bin/workspace-wrapper",
+            "directory-membership",
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::create_dir_all(root.join("lib/rustlib/native/lib")).unwrap();
+            for name in [
+                "bin/compiler",
+                "lib/driver.dylib",
+                "lib/rustlib/native/lib/libcore.rlib",
+                "bin/workspace-wrapper",
+            ] {
+                std::fs::write(root.join(name), b"original bytes").unwrap();
+            }
+            let compiler = root.join("bin/compiler");
+            let workspace_wrapper = root.join("bin/workspace-wrapper");
+            let gctx = GlobalContext::default().unwrap();
+            let launch = || CompilerLaunch {
+                path: compiler.clone(),
+                wrapper: None,
+                workspace_wrapper: Some(workspace_wrapper.clone()),
+                rustup_rustc: PathBuf::from("unused-rustup"),
+            };
+            let capture = |inputs: &mut CompilerInputs| {
+                compiler_content_identity_with_inputs(
+                    &compiler,
+                    None,
+                    Some(&workspace_wrapper),
+                    Path::new("unused-rustup"),
+                    Some((&root, &root)),
+                    &gctx,
+                    inputs,
+                )
+            };
+            let captures = CompilerContentCaptures::default();
+            let first = captures
+                .capture(launch(), &mut CompilerInputs::default(), capture)
+                .unwrap();
+            if changed == "directory-membership" {
+                std::fs::write(root.join("lib/unrelated.txt"), b"new unrecorded member").unwrap();
+            } else {
+                let path = root.join(changed);
+                let stamp =
+                    FileTime::from_last_modification_time(&std::fs::metadata(&path).unwrap());
+                std::fs::write(&path, b"mutated! bytes").unwrap();
+                filetime::set_file_mtime(&path, stamp).unwrap();
+            }
+            let mut fresh_inputs = CompilerInputs::default();
+            let fresh = capture(&mut fresh_inputs).unwrap();
+            if changed == "directory-membership" {
+                assert_eq!(
+                    first, fresh,
+                    "an unrelated member changes inventory, not compiler bytes"
+                );
+            } else {
+                assert!(
+                    first.global_full != fresh.global_full
+                        || first.workspace_full != fresh.workspace_full,
+                    "physical mutation was not detected: {changed}"
+                );
+                if changed == "bin/workspace-wrapper" {
+                    assert_eq!(
+                        first.global_full, fresh.global_full,
+                        "isolate workspace-only identity drift"
+                    );
+                }
+            }
+            let mut inputs = CompilerInputs::default();
+            match captures.capture(launch(), &mut inputs, capture) {
+                Err(_) => {} // A refusal is safe too.
+                Ok(identity) => {
+                    if inputs.ensure_directories_current().is_err() {
+                        continue; // The caller also refuses an outdated inventory.
+                    }
+                    if identity != fresh || inputs != fresh_inputs {
+                        stale.push(changed);
+                    }
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "same launch accepted stale compiler content after mutation: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn one_command_recaptures_each_compiler_launch_and_checks_consistency() {
+        let captures = CompilerContentCaptures::default();
+        let launch = |path: &str| CompilerLaunch {
+            path: PathBuf::from(path),
+            wrapper: None,
+            workspace_wrapper: None,
+            rustup_rustc: PathBuf::from("rustup-rustc"),
+        };
+        let identity = |value| CompilerContentIdentity {
+            global: value,
+            workspace: value,
+            global_full: [0; 32],
+            workspace_full: [0; 32],
+            cacheable: true,
+        };
+        let runs = std::cell::Cell::new(0);
+        let capture = |value, inputs: &mut CompilerInputs| {
+            runs.set(runs.get() + 1);
+            inputs.files.insert(PathBuf::from("libstd.rlib"));
+            Ok(identity(value))
+        };
+        let mut first = CompilerInputs::default();
+        let a = captures
+            .capture(launch("trustc"), &mut first, |inputs| capture(1, inputs))
+            .unwrap();
+        let mut second = CompilerInputs::default();
+        let b = captures
+            .capture(launch("trustc"), &mut second, |inputs| capture(1, inputs))
+            .unwrap();
+        assert_eq!(
+            runs.get(),
+            2,
+            "the second construction captures current inputs again"
+        );
+        assert_eq!((a.global, b.global), (1, 1));
+        assert_eq!(second.files, first.files);
+        let drift = captures
+            .capture(launch("trustc"), &mut CompilerInputs::default(), |inputs| {
+                capture(2, inputs)
+            })
+            .unwrap_err();
+        assert!(
+            drift
+                .to_string()
+                .contains("compiler input content or inventory changed within one command")
+        );
+        captures
+            .capture(launch("other"), &mut CompilerInputs::default(), |inputs| {
+                capture(3, inputs)
+            })
+            .unwrap();
+        assert_eq!(
+            runs.get(),
+            4,
+            "a refused drift and another compiler are both captured"
+        );
+        assert!(
+            captures
+                .capture(launch("failing"), &mut CompilerInputs::default(), |_| {
+                    anyhow::bail!("unreadable")
+                })
+                .is_err()
+        );
+        assert_eq!(captures.len(), 2, "a failed capture is not kept");
+    }
+
+    #[test]
+    fn parallel_capture_hashes_what_a_serial_capture_hashes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..12 {
+            let path = root.path().join(format!("lib{index}.rlib"));
+            std::fs::write(&path, format!("library {index}").repeat(index * 97 + 1)).unwrap();
+            paths.push(path);
+        }
+        // Larger than one read block and than the parallel digest threshold.
+        let large: Vec<u8> = (0..(9 << 20) + 7)
+            .map(|i: usize| (i * 31 % 251) as u8)
+            .collect();
+        let driver = root.path().join("librustc_driver.dylib");
+        std::fs::write(&driver, &large).unwrap();
+        let alias = root.path().join("alias.dylib");
+        std::fs::hard_link(&driver, &alias).unwrap();
+        paths.extend([driver.clone(), alias]);
+
+        let mut serial = StableHasher::new();
+        let mut serial_contents = Vec::new();
+        for path in &paths {
+            hash_executable_content_with_cache(path, &mut serial, &mut serial_contents).unwrap();
+        }
+        let mut parallel = StableHasher::new();
+        let mut parallel_contents = Vec::new();
+        let captured =
+            capture_executable_contents(&paths, &mut parallel_contents, "test input").unwrap();
+        for input in &captured {
+            input.hash_into(&mut parallel);
+        }
+        assert_eq!(Hasher::finish(&serial), Hasher::finish(&parallel));
+        let driver_digest = captured
+            .iter()
+            .find(|input| input.resolved == driver)
+            .unwrap()
+            .digest;
+        assert_eq!(driver_digest, *blake3::hash(&large).as_bytes());
+
+        // A later batch reuses an earlier batch's opened object, and a byte
+        // change behind an unchanged length and timestamp is still seen.
+        let timestamp = FileTime::from_last_modification_time(&std::fs::metadata(&driver).unwrap());
+        let mut changed = large.clone();
+        changed[5 << 20] ^= 1;
+        std::fs::write(&driver, &changed).unwrap();
+        filetime::set_file_mtime(&driver, timestamp).unwrap();
+        let recaptured =
+            capture_executable_contents(&[driver.clone()], &mut Vec::new(), "test input").unwrap();
+        assert_eq!(recaptured[0].digest, *blake3::hash(&changed).as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subtree_digest_is_the_blake3_hash_at_every_shape() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input");
+        let chunk = blake3::CHUNK_LEN as u64;
+        let lengths = [
+            0,
+            1,
+            chunk - 1,
+            chunk,
+            chunk + 1,
+            2 * chunk,
+            3 * chunk + 17,
+            7 * chunk,
+            8 * chunk,
+            9 * chunk - 1,
+            64 * chunk + 1,
+            1000 * chunk + 333,
+        ];
+        for len in lengths {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 131 % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            for leaf in [chunk, 2 * chunk, 3 * chunk, 16 * chunk] {
+                assert_eq!(
+                    digest_file_subtrees(&file, len, leaf).unwrap(),
+                    *blake3::hash(&bytes).as_bytes(),
+                    "length {len}, leaf {leaf}"
+                );
+            }
+            if len > 0 {
+                assert!(
+                    digest_file_subtrees(&file, len + chunk, chunk).is_err(),
+                    "a file shorter than its recorded length is refused"
+                );
+            }
+        }
     }
 
     #[test]

@@ -49,6 +49,7 @@ description = "Clean -> TrustIR producer: the second consumer of a sealed CleanO
 workspace = true
 
 [dependencies]
+clean-kernel = { workspace = true }
 trust-clean-origin = { path = "../trust-clean-origin" }
 trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-ir = { workspace = true }
@@ -72,10 +73,11 @@ trust-ir-build = { workspace = true }
 trust-types = { path = "../trust-types", default-features = false }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 # TESTS ONLY. A `CleanOriginPlan` has no public constructor -- by design, since a
 # plan must rest on a kernel verdict -- so the tests drive REAL Clean source
 # through a real island session, exactly as trust-clean-origin's own control
 # tests do. No cycle: neither crate depends on this one.
 trust-certify = { path = "../trust-certify" }
 clean-kernel = { workspace = true }
-trust-ir = { workspace = true, features = ["clean-expr"] }
+trust-ir = { workspace = true, features = ["clean-expr", "binary"] }

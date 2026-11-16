@@ -7,8 +7,8 @@ LL | |     theorem min2_le_left : forall (x : UInt64) (y : UInt64),
 LL | |         Nat.le (UInt64.toNat (if x < y then x else y)) (UInt64.toNat x) :=
 ...  |
 LL | |             (fun h => Iff.mp (Nat.not_lt (UInt64.toNat x) (UInt64.toNat y)) h)
-LL | |             (fun h => Nat.le.refl (UInt64.toNat x))
-   | |___________________________________________________^
+LL | |             (fun h => @Nat.le.refl (UInt64.toNat x))
+   | |____________________________________________________^
 
 
 === Trust Verification Report (e9_release_mode_discharge) ===

@@ -2626,11 +2626,14 @@ mod tests {
 
     #[test]
     fn verify_rejects_axiom_backed_proof_of_canonical_theorem() {
-        // THE FORGERY CONTROL for the strict closure gate: the prelude ships
-        // `sorry.{u} : {α : Sort u} → α` as an axiom-kind constant, so
+        // THE FORGERY CONTROL for the strict closure gate. `sorry.{u} : {α :
+        // Sort u} → α` is an axiom-kind constant, so where it exists
         // `sorry (Trust.VC.holds k f)` KERNEL-TYPECHECKS at the canonical
-        // theorem for ANY VC — including satisfiable violations. Both halves
-        // are asserted: the kernel alone accepts it; verify_proof_cert rejects.
+        // theorem for ANY VC — including satisfiable violations. Clean ships
+        // it in the opt-in admission fragment (`init_admission_stub_theory`),
+        // not in the prelude, so there are two refusals and both are asserted:
+        // the certification environment cannot name the marker at all, and
+        // where it can be named the closure audit calls it an axiom.
         let kind = test_kind();
         // A SATISFIABLE violation — certifying it would be a false-Certify.
         let formula = Formula::Not(Box::new(Formula::Eq(
@@ -2639,24 +2642,41 @@ mod tests {
         )));
         let theorem = translate_vc_to_clean_theorem(&kind, &formula);
         let env = certification_env().expect("certification env builds");
-        let tc = TypeChecker::new(env);
 
         let sorry0 = LeanExpr::const_(name("sorry"), vec![LeanLevel::zero()]);
         let forged = LeanExpr::app(sorry0, theorem.clone());
-        let (ty, cert) = tc
-            .infer_type_with_cert(&forged)
-            .expect("control: the kernel alone accepts the sorry-backed term");
+        assert!(
+            TypeChecker::new(env).infer_type_with_cert(&forged).is_err(),
+            "the certification environment must not be able to name `sorry`"
+        );
+
+        // The control: an environment that opted in to the admission markers.
+        let mut admitted = env.clone();
+        admitted.init_admission_stub_theory().expect("admission fragment registers");
+        let tc = TypeChecker::new(&admitted);
+        let (ty, cert) = tc.infer_type_with_cert(&forged).expect(
+            "control: with the admission fragment the kernel accepts the sorry-backed term",
+        );
         assert!(
             tc.is_def_eq(&ty, &theorem),
             "control: without the closure gate the forgery def-eqs the canonical theorem"
         );
-
-        let err = verify_proof_cert(&cert, &theorem)
-            .expect_err("axiom-backed proof must be rejected by the closure gate");
+        assert_eq!(
+            admitted.get_const(&name("sorry")).map(|info| info.kind),
+            Some(ConstantKind::Axiom),
+            "control: the marker is an axiom-kind constant"
+        );
         assert!(
-            matches!(err, CertificateError::KernelRejected { .. })
-                && err.to_string().contains("axiom"),
-            "rejection must name the axiom-closure gate, got: {err}"
+            !proof_is_axiom_free(&admitted, &forged),
+            "the closure audit must refuse the sorry-backed term where the marker exists"
+        );
+
+        // The forged certificate, replayed where certification happens.
+        let err = verify_proof_cert(&cert, &theorem)
+            .expect_err("axiom-backed proof must be rejected by certification");
+        assert!(
+            matches!(err, CertificateError::KernelRejected { .. }),
+            "certification must reject the forged certificate, got: {err}"
         );
     }
 

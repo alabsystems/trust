@@ -35,6 +35,20 @@ pub enum HelperThread {
 }
 
 impl Client {
+    /// Trust: lend the waiting caller's one execution to a child compiler.
+    /// This transfers only the same GNU transport, never a fresh pool or native
+    /// worker grant. The caller must serialize loans and retain the returned
+    /// owner through the entire child wait. Native workers require their own
+    /// admitted child profile and refuse this ordinary transport-only route.
+    pub(super) fn for_compiler_descendant(&self) -> Result<jobserver_utils::Jobserver, String> {
+        if self.is_global() {
+            return Err(
+                "a native worker child compiler requires an admitted execution profile".into()
+            );
+        }
+        super::early::for_compiler_descendant(&self.local)
+    }
+
     pub fn is_global(&self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {

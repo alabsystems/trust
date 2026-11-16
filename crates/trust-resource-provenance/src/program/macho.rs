@@ -49,7 +49,17 @@ pub(super) fn produced_commands(bytes: &[u8], executable: bool) -> io::Result<Co
     parse_commands(bytes, executable, true)
 }
 
-fn parse_commands(bytes: &[u8], executable: bool, produced: bool) -> io::Result<Commands> {
+/// The distinct ordinary-command profile ignores run paths only after every static
+/// dependency is a canonical absolute system import. It grants no loader roots.
+pub(super) fn absolute_system_commands(bytes: &[u8]) -> io::Result<Commands> {
+    let commands = parse_commands(bytes, true, true)?;
+    if commands.loads.iter().any(|load| !system(load)) {
+        return Err(refused("absolute native command requires canonical system imports"));
+    }
+    Ok(commands)
+}
+
+fn parse_commands(bytes: &[u8], executable: bool, expanded_rpaths: bool) -> io::Result<Commands> {
     if word(bytes, 0)? != 0xfeed_facf
         || word(bytes, 4)? != 0x0100_000c
         || word(bytes, 12)? != if executable { 2 } else { 6 }
@@ -99,7 +109,7 @@ fn parse_commands(bytes: &[u8], executable: bool, produced: bool) -> io::Result<
             }
             0x8000_001c => {
                 let path = text(command, 8, 12)?;
-                if !produced
+                if !expanded_rpaths
                     && !matches!(
                         path.as_str(),
                         "@loader_path" | "@loader_path/../lib" | "@executable_path/../lib"
@@ -126,6 +136,10 @@ fn parse_commands(bytes: &[u8], executable: bool, produced: bool) -> io::Result<
     }
     Ok(Commands { loads, rpaths })
 }
+
+#[cfg(test)]
+#[path = "macho/absolute_system_tests.rs"]
+mod absolute_system_tests;
 
 #[cfg(test)]
 mod tests {

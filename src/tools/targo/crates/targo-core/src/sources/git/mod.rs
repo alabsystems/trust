@@ -10,7 +10,7 @@
 pub use self::source::GitSource;
 pub use self::utils::{GitCheckout, GitDatabase, GitRemote, fetch, resolve_ref};
 mod known_hosts;
-// Trust: an explicit source-DATA transaction, separate from normal fetching.
+// Trust: guarded source-DATA import and absent-database recovery.
 mod local_import;
 pub use local_import::import_locked_source_data;
 pub use local_import::{snapshot_locked_cache_data, snapshot_locked_cache_data_workspaces};

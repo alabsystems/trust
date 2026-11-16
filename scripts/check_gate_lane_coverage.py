@@ -152,6 +152,19 @@ INDIRECT: dict[str, str] = {
     # by the `slow.idiomatic-rust-sample` row added with this entry, so the
     # indirection terminates in a row. Read, not assumed: checked 2026-09-20.
     "tests/idiomatic-rust-sample": "scripts/idiomatic_rust_sample.sh",
+    # The bench's 71 programs as files, one per `b <category> <name> '<source>'`
+    # line of scripts/daily_driver_bench.sh, so `targo trust gate corpus-delta`
+    # can compile them (tests/corpora.toml, corpus `bench`). The script still
+    # writes its own copies and does not read this directory. What holds the
+    # two together is targo-trust's unit binary:
+    # corpus_delta::tests::cases::the_bench_table_matches_its_script reads the
+    # script and every file here, and is red when a case, a source or the
+    # arguments differ. Read, not assumed: checked 2026-11-14. Not on yet
+    # (docs/STATUS.md, "Daily-driver corpora on the deployed pack"): that row is
+    # scoped to changes under targo-trust/ and its dependency graph, so a push
+    # that changes only this directory or only the script does not run it;
+    # quick.targo-trust-tests does.
+    "tests/daily-driver-bench": "scripts/check_targo_trust_unit_tests.sh",
     # `scripts/check_*` checkers reached through an aggregate a row DOES name.
     # Verified by reading the aggregate, not by assuming: the e2e script execs
     # the real checker (not a synthetic copy) inside the corpus lane.

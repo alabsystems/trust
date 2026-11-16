@@ -74,11 +74,15 @@ Usage: targo trust benchmark <command> [args...]
 
 Commands:
   program-index   Run the compile/verify program-index matrix in Rust
+  verify-cost     Time verifying a generated crate of trivial functions (PKG-C5d)
+  rival           Time Trust's edit loop against a rival tool (blaze)
 
 Examples:
   targo trust benchmark program-index --list
+  targo trust benchmark rival --subject small --check
   targo trust benchmark program-index --suite proof-design --limit 2 --slots trust-verify
   targo trust benchmark program-index --runtime-parity --slots upstream-rustc trust-noverify llvm
+  targo trust benchmark verify-cost --trustc build/host/stage1/bin/trustc --by-shape
 
 Python is not used by this benchmark command.
 ";
@@ -251,11 +255,11 @@ impl BuildProfile {
 }
 
 #[derive(Debug, Clone)]
-struct CommandRun {
-    exit_code: Option<i32>,
-    timed_out: bool,
-    elapsed_seconds: f64,
-    resource_usage: Value,
+pub(crate) struct CommandRun {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
+    pub(crate) elapsed_seconds: f64,
+    pub(crate) resource_usage: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +313,8 @@ pub(crate) fn run_benchmark_subcommand(args: &[String]) -> ExitCode {
 
     match command {
         "program-index" => run_program_index_subcommand(&args[1..]),
+        "verify-cost" => crate::verify_cost::run_verify_cost_subcommand(&args[1..]),
+        "rival" => crate::rival_bench::run(&args[1..]),
         other => {
             eprintln!("targo trust benchmark: unknown command `{other}`");
             eprint!("{BENCHMARK_USAGE}");
@@ -3651,7 +3657,7 @@ fn execute_command(input: CommandExecutionInput<'_>) -> Result<ExecutionResult, 
     })
 }
 
-fn run_command_with_resource_usage(
+pub(crate) fn run_command_with_resource_usage(
     command: &[String],
     cwd: &Path,
     env_map: &BTreeMap<String, String>,

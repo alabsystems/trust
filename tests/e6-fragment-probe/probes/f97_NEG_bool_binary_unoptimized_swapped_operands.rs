@@ -18,9 +18,9 @@ clean {
     def key64 (v : BitVec 64) : Nat :=
         Nat.xor (BitVec.toNat v) 9223372036854775808
     def axis_swapped_isl (p : BitVec 64) (lo : BitVec 64) (hi : BitVec 64) : Bool :=
-        Bool.and (Decidable.decide (Nat.le (key64 lo) (key64 p))
+        Bool.and (@Decidable.decide (Nat.le (key64 lo) (key64 p))
                                    (Nat.decLe (key64 lo) (key64 p)))
-                 (Decidable.decide (Nat.le (key64 hi) (key64 p))
+                 (@Decidable.decide (Nat.le (key64 hi) (key64 p))
                                    (Nat.decLe (key64 hi) (key64 p)))
 }
 pub fn axis_contains(p: i64, lo: i64, hi: i64) -> bool

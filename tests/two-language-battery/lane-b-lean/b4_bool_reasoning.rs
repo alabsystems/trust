@@ -70,33 +70,33 @@
 
 clean {
     theorem bool_double_negation : forall (b : Bool),
-        Eq Bool (Bool.not (Bool.not b)) b :=
-        fun b => Bool.rec
-            (fun bb => Eq Bool (Bool.not (Bool.not bb)) bb)
-            (Eq.refl Bool Bool.false)
-            (Eq.refl Bool Bool.true)
+        @Eq Bool (Bool.not (Bool.not b)) b :=
+        fun b => @Bool.rec
+            (fun bb => @Eq Bool (Bool.not (Bool.not bb)) bb)
+            (@Eq.refl Bool Bool.false)
+            (@Eq.refl Bool Bool.true)
             b
 
     theorem ble_decides_le : forall (x y : UInt64) (d : Bool),
-        Eq Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)) d ->
-        Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x d)) (UInt64.toNat y) :=
-        fun x y d => Bool.rec
-            (fun dd => Eq Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)) dd ->
-                Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x dd)) (UInt64.toNat y))
-            (fun h => Nat.le.refl (UInt64.toNat y))
+        @Eq Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)) d ->
+        Nat.le (UInt64.toNat (@Bool.rec (fun _ => UInt64) y x d)) (UInt64.toNat y) :=
+        fun x y d => @Bool.rec
+            (fun dd => @Eq Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)) dd ->
+                Nat.le (UInt64.toNat (@Bool.rec (fun _ => UInt64) y x dd)) (UInt64.toNat y))
+            (fun h => @Nat.le.refl (UInt64.toNat y))
             (fun h => Nat.le_of_ble_eq_true (UInt64.toNat x) (UInt64.toNat y) h)
             d
 
     theorem ble_selects_le : forall (x y : UInt64),
-        Nat.le (UInt64.toNat (Bool.rec (fun _ => UInt64) y x
+        Nat.le (UInt64.toNat (@Bool.rec (fun _ => UInt64) y x
             (Nat.ble (UInt64.toNat x) (UInt64.toNat y))))
             (UInt64.toNat y) :=
         fun x y => ble_decides_le x y (Nat.ble (UInt64.toNat x) (UInt64.toNat y))
-            (Eq.refl Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)))
+            (@Eq.refl Bool (Nat.ble (UInt64.toNat x) (UInt64.toNat y)))
 
     theorem ble_refl_true : forall (a : Nat),
-        Eq Bool (Nat.ble a a) Bool.true :=
-        fun a => Nat.ble_eq_true_of_le a a (Nat.le.refl a)
+        @Eq Bool (Nat.ble a a) Bool.true :=
+        fun a => Nat.ble_eq_true_of_le a a (@Nat.le.refl a)
 
     theorem le_ble_roundtrip : forall (a b : Nat),
         Nat.le a b -> Nat.le a b :=

@@ -74,7 +74,7 @@
 clean {
     theorem u64_ge_refl : forall (x : UInt64),
         Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
+        fun x => @Nat.le.refl (UInt64.toNat x)
 
     theorem nat_le_doubled : forall (n : Nat),
         Nat.le n (Nat.add n n) :=
