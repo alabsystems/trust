@@ -1,4 +1,3 @@
-// ignore-tidy-dbg -- `lenwitness_dbg!` is a gated debug channel, not std dbg!; tidy's check is textual
 // trust_vcgen/generate.rs: Core verification condition generation
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -64,10 +63,22 @@ const MAX_SEMANTIC_GUARD_STMTS: usize = 8000;
 
 /// Combined WORK budget for `build_semantic_guard_map`, measured as the
 /// PER-BLOCK sum `Σ_b stmts_b × max(agg_operands_b, 1)`. The BFS versions each
-/// block-def (one per aggregate field) at establish points via the
-/// statement-version oracle, whose per-query cost is bounded by the statements
-/// and aggregate operands OF THE QUERIED BLOCK — so a block only pays for its
-/// own density, and a function's cost is the sum of its blocks' local products.
+/// block-def (one per aggregate field) at establish points — a block pays for its
+/// own density — and so a function's cost is the sum of its blocks' local products.
+///
+/// RE-JUSTIFIED 2026-09-28 (WS-E, the SSA statement-version oracle). The cost model
+/// above used to rest on the version oracle's per-query cost being "bounded by the
+/// statements and aggregate operands OF THE QUERIED BLOCK" (the retired
+/// `writes_until` prefix extraction). That query is now O(log), so the oracle is not
+/// what these three caps bound any more. What still is super-linear is the BFS
+/// itself: every block STORES, and re-versions, the whole guard list accumulated
+/// along its first path — Θ(blocks × path depth) facts. Measured with deterministic
+/// counts (`version_ssa_scaling_tests::measure_semantic_guard_map`, the caps not
+/// reached): `locals_chain` stores 14,840 / 59,120 / 236,000 / 943,040 facts at
+/// 114 / 226 / 450 / 898 blocks (4x per doubling), and the back-edge ladder makes
+/// 241 / 993 / 4,033 / 16,257 version queries at 16 / 32 / 64 / 128 blocks. The caps
+/// therefore stay until the threaded facts are hash-consed persistent sets (WS-E
+/// step 6), and are to be deleted in that commit, with the measurement showing it.
 /// A previous model used the GLOBAL triple product
 /// `blocks × total_stmts × total_agg_operands`, tuned on the 1-block kernel
 /// shape where it coincides with the per-block sum; on many-small-blocks
@@ -90,6 +101,7 @@ const MAX_SEMANTIC_GUARD_WORK: usize = 400_000;
 /// to build the exact panic condition `s[range]` carries. RangeInclusive (`a..=b`,
 /// `+1`/overflow subtlety) and RangeFull (`..`, never panics) are intentionally
 /// excluded — they are handled soundly elsewhere.
+#[derive(Clone, Copy)]
 enum RangeFamilyOperands<'a> {
     /// `a..b` (`std::ops::Range`): panics when `start > end` OR `end > len`.
     Exclusive(&'a Operand, &'a Operand),
@@ -353,33 +365,62 @@ enum InferredSubject {
 /// elements is treated as an availability hazard unless proven smaller — sized
 /// to clear legitimate content-derived allocations while flagging untrusted or
 /// unbounded sizes (matches AY's own `MAX_DIMACS_VARS = 1 << 28` backstop).
+///
+/// Trust (2026-10-08, review of ALLOC-BYTE-1): this is a VALUE threshold, and
+/// it is still one. It is a disjunct of every counted allocation row, including
+/// the rows whose capacity term is already the exact panic line, so for a 1-byte
+/// element it is a 256 MiB byte line by another name, and it decides the verdict
+/// of a constant count past it (`Vec::<u64>::with_capacity(300_000_000)` is
+/// reported; `Box::<[u64; 1 << 37]>::new` is not). It is kept, and recorded as
+/// OPEN policy debt (docs/OPEN_ISSUES.md D102). A counted allocation whose
+/// element size is unknown now keeps a visible Unknown, apart from a literal
+/// zero request; this count threshold cannot establish byte capacity for a
+/// generic `T` or an unsized destination. Known layouts retain their separate
+/// capacity term. Removing this availability threshold is a distinct change.
 const UNBOUNDED_ALLOC_ELEM_CEILING: i128 = 1 << 28;
 
-/// Per-allocation BYTE budget (256 MiB), mirroring the trust-ir interpreter's
-/// default `mem_budget`. Used to TIGHTEN the element-count ceiling for the one
-/// MIR allocation whose element type is recoverable — `vec![x; n]` / `from_elem`,
-/// where the element VALUE is a real typed operand (with_capacity/reserve/resize/
-/// collect erase T to u8 via RawVec, so byte size is unrecoverable there; that is
-/// handled at the trust-ir layer in `trust_ir::alloc_bound`). Applied ONLY to a
-/// SYMBOLIC count, so a constant multi-byte allocation that already cleared the
-/// element ceiling stays green and never becomes a false ground hard error.
-const UNBOUNDED_ALLOC_BYTE_CEILING: i128 = 256 * 1024 * 1024;
+// There is NO per-allocation BYTE budget for an element of more than one byte:
+// the 256 MiB `UNBOUNDED_ALLOC_BYTE_CEILING` that stood here — a copy of
+// trust-ir's `alloc_bound::ALLOC_BYTE_BUDGET`, failing a symbolic multi-byte
+// allocation whose `stride * count` might reach 256 MiB and a single value of
+// 256 MiB or more — was deleted 2026-10-08 (ALLOC-BYTE-1, after trust-ir's
+// dda53e12; the owner, 2026-09-29: "delete the 256 MiB number; the lint
+// reports only allocations whose size is not provably bounded"; docs/OWNER_RULINGS.md OW-29). It was deleted
+// together with the two fixes that make it unnecessary, because it had been
+// guarding two real panics nothing else charged:
+//
+//   * the TARGET'S object limit. The byte line is now `isize::MAX` at the
+//     compilation target's pointer width (`alloc_bounds::AllocTarget`, from the
+//     compiler-supplied `VcgenContext::with_target_pointer_bits`), not the 64-bit
+//     value: on a 32-bit target `Vec::<[u8; 65536]>::with_capacity(n as usize)`
+//     over a `u16` panics from `n = 32768`, and only the 256 MiB atom refused it;
+//   * a LIVE receiver. `reserve` / `reserve_exact` / `extend_reserve`, a counted
+//     `extend` and a counted `collect_into` add their count to what the receiver
+//     already holds (RawVec asks for `(len + additional) * stride`). Their rows
+//     now charge the receiver too (`AllocTarget::live_receiver_items`): one live
+//     element of `MaybeUninit<[u8; 1 << 35]>` plus `reserve(n)` with
+//     `n < 2^28` panics "capacity overflow", and only the 256 MiB atom refused it.
 
-/// `isize::MAX` in bytes on a 64-bit target. A `Vec` / `RawVec` allocation whose
-/// `count * size_of::<T>()` REACHES this byte total panics with "capacity overflow"
-/// at runtime (RawVec hard-caps every allocation at `isize::MAX` bytes, BEFORE the
-/// availability budget matters) — a real, credited memory-safety panic. The
+/// `isize::MAX` in bytes on a 64-bit target — the 64-bit arm of
+/// `alloc_bounds::AllocTarget`'s object limit, and nothing else. A `Vec` /
+/// `RawVec` allocation whose `count * size_of::<T>()` REACHES the target's
+/// `isize::MAX` panics with "capacity overflow" at runtime (RawVec hard-caps every
+/// allocation at `isize::MAX` bytes) — a real, credited memory-safety panic. The
 /// `UNBOUNDED_ALLOC_ELEM_CEILING` (count-only) obligation does NOT catch it: a
 /// MULTI-BYTE element makes `count * stride` overflow `isize::MAX` while `count`
 /// itself stays far below `2^28` (e.g. `Vec::<[u8; 1<<40]>::with_capacity(n)` with
-/// `n < 2^27`). Trust's targets are 64-bit; on a 32-bit target the true limit is
-/// smaller, so over-approximating with the 64-bit value flags only MORE (sound).
+/// `n < 2^27`). It is NOT the line on a narrower target: a LARGER failure
+/// threshold flags FEWER allocations, so judging a 32-bit target at this value
+/// would prove allocations that panic there (the pre-2026-10-08 comment here said
+/// the opposite, and was wrong).
 const ALLOC_CAPACITY_OVERFLOW_BYTES: i128 = (1 << 63) - 1;
 
 /// The kind of overflowing arithmetic hidden inside a recognized `Terminator::Call`.
 #[derive(Clone, Copy)]
 enum OverflowCall {
-    /// `base.pow(exp)` — exponentiation, modeled conservatively.
+    /// `base.pow(exp)` on core's primitive integers — exponentiation, modeled
+    /// exactly (`v2_overflow_call_body`); minted only for the authenticated
+    /// `core::num::<impl iN/uN>::pow` (`alloc_bounds::overflow_arith_call`).
     Pow,
     /// `unchecked_{add,sub,mul}(a, b)` — UB on overflow; the inner `+`/`-`/`*`.
     Unchecked(BinOp),
@@ -424,6 +465,49 @@ enum SliceMethodPanic {
     /// `HashMap`/`BTreeMap`/`VecDeque`/`HashSet::remove`/`insert` (never panic) and the
     /// byte-boundary-panicking `String::remove`/`insert` are NOT matched. Index is arg 1.
     VecPanicMethod { index_idx: usize, insert: bool },
+    /// Trust (2026-09-25, F5): `BTreeMap::range(r)` / `BTreeSet::range(r)` PANICS
+    /// when `r`'s start is greater than its end (or both are equal and
+    /// excluded). The range is arg 1. See `panic_calls::btree_range_panic_body`.
+    BTreeRange { range_idx: usize },
+    /// Trust (2026-09-25, std-range-family): a std collection method that checks a
+    /// caller `RangeBounds<usize>` with `slice::range(r, ..len)` — `Vec::splice`,
+    /// `Vec::extract_if`, `VecDeque::range`/`range_mut`, `String::drain`/
+    /// `replace_range`/`extend_from_within`. The range is arg `range_idx`. See
+    /// `collection_range::collection_range_panic_body`.
+    ///
+    /// `range_is_full` records that the method's range type parameter is
+    /// `RangeFull` — `..` reaches MIR as a typeless zero-sized constant.
+    CollectionRange {
+        range_idx: usize,
+        owner: collection_range::RangeMethodOwner,
+        range_is_full: bool,
+    },
+    /// Trust (2026-09-25, std-range-family): `Vec::insert_mut(i, x)` /
+    /// `VecDeque::insert_mut(i, x)` (panic `i > len`) — a RESIZING method, so no
+    /// stable length can discharge its index: fail-honest, like
+    /// [`SliceMethodPanic::VecPanicMethod`].
+    ResizingIndexArg { idx: usize },
+    /// Trust (2026-09-25, std-range-family): `String::split_off(at)` (panic
+    /// `at > len` or `at` not a char boundary) and `String::truncate(n)` (panic
+    /// `n <= len` and `n` not a char boundary). Char boundaries are not modeled.
+    CharBoundaryArg { idx: usize, truncate: bool },
+    /// Trust (2026-09-25, std-range-family): `<[T]>::repeat(n)` — "capacity
+    /// overflow" when `len * n` overflows, computed inside the library. The
+    /// sibling of `str::repeat`'s `str-repeat-capacity-overflow` row.
+    SliceRepeat { n_idx: usize },
+    /// Trust (2026-09-25, std-range-family): `VecDeque::swap(i, j)` — panics when
+    /// `i >= len || j >= len`, over the deque's length (the slice
+    /// [`SliceMethodPanic::SwapIndices`] body finds no slice length on a deque
+    /// receiver and emitted nothing).
+    DequeSwap { i_idx: usize, j_idx: usize },
+    /// Trust (2026-09-25, std-range-family): `<[T]>::as_chunks::<N>` /
+    /// `as_chunks_mut` / `as_rchunks` / `as_rchunks_mut` / `array_windows::<N>` —
+    /// `assert!(N != 0)`. `nonzero` records that the instantiation renders a
+    /// nonzero integer literal; anything else (`0`, a generic `N`) is charged.
+    ConstChunkSize { nonzero: bool },
+    /// Trust (2026-09-25, std-range-family): `Vec<[T; N]>::into_flattened` —
+    /// "vec len overflow" when `T` is zero-sized and `len * N` overflows.
+    VecIntoFlattened,
 }
 
 enum LocalDef<'a> {
@@ -455,11 +539,10 @@ struct V2FloatOverflowContext<'a> {
 const FLOAT_EXP_BOUND_FUEL: u32 = 32;
 
 /// Max nesting for the struct-leaf walk (`Mat4 -> cols -> [Vec4;4] -> field`
-/// is depth 3); a deeper aggregate simply stops contributing overrides.
+/// is depth 3); a deeper aggregate simply stops contributing overrides. A
+/// bound on TYPE nesting (program text), not on any array length: a leaf is
+/// resolved from the one chain a read names (`float_leaf_chain`).
 const FLOAT_STRUCT_LEAF_DEPTH: u32 = 6;
-
-/// Longest array whose f64 elements are enumerated for per-field overrides.
-const FLOAT_STRUCT_LEAF_ARRAY_LIMIT: u64 = 16;
 
 // ---------------------------------------------------------------------------
 // F0/F1 — the signed-interval float tracer (`float_range`) and its consumers.
@@ -500,6 +583,11 @@ const FLOAT_RANGE_WORK: u32 = 4096;
 /// Refusal past the limit is `None` (fail-closed).
 const FLOAT_INTERPROC_DEPTH: usize = 3;
 
+/// The F6b trace memo key: (call block, callee, `Debug` of the args, `Debug` of
+/// the suffix), all in ONE context's function-local names (see
+/// `FloatRangeCtx::trace_memo`).
+type TraceMemoKey = (BlockId, String, String, String);
+
 /// Shared per-function context for [`float_range`]: the dominating path-guard
 /// map is built lazily ONCE and the per-block INTERSECTED fact set memoized
 /// (mirroring `v2_bv_mul_dominating_guard_constraints`, which rebuilds the map
@@ -523,15 +611,22 @@ struct FloatRangeCtx<'a> {
     /// F6b (STRUCT-argument tracing): CALLER-proved intervals for the SCALAR
     /// FIELD LEAVES of this function's struct/vector formals, keyed by the
     /// callee-side rendered place name (`place_to_var_name` + index
-    /// canonicalization — e.g. `"self.0"`, `"m.0[0].1"`). A scalar
-    /// `param_override` cannot bound `Vec3::add`'s `self.0` when the caller
-    /// passed a whole `Vec3`; this per-field map carries the callsite-specific
-    /// interval of the ACTUAL's corresponding field (`self_min.0`), letting a
-    /// matrix/vector CHAIN (`center = min.add(max).scale(0.5)` — every a3d
-    /// residual) discharge against the callee's own contract requirement. Same
-    /// ENTRY-fact discipline as `param_overrides`; empty off the callee-trace.
-    param_field_overrides: FxHashMap<String, (f64, f64)>,
-    guard_map: std::cell::OnceCell<FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>>>,
+    /// canonicalization — e.g. `"self.0"`, `"m.0[0].1"`) and resolved when a
+    /// leaf is read (`FieldOverrideSource`). A scalar `param_override` cannot
+    /// bound `Vec3::add`'s `self.0` when the caller passed a whole `Vec3`; this
+    /// source carries the callsite-specific interval of the ACTUAL's
+    /// corresponding field (`self_min.0`), letting a matrix/vector CHAIN
+    /// (`center = min.add(max).scale(0.5)` — every a3d residual) discharge
+    /// against the callee's own contract requirement. Same ENTRY-fact
+    /// discipline as `param_overrides`: a formal the body writes or lends
+    /// write-capably (any field) gets no leaf override — the binder in
+    /// `float_callee_trace_range` binds none and `param_field_override`
+    /// refuses one (F6B-FIELD-OVERRIDE-UNSTABLE-1). `None` off the
+    /// callee-trace.
+    param_field_source: Option<&'a FieldOverrideSource<'a>>,
+    /// The SHARED per-function path-guard map (`guard_map_for`), held by `Rc` so
+    /// a ctx built per float binop borrows it instead of rebuilding it.
+    guard_map: std::cell::OnceCell<std::rc::Rc<PathGuardMap>>,
     guard_facts: std::cell::RefCell<FxHashMap<BlockId, std::rc::Rc<Vec<Formula>>>>,
     alias_names: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<Vec<String>>>>,
     /// Work budget — SHARED (one `Rc`) with every nested callee-trace context
@@ -543,20 +638,32 @@ struct FloatRangeCtx<'a> {
     /// callee already on the stack refuses — direct or mutual recursion has
     /// no closed form here).
     visiting_callees: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-    /// F6b trace memo — SUCCESSFUL callee-trace results, shared (one `Rc`)
-    /// across every nested context of one top-level tracer invocation. The
-    /// same (call block, callee, args, suffix) query recurs massively in
+    /// F6b trace memo — SUCCESSFUL callee-trace results of THIS context only.
+    /// The same (call block, callee, args, suffix) query recurs massively in
     /// wide callers (`mul_mat4`: 16 dot callsites × 16 precondition
     /// conjuncts each re-tracing the same four `row(..)` results), and the
     /// un-memoized recomputation exhausted the shared work budget mid-
     /// function — later callsites then refused NOT for any semantic reason
-    /// but because the meter died (a completeness cliff). ONLY `Some`
-    /// results are cached: a successful trace's own depth/cycle checks
-    /// passed during computation, so its enclosure is context-independent;
-    /// a refusal may be stack-dependent (deeper nesting, mid-cycle) and is
-    /// NEVER cached (fail-closed recomputation).
-    trace_memo:
-        std::rc::Rc<std::cell::RefCell<FxHashMap<(BlockId, String, String, String), (f64, f64)>>>,
+    /// but because the meter died (a completeness cliff).
+    ///
+    /// The key is spelled in this context's own function-local names (a block
+    /// id, the `Debug` of operands naming its locals) and names none of the
+    /// facts the context traces under, so an entry is exact only inside the
+    /// context that made it, where `func`, `param_overrides` and
+    /// `param_field_source` are fixed. Every context — the root and each
+    /// `for_callee` one — therefore starts with its OWN empty memo
+    /// (F6B-TRACE-MEMO-KEY-1, 2026-10-06: one memo `Rc`-shared from the root
+    /// into every nested context let `outer(y)`, `y` unbounded, read the
+    /// `[2, 2]` an earlier `outer(x)` trace had cached for the identical key
+    /// of `outer`'s own `inner(copy _1)`; a caller's root-level
+    /// `inner(copy _1)` at `bb0` collided the same way). A hit returns before
+    /// the depth/cycle cut and the precondition re-establishment of
+    /// `float_callee_trace_range`, which is sound only because the entry was
+    /// made under the same context facts. ONLY `Some` results are cached: what
+    /// still varies within one context (the `visiting` set, fuel, the shared
+    /// callee stack and work budget) can only turn a trace into a refusal, and
+    /// a refusal is NEVER cached (fail-closed recomputation).
+    trace_memo: std::cell::RefCell<FxHashMap<TraceMemoKey, (f64, f64)>>,
 }
 
 impl<'a> FloatRangeCtx<'a> {
@@ -568,37 +675,39 @@ impl<'a> FloatRangeCtx<'a> {
             func,
             summaries,
             param_overrides: FxHashMap::default(),
-            param_field_overrides: FxHashMap::default(),
+            param_field_source: None,
             guard_map: std::cell::OnceCell::new(),
             guard_facts: std::cell::RefCell::new(FxHashMap::default()),
             alias_names: std::cell::RefCell::new(FxHashMap::default()),
             work: std::rc::Rc::new(std::cell::Cell::new(FLOAT_RANGE_WORK)),
-            trace_memo: std::rc::Rc::new(std::cell::RefCell::new(FxHashMap::default())),
+            trace_memo: std::cell::RefCell::new(FxHashMap::default()),
             visiting_callees: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         }
     }
 
     /// F6b: a context for tracing INSIDE a callee's extracted body, carrying
     /// the caller-derived formal overrides and SHARING the caller context's
-    /// work budget and callee-visiting stack (the guard/alias caches are
-    /// per-function and start fresh).
+    /// work budget and callee-visiting stack. The guard/alias caches are
+    /// per-function and the trace memo is per-context; all start fresh.
     fn for_callee(
         parent: &FloatRangeCtx<'a>,
         func: &'a VerifiableFunction,
         param_overrides: FxHashMap<usize, (f64, f64)>,
-        param_field_overrides: FxHashMap<String, (f64, f64)>,
+        param_field_source: Option<&'a FieldOverrideSource<'a>>,
     ) -> Self {
         Self {
             func,
             summaries: parent.summaries,
             param_overrides,
-            param_field_overrides,
+            param_field_source,
             guard_map: std::cell::OnceCell::new(),
             guard_facts: std::cell::RefCell::new(FxHashMap::default()),
             alias_names: std::cell::RefCell::new(FxHashMap::default()),
             work: std::rc::Rc::clone(&parent.work),
             visiting_callees: std::rc::Rc::clone(&parent.visiting_callees),
-            trace_memo: std::rc::Rc::clone(&parent.trace_memo),
+            // NEVER the parent's memo: its keys name the parent's blocks and
+            // locals, under the parent's facts (F6B-TRACE-MEMO-KEY-1).
+            trace_memo: std::cell::RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -630,13 +739,30 @@ impl<'a> FloatRangeCtx<'a> {
     /// Only a place ROOTED at a formal parameter is looked up (the map is keyed
     /// by formal-rooted names the binder produced); the interval is re-validated
     /// like `param_override`.
+    ///
+    /// The interval is the caller's value of the actual, an ENTRY fact, so it is
+    /// returned only under `contract_range`'s license: the formal is never
+    /// written or lent write-capably anywhere in the body
+    /// (`param_place_is_entry_stable`) and the read does not go through a raw
+    /// pointer (`place_reads_through_raw_ptr`). The binder in
+    /// `float_callee_trace_range` already binds no actual for such a formal;
+    /// this repeats the gate at the one lookup every reader goes through
+    /// (F6B-FIELD-OVERRIDE-UNSTABLE-1, 2026-10-06: `fn bump(mut p: P) -> f64
+    /// { p.a = 1e300; p.a }` was traced as returning the caller's `p.a`).
     fn param_field_override(&self, place: &Place) -> Option<(f64, f64)> {
         if place.local < 1 || place.local > self.func.body.arg_count {
             return None;
         }
+        let source = self.param_field_source?;
+        if !source.has_actual(place.local)
+            || !param_place_is_entry_stable(self.func, place.local)
+            || place_reads_through_raw_ptr(self.func, place)
+        {
+            return None;
+        }
         let name =
-            canonicalize_contract_index_segments(&crate::place_to_var_name(self.func, place));
-        let (lo, hi) = *self.param_field_overrides.get(&name)?;
+            float_range::canonicalize_contract_index_segments_owned(crate::place_to_var_name(self.func, place));
+        let (lo, hi) = source.resolve(self.func, place, name)?;
         (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
     }
 
@@ -649,28 +775,129 @@ impl<'a> FloatRangeCtx<'a> {
         if let Some(facts) = self.guard_facts.borrow().get(&block_id) {
             return std::rc::Rc::clone(facts);
         }
-        let map = self.guard_map.get_or_init(|| v2_build_path_guard_map(self.func));
-        let facts: Vec<Formula> = map
-            .get(&block_id)
-            .map(|paths| {
-                let resolved: Vec<Vec<Formula>> = paths
+        let func_addr = std::ptr::from_ref(self.func) as usize;
+        let scope_id = callee_write_set::current_scope_id();
+        if !crate::fn_memo::is_disabled() && !trust_types::verify_budget::exhausted_readonly() {
+            let shared_hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+                memo.borrow()
                     .iter()
-                    .map(|gs| {
-                        gs.iter().map(|(_, g)| guards::guard_to_formula(self.func, g)).collect()
-                    })
-                    .collect();
-                match resolved.split_first() {
-                    None => Vec::new(),
-                    Some((first, rest)) => first
-                        .iter()
-                        .filter(|fact| rest.iter().all(|path| path.contains(fact)))
-                        .cloned()
-                        .collect(),
+                    .rev()
+                    .find(|frame| frame.func_addr == func_addr)
+                    .and_then(|frame| frame.float_guard_facts.get(&(block_id, scope_id)).cloned())
+            });
+            if let Some(facts) = shared_hit {
+                self.guard_facts.borrow_mut().insert(block_id, std::rc::Rc::clone(&facts));
+                return facts;
+            }
+        }
+        // The SHARED per-function memo, not a ctx-local build. `FloatRangeCtx` is
+        // constructed fresh PER FLOAT BINOP (`v2_float_binop_cannot_overflow_at`),
+        // so a ctx-local `OnceCell` rebuilt the whole path-guard map once per
+        // arithmetic statement — the walk that reached a 137.8 GB peak footprint
+        // on tla-cli (2026-09-10). `guard_map_for` calls the same builder and
+        // returns the same value; it just does it once per function.
+        let map = self.guard_map.get_or_init(|| guard_map_for(self.func));
+        let facts: Vec<Formula> = match map.get(&block_id) {
+            None => Vec::new(),
+            Some(paths) if paths.is_empty() || paths.iter().any(Vec::is_empty) => Vec::new(),
+            Some(paths) => {
+                // BUDGET POLL, per GUARD (not per path): a block carries up to
+                // `MAX_PATHS_PER_BLOCK` = 64 enumerated paths and each guard on
+                // one costs a `guards::guard_to_formula` resolution, which walks
+                // the defining block looking for the comparison's latest
+                // definition — so resolution alone is 64 x |path| whole-block
+                // scans with nothing bounding it in TIME. Written as explicit
+                // loops because a poll inside the `.map()` closures cannot
+                // return from this function (the `entry_version_gen_sets`
+                // lesson in `path_defs.rs`).
+                //
+                // The degradation is the empty fact vector — byte-identical to
+                // what this function already returns for a block absent from the
+                // map, and to what per-block saturation and cap-overflow already
+                // hand back as "one unguarded path". `float_guard_bounds` reads
+                // an empty set as NO dominating bound and returns `(None, None)`,
+                // so the interval lane is left wider: dropping guard hypotheses
+                // turns a PROVE into a FAIL, never a FAIL into a PROVE. The
+                // degraded vector is deliberately NOT written to `guard_facts`
+                // — a budget refusal is budget-state dependent, so it is
+                // recomputed (and immediately re-refused, the counter having
+                // stuck at zero) rather than cached, the same discipline
+                // `trace_memo` states for a refused callee trace.
+                let mut resolved: Vec<Vec<Formula>> = Vec::with_capacity(paths.len());
+                let mut edge_cache: FxHashMap<(BlockId, u8, u128), (&GuardCondition, Formula)> =
+                    FxHashMap::default();
+                let use_edge_cache = paths.len() > 1;
+                for gs in paths {
+                    let mut path: Vec<Formula> = Vec::with_capacity(gs.len());
+                    for (src, g) in gs {
+                        if trust_types::verify_budget::budget_exhausted() {
+                            return std::rc::Rc::new(Vec::new());
+                        }
+                        let edge_key =
+                            use_edge_cache.then(|| safety::guard_cache_key(*src, g)).flatten();
+                        if let Some(key) = edge_key
+                            && let Some((cached_g, cached_f)) = edge_cache.get(&key)
+                            && safety::guard_condition_eq(cached_g, g)
+                        {
+                            path.push(cached_f.clone());
+                            continue;
+                        }
+                        let f = guards::guard_to_formula(self.func, g);
+                        if let Some(key) = edge_key {
+                            edge_cache.entry(key).or_insert_with(|| (g, f.clone()));
+                        }
+                        path.push(f);
+                    }
+                    resolved.push(path);
                 }
-            })
-            .unwrap_or_default();
+                let mut iter = resolved.into_iter();
+                match iter.next() {
+                    None => Vec::new(),
+                    Some(first) if iter.as_slice().is_empty() => first,
+                    Some(first) => {
+                        let rest = iter.as_slice();
+                        // BUDGET POLL, per (candidate fact, remaining path)
+                        // pair: `contains` is a DEEP structural `Formula`
+                        // compare, so this intersection is up to 63 x |first|
+                        // whole-tree comparisons and a poll at the path level
+                        // above cannot interrupt one pass of it. Short-circuits
+                        // exactly where `rest.iter().all(..)` did, so the
+                        // surviving set is unchanged on the non-exhausted path.
+                        let mut kept: Vec<Formula> = Vec::new();
+                        for fact in first {
+                            let mut on_every_path = true;
+                            for path in rest {
+                                if trust_types::verify_budget::budget_exhausted() {
+                                    return std::rc::Rc::new(Vec::new());
+                                }
+                                if !path.contains(&fact) {
+                                    on_every_path = false;
+                                    break;
+                                }
+                            }
+                            if on_every_path {
+                                kept.push(fact);
+                            }
+                        }
+                        kept
+                    }
+                }
+            }
+        };
         let facts = std::rc::Rc::new(facts);
         self.guard_facts.borrow_mut().insert(block_id, std::rc::Rc::clone(&facts));
+        if !crate::fn_memo::is_disabled() && !trust_types::verify_budget::exhausted_readonly() {
+            FUNC_ANALYSIS_MEMO.with(|memo| {
+                if let Some(frame) = memo
+                    .borrow_mut()
+                    .iter_mut()
+                    .rev()
+                    .find(|frame| frame.func_addr == func_addr)
+                {
+                    frame.float_guard_facts.insert((block_id, scope_id), std::rc::Rc::clone(&facts));
+                }
+            });
+        }
         facts
     }
 
@@ -683,8 +910,41 @@ impl<'a> FloatRangeCtx<'a> {
         if let Some(names) = self.alias_names.borrow().get(&place.local) {
             return std::rc::Rc::clone(names);
         }
+        let func_addr = std::ptr::from_ref(self.func) as usize;
+        if !crate::fn_memo::is_disabled() && !trust_types::verify_budget::exhausted_readonly() {
+            let shared_hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+                memo.borrow()
+                    .iter()
+                    .rev()
+                    .find(|frame| frame.func_addr == func_addr)
+                    .and_then(|frame| frame.float_alias_names.get(&place.local).cloned())
+            });
+            if let Some(names) = shared_hit {
+                self.alias_names.borrow_mut().insert(place.local, std::rc::Rc::clone(&names));
+                return names;
+            }
+        }
         let mut names = vec![crate::place_to_var_name(self.func, place)];
         for decl in &self.func.body.locals {
+            // BUDGET POLL, per LOCAL: `float_whole_local_defs` below is a
+            // whole-BODY walk (every block, every statement, plus each
+            // terminator) run once per declared local, so this loop is
+            // O(locals x body) with nothing bounding it in time — the same
+            // shape as the `entry_version_gen_sets` per-block poll over
+            // `block_written_names`.
+            //
+            // The degradation is the alias list accumulated SO FAR. It is
+            // seeded with the place's own name before the loop, so an early
+            // return is always a non-empty but strictly SMALLER alias set, and
+            // `float_guard_bounds` uses this list only to decide which
+            // dominating facts are ABOUT this place — a name it does not
+            // contain makes the fact be skipped. Fewer aliases therefore mean
+            // fewer guard bounds and a wider interval: PROVE turns into FAIL,
+            // never FAIL into PROVE. A partial list is not memoized, for the
+            // reason `dominating_facts` gives above.
+            if trust_types::verify_budget::budget_exhausted() {
+                return std::rc::Rc::new(names);
+            }
             let l = decl.index;
             if l == place.local {
                 continue;
@@ -712,6 +972,18 @@ impl<'a> FloatRangeCtx<'a> {
         }
         let names = std::rc::Rc::new(names);
         self.alias_names.borrow_mut().insert(place.local, std::rc::Rc::clone(&names));
+        if !crate::fn_memo::is_disabled() && !trust_types::verify_budget::exhausted_readonly() {
+            FUNC_ANALYSIS_MEMO.with(|memo| {
+                if let Some(frame) = memo
+                    .borrow_mut()
+                    .iter_mut()
+                    .rev()
+                    .find(|frame| frame.func_addr == func_addr)
+                {
+                    frame.float_alias_names.insert(place.local, std::rc::Rc::clone(&names));
+                }
+            });
+        }
         names
     }
 }
@@ -742,6 +1014,45 @@ const FLOAT_OVERFLOW_DISCHARGE_MARGIN: f64 = f64::from_bits(0x7FB0_0000_0000_000
 /// correctly keeps its obligation (the round-10 one-sided false-proof shape).
 const FLOAT_ADD_TINY_OPERAND_BOUND: f64 = f64::from_bits(0x7C90_0000_0000_0000);
 
+/// `2^exp` as an exact `f64`, for the width-parametric thresholds below.
+const fn pow2_f64(exp: i32) -> f64 {
+    f64::from_bits(((exp + 1023) as u64) << 52)
+}
+
+/// The discharge margin for an operation of this IEEE width, expressed in `f64`
+/// because the interval tracer reasons at `f64` and every binary32 value is a
+/// binary64 value exactly.
+///
+/// The f64 figure above is `2^1020`, an 8x headroom under `f64::MAX ~ 2^1024`.
+/// The SAME derivation at binary32 gives `2^125` under `f32::MAX ~ 2^128`.
+/// Using the f64 figure for a binary32 operation is the FALSE PROOF this exists
+/// to prevent: `2^1020` is astronomically above `f32::MAX`, so an f32 result
+/// "inside the margin" can be infinity.
+///
+/// `None` for any other width — fail closed, no discharge.
+pub(super) const fn float_overflow_discharge_margin(width: u32) -> Option<f64> {
+    match width {
+        64 => Some(FLOAT_OVERFLOW_DISCHARGE_MARGIN),
+        32 => Some(pow2_f64(125)),
+        _ => None,
+    }
+}
+
+/// The tiny-addend bound for an operation of this IEEE width: `ulp(MAX) / 2`,
+/// the round-to-infinity boundary argued out above.
+///
+/// f64: `ulp(MAX) = 2^(1023 - 52) = 2^971`, so the bound is `2^970`.
+/// binary32: `ulp(MAX) = 2^(127 - 23) = 2^104`, so the bound is `2^103`.
+///
+/// `None` for any other width — fail closed, no discharge.
+pub(super) const fn float_add_tiny_operand_bound(width: u32) -> Option<f64> {
+    match width {
+        64 => Some(FLOAT_ADD_TINY_OPERAND_BOUND),
+        32 => Some(pow2_f64(103)),
+        _ => None,
+    }
+}
+
 /// Retired block-granularity reaching-def oracle retained as a test witness for
 /// the statement-granular production versioning.
 #[cfg(test)]
@@ -771,22 +1082,34 @@ impl VersionCtx {
         )
     }
 
-    /// OVERLAP-AWARE staleness query (S2b): is a fact whose sole free var is `name`
-    /// stale at `block`? True iff some TRACKED name that OVERLAPS `name`
-    /// (prefix-ancestor / descendant / index-alias via `place_names_overlap`) has a
-    /// non-entry reaching-def version at `block`.
+    /// REBIND-AWARE staleness query (S2b): is a fact whose sole free var is `name`
+    /// stale at `block`? True iff some TRACKED name that REBINDS `name` — the
+    /// directional [`path_defs::write_rebinds`]: prefix-ancestor / descendant /
+    /// index-alias (`place_names_overlap`) plus the `[_l]` index-segment channel —
+    /// has a non-entry reaching-def version at `block`.
     ///
     /// This closes the projection gap the shadow audit surfaced: the oracle tracks
     /// whole gen-set names (`s`), but the kill drops a fact about `s.0` via overlap
-    /// with a write to `s`. Because the kill's drop set IS the tracked-names with a
-    /// non-entry version (the proven base parity) and both sides use the SAME
-    /// `place_names_overlap`, this query is drop-equivalent to the kill for ANY
-    /// `name`, tracked or not — so a versioned read of `s.0` is renamed away exactly
-    /// when the kill would drop the fact.
+    /// with a write to `s`. The kill's drop set IS the tracked names with a non-entry
+    /// version (the proven base parity), so this query is drop-equivalent to the kill
+    /// for ANY `name`, tracked or not — a versioned read of `s.0` is renamed away
+    /// exactly when the kill would drop the fact.
+    ///
+    /// AMENDED (merge, 2026-09-18): the two sides no longer run the SAME predicate,
+    /// so the equivalence above is now claimed only up to that difference. This query
+    /// tests `write_rebinds`; the kill (`formula_survives_redefs` →
+    /// `formula_mentions_redef`) tests the WIDER `dest_write_rebinds`, which adds
+    /// `write_covers_derived_slice_len`. The kill can therefore drop a fact about
+    /// `s__slice_len` on a write of `s` that this query calls unversioned. `VersionCtx`
+    /// is `#[cfg(test)]` — a retired witness read only by
+    /// `path_defs::shadow_parity_disagreements_overlap` — so the gap is a parity-audit
+    /// question, not a production renaming one; production reads go through
+    /// [`StmtVersionCtx::version_token_at`], whose gate already tests
+    /// `dest_write_rebinds`.
     pub(crate) fn is_versioned_query(&self, block: BlockId, name: &str) -> bool {
         let entry_only = std::collections::BTreeSet::from([-1i64]);
         let Some(vers) = self.per_block.get(&block) else { return false };
-        vers.iter().any(|(tracked, vset)| *vset != entry_only && place_names_overlap(tracked, name))
+        vers.iter().any(|(tracked, vset)| *vset != entry_only && write_rebinds(tracked, name))
     }
 }
 
@@ -806,45 +1129,307 @@ pub(crate) const ENTRY_VERSION_SENTINEL: &str = "e";
 /// matches the token `e` exactly — so it still prevents the `x#t == f(x#t)`
 /// recurrence without ever asserting the pre-write value is the entry value.
 /// Distinct by construction from real establish tokens (`s{b}_{k}`), the phantom
-/// entry-havoc token (`s{b}_pre`), mixed joins (`e_s{b}_t`), and the loop
-/// transition havoc prefix (`e45_`).
+/// entry-havoc token (`s{b}_pre`), mixed joins (`e_s{b}_t`), the loop
+/// transition havoc prefix (`e45_`), and the TINV unwind havoc prefix (`tinvu_`,
+/// `crate::TINV_UNWIND_HAVOC_TOKEN_PREFIX`).
 pub(crate) const PRE_WRITE_SENTINEL_PREFIX: &str = "pre";
 
 /// Statement-granular version oracle: the version of a place name at a precise
 /// `(block, stmt_idx)` program point, distinguishing reads that straddle a
 /// same-block write.
+///
+/// Built once per body (memoized per function; see [`stmt_versions_for`] and
+/// `crate::havoc_memo::version_oracle`) from two linear-size indexes:
+///
+///  * the per-block WRITE index ([`block_writes::FnWrites`]) — the intra-block arm:
+///    the latest writing statement before the read, the `writes_until` gate and the
+///    `s{b}_pre` phantom, each by lookup;
+///  * the inter-block SSA oracle ([`version_ssa::VersionSsa`]) — the reaching-version
+///    sets at block entry, resolved on demand over the dominator tree.
+///
+/// Every answer is byte-identical to the retired dense-map oracle (two whole-CFG
+/// fixpoints, `Θ(blocks × names)` `String` maps, a step cap and budget polls), which is
+/// kept in `legacy_version_oracle` as a differential: under `cfg(test)` (and the
+/// `version-oracle-differential` feature) every query is answered by both and asserted
+/// equal.
 pub(crate) struct StmtVersionCtx {
-    entry: FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>,
-    /// UNWIND-INCLUSIVE sibling of `entry` (see `block_entry_versions_full_graph`):
-    /// predecessor edges additionally include every `UnwindEdge::cleanup_target()`
-    /// edge, mirroring `v2_path_def_fixpoint`'s enqueue set. Consulted ONLY by the
-    /// `#e` mint gate; `None` = the fixpoint did not converge, and the gate fails
-    /// closed (no `#e` anywhere in this function).
-    entry_full: Option<FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>>,
+    ssa: version_ssa::VersionSsa,
+    /// Declared local names containing `'#'` (empty in normal Rust bodies), precomputed
+    /// once per oracle so `#`-minted SSA/sentinel collision checks stay `O(1)`.
+    hash_local_names: FxHashSet<String>,
+    /// Memo for [`Self::ever_versioned`], keyed by name. Trust (2026-09-30,
+    /// stale-read seal): the answer is a pure function of `func` and the name, so
+    /// caching it cannot change which answer a caller sees.
+    ever_versioned_memo: std::cell::RefCell<FxHashMap<String, bool>>,
+    /// Memo for [`Self::versioned_block_defs_at_point`], keyed by
+    /// `(block.id.0, block_key(block), block.stmts.len(), end)`.
+    versioned_block_defs_memo: std::cell::RefCell<
+        FxHashMap<(usize, usize, usize, usize), std::rc::Rc<block_defs::VersionedBlockDefs>>,
+    >,
+    /// Memo for [`Self::terminator_kill`], keyed by
+    /// `(block.id.0, block as *const _ as usize, callee_write_set::current_scope_id())`.
+    terminator_kill_memo:
+        std::cell::RefCell<FxHashMap<(usize, usize, u64), std::rc::Rc<TerminatorKillData>>>,
+    /// Memo for [`Self::prepared_block_outflow`], keyed by
+    /// `(block.id.0, block as *const _ as usize)`.
+    block_outflow_memo:
+        std::cell::RefCell<FxHashMap<(usize, usize), std::rc::Rc<path_defs::PreparedBlockOutflow>>>,
+    /// Memo for [`Self::spelled_guard_paths_for`], keyed by
+    /// `(at, canonical_ptr, canonical_len, callee_write_set::current_scope_id())`.
+    spelled_guard_paths_memo:
+        std::cell::RefCell<FxHashMap<(BlockId, usize, usize, u64), std::rc::Rc<Vec<Vec<Formula>>>>>,
+    #[cfg(any(test, feature = "version-oracle-differential"))]
+    legacy: Option<legacy_version_oracle::LegacyStmtVersions>,
 }
 
 impl StmtVersionCtx {
     /// Build (or reuse) this function's version oracle.
     ///
-    /// verifier-perf: this runs TWO whole-function dataflow fixpoints, and it is
-    /// called from ~20 sites — several of them once per OBLIGATION rather than
-    /// once per function — which is the dominant term in VC-generation time (see
-    /// `crate::havoc_memo::version_oracle`). Memoized per function, so every
-    /// site now shares one build. The oracle is immutable after construction and
-    /// a pure function of `func`, so this is observationally identical to each
-    /// caller building its own; `Rc` deref-coercion keeps every existing
-    /// `sv.version_token_at(..)` / `&sv` call site source-compatible.
+    /// Memoized per function behind `crate::havoc_memo::version_oracle` (inert
+    /// outside a `gen_work` scope). The oracle's answers are a pure function of
+    /// `func`; its lazily-filled join memo changes only how often a set is computed,
+    /// never which set, so sharing one `Rc` among every site is observationally
+    /// identical to each building its own.
     pub(crate) fn build(func: &VerifiableFunction) -> std::rc::Rc<Self> {
-        crate::havoc_memo::version_oracle(func, || StmtVersionCtx {
-            entry: block_entry_versions(func),
-            entry_full: path_defs::block_entry_versions_full_graph(func),
+        crate::havoc_memo::version_oracle(func, || {
+            let ssa = version_ssa::VersionSsa::build(func);
+            let mut hash_local_names = FxHashSet::default();
+            for decl in &func.body.locals {
+                if let Some(name) = decl.name.as_deref()
+                    && name.contains('#')
+                {
+                    hash_local_names.insert(name.to_owned());
+                }
+            }
+            // No differential for an oracle built after a budget trip: it fails closed
+            // on purpose where the retired one answered from whatever its polls let
+            // through (see `FnWrites::built_after_trip`).
+            #[cfg(any(test, feature = "version-oracle-differential"))]
+            let legacy = (legacy_version_oracle::differential_enabled()
+                && !ssa.writes().built_after_trip())
+            .then(|| legacy_version_oracle::LegacyStmtVersions::build(func))
+            .filter(legacy_version_oracle::LegacyStmtVersions::converged);
+            StmtVersionCtx {
+                ssa,
+                hash_local_names,
+                ever_versioned_memo: std::cell::RefCell::new(FxHashMap::default()),
+                versioned_block_defs_memo: std::cell::RefCell::new(FxHashMap::default()),
+                terminator_kill_memo: std::cell::RefCell::new(FxHashMap::default()),
+                block_outflow_memo: std::cell::RefCell::new(FxHashMap::default()),
+                spelled_guard_paths_memo: std::cell::RefCell::new(FxHashMap::default()),
+                #[cfg(any(test, feature = "version-oracle-differential"))]
+                legacy,
+            }
         })
+    }
+
+    /// Whether any declared local in `func.body.locals` carries `'#'` in its name.
+    #[inline]
+    pub(crate) fn has_any_hash_local(&self) -> bool {
+        !self.hash_local_names.is_empty()
+    }
+
+    /// Whether `minted` (which contains `'#'`) collides with a declared local name.
+    #[inline]
+    pub(crate) fn has_hash_local_named(&self, minted: &str) -> bool {
+        !self.hash_local_names.is_empty() && self.hash_local_names.contains(minted)
+    }
+
+    #[cfg(any(test, feature = "version-oracle-differential"))]
+    pub(super) fn has_legacy(&self) -> bool {
+        self.legacy.is_some()
+    }
+
+    pub(super) fn spelled_guard_paths_for(
+        &self,
+        func: &VerifiableFunction,
+        at: BlockId,
+        guard_paths: &[Vec<(BlockId, GuardCondition)>],
+    ) -> Option<(std::rc::Rc<Vec<Vec<Formula>>>, usize, usize)> {
+        let cacheable = !crate::fn_memo::is_disabled()
+            && !trust_types::verify_budget::exhausted_readonly()
+            && !self.ssa.writes().built_after_trip();
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let cacheable =
+            cacheable && !(self.legacy.is_some() && legacy_version_oracle::legacy_answers());
+        if !cacheable {
+            return None;
+        }
+        let addr = std::ptr::from_ref(func) as usize;
+        let canonical_map = FUNC_ANALYSIS_MEMO.with(|memo| {
+            memo.borrow()
+                .last()
+                .filter(|frame| frame.func_addr == addr)
+                .and_then(|frame| frame.guard_map.clone())
+        })?;
+        let canonical = canonical_map.get(&at)?;
+        let canon_slice = canonical.as_slice();
+        let elem_size = std::mem::size_of::<Vec<(BlockId, GuardCondition)>>();
+        if elem_size == 0 || guard_paths.len() > canon_slice.len() {
+            return None;
+        }
+        let canon_ptr = canon_slice.as_ptr() as usize;
+        let sub_ptr = guard_paths.as_ptr() as usize;
+        if sub_ptr < canon_ptr || (sub_ptr - canon_ptr) % elem_size != 0 {
+            return None;
+        }
+        let start_idx = (sub_ptr - canon_ptr) / elem_size;
+        if !canon_slice
+            .get(start_idx..start_idx + guard_paths.len())
+            .is_some_and(|s| std::ptr::eq(s, guard_paths))
+        {
+            return None;
+        }
+        let key = (
+            at,
+            canon_ptr,
+            canon_slice.len(),
+            callee_write_set::current_scope_id(),
+        );
+        if let Some(hit) = self.spelled_guard_paths_memo.borrow().get(&key).cloned() {
+            return Some((hit, start_idx, guard_paths.len()));
+        }
+        let computed = std::rc::Rc::new(safety::spell_guard_paths_uncached(
+            func,
+            self,
+            at,
+            canon_slice,
+        ));
+        if !trust_types::verify_budget::exhausted_readonly() {
+            self.spelled_guard_paths_memo
+                .borrow_mut()
+                .insert(key, std::rc::Rc::clone(&computed));
+        }
+        Some((computed, start_idx, guard_paths.len()))
+    }
+
+    pub(super) fn prepared_block_outflow(
+        &self,
+        func: &VerifiableFunction,
+        block: &trust_types::BasicBlock,
+    ) -> Option<std::rc::Rc<path_defs::PreparedBlockOutflow>> {
+        let cacheable = !crate::fn_memo::is_disabled()
+            && !trust_types::verify_budget::exhausted_readonly()
+            && !self.ssa.writes().built_after_trip()
+            && func.body.blocks.get(block.id.0).is_some_and(|b| std::ptr::eq(b, block));
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let cacheable =
+            cacheable && !(self.legacy.is_some() && legacy_version_oracle::legacy_answers());
+        if !cacheable {
+            return None;
+        }
+        let key = (block.id.0, std::ptr::from_ref(block) as usize);
+        if let Some(hit) = self.block_outflow_memo.borrow().get(&key).cloned() {
+            return Some(hit);
+        }
+        let built = std::rc::Rc::new(path_defs::PreparedBlockOutflow::default());
+        self.block_outflow_memo.borrow_mut().insert(key, std::rc::Rc::clone(&built));
+        Some(built)
+    }
+
+    pub(crate) fn versioned_block_defs_at_point(
+        &self,
+        func: &VerifiableFunction,
+        block: &trust_types::BasicBlock,
+        end: usize,
+    ) -> std::rc::Rc<block_defs::VersionedBlockDefs> {
+        let end = end.min(block.stmts.len());
+        let cacheable = !crate::fn_memo::is_disabled()
+            && !trust_types::verify_budget::exhausted_readonly()
+            && !self.ssa.writes().built_after_trip();
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let cacheable =
+            cacheable && !(self.legacy.is_some() && legacy_version_oracle::legacy_answers());
+        let key = (block.id.0, crate::havoc_memo::block_key(block), block.stmts.len(), end);
+        if cacheable
+            && let Some(hit) = self.versioned_block_defs_memo.borrow().get(&key).cloned()
+        {
+            return hit;
+        }
+        let computed =
+            std::rc::Rc::new(block_defs::VersionedBlockDefs::compute(self, func, block, end));
+        if cacheable && !trust_types::verify_budget::exhausted_readonly() {
+            self.versioned_block_defs_memo
+                .borrow_mut()
+                .insert(key, std::rc::Rc::clone(&computed));
+        }
+        computed
+    }
+
+    pub(super) fn block_entry_kill_rebinds(&self, b: usize, read: &str) -> bool {
+        let writes = self.ssa.writes();
+        let Some(bw) = writes.block(b) else {
+            return true;
+        };
+        bw.stmt_explicit_dest_rebinds(&writes.names, read)
+            || (bw.any_opaque_store() && writes.havoc_dest_rebinds(read))
+            || (bw.gen_all() && writes.all_dest_rebinds(read))
+    }
+
+    pub(super) fn first_writer_before(
+        &self,
+        func: &VerifiableFunction,
+        block: &trust_types::BasicBlock,
+        end: usize,
+        name: &str,
+    ) -> Option<usize> {
+        let clamped = end.min(block.stmts.len());
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if self.legacy.is_some() && legacy_version_oracle::legacy_answers() {
+            return (0..clamped).find(|&j| stmt_writes_name(func, block, j, name));
+        }
+        if self.ssa.writes().built_after_trip()
+            || !func.body.blocks.get(block.id.0).is_some_and(|b| std::ptr::eq(b, block))
+        {
+            return (0..clamped).find(|&j| stmt_writes_name(func, block, j, name));
+        }
+        let fast =
+            self.ssa.writes().first_writer_before(block.id.0, clamped, name).map(|w| w as usize);
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if self.legacy.is_some() {
+            let slow = (0..clamped).find(|&j| stmt_writes_name(func, block, j, name));
+            assert_eq!(
+                fast, slow,
+                "first_writer_before differential mismatch in {} bb{} end={clamped} for `{name}`",
+                func.name, block.id.0
+            );
+        }
+        fast
     }
 
     /// `#token` for `name` read at `(block, stmt_idx)`, or `None` when the value
     /// there is the entry/parameter value (so unversioned names stay byte-identical
     /// on the flip). A same-block write in `stmts[..stmt_idx]` versions it; a write
     /// LATER in the block does NOT (the block-level oracle gets this wrong).
+    ///
+    /// THE INTRA-BLOCK ARM, and why its order is safe. The retired arm tested the
+    /// `writes_until(block, stmt_idx)` GATE first — does some name written in
+    /// `stmts[..stmt_idx]` `dest_write_rebinds` `name` — and only then searched the
+    /// statements for the latest one that itself writes `name` (`stmt_writes_name`),
+    /// minting `s{b}_{k}`. The search is answered first here, and that is the same
+    /// function: every case `stmt_writes_name` accepts puts the written name into
+    /// `writes_until` under a relation `dest_write_rebinds` contains (an `Assign` /
+    /// `Deinit` destination under `dest_write_rebinds` itself; the index fallback
+    /// under `write_rebinds`; an opaque store's havoc names, which
+    /// `deref_store_havoc_names_over` adds with the same confinement filter, under
+    /// `write_rebinds`; a `SetDiscriminant` place and a `CopyNonOverlapping`'s names,
+    /// which `extend_with_assigned_place_dests` adds, under `write_rebinds`), so a
+    /// found writer implies the gate. When there is no writer the gate decides, as
+    /// before, between the fail-closed phantom `s{b}_pre` and the fall-through:
+    ///
+    /// Trust #soundness (2026-08-26): the gate admits EXACTLY what the per-statement
+    /// search admits under `dest_write_rebinds` — a write of `p` versions the DERIVED
+    /// `p__slice_len` read at the same statement (`p = &raw const *sb; (*p)[2]` used
+    /// to keep the pre-reassignment length and proved an out-of-bounds index).
+    ///
+    /// Trust #false-refutation (2026-09-21, WRITE-THEN-READ on a `&mut [T]`): when the
+    /// gate fired ONLY through the derived `__slice_len` channel of an opaque store's
+    /// havoc names (nothing in `writes_until` `write_rebinds` the name), the search is
+    /// right and the read falls through to the inter-block set — the value at the read
+    /// IS the block-entry value. Every other gate-without-writer case keeps the
+    /// phantom, which `flip_matches_kill_stmt` pins (4 disagreements on
+    /// `sem_stale_blockdef` caught a broader fall-through). `TRUST_VERSION_GATE_TRACE`
+    /// prints every name reaching the fall-through.
     pub(crate) fn version_token_at(
         &self,
         func: &VerifiableFunction,
@@ -852,134 +1437,416 @@ impl StmtVersionCtx {
         stmt_idx: usize,
         name: &str,
     ) -> Option<String> {
-        // Trust (lane-A CSE): id==index invariant (held by direct `blocks[id.0]`
-        // indexing elsewhere) lets the linear find be an O(1) indexed lookup. The
-        // `.filter(|b| b.id == block)` keeps it BEHAVIORALLY IDENTICAL — same
-        // `Option<&BasicBlock>`, same `None` were the invariant ever violated.
-        let bb = func.body.blocks.get(block.0).filter(|b| b.id == block)?;
-        // In-block write before the read point wins (the live value at stmt_idx).
-        // Trust #soundness (callee-write false-accept sweep): the gate is
-        // OVERLAP-aware, matching the `stmt_writes_name` token search below — the
-        // old exact-name `.contains(name)` let an overlapping statement write
-        // (whole-place `s = ..` before a field read `s.v`; a havoc of `r` before
-        // a pointee read `r*`) pass the search yet be gated out here, silently
-        // falling through to the entry map with the write invisible.
-        // Trust #soundness (2026-08-26): the gate must admit EXACTLY what the
-        // `stmt_writes_name` search below admits, which is
-        // `place_names_overlap(dest, name) || write_covers_derived_slice_len(dest, name)`.
-        // Testing only the first left a write of `p` invisible for the DERIVED name
-        // `p__slice_len` (`place_names_overlap("p", "p__slice_len")` is FALSE — `_` is
-        // not a projection separator), so a same-block reassignment fell through to the
-        // inter-block entry map and the read kept its PRE-reassignment token.
-        //
-        // MEASURED via TRUST_DUMP_V2_VC on
-        // `let mut p=&raw const *sa; if sa.len()>2 { p=&raw const *sb; (*p)[2] }`:
-        //     Eq(p__slice_len#s0_1, sa__slice_len)   <- tie, at its establish token
-        //     Eq(p#s2_3, _7)                         <- reassignment DOES bump `p`
-        //     Eq(_10, p__slice_len#s0_1)             <- but the READ still reads #s0_1
-        // The base name is versioned and the derived one is not, so the stale length
-        // unified with the read and the bounds row shipped `proved` while the binary
-        // panics "index out of bounds: the len is 1 but the index is 2".
-        //
-        // Mirroring the search is what makes this safe rather than a widening: the
-        // `s{b}_pre` phantom-token arm below (the hazard `writes_until`'s own doc warns
-        // about) is unreachable for a name admitted here, because the search tests the
-        // same disjunction statement-by-statement and must therefore find one.
-        if writes_until(func, bb, stmt_idx)
-            .iter()
-            .any(|w| place_names_overlap(w, name) || write_covers_derived_slice_len(w, name))
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy
+            && legacy_version_oracle::legacy_answers()
         {
-            // P-A: the LATEST single statement < stmt_idx that ITSELF writes an
-            // overlap of `name` gives a point-distinct token. Test each statement
-            // directly (`stmt_writes_name`), NOT the cumulative `writes_until` delta —
-            // that delta is nonzero only at the FIRST write, so two same-block writes
-            // (and def-then-deref-havoc) collapsed to one token, defeating the
-            // statement-granular distinction the oracle exists to provide.
-            let j = (0..stmt_idx.min(bb.stmts.len()))
-                .rev()
-                .find(|&k| stmt_writes_name(func, bb, k, name));
-            return Some(match j {
-                Some(k) => format!("s{}_{k}", block.0),
-                None => format!("s{}_pre", block.0), // entry-block param havoc, no stmt
-            });
+            return legacy.version_token_at(func, block, stmt_idx, name);
         }
-        // Else the inter-block reaching set at block entry. The tokens are already
-        // statement-granular `s{pred}_{k}` strings (`e` = entry/param value).
-        //
-        // Trust #soundness (callee-write false-accept sweep — THE CORE FIX): the
-        // lookup is an OVERLAP UNION, not an exact-key get. The confirmed silent
-        // false-accept: `if *r < 1000 { bump(r); t = *r + 1 }` where `bump` sets
-        // `*r = u32::MAX` — the Call havocs the BASE name "r" (entry map of the
-        // successor holds {"r" -> {s1_t}}), but the post-call READ spells "r*";
-        // the exact-key get missed it, both `*r` reads stayed the SAME bare SMT
-        // var, and the guard bound falsely transferred across the call (verified
-        // "1 proved" yet panics at runtime). With the overlap union, the
-        // entry-versioned base "r" versions the pointee read to `r*#s1_t`,
-        // name-disjoint from the pre-call bare guard read — the transfer is
-        // severed. Deterministic per (block, name): the BTreeSet-sorted join
-        // gives two post-call reads at the same block ONE shared token, so a
-        // post-call guard still discharges a post-call use (no over-splitting).
-        // An all-entry union stays `None` (bare, never-havoced parameter reads
-        // stay byte-identical). A MIXED union keeps the entry sentinel IN the
-        // join (`e_s1_t`): a partially-entry-valued read has a DIFFERENT
-        // reaching-value set than a definitely-post-write read (`s1_t`), and
-        // collapsing the two names would assert a false cross-path equality.
-        let em = self.entry.get(&block)?;
-        let mut toks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (k, s) in em {
-            if place_names_overlap(k, name) {
-                toks.extend(s.iter().cloned());
-            }
+        let token = self.version_token_at_ssa(func, block, stmt_idx, name);
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy {
+            let expected = legacy.version_token_at(func, block, stmt_idx, name);
+            assert_eq!(
+                token, expected,
+                "version oracle differential: `{name}` at {block:?}[{stmt_idx}] of `{}`",
+                func.def_path
+            );
         }
-        if toks.is_empty()
-            || toks == std::collections::BTreeSet::from([ENTRY_VERSION_SENTINEL.to_string()])
-        {
-            return None;
-        }
-        Some(toks.iter().cloned().collect::<Vec<_>>().join("_"))
+        token
     }
 
-    /// True iff `block`'s entry-version map TRACKS a name overlapping `name`.
+    /// Trust (2026-09-30, stale-read seal — root cause of the `vac` false proofs):
+    /// true iff SOME program point of `func` versions `name`, i.e. some block `b`
+    /// has `version_token_at(b, b.stmts.len(), name)` set. Probing each block's
+    /// END is enough: a point with a token implies its block's end has one (a
+    /// later in-block write only moves the token, never erases it).
+    ///
+    /// When this is FALSE a bare `name` stays bare under EVERY whole-formula
+    /// rename, so a bare read of it needs no seal. When it is TRUE a bare read
+    /// left in a formula stamped at one point can be RE-STAMPED by a later rename
+    /// at another point with a post-write token — the stale re-stamp that turned
+    /// `s.f#s0_0 == !s.f` into the unsatisfiable `s.f#s0_0 == !s.f#s0_0`
+    /// ([`super::path_defs::seal_bare_reads`] closes it).
+    ///
+    /// Fails closed (answers TRUE — seal more) when the write index was built
+    /// after the verify budget tripped: its gen-sets can be short, so "no block
+    /// versions it" is not evidence there. Memoized per function (this oracle is).
+    pub(crate) fn ever_versioned(&self, func: &VerifiableFunction, name: &str) -> bool {
+        if self.ssa.writes().built_after_trip() {
+            return true;
+        }
+        if let Some(&hit) = self.ever_versioned_memo.borrow().get(name) {
+            return hit;
+        }
+        let versioned = func
+            .body
+            .blocks
+            .iter()
+            .any(|b| self.version_token_at(func, b.id, b.stmts.len(), name).is_some());
+        self.ever_versioned_memo.borrow_mut().insert(name.to_string(), versioned);
+        versioned
+    }
+
+    /// Trust (2026-10-16, S2): every `name#token` symbol a formula of `func` uses
+    /// for a LOOP-CARRIED JOIN — the value of a tracked name at the entry of a loop
+    /// header that is a pseudo-def of it (step 0 of `version_ssa`'s resolution,
+    /// [`version_ssa::VersionSsa::loop_header_join_names`]). The token is the
+    /// generator's own spelling of a read at the header's entry
+    /// (`version_token_at(h, 0, name)`), so it matches the symbols in the VCs byte
+    /// for byte (`i#s0_0_s23_0`). Such a symbol has a back-edge operand and no
+    /// defining equation: only its type range and monotone bounds constrain it, so a
+    /// model over it is a model of the formula, not of any iteration.
+    ///
+    /// Each symbol maps to its loop header's block index.
+    ///
+    /// `None` when the answer is not exact (an oracle built after a budget trip) or
+    /// exceeds `max_queries` (header × name) queries — the caller fails closed.
+    pub(crate) fn loop_carried_join_symbols(
+        &self,
+        func: &VerifiableFunction,
+        max_queries: usize,
+    ) -> Option<FxHashMap<String, usize>> {
+        let cfg = self.ssa.cfg();
+        let headers: Vec<usize> =
+            (0..cfg.n_blocks()).filter(|&b| cfg.is_loop_header(b as u32)).collect();
+        let mut out = FxHashMap::default();
+        if headers.is_empty() {
+            return Some(out);
+        }
+        if headers.len().saturating_mul(self.ssa.name_count()) > max_queries {
+            return None;
+        }
+        for h in headers {
+            for name in self.ssa.loop_header_join_names(h)? {
+                if let Some(token) = self.version_token_at(func, BlockId(h), 0, &name) {
+                    out.insert(format!("{name}#{token}"), h);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn version_token_at_ssa(
+        &self,
+        func: &VerifiableFunction,
+        block: BlockId,
+        stmt_idx: usize,
+        name: &str,
+    ) -> Option<String> {
+        // Trust (lane-A CSE): the id==index invariant, filtered exactly as before.
+        func.body.blocks.get(block.0).filter(|b| b.id == block)?;
+        let writes = self.ssa.writes();
+        if let Some(k) = writes.last_writer_before(block.0, stmt_idx, name) {
+            return Some(format!("s{}_{k}", block.0));
+        }
+        let (gate_dest, gate_plain) = writes.gate(func, block.0, stmt_idx, name);
+        if gate_dest {
+            if gate_plain {
+                return Some(format!("s{}_pre", block.0));
+            }
+            static VERSION_GATE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *VERSION_GATE_TRACE
+                .get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_VERSION_GATE_TRACE"))
+            {
+                eprintln!(
+                    "[VERSION_GATE] fall-through: fn={} block={} stmt={stmt_idx} name={name}",
+                    func.name, block.0,
+                );
+            }
+        }
+        // Else the inter-block reaching set at block entry: the union over every
+        // tracked name that `write_rebinds` `name` (an OVERLAP union, not an exact-key
+        // get — the callee-write false-accept sweep: a call havocs the base `r`, the
+        // read spells `r*`), spelled `None` when it is empty or exactly `{e}` (bare,
+        // never-rewritten reads stay byte-identical) and otherwise as the sorted
+        // `_`-joined token list — a MIXED union keeps `e` in the join (`e_s1_t`),
+        // because a partially-entry-valued read denotes a different value than a
+        // definitely-post-write one. The union ranges over DIFFERENT tracked names, so
+        // a joined token can carry components from several of them; the guarantee
+        // that makes that sound — THE DEF'S WRITE IS THE LAST WRITE OF EVERY UNION
+        // COMPONENT ON EVERY PATH into the successor — is carried by the kills
+        // (`thread_own_defs_in_statement_order`, `extract_block_definitions_until_impl`)
+        // and by a correct name for the def's destination (`referent_fold::is_stable`).
+        self.ssa.inter_block_token(block.0, name)
+    }
+
+    /// The SSA [`version_ssa::ValueId`] `name` denotes when read at `(block, stmt_idx)`,
+    /// or `None` when it cannot be named exactly.
+    ///
+    /// The statement-granular twin of [`Self::version_token_at`], with the same two
+    /// arms: a same-block writer in `stmts[..stmt_idx]` names its own statement; with
+    /// none, the block-entry value ([`version_ssa::VersionSsa::entry_value_id`]). Where
+    /// the token oracle mints a phantom (`s{b}_pre`) or falls through on the derived
+    /// `__slice_len` channel, this answers `None` — there is no single value to name.
+    ///
+    /// Read the contract on [`version_ssa::ValueId`] before comparing two of these:
+    /// equality means "the same value" only between a point and a point it DOMINATES.
+    pub(crate) fn value_id_at(
+        &self,
+        func: &VerifiableFunction,
+        block: BlockId,
+        stmt_idx: usize,
+        name: &str,
+    ) -> Option<version_ssa::ValueId> {
+        func.body.blocks.get(block.0).filter(|b| b.id == block)?;
+        let writes = self.ssa.writes();
+        if let Some(k) = writes.last_writer_before(block.0, stmt_idx, name) {
+            return Some(version_ssa::ValueId::Def { block: block.0 as u32, stmt: k });
+        }
+        if writes.gate(func, block.0, stmt_idx, name).0 {
+            return None;
+        }
+        self.ssa.entry_value_id(block.0, name)
+    }
+
+    /// [`Self::value_id_at`], answering a read two or more tracked names rebind too
+    /// ([`version_ssa::VersionSsa::entry_value_id_grouped`]; its doc has the argument).
+    /// Trust (2026-10-17, gate RCA precision T3): asked only by the path-guard spelling
+    /// (`guard_value_spelling`); the same-block arms are [`Self::value_id_at`]'s.
+    pub(crate) fn value_id_at_grouped(
+        &self,
+        func: &VerifiableFunction,
+        block: BlockId,
+        stmt_idx: usize,
+        name: &str,
+    ) -> Option<version_ssa::ValueId> {
+        func.body.blocks.get(block.0).filter(|b| b.id == block)?;
+        let writes = self.ssa.writes();
+        if let Some(k) = writes.last_writer_before(block.0, stmt_idx, name) {
+            return Some(version_ssa::ValueId::Def { block: block.0 as u32, stmt: k });
+        }
+        if writes.gate(func, block.0, stmt_idx, name).0 {
+            return None;
+        }
+        self.ssa.entry_value_id_grouped(block.0, name)
+    }
+
+    /// The CFG index the oracle resolves over: the dominator tree of the full
+    /// (unwind-inclusive) block graph, augmented with the virtual entry `E` and root `R`.
+    pub(crate) fn cfg(&self) -> &cfg_index::CfgIndex {
+        self.ssa.cfg()
+    }
+
+    /// True iff `block`'s entry-version map TRACKS a name overlapping `name` with a
+    /// non-empty reaching set.
     ///
     /// Where it does NOT, [`Self::version_token_at`]'s `None` does not mean "the
-    /// entry value". Since 2026-08-30 `block_entry_versions` builds its
-    /// predecessor lists from `full_graph_terminator_targets` (unwind-inclusive,
-    /// matching the fact-transport graph), so a cleanup-only-reachable block now
-    /// versions its reads like any other; but a block unreachable from bb0 across
-    /// full-graph edges still gets an EMPTY map, and a never-written name is
-    /// simply untracked. A caller that reads a bare (or `#e`) spelling AS the
-    /// entry value must consult this first.
-    // MERGE NOTE (integrate-e6-perfield-20260831): the non-test caller went with
-    // the other line; the tie-subsumption tests still exercise it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only since the merge"))]
+    /// entry value": a block unreachable from bb0 across full-graph edges has no
+    /// reaching set, and a never-written name is simply untracked. A caller that
+    /// reads a bare (or `#e`) spelling AS the entry value must consult this first.
+    #[cfg(test)]
     pub(crate) fn entry_map_covers(&self, block: BlockId, name: &str) -> bool {
-        self.entry
-            .get(&block)
-            .is_some_and(|em| em.keys().any(|tracked| place_names_overlap(tracked, name)))
+        let covers = self.ssa.covers(block.0, name);
+        if let Some(legacy) = &self.legacy {
+            assert_eq!(
+                covers,
+                legacy.entry_map_covers(block, name),
+                "entry_map_covers differential"
+            );
+        }
+        covers
     }
 
     /// THE `#e` MINT GATE's oracle: true iff EVERY runtime path into `block` —
     /// normal or unwind — delivers `name`'s function-ENTRY value, i.e. the
     /// UNWIND-INCLUSIVE reaching-version union at `block`'s entry is exactly
-    /// `{e}`. Same overlap-union lookup as `version_token_at`'s inter-block arm,
-    /// but over the full-graph map: `{e}` tokens are seeded only at bb0 and any
-    /// gen replaces them, so with unwind edges IN the predecessor relation an
-    /// exactly-`{e}` union means no writer of `name` on ANY path into the block.
+    /// `{e}`. Same overlap-union lookup as `version_token_at`'s inter-block arm:
+    /// `{e}` is seeded only at bb0 and any gen replaces it, so with unwind edges IN
+    /// the predecessor relation an exactly-`{e}` union means no writer of `name` on
+    /// ANY path into the block.
     ///
-    /// Fails closed three ways, each toward "not entry" (no `#e` mint):
-    ///  * the full-graph fixpoint hit its step cap (`entry_full` is `None`);
+    /// Fails closed two ways, each toward "not entry" (no `#e` mint):
     ///  * `block` is unreachable from bb0 across full-graph edges (empty union);
     ///  * ANY overlapping tracked name contributes a non-`e` token.
+    ///
+    ///  * the oracle's write index was built after the ambient verify budget
+    ///    tripped (`FnWrites::built_after_trip`): its gen-sets come from a polled
+    ///    extraction that returns FEWER names on a trip, so an exactly-`{e}` union
+    ///    there is not evidence that no writer exists. (The retired form's third way,
+    ///    "the full-graph fixpoint hit its step cap", is gone with the fixpoint.)
     pub(crate) fn full_graph_union_is_entry_only(&self, block: BlockId, name: &str) -> bool {
-        let Some(full) = &self.entry_full else { return false };
-        let Some(em) = full.get(&block) else { return false };
-        let mut toks: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for (tracked, s) in em {
-            if place_names_overlap(tracked, name) {
-                toks.extend(s.iter().map(String::as_str));
-            }
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy
+            && legacy_version_oracle::legacy_answers()
+        {
+            return legacy.full_graph_union_is_entry_only(block, name);
         }
-        toks.len() == 1 && toks.contains(ENTRY_VERSION_SENTINEL)
+        let entry_only = self.ssa.union_is_entry_only(block.0, name);
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy {
+            assert_eq!(
+                entry_only,
+                legacy.full_graph_union_is_entry_only(block, name),
+                "full_graph_union_is_entry_only differential: `{name}` at {block:?}"
+            );
+        }
+        entry_only
+    }
+
+    /// THE STATEMENT-PREFIX KILL, probed: whether some name of
+    /// `writes_until(block, point)` — or, when `block_havoc`, of the block's
+    /// opaque-store havoc list — `dest_write_rebinds` `name`. Exactly the membership
+    /// test `formula_survives_redefs` applies to every free mention against that set
+    /// (`v2_live_path_defs_at_point`), answered by the write index.
+    pub(crate) fn prefix_kill_rebinds(
+        &self,
+        func: &VerifiableFunction,
+        block: BlockId,
+        point: usize,
+        name: &str,
+        block_havoc: bool,
+    ) -> bool {
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if self.legacy.is_some() && legacy_version_oracle::legacy_answers() {
+            let bb = &func.body.blocks[block.0];
+            let set = writes_until_uncached(func, bb, point);
+            return set.iter().any(|n| dest_write_rebinds(n, name))
+                || (block_havoc
+                    && deref_store_havoc_names(func, bb).iter().any(|n| write_rebinds(n, name)));
+        }
+        let writes = self.ssa.writes();
+        // Trust (2026-09-29): the CONSERVATIVE whole-block havoc — it also covers
+        // opaque stores at or after `point`, which cannot change the value read at
+        // `point` — is judged with the PLAIN relation a havoc base name carries
+        // (`WriteIndex::havoc_rebinds`), not the destination relation: an element
+        // store through `s: &mut [u8]` does not write `s__slice_len`. Dest mode here
+        // severed every length tie of a row in a block that stores through its slice,
+        // and the store half of `digits[i] -= 1` — whose OWN store is the only opaque
+        // store of its block, at the row's point — was refuted at
+        // `digits__slice_len = 0` beside `_6__slice_len = 1`
+        // (tests/false_refutation_shapes_realmir.rs). A store BEFORE `point` is still
+        // judged by `gate` exactly as before.
+        (block_havoc && writes.havoc_rebinds(name)) || writes.gate(func, block.0, point, name).0
+    }
+
+    /// THE TERMINATOR KILL of `block`: the kill set `terminator_def_names(func, block)`,
+    /// prepared for many `formula_survives_redefs` tests. When the terminator havocs
+    /// the whole-function list — unrefined, or refined per call (a few names dropped,
+    /// a few added) — that list is probed through the write index's ONE shared havoc
+    /// index instead of being copied and re-indexed per block (a Call/Drop terminator
+    /// in a body with many pointer locals — every call of `ever-init-many-locals` —
+    /// used to cost the whole list per block per pass).
+    pub(crate) fn terminator_kill(
+        &self,
+        func: &VerifiableFunction,
+        block: &trust_types::BasicBlock,
+    ) -> TerminatorKill<'_> {
+        let writes = self.ssa.writes();
+        let cacheable = !crate::fn_memo::is_disabled()
+            && !trust_types::verify_budget::exhausted_readonly()
+            && !writes.built_after_trip()
+            && func.body.blocks.get(block.id.0).is_some_and(|b| std::ptr::eq(b, block));
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let cacheable = cacheable
+            && !differential_enabled()
+            && !(self.legacy.is_some() && legacy_version_oracle::legacy_answers());
+        let key = (
+            block.id.0,
+            std::ptr::from_ref(block) as usize,
+            callee_write_set::current_scope_id(),
+        );
+        if cacheable
+            && let Some(data) = self.terminator_kill_memo.borrow().get(&key).cloned()
+        {
+            return TerminatorKill { writes, data };
+        }
+        let term = terminator_def_names_structured(func, block);
+        let mut names: Vec<String> = Vec::new();
+        // The havoc-list names this terminator drops, as text (the split reference of
+        // `survives_havoc_plain`'s differential).
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let diff_enabled = differential_enabled();
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let mut removed_text: Vec<String> = Vec::new();
+        let havoc = match &term.havoc {
+            TermHavoc::None => None,
+            TermHavoc::Function => Some(Vec::new()),
+            TermHavoc::Refined(delta) => {
+                let in_h = |n: &str| writes.in_havoc_text(n);
+                names.extend(delta.added(&in_h));
+                let removed_names = delta.removed(&in_h);
+                #[cfg(any(test, feature = "version-oracle-differential"))]
+                if diff_enabled {
+                    removed_text.extend(removed_names.iter().map(|n| n.to_string()));
+                }
+                let mut removed: Vec<rebind_index::NameId> =
+                    removed_names.iter().filter_map(|n| writes.name_id(n)).collect();
+                removed.sort_unstable();
+                Some(removed)
+            }
+            TermHavoc::Escape(e) => {
+                #[cfg(any(test, feature = "version-oracle-differential"))]
+                if diff_enabled {
+                    removed_text.extend(e.dropped.iter().cloned());
+                }
+                let mut removed: Vec<rebind_index::NameId> =
+                    e.dropped.iter().filter_map(|n| writes.name_id(n)).collect();
+                removed.sort_unstable();
+                Some(removed)
+            }
+        };
+        for e in &term.extra {
+            let (TermExtra::Push(n) | TermExtra::PushIfAbsent(n)) = e;
+            names.push(n.clone());
+        }
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let reference: FxHashSet<String> = if diff_enabled {
+            terminator_def_names(func, block).into_iter().collect()
+        } else {
+            FxHashSet::default()
+        };
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let reference_havoc: Vec<String> = if diff_enabled && havoc.is_some() {
+            path_defs::function_havoc_names(func)
+                .iter()
+                .filter(|n| !removed_text.contains(n))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        let reference_extra = if diff_enabled { names.clone() } else { Vec::new() };
+        let data = std::rc::Rc::new(TerminatorKillData {
+            empty: havoc.is_none() && names.is_empty(),
+            havoc,
+            extra: KillSet::new(&names),
+            #[cfg(any(test, feature = "version-oracle-differential"))]
+            reference,
+            #[cfg(any(test, feature = "version-oracle-differential"))]
+            reference_havoc,
+            #[cfg(any(test, feature = "version-oracle-differential"))]
+            reference_extra,
+        });
+        if cacheable && !trust_types::verify_budget::exhausted_readonly() {
+            self.terminator_kill_memo.borrow_mut().insert(key, std::rc::Rc::clone(&data));
+        }
+        TerminatorKill { writes, data }
+    }
+
+    /// THE MAY-REASSIGNED KILL, probed: whether some name of the retired
+    /// `v2_may_reassigned_per_block(func)[block]` set `dest_write_rebinds` `name` —
+    /// i.e. whether a fact mentioning `name` is killed at `block` by a write on some
+    /// path into it or by the block's own statements. See
+    /// `version_ssa::VersionSsa::may_reassigned_rebinds`.
+    pub(crate) fn may_reassigned_rebinds(&self, block: BlockId, name: &str) -> bool {
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy
+            && legacy_version_oracle::legacy_answers()
+        {
+            return legacy.may_reassigned_rebinds(block, name);
+        }
+        let rebinds = self.ssa.may_reassigned_rebinds(block.0, name);
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if let Some(legacy) = &self.legacy {
+            assert_eq!(
+                rebinds,
+                legacy.may_reassigned_rebinds(block, name),
+                "may-reassigned differential: `{name}` at {block:?}"
+            );
+        }
+        rebinds
     }
 
     /// Overlap-aware staleness at a precise point: is a fact whose sole free var is
@@ -993,17 +1860,136 @@ impl StmtVersionCtx {
         stmt_idx: usize,
         name: &str,
     ) -> bool {
-        let entry_only = std::collections::BTreeSet::from([ENTRY_VERSION_SENTINEL.to_string()]);
-        // Trust (lane-A CSE): id==index invariant → O(1) indexed lookup; the
-        // `.filter` preserves the exact `None`-on-violation behavior of the find.
         let Some(bb) = func.body.blocks.get(block.0).filter(|b| b.id == block) else {
             return false;
         };
-        let mut redefined = writes_until(func, bb, stmt_idx).as_ref().clone();
-        if let Some(em) = self.entry.get(&block) {
-            redefined.extend(em.iter().filter(|(_, v)| **v != entry_only).map(|(k, _)| k.clone()));
+        let stale = writes_until(func, bb, stmt_idx).iter().any(|n| write_rebinds(n, name))
+            || self.ssa.has_non_entry_rebinder(block.0, name);
+        if let Some(legacy) = &self.legacy {
+            assert_eq!(
+                stale,
+                legacy.is_versioned_stale_at(func, block, stmt_idx, name),
+                "is_versioned_stale_at differential"
+            );
         }
-        redefined.iter().any(|n| place_names_overlap(n, name))
+        stale
+    }
+
+    /// The inter-block SSA oracle (parity tests).
+    #[cfg(test)]
+    pub(crate) fn ssa(&self) -> &version_ssa::VersionSsa {
+        &self.ssa
+    }
+}
+
+struct TerminatorKillData {
+    /// When the terminator havocs the whole-function list: the names of it the
+    /// refinement dropped (sorted; empty when unrefined).
+    havoc: Option<Vec<rebind_index::NameId>>,
+    /// Every other name of the set.
+    extra: KillSet,
+    empty: bool,
+    #[cfg(any(test, feature = "version-oracle-differential"))]
+    reference: FxHashSet<String>,
+    /// The havoc-list part of `reference` (the whole-function list minus the names
+    /// the refinement dropped), judged under the plain relation by
+    /// [`TerminatorKill::survives_havoc_plain`]'s differential.
+    #[cfg(any(test, feature = "version-oracle-differential"))]
+    reference_havoc: Vec<String>,
+    /// Every other name of `reference` (refinement additions, destination and
+    /// stored-pointee extras), judged under the destination relation.
+    #[cfg(any(test, feature = "version-oracle-differential"))]
+    reference_extra: Vec<String>,
+}
+
+/// A terminator's kill set (see [`StmtVersionCtx::terminator_kill`]).
+pub(crate) struct TerminatorKill<'a> {
+    /// The oracle's write index (its shared whole-function havoc index).
+    writes: &'a block_writes::FnWrites,
+    data: std::rc::Rc<TerminatorKillData>,
+}
+
+impl TerminatorKill<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.empty
+    }
+
+    /// `formula_survives_redefs(f, terminator_def_names(func, block))`.
+    pub(crate) fn survives(&self, f: &Formula) -> bool {
+        let survives = self.data.empty
+            || formula_survives_redefs_by(f, &mut |n| {
+                self.data.extra.kills(n)
+                    || self.data.havoc.as_ref().is_some_and(|removed| {
+                        if removed.is_empty() {
+                            self.writes.havoc_dest_rebinds(n)
+                        } else {
+                            self.writes.havoc_dest_rebinds_except(n, removed)
+                        }
+                    })
+            });
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if differential_enabled() {
+            assert_eq!(
+                survives,
+                formula_survives_redefs(f, &self.data.reference),
+                "TerminatorKill differential on {f:?}"
+            );
+        }
+        survives
+    }
+
+    /// [`Self::survives`] with the whole-function HAVOC LIST judged under the PLAIN
+    /// relation (`write_rebinds`) a havoc base name carries, and every other name —
+    /// the call destination and its `__slice_len` twin, a refinement's added
+    /// callee-write paths, the stored-pointee names, an unlocatable terminator's
+    /// every-local names — still under the destination relation.
+    ///
+    /// Trust (2026-10-10, SLICE-LEN-CALL-HAVOC-1). The opaque deref-store havoc moved
+    /// to the plain relation on 2026-09-29 ([`path_defs::KillSet::havoc`], whose doc
+    /// states the premise); the path-definition fixpoint's TERMINATOR kill kept the
+    /// destination relation because no fixture distinguished it. One does now: a
+    /// slice pattern behind an or-pattern of string literals
+    /// (`match (name, args) { ("a" | "b", [x, y]) => .. }`) tests
+    /// `PtrMetadata(&raw const (*_13)) == 2` in bb0 through the raw temp `_6`, then
+    /// calls `<str as PartialEq>::eq` before the arm. `_6: *const [i64]` is a
+    /// mutable-pointer local, so its BASE name is on the havoc list, and the
+    /// destination relation read it as a write of `_6__slice_len` — the pointer's
+    /// own length metadata, which lives in `_6`'s slot and which no callee can
+    /// write without a slot-write channel. The tie `_6__slice_len == _13__slice_len`
+    /// and `_7 == _6__slice_len` died at the call, and the arm's `[0 of 2]` read was
+    /// refuted at `_16__slice_len = 0` beside `PtrMetadata == 2`
+    /// (tla-shapes-families `cvw.rs:474`).
+    ///
+    /// SOUNDNESS: the premise of [`path_defs::KillSet::havoc`], unchanged: every
+    /// pointer that can write a local's slot comes from a slot-write channel
+    /// (`own_storage_write_borrow`), and each such local is a
+    /// `mutably_borrowed_havoc_names` member whose `__slice_len` twin is on the list
+    /// EXPLICITLY, so the plain relation still kills it. Everything reachable
+    /// THROUGH a havoc base (`p*`, `p*[_i]`, `p*__slice_len`, `p.f*`) overlaps it
+    /// under the plain relation too. Names that denote WRITTEN memory rather than a
+    /// pointer base — the destination, the refinement's callee-write paths, the
+    /// stored-pointee names — are in `extra` and keep the derived channel.
+    pub(crate) fn survives_havoc_plain(&self, f: &Formula) -> bool {
+        let survives = self.data.empty
+            || formula_survives_redefs_by(f, &mut |n| {
+                self.data.extra.kills(n)
+                    || self.data.havoc.as_ref().is_some_and(|removed| {
+                        if removed.is_empty() {
+                            self.writes.havoc_rebinds(n)
+                        } else {
+                            self.writes.havoc_rebinds_except(n, removed)
+                        }
+                    })
+            });
+        #[cfg(any(test, feature = "version-oracle-differential"))]
+        if differential_enabled() {
+            let reference = formula_survives_redefs_by(f, &mut |n| {
+                self.data.reference_extra.iter().any(|w| path_defs::dest_write_rebinds(w, n))
+                    || self.data.reference_havoc.iter().any(|w| path_defs::write_rebinds(w, n))
+            });
+            assert_eq!(survives, reference, "TerminatorKill plain-havoc differential on {f:?}");
+        }
+        survives
     }
 }
 
@@ -1032,8 +2018,72 @@ struct FuncAnalysisFrame {
     /// cannot be freed and reused underneath it, so no other live
     /// `VerifiableFunction` can share the address.
     func_addr: usize,
+    /// The address of that function's `body` (pinned by the same borrow).
+    body_addr: usize,
     stmt_versions: Option<std::rc::Rc<StmtVersionCtx>>,
     guard_map: Option<std::rc::Rc<PathGuardMap>>,
+    path_guard_analysis: Option<std::rc::Rc<safety::PathGuardAnalysis>>,
+    path_definition_map: Option<(u64, std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>)>,
+    semantic_guard_maps: Vec<((u64, u64), std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>)>,
+    row_global_facts: Option<std::rc::Rc<RowGlobalFacts>>,
+    range_yield_guards: Option<(u64, std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>)>,
+    enumerate_yield_guards: Option<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>>,
+    slice_iter_yield_guards: Option<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>>,
+    downward_vars: Option<std::rc::Rc<Vec<DownwardVar>>>,
+    countdown_facts: Option<std::rc::Rc<CountdownFacts>>,
+    primitive_decimal_len_guards: Option<(usize, std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>)>,
+    unwrap_panic_vcs: Option<(u64, std::rc::Rc<Vec<(BlockId, VerificationCondition)>>)>,
+    write_index: Option<std::rc::Rc<crate::local_defs::LocalWriteIndex>>,
+    /// [`crate::guards::unstable_locals`], built on first use.
+    unstable_locals: Option<std::rc::Rc<Vec<bool>>>,
+    /// [`dominating_facts::DominatingFacts`], built on first use.
+    dominating_facts: Option<std::rc::Rc<dominating_facts::DominatingFacts>>,
+    /// [`SafetyTerminatorPresence`], built on first use.
+    terminator_presence: Option<SafetyTerminatorPresence>,
+    /// [`loop_bounds::count_back_edges`], built on first use.
+    back_edge_count: Option<usize>,
+    /// [`loop_bounds::has_unmodelable_write_uncached`], built on first use.
+    has_unmodelable_write: Option<bool>,
+    /// [`trust_types::loop_nest::LoopNest::of`], built on first use.
+    loop_nest: Option<Option<std::rc::Rc<trust_types::loop_nest::LoopNest>>>,
+    /// [`semantic_guard::func_exceeds_vcgen_budget`], built on first use when tracing is off.
+    exceeds_vcgen_budget: Option<bool>,
+    /// [`crate::enum_entry::has_enum_parameter_uncached`], built on first use.
+    enum_entry_has_enum_param: Option<bool>,
+    /// [`crate::enum_entry::pure_body_non_call_uncached`], built on first use.
+    enum_entry_pure_body_non_call: Option<Option<bool>>,
+    /// [`crate::elem_sizes::elem_size_binding_digest`], built on first use.
+    elem_size_binding_digest: Option<Option<String>>,
+    /// [`crate::primitive_decimal_strings::body_digest`], built on first use.
+    primitive_decimal_body_digest: Option<Option<String>>,
+    /// [`trust_types::VerifiableBody::contains_memory_image`], built on first use.
+    body_contains_memory_image: Option<bool>,
+    /// Whether [`crate::validate_function_uncached`] succeeded (`Ok(())`), built on first use.
+    validate_function_ok: Option<bool>,
+    /// Whether [`trust_types::VerifiableBody::opaque_values_need_placement`] holds for
+    /// `func.body`, built on first use (or seeded to `Some(false)` on a placed view).
+    opaque_values_need_placement: Option<bool>,
+    /// Whether `func` declares any named 128-bit integer parameter (`1..=arg_count`),
+    /// built on first use.
+    has_wide_int_param: Option<bool>,
+    /// [`sep_engine::has_unsafe_patterns_uncached`], built on first use.
+    has_sep_unsafe_patterns: Option<bool>,
+    /// [`crate::func_has_no_join_uncached`], built on first use.
+    has_no_join: Option<bool>,
+    /// [`path_defs::func_has_pointer_laundering_uncached`], built on first use.
+    has_pointer_laundering: Option<bool>,
+    /// [`path_defs::func_has_writable_pointer_laundering_uncached`], built on first use.
+    has_writable_pointer_laundering: Option<bool>,
+    /// [`path_defs::index_locals_uncached`], built on first use.
+    index_locals: Option<std::rc::Rc<Vec<bool>>>,
+    /// [`guards::block_predecessors_uncached`], built on first use.
+    block_predecessors: Option<std::rc::Rc<Vec<Vec<BlockId>>>>,
+    /// [`guards::block_predecessor_edges_uncached`], built on first use.
+    block_predecessor_edges: Option<std::rc::Rc<Vec<Vec<BlockId>>>>,
+    /// [`FloatRangeCtx::dominating_facts`], keyed by `(block_id, scope_id)`.
+    float_guard_facts: FxHashMap<(BlockId, u64), std::rc::Rc<Vec<Formula>>>,
+    /// [`FloatRangeCtx::guard_alias_names`], keyed by `local`.
+    float_alias_names: FxHashMap<usize, std::rc::Rc<Vec<String>>>,
 }
 
 /// Per-function memo for the two whole-CFG analyses that are PURE FUNCTIONS of
@@ -1085,12 +2135,88 @@ impl<'f> FuncAnalysisScope<'f> {
             let mut memo = memo.borrow_mut();
             memo.push(FuncAnalysisFrame {
                 func_addr: std::ptr::from_ref(func) as usize,
+                body_addr: std::ptr::from_ref(&func.body) as usize,
                 stmt_versions: None,
                 guard_map: None,
+                path_guard_analysis: None,
+                path_definition_map: None,
+                semantic_guard_maps: Vec::new(),
+                row_global_facts: None,
+                range_yield_guards: None,
+                enumerate_yield_guards: None,
+                slice_iter_yield_guards: None,
+                downward_vars: None,
+                countdown_facts: None,
+                primitive_decimal_len_guards: None,
+                unwrap_panic_vcs: None,
+                write_index: None,
+                unstable_locals: None,
+                dominating_facts: None,
+                terminator_presence: None,
+                back_edge_count: None,
+                has_unmodelable_write: None,
+                loop_nest: None,
+                exceeds_vcgen_budget: None,
+                enum_entry_has_enum_param: None,
+                enum_entry_pure_body_non_call: None,
+                elem_size_binding_digest: None,
+                primitive_decimal_body_digest: None,
+                body_contains_memory_image: None,
+                validate_function_ok: None,
+                opaque_values_need_placement: None,
+                has_wide_int_param: None,
+                has_sep_unsafe_patterns: None,
+                has_no_join: None,
+                has_pointer_laundering: None,
+                has_writable_pointer_laundering: None,
+                index_locals: None,
+                block_predecessors: None,
+                block_predecessor_edges: None,
+                float_guard_facts: FxHashMap::default(),
+                float_alias_names: FxHashMap::default(),
             });
             memo.len()
         });
         FuncAnalysisScope { _func: func, depth, _thread_affine: std::marker::PhantomData }
+    }
+
+    pub(crate) fn enter_placed(func: &'f VerifiableFunction) -> Self {
+        let scope = Self::enter(func);
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo.borrow_mut().last_mut() {
+                frame.opaque_values_need_placement = Some(false);
+            }
+        });
+        scope
+    }
+
+    pub(crate) fn enter_if_unbound(func: &'f VerifiableFunction) -> Option<Self> {
+        let func_addr = std::ptr::from_ref(func) as usize;
+        let body_addr = std::ptr::from_ref(&func.body) as usize;
+        let bound = FUNC_ANALYSIS_MEMO.with(|memo| {
+            memo.borrow()
+                .last()
+                .is_some_and(|frame| frame.func_addr == func_addr && frame.body_addr == body_addr)
+        });
+        (!bound).then(|| Self::enter(func))
+    }
+
+    pub(crate) fn enter_placed_if_unbound(func: &'f VerifiableFunction) -> Option<Self> {
+        let func_addr = std::ptr::from_ref(func) as usize;
+        let body_addr = std::ptr::from_ref(&func.body) as usize;
+        let bound = FUNC_ANALYSIS_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some(frame) = memo
+                .last_mut()
+                .filter(|frame| frame.func_addr == func_addr && frame.body_addr == body_addr)
+            {
+                frame.opaque_values_need_placement = Some(false);
+                true
+            } else {
+                false
+            }
+        });
+        (!bound).then(|| Self::enter_placed(func))
     }
 }
 
@@ -1100,20 +2226,991 @@ impl Drop for FuncAnalysisScope<'_> {
     }
 }
 
-/// The statement-version oracle for `func`, memoized for the innermost
-/// [`FuncAnalysisScope`] bound to the same function. Falls back to building it
-/// (today's behaviour) when there is no matching scope.
-pub(crate) fn stmt_versions_for(func: &VerifiableFunction) -> std::rc::Rc<StmtVersionCtx> {
-    let addr = std::ptr::from_ref(func) as usize;
+/// The per-local write index of `body` (`local_defs::LocalWriteIndex`), memoized for
+/// the innermost [`FuncAnalysisScope`] whose function OWNS `body` — `None` for any
+/// other body (a callee's, a derived clone's), which then takes the whole-body walk.
+/// Keyed on the body's address, which the scope's borrow pins for exactly as long as
+/// the frame lives.
+pub(crate) fn local_write_index_for(
+    body: &trust_types::VerifiableBody,
+) -> Option<std::rc::Rc<crate::local_defs::LocalWriteIndex>> {
+    let addr = std::ptr::from_ref(body) as usize;
+    let (hit, owned) = FUNC_ANALYSIS_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        match memo.iter().rev().find(|frame| frame.body_addr == addr) {
+            Some(frame) => (frame.write_index.clone(), true),
+            None => (None, false),
+        }
+    });
+    if !owned {
+        return None;
+    }
+    if let Some(hit) = hit {
+        return Some(hit);
+    }
+    let built = std::rc::Rc::new(crate::local_defs::LocalWriteIndex::build(body));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.write_index = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    Some(built)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SafetyTerminatorPresence {
+    pub(crate) has_call: bool,
+    pub(crate) has_tail_call: bool,
+    pub(crate) has_atomic_call: bool,
+    pub(crate) has_bare_dest_call: bool,
+    pub(crate) has_iterator_next_call: bool,
+    pub(crate) has_str_search_item_call: bool,
+    pub(crate) has_position_call: bool,
+    pub(crate) has_count_call: bool,
+    pub(crate) has_str_find_call: bool,
+    pub(crate) has_std_scalar_index_call: bool,
+    pub(crate) has_vec_sole_resize_call: bool,
+    pub(crate) has_switch_int: bool,
+    pub(crate) has_assert: bool,
+    pub(crate) has_bounds_check_assert: bool,
+    pub(crate) has_overflow_assert: bool,
+    pub(crate) has_overflow_neg_assert: bool,
+    pub(crate) has_divrem_zero_assert: bool,
+    pub(crate) has_opaque: bool,
+    pub(crate) has_drop: bool,
+    pub(crate) has_back_edge: bool,
+}
+
+impl SafetyTerminatorPresence {
+    fn of(body: &trust_types::VerifiableBody) -> Self {
+        let mut p = Self::default();
+        for block in &body.blocks {
+            if !p.has_back_edge {
+                crate::loop_analysis::for_each_successor(&block.terminator, |succ| {
+                    if succ.0 <= block.id.0 {
+                        p.has_back_edge = true;
+                    }
+                });
+            }
+            match &block.terminator {
+                Terminator::SwitchInt { .. } => {
+                    p.has_switch_int = true;
+                }
+                Terminator::Assert { msg, .. } => {
+                    p.has_assert = true;
+                    match msg {
+                        AssertMessage::BoundsCheck => {
+                            p.has_bounds_check_assert = true;
+                        }
+                        AssertMessage::Overflow(_) => {
+                            p.has_overflow_assert = true;
+                        }
+                        AssertMessage::OverflowNeg => {
+                            p.has_overflow_neg_assert = true;
+                        }
+                        AssertMessage::DivisionByZero | AssertMessage::RemainderByZero => {
+                            p.has_divrem_zero_assert = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Terminator::Opaque { .. } => {
+                    p.has_opaque = true;
+                }
+                Terminator::Drop { .. } => {
+                    p.has_drop = true;
+                }
+                Terminator::TailCall { atomic, .. } => {
+                    p.has_tail_call = true;
+                    if atomic.is_some() {
+                        p.has_atomic_call = true;
+                    }
+                }
+                term @ Terminator::Call { func: callee, args, dest, target, atomic, .. } => {
+                    p.has_call = true;
+                    if atomic.is_some() {
+                        p.has_atomic_call = true;
+                    }
+                    if !p.has_vec_sole_resize_call
+                        && !args.is_empty()
+                        && (callee.starts_with("alloc::vec::") || callee.starts_with("std::vec::"))
+                        && matches!(method_tail(callee), "remove" | "swap_remove" | "insert")
+                    {
+                        p.has_vec_sole_resize_call = true;
+                    }
+                    if !p.has_str_search_item_call
+                        && str_offset::terminator_is_str_search_call(term)
+                    {
+                        p.has_str_search_item_call = true;
+                    }
+                    if dest.projections.is_empty() {
+                        p.has_bare_dest_call = true;
+                        match method_tail(callee) {
+                            "next" => {
+                                if !p.has_iterator_next_call
+                                    && args.len() == 1
+                                    && iterator_yield::callee_is_iterator_next(callee)
+                                {
+                                    p.has_iterator_next_call = true;
+                                }
+                            }
+                            "position" | "rposition" => {
+                                if !p.has_position_call
+                                    && container_len::callee_is_slice_iter_position(callee)
+                                {
+                                    p.has_position_call = true;
+                                }
+                            }
+                            "count" => {
+                                if !p.has_count_call
+                                    && target.is_some()
+                                    && !trust_types::path_has_unauthenticated_crate_stamp(callee)
+                                    && iterator_yield::vc_callee_is_std_iter_trait_method(
+                                        callee, "Iterator", "count",
+                                    )
+                                {
+                                    p.has_count_call = true;
+                                }
+                            }
+                            "find" | "rfind" => {
+                                if !p.has_str_find_call
+                                    && iterator_yield::callee_is_std_str_find(callee)
+                                {
+                                    p.has_str_find_call = true;
+                                }
+                            }
+                            "index" => {
+                                if !p.has_std_scalar_index_call
+                                    && args.len() >= 2
+                                    && unwrap_panic::is_std_scalar_index_call(callee)
+                                {
+                                    p.has_std_scalar_index_call = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        p
+    }
+}
+
+/// Single-pass terminator summary of `body`, memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `body`.
+pub(crate) fn terminator_presence_for_body(
+    body: &trust_types::VerifiableBody,
+) -> SafetyTerminatorPresence {
+    let addr = std::ptr::from_ref(body) as usize;
     let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
         memo.borrow()
-            .last()
-            .filter(|frame| frame.func_addr == addr)
-            .and_then(|frame| frame.stmt_versions.clone())
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.terminator_presence)
     });
     if let Some(hit) = hit {
         return hit;
     }
+    let built = SafetyTerminatorPresence::of(body);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.terminator_presence = Some(built);
+        }
+    });
+    built
+}
+
+/// Single-pass terminator summary of `func.body`, memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn terminator_presence_for(func: &VerifiableFunction) -> SafetyTerminatorPresence {
+    terminator_presence_for_body(&func.body)
+}
+
+/// Cached [`SafetyTerminatorPresence`] when the innermost [`FuncAnalysisScope`] owns
+/// `body` (building on first use), or `None` outside a matching scope.
+pub(crate) fn cached_terminator_presence_for_body(
+    body: &trust_types::VerifiableBody,
+) -> Option<SafetyTerminatorPresence> {
+    let addr = std::ptr::from_ref(body) as usize;
+    let (hit, owned) = FUNC_ANALYSIS_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        match memo.iter().rev().find(|frame| frame.body_addr == addr) {
+            Some(frame) => (frame.terminator_presence, true),
+            None => (None, false),
+        }
+    });
+    if !owned {
+        return None;
+    }
+    if let Some(hit) = hit {
+        return Some(hit);
+    }
+    let built = SafetyTerminatorPresence::of(body);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.terminator_presence = Some(built);
+        }
+    });
+    Some(built)
+}
+
+/// Distinct loop-header count ([`loop_bounds::count_back_edges`]), memoized on the
+/// innermost [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn back_edge_count_for(func: &VerifiableFunction) -> usize {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.back_edge_count)
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = loop_bounds::count_back_edges_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.back_edge_count = Some(built);
+        }
+    });
+    built
+}
+
+/// [`loop_bounds::has_unmodelable_write_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn has_unmodelable_write_for(func: &VerifiableFunction) -> bool {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_unmodelable_write)
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = loop_bounds::has_unmodelable_write_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_unmodelable_write = Some(built);
+        }
+    });
+    built
+}
+
+/// [`trust_types::loop_nest::LoopNest::of`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn loop_nest_for(
+    func: &VerifiableFunction,
+) -> Option<std::rc::Rc<trust_types::loop_nest::LoopNest>> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.loop_nest.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = trust_types::loop_nest::LoopNest::of(&func.body).map(std::rc::Rc::new);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.loop_nest = Some(built.clone());
+        }
+    });
+    built
+}
+
+/// [`crate::enum_entry::has_enum_parameter_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn enum_entry_has_enum_parameter_for(func: &VerifiableFunction) -> bool {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.enum_entry_has_enum_param)
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = crate::enum_entry::has_enum_parameter_uncached(func);
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.body_addr == addr)
+            {
+                frame.enum_entry_has_enum_param = Some(built);
+            }
+        });
+    }
+    built
+}
+
+/// [`crate::enum_entry::pure_body_non_call_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn enum_entry_pure_body_non_call_for(func: &VerifiableFunction) -> Option<bool> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.enum_entry_pure_body_non_call)
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = crate::enum_entry::pure_body_non_call_uncached(func);
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.body_addr == addr)
+            {
+                frame.enum_entry_pure_body_non_call = Some(built);
+            }
+        });
+    }
+    built
+}
+
+/// [`trust_types::VerifiableBody::contains_memory_image`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `body`.
+pub(crate) fn body_contains_memory_image_for_body(body: &trust_types::VerifiableBody) -> bool {
+    let addr = std::ptr::from_ref(body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.body_contains_memory_image)
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = body.contains_memory_image();
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.body_contains_memory_image = Some(built);
+        }
+    });
+    built
+}
+
+/// [`trust_types::VerifiableBody::contains_memory_image`] for `func.body`, memoized on
+/// the innermost [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn body_contains_memory_image_for(func: &VerifiableFunction) -> bool {
+    body_contains_memory_image_for_body(&func.body)
+}
+
+/// [`crate::validate_function`] with `Ok(())` memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn validate_function_cached(
+    func: &VerifiableFunction,
+) -> Result<(), crate::VcgenError> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.validate_function_ok)
+    });
+    if hit == Some(true) {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert!(
+                crate::validate_function_uncached(func).is_ok(),
+                "validate_function_cached disagrees with validate_function_uncached for {}",
+                func.name
+            );
+        }
+        return Ok(());
+    }
+    let res = crate::validate_function_uncached(func);
+    let ok = res.is_ok();
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.validate_function_ok = Some(ok);
+            if ok {
+                frame.body_contains_memory_image = Some(false);
+            }
+        }
+    });
+    res
+}
+
+/// [`trust_types::VerifiableFunction::with_placed_opaque_values`] with the
+/// `opaque_values_need_placement == false` fast path memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn with_placed_opaque_values_cached(
+    func: &VerifiableFunction,
+) -> std::borrow::Cow<'_, VerifiableFunction> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.opaque_values_need_placement)
+    });
+    if hit == Some(false) {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert!(
+                !func.body.opaque_values_need_placement(),
+                "with_placed_opaque_values_cached disagrees with opaque_values_need_placement for {}",
+                func.name
+            );
+        }
+        return std::borrow::Cow::Borrowed(func);
+    }
+    let placed = func.with_placed_opaque_values();
+    let needed = matches!(placed, std::borrow::Cow::Owned(_));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.opaque_values_need_placement = Some(needed);
+        }
+    });
+    placed
+}
+
+/// [`trust_types::VerifiableFunction::with_tail_calls_expanded`] fast-pathed through
+/// [`cached_terminator_presence_for_body`] when a [`FuncAnalysisScope`] is bound to
+/// `func.body` and `!tp.has_tail_call`.
+pub(crate) fn with_tail_calls_expanded_cached(
+    func: &VerifiableFunction,
+) -> std::borrow::Cow<'_, VerifiableFunction> {
+    if let Some(tp) = cached_terminator_presence_for_body(&func.body)
+        && !tp.has_tail_call
+    {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert!(
+                matches!(func.with_tail_calls_expanded(), std::borrow::Cow::Borrowed(_)),
+                "with_tail_calls_expanded_cached disagrees with with_tail_calls_expanded for {}",
+                func.name
+            );
+        }
+        return std::borrow::Cow::Borrowed(func);
+    }
+    func.with_tail_calls_expanded()
+}
+
+pub(crate) fn body_has_wide_int_param_uncached(func: &VerifiableFunction) -> bool {
+    if func.body.arg_count == 0 {
+        return false;
+    }
+    let locals_slice = if func
+        .body
+        .locals
+        .get(func.body.arg_count)
+        .is_some_and(|d| d.index == func.body.arg_count)
+        && func.body.locals[..=func.body.arg_count]
+            .iter()
+            .enumerate()
+            .all(|(i, d)| d.index == i)
+    {
+        &func.body.locals[1..=func.body.arg_count]
+    } else {
+        &func.body.locals[..]
+    };
+    locals_slice.iter().any(|decl| {
+        decl.index >= 1
+            && decl.index <= func.body.arg_count
+            && decl.name.is_some()
+            && matches!(&decl.ty, Ty::Int { width, .. } if *width > 64 && *width <= 128)
+    })
+}
+
+/// Whether `func` declares any named 128-bit integer parameter (`1..=arg_count`),
+/// memoized on the innermost [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn body_has_wide_int_param_for(func: &VerifiableFunction) -> bool {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_wide_int_param)
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                hit,
+                body_has_wide_int_param_uncached(func),
+                "body_has_wide_int_param_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = body_has_wide_int_param_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_wide_int_param = Some(built);
+        }
+    });
+    built
+}
+
+/// [`sep_engine::has_unsafe_patterns_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn has_sep_unsafe_patterns_for(func: &VerifiableFunction) -> bool {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_sep_unsafe_patterns)
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                hit,
+                sep_engine::has_unsafe_patterns_uncached(func),
+                "has_sep_unsafe_patterns_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = sep_engine::has_unsafe_patterns_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_sep_unsafe_patterns = Some(built);
+        }
+    });
+    built
+}
+
+/// [`crate::func_has_no_join_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn func_has_no_join_for(func: &VerifiableFunction) -> bool {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_no_join)
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                hit,
+                crate::func_has_no_join_uncached(func),
+                "func_has_no_join_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = crate::func_has_no_join_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_no_join = Some(built);
+        }
+    });
+    built
+}
+
+/// [`path_defs::func_has_pointer_laundering_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body` when `!crate::fn_memo::is_disabled()`.
+pub(crate) fn func_has_pointer_laundering_for(func: &VerifiableFunction) -> bool {
+    if crate::fn_memo::is_disabled() {
+        return path_defs::func_has_pointer_laundering_uncached(func);
+    }
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_pointer_laundering)
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                hit,
+                path_defs::func_has_pointer_laundering_uncached(func),
+                "func_has_pointer_laundering_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = path_defs::func_has_pointer_laundering_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_pointer_laundering = Some(built);
+            if !built {
+                frame.has_writable_pointer_laundering = Some(false);
+            }
+        }
+    });
+    built
+}
+
+/// [`path_defs::func_has_writable_pointer_laundering_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body` when `!crate::fn_memo::is_disabled()`.
+pub(crate) fn func_has_writable_pointer_laundering_for(func: &VerifiableFunction) -> bool {
+    if crate::fn_memo::is_disabled() {
+        return path_defs::func_has_writable_pointer_laundering_uncached(func);
+    }
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.has_writable_pointer_laundering)
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                hit,
+                path_defs::func_has_writable_pointer_laundering_uncached(func),
+                "func_has_writable_pointer_laundering_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = path_defs::func_has_writable_pointer_laundering_uncached(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.has_writable_pointer_laundering = Some(built);
+        }
+    });
+    built
+}
+
+/// [`path_defs::index_locals_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body` when `!crate::fn_memo::is_disabled()`.
+pub(crate) fn index_locals_for(func: &VerifiableFunction) -> Option<std::rc::Rc<Vec<bool>>> {
+    if crate::fn_memo::is_disabled() {
+        return None;
+    }
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let (hit, owned) = FUNC_ANALYSIS_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        match memo.iter().rev().find(|frame| frame.body_addr == addr) {
+            Some(frame) => (frame.index_locals.clone(), true),
+            None => (None, false),
+        }
+    });
+    if !owned {
+        return None;
+    }
+    if let Some(hit) = hit {
+        return Some(hit);
+    }
+    let built = std::rc::Rc::new(path_defs::index_locals_uncached(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.index_locals = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    Some(built)
+}
+
+/// [`guards::block_predecessors_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body` when `!crate::fn_memo::is_disabled()`.
+pub(crate) fn block_predecessors_rc_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<Vec<Vec<BlockId>>> {
+    if crate::fn_memo::is_disabled() {
+        return std::rc::Rc::new(guards::block_predecessors_uncached(func));
+    }
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.block_predecessors.clone())
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                *hit,
+                guards::block_predecessors_uncached(func),
+                "block_predecessors_rc_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = std::rc::Rc::new(guards::block_predecessors_uncached(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.block_predecessors = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    built
+}
+
+/// [`guards::block_predecessor_edges_uncached`], memoized on the innermost
+/// [`FuncAnalysisScope`] bound to `func.body` when `!crate::fn_memo::is_disabled()`.
+pub(crate) fn block_predecessor_edges_rc_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<Vec<Vec<BlockId>>> {
+    if crate::fn_memo::is_disabled() {
+        return std::rc::Rc::new(guards::block_predecessor_edges_uncached(func));
+    }
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.block_predecessor_edges.clone())
+    });
+    if let Some(hit) = hit {
+        #[cfg(test)]
+        if differential_enabled() {
+            assert_eq!(
+                *hit,
+                guards::block_predecessor_edges_uncached(func),
+                "block_predecessor_edges_rc_for disagrees with uncached scan for {}",
+                func.name
+            );
+        }
+        return hit;
+    }
+    let built = std::rc::Rc::new(guards::block_predecessor_edges_uncached(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.block_predecessor_edges = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    built
+}
+
+fn empty_block_fact_map() -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    thread_local! {
+        static EMPTY: std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> =
+            std::rc::Rc::new(FxHashMap::default());
+    }
+    EMPTY.with(std::rc::Rc::clone)
+}
+
+fn empty_unwrap_panic_vcs() -> std::rc::Rc<Vec<(BlockId, VerificationCondition)>> {
+    thread_local! {
+        static EMPTY: std::rc::Rc<Vec<(BlockId, VerificationCondition)>> =
+            std::rc::Rc::new(Vec::new());
+    }
+    EMPTY.with(std::rc::Rc::clone)
+}
+
+fn empty_countdown_facts() -> std::rc::Rc<CountdownFacts> {
+    thread_local! {
+        static EMPTY: std::rc::Rc<CountdownFacts> =
+            std::rc::Rc::new(CountdownFacts::default());
+    }
+    EMPTY.with(std::rc::Rc::clone)
+}
+
+/// [`crate::guards::unstable_locals`] for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function — `None` outside one (the caller
+/// then scans, as it always did).
+pub(crate) fn unstable_locals_for(func: &VerifiableFunction) -> Option<std::rc::Rc<Vec<bool>>> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let (hit, owned) = FUNC_ANALYSIS_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        match memo.iter().rev().find(|frame| frame.func_addr == addr) {
+            Some(frame) => (frame.unstable_locals.clone(), true),
+            None => (None, false),
+        }
+    });
+    if !owned {
+        return None;
+    }
+    if let Some(hit) = hit {
+        return Some(hit);
+    }
+    let built = std::rc::Rc::new(crate::guards::unstable_locals(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+        {
+            frame.unstable_locals = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    Some(built)
+}
+
+/// The per-function dominating guard-fact index ([`dominating_facts::DominatingFacts`])
+/// for `func`, memoized exactly like [`stmt_versions_for`]. Outside a matching scope it
+/// is built per call: the same answer, at the cost of a build.
+pub(crate) fn dominating_facts_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<dominating_facts::DominatingFacts> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.dominating_facts.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(dominating_facts::DominatingFacts::build(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+        {
+            frame.dominating_facts = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    built
+}
+
+/// See [`dominating_facts::unmined_guard_bounds`].
+pub(crate) fn unmined_guard_bounds(func: &VerifiableFunction) -> Vec<String> {
+    dominating_facts::unmined_guard_bounds(func)
+}
+
+pub(super) fn stmt_versions_if_cached(
+    func: &VerifiableFunction,
+) -> Option<std::rc::Rc<StmtVersionCtx>> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.stmt_versions.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    crate::havoc_memo::cached_version_oracle(func)
+}
+
+/// The statement-version oracle for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function. Falls back to building it
+/// (today's behaviour) when there is no matching scope.
+pub(crate) fn stmt_versions_for(func: &VerifiableFunction) -> std::rc::Rc<StmtVersionCtx> {
+    if let Some(hit) = stmt_versions_if_cached(func) {
+        return hit;
+    }
+    let addr = std::ptr::from_ref(func) as usize;
     // Built OUTSIDE the `RefCell` borrow: the analysis is deep code and must be
     // free to re-enter this module without tripping a borrow panic.
     // NOT `Rc::new(..)`: on this base `StmtVersionCtx::build` ALREADY returns an
@@ -1123,8 +3220,11 @@ pub(crate) fn stmt_versions_for(func: &VerifiableFunction) -> std::rc::Rc<StmtVe
     // for the guard-map half below.
     let built = StmtVersionCtx::build(func);
     FUNC_ANALYSIS_MEMO.with(|memo| {
-        if let Some(frame) = memo.borrow_mut().last_mut()
-            && frame.func_addr == addr
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
         {
             frame.stmt_versions = Some(std::rc::Rc::clone(&built));
         }
@@ -1142,10 +3242,44 @@ pub(crate) fn stmt_versions_for(func: &VerifiableFunction) -> std::rc::Rc<StmtVe
 /// modes. This is analysis-output disclosure, not proof authority: a caller
 /// holding this set can only mint obligations this producer also mints.
 #[must_use]
-pub fn terminator_vc_block_set(
-    func: &VerifiableFunction,
-) -> std::collections::HashSet<BlockId> {
+pub fn terminator_vc_block_set(func: &VerifiableFunction) -> std::collections::HashSet<BlockId> {
     guard_map_for(func).keys().copied().collect()
+}
+
+/// The full path-guard analysis for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function unless an ambient
+/// verification budget trip cut the walk short.
+pub(crate) fn path_guard_analysis_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<safety::PathGuardAnalysis> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.path_guard_analysis.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(safety::v2_analyze_path_guards(func));
+    if built.collapse != safety::PathGuardCollapse::BudgetTripped
+        && !trust_types::verify_budget::exhausted_readonly()
+    {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.path_guard_analysis = Some(std::rc::Rc::clone(&built));
+                frame.guard_map = Some(std::rc::Rc::clone(&built.paths));
+            }
+        });
+    }
+    built
 }
 
 /// The path-guard map for `func`, memoized exactly like [`stmt_versions_for`].
@@ -1153,21 +3287,492 @@ pub(crate) fn guard_map_for(func: &VerifiableFunction) -> std::rc::Rc<PathGuardM
     let addr = std::ptr::from_ref(func) as usize;
     let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
         memo.borrow()
-            .last()
-            .filter(|frame| frame.func_addr == addr)
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
             .and_then(|frame| frame.guard_map.clone())
     });
     if let Some(hit) = hit {
         return hit;
     }
-    let built = std::rc::Rc::new(safety::v2_build_path_guard_map(func));
+    std::rc::Rc::clone(&path_guard_analysis_for(func).paths)
+}
+
+/// The cross-block path-definition map for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function and keyed by the active
+/// [`callee_write_set`] scope id.
+pub(crate) fn path_definition_map_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let scope_id = callee_write_set::current_scope_id();
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.path_definition_map.as_ref())
+            .filter(|(cached_scope_id, _)| *cached_scope_id == scope_id)
+            .map(|(_, map)| std::rc::Rc::clone(map))
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(path_defs::v2_build_path_definition_map(func));
+    if !trust_types::verify_budget::exhausted_readonly() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.path_definition_map = Some((scope_id, std::rc::Rc::clone(&built)));
+            }
+        });
+    }
+    built
+}
+
+/// The per-block semantic guard map for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function and keyed by the active
+/// summary-injection revision (`0` when `summaries` is `None`, empty, or matches no
+/// returning call in `func`) and [`callee_write_set`] scope id.
+pub(crate) fn semantic_guard_map_for(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let scope_id = callee_write_set::current_scope_id();
+    let raw_rev = summaries
+        .filter(|s| !s.is_empty())
+        .map_or(0, crate::modular::SummaryDatabase::revision);
+    let raw_key = (raw_rev, scope_id);
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| {
+                frame
+                    .semantic_guard_maps
+                    .iter()
+                    .find(|(k, _)| *k == raw_key)
+                    .map(|(_, map)| std::rc::Rc::clone(map))
+            })
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let summary_rev = if raw_rev != 0
+        && terminator_presence_for(func).has_call
+        && let Some(s) = summaries
+        && func.body.blocks.iter().any(|b| {
+            matches!(
+                &b.terminator,
+                Terminator::Call { func: call_name, target: Some(_), .. }
+                    if s.get(call_name).is_some_and(summary_may_inject_postcondition)
+            )
+        })
+    {
+        raw_rev
+    } else {
+        0
+    };
+    let key = (summary_rev, scope_id);
+    if key != raw_key {
+        let fallback_hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            let frame = memo.iter_mut().rev().find(|frame| frame.func_addr == addr)?;
+            let map = frame
+                .semantic_guard_maps
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, map)| std::rc::Rc::clone(map))?;
+            if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+                frame.semantic_guard_maps.push((raw_key, std::rc::Rc::clone(&map)));
+            }
+            Some(map)
+        });
+        if let Some(hit) = fallback_hit {
+            return hit;
+        }
+    }
+    let built = std::rc::Rc::new(match summaries.filter(|_| summary_rev != 0) {
+        Some(s) => semantic_guard::build_semantic_guard_map_with_summaries(func, s),
+        None => semantic_guard::build_semantic_guard_map(func),
+    });
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.semantic_guard_maps.push((key, std::rc::Rc::clone(&built)));
+                if raw_key != key {
+                    frame.semantic_guard_maps.push((raw_key, std::rc::Rc::clone(&built)));
+                }
+            }
+        });
+    }
+    built
+}
+
+/// The function-wide invariant fact bundle for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function.
+pub(crate) fn row_global_facts_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<RowGlobalFacts> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.row_global_facts.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(RowGlobalFacts::for_function(func));
+    if !trust_types::verify_budget::exhausted_readonly() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.row_global_facts = Some(std::rc::Rc::clone(&built));
+            }
+        });
+    }
+    built
+}
+
+/// The range-iterator yield guard map for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function and keyed by the active
+/// [`callee_write_set`] scope id.
+pub(crate) fn range_yield_guards_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    if !terminator_presence_for(func).has_iterator_next_call
+        && crate::adapter_yield_premises_for(&func.def_path).is_empty()
+    {
+        return empty_block_fact_map();
+    }
+    let addr = std::ptr::from_ref(func) as usize;
+    let scope_id = callee_write_set::current_scope_id();
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.range_yield_guards.as_ref())
+            .filter(|(cached_scope_id, _)| *cached_scope_id == scope_id)
+            .map(|(_, map)| std::rc::Rc::clone(map))
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(build_range_yield_guard_map(func));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.range_yield_guards = Some((scope_id, std::rc::Rc::clone(&built)));
+            }
+        });
+    }
+    built
+}
+
+/// The enumerate-iterator yield guard map for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function.
+pub(crate) fn enumerate_yield_guards_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    if !terminator_presence_for(func).has_iterator_next_call {
+        return empty_block_fact_map();
+    }
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.enumerate_yield_guards.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(build_enumerate_yield_guard_map(func));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.enumerate_yield_guards = Some(std::rc::Rc::clone(&built));
+            }
+        });
+    }
+    built
+}
+
+/// The slice-chunking yield guard map for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function.
+pub(crate) fn slice_iter_yield_guards_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    if !terminator_presence_for(func).has_iterator_next_call
+        && crate::adapter_yield_premises_for(&func.def_path).is_empty()
+    {
+        return empty_block_fact_map();
+    }
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.slice_iter_yield_guards.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(build_slice_iter_yield_guard_map(func));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.slice_iter_yield_guards = Some(std::rc::Rc::clone(&built));
+            }
+        });
+    }
+    built
+}
+
+/// The unwrap/abs panic-freedom VCs for `func` paired with their origin blocks,
+/// memoized for the innermost [`FuncAnalysisScope`] bound to the same function
+/// and keyed by the active [`callee_write_set`] scope id.
+pub(crate) fn unwrap_panic_vcs_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<Vec<(BlockId, VerificationCondition)>> {
+    if !terminator_presence_for(func).has_call {
+        return empty_unwrap_panic_vcs();
+    }
+    let addr = std::ptr::from_ref(func) as usize;
+    let scope_id = callee_write_set::current_scope_id();
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.unwrap_panic_vcs.as_ref())
+            .filter(|(cached_scope_id, _)| *cached_scope_id == scope_id)
+            .map(|(_, vcs)| std::rc::Rc::clone(vcs))
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(unwrap_panic::unwrap_panic_freedom_vcs_with_blocks(func));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.unwrap_panic_vcs = Some((scope_id, std::rc::Rc::clone(&built)));
+            }
+        });
+    }
+    built
+}
+
+/// The downward induction variables for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function.
+pub(crate) fn downward_induction_vars_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<Vec<DownwardVar>> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.downward_vars.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(induction::downward_induction_vars(func));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.downward_vars = Some(std::rc::Rc::clone(&built));
+            }
+        });
+    }
+    built
+}
+
+/// The global and per-block countdown trip facts for `func`, memoized for the
+/// innermost [`FuncAnalysisScope`] bound to the same function.
+pub(crate) fn countdown_facts_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<CountdownFacts> {
+    if !terminator_presence_for(func).has_switch_int {
+        return empty_countdown_facts();
+    }
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.countdown_facts.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let dvars = downward_induction_vars_for(func);
+    let built = std::rc::Rc::new(induction::countdown_trip_analysis(func, Some(&dvars)));
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.countdown_facts = Some(std::rc::Rc::clone(&built));
+            }
+        });
+    }
+    built
+}
+
+/// [`crate::elem_sizes::elem_size_binding_digest`] for `func`, memoized on the
+/// innermost [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn elem_size_binding_digest_for(func: &VerifiableFunction) -> Option<String> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.elem_size_binding_digest.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = crate::elem_sizes::elem_size_binding_digest(func);
     FUNC_ANALYSIS_MEMO.with(|memo| {
-        if let Some(frame) = memo.borrow_mut().last_mut()
-            && frame.func_addr == addr
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
         {
-            frame.guard_map = Some(std::rc::Rc::clone(&built));
+            frame.elem_size_binding_digest = Some(built.clone());
         }
     });
+    built
+}
+
+/// [`crate::primitive_decimal_strings::body_digest`] for `func`, memoized on the
+/// innermost [`FuncAnalysisScope`] bound to `func.body`.
+pub(crate) fn primitive_decimal_body_digest_for(func: &VerifiableFunction) -> Option<String> {
+    let addr = std::ptr::from_ref(&func.body) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+            .and_then(|frame| frame.primitive_decimal_body_digest.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = crate::primitive_decimal_strings::body_digest(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.body_addr == addr)
+        {
+            frame.primitive_decimal_body_digest = Some(built.clone());
+        }
+    });
+    built
+}
+
+/// The per-block primitive decimal formatting length bounds for `func`, memoized
+/// for the innermost [`FuncAnalysisScope`] bound to the same function and keyed by
+/// the active `PrimitiveDecimalStringTable` address.
+pub(crate) fn primitive_decimal_len_guards_for(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>> {
+    if !terminator_presence_for(func).has_call {
+        return empty_block_fact_map();
+    }
+    let Some(table) = crate::inherited_primitive_decimal_strings(&func.def_path) else {
+        return empty_block_fact_map();
+    };
+    let addr = std::ptr::from_ref(func) as usize;
+    let table_addr = std::sync::Arc::as_ptr(&table) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .iter()
+            .rev()
+            .find(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.primitive_decimal_len_guards.as_ref())
+            .filter(|(cached_table_addr, _)| *cached_table_addr == table_addr)
+            .map(|(_, map)| std::rc::Rc::clone(map))
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    if !table.matches_body(func) {
+        return empty_block_fact_map();
+    }
+    let built = std::rc::Rc::new(
+        primitive_decimal_len::build_primitive_decimal_len_guard_map_with_table(func, &table),
+    );
+    if !trust_types::verify_budget::exhausted_readonly() && !crate::gen_work_tripped() {
+        FUNC_ANALYSIS_MEMO.with(|memo| {
+            if let Some(frame) = memo
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.func_addr == addr)
+            {
+                frame.primitive_decimal_len_guards =
+                    Some((table_addr, std::rc::Rc::clone(&built)));
+            }
+        });
+    }
     built
 }
 
@@ -1285,7 +3890,9 @@ struct LenModelVar {
 
 // ======================================================================
 // Ordering/sign-witness return grounding (b62 F4): `_0__value.__trust_ok_<i>`
-// pair terms + the `_0__value__sign` term
+// pair terms + the `_0__value__sign` term (the sign half RETIRED and the pair half
+// GATED on 2026-10-05, ORD-WITNESS-CONSISTENT-1: see the amendment at the end of
+// this banner)
 // ======================================================================
 //
 // The F4 `matches!`-guard lowering emits `#[ensures]` predicates over the
@@ -1369,6 +3976,30 @@ struct LenModelVar {
 // valid in EVERY total order — no Int-discreteness leak (see the coverage
 // gate above). A FALSE postcondition stays refutable: the single pinned atom
 // is TRUE of the actual returned values on that path, never credited.
+//
+// AMENDED 2026-10-05 (ORD-WITNESS-CONSISTENT-1) — THE ASSUMPTION ABOVE WAS NOT
+// CHECKED, AND IT IS FALSE OF SAFE RUST. Nothing enforces the `PartialOrd`
+// laws or a sign trichotomy: an impl whose `le` and `gt` both answer `true`
+// is valid Rust, and `pick(a, b) { if !(a <= b) { return Err } Ok((a, b)) }`
+// had `!matches!(r, Ok((d, c)) if d > c)` reported PROVED under certify (three
+// rows, ay-in-process) on the stage 1 of `76a6ea45b2`, while
+// `pick(Odd(1), Odd(2))` returned `Ok` with `d > c` true at run time. Two
+// changes, both refusals:
+//  * the PAIR lane credits a guard only on a payload type the COMPILER found
+//    order-consistent (`crate::is_order_consistent_adt`, filled by
+//    `trust_verify::order_consistent_adts`: builtin-derived `PartialEq`,
+//    `PartialOrd` and any `Ord`, over integer/`bool`/`char` fields or such
+//    types, nothing generic). A builtin derive cannot be written by the user,
+//    and its operators are the core defaults over one pure `partial_cmp` that
+//    is total on those fields, so the {Lt, Eq, Gt} reading is exact. MEASURED
+//    on the same stage 1: the comparison of such a type never reaches this
+//    lane today, because the extractor already rewrites a provably-total
+//    derived comparison to `TRUST_TOTAL_CLONE_SENTINEL`
+//    (`apply_total_partial_ord_sentinel`); the gate is what a future identity-
+//    carrying spelling of that call must pass, not a live credit;
+//  * the SIGN lane is retired (`_0__value__sign` stays ungrounded).
+// The capability cost is ny-cert's four `Rat` contracts (a hand-written `Ord`
+// over an arena): recorded in docs/DECISION_QUEUE.md (ORD-WITNESS-CONSISTENT-1).
 /// A parsed `_0__value.__trust_ok_<i>` spec-model name: the tuple-bind payload
 /// component var the compiler's `matches!(r, Ok((d, c)) if ..)` lowering
 /// mints. Any other shape (a trailing `.field`, non-numeric index, other
@@ -1390,7 +4021,6 @@ struct OrderFacts {
 
 impl OrderFacts {
     const LT: Self = Self { lt: true, eq: false, gt: false };
-    const EQ: Self = Self { lt: false, eq: true, gt: false };
     const GT: Self = Self { lt: false, eq: false, gt: true };
     const LE: Self = Self { lt: true, eq: true, gt: false };
     const GE: Self = Self { lt: false, eq: true, gt: true };
@@ -1440,11 +4070,11 @@ impl OrderFacts {
 }
 
 /// The witness TARGET a guard must establish facts about: the ordered
-/// component pair, or the payload sign. Carries the component type name (the
-/// callee allowlist key) and the stability-checked candidate places.
+/// component pair. Carries the component type name (the callee allowlist key)
+/// and the stability-checked candidate places. (The payload-SIGN target was
+/// retired by ORD-WITNESS-CONSISTENT-1; see `witness_grounding`.)
 enum OrdWitnessTarget<'a> {
     Pair { ty_name: &'a str, cand_a: &'a [Place], cand_b: &'a [Place] },
-    Sign { ty_name: &'a str, cands: &'a [Place] },
 }
 
 /// One whole-local def site: a statement rvalue or a call terminator.
@@ -1453,19 +4083,17 @@ enum F4LocalDef<'a> {
     Call { callee: &'a str, args: &'a [Operand] },
 }
 
-/// One credited F4 item: a `__trust_ok` pair or the payload sign term.
+/// One credited F4 item: a `__trust_ok` pair. (The payload sign term is no
+/// longer credited: ORD-WITNESS-CONSISTENT-1.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OrdWitnessItem {
     Pair(OkPairModelVar, OkPairModelVar),
-    Sign(String),
 }
 
 impl OrdWitnessItem {
     fn model_names(&self) -> Vec<String> {
-        match self {
-            Self::Pair(a, b) => vec![a.name.clone(), b.name.clone()],
-            Self::Sign(n) => vec![n.clone()],
-        }
+        let Self::Pair(a, b) = self;
+        vec![a.name.clone(), b.name.clone()]
     }
 }
 
@@ -1480,8 +4108,14 @@ mod call_facts;
 // with a definition. Its own module because it is the only place in this crate
 // that ADDS facts to the hypothesis set — see its header for the soundness
 // discipline that follows from that.
+// Trust (D2 tier 1, 2026-09-24): the ADAPTER_YIELD modeled fact, closure side.
+mod adapter_yield;
 mod alloc_bounds;
+mod alloc_len;
 mod alloc_vcs;
+// Trust (2026-10-15, TRUST-KI-1015-1): the lengths of the two halves core's
+// `[T]::as_chunks::<N>` family returns, as post-return path definitions of the call.
+mod as_chunks_len;
 mod assert_refutation;
 mod block_defs;
 mod bmc_reduction;
@@ -1490,47 +4124,144 @@ pub(crate) mod callee_write_set;
 mod callsite;
 mod callsite_replay;
 mod checked_vcs;
+pub(crate) mod collection_range;
 mod container_len;
 mod contract_vcs;
 mod discharge;
 mod entry;
 mod entry_hypothesis;
+mod ffi_buffer_extent;
 mod float_overflow;
 mod float_range;
 mod havoc_decline;
+// `build_int_abs_facts`' checked-argument spelling needs the op's overflow assert
+// (WRAPPING-SUB-AND-INTERVAL-NEG-1 sibling).
+#[cfg(test)]
+mod int_abs_fact_tests;
+mod primitive_decimal_len;
+// Trust (2026-10-16, S3): the generic refutation scope asks the same question.
+pub(crate) use havoc_decline::{HAVOC_DECLINE_KIND, PayloadSources, UnmodelledValues};
+mod constructor_return;
 mod induction;
+// Trust (D5-B): kernel-checked body-inferred return equalities (candidate side).
+mod inferred_return;
 mod int_conversion;
 mod intrinsic_semantics;
 mod ite;
 mod iterator_yield;
 mod loop_bounds;
+mod source_entry;
+// Trust (2026-09-25, std-numeric-family): the std numeric methods that panic on a
+// caller-supplied argument value (clamp bounds, ilog/isqrt domains, radix,
+// next_power_of_two/next_multiple_of, Duration/Instant arithmetic).
+mod numeric_panic;
+// The name-level half of `numeric_panic`, which the compiler consults for a
+// sysroot fn item handed over as a type argument.
+#[cfg(test)]
+mod numeric_panic_tests;
+// Trust (T3 C05): the production generation's overflow-check origins, the
+// proven-overflow-check elision seam's join table.
+mod overflow_origins;
+// Trust (T3 L4, C08): block-def recipes, and the block-def rows that join a context as
+// Spine rows.
+mod recipes;
+// T3 L4 (C08): recipes, their keys and the sink's Spine rows.
+#[cfg(test)]
+mod recipes_tests;
+// Trust (T3 L4, C08s): the production generation's row sink, which runs the per-row
+// passes as each row joins and interns the rows into the caller's context.
+mod row_sink;
+// T3 L4 (C08s): the sink's per-row passes against the whole-list passes they replace.
+#[cfg(test)]
+mod row_sink_tests;
+// Trust (W32-PRIMINT-PIN-1, 2026-10-06): `numeric_panic`'s rows at a pointer-sized
+// (`usize`/`isize`) owner on 16-, 32- and 64-bit carriers, and their fail-closed
+// refusal when the width is unresolved.
+#[cfg(test)]
+mod numeric_panic_ptr_width_tests;
 mod overflow_vc;
+// Trust (2026-10-01): dominating `var CMP const` guard facts, built once per function.
+mod dominating_facts;
+// Trust (2026-10-07, PATH-GUARD-VALUE-1): a path guard is spelled by the SSA value its
+// subject holds at the guard, not by the subject's reaching-definition set.
+mod guard_value_spelling;
 mod panic_calls;
 mod path_defs;
+// TINV-21: the lemma-root pointer backstop (`type_invariant::obligations::lemma_param_root`).
+pub(crate) use path_defs::local_pointee_may_escape;
+pub use path_defs::noalias_premise_would_fire;
 mod per_path_refute;
+mod range_bound_use;
+// Trust (2026-10-15, TRUST-KI-1015-1): the result length of a std range index and of
+// `[T]::split_at`, as post-return path definitions of the call.
+mod range_index_len;
+// The statement-version oracle's indexes (see `StmtVersionCtx`).
+mod block_writes;
+pub(crate) mod cfg_index;
+pub(crate) mod rebind_index;
+mod version_ssa;
+// The retired dense-map oracle, kept as the differential.
+#[cfg(any(test, feature = "version-oracle-differential"))]
+mod legacy_version_oracle;
+/// Whether the test-time cross-checks (the retired-oracle differential and the
+/// scan-vs-index assertions of the kill and place-name tables) run on this thread.
+/// Off inside `legacy_version_oracle::without_differential`, which the scaling and
+/// measurement harnesses use so they time the production code path.
+#[cfg(any(test, feature = "version-oracle-differential"))]
+pub(crate) use legacy_version_oracle::differential_enabled;
+// Trust (TRUST-10): field-read return summaries (`len`/`is_empty` getters).
+mod return_field_summary;
 mod safety;
 mod semantic_guard;
 mod slice_conversion;
+mod slice_len_licence;
+mod str_offset;
+pub(crate) mod tinv_rows;
 mod type_ranges;
+// TINV step 10.2: the tagged use-site facts of a published type invariant (not yet
+// conjoined; step 10.3 wires them into the safety walk).
+pub(crate) mod type_invariant_facts;
 mod unsupported;
 mod unwrap_panic;
 mod value_facts;
+// Trust (VEC-INSERT, 2026-09-25): the pre-mutation region of a `Vec` base, and the
+// index precondition of `Vec::{remove, swap_remove, insert}` over it.
+mod vec_region;
+// Trust (VEC-LEN-LOOP-1, 2026-10-07): the length of a std `Vec` nothing between its
+// read and an index can change, tied at each std index call (loop-head precision).
+mod vec_len_invariant;
 mod witness_grounding;
 // Trust (coroutine resume-state contract): the refutation-lane prover for the
 // compiler-inserted `ResumedAfter*` executor-protocol sentinels. Deliberately a
 // module of its own — see its header.
 pub(crate) mod coroutine_sentinel;
 
+pub(crate) use adapter_yield::{AdapterPremiseFamily, extend_with_adapter_premise_facts};
+pub use adapter_yield::{AdapterYieldFact, ClosureAdapterPremise};
 pub(crate) use alloc_bounds::*;
+pub(crate) use alloc_len::*;
 pub(crate) use alloc_vcs::*;
 pub use assert_refutation::*;
 pub(crate) use block_defs::*;
 pub use bmc_reduction::*;
+// LEN-KEY-1: std's inherent `len` by its DefId key, for `guards`' `_len == coll_len` tie.
+pub(crate) use call_facts::body_mentions_opaque_scalar;
+pub(crate) use call_facts::callee_key_is_std_inherent_len;
+// The one call-fact reader `crate::const_expr` needs outside `generate`.
+pub(crate) use call_facts::lossless_int_conversion_arg;
+// TINV step 8 (`type_invariant::candidate`): its constant pool reads `clamp`/`min`/`max`
+// constants only through the NAME-ANCHOR-2 gate, and literal operands through the same
+// reader the loop-bound lane uses.
+pub(crate) use call_facts::primitive_int_ord_method;
 use call_facts::*;
 pub use callee_summaries::*;
 pub use callsite::*;
 pub use callsite_replay::*;
 pub(crate) use checked_vcs::*;
+pub use constructor_return::{
+    ConstructorReturnCandidate, ConstructorReturnSummary, infer_constructor_return_candidate,
+    intern_constructor_return_rows,
+};
 pub(crate) use container_len::*;
 use contract_vcs::*;
 pub use discharge::*;
@@ -1539,28 +4270,79 @@ use entry_hypothesis::*;
 use float_overflow::*;
 pub use float_range::*;
 use induction::*;
+pub(crate) use inferred_return::EntryBindings;
+pub use inferred_return::{
+    INFERRED_RETURN_MAX_NODES, InferredReturn, InferredReturnCall, infer_return_candidate,
+    infer_return_candidate_rows, infer_return_candidate_with_calls_rows,
+    inferred_enum_return_check_vcs, inferred_return_check_vcs,
+    return_dependency_body_within_budget,
+};
 use int_conversion::*;
 use intrinsic_semantics::*;
 use ite::*;
+pub(crate) use iterator_yield::inclusive_range_yield_set_only_values;
 use iterator_yield::*;
+pub(crate) use loop_bounds::operand_const_int;
 use loop_bounds::*;
+use overflow_origins::{
+    EmittedRow, KeepOrigins, PendingOriginRow, PendingOrigins, RowInventory, RowOrigins,
+};
+pub use overflow_origins::{OriginRow, OriginSite, OverflowOrigins};
 pub(crate) use overflow_vc::*;
 pub(crate) use panic_calls::*;
 pub(crate) use path_defs::*;
 pub use per_path_refute::{
     generate_per_path_assert_refutation_vcs, generate_per_path_assert_refutation_vcs_with_context,
 };
-pub use safety::*;
+pub use recipes::{RecipeCounts, SpineDecline, recipe_counts};
+pub use return_field_summary::*;
+use row_sink::{RowSink, SepFacts, SinkOutput, checked_ids, work_budget_refusal};
+// Nothing in `safety` is public since T3 C05 deleted `overflow_vc_block_origins`.
+use safety::*;
 pub(crate) use semantic_guard::*;
 use slice_conversion::*;
+use slice_len_licence::*;
+pub(crate) use str_offset::*;
 pub(crate) use type_ranges::*;
 pub(crate) use unsupported::*;
+// Trust (2026-10-06, ABS-NAME-1): the emitter's own signed-`abs` recognizer, for
+// trust-clean's negation-subject gate (re-exported at the crate root).
+pub use unwrap_panic::is_signed_abs_call;
 pub(crate) use unwrap_panic::*;
 pub(crate) use value_facts::*;
+pub(crate) use vec_region::*;
+pub use vec_region::{vec_mutator_charge_rows, vec_mutator_charged_blocks};
 use witness_grounding::*;
 
 #[cfg(test)]
+mod assert_refutation_coverage_tests;
+#[cfg(test)]
 mod coroutine_sentinel_tests;
+// verifier-perf (2026-09-16): `StmtVersionCtx`'s root index and token memo
+// answer exactly as the full scan does.
+#[cfg(test)]
+mod version_oracle_index_tests;
+#[cfg(test)]
+mod version_ssa_families;
+// The dominator index against the textbook definitions (a module the SSA oracle's
+// first commit wrote but never declared, so it had never run).
+#[cfg(test)]
+mod cfg_index_tests;
+#[cfg(test)]
+mod dominating_facts_scaling_tests;
+#[cfg(test)]
+mod version_ssa_parity_tests;
+#[cfg(test)]
+mod version_ssa_random_tests;
+#[cfg(test)]
+mod version_ssa_scaling_tests;
+// T3 L4 (C06): the per-function VC context's spine against this crate's block-def rule.
+#[cfg(test)]
+mod vc_context_spine_tests;
+// D15: the joined-token spelling's partition identity, collision fallback and linear
+// bytes.
+#[cfg(test)]
+mod version_ssa_spelling_tests;
 // Trust (coroutine resume-state contract): the same lane against the REAL
 // compiler-extracted resume body of the falsification fixture, not a synthetic
 // one. See the file header for why that distinction is load-bearing.
@@ -1598,6 +4380,14 @@ mod intrinsic_semantics_tests;
 mod recursion_decreases_production_variant_tests;
 #[cfg(test)]
 mod summary_callsite_tests;
+// census-vcgen-hang (2026-10-02): a batch of owned-`Vec` index row replays under one
+// `RowReplayScope` returns the rows unscoped replays return and builds the oracle once.
+#[cfg(test)]
+mod row_replay_scope_tests;
+// R1 harvest (2026-10-19): the call-site producers' `EntryScope` builds their
+// whole-body analyses independent of the call sites and changes no row.
+#[cfg(test)]
+mod entry_scope_tests;
 // The terminator-fact channel's TIME AXIS: `version_terminator_dest_fact` retimes
 // every variable whose base name is the subject's, so an ARGUMENT that renders to
 // that name would be read at the post-call token — `result > n` injected as
@@ -1614,6 +4404,16 @@ mod summary_dest_retiming_tests;
 // missing extracted body, self-recursion).
 #[cfg(test)]
 mod callsite_replay_tests;
+// PANIC-SKIP-ANCHOR-1 (2026-10-05): a call's arguments leave the fail-closed
+// `UnsupportedMir` collector only at a stamped sysroot panic entry with no
+// continuation, never because the callee's rendering looks like one.
+#[cfg(test)]
+mod panic_skip_anchor_tests;
+// The FAIL-CLOSED half of the unfolded-constant-bound fold: the refusals no
+// compiled fixture can carry (`1i64 << 64` is a compile error, `-(1i64 << 63)`
+// always panics), pinned on the resolver's own inputs.
+#[cfg(test)]
+mod const_expr_bound_tests;
 #[cfg(test)]
 mod contract_field_bound_tests;
 #[cfg(test)]
@@ -1647,16 +4447,37 @@ mod bounds_const_index_tests;
 // directions: the unrelated row emits, the exactly-bound row stays suppressed.
 #[cfg(test)]
 mod bounds_exact_binding_tests;
+// The load/store index lane's same-block slice-length ties at a row's use point
+// (`v2_live_slice_len_ties_at_point`): live ties kept, stale ones never reach the row.
 #[cfg(test)]
 mod early_return_postcondition_tests;
+#[cfg(test)]
+mod slice_len_ties_at_point_tests;
+// Two-language battery blocker a7: a Return-block predecessor reached by SEVERAL
+// guard paths was emitted as ONE `Or`-shaped row, and that row — alone among the
+// rows of the same clause — got no trust-mc PDR receipt, so the source-clause
+// catalog refused a clause whose every body row read `Proved`. One row per
+// enumerated path distributes the path-guard conjunct (and no more than that —
+// the shared tail is spine-sensitive, so a per-path row can be strictly more
+// PROVABLE than the merged row's corresponding disjunct, never more credulous;
+// see `contract_vcs::generate_v2_contract_vcs_impl`). These tests pin the
+// flatness, the path coverage, the one-path-false twin, the dropped-`requires`
+// carve-out and the cap; the SATISFIABILITY canary for a clause false on exactly
+// one of three paths lives in `early_return_postcondition_tests`, which owns the
+// exhaustive oracle.
+#[cfg(test)]
+mod per_path_postcondition_tests;
 // The RETURN-SLOT twin of the join-token defect above (probe f53): an
 // Eq-shaped `ensures result == …` over an `&&`-diamond body was negated at the
 // Return block's MERGED `_0` token while the pin carried the predecessor's
-// single token, and `return_slot_pin_version`'s everywhere-walk counted the
-// clause's own equality as a second "pin" — so the unifier bailed and the
-// clause was refuted as a free-variable query.
+// single token. These regressions require the clause to read that final value
+// without using its own equality, or any historical value, as a binding pin.
 #[cfg(test)]
 mod return_slot_join_version_tests;
+// P4 (hunter Finding 1, 2026-09-30): the transitive return pin pins only the
+// definition of `_L` that REACHES `_0 = copy _L`.
+#[cfg(test)]
+mod transitive_return_pin_reach_tests;
 // The AGGREGATE-FIELD twin of the two defects above, and the one still OPEN: a
 // clause over a FIELD of the returned struct, whose source local is written in
 // two select arms. The clause is negated at `_0.0#s3_0` while the field pin
@@ -1691,6 +4512,10 @@ mod len_witness_grounding_tests;
 // local, reassigned-parameter, and mutable-alias false-proof boundaries.
 #[cfg(test)]
 mod loop_bounds_tests;
+// The conduit allow-list under which the `for`-loop iterator tracers readmit the
+// alias channel (`iterator_yield::iterator_origin_def`), pinned one refusal at a time.
+#[cfg(test)]
+mod iterator_origin_gate_tests;
 #[cfg(test)]
 mod machine_faithful_contract_lane_tests;
 #[cfg(test)]
@@ -1724,6 +4549,11 @@ mod path_definition_map_tests;
 // the old unbounded `dest == a + b` def failed. See the module header.
 #[cfg(test)]
 mod wrapping_binop_defs_tests;
+// Trust (2026-10-05, NEG-WRAP-OFF-1): the bare-`Rvalue::UnaryOp(Neg)` sibling — the
+// wrap-exact block def, the interval and value-set clamps, and the solver-backed
+// false-prove control on the checks-off `abs_like` body. See the module header.
+#[cfg(test)]
+mod bare_neg_wrap_tests;
 // The bounded-collect grant's two authenticators, measured on real
 // `-Ztrust-dump=mir` bundles rather than hand-built doubles:
 //   * `trusted_root_spoof_iter_producer_tests` — the CALLEE-path half, on the
@@ -1742,11 +4572,19 @@ mod bounded_source_value_tests;
 #[cfg(test)]
 mod capture_avoiding_tests;
 #[cfg(test)]
+mod discriminant_cse_license_tests;
+#[cfg(test)]
 mod no_std_sysroot_impersonation_tests;
 #[cfg(test)]
 mod ord_method_tests;
+// NAME-ANCHOR-2: an `Ord::min`/`max`/`clamp` fact needs a primitive integer
+// `Self`, not only std's trait path. Pinned on real extracted MIR.
+#[cfg(test)]
+mod ord_self_type_tests;
 #[cfg(test)]
 mod refute3_rangefrom_tests;
+#[cfg(test)]
+mod slot_write_channel_tests;
 #[cfg(test)]
 mod trusted_root_spoof_iter_producer_tests;
 // ======================================================================
@@ -1761,6 +4599,12 @@ mod int_wrapping_neg_tests;
 #[cfg(test)]
 mod clean_origin_wrapping_summary_tests;
 // ======================================================================
+// Clean-origin definitional grounding in the assert-refutation lane:
+// identity-keyed call-result definitions, both verdict directions (tests)
+// ======================================================================
+#[cfg(test)]
+mod clean_origin_refute_grounding_tests;
+// ======================================================================
 // Postcondition composition slice 2: a preconditioned callee's `ensures`
 // rides at a call site UNDER its own `requires` (tests)
 // ======================================================================
@@ -1773,8 +4617,18 @@ mod guarded_postcondition_tests;
 mod int_try_from_unwrap_or_tests;
 #[cfg(test)]
 mod return_const_summary_tests;
+// Trust (SUMMARY-NAME-COLLIDE-1): a body-derived summary key two bodies share
+// summarizes nothing, in any lane.
+#[cfg(test)]
+mod alloc_len_adt_tests;
+#[cfg(test)]
+mod body_summary_key_collision_tests;
 #[cfg(test)]
 mod trivial_setter_summary_tests;
+// Trust (2026-10-08): ALLOC-RECEIVER-1 / ALLOC-WIDTH-1 — the live receiver and the
+// target's object limit, the two panics the deleted 256 MiB budget was guarding.
+#[cfg(test)]
+mod alloc_width_receiver_tests;
 #[cfg(test)]
 mod unbounded_alloc_tests;
 // Trust: arithmetic hidden INSIDE a library/intrinsic Call (`i32::pow`,
@@ -1834,6 +4688,16 @@ mod bv_rem_mul_tests;
 #[cfg(test)]
 mod field_vec_len_key_tests;
 #[cfg(test)]
+mod len_of_place_anchor_tests;
+// IDX-TIE-1, second consumer: the nested-index LENGTH tie names std's
+// `Index<usize>` on a std container. Pinned on real extracted MIR.
+#[cfg(test)]
+mod index_len_tie_anchor_tests;
+// OWNED-VEC-NAME-1: an owned std `Vec`/`String` is named by its exact std path,
+// never by the last segment of its type name. Pinned on real extracted MIR.
+#[cfg(test)]
+mod owned_container_name_anchor_tests;
+#[cfg(test)]
 mod push_guard_elem_len_tests;
 /// 128-bit signed CheckedBinaryOp (add/sub) overflow and i128 negation overflow.
 ///
@@ -1849,7 +4713,7 @@ mod push_guard_elem_len_tests;
 /// while a safe in-range input must NOT — the new model is the exact overflow
 /// predicate, never weaker (no false-PROVE).
 #[cfg(test)]
-mod signed_128_overflow_tests;
+pub(crate) mod signed_128_overflow_tests;
 /// Cast VC model: value-preserving WIDENING casts into a 128-bit target.
 ///
 /// Covers the `u32 as u128` (and friends) widening that previously returned
@@ -1898,10 +4762,10 @@ mod known_panicking_method_tests;
 // so proof behavior never depends on process-global environment state.
 #[cfg(test)]
 mod gen_work_budget_tests;
-// The overflow-elision JOIN TABLE replay: byte-exactness of the memoized path against
-// the unmemoized one, and the completeness property that makes `Unique` sound.
+// Trust (T3 C05): the production generation's origin inventory: each row's own block
+// through the sort, the emitted rows byte for byte, and complete-or-no-table.
 #[cfg(test)]
-mod overflow_origins_replay_tests;
+mod overflow_origins_tests;
 // The ENUM VARIANT PAYLOAD range fact: resolution-layer pins for the shapes a
 // verdict cannot see. The verdict matrix is `tests/enum_payload_range.rs`.
 #[cfg(test)]
@@ -1914,8 +4778,18 @@ mod enum_payload_range_tests;
 // unresolved generic, an un-migrated `adt_kind: None` — is the load-bearing half.
 #[cfg(test)]
 mod uninhabited_variant_tests;
+// Trust (never-typed divergence): an `Opaque` terminator answers
+// `LocalWrite::Unlocatable` for EVERY local, which deleted the dest-keyed enum
+// tag-range fact for every `Discriminant` read in the body and left an
+// exhaustive match's shared `otherwise -> Unreachable` REFUTED — 2962 of the
+// 4734 refuted rows on the ay-dpll graph at seal 30. The decline half (a live
+// `otherwise` arm stays live; a non-call `Opaque` stays fail-closed) is the
+// load-bearing half.
+#[cfg(test)]
+mod never_call_opaque_poison_tests;
 // Trust: piece #7a — folds + freshen-list soundness for the const-generic
-// `ConstValue::ConstParam` value.
+// `ConstValue::ConstParam` value; since CONSTPARAM-SIGMA-FRESHEN-1 also the σ
+// path end to end (the caller's `K` is one term, a callee's `K` never meets it).
 #[cfg(test)]
 mod const_param_fold_tests;
 // Trust (unwrap panic-freedom, dominated-safe): the two recognized pinning
@@ -1931,6 +4805,29 @@ mod unwrap_panic_freedom_tests;
 // group (`serde_json::Map::<std::string::String, …>::insert` is TOTAL).
 #[cfg(test)]
 mod container_mutator_path_tests;
+// Trust (W4 fix round 1, 2026-09-25): the `binary_search` result facts are seeded
+// only over a result local with ONE definition, and a whole write of the local
+// kills a fact over its downcast payload (`@` is a projection separator).
+#[cfg(test)]
+mod vec_region_bsearch_tests;
+// Trust (W4 fix round 3, 2026-09-29): the region's definition-block exemption covers
+// the DEFINITION, not a two-phase `&mut` reservation the same block leaves open for a
+// later block (probe v2p01: a len read inside `v.truncate(..)`'s argument stated `L0`
+// at the pre-truncate length).
+#[cfg(test)]
+mod vec_region_twophase_tests;
+// Trust (MUTREF-VEC-LEN-GUARD-REFUTE-1 / VEC-REGION-JOIN-SEED-1, 2026-10-12): the region
+// facts are minted for a mutator-free `&mut Vec` parameter (`if !v.is_empty() { v.len() -
+// 1 }` proves), never at a return target another edge enters (`let n = if c { v.len() }
+// else { 100 }` states no `n == L0`), and never past a resize (`clear`, `truncate`, an
+// opaque `f(v)`). Pinned on real extracted MIR.
+#[cfg(test)]
+mod vec_region_no_mutator_tests;
+// Trust (2026-10-15, DECISION_QUEUE D101): an `&mut Vec` parameter is a region root only
+// when no other parameter could reach its pointee (the region assumed `noalias` silently).
+// Pinned on real extracted MIR.
+#[cfg(test)]
+mod vec_region_param_alias_tests;
 // Trust (return-discriminant summary): the callee-summary recognizer
 // (`function_return_disc_summary` — UNCONDITIONAL / GUARD-CONDITIONED, both
 // fail-closed) and its use site — the unwrap panic-freedom lane's
@@ -1948,12 +4845,27 @@ mod return_disc_summary_tests;
 mod const_param_range_tests;
 #[cfg(test)]
 mod countdown_trip_tests;
+// The loop-guard underflow certificate of a downward-var decrement (relational
+// `lo < hi` guards, guard freshness, second decrements, parameter cursors), each
+// pinned on REAL MIR from the probe it closes or wins (TWO-POINTER-FALSE-REFUTE).
 #[cfg(test)]
-mod immutable_read_value_tie_tests;
+mod downward_guard_tests;
+#[cfg(test)]
+mod element_read_congruence_tests;
 #[cfg(test)]
 mod per_arg_havoc_refinement_tests;
+// TINV P1 on real MIR (2026-10-06): calls whose arguments grant no write channel.
+#[cfg(test)]
+mod escape_havoc_tests;
+#[cfg(test)]
+mod no_write_call_args_tests;
 #[cfg(test)]
 mod vec_index_dest_value_tie_tests;
+// STD-RECEIVER-ANCHOR-1: the length-benign `&mut` receiver is std's own `Index`/
+// `IndexMut` on a std container, and the `?` re-wrap is the keyed `Try::branch`.
+// Pinned on real extracted MIR.
+#[cfg(test)]
+mod std_receiver_anchor_tests;
 // ======================================================================
 // Float bit-reinterpretation call models: `f64::to_bits`/`from_bits` and the
 // f32 siblings. Task #66 (completeness half): restore the correlation between a
@@ -1972,6 +4884,13 @@ mod float_bits_call_model_tests;
 // genuinely-refutable one are both untouched.
 #[cfg(test)]
 mod entry_hypothesis_tests;
+// INTRINSIC-RESIDUAL-1: a 128-bit integer parameter's type range, which the extractor
+// does not attach, is stated by the generator (`missing_param_type_range_facts`).
+#[cfg(test)]
+mod param_type_range_facts_tests;
+
+#[cfg(test)]
+mod postcondition_type_range_tests;
 // The premise the CONSUMER-SIDE clause of `entry_sentinel_tie_is_sound` is dead
 // under: `v2_terminator_targets` ⊆ the path-def fixpoint's enqueue set, so a
 // consumer's mandatory v2 in-edge is always intersected in. Nothing else in the
@@ -2000,3 +4919,505 @@ mod merged_local_vacuity_tests;
 // when some producer happens to key that local.
 #[cfg(test)]
 mod param_entry_gate_tests;
+// ENC-DEFECTS 13b (salvage reconciliation 2026-09-28): the gates of
+// `path_defs::frozen_shared_reborrow_roots`, asked directly on real MIR, and its
+// composition with the TRUST-10 sibling `callee_write_set::refine_shared_reborrow_havoc`
+// in `terminator_def_names`. Lives here because the function is `pub(super)`.
+#[cfg(test)]
+mod enc_defects_13b_gate_tests;
+// TINV step 0(a) (docs/design/2026-10-04-type-invariant-tinv.md, gate G14): a
+// `&mut self` pointee field read before any write binds the ENTRY version, and a
+// read after `self.k = ..` binds a fresh one. An entry type-invariant fact keyed on
+// the bare name is sound only while both hold. `stmt_versions_for` is `pub(crate)`.
+#[cfg(test)]
+mod tinv_entry_rename_tests;
+// TINV step 10.1: the type-invariant assumption tag passes the version-token grammar
+// (every rename, seal and tie helper, and a whole generation) byte for byte.
+#[cfg(test)]
+mod tinv_assume_tag_tests;
+// TINV 10.3-LEN: an entry fact's length terms are re-versioned by a `&mut` call on the
+// field or a store to it (landed before any use-site fact).
+#[cfg(test)]
+mod tinv_len_versioning_tests;
+// TINV step 10.3: the use-site facts conjoined into real rows, end to end.
+#[cfg(test)]
+mod tinv_use_site_tests;
+
+/// Trust (2026-09-19): the NAME-ONLY members of the "this callee panics on a
+/// caller-supplied value" family, re-exported for the COMPILER's
+/// vanilla-sysroot tolerance.
+///
+/// WHY THE TOLERANCE NEEDS THEM. That class admits a sysroot callee at
+/// foundational types because "its panic, if any, is std's own DEFINED behaviour
+/// reacting to the environment". A panic on an out-of-range index or a too-small
+/// buffer is NOT that — it is a Rust safety obligation about the caller's own
+/// value, and the class already carves out the division family for exactly this
+/// reason (`is_panicking_primitive_int_div_method`, consulted the same way).
+///
+/// These rows are ALSO emitted by `unsupported.rs` on the CALLER's MIR, but that
+/// lane only sees calls in a body vcgen analyses — measured 2026-09-19, a call
+/// inside a BUNDLED core member (`char::encode_utf8_raw`, reached through core's
+/// own `fmt::Write::write_char`) is invisible to it. Consulting the same
+/// predicates from the tolerance covers the bundled case without duplicating the
+/// name lists.
+///
+/// Name-only by construction: `is_bounds_panicking_slice_mutator` is NOT here
+/// because it needs the function and its arguments, which the tolerance does not
+/// have.
+///
+/// `VecDeque`'s caller-value members and `char::encode_utf16` are deliberately NOT
+/// here — see [`callee_is_root_call_caller_value_panic`] for why they are asked only
+/// of the ROOT body's own call sites.
+pub fn callee_is_known_caller_value_panic(callee: &str) -> bool {
+    unwrap_panic::is_index_panicking_container_mutator(callee)
+        || unwrap_panic::is_buffer_panicking_char_encoder(callee)
+}
+
+/// Trust (2026-10-01, review rounds 29 and 30): whether the integer fold row
+/// (`generate/safety.rs`, `1c-fold`) recognizes `callee` as `Iterator::sum` or
+/// `Iterator::product` — the spelling the extractor renders for the call site. The
+/// compiler grants such a call as charged only when this answers true, so a spelling
+/// vcgen's parse misses (a `'>'` char const generic or a source path with `<`/`>`
+/// in a callable's rendering) leaves the call ungranted, bundled and refused,
+/// instead of uncharged.
+pub fn callee_is_charged_integer_fold(callee: &str) -> bool {
+    alloc_bounds::iterator_integer_fold_call(callee).is_some()
+}
+
+/// Trust (W4 fix round 1, 2026-09-25): the "panics on a caller-supplied value"
+/// callees asked of ROOT call sites only — first the members of std's `VecDeque`
+/// that no call-site lane charges
+/// (`unwrap_panic::is_caller_value_panicking_deque_method`: `insert`, `split_off`,
+/// `rotate_*`, `drain`, …), for the compiler's tolerance to ask of the ROOT body's
+/// own call sites ONLY.
+///
+/// THE DEFECT: the index-mutator recognizer excludes `collections::` wholesale, so
+/// an unguarded `d.insert(i, 0)` was admitted as "std's own defined behaviour" and
+/// panicked at runtime (probe r08; measured on `0.10.0+gc2e3daed7`).
+///
+/// NOT HERE (reconciled with 92e7829ca5, W4 salvage 2026-09-28): `swap`, `range`,
+/// `range_mut`, `insert_mut` and `d[i]`/`d[i] = x`, wherever main's `collection_range`
+/// recognizer names the call. It charges each at the call site, precisely over a
+/// stable deque length, so a guard discharges it; withholding the tolerance by NAME
+/// would refuse every such call, guarded or not (it regressed
+/// `policy_b/std_index_range_panics_charged.rs`). Their refusal when unguarded is that
+/// charge row. A spelling that recognizer declines keeps this carve-out.
+///
+/// WHY ROOT CALL SITES ONLY, NOT THE BUNDLE WALK. The tolerance keys its ledger on
+/// the callee NAME and consults it for std-internal call sites too, and std calls
+/// these members with its OWN, already-validated arguments: `swap_remove_back` is
+/// `if index < len && index != len - 1 { self.swap(index, len - 1) }; self.pop_back()`.
+/// Asked there, the carve-out refused the TOTAL `swap_remove_back`/`swap_remove_front`
+/// — measured when this predicate first sat in [`callee_is_known_caller_value_panic`]:
+/// both went from rc=0 to rc=1 ("NOT-VANILLA callee=`VecDeque::<u32>::swap`" from the
+/// bundle walk). A root call site is the user's own value by construction. The
+/// bundled case the shared carve-out exists for — a std member FORWARDING a user
+/// value into one of these — has no instance among the stable foundational-type
+/// `VecDeque` API: every public entry that reaches one of these panics is itself in
+/// the list, or is one of the members `collection_range` charges at the root call
+/// (`swap`, `range`, `range_mut`, `insert_mut`, `Index`/`IndexMut`), and the rest
+/// take a closure or a user type and are not vanilla at all. The fail-closed
+/// `Call::<m>::panic-freedom-unverified` row `unsupported.rs` mints on the root MIR
+/// is the second, independent refusal of every root call — except a std
+/// `VecDeque::drain` over `..`, `0..`, `..0` or `0..0`
+/// (`collection_range::std_vec_drain_range_cannot_panic`), which gets no row
+/// because its one range check (`slice::range(r, ..len)`) cannot fail; tolerating
+/// that call here admits no panic.
+///
+/// Trust (UTF8-ENCODE-UTF16-SHORTBUF-1, 2026-10-05): and `char::encode_utf16` /
+/// `encode_utf16_raw` (`unwrap_panic::is_buffer_panicking_char_utf16_encoder`), which
+/// panic on a caller buffer shorter than the character's UTF-16 length. Root call
+/// sites only for the same reason: core's `EncodeUtf16::next` and `wtf8` call them
+/// with a two-unit buffer of their own, so asking the bundle walk would refuse the
+/// total `s.encode_utf16().count()`. MEASURED before (stage 1 of `dc15b882f6`):
+/// the root ledger admitted `core::char::methods::<impl char>::encode_utf16` as
+/// `vanilla=true`, and `c.encode_utf16(&mut [0u16; 1])` built rc=0 and panicked.
+/// `unsupported.rs` mints the second, independent refusal on the root MIR.
+pub fn callee_is_root_call_caller_value_panic(callee: &str) -> bool {
+    unwrap_panic::is_caller_value_panicking_deque_method(callee)
+        || unwrap_panic::is_buffer_panicking_char_utf16_encoder(callee)
+}
+
+/// Trust (2026-09-25): does a call to `callee` (rendered as at a call site) fall
+/// in a panic family vcgen charges AT THE CALL SITE — `unwrap`/`expect`, signed
+/// `abs`, the slice-method panics, the caller-value families above, and the
+/// bounds-panicking slice mutators? NAME-ONLY and conservative (no receiver
+/// gating): the compiler asks it of a sysroot function ITEM handed to a callee as
+/// a TYPE ARGUMENT, which runs inside that callee where no call-site recognizer
+/// looks. The item is admitted only where a DIRECT call to it would have been
+/// charged nothing.
+///
+/// Trust (2026-10-06, ROTATE-ITEM-NAME-1): with one owner check. The
+/// bounds-panicking mutator arm (the last one: `rotate_left`/`rotate_right`,
+/// `split_off`, `drain`, ...) is for the slice, `Vec`, `String` and `VecDeque`
+/// members, and it used to answer `true` for core's TOTAL integer
+/// `core::num::<impl u32>::rotate_left` too, so `v.iter().copied().fold(1u32,
+/// u32::rotate_left)` was refused under the DEFAULT policy ("an unresolved indirect
+/// call keeps the function fail-closed") while `fold(1u32, u32::wrapping_shl)`, the
+/// same signature on the same owner, and the closure twin `|a, b| a.rotate_left(b)`
+/// were admitted (measured on the stage 1 of `4ccd862830`; a verify-off build prints
+/// 64). The arm now skips core's authenticated primitive-integer inherent
+/// (`numeric_panic::int_inherent`: a `core::num::<impl iN/uN>::` owner under a
+/// sysroot root that carries no `__trust_crate@` stamp). No other name in that arm
+/// exists as an integer inherent, so only the two integer rotates leave the union,
+/// and both are `intrinsics::rotate_left/right(self, n)`, which cannot panic. A
+/// stamped or user spelling (`mycrate::num::<impl u32>::rotate_left`) fails
+/// `int_inherent` and stays in; so do `NonZero`/`Wrapping`/`Saturating`'s rotates (an
+/// over-refusal of total items, kept). This change makes the union answer `false`
+/// for two spellings it used to refuse, so it GRANTS, and the grant is anchored on
+/// `int_inherent`'s sysroot-root check.
+///
+/// Trust (W4 HASHMAP r3, 2026-09-29): and the ALLOCATION lane's call-site charges
+/// ([`callee_is_call_site_allocation_sink`]) — the capacity-overflow panics of
+/// `with_capacity`, `reserve`, `collect`, `from_iter`, `extend`, `unzip`,
+/// `collect_into`, ... are exactly such charges. MEASURED on the redo's r2
+/// (`b9288112d`): `Some(n).map(HashSet::<u64>::with_capacity)`, `Result::map`,
+/// `Option::map_or_else(HashSet::new, HashSet::with_capacity)`, `Iterator::map`, an
+/// `impl Fn` returning the item, and `Option::map(HashSet::from_iter)` /
+/// `map(Iterator::collect::<HashMap<_, _>>)` built rc=0 and panicked "Hash table
+/// capacity overflow" (15 probes); their `Vec` twins built rc=0 on main too.
+///
+/// Trust (W4 ITER-HOF fix round 4, 2026-10-02): and the two NUMERIC call-site
+/// producers the union had left out, so it now names every family a direct call is
+/// charged by: `panic_calls::divzero_call` (`div_euclid`, `div_ceil`, `rem_euclid`
+/// — a zero divisor — and `step_by(0)`) and `alloc_bounds::overflow_arith_call`
+/// (`pow`, which overflows under the CALLER's overflow checks:
+/// `#[rustc_inherit_overflow_checks]`); since 2026-10-06 the union reads their
+/// name-only twins (`divzero_call_name_only`, `overflow_arith_call_name_only`),
+/// whose answers are the ones measured here. `numeric_panic` deliberately leaves
+/// exactly these to them ("`div_euclid`/`rem_euclid`/`div_ceil` (the zero divisor)
+/// stay with `divzero_call`"), so a sysroot item from either family was charged
+/// nothing.
+/// MEASURED (adversarial probes q07/q08 of `w4-salvage/probes/T5-iterhof-fix8`, and
+/// the same verdict on stage 1 of origin/main `a3be88bbde` without W4):
+/// `v.iter().copied().reduce(u32::div_ceil)`, `fold(7, u32::div_ceil)`,
+/// `fold(2, u32::pow)`, `reduce(u32::pow)` and `fold(2i32, i32::pow)` built rc=0 with
+/// no row (a `native-verification-gap` only) and panicked ("attempt to divide by
+/// zero", "attempt to exponentiate with overflow"), while every DIRECT call
+/// (`a.div_ceil(b)`, `a.pow(b)`) and every closure twin was refused. Unsigned
+/// `div_euclid`/`rem_euclid` items were already refused, through the bridge's
+/// division list (`is_panicking_primitive_int_div_method`), which has no `div_ceil`
+/// and no `pow`. The integer division OPERATORS handed as items
+/// (`fold(7u32, core::ops::Div::div)`, `Rem::rem`, by value or by reference, and the
+/// `Wrapping`/`Saturating` impls) were the same hole, measured the same way; they are
+/// `numeric_panic::is_int_division_operator_callee`. So were the integer `sum`/`product`
+/// folds handed as items (`map(Iterator::sum::<u32>)`), which a direct call pays as an
+/// `iterator-fold-overflow` row: `alloc_bounds::iterator_fold_item_may_overflow`. A
+/// `true` here only withholds the vanilla admission of an item.
+///
+/// Trust (W4 ITER-HOF fix round 6, 2026-10-03): and the integer OVERFLOW-checked
+/// operators by REFERENCE (`v.iter().fold(0u32, core::ops::Add::add)` is
+/// `<u32 as Add<&u32>>::add`; `map(core::ops::Neg::neg)` over `&i32`; `Shl<&u32>`):
+/// a direct call to one is the ruled foundational-member class, charged a
+/// runtime-checked row the default policy reports and `certify` refuses, so it is
+/// not "charged nothing". MEASURED: the item spellings built rc=0 under `certify`
+/// too, with no row, and panicked verify-off. They are
+/// `numeric_panic::is_int_overflow_operator_callee` (which also matches the by-value
+/// spellings `is_numeric_value_panic_callee` already names).
+///
+/// Trust (W4 ITER-HOF landing round, 2026-10-03): the `Box`/`Rc`/`Arc` uninitialized
+/// and zeroed SLICE constructors (`map(Box::<[u64]>::new_uninit_slice)`) are now in the
+/// allocation arm, because `bulk_alloc_call` charges them at a direct call; before, no
+/// lane did, and the review's probes built every spelling rc=0 and panicked "capacity
+/// overflow". A DIVERGING item (`std::panic::panic_any`) is not this union's to name —
+/// a rendered name carries no return type — and the compiler withholds every `-> !`
+/// item before asking it (`foreign_fn_item_type_arg_is_accounted`). The union is still
+/// a DENY-list: an item that panics on a caller value and that no family names is
+/// admitted (docs/KNOWN_HAZARDS.md, the W4 ITER-HOF residual).
+pub fn callee_has_call_site_panic_family(callee: &str) -> bool {
+    let tail = alloc_bounds::method_tail(callee);
+    if (matches!(tail, "unwrap" | "expect" | "unwrap_err" | "expect_err")
+        && (callee.contains("Option") || callee.contains("Result")))
+        || callee_is_call_site_allocation_sink(callee)
+        // Trust (2026-10-06, DIVZERO-NAME-1): the name-only view, as for `pow` and
+        // `abs` below. `divzero_call` now mints its row only for core's
+        // authenticated `div_euclid`/`div_ceil`/`rem_euclid` and std's
+        // `Iterator::step_by`; this deny-list keeps its wider answer.
+        || panic_calls::divzero_call_name_only(callee).is_some()
+        // Trust (2026-10-06): the name-only view. `overflow_arith_call` now mints
+        // `pow`'s row only for core's authenticated primitive-integer `pow`; this
+        // deny-list keeps its wider answer (a `Some` only withholds an admission).
+        || alloc_bounds::overflow_arith_call_name_only(callee).is_some()
+        || (matches!(tail, "sum" | "product")
+            && alloc_bounds::iterator_fold_item_may_overflow(callee))
+        // Trust (2026-10-06, ABS-NAME-1): the name-only view, as for `pow` above.
+        // `abs`'s row is minted only for core's signed-integer `abs`
+        // (`is_signed_abs_mint`, authenticated or behind one leading extractor stamp);
+        // this deny-list keeps its wider answer.
+        || (tail == "abs"
+            && (callee.contains("core::num::") || callee.contains("std::num::")))
+        // Trust (2026-10-11, SLICE-ZERO-SIZE-NAME-1): the name-only view, as for
+        // `div_ceil` above. `slice_method_panic` now mints its `split_at`/`chunks*`/
+        // `windows`/`swap` rows only for a sysroot-rooted callee; this deny-list
+        // keeps its wider answer.
+        || SliceMethodPanic::classify_name_only_with_tail(callee, tail).is_some()
+        || (matches!(
+            tail,
+            "remove" | "insert" | "swap_remove" | "insert_str" | "encode_utf8" | "encode_utf8_raw"
+        ) && callee_is_known_caller_value_panic(callee))
+        || (matches!(
+            tail,
+            "drain"
+                | "splice"
+                | "extract_if"
+                | "extend_from_within"
+                | "prepend_from_within"
+                | "insert"
+                | "split_off"
+                | "rotate_left"
+                | "rotate_right"
+                | "swap"
+                | "range"
+                | "range_mut"
+                | "insert_mut"
+                | "encode_utf16"
+                | "encode_utf16_raw"
+        ) && callee_is_root_call_caller_value_panic(callee))
+    {
+        return true;
+    }
+    let numeric = numeric_panic::NumericCallee::for_authenticated(callee, tail);
+    numeric.is_int_division_operator()
+        || numeric.is_int_overflow_operator()
+        // Trust (2026-09-25, std-numeric-family): `iter.map(u32::ilog2)`,
+        // `opt.map(char::from_digit ..)` — a numeric method whose panic is an
+        // argument value, handed over as an ITEM, runs where no call-site row
+        // can be minted.
+        || numeric.is_value_panic_callee()
+        // Trust (2026-10-06, ROTATE-ITEM-NAME-1): not core's own integer inherent,
+        // whose `rotate_left`/`rotate_right` are total (see the doc above).
+        || (matches!(
+            tail,
+            "rotate_left"
+                | "rotate_right"
+                | "split_off"
+                | "drain"
+                | "copy_within"
+                | "select_nth_unstable"
+                | "select_nth_unstable_by"
+                | "select_nth_unstable_by_key"
+                | "extend_from_within"
+        ) && numeric.int_inherent().is_none())
+}
+
+/// Trust (VEC-AS-SLICE, 2026-09-25): the exact identity of the row the `1e` arm of
+/// the safety pipeline emits for the OWNED-`Vec` SCALAR index call (`v[i]`,
+/// `<Vec<T> as Index<usize>>::index(&v, i)`, and its `index_mut` twin) that
+/// terminates `block_id` — its kind and its recorded obligation BODY, normalized
+/// exactly as the pipeline's final pass normalizes it.
+///
+/// The compiler's bundled-member Assert gate asks this, per call site, before it
+/// credits the bounds `Assert` inside std's `<usize as SliceIndex<[T]>>::index`
+/// (reached only through `Vec`'s forwarding `Index` impl) to that row: the row must
+/// exist in the root's public inventory under this exact identity, so a row
+/// dropped or rewritten between producer and inventory refuses instead of
+/// silently leaving the member `Assert` charged to nobody.
+///
+/// `Some` only for the two shapes that row can take: the real bounds obligation
+/// (`VcKind::SliceBoundsCheck`, body `i >= coll_len(base)`) and its fail-honest
+/// `UnsupportedMir { kind: "container-index-unstable-len" }` backstop (body
+/// `Bool(true)`, never provable). Everything else — a range index, a map index, a
+/// receiver the producer does not recognize as an owned `Vec` — is `None`, and the
+/// caller must refuse.
+pub fn owned_vec_scalar_index_row(
+    func: &VerifiableFunction,
+    block_id: BlockId,
+) -> Option<(VcKind, Formula)> {
+    let block = func
+        .body
+        .blocks
+        .get(block_id.0)
+        .filter(|block| block.id == block_id)
+        .or_else(|| func.body.blocks.iter().find(|block| block.id == block_id))?;
+    let Terminator::Call { func: callee, args, .. } = &block.terminator else {
+        return None;
+    };
+    let panic = slice_method_panic(callee)?;
+    // Trust (CONST-RANGE-INDEX-1, 2026-10-06): a range index is the `1e` arm's own
+    // answer (`range_index_range_operand`), which also sees a constant range the
+    // callee's instantiation names.
+    if !matches!(panic, SliceMethodPanic::RangeIndex)
+        || range_index_range_operand(func, callee, args).is_some()
+        || !args.iter().any(|arg| operand_is_scalar_usize_index(func, arg))
+    {
+        return None;
+    }
+    let (violation, kind) = slice_method_panic_body(
+        func,
+        &panic,
+        callee,
+        args,
+        callee.contains("__trust_str_index"),
+        block,
+    )?;
+    let unsupported = match &kind {
+        VcKind::SliceBoundsCheck => false,
+        VcKind::UnsupportedMir { kind: name, .. } if name == "container-index-unstable-len" => true,
+        _ => return None,
+    };
+    // Mirror the `1e` arm: a scalar index renames the violation at the block terminal
+    // (`v2_formula_with_block_defs_recorded`'s `body`), and the final pass normalizes
+    // every row except an `UnsupportedMir` one.
+    let sv = stmt_versions_for(func);
+    let body = version_rename_owned_at(violation, &sv, func, block.id, block.stmts.len());
+    let body = if unsupported { body } else { normalize_ssa_version_tokens_owned(func, body) };
+    Some((kind, body))
+}
+
+/// Trust (2026-10-02, census-vcgen-hang): one VC-generation memo scope held across a
+/// BATCH of [`owned_vec_scalar_index_row`] replays of ONE function.
+///
+/// WHY. A replay builds its row with the full block-defs builder, which asks the
+/// function's statement-version oracle (`havoc_memo::version_oracle`: a dominator
+/// index, a write index and the SSA oracle over the WHOLE body) and the whole-body
+/// analyses of `fn_memo` / `place_memo`. Those are memoized only inside a VC-gen
+/// scope, and the compiler's `Vec`-forwarder gate (`charge_vec_index_forwarders`)
+/// replays one row per root call site of a forwarder OUTSIDE any scope, so every
+/// site rebuilt the whole-function oracle: O(sites x body), after generation itself
+/// had built it once. On aterm-census `lock_order::run_lock_order_census` (1114
+/// blocks, 24 `Vec` index sites; trust main 123f22d176, opt-level 2 + debug
+/// assertions) the replay ran for minutes past the function's 120 s budget, all of
+/// it inside native bundle construction, where the budget is only checked before and
+/// after. Held across the batch, the oracle and the analyses are built once.
+///
+/// WHY IT CHANGES NO ROW. This is `gen_work::enter_unmetered`, the scope the
+/// overflow-elision join-table replay used until T3 C05: memos live, work meter OFF for
+/// the scope's whole extent. Every memoized value is a pure function of the function
+/// (keyed on its identity: address, locals buffer, name) and of its key, so a replay
+/// under the scope returns the bytes an unscoped replay returns; and with the meter
+/// off no degraded leaf can be produced, exactly as for an unscoped call, which never
+/// meters. `row_replay_scope_tests` pins both halves: identical rows, one oracle.
+///
+/// THE HOLDER'S CONTRACT. Query only functions that stay borrowed for the scope's
+/// whole extent (the identity key relies on an address that cannot be reused while
+/// they are alive), and drop the scope on the thread that entered it (it is not
+/// `Send`).
+#[must_use = "the memo scope lasts only while the guard is held"]
+pub struct RowReplayScope {
+    _scope: crate::gen_work::UnmeteredGuard,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Enter a [`RowReplayScope`]; hold the guard across the batch of replays.
+pub fn row_replay_scope() -> RowReplayScope {
+    RowReplayScope {
+        _scope: crate::gen_work_scope_unmetered(),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Trust (2026-10-19, R1 harvest): the memo scopes of a public VC-generation entry that
+/// has NO work meter of its own — the call-site precondition producers
+/// ([`generate_callsite_precondition_vcs`], its `_attributed` twin), the call-site L0
+/// replay's caller assembly and the `Vec`-mutator charge gates. Opened on the function
+/// VIEW the entry's analyses read (the arithmetic-safe clone, when there is one), held
+/// for the rest of the entry.
+///
+/// WHY. Those entries ran OUTSIDE every scope when the compiler called them directly,
+/// and outside a scope every whole-body analysis is rebuilt per ask: `place_memo`'s
+/// local-name table per minted name, `fn_memo`'s laundered alias roots and shared-cell
+/// borrows per havoc list, and, with no [`FuncAnalysisScope`], the path-guard map and
+/// the statement-version oracle per lookup. The R1 harvest
+/// (`trust_verify::try_harvest_flip`) asks the attributed producer once per (callee,
+/// caller). Sampled on the `ty` bin under trust 4e95b2c82cee, R1 ran past 1 h 40 min
+/// at 13.5 GB with the thread wholly under that producer's
+/// `build_semantic_guard_map_impl`: of 7983 samples, 4904 in `LocalNameTable::of` via
+/// `place_memo::local_names` and 5290 in `write_havocs_function_list` ->
+/// `fn_memo::laundered_alias_roots` (inclusive counts; the two overlap).
+///
+/// WHY IT CHANGES NO OBLIGATION BELOW A BUDGET. The work half is
+/// `gen_work::enter_joined`: nested in a generation it is a depth increment, so the
+/// entry is charged to the enclosing meter and to no other; outermost it is the
+/// unmetered scope, under which nothing trips, as nothing trips unscoped. The memo half
+/// returns, for every query, the value an uncached computation returns (each is a pure
+/// function of the body and its key, bound to the function's identity, and the view
+/// stays borrowed for the scope's whole extent). The analysis frame is reused when the
+/// innermost one is already bound to this very function, so an entry nested in a scope
+/// of its own function shares that scope's analyses rather than rebuilding them in a
+/// fresh frame. `entry_scope_tests` pins both halves below every budget: byte-identical
+/// rows with and without the scope, and analyses whose builds do not grow with the call
+/// sites.
+///
+/// AT A BUDGET IT CAN CHANGE A ROW, in one direction only: the scope can only LOWER the
+/// work two budgets see, and both count it deterministically.
+/// * The `gen_work` meter. A place query charges it even on a memo hit
+///   (`place_memo::HIT_COST`), and nested in the per-body lane
+///   (`discharge::generate_vcs_with_discharge_and_summaries_configured_impl`, whose
+///   metered scope opens no [`FuncAnalysisScope`]) the new analysis frame removes the
+///   per-lookup rebuilds of the path-guard map and the statement-version oracle, and
+///   with them their place queries.
+/// * The ambient `verify_budget` step counter. The guard-map walk polls
+///   `budget_exhausted` once per step (`safety::v2_analyze_path_guards`), and R1, the
+///   per-body lane up to its checkpoint (`trust_verify::preprocessing_budget_exceeded`)
+///   and the StepBy and L0 gates all run under an installed step budget, so fewer
+///   rebuilds are fewer steps spent.
+///
+/// So a function or a harvest that used to trip can now finish: the per-body inventory
+/// goes from the wholesale budget verdict (one synthetic `Unknown` row, or a located
+/// error in a fail-closed lane) to real rows, and an R1 attribution that used to be
+/// discarded (`trust_verify::r1_budget_tripped`) is now minted. That is sound (fewer
+/// trips, and every added row is an obligation a solver still decides, never a PROVE
+/// without one), but it is not byte-identical to the rows before the scope: a consumer
+/// recheck is not judged by a byte diff against trust 4e95b2c82cee.
+///
+/// THE HOLDER'S CONTRACT is `enter_joined`'s: run no METERED entry inside the scope
+/// (one nested there neither resets nor meters); the L0 replay generates its callee's
+/// VCs before it opens one.
+#[must_use = "the memo scope lasts only while the guard is held"]
+pub(crate) struct EntryScope<'f> {
+    // Declared first, so dropped first: the analysis frame goes before the work scope.
+    _analysis: Option<FuncAnalysisScope<'f>>,
+    _work: Option<crate::gen_work::JoinedGuard>,
+}
+
+impl<'f> EntryScope<'f> {
+    pub(crate) fn enter_analysis_if_unbound(
+        func: &'f VerifiableFunction,
+    ) -> Option<FuncAnalysisScope<'f>> {
+        #[cfg(test)]
+        if ENTRY_SCOPE_DISABLED.with(std::cell::Cell::get) {
+            return None;
+        }
+        FuncAnalysisScope::enter_if_unbound(func)
+    }
+
+    pub(crate) fn enter(func: &'f VerifiableFunction) -> Self {
+        #[cfg(test)]
+        if ENTRY_SCOPE_DISABLED.with(std::cell::Cell::get) {
+            return EntryScope { _analysis: None, _work: None };
+        }
+        let work = crate::gen_work_scope_joined();
+        let (func_addr, body_addr) =
+            (std::ptr::from_ref(func) as usize, std::ptr::from_ref(&func.body) as usize);
+        let bound = FUNC_ANALYSIS_MEMO.with(|memo| {
+            memo.borrow()
+                .last()
+                .is_some_and(|frame| frame.func_addr == func_addr && frame.body_addr == body_addr)
+        });
+        let analysis = (!bound).then(|| FuncAnalysisScope::enter(func));
+        EntryScope { _analysis: analysis, _work: Some(work) }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`EntryScope::enter`] opens nothing, so an entry runs as
+    /// it did before it had a scope — the negative control of the scope's work tests.
+    static ENTRY_SCOPE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with [`EntryScope`] disabled on this thread (restored on return or unwind).
+#[cfg(test)]
+pub(crate) fn without_entry_scope<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ENTRY_SCOPE_DISABLED.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(ENTRY_SCOPE_DISABLED.with(|slot| slot.replace(true)));
+    f()
+}
+
+#[cfg(test)]
+mod primitive_decimal_len_tests;

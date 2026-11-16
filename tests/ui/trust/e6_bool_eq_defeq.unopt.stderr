@@ -1,0 +1,71 @@
+note: Clean island kernel-checked: 3 declaration(s) registered (beq_isl, bneq_isl, keep_isl)
+  --> $DIR/e6_bool_eq_defeq.rs:24:5
+   |
+LL | /     def beq_isl (a b : Bool) : Bool := a == b
+LL | |     def bneq_isl (a b : Bool) : Bool := a != b
+LL | |     def keep_isl (v : Bool) : Bool := v == Bool.true
+   | |____________________________________________________^
+
+note: island definition `beq_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_eq_defeq::lit_value`
+  --> $DIR/e6_bool_eq_defeq.rs:30:13
+   |
+LL |     ensures result == beq_isl(v, pos)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+
+=== Trust Verification Report (e6_bool_eq_defeq) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_eq_defeq.rs:29:1
+   |
+LL | / pub fn lit_value(v: bool, pos: bool) -> bool
+LL | |     ensures result == beq_isl(v, pos)
+LL | | {
+LL | |     v == pos
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `bneq_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_eq_defeq::differ`
+  --> $DIR/e6_bool_eq_defeq.rs:36:13
+   |
+LL |     ensures result == bneq_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_eq_defeq.rs:35:1
+   |
+LL | / pub fn differ(a: bool, b: bool) -> bool
+LL | |     ensures result == bneq_isl(a, b)
+LL | | {
+LL | |     a != b
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `bneq_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e6_bool_eq_defeq::differ_swapped`
+  --> $DIR/e6_bool_eq_defeq.rs:44:13
+   |
+LL |     ensures result == bneq_isl(b, a)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e6_bool_eq_defeq.rs:43:1
+   |
+LL | / pub fn differ_swapped(a: bool, b: bool) -> bool
+LL | |     ensures result == bneq_isl(b, a)
+LL | | {
+LL | |     b != a
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

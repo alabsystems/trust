@@ -78,11 +78,13 @@ fn make_indirect_module() -> Module {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     module.func_types.push(FuncTy {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
 
     // A module global whose NAME is the callee function symbol: its address is the
@@ -97,6 +99,10 @@ fn make_indirect_module() -> Module {
         // `None` = derive alignment from the global's `Ty`, which is the
         // behaviour these fixtures had before `align` existed.
         align: None,
+        // v41: a fixture that states no section, visibility or retention.
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     });
 
     // --- callee: ir_addf(x, y) = x + y  (FuncId 1) ---
@@ -869,11 +875,13 @@ fn open_target_indirect_call_via_non_function_global_fails_closed() {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     module.func_types.push(FuncTy {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     // A DATA global — NOT a function symbol.
     module.globals.push(Global {
@@ -886,6 +894,10 @@ fn open_target_indirect_call_via_non_function_global_fails_closed() {
         // `None` = derive alignment from the global's `Ty`, which is the
         // behaviour these fixtures had before `align` existed.
         align: None,
+        // v41: a fixture that states no section, visibility or retention.
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     });
 
     let mut caller = IrFunction::new(FuncId::new(0), "ir_open", FuncTyId::new(0), BlockId::new(0));
@@ -938,12 +950,14 @@ fn impure_known_target_indirect_call_fails_closed_at_lowering() {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     // callee sig: (i32, ptr) -> i32 — takes a pointer it writes through (impure).
     module.func_types.push(FuncTy {
         params: vec![Ty::I32, Ty::Ptr],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     module.globals.push(Global {
         name: "ir_impure".to_string(),
@@ -955,6 +969,10 @@ fn impure_known_target_indirect_call_fails_closed_at_lowering() {
         // `None` = derive alignment from the global's `Ty`, which is the
         // behaviour these fixtures had before `align` existed.
         align: None,
+        // v41: a fixture that states no section, visibility or retention.
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     });
 
     // callee: ir_impure(x, p) { *p = x; return x }  — the Store makes it impure.
@@ -1051,8 +1069,14 @@ fn make_open_indirect_module() -> Module {
         params: vec![Ty::Ptr],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
 
     // caller: open_ci(fp) { let _ = fp(); return 7 }
     let mut caller = IrFunction::new(FuncId::new(0), "open_ci", FuncTyId::new(0), BlockId::new(0));
@@ -1088,8 +1112,14 @@ fn make_open_indirect_dependent_module() -> Module {
         params: vec![Ty::Ptr],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
 
     let mut caller =
         IrFunction::new(FuncId::new(0), "open_ci_dep", FuncTyId::new(0), BlockId::new(0));
@@ -1463,8 +1493,18 @@ fn open_indirect_dependent_return_is_not_provable_to_any_constant() {
 fn make_open_indirect_mem_module() -> Module {
     let mut module = Module::new("open_indirect_mem_module");
     // FuncTy 0: caller()->i32 ; FuncTy 1: the callee sig ()->i32.
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
 
     let mut caller =
         IrFunction::new(FuncId::new(0), "open_ci_mem", FuncTyId::new(0), BlockId::new(0));
@@ -1505,8 +1545,18 @@ fn make_open_indirect_mem_module() -> Module {
 /// Proves the memory-loaded-fn-ptr havoc HAS TEETH.
 fn make_open_indirect_mem_dependent_module() -> Module {
     let mut module = Module::new("open_indirect_mem_dependent_module");
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
-    module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::I32], is_vararg: false });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
+    module.func_types.push(FuncTy {
+        params: vec![],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    });
 
     let mut caller =
         IrFunction::new(FuncId::new(0), "open_ci_mem_dep", FuncTyId::new(0), BlockId::new(0));

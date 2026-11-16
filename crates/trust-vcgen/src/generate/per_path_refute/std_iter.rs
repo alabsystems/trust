@@ -128,13 +128,9 @@ pub(super) const SLICE_ITER_ADT_NAMES: &[&str] =
 /// ADT names admitted as the `Option<&T>` `next` returns.
 const OPTION_ADT_NAMES: &[&str] = &["core::option::Option", "std::option::Option"];
 
-/// Longest `[T; N]` this lane will symbolize element-wise. Each element becomes
-/// one free SMT symbol plus one range constraint, so the bound keeps a large
-/// array from inflating every path formula in the function.
-pub(super) const MAX_MODELED_ARRAY_LEN: u64 = 64;
-
 /// Prefix of the SMT symbol minted for one element of a modeled `&[T; N]`
-/// parameter.
+/// parameter. A lane's symbol is minted when a path READS the lane (see
+/// [`super::read_array_lane`]), so no path formula is sized by `N`.
 ///
 /// INJECTIVITY, which is load-bearing exactly as it is for
 /// `super::param_var_name`: two element symbols that collide would identify two
@@ -142,9 +138,9 @@ pub(super) const MAX_MODELED_ARRAY_LEN: u64 = 64;
 /// execution. The full name is `{PREFIX}{local_index}_{element_index}`, which is
 /// injective in `(local, element)` because local indices are unique
 /// (`super::Ctx::build` rejects the function otherwise). Collisions with a
-/// SOURCE name are not argued away — [`super::array_param_element_symbols`]
-/// checks every minted name against the function's whole local-name space and
-/// declines the parameter on any clash.
+/// SOURCE name are not argued away — [`super::read_array_lane`] checks every
+/// minted name against the function's whole local-name space and drops the
+/// path on any clash.
 pub(super) const ELEM_VAR_PREFIX: &str = "__trust_ppr_elem_";
 
 /// Is `name` the ADT name of a `core`/`std` slice iterator?
@@ -406,14 +402,15 @@ mod tests {
         let variants = if none_first { vec![none, some] } else { vec![some, none] };
         Ty::Adt {
             name: "core::option::Option".into(),
-            fields: Vec::new(),
-            variants,
+            fields: Vec::new().into(),
+            variants: variants.into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: Some(AdtKind::Enum),
             arbitrary_precision: None,
+            validity_wrapper: None,
         }
     }
 

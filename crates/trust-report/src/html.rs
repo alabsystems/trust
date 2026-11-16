@@ -13,6 +13,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -85,7 +86,7 @@ pub fn format_html_report(report: &JsonProofReport) -> String {
     html.push_str(&html_filters(report));
     html.push_str(&html_functions(report));
     html.push_str(&html_footer(report));
-    html.push_str(&html_script());
+    html.push_str(html_script());
     html.push_str("</body>\n</html>\n");
 
     html
@@ -404,6 +405,9 @@ fn format_obligation_row(ob: &ObligationReport) -> String {
     let (status_class, status_label) = match &ob.outcome {
         ObligationOutcome::Proved { .. } => ("status-proved", "PROVED"),
         ObligationOutcome::RuntimeChecked { .. } => ("status-runtime-checked", "RUNTIME-CHECKED"),
+        ObligationOutcome::Failed { basis, .. } if !basis.is_refuted() => {
+            ("status-failed", "FAILED (unproved, no counterexample; failed closed)")
+        }
         ObligationOutcome::Failed { .. } => ("status-failed", "FAILED"),
         ObligationOutcome::Unknown { .. } => ("status-unknown", "UNKNOWN"),
         ObligationOutcome::Timeout { .. } => ("status-timeout", "TIMEOUT"),
@@ -412,27 +416,30 @@ fn format_obligation_row(ob: &ObligationReport) -> String {
         }
         _ => ("status-unknown", "UNKNOWN"),
     };
-    let strength_cell = match &ob.outcome {
+    let strength_cell: Cow<'static, str> = match &ob.outcome {
         ObligationOutcome::Proved { strength } => {
-            escape(&proof_evidence_label_with_monitor(strength, monitor))
+            Cow::Owned(escape(&proof_evidence_label_with_monitor(strength, monitor)).into_owned())
         }
-        ObligationOutcome::RuntimeChecked { .. } => monitor.map_or_else(
-            || "runtime-checked".to_string(),
+        ObligationOutcome::RuntimeChecked { .. } => monitor.map_or(
+            Cow::Borrowed("runtime-checked"),
             |monitor| {
-                format!("runtime-checked; execution={}", monitor_executability_label(monitor))
+                Cow::Owned(format!(
+                    "runtime-checked; execution={}",
+                    monitor_executability_label(monitor)
+                ))
             },
         ),
-        _ => monitor.map_or_else(
-            || "&mdash;".to_string(),
-            |monitor| format!("execution={}", monitor_executability_label(monitor)),
+        _ => monitor.map_or(
+            Cow::Borrowed("&mdash;"),
+            |monitor| Cow::Owned(format!("execution={}", monitor_executability_label(monitor))),
         ),
     };
 
-    let location_str = ob
+    let location_str: Cow<'static, str> = ob
         .location
         .as_ref()
-        .map(|loc| format!("{}:{}", escape(&loc.file), loc.line_start))
-        .unwrap_or_else(|| "&mdash;".to_string());
+        .map(|loc| Cow::Owned(format!("{}:{}", escape(&loc.file), loc.line_start)))
+        .unwrap_or(Cow::Borrowed("&mdash;"));
 
     let mut row = format!(
         "<tr><td class=\"{sc}\">{sl}</td><td>{strength}</td><td>{desc}</td><td>{solver}</td><td>{time}ms</td><td>{loc}</td></tr>\n",
@@ -445,17 +452,27 @@ fn format_obligation_row(ob: &ObligationReport) -> String {
         loc = location_str,
     );
 
+    // Trust (TINV step 10.7): the premises the row rests on, whatever the outcome.
+    for premise in &ob.assumes {
+        let _ = writeln!(
+            row,
+            "<tr><td colspan=\"6\"><div class=\"reason\">{premise}</div></td></tr>",
+            premise = escape(premise),
+        );
+    }
+
     // Counterexample detail row
-    if let ObligationOutcome::Failed { counterexample: Some(cex) } = &ob.outcome {
-        let vars: Vec<String> = cex
-            .variables
-            .iter()
-            .map(|v| format!("{} = {}", escape(&v.name), escape(&v.display)))
-            .collect();
+    if let ObligationOutcome::Failed { counterexample: Some(cex), .. } = &ob.outcome {
+        let mut vars = String::new();
+        for (i, v) in cex.variables.iter().enumerate() {
+            if i > 0 {
+                vars.push_str(", ");
+            }
+            let _ = write!(vars, "{} = {}", escape(&v.name), escape(&v.display));
+        }
         let _ = writeln!(
             row,
             "<tr><td colspan=\"6\"><div class=\"counterexample\"><div class=\"cex-label\">Counterexample</div>{vars}</div></td></tr>",
-            vars = vars.join(", "),
         );
     }
 
@@ -491,15 +508,16 @@ fn format_obligation_row(ob: &ObligationReport) -> String {
 /// Emit the page footer.
 fn html_footer(report: &JsonProofReport) -> String {
     // Collect unique solver names across all obligations.
-    let mut solvers: Vec<String> = report
+    let mut solvers: Vec<&str> = report
         .functions
         .iter()
-        .flat_map(|f| f.obligations.iter().map(|o| o.solver.clone()))
+        .flat_map(|f| f.obligations.iter().map(|o| o.solver.as_str()))
         .collect();
-    solvers.sort();
+    solvers.sort_unstable();
     solvers.dedup();
 
-    let solver_list = if solvers.is_empty() { "none".to_string() } else { solvers.join(", ") };
+    let solver_list: Cow<'static, str> =
+        if solvers.is_empty() { Cow::Borrowed("none") } else { Cow::Owned(solvers.join(", ")) };
 
     format!(
         "<div class=\"footer\">Generated by Trust v{version} | Solvers: {solvers} | Schema v{schema}</div>\n",
@@ -514,7 +532,7 @@ fn html_footer(report: &JsonProofReport) -> String {
 /// Provides:
 /// - `filterFunctions(verdict)`: toggle visibility of function sections by verdict
 /// - `expandAll()` / `collapseAll()`: bulk open/close all `<details>` elements
-fn html_script() -> String {
+fn html_script() -> &'static str {
     r#"<script>
 function filterFunctions(verdict) {
   var btn = document.querySelector('.filter-btn[data-filter="' + verdict + '"]');
@@ -570,7 +588,6 @@ function collapseAll() {
 }
 </script>
 "#
-    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +643,21 @@ fn func_verdict_data_attr(verdict: FunctionVerdict) -> &'static str {
 }
 
 /// Minimal HTML entity escaping for user-controlled strings.
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+fn escape(s: &str) -> Cow<'_, str> {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"')) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -784,8 +814,6 @@ mod tests {
                 trust_version: TRUST_VERSION.to_string(),
                 timestamp: "0".to_string(),
                 total_time_ms: 11,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "runtime_checked".to_string(),
             summary: CrateSummary {
@@ -802,6 +830,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -817,6 +846,7 @@ mod tests {
                     unknown: 0,
                     timed_out: 0,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 0,
@@ -825,6 +855,7 @@ mod tests {
                     verdict: FunctionVerdict::RuntimeChecked,
                 },
                 obligations: vec![ObligationReport {
+                    assumes: Vec::new(),
                     obligation_id: None,
                     description: "runtime safety check".to_string(),
                     kind: "postcondition".to_string(),

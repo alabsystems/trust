@@ -40,7 +40,10 @@
 
 #![allow(clippy::doc_markdown)]
 
-use clean_kernel::{BinderData, Environment, Expr, ExprKind, Name, TypeChecker};
+use clean_kernel::{
+    BinderData, Declaration, Environment, Expr, ExprKind, KernelEnvError, Level, Name, TypeChecker,
+    TypeError as KernelTypeError,
+};
 use trust_clean_origin::materialize::{
     BodyTemplate, TemplateCallee, TemplateOperand, TemplateRvalue, TemplateTerminator, TemplateTy,
     TemplateUnwind, body_template,
@@ -176,6 +179,9 @@ fn render_operand(operand: TemplateOperand) -> Operand {
         TemplateOperand::U64Scalar(value) => {
             Operand::Constant(ConstValue::Uint(u128::from(value), 64))
         }
+        TemplateOperand::UIntScalar { value, width } => {
+            Operand::Constant(ConstValue::Uint(value, width))
+        }
         TemplateOperand::BoolScalar(value) => Operand::Constant(ConstValue::Bool(value)),
     }
 }
@@ -187,6 +193,9 @@ pub fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
     let local_ty = |ty: TemplateTy| match ty {
         TemplateTy::Result | TemplateTy::Param { .. } => nat_adt(),
         TemplateTy::Bool => Ty::Bool,
+        TemplateTy::RustCalleeResult { .. } => {
+            panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement")
+        }
         TemplateTy::ResultRef => Ty::Ref { mutable: false, inner: Box::new(nat_adt()) },
     };
     let locals = template
@@ -232,6 +241,7 @@ pub fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
                     Terminator::Call {
                         func: match callee {
                             TemplateCallee::Primitive(identity) => extracted_callee_path(*identity),
+                            TemplateCallee::RustFn { .. } => panic!("W5: this probe plans no Rust-call chain; control_23 is that lane's measurement"),
                             TemplateCallee::SelfDef => def_path.to_owned(),
                         },
                         args: args.iter().map(|arg| render_operand(*arg)).collect(),
@@ -246,6 +256,7 @@ pub fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
                             TemplateUnwind::Continue => UnwindEdge::Continue,
                         },
                         callee_identity: None,
+                        callee_key: None,
                     }
                 }
             },
@@ -266,6 +277,7 @@ pub fn render(template: &BodyTemplate, def_path: &str) -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -350,10 +362,10 @@ fn p1_the_decrease_proof_is_what_fills_the_traversal_envelope() {
     let functional_depth = depth(anatomy.functional());
     let proof_depth = depth(anatomy.calls()[0].decrease_proof());
 
-    eprintln!("ROW p1 | functional {functional} nodes | decrease proof {proof} | measure {measure}");
     eprintln!(
-        "ROW p1 | functional DEPTH {functional_depth} | decrease proof DEPTH {proof_depth}"
+        "ROW p1 | functional {functional} nodes | decrease proof {proof} | measure {measure}"
     );
+    eprintln!("ROW p1 | functional DEPTH {functional_depth} | decrease proof DEPTH {proof_depth}");
 
     assert!(
         proof > 4_096,
@@ -684,14 +696,10 @@ fn p4_the_phase3_borrow_is_a_kernel_decision() {
     };
 
     // (a) side B AUTHORS the major premise instead of leaving the sentinel.
-    let authored_major = side_b_from(
-        anatomy.functional(),
-        arity,
-        &keep_binders,
-        &move |position, argument| {
+    let authored_major =
+        side_b_from(anatomy.functional(), arity, &keep_binders, &move |position, argument| {
             if position == slot { decrease_sentinel() } else { argument.clone() }
-        },
-    );
+        });
     let refusal = check_faithful_wf_functional(
         &env,
         "gcdB",
@@ -766,17 +774,15 @@ fn p4_the_phase3_borrow_is_a_kernel_decision() {
     //     hands the same two terms the other way round. Both are well-typed
     //     `Nat`s built from the same parameters, so nothing structural
     //     separates them — only the kernel does.
-    let swapped = side_b_from(
-        anatomy.functional(),
-        arity,
-        &keep_binders,
-        &move |position, argument| match position {
-            0 => measure_sentinel(),
-            _ if position == slot => decrease_sentinel(),
-            2 | 3 => argument.clone(),
-            _ => argument.clone(),
-        },
-    );
+    let swapped =
+        side_b_from(anatomy.functional(), arity, &keep_binders, &move |position, argument| {
+            match position {
+                0 => measure_sentinel(),
+                _ if position == slot => decrease_sentinel(),
+                2 | 3 => argument.clone(),
+                _ => argument.clone(),
+            }
+        });
     // …built explicitly so the swap is visible: arguments 2 and 3 exchanged.
     let legs: Vec<Expr> = anatomy.calls()[0].arguments().to_vec();
     let swapped = replace_call_arguments(&swapped, arity, &[legs[1].clone(), legs[0].clone()]);
@@ -799,18 +805,13 @@ fn p4_the_phase3_borrow_is_a_kernel_decision() {
 /// Replace the SOURCE arguments of the single self-call (positions
 /// `2 .. 2 + arity`) with `replacements`, leaving the plumbing alone.
 fn replace_call_arguments(functional: &Expr, arity: usize, replacements: &[Expr]) -> Expr {
-    side_b_from(
-        functional,
-        arity,
-        &|_, ty| ty.clone(),
-        &move |position, argument| {
-            if (2..2 + arity).contains(&position) {
-                replacements[position - 2].clone()
-            } else {
-                argument.clone()
-            }
-        },
-    )
+    side_b_from(functional, arity, &|_, ty| ty.clone(), &move |position, argument| {
+        if (2..2 + arity).contains(&position) {
+            replacements[position - 2].clone()
+        } else {
+            argument.clone()
+        }
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -890,11 +891,7 @@ fn p6_every_phase2_fixture_still_plans_identically() {
         let env = island(source).unwrap_or_else(|why| panic!("`{name}` must elaborate: {why}"));
         let plan = plan_clean_origin_body(&env, name)
             .unwrap_or_else(|refusal| panic!("`{name}` must still PLAN: {}", refusal.note()));
-        assert_eq!(
-            format!("{:?}", plan.shape()),
-            expected,
-            "R3d must not move `{name}`'s plan"
-        );
+        assert_eq!(format!("{:?}", plan.shape()), expected, "R3d must not move `{name}`'s plan");
         // …and the phase-2 MIR door still reads its emitted body.
         assert!(
             recognize_wf_nat_rec(&emitted(&env, name)).is_some(),
@@ -918,7 +915,6 @@ fn p6_every_phase2_fixture_still_plans_identically() {
     assert_eq!(*measure_index, 0);
     assert_eq!(*lowering, WfLowering::OnParameter, "the fuel form is PHASE 2 — its measure is `f`");
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // (p7) THE RUN-PASS FIXTURE'S OWN ROWS, DECIDED AT THE KERNEL
@@ -972,6 +968,19 @@ fn p7_the_run_pass_fixture_rows_are_kernel_decisions() {
     // (or one of the inputs), so a body that returned a common divisor rather
     // than the GREATEST one — or that returned an argument — would pass the
     // admits above and fail here.
+    //
+    // They are put to the KERNEL DIRECTLY — `theorem v : gcdB a b = wrong :=
+    // Eq.refl (gcdB a b)` through `check_decl_readonly`, the declaration check
+    // the island's registration runs, over the environment the island itself
+    // produced — and must fail with the kernel's TYPE MISMATCH, while the same
+    // builder at the true value is ADMITTED (so a refusal is never a malformed
+    // term). Not through the island: Clean's elaborator refuses a false `rfl`
+    // over a well-founded definition in time exponential in the recursion
+    // (measured 2026-09-28 in `gcd_final_probes`' module docs; this test did not
+    // finish in 10 minutes), while the kernel decides each row in milliseconds.
+    // The island's own refusal of a false `rfl` is still measured below, at the
+    // rows where the recursion is shallow.
+    let env = gcdb_env();
     for (a, b, wrong) in [
         (12_u32, 18_u32, 3_u32),
         (12, 18, 18),
@@ -983,12 +992,51 @@ fn p7_the_run_pass_fixture_rows_are_kernel_decisions() {
         (42, 0, 21),
         (6, 6, 3),
     ] {
+        let right = gcd(a, b);
+        assert_ne!(right, wrong, "a control row must state a FALSE value");
+        if let Err(error) = kernel_rfl(&env, a, b, right) {
+            panic!(
+                "BUILDER CONTROL: the kernel must ADMIT `gcdB {a} {b} = {right}` built the same way: {error}"
+            );
+        }
+        match kernel_rfl(&env, a, b, wrong) {
+            Err(KernelEnvError::TypeCheckFailed {
+                source: KernelTypeError::TypeMismatch { .. },
+                ..
+            }) => {}
+            Ok(()) => panic!(
+                "CONTROL: `gcdB {a} {b} = {wrong}` is FALSE and the kernel ADMITTED it — the \
+                 rows above are not decisions"
+            ),
+            Err(other) => panic!(
+                "CONTROL: `gcdB {a} {b} = {wrong}` must be refused by the kernel's TYPE \
+                 MISMATCH (not being def-eq), not by: {other}"
+            ),
+        }
+    }
+    for (a, b, wrong) in [(42_u32, 0_u32, 21_u32), (6, 6, 3)] {
         assert!(
             island(&format!("{GCDB}\ntheorem v : gcdB {a} {b} = {wrong} := rfl")).is_err(),
-            "CONTROL: `gcdB {a} {b} = {wrong}` is FALSE and the kernel must refuse it — if it \
-             admits, the rows above are not decisions"
+            "CONTROL: `gcdB {a} {b} = {wrong}` is FALSE and the island must refuse it"
         );
     }
+}
+
+/// `theorem v : gcdB a b = v := @Eq.refl Nat (gcdB a b)` put to the kernel's
+/// full declaration check, with no elaborator in between. `env` is not modified.
+fn kernel_rfl(env: &Environment, a: u32, b: u32, v: u32) -> Result<(), KernelEnvError> {
+    let cnst = |name: &str, levels: Vec<Level>| Expr::const_(Name::from_string(name), levels);
+    let one = || vec![Level::succ(Level::zero())];
+    let lhs = Expr::apps(cnst("gcdB", vec![]), [Expr::nat_lit(a.into()), Expr::nat_lit(b.into())]);
+    env.check_decl_readonly(&Declaration::Theorem {
+        name: Name::from_string("gcd_phase3_probes_kernel_row"),
+        level_params: vec![],
+        type_: Expr::apps(
+            cnst("Eq", one()),
+            [cnst("Nat", vec![]), lhs.clone(), Expr::nat_lit(v.into())],
+        ),
+        value: Expr::apps(cnst("Eq.refl", one()), [cnst("Nat", vec![]), lhs]),
+    })
 }
 
 const fn gcd(mut a: u32, mut b: u32) -> u32 {

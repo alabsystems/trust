@@ -224,30 +224,21 @@ pub fn parse_ay_proof(
         return Ok(cert);
     }
 
-    // Parse let-bindings first, collecting named subproofs
-    let mut named_steps: BTreeMap<String, usize> = BTreeMap::new();
-    let lines: Vec<&str> = trimmed.lines().collect();
+    // Parse let-bindings first, collecting named subproofs (keyed by name without '@')
+    let mut named_steps: BTreeMap<&str, usize> = BTreeMap::new();
 
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim();
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim();
 
         // Skip empty lines and comments
-        if line.is_empty() || line.starts_with(';') {
-            i += 1;
-            continue;
-        }
-
-        // Parse let-bindings: (let ((@name <proof>)) ...)
-        if line.starts_with("(let") {
-            i += 1;
+        if line.is_empty() || line.starts_with(';') || line.starts_with("(let") {
             continue;
         }
 
         // Parse named step: (@name (rule ...))
         if let Some(rest) = line.strip_prefix("((@") {
             if let Some(name_end) = rest.find(|c: char| c.is_whitespace()) {
-                let name = format!("@{}", &rest[..name_end]);
+                let name = &rest[..name_end];
                 let step_body = rest[name_end..].trim().trim_end_matches(')');
                 if let Some(step) = parse_proof_step(step_body, &named_steps) {
                     let idx = cert.proof_steps.len();
@@ -255,7 +246,6 @@ pub fn parse_ay_proof(
                     cert.proof_steps.push(step);
                 }
             }
-            i += 1;
             continue;
         }
 
@@ -266,8 +256,6 @@ pub fn parse_ay_proof(
         {
             cert.proof_steps.push(step);
         }
-
-        i += 1;
     }
 
     Ok(cert)
@@ -277,29 +265,30 @@ pub fn parse_ay_proof(
 ///
 /// Format: `rule_name arg1 arg2 ... conclusion`
 /// Arguments that are `@name` references are resolved to premise indices.
-fn parse_proof_step(body: &str, named_steps: &BTreeMap<String, usize>) -> Option<AYProofStep> {
+fn parse_proof_step(body: &str, named_steps: &BTreeMap<&str, usize>) -> Option<AYProofStep> {
     let body = body.trim();
     if body.is_empty() {
         return None;
     }
 
     // The rule name is the first token
-    let (rule_name, rest) = split_first_token(body)?;
+    let (rule_name_str, rest) = split_first_token(body)?;
 
     // Parse remaining tokens: named refs become premises, last non-ref is conclusion
     let mut premises = Vec::new();
     let mut annotations = BTreeMap::new();
-    let mut conclusion = String::new();
+    let mut conclusion_token: Option<&str> = None;
     let tokens = tokenize_sexpr(rest);
 
     // Check for annotations (keys starting with ':')
     let mut i = 0;
     while i < tokens.len() {
-        if tokens[i].starts_with(':') {
-            let key = tokens[i].clone();
+        let token = tokens[i];
+        if token.starts_with(':') {
+            let key = token.to_string();
             let value = if i + 1 < tokens.len() && !tokens[i + 1].starts_with(':') {
                 i += 1;
-                tokens[i].clone()
+                tokens[i].to_string()
             } else {
                 String::new()
             };
@@ -308,23 +297,29 @@ fn parse_proof_step(body: &str, named_steps: &BTreeMap<String, usize>) -> Option
             continue;
         }
 
-        if tokens[i].starts_with('@') {
-            if let Some(&idx) = named_steps.get(&tokens[i]) {
+        if let Some(ref_name) = token.strip_prefix('@') {
+            if let Some(&idx) = named_steps.get(ref_name) {
                 premises.push(idx);
             }
         } else {
             // Last non-annotation, non-reference token is the conclusion
-            conclusion = tokens[i].clone();
+            conclusion_token = Some(token);
         }
         i += 1;
     }
 
-    let rule = Some(AYRule::parse(&rule_name));
-    Some(AYProofStep { rule_name, rule, conclusion, premises, annotations })
+    let rule = Some(AYRule::parse(rule_name_str));
+    Some(AYProofStep {
+        rule_name: rule_name_str.to_string(),
+        rule,
+        conclusion: conclusion_token.unwrap_or("").to_string(),
+        premises,
+        annotations,
+    })
 }
 
 /// Split the first whitespace-delimited token from a string.
-fn split_first_token(s: &str) -> Option<(String, &str)> {
+fn split_first_token(s: &str) -> Option<(&str, &str)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -333,15 +328,15 @@ fn split_first_token(s: &str) -> Option<(String, &str)> {
     // Handle parenthesized first token
     if s.starts_with('(') {
         let end = find_matching_paren(s)?;
-        let token = s[..=end].to_string();
+        let token = &s[..=end];
         let rest = s[end + 1..].trim();
         return Some((token, rest));
     }
 
     if let Some(pos) = s.find(|c: char| c.is_whitespace()) {
-        Some((s[..pos].to_string(), s[pos..].trim()))
+        Some((&s[..pos], s[pos..].trim()))
     } else {
-        Some((s.to_string(), ""))
+        Some((s, ""))
     }
 }
 
@@ -364,51 +359,49 @@ fn find_matching_paren(s: &str) -> Option<usize> {
 }
 
 /// Tokenize an s-expression into top-level tokens, respecting parenthesized groups.
-fn tokenize_sexpr(s: &str) -> Vec<String> {
+fn tokenize_sexpr(s: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let s = s.trim();
     if s.is_empty() {
         return tokens;
     }
 
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
+    let mut iter = s.char_indices().peekable();
 
-    while i < chars.len() {
+    while let Some(&(start, ch)) = iter.peek() {
         // Skip whitespace
-        if chars[i].is_whitespace() {
-            i += 1;
+        if ch.is_whitespace() {
+            iter.next();
             continue;
         }
 
-        if chars[i] == '(' {
+        if ch == '(' {
             // Collect entire parenthesized group
-            let mut depth = 0;
-            let start = i;
-            loop {
-                if i >= chars.len() {
-                    break;
-                }
-                if chars[i] == '(' {
+            let mut depth = 0usize;
+            let mut end = s.len();
+            while let Some((idx, c)) = iter.next() {
+                if c == '(' {
                     depth += 1;
-                } else if chars[i] == ')' {
+                } else if c == ')' {
                     depth -= 1;
                     if depth == 0 {
-                        i += 1;
+                        end = idx + 1;
                         break;
                     }
                 }
-                i += 1;
             }
-            tokens.push(chars[start..i].iter().collect());
+            tokens.push(&s[start..end]);
         } else {
             // Collect non-whitespace token
-            let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '(' && chars[i] != ')'
-            {
-                i += 1;
+            let mut end = s.len();
+            while let Some(&(idx, c)) = iter.peek() {
+                if c.is_whitespace() || c == '(' || c == ')' {
+                    end = idx;
+                    break;
+                }
+                iter.next();
             }
-            tokens.push(chars[start..i].iter().collect());
+            tokens.push(&s[start..end]);
         }
     }
 
@@ -431,6 +424,10 @@ pub fn check_proof_step_structure(cert: &AYProofCertificate) -> Result<(), CertE
         });
     }
 
+    // Axiom rules: "asserted", "refl", "true-axiom", "hypothesis", "intro"
+    const AXIOM_RULES: [&str; 5] = ["asserted", "refl", "true-axiom", "hypothesis", "intro"];
+    let mut orphan_count = 0;
+
     for (i, step) in cert.proof_steps.iter().enumerate() {
         // Check 1: all premises reference earlier steps
         for &premise_idx in &step.premises {
@@ -443,14 +440,8 @@ pub fn check_proof_step_structure(cert: &AYProofCertificate) -> Result<(), CertE
                 });
             }
         }
-    }
-
-    // Check 2: non-axiom steps should have premises
-    // Axiom rules: "asserted", "refl", "true-axiom", "hypothesis"
-    let axiom_rules = ["asserted", "refl", "true-axiom", "hypothesis", "intro"];
-    let mut orphan_count = 0;
-    for step in &cert.proof_steps {
-        if step.premises.is_empty() && !axiom_rules.contains(&step.rule_name.as_str()) {
+        // Check 2: non-axiom steps should have premises
+        if step.premises.is_empty() && !AXIOM_RULES.contains(&step.rule_name.as_str()) {
             orphan_count += 1;
         }
     }

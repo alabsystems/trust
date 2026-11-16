@@ -198,6 +198,24 @@ fn every_refusal_note_offers_at_least_two_options() {
             carrier_at(&nat_ty(), &u64_ty()),
         )
         .unwrap_err(),
+        // The two variants `decide_mint` never returns — the mint SITE builds
+        // them (control 28) — held to the same floor as the rest.
+        MintRefusal::CertifiedAdmissionRefused {
+            name: "f".to_owned(),
+            reason: "island definition `f` is universe-polymorphic".to_owned(),
+            carrier: None,
+            type_variable_binders: 1,
+        },
+        MintRefusal::NotTopLevel {
+            name: "f".to_owned(),
+            clean_name: "N.f".to_owned(),
+            namespace: Some("N".to_owned()),
+        },
+        MintRefusal::NotTopLevel {
+            name: "f".to_owned(),
+            clean_name: "f".to_owned(),
+            namespace: None,
+        },
     ];
 
     for refusal in &refusals {

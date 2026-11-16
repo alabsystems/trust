@@ -94,8 +94,10 @@ pub fn no_loop_control() -> Vec<f32> {
     b
 }
 
-/// A non-carrier local mutated in a `for` loop: no ledger row, so the guard is
-/// keyed off and this must keep taking the ordinary summary path.
+/// A non-carrier local mutated in a `for` loop: no ledger row, so the guard was
+/// keyed off and this took the ordinary summary path. The summary itself was removed
+/// on 2026-10-01 (it erased loops; tests/run-make/trust-for-loop-no-erasure), so this
+/// now takes the faithful range lane and must still lower.
 pub fn non_carrier_control() -> u32 {
     let mut n = 0u32;
     for _ in 0..4 {

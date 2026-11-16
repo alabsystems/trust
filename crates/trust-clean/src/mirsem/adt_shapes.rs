@@ -1876,7 +1876,7 @@ pub(super) fn nested_ctor_field_of_reasoned(
         if variant_idx != 0 {
             return Err("a STRUCT aggregate names a non-zero variant");
         }
-        flat
+        flat.into_vec()
     } else {
         variants.get(variant_idx).ok_or("no such variant in the temp's metadata")?.fields.clone()
     };
@@ -3168,6 +3168,7 @@ pub fn sem_adt_return_opaque_shape_of(
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             ..
         } = term
         else {
@@ -3630,6 +3631,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         ..
     } = &bb0.terminator
     else {
@@ -3770,6 +3772,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         ..
     } = &bb7.terminator
     else {
@@ -3813,6 +3816,7 @@ pub fn sem_adt_return_opaque_ord_shape_of(
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         ..
     } = &bb5.terminator
     else {
@@ -4012,6 +4016,7 @@ pub fn sem_scalar_sentinel_select_shape_of(
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
         ..
     } = &entry.terminator
     else {

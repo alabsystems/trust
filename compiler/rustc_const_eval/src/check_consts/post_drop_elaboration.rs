@@ -1,6 +1,5 @@
-use rustc_hir::find_attr;
-use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{self, BasicBlock, Location};
+use rustc_attr_ir::find_attr;
+use rustc_middle::mir;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::sym;
 use tracing::trace;
@@ -46,53 +45,26 @@ pub fn check_live_drops<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
     // I know it's not great to be creating a new const checker, but I'd
     // rather use it so we can deduplicate the error emitting logic that
     // it contains.
-    let mut visitor = CheckLiveDrops { checker: Checker::new(&ccx) };
+    let mut checker = Checker::new(&ccx);
 
-    visitor.visit_body(body);
-}
-
-struct CheckLiveDrops<'mir, 'tcx> {
-    checker: Checker<'mir, 'tcx>,
-}
-
-impl<'tcx> Visitor<'tcx> for CheckLiveDrops<'_, 'tcx> {
-    fn visit_basic_block_data(&mut self, bb: BasicBlock, block: &mir::BasicBlockData<'tcx>) {
+    for (bb, block) in body.basic_blocks.iter_enumerated() {
         trace!("visit_basic_block_data: bb={:?} is_cleanup={:?}", bb, block.is_cleanup);
 
         // Ignore drop terminators in cleanup blocks.
         if block.is_cleanup {
-            return;
+            continue;
         }
 
-        self.super_basic_block_data(bb, block);
-    }
-
-    fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
+        let terminator = block.terminator();
+        let location = body.terminator_loc(bb);
         trace!("visit_terminator: terminator={:?} location={:?}", terminator, location);
 
-        match &terminator.kind {
-            mir::TerminatorKind::Drop { place: dropped_place, .. } => {
-                self.checker.check_drop_terminator(
-                    *dropped_place,
-                    location,
-                    terminator.source_info.span,
-                );
-            }
-
-            mir::TerminatorKind::UnwindTerminate(_)
-            | mir::TerminatorKind::Call { .. }
-            | mir::TerminatorKind::TailCall { .. }
-            | mir::TerminatorKind::Assert { .. }
-            | mir::TerminatorKind::FalseEdge { .. }
-            | mir::TerminatorKind::FalseUnwind { .. }
-            | mir::TerminatorKind::CoroutineDrop
-            | mir::TerminatorKind::Goto { .. }
-            | mir::TerminatorKind::InlineAsm { .. }
-            | mir::TerminatorKind::UnwindResume
-            | mir::TerminatorKind::Return
-            | mir::TerminatorKind::SwitchInt { .. }
-            | mir::TerminatorKind::Unreachable
-            | mir::TerminatorKind::Yield { .. } => {}
+        if let mir::TerminatorKind::Drop { place: dropped_place, .. } = &terminator.kind {
+            checker.check_drop_terminator(
+                *dropped_place,
+                location,
+                terminator.source_info.span,
+            );
         }
     }
 }

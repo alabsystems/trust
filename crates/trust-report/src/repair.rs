@@ -75,6 +75,13 @@ pub struct RepairObligation {
     /// Structured counterexample for `failed` obligations (named, typed vars).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterexample: Option<CounterexampleReport>,
+    /// Present only on a `failed` row that nothing refuted
+    /// (`unproved_fail_closed`): there is NO counterexample and no bug was
+    /// found — the row fails because Trust could not prove it and the family
+    /// fails closed. The repair is a model, a proof, or removing the construct,
+    /// not a guard against a concrete input. Absent for refuted rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_basis: Option<trust_types::FailureBasis>,
     /// **Why** an obligation could not be proved — classified so the agent can
     /// pick a repair strategy. Present for `unknown` / `timeout` obligations.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,7 +101,8 @@ pub struct RepairObligation {
 pub enum RepairStatus {
     /// Property proved — no repair needed (only present in the full variant).
     Proved,
-    /// Property violated — a counterexample is available.
+    /// The obligation fails: refuted (a counterexample may be available), or
+    /// unproved and failed closed (see [`RepairObligation::failure_basis`]).
     Failed,
     /// Solver could not decide — an `unsupported_reason` explains why.
     Unknown,
@@ -212,7 +220,7 @@ impl UnsupportedReason {
 /// is robust to minor wording drift.
 #[must_use]
 pub fn classify_unsupported_reason(reason: &str) -> UnsupportedReason {
-    let r = reason.to_ascii_lowercase();
+    let r_owned = reason.to_ascii_lowercase();
     // Trust (R1 corpus, F6): unwrap the reporting ENVELOPES before keyword
     // matching. Strict-mode rows arrive as "`#[trust(static)]` requires a
     // static proof, but the solver returned unknown: <inner>" and native rows
@@ -222,14 +230,14 @@ pub fn classify_unsupported_reason(reason: &str) -> UnsupportedReason {
     // envelope word "budget" in lowering details misclassified the two biggest
     // in-family clusters as `resource_limit`. Classification must key on the
     // INNER detail.
-    let r = match r.split_once("but the solver returned unknown:") {
-        Some((envelope, inner)) if envelope.contains("#[trust(static)]") => inner.to_string(),
-        _ => r,
+    let r = match r_owned.split_once("but the solver returned unknown:") {
+        Some((envelope, inner)) if envelope.contains("#[trust(static)]") => inner,
+        _ => &r_owned,
     };
     let r = match r.split_once("native full verifier evidence status:") {
         Some((_, tail)) => match tail.split_once(';') {
-            Some((_status, inner)) => inner.to_string(),
-            None => tail.to_string(),
+            Some((_status, inner)) => inner,
+            None => tail,
         },
         None => r,
     };
@@ -418,7 +426,7 @@ fn repair_obligation(
             }
             (RepairStatus::Proved, None, None, None)
         }
-        ObligationOutcome::Failed { counterexample } => {
+        ObligationOutcome::Failed { counterexample, .. } => {
             (RepairStatus::Failed, counterexample.clone(), None, None)
         }
         ObligationOutcome::Unknown { reason } => (
@@ -467,6 +475,7 @@ fn repair_obligation(
         status,
         sort: RepairSort::from(ob.proof_level),
         counterexample,
+        failure_basis: ob.outcome.failure_basis().filter(|basis| !basis.is_refuted()),
         unsupported_reason,
         design_requirement_detail,
     })
@@ -490,6 +499,7 @@ mod tests {
             unknown: 0,
             timed_out: 0,
             design_requirements: 0,
+            failed_unproved: 0,
             unattributed_failed: 0,
             unattributed_unknown: 0,
             unattributed_proved: 0,
@@ -501,6 +511,7 @@ mod tests {
 
     fn ob(kind: &str, level: ProofLevel, outcome: ObligationOutcome) -> ObligationReport {
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: kind.to_string(),
             kind: kind.to_string(),
@@ -528,8 +539,6 @@ mod tests {
                 trust_version: "x".to_string(),
                 timestamp: "0".to_string(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "demo".to_string(),
             summary: CrateSummary {
@@ -545,6 +554,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -716,7 +726,10 @@ mod tests {
         let report = report_with(vec![ob(
             "division_by_zero",
             ProofLevel::L0Safety,
-            ObligationOutcome::Failed { counterexample: None },
+            ObligationOutcome::Failed {
+                counterexample: None,
+                basis: trust_types::FailureBasis::Refuted,
+            },
         )]);
         let repair = build_repair_report(&report);
         assert_eq!(repair.obligations[0].status, RepairStatus::Failed);
@@ -814,7 +827,10 @@ mod tests {
             ob(
                 "index_out_of_bounds",
                 ProofLevel::L0Safety,
-                ObligationOutcome::Failed { counterexample: Some(counterexample()) },
+                ObligationOutcome::Failed {
+                    counterexample: Some(counterexample()),
+                    basis: trust_types::FailureBasis::Refuted,
+                },
             ),
             ob(
                 "postcondition",
@@ -859,7 +875,7 @@ mod tests {
                     ob(
                         "assertion",
                         ProofLevel::L1Functional,
-                        ObligationOutcome::Failed { counterexample: None },
+                        ObligationOutcome::Failed { counterexample: None, basis: trust_types::FailureBasis::Refuted },
                     ),
                     ob(
                         "slice_bounds_check",

@@ -167,13 +167,9 @@ impl core::fmt::Display for CleanOriginPrecondition {
             PreconditionOperand::Literal(v) => v.to_string(),
         };
         match self.relation {
-            PreconditionRelation::NotEqual => write!(
-                f,
-                "{} != {} (u{})",
-                operand(self.left),
-                operand(self.right),
-                self.width
-            ),
+            PreconditionRelation::NotEqual => {
+                write!(f, "{} != {} (u{})", operand(self.left), operand(self.right), self.width)
+            }
         }
     }
 }

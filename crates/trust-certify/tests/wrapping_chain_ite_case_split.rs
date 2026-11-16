@@ -360,11 +360,11 @@ fn formulas_match_the_compiler_dump() {
 /// independently REGENERATES the certificate from the violation and compares
 /// bytes, so this also pins the lane's determinism.
 ///
-/// The producer memoizes on the violation formula, so run this target with
-/// `TRUST_CERTIFY_MEMO=0` in the environment to make the regeneration a genuine
-/// second run of the case-tree builder rather than a cache hit — that is the
-/// determinism measurement. The test is meaningful either way (it exercises the
-/// full consumer entry point), so it is not gated on the variable.
+/// The producer memoizes on the violation formula, so the regeneration may be a
+/// memo hit; a hit is byte-identical to a fresh run by construction (pinned by
+/// trust-certify's `memo_hit_is_byte_identical_to_fresh`), so the comparison
+/// still pins the lane's determinism, and it exercises the full consumer entry
+/// point either way.
 #[test]
 fn certificates_replay_through_recheck() {
     for (name, violation) in [

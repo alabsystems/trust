@@ -1,6 +1,8 @@
 //! Tests for `[env]` config.
+// Trust: transparent proxy fixture adapters for SP-1; exact changed coverage
+// is ledgered in tests/upstream-rust/divergence-audit.toml.
 
-use std::{env, fs};
+use std::fs;
 
 use crate::prelude::*;
 use cargo_test_support::basic_manifest;
@@ -62,17 +64,35 @@ fn targo_compat_rustc_proxy(name: &str) -> cargo_test_support::Project {
                         index += 1;
                     }
 
-                    let status = Command::new(std::env::var_os("REAL_RUSTC").unwrap())
-                        .args(forwarded)
-                        .status()
-                        .unwrap();
-                    std::process::exit(status.code().unwrap_or(1));
+                    let mut command = Command::new(std::env::var_os("REAL_RUSTC").unwrap());
+                    command.args(forwarded);
+                    // Trust: this transparent proxy preserves the compiler's
+                    // inherited scheduling descriptors through exec.
+                    #[cfg(unix)] {
+                        use std::os::unix::process::CommandExt;
+                        panic!("failed to exec compiler: {}", command.exec());
+                    }
+                    #[cfg(not(unix))] {
+                        std::process::exit(command.status().unwrap().code().unwrap_or(1));
+                    }
                 }
             "#,
         )
         .build();
     compiler.cargo("build").run();
     compiler
+}
+
+// Trust: p.process() installs the isolated fixture environment. Select its
+// matching sidecar compiler too; the ambient bootstrap RUSTC requires controls
+// that fixture isolation deliberately removes. Without the complete bundle the
+// shared selector preserves the standalone caller's RUSTC/default, and malformed
+// bundles refuse rather than copying bootstrap authority into the fixture.
+fn targo_compat_rustc() -> std::ffi::OsString {
+    cargo_test_support::rustc_fixture_command()
+        .expect("valid compiler fixture context")
+        .get_program()
+        .to_owned()
 }
 
 #[cargo_test]
@@ -190,6 +210,7 @@ fn authenticated_targo_rejects_reserved_env_authority_even_when_forced() {
         "TRUST_NO_VERIFY",
         "trust_no_verify",
         "TRUST_TARGO_NESTED_UNVERIFIED_BROKER",
+        "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT",
         "TRUSTC",
         "CARGO_TRUST_BIN",
         "CARGO",
@@ -342,7 +363,7 @@ fn authenticated_targo_rejects_late_build_script_process_authority() {
         .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
     fs::hard_link(crate::utils::cargo_exe(), &targo).unwrap();
     let sentinel = p.root().join("root-compiler-launched");
-    let real_rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let real_rustc = targo_compat_rustc();
 
     p.process(&targo)
         .arg("--unverified")
@@ -360,6 +381,49 @@ fn authenticated_targo_rejects_late_build_script_process_authority() {
         !sentinel.exists(),
         "authority rejection must happen before launching the package compiler"
     );
+}
+
+// Trust: the same proxy and compiler path must complete an allowed late-env
+// compile. This makes the negative case's root-compiler sentinel nonvacuous.
+#[cargo_test]
+fn authenticated_targo_allows_non_authority_late_build_script_env() {
+    let compiler = targo_compat_rustc_proxy("allowed-build-script-env-rustc-proxy");
+    let p = project()
+        .file("Cargo.toml", &basic_manifest("foo", "1.0.0"))
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    println!("cargo::rustc-env=SAFE_FIXTURE_VALUE=allowed-late-env");
+                }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+                pub const SELECTED: &str = env!("SAFE_FIXTURE_VALUE");
+                const _: [(); 16] = [(); SELECTED.len()];
+            "#,
+        )
+        .build();
+    let targo = p
+        .root()
+        .join(format!("targo{}", std::env::consts::EXE_SUFFIX));
+    fs::hard_link(crate::utils::cargo_exe(), &targo).unwrap();
+    let sentinel = p.root().join("root-compiler-launched");
+
+    p.process(&targo)
+        .arg("--unverified")
+        .arg("check")
+        .env(
+            "RUSTC",
+            compiler.bin("allowed-build-script-env-rustc-proxy"),
+        )
+        .env("REAL_RUSTC", targo_compat_rustc())
+        .env("ROOT_COMPILER_SENTINEL", &sentinel)
+        .env_remove("RUSTC_WRAPPER")
+        .run();
+    assert_eq!(fs::read(sentinel).unwrap(), b"root compiler launched");
 }
 
 #[cargo_test]
@@ -508,7 +572,8 @@ fn env_applied_to_target_info_discovery_rustc() {
         .file("Cargo.toml", &basic_manifest("wrapper", "1.0.0"))
         .file(
             "src/main.rs",
-            r#"
+            &crate::utils::tools::with_transparent_proxy(
+                r#"
             fn main() {
                 let mut cmd = std::env::args().skip(1).collect::<Vec<_>>();
                 // This will be invoked twice (with `-vV` and with all the `--print`),
@@ -516,11 +581,12 @@ fn env_applied_to_target_info_discovery_rustc() {
                 let env_test = std::env::var("ENV_TEST").unwrap();
                 eprintln!("WRAPPER ENV_TEST:{env_test}");
                 let (prog, args) = cmd.split_first().unwrap();
-                let status = std::process::Command::new(prog)
-                    .args(args).status().unwrap();
+                let status = transparent_proxy::status(std::process::Command::new(prog)
+                    .args(args)).unwrap();
                 std::process::exit(status.code().unwrap_or(1));
             }
             "#,
+            ),
         )
         .build();
     wrapper.cargo("build").run();

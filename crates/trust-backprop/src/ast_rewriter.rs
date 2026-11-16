@@ -1054,32 +1054,35 @@ fn resolve_expression_in_function(
     expr_pattern: &str,
     occurrence: usize,
 ) -> Result<(usize, usize), AstRewriteError> {
-    // 1. Parse the pattern as a syn::Expr
+    use quote::ToTokens;
+
+    // 1. Parse the pattern as a syn::Expr and pre-render its normalized token string once.
     let pattern: syn::Expr =
         syn::parse_str(expr_pattern).map_err(|e| AstRewriteError::PatternParseError {
             pattern: expr_pattern.to_string(),
             error: e.to_string(),
         })?;
+    let pattern_tokens = pattern.to_token_stream().to_string();
 
     // 2. Find the function in the file
     let found = find_function_in_ast(file, fn_name)?;
 
     // 3. Walk the function body with a visitor that matches expressions
     struct ExprFinder<'a> {
-        pattern: &'a syn::Expr,
+        pattern_tokens: &'a str,
         matches: Vec<proc_macro2::Span>,
     }
 
     impl<'ast, 'a> Visit<'ast> for ExprFinder<'a> {
         fn visit_expr(&mut self, expr: &'ast syn::Expr) {
-            if exprs_structurally_equal(expr, self.pattern) {
+            if expr.to_token_stream().to_string() == self.pattern_tokens {
                 self.matches.push(expr_full_span(expr));
             }
             syn::visit::visit_expr(self, expr);
         }
     }
 
-    let mut finder = ExprFinder { pattern: &pattern, matches: Vec::new() };
+    let mut finder = ExprFinder { pattern_tokens: &pattern_tokens, matches: Vec::new() };
     syn::visit::visit_block(&mut finder, found.block);
 
     // 4. Select the requested occurrence
@@ -1090,30 +1093,26 @@ fn resolve_expression_in_function(
             total_matches: finder.matches.len(),
         })?;
 
-    let start = span_start_byte_offset(source, *span)?;
-    let end = span_end_byte_offset(source, *span)?;
+    let table = LineOffsets::new(source);
+    let start_pos = span.start();
+    let end_pos = span.end();
+    let start = table.byte_offset(start_pos.line, start_pos.column)?;
+    let end = table.byte_offset(end_pos.line, end_pos.column)?;
     Ok((start, end))
 }
 
 /// Get a span covering the full expression (from first to last token).
 fn expr_full_span(expr: &syn::Expr) -> proc_macro2::Span {
     use quote::ToTokens;
-    let tokens: Vec<proc_macro2::TokenTree> = expr.to_token_stream().into_iter().collect();
-    match (tokens.first(), tokens.last()) {
-        (Some(first), Some(last)) => first.span().join(last.span()).unwrap_or(first.span()),
-        (Some(only), None) | (None, Some(only)) => only.span(),
-        (None, None) => proc_macro2::Span::call_site(),
+    let mut iter = expr.to_token_stream().into_iter();
+    let Some(first) = iter.next() else {
+        return proc_macro2::Span::call_site();
+    };
+    let first_span = first.span();
+    match iter.last() {
+        Some(last) => first_span.join(last.span()).unwrap_or(first_span),
+        None => first_span,
     }
-}
-
-/// Compare two expressions for structural equality, ignoring spans.
-///
-/// Uses the `quote::ToTokens` representation normalized to strings.
-fn exprs_structurally_equal(a: &syn::Expr, b: &syn::Expr) -> bool {
-    use quote::ToTokens;
-    let a_tokens = a.to_token_stream().to_string();
-    let b_tokens = b.to_token_stream().to_string();
-    a_tokens == b_tokens
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,6 +1489,11 @@ impl Runner for B { fn run(&self) {} }
     }
 
     // --- Structural equality ---
+
+    fn exprs_structurally_equal(a: &syn::Expr, b: &syn::Expr) -> bool {
+        use quote::ToTokens;
+        a.to_token_stream().to_string() == b.to_token_stream().to_string()
+    }
 
     #[test]
     fn test_exprs_structurally_equal_same() {

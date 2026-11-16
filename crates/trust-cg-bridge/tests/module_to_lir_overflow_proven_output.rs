@@ -20,7 +20,9 @@
 //     SAME `[value, overflow_b1]` pair (NO materialized tuple, NO ExtractField);
 //   * Inst::Select -> LIR `Select { NotEqual }` (the `!overflowed` negation);
 //   * Inst::Assert -> a block SPLIT: `Brif(ok, cont, trap)` where the shared
-//     trap block is a single `Trap` (abort), mirroring the VF->LIR panic block.
+//     trap block is a single `Trap`, mirroring the VF->LIR panic block. Since
+//     trust-cg b80b958f5 a LIR `Trap` selects to AArch64 `BRK #1` (as LLVM
+//     does for llvm.trap), not a `call abort`.
 //
 // We prove the emitted machine bytes compute `a + b` ON THE NO-OVERFLOW PATH
 // for ALL inputs:
@@ -30,17 +32,26 @@
 //       the real Overflow + Select + Assert machinery;
 //   (2) it emits a real object whose __text carries a conditional branch and a
 //       trap (proof the overflow check was lowered, not dropped);
-//   (3) PROVEN-OUTPUT (infinite domain): the emitted bytes are decoded into
-//       machine effects (NOT reconstructed from the IR). The bounded path-merge
-//       executor explores the conditional branch; the OVERFLOW arm diverges into
-//       the `abort` trap (a Call effect), so it is the trap/panic path — the
-//       executor returns the LIVE (no-overflow) arm's value and records the
-//       live-arm path condition as the NO-OVERFLOW PRECONDITION. ay (QF_BV)
-//       proves `precondition => (machine_out == a + b)` for ALL 2^64 input pairs
+//   (3) PROVEN-OUTPUT (full symbolic input domain): the emitted bytes are
+//       decoded into machine effects (NOT reconstructed from the IR). The
+//       no-overflow PRECONDITION is an independent source-level signed-add
+//       domain bound to the original argument registers, NOT read off emitted
+//       control flow. At each conditional branch the executor omits an arm
+//       only when ay proves its accumulated path condition UNSAT under that
+//       domain; it never decodes an omitted arm, so the overflow `BRK` is
+//       avoided only by proving it unreachable. ay (QF_BV) then proves
+//       `precondition => (machine_out == a + b)` for ALL 2^64 input pairs
 //       (UNSAT of the negation); and
 //   (4) NEGATIVE CONTROL: the SAME bytes proven against an `a + b + 1` spec
 //       (still under the precondition) MUST be SAT — otherwise the discharge is
-//       vacuous.
+//       vacuous; and
+//   (5) REFUSAL AND DOMAIN CONTROLS: a FEASIBLE overflow (concrete or over the
+//       unconstrained symbolic domain) still reaches the unchanged `BRK`
+//       Semantics refusal; an arbitrary call is not a trap; the source domain
+//       has exact signed boundaries; and an inverted overflow branch cannot
+//       silently shrink the admitted input domain.
+//
+// These are bounded development solver checks, not kernel certificates.
 //
 // The machine output is BYTE-DERIVED (emit -> decode -> effects -> path-merge),
 // NEVER reconstructed from the IR; a wrong overflow lowering (wrong checked op,
@@ -51,11 +62,30 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
-use ay::{BigInt, Logic, Solver, Term};
+use std::time::Duration;
+
+use ay::{BigInt, Logic, Solver, SolverConfig, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_disasm::{Opcode, decode_aarch64};
 use trust_ir::inst::{Inst, OverflowOp};
 use trust_ir::interpret::{InterpretValue, Interpreter};
@@ -78,6 +108,7 @@ fn make_checked_add_module() -> Module {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
 
     let mut f =
@@ -120,7 +151,11 @@ fn make_checked_add_module() -> Module {
         .with_result(ok),
     );
     // assert %ok   (trap iff overflow)
-    block.body.push(InstrNode::new(Inst::Assert { cond: ok }));
+    block.body.push(InstrNode::new(Inst::Assert {
+        cond: ok,
+        kind: trust_ir::AssertKind::Unspecified,
+        site: None,
+    }));
     // return %res
     block.body.push(InstrNode::new(Inst::Return { values: vec![res] }));
 
@@ -207,18 +242,37 @@ fn has_conditional_branch(code: &[u8], base: u64) -> bool {
     false
 }
 
+/// Decode all emitted words. Unknown words or a truncated instruction refuse
+/// the structural check rather than being omitted from the call/trap counts.
+fn count_opcode(code: &[u8], base: u64, wanted: &[Opcode]) -> usize {
+    assert_eq!(code.len() % 4, 0, "AArch64 text must contain complete instructions");
+    code.chunks_exact(4)
+        .enumerate()
+        .filter(|(index, bytes)| {
+            let bytes: [u8; 4] = (*bytes).try_into().unwrap();
+            let insn = decode_aarch64(&bytes, base + (*index * 4) as u64)
+                .expect("every emitted word must decode for structural accounting");
+            wanted.contains(&insn.opcode)
+        })
+        .count()
+}
+
 // ===========================================================================
-// BOUNDED SYMBOLIC PATH-MERGING EXECUTOR (mirrors module_to_lir_cfg_proven_
-// output.rs), extended to model the OVERFLOW TRAP arm.
+// BOUNDED SYMBOLIC RETURN-PATH EXECUTOR (ported from
+// module_to_lir_inline_multiblock_proven_output.rs, 7a1034b5c1).
 //
-// At a ConditionalBranch we explore both targets. If one arm DIVERGES into the
-// `abort` trap (a Call effect), that arm is the overflow/panic path: we discard
-// it and return the LIVE arm's value, conjoining the live-arm path condition
-// into the NO-OVERFLOW PRECONDITION accumulated in `self.precondition`.
+// The arithmetic input assumption is supplied independently of emitted control
+// flow and threaded as the path condition. At a ConditionalBranch an arm is
+// omitted only when AY establishes that its accumulated path condition is
+// UNSAT; an omitted arm is never decoded. Reachable BRK, calls, and unknown
+// feasibility remain refusals; no trap semantics is invented. (This replaces
+// the retired design in which the `call abort` trap arm surfaced as a Call
+// effect, was classified `Trapped`, and its negation became the precondition:
+// since trust-cg b80b958f5 the trap is `BRK #1`, which the machine semantics
+// refuses fail-closed, and a Call is not evidence of divergence.)
 //
-// The returned Formula is therefore the machine output ON THE NO-OVERFLOW PATH,
-// and `self.precondition` is the assumption under which it is proven equal to
-// the spec. Loops / non-trap calls / atomics / indirect branches fail closed.
+// The returned Formula is the machine output on every feasible path under the
+// precondition. Loops / calls / atomics / indirect branches fail closed.
 // ===========================================================================
 
 const MAX_STEPS: u32 = 4096;
@@ -226,13 +280,8 @@ const MAX_DEPTH: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecError {
-    Loop {
-        at: u64,
-    },
+    Loop { at: u64 },
     BudgetExceeded,
-    /// The arm diverged into the abort trap (the overflow/panic path). Carries
-    /// nothing: the caller treats it as the excluded (trapping) branch.
-    Trapped,
     Unsupported(String),
     Decode(String),
 }
@@ -242,13 +291,11 @@ struct Executor<'a> {
     code: &'a [u8],
     base: u64,
     steps: u32,
-    /// Conjuncts of the no-overflow precondition (the live-arm path conditions).
-    precondition: Vec<Formula>,
 }
 
 impl<'a> Executor<'a> {
     fn new(code: &'a [u8], base: u64) -> Self {
-        Executor { sem: Aarch64Semantics, code, base, steps: 0, precondition: Vec::new() }
+        Executor { sem: Aarch64Semantics, code, base, steps: 0 }
     }
 
     fn decode_at(&self, pc: u64) -> Result<trust_disasm::Instruction, ExecError> {
@@ -269,6 +316,7 @@ impl<'a> Executor<'a> {
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        path_condition: Formula,
     ) -> Result<Formula, ExecError> {
         if depth > MAX_DEPTH {
             return Err(ExecError::BudgetExceeded);
@@ -307,8 +355,8 @@ impl<'a> Executor<'a> {
                     Effect::Branch { target } => uncond_target = Some(target.clone()),
                     Effect::PcUpdate { .. } => {}
                     Effect::Call { .. } => {
-                        // The abort call IS the trap/panic path: this arm diverges.
-                        return Err(ExecError::Trapped);
+                        // A call is not evidence that this arm diverges: refuse.
+                        return Err(ExecError::Unsupported(format!("call at {pc:#x}")));
                     }
                     Effect::Aarch64SyncBoundary { .. } | Effect::Aarch64AtomicAccess { .. } => {
                         return Err(ExecError::Unsupported(format!("atomic/sync at {pc:#x}")));
@@ -335,10 +383,30 @@ impl<'a> Executor<'a> {
                     return Err(ExecError::Loop { at: pc });
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1);
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1);
-
-                return self.merge(path_cond, taken, fall);
+                let taken_path = Formula::And(vec![path_condition.clone(), path_cond.clone()]);
+                let fall_path = Formula::And(vec![
+                    path_condition.clone(),
+                    Formula::Not(Box::new(path_cond.clone())),
+                ]);
+                // Do not even decode an infeasible destination. In particular,
+                // a BRK may only be avoided by proving its path impossible;
+                // a feasible BRK still reaches the unchanged Semantics refusal.
+                return match (path_is_feasible(&taken_path)?, path_is_feasible(&fall_path)?) {
+                    (true, true) => {
+                        let taken = self.run(
+                            target_pc,
+                            state.clone(),
+                            visited.clone(),
+                            depth + 1,
+                            taken_path,
+                        )?;
+                        let fall = self.run(fall_pc, state, visited, depth + 1, fall_path)?;
+                        Ok(Formula::Ite(Box::new(path_cond), Box::new(taken), Box::new(fall)))
+                    }
+                    (true, false) => self.run(target_pc, state, visited, depth + 1, taken_path),
+                    (false, true) => self.run(fall_pc, state, visited, depth + 1, fall_path),
+                    (false, false) => Err(ExecError::Unsupported("no feasible return path".into())),
+                };
             }
 
             if let Some(target) = uncond_target {
@@ -354,33 +422,25 @@ impl<'a> Executor<'a> {
             pc += 4;
         }
     }
+}
 
-    /// Merge a conditional fork. If exactly ONE arm trapped, that arm is the
-    /// overflow/panic path: return the other arm's value and conjoin the
-    /// live-arm path condition into the no-overflow precondition. If neither
-    /// trapped, merge with an Ite (a real two-valued branch). If both trapped
-    /// the whole path diverges.
-    fn merge(
-        &mut self,
-        path_cond: Formula,
-        taken: Result<Formula, ExecError>,
-        fall: Result<Formula, ExecError>,
-    ) -> Result<Formula, ExecError> {
-        match (taken, fall) {
-            (Ok(t), Ok(f)) => Ok(Formula::Ite(Box::new(path_cond), Box::new(t), Box::new(f))),
-            // taken trapped -> overflow path is `path_cond`; live path is its negation.
-            (Err(ExecError::Trapped), Ok(f)) => {
-                self.precondition.push(Formula::Not(Box::new(path_cond)));
-                Ok(f)
-            }
-            // fallthrough trapped -> overflow path is `!path_cond`; live path is `path_cond`.
-            (Ok(t), Err(ExecError::Trapped)) => {
-                self.precondition.push(path_cond);
-                Ok(t)
-            }
-            (Err(ExecError::Trapped), Err(ExecError::Trapped)) => Err(ExecError::Trapped),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
+/// Unknown (including the finite solver deadline) is never an infeasibility
+/// certificate. This is a test oracle, not a kernel-certified proof artifact.
+fn path_is_feasible(path: &Formula) -> Result<bool, ExecError> {
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(30));
+    let mut solver = Solver::try_new_with_config(Logic::QfAbv, config)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility solver: {e:?}")))?;
+    let condition = formula_to_term(&mut solver, path);
+    solver
+        .try_assert_term(condition)
+        .map_err(|e| ExecError::Unsupported(format!("feasibility assertion: {e:?}")))?;
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(false)
+    } else if result.is_sat() {
+        Ok(true)
+    } else {
+        Err(ExecError::Unsupported(format!("unknown branch feasibility: {result:?}")))
     }
 }
 
@@ -392,18 +452,49 @@ fn const_addr(f: &Formula) -> Option<u64> {
 }
 
 /// Returns (machine_out_on_no_overflow_path, no_overflow_precondition).
+///
+/// Bind the source precondition to the ORIGINAL argument registers before any
+/// emitted instruction executes; decoded branches cannot redefine this domain.
 fn symbolic_machine_output(code: &[u8], base: u64) -> Result<(Formula, Formula), ExecError> {
-    let mut exec = Executor::new(code, base);
     let state = MachineState::symbolic();
-    let out = exec.run(base, state, Vec::new(), 0)?;
-    let pre = if exec.precondition.is_empty() {
-        Formula::Bool(true)
-    } else if exec.precondition.len() == 1 {
-        exec.precondition.pop().unwrap()
-    } else {
-        Formula::And(exec.precondition.clone())
-    };
+    let pre = no_signed_i32_add_overflow(state.read_gpr(0, 32), state.read_gpr(1, 32));
+    if !path_is_feasible(&pre)? {
+        return Err(ExecError::Unsupported("empty input domain".into()));
+    }
+    let out = Executor::new(code, base).run(base, state, Vec::new(), 0, pre.clone())?;
     Ok((out, pre))
+}
+
+/// Symbolic replay over the UNCONSTRAINED input domain (path condition `true`).
+/// Used only as a control: the overflow arm is then feasible, so the replay
+/// must reach the BRK refusal rather than return a value.
+fn unconstrained_symbolic_run(code: &[u8], base: u64) -> Result<Formula, ExecError> {
+    let state = MachineState::symbolic();
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
+}
+
+/// Concrete replay: the argument registers hold constants, so every branch
+/// condition is concrete and feasibility under those inputs prunes the
+/// untaken side. Concrete inputs are NOT restricted to non-overflowing
+/// arguments: an actual overflow must reach the unchanged BRK refusal.
+fn concrete_run(code: &[u8], base: u64, a: i32, b: i32) -> Result<Formula, ExecError> {
+    let mut state = MachineState::symbolic();
+    state.gpr[0] = Formula::BitVec { value: i128::from(a) & 0xffff_ffff, width: 64 };
+    state.gpr[1] = Formula::BitVec { value: i128::from(b) & 0xffff_ffff, width: 64 };
+    Executor::new(code, base).run(base, state, Vec::new(), 0, Formula::Bool(true))
+}
+
+fn concrete_equals(out: &Formula, expected: i32) -> bool {
+    let mut solver = Solver::try_new(Logic::QfAbv).expect("ay Solver::try_new");
+    let lhs = formula_to_term(&mut solver, out);
+    let rhs = formula_to_term(
+        &mut solver,
+        &Formula::BitVec { value: i128::from(expected) & 0xffff_ffff, width: 32 },
+    );
+    let eq = solver.try_eq(lhs, rhs).expect("eq");
+    let differ = solver.try_not(eq).expect("not");
+    solver.try_assert_term(differ).expect("assert");
+    solver.check_sat().is_unsat()
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +621,29 @@ fn bv32(value: i128) -> Formula {
     Formula::BitVec { value, width: 32 }
 }
 
+/// The independent source-level domain of `checked_add`: the exact signed i32
+/// addition fits iff its exact signed i64 sum lies in [i32::MIN, i32::MAX].
+/// Two sign-extended i32 values cannot overflow i64.
+fn no_signed_i32_add_overflow(a: Formula, b: Formula) -> Formula {
+    let sum = Formula::BvAdd(
+        Box::new(Formula::BvSignExt(Box::new(a), 32)),
+        Box::new(Formula::BvSignExt(Box::new(b), 32)),
+        64,
+    );
+    Formula::And(vec![
+        Formula::BvSLe(
+            Box::new(Formula::BitVec { value: i128::from(i32::MIN), width: 64 }),
+            Box::new(sum.clone()),
+            64,
+        ),
+        Formula::BvSLe(
+            Box::new(sum),
+            Box::new(Formula::BitVec { value: i128::from(i32::MAX), width: 64 }),
+            64,
+        ),
+    ])
+}
+
 /// a + b spec (32-bit wrapping add — the checked-add value result).
 fn add_spec() -> Formula {
     Formula::BvAdd(Box::new(wn(0)), Box::new(wn(1)), 32)
@@ -591,6 +705,18 @@ fn checked_add_emits_object_with_conditional_branch() {
         has_conditional_branch(&code, base),
         "expected a conditional branch in the emitted checked_add bytes (overflow check lowered)"
     );
+    // The lowered `Trap` must survive into the bytes as exactly one BRK, and
+    // the function must carry no call edge (the trap is no longer `call abort`).
+    assert_eq!(
+        count_opcode(&code, base, &[Opcode::Brk]),
+        1,
+        "emitted checked_add bytes must retain the overflow-trap BRK"
+    );
+    assert_eq!(
+        count_opcode(&code, base, &[Opcode::Bl, Opcode::Blr]),
+        0,
+        "emitted checked_add bytes must carry no call edge"
+    );
 }
 
 // ===========================================================================
@@ -608,8 +734,8 @@ fn module_interpreter_checked_add_is_correct() {
 }
 
 // ===========================================================================
-// TEST 3 — PROVEN OUTPUT (infinite domain): on the no-overflow path the emitted
-// bytes compute `a + b` for ALL inputs.
+// TEST 3 — PROVEN OUTPUT (full symbolic input domain): on the no-overflow path
+// the emitted bytes compute `a + b` for ALL inputs.
 // ===========================================================================
 
 #[test]
@@ -625,12 +751,17 @@ fn checked_add_bytes_compute_a_plus_b_on_no_overflow_path() {
     let (machine_out, precondition) = symbolic_machine_output(&code, base)
         .expect("path-merge of the checked_add bytes failed (loop/unsupported/budget)");
 
-    // The proof MUST be conditioned on a real no-overflow precondition — a
-    // vacuously-true precondition would mean the overflow trap was never
-    // explored (the check was dropped). We assert it is non-trivial.
+    // The proof MUST be conditioned on a real no-overflow precondition. Its
+    // premise changed with the retired `call abort` trap block: the
+    // precondition is no longer read off the emitted trap arm, it is the
+    // explicit independent source domain, so this asserts that domain is
+    // present. That the overflow check was lowered (not dropped) and that the
+    // trap stays reachable outside the domain is now checked directly by
+    // `feasible_overflow_still_reaches_the_brk_refusal`; the domain's exact
+    // boundaries and its immunity to a corrupted guard are checked below too.
     assert!(
         !matches!(precondition, Formula::Bool(true)),
-        "expected a non-trivial no-overflow precondition; got `true` (overflow trap not explored)"
+        "expected the explicit independent source no-overflow domain; got `true`"
     );
 
     let spec = add_spec();
@@ -664,4 +795,95 @@ fn negative_control_checked_add_vs_a_plus_b_plus_1_is_sat() {
         "VACUITY CHECK FAILED: the checked_add bytes were 'proven' equal to a+b+1; \
          the overflow discharge has no teeth.\n  machine_out = {machine_out:?}"
     );
+}
+
+// ===========================================================================
+// TEST 5 — REFUSAL CONTROLS: pruning may only drop a PROVABLY infeasible arm.
+// A reachable BRK must still hit the exact, unchanged Semantics refusal — the
+// executor never maps BRK to a trap outcome — and a call is not a trap.
+// ===========================================================================
+
+fn assert_brk_refused(result: Result<Formula, ExecError>) {
+    assert!(
+        matches!(result, Err(ExecError::Decode(ref message))
+        if message.contains("effects Brk")
+        && message.contains("aarch64-brk-debug-trap-not-proof-consumed")),
+        "reachable BRK must remain the exact semantics refusal: {result:?}"
+    );
+}
+
+#[test]
+fn feasible_overflow_still_reaches_the_brk_refusal() {
+    let (code, base) = emit_text(&make_checked_add_module());
+
+    // Paired positives: concrete non-overflow inputs (including the exact
+    // signed boundaries) prune the trap side and return the checked sum.
+    for (a, b) in [(2, 3), (-1, 1), (i32::MAX, 0), (i32::MIN, 0), (i32::MAX, i32::MIN)] {
+        let out = concrete_run(&code, base, a, b)
+            .unwrap_or_else(|e| panic!("concrete non-overflow run {a} + {b} must return: {e:?}"));
+        assert!(concrete_equals(&out, a + b), "concrete {a} + {b}: {out:?}");
+    }
+
+    // A feasible overflow, concrete or over the unconstrained symbolic domain,
+    // must reach the BRK and be refused, never pruned or returned.
+    assert_brk_refused(concrete_run(&code, base, i32::MAX, 1));
+    assert_brk_refused(concrete_run(&code, base, i32::MIN, -1));
+    assert_brk_refused(concrete_run(&code, base, i32::MIN, i32::MIN));
+    assert_brk_refused(unconstrained_symbolic_run(&code, base));
+    // A BRK on the entry path (no branch to prune) is refused as well.
+    assert_brk_refused(concrete_run(&0xd4200020u32.to_le_bytes(), 0, 2, 3));
+}
+
+#[test]
+fn arbitrary_call_is_not_treated_as_a_trap() {
+    let result = concrete_run(&0x94000000u32.to_le_bytes(), 0, 2, 3);
+    assert!(
+        matches!(result, Err(ExecError::Unsupported(ref message))
+        if message.starts_with("call at ")),
+        "a call is not a proved diverging branch: {result:?}"
+    );
+}
+
+// ===========================================================================
+// TEST 6 — DOMAIN CONTROLS: the independent source domain has exact signed
+// boundaries, and an inverted overflow branch in the bytes cannot silently
+// shrink the admitted input domain (it exposes the BRK instead).
+// ===========================================================================
+
+#[test]
+fn independent_no_overflow_domain_has_exact_signed_boundaries() {
+    for (a, b, fits) in [
+        (i32::MIN, 0, true),
+        (i32::MIN, -1, false),
+        (i32::MAX, 0, true),
+        (i32::MAX, 1, false),
+        (i32::MAX, i32::MIN, true),
+        (i32::MIN, i32::MIN, false),
+        (-1, 1, true),
+        (-5, -7, true),
+    ] {
+        let predicate = no_signed_i32_add_overflow(bv32(i128::from(a)), bv32(i128::from(b)));
+        assert_eq!(path_is_feasible(&predicate).unwrap(), fits, "domain for {a} + {b}");
+    }
+}
+
+#[test]
+fn corrupted_overflow_guard_cannot_shrink_the_input_domain() {
+    let (mut code, base) = emit_text(&make_checked_add_module());
+    let branches: Vec<_> = code
+        .chunks_exact(4)
+        .enumerate()
+        .filter_map(|(index, bytes)| {
+            let bytes: [u8; 4] = bytes.try_into().unwrap();
+            (decode_aarch64(&bytes, base + (index * 4) as u64).unwrap().opcode == Opcode::BCond)
+                .then_some(index * 4)
+        })
+        .collect();
+    assert_eq!(branches.len(), 1, "fixture must have one actual overflow branch");
+    let offset = branches[0];
+    // Flip the condition's low bit: the branch polarity inverts (e.g. VS <-> VC).
+    let word = u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()) ^ 1;
+    code[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+    assert_brk_refused(concrete_run(&code, base, 2, 3));
+    assert_brk_refused(symbolic_machine_output(&code, base).map(|(out, _)| out));
 }

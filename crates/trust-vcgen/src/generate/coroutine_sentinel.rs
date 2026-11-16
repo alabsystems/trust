@@ -36,9 +36,7 @@ use trust_types::{
     VerifiableFunction, VerificationCondition,
 };
 
-use super::StmtVersionCtx;
-use super::path_defs::version_rename_at;
-use super::safety::{v2_build_path_guard_map, v2_formula_with_path_guards};
+use super::safety::v2_formula_with_path_guards;
 use super::semantic_guard::func_exceeds_vcgen_budget;
 use crate::guards;
 
@@ -146,6 +144,20 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
         return Vec::new();
     }
 
+    // Sentinel blocks that are DIRECT targets of the recognized entry dispatch
+    // (see the direct-successor rationale on this function's doc comment).
+    let entry_arm_targets: FxHashSet<BlockId> = targets.iter().map(|(_, target)| *target).collect();
+    if !func.body.blocks.iter().any(|block| {
+        entry_arm_targets.contains(&block.id)
+            && matches!(
+                &block.terminator,
+                Terminator::Assert { cond: Operand::Constant(ConstValue::Bool(false)), expected: true, msg, .. }
+                    if coroutine_sentinel_message_text(msg).is_some()
+            )
+    }) {
+        return Vec::new();
+    }
+
     let sv = super::stmt_versions_for(func);
     let guard_paths_map = super::guard_map_for(func);
 
@@ -166,7 +178,7 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
                 func,
                 &GuardCondition::SwitchIntMatch { discr: discr.clone(), value: *state },
             );
-            version_rename_at(&guard, &sv, func, entry.id, entry_terminal)
+            super::path_defs::version_rename_owned_at(guard, &sv, func, entry.id, entry_terminal)
         })
         .collect();
     let precondition = match live_terms.len() {
@@ -185,10 +197,11 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
     // and could be picked to satisfy the formula — a false refutation of a
     // well-formed async body.
     let constrained: FxHashSet<String> = precondition.free_variables().into_iter().collect();
-    // Sentinel blocks that are DIRECT targets of the recognized entry dispatch
-    // (see the direct-successor rationale on this function's doc comment).
-    let entry_arm_targets: FxHashSet<BlockId> = targets.iter().map(|(_, target)| *target).collect();
+    if constrained.is_empty() {
+        return Vec::new();
+    }
 
+    let fn_sym: trust_types::Symbol = func.name.as_str().into();
     let mut out = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Assert { cond, expected, msg, span, .. } = &block.terminator else {
@@ -223,13 +236,18 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
         {
             continue;
         }
-        let feasibility = v2_formula_with_path_guards(func, &sv, paths, Formula::Bool(true));
-        let free = feasibility.free_variables();
+        let feasibility =
+            v2_formula_with_path_guards(func, &sv, block.id, paths, Formula::Bool(true));
         // The feasibility must MENTION the selector and NOTHING ELSE: a formula
         // with no free variable carries no reachability condition at all (same
         // trivially-SAT hazard as above), and a stray free variable is
         // UNCONSTRAINED here. Both decline.
-        if free.is_empty() || !free.iter().all(|v| constrained.contains(v)) {
+        let mut any_free = false;
+        let all_constrained = trust_types::all_free_variable_names(&feasibility, &mut |v| {
+            any_free = true;
+            constrained.contains(v)
+        });
+        if !any_free || !all_constrained {
             continue;
         }
         out.push(VerificationCondition {
@@ -239,7 +257,7 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
                     sentinel,
                 ),
             },
-            function: func.name.clone().into(),
+            function: fn_sym,
             location: span.clone(),
             formula: Formula::And(vec![precondition.clone(), feasibility]),
             contract_metadata: None,

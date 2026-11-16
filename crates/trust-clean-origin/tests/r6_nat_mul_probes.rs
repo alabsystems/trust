@@ -168,6 +168,8 @@ const GCD_MOD: &str = "def gcd (a b : Nat) : Nat := \
                        termination_by b";
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts and the elaborated \
+            spine, asserts none; run with --ignored --nocapture"]
 fn probe_q1_ratified_gcd() {
     row("q1 gcd%", "gcd", GCD_MOD);
     spine("q1 gcd%", "gcd", GCD_MOD, 9);
@@ -178,6 +180,7 @@ fn probe_q1_ratified_gcd() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts, asserts none; run with --ignored --nocapture"]
 fn probe_q2_subtractive_gcd_measures() {
     // The textbook two-branch subtractive Euclid. Only `a + b` decreases in
     // both branches.
@@ -232,6 +235,8 @@ const SUM_TO: &str = "def sumTo (a b : Nat) : Nat := \
                       termination_by a";
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts and the elaborated \
+            spine, asserts none; run with --ignored --nocapture"]
 fn probe_q3_two_parameter_threaded() {
     row("q3 mulAdd", "mulAdd", MUL_ADD);
     row("q3 mulAdd2", "mulAdd2", MUL_ADD2);
@@ -249,6 +254,8 @@ const COUNTDOWN_SUM: &str = "def countdownSum (n : Nat) : Nat := \
                              termination_by n";
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts and the elaborated \
+            spine, asserts none; run with --ignored --nocapture"]
 fn probe_q4_single_parameter_baseline() {
     row("q4 cds", "countdownSum", COUNTDOWN_SUM);
     spine("q4 cds", "countdownSum", COUNTDOWN_SUM, 10);
@@ -328,6 +335,10 @@ fn probe_q7_kernel_identifies_the_two_multiplication_spellings() {
 /// The full refusal texts, so the v7/D3 question ("does it carry the fix?")
 /// is answered from the compiler's own output rather than from prose.
 #[test]
+#[ignore = "measurement instrument: prints the call lane's refusal notes; its only checks are \
+            elaboration expects, pinned elsewhere (control_17 (g) asserts mulAdd's source, as \
+            `scale`, elaborates and its note's content; probe_q6 asserts fact; \
+            gcd_formulation_probes p2 asserts gcd); run with --ignored --nocapture"]
 fn probe_q8_refusal_texts() {
     for (name, source) in [("gcd", GCD_MOD), ("mulAdd", MUL_ADD), ("fact", FACT)] {
         let env = island(source).expect("elaborates");
@@ -338,6 +349,7 @@ fn probe_q8_refusal_texts() {
 }
 
 #[test]
+#[ignore = "measurement instrument: prints the island and call-lane verdicts, asserts none; run with --ignored --nocapture"]
 fn probe_q5_p8_fixture_reason() {
     // `r2_session_probes` p8 asserts this is rejected and attributes the
     // rejection to "multi-parameter well-founded recursion is refused in
@@ -415,6 +427,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> Termi
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -532,6 +545,7 @@ fn emitted_factorial() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -606,8 +620,13 @@ fn probe_q9b_factorial_mutations_refuse() {
         ),
         ..factorial_recognised()
     };
-    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(&env, "fact", &wrong_reading, trust_clean_origin::WfLowering::OnParameter)
-        .expect("the frozen producer renders whatever reading it is given");
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        &env,
+        "fact",
+        &wrong_reading,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .expect("the frozen producer renders whatever reading it is given");
     let gate = trust_clean_origin::gate::check_faithful_wf_functional(
         &env,
         "fact",
@@ -631,9 +650,13 @@ fn probe_q9b_factorial_mutations_refuse() {
         ),
         ..factorial_recognised()
     };
-    let reflected =
-        trust_clean_origin::reflect_wf::reflect_wf_functional(&env, "fact", &swapped, trust_clean_origin::WfLowering::OnParameter)
-            .expect("renders");
+    let reflected = trust_clean_origin::reflect_wf::reflect_wf_functional(
+        &env,
+        "fact",
+        &swapped,
+        trust_clean_origin::WfLowering::OnParameter,
+    )
+    .expect("renders");
     let swapped_gate = trust_clean_origin::gate::check_faithful_wf_functional(
         &env,
         "fact",

@@ -1,0 +1,2289 @@
+{
+  "name": "diamonds_7",
+  "def_path": "neg128_guard_shapes_safe::diamonds_7",
+  "span": {
+    "file": "neg128_guard_shapes_safe.rs",
+    "line_start": 4,
+    "col_start": 0,
+    "line_end": 18,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 128,
+                "signed": true
+              }
+            },
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": "a"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": "c0"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": "c1"
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": "c2"
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": "c3"
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": "c4"
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": "c5"
+      },
+      {
+        "index": 8,
+        "ty": "Bool",
+        "name": "c6"
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "z"
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      0,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 5,
+                "col_start": 20,
+                "line_end": 5,
+                "col_end": 21
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -170141183460469231731687303715884105727
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 6,
+                "col_start": 7,
+                "line_end": 6,
+                "col_end": 56
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                36
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 6,
+              "col_start": 7,
+              "line_end": 6,
+              "col_end": 56
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 7,
+              "col_start": 11,
+              "line_end": 7,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      1,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 7,
+                "col_start": 16,
+                "line_end": 7,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      100,
+                      8
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 7,
+                "col_start": 32,
+                "line_end": 7,
+                "col_end": 39
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 4
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 8,
+              "col_start": 11,
+              "line_end": 8,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 8,
+                "col_start": 20,
+                "line_end": 8,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 12,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 8,
+              "col_start": 20,
+              "line_end": 8,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 11,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 8,
+                "col_start": 16,
+                "line_end": 8,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 8,
+                "col_start": 52,
+                "line_end": 8,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 8,
+              "col_start": 52,
+              "line_end": 8,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 8,
+                "col_start": 48,
+                "line_end": 8,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ]
+            ],
+            "otherwise": 10,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 9,
+              "col_start": 11,
+              "line_end": 9,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 9,
+                "col_start": 20,
+                "line_end": 9,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 16,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 15,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 9,
+              "col_start": 20,
+              "line_end": 9,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 15,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 9,
+                "col_start": 16,
+                "line_end": 9,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 9,
+                "col_start": 52,
+                "line_end": 9,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 18,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 17,
+              "projections": []
+            },
+            "target": 13,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 9,
+              "col_start": 52,
+              "line_end": 9,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 17,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 9,
+                "col_start": 48,
+                "line_end": 9,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 14
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                17
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 10,
+              "col_start": 11,
+              "line_end": 10,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 10,
+                "col_start": 20,
+                "line_end": 10,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 19,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 10,
+              "col_start": 20,
+              "line_end": 10,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 19,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 10,
+                "col_start": 16,
+                "line_end": 10,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 10,
+                "col_start": 52,
+                "line_end": 10,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 22,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 21,
+              "projections": []
+            },
+            "target": 18,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 10,
+              "col_start": 52,
+              "line_end": 10,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 21,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 10,
+                "col_start": 48,
+                "line_end": 10,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                22
+              ]
+            ],
+            "otherwise": 20,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 11,
+              "col_start": 11,
+              "line_end": 11,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 11,
+                "col_start": 20,
+                "line_end": 11,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 24,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 23,
+              "projections": []
+            },
+            "target": 21,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 11,
+              "col_start": 20,
+              "line_end": 11,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 23,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 11,
+                "col_start": 16,
+                "line_end": 11,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 24
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 11,
+                "col_start": 52,
+                "line_end": 11,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 26,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 25,
+              "projections": []
+            },
+            "target": 23,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 11,
+              "col_start": 52,
+              "line_end": 11,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 25,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 11,
+                "col_start": 48,
+                "line_end": 11,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 24
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                27
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 12,
+              "col_start": 11,
+              "line_end": 12,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 12,
+                "col_start": 20,
+                "line_end": 12,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 28,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 27,
+              "projections": []
+            },
+            "target": 26,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 12,
+              "col_start": 20,
+              "line_end": 12,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 27,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 12,
+                "col_start": 16,
+                "line_end": 12,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 12,
+                "col_start": 52,
+                "line_end": 12,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 30,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 29,
+              "projections": []
+            },
+            "target": 28,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 12,
+              "col_start": 52,
+              "line_end": 12,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 29,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 12,
+                "col_start": 48,
+                "line_end": 12,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 29,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                32
+              ]
+            ],
+            "otherwise": 30,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 13,
+              "col_start": 11,
+              "line_end": 13,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 30,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 13,
+                "col_start": 20,
+                "line_end": 13,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 32,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    1,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 31,
+              "projections": []
+            },
+            "target": 31,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 13,
+              "col_start": 20,
+              "line_end": 13,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 31,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 31,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 13,
+                "col_start": 16,
+                "line_end": 13,
+                "col_end": 37
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 34
+        }
+      },
+      {
+        "id": 32,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 13,
+                "col_start": 52,
+                "line_end": 13,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add",
+            "args": [
+              {
+                "Move": {
+                  "local": 34,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    8
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 33,
+              "projections": []
+            },
+            "target": 33,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 13,
+              "col_start": 52,
+              "line_end": 13,
+              "col_end": 69
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11826276976595914441,
+              "def_index": 27309,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11826276976595914441,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 33,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 33,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 69
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 34
+        }
+      },
+      {
+        "id": 34,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -170141183460469231731687303715884105728
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 14,
+                "col_start": 9,
+                "line_end": 14,
+                "col_end": 11
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 36,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "OverflowNeg",
+            "target": 35,
+            "span": {
+              "file": "neg128_guard_shapes_safe.rs",
+              "line_start": 14,
+              "col_start": 9,
+              "line_end": 14,
+              "col_end": 11
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 35,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Neg",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 14,
+                "col_start": 9,
+                "line_end": 14,
+                "col_end": 11
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 37,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 14,
+                "col_start": 13,
+                "line_end": 14,
+                "col_end": 14
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Move": {
+                        "local": 35,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 37,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 14,
+                "col_start": 8,
+                "line_end": 14,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 37
+        }
+      },
+      {
+        "id": 36,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 16,
+                "col_start": 12,
+                "line_end": 16,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Constant": {
+                        "Int": 0
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 38,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "neg128_guard_shapes_safe.rs",
+                "line_start": 16,
+                "col_start": 8,
+                "line_end": 16,
+                "col_end": 14
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 37
+        }
+      },
+      {
+        "id": 37,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 8,
+    "return_ty": {
+      "Tuple": [
+        {
+          "Int": {
+            "width": 128,
+            "signed": true
+          }
+        },
+        {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        }
+      ]
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -34,10 +34,11 @@
 use std::collections::hash_map::Entry;
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_middle::bug;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
 };
+use rustc_span::bug;
+use rustc_type_ir::PredicateProxy;
 
 use super::InferCtxt;
 
@@ -133,6 +134,16 @@ impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for TypeFreshener<'a, 'tcx> {
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        if !ct.has_infer()
+            && !ct.has_erasable_regions()
+            && !ct.has_type_flags(
+                ty::TypeFlags::HAS_CT_FRESH
+                    | ty::TypeFlags::HAS_CT_BOUND
+                    | ty::TypeFlags::HAS_CT_PLACEHOLDER,
+            )
+        {
+            return ct;
+        }
         match ct.kind() {
             ty::ConstKind::Infer(ty::InferConst::Var(v)) => {
                 let mut inner = self.infcx.inner.borrow_mut();
@@ -161,6 +172,30 @@ impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for TypeFreshener<'a, 'tcx> {
             | ty::ConstKind::Alias(..)
             | ty::ConstKind::Expr(..)
             | ty::ConstKind::Error(_) => ct.super_fold_with(self),
+        }
+    }
+
+    fn fold_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(&mut self, p: P) -> P {
+        if !p.has_infer() && !p.has_erasable_regions() {
+            #[cfg(debug_assertions)]
+            if p.has_escaping_bound_vars() || p.has_placeholders() {
+                return p.super_fold_with(self);
+            }
+            p
+        } else {
+            p.super_fold_with(self)
+        }
+    }
+
+    fn fold_clauses(&mut self, c: ty::Clauses<'tcx>) -> ty::Clauses<'tcx> {
+        if !c.has_infer() && !c.has_erasable_regions() {
+            #[cfg(debug_assertions)]
+            if c.has_escaping_bound_vars() || c.has_placeholders() {
+                return c.super_fold_with(self);
+            }
+            c
+        } else {
+            c.super_fold_with(self)
         }
     }
 }

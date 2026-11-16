@@ -1,27 +1,28 @@
 //! WHOLE-ENVIRONMENT AXIOM CENSUS — closes the "silent admission slot" gap.
 //!
 //! The per-declaration modulo-3 gates (`env.axiom_deps(&name)` residue empty) are the
-//! PRIMARY enforcement, but `axiom_deps` FILTERS every name the kernel classifies as
-//! foundational (`clean_kernel::env::is_foundational_axiom` — a whitelist that is wider
-//! than the 3 foundational axioms: it also contains kernel primitives like the `Quot`
-//! quartet / `WellFounded.fix` AND historically-dead entries such as `proofIrrel` /
-//! `Eq.refl` / `Char.decEq` / `String.decEq` that are no longer axioms). So a 4th axiom
-//! REGISTERED UNDER A WHITELISTED NAME is INVISIBLE to every residue check — a proof
-//! referencing it still reports an EMPTY residue and would certify "modulo 3". The
-//! `smuggled_dead_whitelist_name_is_invisible_to_residue_but_caught_by_census` control
-//! below DEMONSTRATES that hole is real, and this census is the instrument that closes
-//! it.
+//! PRIMARY enforcement. Historically `axiom_deps` filtered a broad foundational-name
+//! whitelist that included dead entries such as `proofIrrel`; a user axiom under one
+//! of those names disappeared from the residue, and this census caught it. Since
+//! Clean e20128880 (train T6), the kernel removed the dead names `proofIrrel`,
+//! `Eq.refl`, `WellFounded.fix`, `Char.decEq`, and `String.decEq` from its foundational
+//! whitelist. `axiom_deps` filters only a kernel-canonical foundational declaration
+//! (`is_canonical_foundational_constant`), so even a user axiom under a still-listed
+//! name reaches the residue. Name classification alone is not that canonical check. The
+//! `smuggled_dead_whitelist_name_reaches_residue_and_census` control now asserts that
+//! a user `Axiom proofIrrel` reaches the PRIMARY residue gate AND increments this
+//! census's visible-domain count. It is not a hidden offender or an axiom-free proof.
 //!
 //! The census iterates every constant in an `Environment` and splits the
 //! `ConstantKind::Axiom` population in two:
 //!
 //! * **Hidden slots (HARD FAIL unless allowed):** axiom-kind constants the kernel
-//!   classifies as foundational. These are exactly the residue-invisible names. The ONLY
+//!   classifies as foundational by name. A name alone is not the kernel's canonical
+//!   declaration check and therefore does not establish residue invisibility. The ONLY
 //!   allowed ones are the 3 foundational axioms `{propext, Quot.sound, Classical.choice}`
 //!   (the scoring gate — `axioms::FOUNDATIONAL_AXIOMS`), the 4 `Quot` kernel primitives
-//!   `{Quot, Quot.mk, Quot.ind, Quot.lift}`, and `WellFounded.fix` (both named "kernel
-//!   primitives", TCB item 1 in `docs/TRUST-BASE-AND-SCOPE.md`). Anything else here is a
-//!   modulo-3-invisible 4th trust root: TRIAGE, DON'T SUPPRESS.
+//!   `{Quot, Quot.mk, Quot.ind, Quot.lift}` (kernel primitives, TCB item 1 in
+//!   `docs/TRUST-BASE-AND-SCOPE.md`). Anything else here requires triage, not suppression.
 //! * **Visible domain axioms (reported, inert):** axiom-kind constants the kernel does
 //!   NOT classify as foundational (`sorryAx`, `trustedAy`/`trustedArith`, the mathverse
 //!   `SetTheory.*` surface, monad/algebra stubs, …). The prelude ships HUNDREDS of these.
@@ -41,8 +42,8 @@
 //! and the WITNESS declaration each verdict cites passes the
 //! `axiom_deps`-residue-empty gate before anything is `ProvenModulo3` (intermediate
 //! registrations are covered by the no-`Declaration::Axiom` discipline + this
-//! census, not by per-decl residue gates). The census closes the remaining slot: a
-//! whitelisted-NAME axiom the residue gate cannot see.
+//! census, not by per-decl residue gates). The census independently inventories the
+//! axiom population, including a formerly whitelisted name now exposed by the residue.
 
 use clean_kernel::env::{ConstantKind, Environment, is_foundational_axiom};
 
@@ -216,25 +217,32 @@ mod tests {
         );
     }
 
-    /// THE DISCRIMINATING CONTROL — the hole the census exists to close is REAL: an
-    /// axiom registered under a DEAD kernel-whitelist name (`proofIrrel` — no longer a
-    /// real axiom in Clean, but still on the foundational whitelist) is INVISIBLE to the
-    /// residue gate (a theorem proved BY it reports an EMPTY residue — it would certify
-    /// "modulo 3"), while the census CATCHES it. Both halves are asserted.
+    /// CLOSED-HOLE CONTROL: a user axiom under the former dead-whitelist name
+    /// `proofIrrel` is now visible to BOTH the per-declaration residue and the census's
+    /// visible-domain count. The residue prevents certification; no hidden-slot
+    /// exemption or whole-environment axiom-free claim is inferred from that count.
+    /// The explicit name-classification assertion also detects a regression that puts
+    /// this dead name back on the whitelist, independently of the residue assertion.
     #[test]
-    fn smuggled_dead_whitelist_name_is_invisible_to_residue_but_caught_by_census() {
+    fn smuggled_dead_whitelist_name_reaches_residue_and_census() {
         let mut env = crate::trustir_anchor::trustir_env().expect("trustir_env");
+        let baseline = env_axiom_census(&env);
         assert!(
             env.get_const(&Name::from_string("proofIrrel")).is_none(),
             "precondition: the pipeline env does not register `proofIrrel` — if this \
              changes, re-derive this control with another dead whitelist name",
+        );
+        assert!(
+            !is_foundational_axiom(&Name::from_string("proofIrrel")),
+            "the kernel's foundational whitelist must not name `proofIrrel`: a name that is \
+             not a kernel axiom must remain outside the foundational-name classification",
         );
         env.add_decl(Declaration::Axiom {
             name: Name::from_string("proofIrrel"),
             level_params: vec![],
             type_: zero_le_one(),
         })
-        .expect("registering an axiom under a whitelisted name is legal — that is the hole");
+        .expect("register a user axiom under the formerly whitelisted name");
         // A theorem "proved" by the smuggled axiom.
         let thm = Name::from_string("Trust.Census.launderedViaWhitelist");
         env.add_decl(Declaration::Theorem {
@@ -244,20 +252,18 @@ mod tests {
             value: Expr::const_(Name::from_string("proofIrrel"), vec![]),
         })
         .expect("the theorem type-checks — the axiom provides its type");
-        // (1) The residue gate CANNOT see it: empty residue despite the 4th axiom.
+        // (1) The PRIMARY residue gate names exactly the smuggled axiom.
         let residue = env.axiom_deps(&thm).expect("axiom closure computes");
-        assert!(
-            residue.is_empty(),
-            "expected the whitelist hole (empty residue) — if the kernel now surfaces \
-             dead-whitelist axioms, the census is belt-and-suspenders (got {residue:?})",
-        );
-        // (2) The census DOES see it.
-        let census = env_axiom_census(&env);
         assert_eq!(
-            census.hidden_offenders,
-            vec!["proofIrrel".to_string()],
-            "the census must catch the whitelisted-name smuggled axiom",
+            residue.into_iter().collect::<Vec<_>>(),
+            vec![Name::from_string("proofIrrel")],
+            "the former dead-whitelist axiom must not disappear from the proof closure",
         );
+        // (2) The census counts it as visible, not as a hidden offender.
+        let census = env_axiom_census(&env);
+        assert_eq!(census.visible_domain, baseline.visible_domain + 1);
+        assert_eq!(census.hidden_allowed, baseline.hidden_allowed);
+        assert_eq!(census.hidden_offenders, baseline.hidden_offenders);
     }
 
     /// NEGATIVE CONTROL (residue): a FRESH-name 4th axiom is caught by the PRIMARY

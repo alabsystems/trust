@@ -96,11 +96,6 @@ fn retained_formula_families_route_to_compatible_backends() {
                 family: FormulaFamily::Ffi,
             }),
             Box::new(CompatBackend {
-                name: "race-gate",
-                role: BackendRole::Temporal,
-                family: FormulaFamily::DataRace,
-            }),
-            Box::new(CompatBackend {
                 name: "protocol-gate",
                 role: BackendRole::Temporal,
                 family: FormulaFamily::TypestateProtocol,
@@ -144,6 +139,67 @@ fn retained_formula_families_fail_closed_without_compatible_backend() {
             case.label
         );
     }
+}
+
+/// Standing ruling v6/D2 (CLAUDE.md): the concurrency obligations are labels,
+/// not claims, so `VcKind::DataRace` is routed to NO engine until it carries a
+/// real model. The router enacts that before dispatch (`backend_trait.rs`, the
+/// `VcKind::DataRace` arm, landed in 3dc5327fd7).
+///
+/// This file used to list data race among the families that ROUTE to a
+/// compatible backend, which pinned the opposite of the ruling and sat red in
+/// `tests/known-red/crates-tests.txt` under an owner branch that did not exist.
+/// The lib suite's `legacy_data_race_is_unknown_with_constant_folder` pins the
+/// refusal against a backend that merely happens to accept the formula. This
+/// pins the stronger thing: a backend BUILT for the data-race family, which says
+/// yes to this exact VC and would answer `Proved`, is still never asked. If
+/// anyone routes DataRace, `verify_one` comes back `Proved` from `race-gate` and
+/// this fails — which is the point, because that change needs its own recorded decision.
+#[test]
+fn data_race_is_never_dispatched_even_to_a_willing_backend() {
+    let vc = vc(
+        VcKind::DataRace {
+            variable: "shared_counter".to_string(),
+            thread_a: "worker_a".to_string(),
+            thread_b: "worker_b".to_string(),
+        },
+        "data_race_gate",
+        Formula::And(vec![
+            Formula::Var("write_worker_a".to_string(), Sort::Bool),
+            Formula::Var("write_worker_b".to_string(), Sort::Bool),
+            Formula::Not(Box::new(Formula::Var(
+                "happens_before_worker_a_worker_b".to_string(),
+                Sort::Bool,
+            ))),
+        ]),
+    );
+    let race_gate = CompatBackend {
+        name: "race-gate",
+        role: BackendRole::Temporal,
+        family: FormulaFamily::DataRace,
+    };
+
+    // The refusal must be the ROUTER's, not the backend's: the family matcher
+    // recognises this VC and the backend accepts it outright.
+    assert_eq!(retained_formula_family(&vc), Some(FormulaFamily::DataRace));
+    assert!(race_gate.can_handle(&vc), "the backend must be willing, or this test is vacuous");
+
+    let router = Router::with_backends(vec![Box::new(race_gate)]);
+    assert!(
+        router.backend_plan(&vc).is_empty(),
+        "a DataRace VC must reach no backend's plan, even one that accepts it (v6/D2)"
+    );
+    let result = router.verify_one(&vc);
+    assert!(
+        matches!(
+            &result,
+            VerificationResult::Unknown { reason, .. }
+                if reason.contains("data-race VC unsupported")
+        ),
+        "a DataRace VC must fail closed before dispatch (v6/D2), got {result:?}"
+    );
+    assert!(!result.is_proved(), "a DataRace VC was discharged: {result:?}");
+    assert_ne!(result.solver_name(), "race-gate", "the willing backend was asked: {result:?}");
 }
 
 #[test]
@@ -213,28 +269,9 @@ fn compat_cases() -> Vec<CompatCase> {
                 ))),
             ),
         },
-        CompatCase {
-            label: "data race",
-            family: FormulaFamily::DataRace,
-            backend_name: "race-gate",
-            backend_role: BackendRole::Temporal,
-            vc: vc(
-                VcKind::DataRace {
-                    variable: "shared_counter".to_string(),
-                    thread_a: "worker_a".to_string(),
-                    thread_b: "worker_b".to_string(),
-                },
-                "data_race_gate",
-                Formula::And(vec![
-                    Formula::Var("write_worker_a".to_string(), Sort::Bool),
-                    Formula::Var("write_worker_b".to_string(), Sort::Bool),
-                    Formula::Not(Box::new(Formula::Var(
-                        "happens_before_worker_a_worker_b".to_string(),
-                        Sort::Bool,
-                    ))),
-                ]),
-            ),
-        },
+        // No data-race case: v6/D2 routes `VcKind::DataRace` to no engine, so it
+        // cannot appear among families that route. It is pinned the other way in
+        // `data_race_is_never_dispatched_even_to_a_willing_backend`.
         CompatCase {
             label: "typestate/protocol",
             family: FormulaFamily::TypestateProtocol,

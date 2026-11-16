@@ -199,7 +199,7 @@ pub fn formula_to_pure_expr(formula: &Formula) -> Option<PureExpr> {
         }
 
         // --- Array theory (unsupported initially) ---
-        Formula::Select(..) | Formula::Store(..) => None,
+        Formula::Select(..) | Formula::Store(..) | Formula::ConstArray { .. } => None,
 
         // Trust: Handle future #[non_exhaustive] variants gracefully
         _ => None,
@@ -239,24 +239,22 @@ pub fn has_bv_ops(formula: &Formula) -> bool {
     formula.has_bitvectors()
 }
 
-/// Cheap check: does this formula contain array theory operations (Select/Store)?
+/// Cheap check: does this formula contain array theory operations
+/// (Select/Store/ConstArray)?
 ///
 /// trust_wp has no array theory, so standalone compatibility conversion rejects
 /// formulas with array operations. This predicate does not route obligations.
 #[must_use]
 pub fn has_array_ops(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |f| {
-        if found {
-            return;
-        }
-        match f {
-            Formula::Select(..) | Formula::Store(..) => found = true,
-            Formula::Var(_, Sort::Array(_, _)) => found = true,
-            _ => {}
-        }
-    });
-    found
+    crate::any_formula_node(formula, &mut |f| {
+        matches!(
+            f,
+            Formula::Select(..)
+                | Formula::Store(..)
+                | Formula::ConstArray { .. }
+                | Formula::Var(_, Sort::Array(_, _))
+        )
+    })
 }
 
 #[cfg(test)]

@@ -1,0 +1,1317 @@
+{
+  "name": "ensure_num_vars",
+  "def_path": "prober_positive_witness::Prober::ensure_num_vars",
+  "span": {
+    "file": "prober_field_update.rs",
+    "line_start": 12,
+    "col_start": 4,
+    "line_end": 27,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "prober_positive_witness::Prober",
+                "fields": [
+                  [
+                    "num_vars",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "bin_occs",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 32,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "propfixed",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "uip_seen",
+                    {
+                      "Seq": {
+                        "elem": "Bool"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "num_vars"
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "num_lits"
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 32,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": "Bool"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": "Bool"
+              }
+            }
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 3
+          },
+          {
+            "StorageLive": 4
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 13,
+                "col_start": 11,
+                "line_end": 13,
+                "col_end": 24
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ge",
+                  {
+                    "Move": {
+                      "local": 4,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 13,
+                "col_start": 11,
+                "line_end": 13,
+                "col_end": 36
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 13,
+              "col_start": 11,
+              "line_end": 13,
+              "col_end": 36
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "StorageDead": 4
+          },
+          {
+            "StorageDead": 3
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": [
+                  "Deref",
+                  {
+                    "Field": 0
+                  }
+                ]
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 16,
+                "col_start": 8,
+                "line_end": 16,
+                "col_end": 32
+              }
+            }
+          },
+          {
+            "StorageLive": 5
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::num::<impl usize>::saturating_mul",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    2,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 5,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 17,
+              "col_start": 23,
+              "line_end": 17,
+              "col_end": 49
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 442258205944087112,
+              "def_index": 28198,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 18,
+                "col_start": 11,
+                "line_end": 18,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u32>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 8,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 7,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 18,
+              "col_start": 11,
+              "line_end": 18,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8821,
+              "substs_digest": [
+                17337453359995378133,
+                3808312788494999420
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "StorageDead": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 7,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 18,
+                "col_start": 11,
+                "line_end": 18,
+                "col_end": 41
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 18,
+              "col_start": 11,
+              "line_end": 18,
+              "col_end": 41
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageLive": 10
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 19,
+                "col_start": 12,
+                "line_end": 19,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u32>::resize::<__trust_elem_bytes@4>",
+            "args": [
+              {
+                "Move": {
+                  "local": 10,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Uint": [
+                    0,
+                    32
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 9,
+              "projections": []
+            },
+            "target": 6,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 19,
+              "col_start": 12,
+              "line_end": 19,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8851,
+              "substs_digest": [
+                17337453359995378133,
+                3808312788494999420
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "StorageDead": 10
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "StorageDead": 7
+          }
+        ],
+        "terminator": {
+          "Goto": 8
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageDead": 6
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "StorageLive": 12
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 21,
+                "col_start": 11,
+                "line_end": 21,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<i64>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 13,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 9,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 21,
+              "col_start": 11,
+              "line_end": 21,
+              "col_end": 31
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8821,
+              "substs_digest": [
+                7683061361532438895,
+                6059847454294257549
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageDead": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 12,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 21,
+                "col_start": 11,
+                "line_end": 21,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ]
+            ],
+            "otherwise": 10,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 21,
+              "col_start": 11,
+              "line_end": 21,
+              "col_end": 42
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 22,
+                "col_start": 12,
+                "line_end": 22,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<i64>::resize::<__trust_elem_bytes@8>",
+            "args": [
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 5,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Int": -1
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": 11,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 22,
+              "col_start": 12,
+              "line_end": 22,
+              "col_end": 47
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8851,
+              "substs_digest": [
+                7683061361532438895,
+                6059847454294257549
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "StorageDead": 15
+          }
+        ],
+        "terminator": {
+          "Goto": 13
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "StorageDead": 12
+          }
+        ],
+        "terminator": {
+          "Goto": 13
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "StorageDead": 11
+          },
+          {
+            "StorageLive": 16
+          },
+          {
+            "StorageLive": 17
+          },
+          {
+            "StorageLive": 18
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 24,
+                "col_start": 11,
+                "line_end": 24,
+                "col_end": 24
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<bool>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 18,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 17,
+              "projections": []
+            },
+            "target": 14,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 24,
+              "col_start": 11,
+              "line_end": 24,
+              "col_end": 30
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8821,
+              "substs_digest": [
+                6349586100047398078,
+                1623389636415431722
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "StorageDead": 18
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Move": {
+                      "local": 17,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 24,
+                "col_start": 11,
+                "line_end": 24,
+                "col_end": 41
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                17
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 24,
+              "col_start": 11,
+              "line_end": 24,
+              "col_end": 41
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "StorageDead": 17
+          },
+          {
+            "StorageLive": 20
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "prober_field_update.rs",
+                "line_start": 25,
+                "col_start": 12,
+                "line_end": 25,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<bool>::resize::<__trust_elem_bytes@1>",
+            "args": [
+              {
+                "Move": {
+                  "local": 20,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Bool": false
+                }
+              }
+            ],
+            "dest": {
+              "local": 19,
+              "projections": []
+            },
+            "target": 16,
+            "span": {
+              "file": "prober_field_update.rs",
+              "line_start": 25,
+              "col_start": 12,
+              "line_end": 25,
+              "col_end": 49
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4324293868756376781,
+              "def_index": 8851,
+              "substs_digest": [
+                6349586100047398078,
+                1623389636415431722
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "StorageDead": 20
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "StorageDead": 17
+          }
+        ],
+        "terminator": {
+          "Goto": 18
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "StorageDead": 16
+          },
+          {
+            "StorageDead": 5
+          }
+        ],
+        "terminator": {
+          "Goto": 19
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "num_vars",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "num_vars",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

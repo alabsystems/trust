@@ -23,27 +23,28 @@ use sha2::Digest;
 #[cfg(feature = "tracing")]
 use tracing::span;
 
+use crate::core::backend::CodegenBackendKind;
+use crate::core::build_steps::llvm::{LlvmFromCi, LlvmKind, prebuilt_llvm_output};
 use crate::core::build_steps::tool::{SourceType, copy_lld_artifacts};
 use crate::core::build_steps::{dist, llvm};
-use crate::core::builder;
 use crate::core::builder::{
-    Builder, Cargo, Kind, RunConfig, ShouldRun, Step, StepMetadata, crate_description,
+    self, Builder, Cargo, CommandLineStep, Kind, RunConfig, ShouldRun, Step, StepMetadata,
+    apply_pgo, crate_description,
 };
+use crate::core::compiler::Compiler;
 use crate::core::config::toml::target::DefaultLinuxLinkerOverride;
 use crate::core::config::{
-    CompilerBuiltins, DebuginfoLevel, LlvmLibunwind, RustcLto, TargetSelection,
+    Allocator, CompilerBuiltins, DebuginfoLevel, LlvmLibunwind, RustcLto, TargetSelection,
 };
+use crate::core::session::{CLang, DependencyType, FileType, Mode};
 use crate::utils::build_stamp;
 use crate::utils::build_stamp::BuildStamp;
-use crate::utils::exec::command;
+use crate::utils::exec::{command, tool_metadata_command};
 use crate::utils::helpers::{
-    dylib_path_var, exe, get_clang_cl_resource_dir, hex_encode, is_debug_info, is_dylib,
+    self, dylib_path_var, exe, get_clang_cl_resource_dir, hex_encode, is_debug_info, is_dylib,
     symlink_dir, t, up_to_date,
 };
-use crate::{
-    CLang, CodegenBackendKind, Compiler, DependencyType, FileType, GitRepo, LLVM_TOOLS, Mode,
-    debug, trace,
-};
+use crate::{debug, trace};
 
 /// Opt-out for `-Zalways-encode-mir` on the standard library.
 pub(crate) const TRUST_STD_ENCODE_MIR_ENV: &str = "TRUST_STD_ENCODE_MIR";
@@ -72,6 +73,61 @@ fn trust_std_encode_mir_enabled(value: Option<&OsStr>) -> Result<bool, String> {
              looking like it had been turned off."
         )),
     }
+}
+
+/// Trust: the flag `TRUST_STD_ENCODE_MIR` gates on every `Mode::Std` unit.
+pub(crate) const TRUST_STD_ENCODE_MIR_FLAG: &str = "-Zalways-encode-mir";
+
+/// Trust: what `rust.trust-ir-metadata = true` adds to every `Mode::Std` unit of a
+/// stage >= 1 build compiler, in this order.
+///
+/// `-Ztrust-ir-lower=on` turns the THIR -> trust-ir producer on by itself: bootstrap
+/// still passes `-Ztrust-verify=off` to these units, and the producer runs when
+/// verification is on OR lowering is requested, so the entries std's metadata carries
+/// do not depend on the verifier switch. `-Ztrust-ir-flip=no` keeps the producer from
+/// installing derived MIR, so the bodies codegen reads are the ones a build without
+/// the option reads. `-Ztrust-ir-lower-templates` also retains generic definitions;
+/// lowering alone records them as `template-pending(capture off)`. These are
+/// structural metadata, not a template admission or proof capability. None of
+/// these flags is a verifier control: bootstrap's self-proof refusal and
+/// its off-switch default do not classify them
+/// (`builder::cargo::tests::the_std_producer_flags_are_not_verifier_controls`).
+pub(crate) const TRUST_STD_IR_METADATA_FLAGS: [&str; 3] = [
+    "-Ztrust-ir-lower=on",
+    "-Ztrust-ir-flip=no",
+    "-Ztrust-ir-lower-templates",
+];
+
+/// Trust: every Trust rustflag of a `Mode::Std` unit, as a pure function of the build
+/// compiler's stage, `rust.trust-ir-metadata` and the `TRUST_STD_ENCODE_MIR` setting.
+///
+/// PURE so the list is tested without a `Builder`, and ONE list so the build lane and
+/// the test lane cannot disagree ([`apply_trust_std_rustflags`] is its only caller).
+///
+/// The two switches are independent. `TRUST_STD_ENCODE_MIR` decides
+/// `-Zalways-encode-mir` at every stage, exactly as before the option existed, and an
+/// unrecognized value is still an error whatever the option says. The option adds the
+/// producer flags only at effective stage >= 1 (`Cargo::build_compiler_stage`: a
+/// local-rebuild stage-0 compiler counts as 1), the same `build_compiler_stage != 0`
+/// condition as `builder::cargo`'s `-Ztrust-verify=off` default. A seed that is not a
+/// local rebuild never gets them: its trust-ir wire version and entry schema need not
+/// be this tree's.
+///
+/// With the option off the result is the one flag, or nothing under
+/// `TRUST_STD_ENCODE_MIR=0`: what a `Mode::Std` unit received before the option existed.
+pub(crate) fn trust_std_rustflags(
+    build_compiler_stage: u32,
+    trust_ir_metadata: bool,
+    encode_mir: Option<&OsStr>,
+) -> Result<Vec<&'static str>, String> {
+    let mut flags = Vec::new();
+    if trust_std_encode_mir_enabled(encode_mir)? {
+        flags.push(TRUST_STD_ENCODE_MIR_FLAG);
+    }
+    if trust_ir_metadata && build_compiler_stage >= 1 {
+        flags.extend(TRUST_STD_IR_METADATA_FLAGS);
+    }
+    Ok(flags)
 }
 
 /// Build a standard library for the given `target` using the given `build_compiler`.
@@ -146,7 +202,7 @@ impl Std {
     }
 }
 
-impl Step for Std {
+impl CommandLineStep for Std {
     /// Build stamp of std, if it was indeed built or uplifted.
     type Output = Option<BuildStamp>;
 
@@ -159,7 +215,7 @@ impl Step for Std {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        let crates = std_crates_for_run_make(&run);
+        let crates = std_crates_for_make_run(&run);
         let builder = run.builder;
 
         // Force compilation of the standard library from source if the `library` is modified. This allows
@@ -338,7 +394,10 @@ impl Step for Std {
             // `Formatter::write_str` (1 call) stayed an absent callee, so no impl of
             // `Debug` or `Display` could verify. An inlining heuristic must not decide
             // what a VERIFYING compiler is able to prove.
-            apply_trust_std_encode_mir(&mut cargo);
+            //
+            // Trust: the same call adds the trust-ir producer flags when
+            // `rust.trust-ir-metadata` is on (default off).
+            apply_trust_std_rustflags(builder, &mut cargo);
             cargo
         };
 
@@ -364,7 +423,7 @@ impl Step for Std {
             if self.is_for_mir_opt_tests {
                 ArtifactKeepMode::OnlyRmeta
             } else {
-                // We use -Zno-embed-metadata for the standard library
+                // We use -Zembed-metadata=no for the standard library
                 ArtifactKeepMode::BothRlibAndRmeta
             },
         );
@@ -404,8 +463,6 @@ fn copy_llvm_libunwind(builder: &Builder<'_>, target: TargetSelection, libdir: &
     builder.copy_link(&libunwind_source, &libunwind_target, FileType::NativeLibrary);
     libunwind_target
 }
-
-/// Copies third party objects needed by various targets.
 fn copy_third_party_objects(
     builder: &Builder<'_>,
     compiler: &Compiler,
@@ -505,15 +562,6 @@ fn copy_self_contained_objects(
             )
         });
 
-        // wasm32-wasip3 doesn't exist in wasi-libc yet, so instead use libs
-        // from the wasm32-wasip2 target. Once wasi-libc supports wasip3 this
-        // should be deleted and the native objects should be used.
-        let srcdir = if target == "wasm32-wasip3" {
-            assert!(!srcdir.exists(), "wasip3 support is in wasi-libc, this should be updated now");
-            builder.wasi_libdir(TargetSelection::from_user("wasm32-wasip2")).unwrap()
-        } else {
-            srcdir
-        };
         for &obj in &["libc.a", "crt1-command.o", "crt1-reactor.o"] {
             copy_and_stamp(
                 builder,
@@ -546,9 +594,9 @@ fn copy_self_contained_objects(
     target_deps
 }
 
-/// Resolves standard library crates for `Std::run_make` for any build kind (like check, doc,
+/// Resolves standard library crates for [`Std::make_run`] for any build kind (like check, doc,
 /// build, clippy, etc.).
-pub fn std_crates_for_run_make(run: &RunConfig<'_>) -> Vec<String> {
+pub fn std_crates_for_make_run(run: &RunConfig<'_>) -> Vec<String> {
     let mut crates = run.make_run_crates(builder::Alias::Library);
 
     // For no_std targets, we only want to check core and alloc
@@ -588,7 +636,7 @@ fn narrow_trust_cg_self_host_error(component: &str) -> String {
 
 fn reject_narrow_trust_cg_self_host(component: &str) -> ! {
     eprintln!("ERROR: {}", narrow_trust_cg_self_host_error(component));
-    crate::exit!(1)
+    crate::exit!(1); // Trust: the exit macro is a diverging statement.
 }
 
 /// Tries to find LLVM's `compiler-rt` source directory, for building `library/profiler_builtins`.
@@ -597,14 +645,16 @@ fn reject_narrow_trust_cg_self_host(component: &str) -> ! {
 /// downloaded copy of CI LLVM, then we try to use the `compiler-rt` sources from
 /// there instead, which lets us avoid checking out the LLVM submodule.
 fn compiler_rt_for_profiler(builder: &Builder<'_>) -> PathBuf {
-    // Try to use `compiler-rt` sources from downloaded CI LLVM, if possible.
-    if builder.config.llvm_from_ci {
-        // CI LLVM might not have been downloaded yet, so try to download it now.
-        builder.config.maybe_download_ci_llvm();
-        let ci_llvm_compiler_rt = builder.config.ci_llvm_root().join("compiler-rt");
-        if ci_llvm_compiler_rt.exists() {
-            return ci_llvm_compiler_rt;
+    // Try to use `compiler-rt` sources from downloaded CI LLVM, if available
+    if let Some(downloaded_llvm) = builder.ensure(LlvmFromCi { target: builder.host_target }) {
+        let ci_llvm_compiler_rt = downloaded_llvm.output.root_dir().join("compiler-rt");
+        if !builder.config.dry_run() {
+            assert!(
+                ci_llvm_compiler_rt.exists(),
+                "compiler-rt sources not found in LLVM downloaded from CI at {ci_llvm_compiler_rt:?}"
+            );
         }
+        return ci_llvm_compiler_rt;
     }
 
     // Otherwise, fall back to requiring the LLVM submodule.
@@ -616,7 +666,8 @@ fn compiler_rt_for_profiler(builder: &Builder<'_>) -> PathBuf {
 
 /// Configure cargo to compile the standard library, adding appropriate env vars
 /// and such.
-/// Trust: apply `-Zalways-encode-mir` to a `Mode::Std` cargo, under its gate.
+/// Trust: apply the Trust rustflags of a `Mode::Std` cargo: `-Zalways-encode-mir`
+/// under its gate, and the trust-ir producer flags under `rust.trust-ir-metadata`.
 ///
 /// EXTRACTED BECAUSE THE TWO STD LANES MUST NOT DRIFT. `compile::Std::run` and
 /// `test::Crate::run` both configure a `Mode::Std` cargo with `std_cargo`, and
@@ -641,14 +692,26 @@ fn compiler_rt_for_profiler(builder: &Builder<'_>) -> PathBuf {
 /// `is_for_mir_opt_tests` path, which uses a different sysroot, so its two lanes
 /// never share a directory while disagreeing about a flag.
 ///
-/// Call this from EVERY `Mode::Std` cargo. A future flag that applies to one
-/// lane only re-creates this bug, and the symptom will again look like anything
-/// but a missing rustflag.
-pub fn apply_trust_std_encode_mir(cargo: &mut Cargo) {
-    if trust_std_encode_mir_enabled(std::env::var_os(TRUST_STD_ENCODE_MIR_ENV).as_deref())
-        .unwrap_or_else(|message| panic!("{message}"))
-    {
-        cargo.rustflag("-Zalways-encode-mir");
+/// Call this from both lanes that build std into `stage_out(compiler, Mode::Std)`
+/// with `std_cargo`: `compile::Std`'s regular sysroot and `test::Crate`'s non-Miri
+/// lane. The check, clippy, doc, Miri and mir-opt lanes do not call it;
+/// `compile::tests::both_std_lanes_take_their_trust_rustflags_from_the_one_helper`
+/// pins exactly these two callers. A future flag that applies to one of the two
+/// only re-creates this bug, and the symptom will again look like anything but a
+/// missing rustflag.
+///
+/// The same holds for the producer flags of `rust.trust-ir-metadata`, which is
+/// why they are added here and not at either call site: one helper, one flag
+/// list ([`trust_std_rustflags`]), both lanes.
+pub fn apply_trust_std_rustflags(builder: &Builder<'_>, cargo: &mut Cargo) {
+    let flags = trust_std_rustflags(
+        cargo.build_compiler_stage(),
+        builder.config.trust_ir_metadata,
+        std::env::var_os(TRUST_STD_ENCODE_MIR_ENV).as_deref(),
+    )
+    .unwrap_or_else(|message| panic!("{message}"));
+    for flag in flags {
+        cargo.rustflag(flag);
     }
 }
 
@@ -883,10 +946,6 @@ impl StdLink {
 impl Step for StdLink {
     type Output = ();
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     /// Link all libstd rlibs/dylibs into the sysroot location.
     ///
     /// Links those artifacts generated by `compiler` to the `stage` compiler's
@@ -917,11 +976,13 @@ impl Step for StdLink {
             (libdir, hostdir)
         };
 
-        let is_downloaded_beta_stage0 = builder
-            .build
-            .config
-            .initial_rustc
-            .starts_with(builder.out.join(compiler.host).join("stage0/bin"));
+        // Trust: an explicitly configured compiler remains an input even if its
+        // executable happens to use the downloaded stage0 directory spelling.
+        let is_downloaded_beta_stage0 = builder.config.external_rustc.is_none()
+            && builder
+                .sess
+                .initial_rustc
+                .starts_with(builder.out.join(compiler.host).join("stage0/bin"));
 
         // Special case for legacy beta stage0 sysroots. We only do this if the stage0 compiler comes from beta,
         // and is not set to a custom path.
@@ -961,7 +1022,56 @@ impl Step for StdLink {
                 let _ = fs::remove_dir_all(sysroot.join("lib/rustlib/src/rust"));
             }
 
-            builder.cp_link_r(&builder.initial_sysroot.join("lib"), &sysroot.join("lib"));
+            // Trust (E0464, 2026-09-14): do NOT copy the initial sysroot's RUSTC-PRIVATE
+            // artifacts into `stage0-sysroot`.
+            //
+            // Upstream's stage0 is a downloaded beta toolchain, which ships no
+            // `rustc_*` rmeta at all, so this whole-tree copy was safe there. EVERY
+            // Trust stage0 is a full Trust toolchain and does ship them. The result is
+            // that building a rustc-private tool sees TWO generations of every rustc
+            // crate — `stage0-sysroot`'s, from the snapshot, and this build's, handed
+            // over as `-L` via `RUSTC_ADDITIONAL_SYSROOT_PATHS` — and rustc refuses with
+            // `E0464: multiple candidates for rmeta dependency rustc_abi`, 29 of them,
+            // failing `src/librustdoc` and with it the whole `scoped.compiler-check`
+            // lane.
+            //
+            // That failure is BUILD-TREE STATE, which is why it has looked intermittent
+            // and been quarantined three times and retired twice in one day: a tree
+            // assembled from scratch carries one generation and is green, a long-lived
+            // one carries two and is red. Same source, opposite verdicts.
+            //
+            // Nothing needs these rows here. `prepare_rustc_private_sysroot` builds a
+            // tool's rustc-private sysroot from `librustc_stamp` — the built rustc's own
+            // artifacts — and returns `None` when that stamp is absent; it reads
+            // `stage0-sysroot` only for std files. So the rustc-private half of this
+            // copy has no consumer, and dropping it makes Trust's stage0-sysroot the
+            // shape the rest of bootstrap already assumes.
+            //
+            // The filter is on the CRATE ROLE, not on a name pattern, for the reason
+            // this file has learned five times today: `librustc_driver-<hash>.dylib` and
+            // `rustc_driver-<hash>.dll` differ by platform, and `-Cextra-filename`
+            // carries a hash that changes with every commit. `is_rustc_private_artifact`
+            // asks what the file IS.
+            //
+            // Trust (2026-09-15, merged from the parallel fix): ALSO skip the `rustlib/src`
+            // and `rustlib/rustc-src` SOURCE SNAPSHOTS. `Sysroot` plants both as symlinks
+            // back into `builder.src`, and a copier that follows a symlink it finds at the
+            // destination writes a stage0 toolchain's `compiler/` and `library/` OVER THE
+            // SOURCE TREE — measured: `x.py check` rewrote 1,002 files under compiler/ and
+            // library/ six seconds in. `cp_link_filtered` skips a rejected DIRECTORY
+            // without descending, so excluding the two relative paths leaves the planted
+            // symlinks untouched; the filter sees paths RELATIVE to `lib/`.
+            // Trust: the custom initial SDK is an external input. Import independent
+            // regular-file bytes so assembly/reassembly cannot change its nlink/ctime.
+            builder.cp_filtered(
+                &builder.initial_sysroot.join("lib"),
+                &sysroot.join("lib"),
+                &|path| {
+                    let is_source_snapshot =
+                        path == Path::new("rustlib/src") || path == Path::new("rustlib/rustc-src");
+                    !is_source_snapshot && !is_rustc_private_artifact(path)
+                },
+            );
         } else {
             if builder.download_rustc() {
                 // Ensure there are no CI-rustc std artifacts.
@@ -1043,7 +1153,7 @@ pub struct StartupObjects {
     pub target: TargetSelection,
 }
 
-impl Step for StartupObjects {
+impl CommandLineStep for StartupObjects {
     type Output = Vec<(PathBuf, DependencyType)>;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1157,26 +1267,28 @@ impl Rustc {
     }
 }
 
-impl Step for Rustc {
+/// Whether `channel` takes upstream's nightly compiler defaults
+/// (`CFG_DEFAULT_POLONIUS_NEXT` / `CFG_DEFAULT_NEXT_SOLVER_GLOBALLY`).
+/// The `trust` channel is Trust's nightly-equivalent (PERF-SEP26-DEFAULTS);
+/// omitting it here silently kept the pre-1.101 defaults on Trust builds.
+fn channel_takes_nightly_defaults(channel: &str) -> bool {
+    matches!(channel, "nightly" | "dev" | "trust")
+}
+
+impl CommandLineStep for Rustc {
     type Output = BuiltRustc;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let mut crates = run.builder.in_tree_crates("rustc-main", None);
-        for (i, krate) in crates.iter().enumerate() {
+        run.crate_or_deps_filtered("rustc-main", |krate| {
             // We can't allow `build rustc` as an alias for this Step, because that's reserved by `Assemble`.
             // Ideally Assemble would use `build compiler` instead, but that seems too confusing to be worth the breaking change.
-            if krate.name == "rustc-main" {
-                crates.swap_remove(i);
-                break;
-            }
-        }
-        // This crate is selected by `BuiltinTrustCg`, which builds the full
-        // compiler. Treating it as a partial Rustc build overwrites the shared
-        // `.librustc-stamp` with a backend-only stamp and can leave stale
-        // rustc/trustc binaries without librustc_driver.
-        crates.retain(|krate| krate.name != "rustc_codegen_trust_cg");
-        run.crates(crates)
+            // `rustc_codegen_trust_cg` is selected by `BuiltinTrustCg`, which builds the full
+            // compiler. Treating it as a partial Rustc build overwrites the shared
+            // `.librustc-stamp` with a backend-only stamp and can leave stale
+            // rustc/trustc binaries without librustc_driver.
+            krate.name != "rustc-main" && krate.name != "rustc_codegen_trust_cg"
+        })
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -1292,6 +1404,25 @@ impl Step for Rustc {
             builder.config.host_target,
         );
 
+        // Trust: the sysroot this compiler is assembled into, with the `ay` it
+        // ships, BEFORE the compiler's crates are compiled: trust-cg-verify
+        // records that `bin/ay` (see `rustc_cargo`). Measured 2026-10-01: with
+        // the build compiler's sysroot recorded instead, a stage2 compiler
+        // refused its own stage2/bin/ay (TCG-AY-IDENTITY-MISMATCH) and admitted
+        // only stage1's, and its bytes changed with whatever stage0 built that.
+        let output_compiler = Compiler::new(stage, target);
+        let output_sysroot = builder.sysroot(output_compiler);
+        assert_eq!(
+            output_sysroot,
+            local_sysroot_dir(builder, output_compiler),
+            "the sysroot rustc_cargo names for the AY record is not the one being assembled",
+        );
+        crate::core::build_steps::tool::ensure_sysroot_ay(
+            builder,
+            output_compiler,
+            &output_sysroot,
+        );
+
         let mut cargo = builder::Cargo::new(
             builder,
             build_compiler,
@@ -1310,7 +1441,7 @@ impl Step for Rustc {
             cargo.arg("-p").arg(krate);
         }
 
-        if builder.build.config.enable_bolt_settings && build_compiler.stage == 1 {
+        if builder.sess.config.enable_bolt_settings && build_compiler.stage == 1 {
             // Relocations are required for BOLT to work.
             cargo.env("RUSTC_BOLT_LINK_FLAGS", "1");
         }
@@ -1337,13 +1468,15 @@ impl Step for Rustc {
                 {
                     // jemalloc_sys and rustc_public_bridge are not linked into librustc_driver.so,
                     // so we need to distribute them as rlib to be able to use them.
-                    filename.ends_with(".rlib")
-                } else {
-                    // Distribute the rest of the rustc crates as rmeta files only to reduce
-                    // the tarball sizes by about 50%. The object files are linked into
-                    // librustc_driver.so, so it is still possible to link against them.
-                    filename.ends_with(".rmeta")
+                    if filename.ends_with(".rlib") {
+                        return true;
+                    }
                 }
+
+                // Distribute the rest of the rustc crates as rmeta files only to reduce
+                // the tarball sizes by about 50%. The object files are linked into
+                // librustc_driver.so, so it is still possible to link against them.
+                filename.ends_with(".rmeta")
             })),
         );
 
@@ -1366,8 +1499,6 @@ impl Step for Rustc {
             strip_debug(builder, target, &target_root_dir.join("rustc-main"));
         }
 
-        let output_compiler = Compiler::new(stage, target);
-        let output_sysroot = builder.sysroot(output_compiler);
         materialize_local_compiler_aliases(
             builder,
             output_compiler,
@@ -1384,6 +1515,101 @@ impl Step for Rustc {
     }
 }
 
+/// Trust: an explicit BUILD component for a coherent self-host development image.
+///
+/// The selected stage is the producer, not the resulting compiler's stage: like
+/// `dist::RustcDev`, this component always builds compiler libraries with stage1.
+/// Those libraries belong to the compiler/runtime they produced (stage2), never
+/// to a stage1 image whose runtime was built by the seed. Normal Assemble owns
+/// that image, its std selection and configured tools; this step also installs
+/// the development libraries when `build.extended` is false.
+///
+/// This is not a distribution/install request or a complete recipe envelope.
+/// Their readiness scopes, including every top-level stage2 request, are intact.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RustcDev {
+    pub target: TargetSelection,
+}
+
+impl CommandLineStep for RustcDev {
+    type Output = Compiler;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("trustc-dev").alias("rustc-dev")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(Self { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> Compiler {
+        assert!(
+            builder.kind == Kind::Build
+                && builder.config.explicit_stage_from_cli
+                && builder.top_stage == 1
+                && self.target == builder.host_target
+                && builder.hosts.as_slice() == [builder.host_target]
+                && !builder.download_rustc()
+                && builder.config.keep_stage.is_empty()
+                && builder.config.keep_stage_std.is_empty()
+                && builder.config.skip.is_empty(),
+            "the BUILD development component requires an explicit native stage1 producer, \
+             original compiler/std builds and no downloaded, kept or skipped stages",
+        );
+
+        // Use the distribution component's maintained compiler1 producer.
+        // Constructing that Step does not enter Dist or create an archive.
+        let producer = dist::RustcDev::new(builder, self.target);
+        let BuiltRustc { build_compiler } =
+            builder.ensure(Rustc::new(producer.build_compiler, self.target));
+        assert_eq!(build_compiler, producer.build_compiler);
+        let compiler = builder.ensure(Assemble {
+            target_compiler: Compiler::new(build_compiler.stage + 1, self.target),
+        });
+
+        // Each configured target gets the complete library population, not a
+        // std-only partial stamp. Std retains its normal full-bootstrap/uplift
+        // policy and the public image retains Assemble's actual runtime.
+        for &target in &builder.targets {
+            builder.ensure(Std::new(compiler, target));
+        }
+        let stamp = build_stamp::librustc_stamp(builder, build_compiler, self.target);
+        let std_stamp = assembled_sysroot_std_stamp(builder, compiler, self.target);
+        install_local_rustc_dev(builder, compiler, &stamp, &std_stamp);
+        validate_assembled_local_compiler(builder, compiler, &builder.sysroot(compiler));
+        compiler
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::build("trustc-dev", self.target).built_by(Compiler::new(1, self.target)))
+    }
+}
+
+/// Trust: trust-cg-verify (linked into the driver) pins the `ay` its compiler
+/// may start, by the bytes of `<sysroot>/bin/ay`. The compiler compiled with
+/// `build_compiler` is assembled into the NEXT stage's sysroot and hosts the
+/// verifier there, so that is the sysroot to record — not the build
+/// compiler's, whose `bin/ay` is the previous stage's battery. `rustc_cargo`
+/// sets it for every kind (check, build, doc, test) so they share one
+/// build-script record instead of re-running it at each switch; `Rustc::run`
+/// puts the battery in place before a compiler that ships is compiled.
+pub(crate) fn name_ay_record_host_sysroot(
+    builder: &Builder<'_>,
+    cargo: &mut Cargo,
+    target: TargetSelection,
+    build_compiler: &Compiler,
+) {
+    cargo.env(
+        AY_RECORD_HOST_SYSROOT_ENV,
+        local_sysroot_dir(builder, Compiler::new(build_compiler.stage + 1, target)),
+    );
+}
+
 pub fn rustc_cargo(
     builder: &Builder<'_>,
     cargo: &mut Cargo,
@@ -1391,11 +1617,14 @@ pub fn rustc_cargo(
     build_compiler: &Compiler,
     crates: &[String],
 ) {
+    let kind = cargo.kind();
     cargo
         .arg("--features")
-        .arg(builder.rustc_features(builder.kind, target, crates))
+        .arg(builder.rustc_features(kind, target, crates))
         .arg("--manifest-path")
         .arg(builder.src.join("compiler/rustc/Cargo.toml"));
+
+    name_ay_record_host_sysroot(builder, cargo, target, build_compiler);
 
     cargo.rustdocflag("-Zcrate-attr=warn(rust_2018_idioms)");
 
@@ -1414,14 +1643,56 @@ pub fn rustc_cargo(
     // <https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Internal.20lint.20for.20raw.20.60print!.60.20and.20.60println!.60.3F>.
     cargo.rustflag("-Zon-broken-pipe=kill");
 
+    // /Brepro tells the MSVC linker to omit non-deterministic COFF data
+    // (namely the PE timestamp) from the produced binary. Only applied when
+    // building rustc itself via bootstrap. See discussion:
+    // https://github.com/rust-lang/rust/pull/158873
+    if target.is_msvc() {
+        cargo.rustflag("-Clink-arg=/Brepro");
+    }
+
     // Building with protected visibility reduces the number of dynamic relocations needed, giving
     // us a faster startup time. However GNU ld < 2.40 will error if we try to link a shared object
     // with direct references to protected symbols, so for now we only use protected symbols if
     // linking with LLD is enabled.
-    if builder.build.config.bootstrap_override_lld.is_used() {
+    if builder.sess.config.bootstrap_override_lld.is_used() {
         cargo.rustflag("-Zdefault-visibility=protected");
     }
 
+    apply_dylib_lto(builder, build_compiler, cargo);
+
+    // With LLD, we can use ICF (identical code folding) to reduce the executable size
+    // of librustc_driver/rustc and to improve i-cache utilization.
+    //
+    // -Wl,[link options] doesn't work on MSVC. However, /OPT:ICF (technically /OPT:REF,ICF)
+    // is already on by default in MSVC optimized builds, which is interpreted as --icf=all:
+    // https://github.com/llvm/llvm-project/blob/3329cec2f79185bafd678f310fafadba2a8c76d2/lld/COFF/Driver.cpp#L1746
+    // https://github.com/rust-lang/rust/blob/f22819bcce4abaff7d1246a56eec493418f9f4ee/compiler/rustc_codegen_ssa/src/back/linker.rs#L827
+    if builder.config.bootstrap_override_lld.is_used() && !build_compiler.host.is_msvc() {
+        cargo.rustflag("-Clink-args=-Wl,--icf=all");
+    }
+
+    apply_pgo(builder, cargo, *build_compiler, &builder.config.rust_pgo);
+
+    // The stage0 compiler changes infrequently and does not directly depend on code
+    // in the current working directory. Therefore, caching it with sccache should be
+    // useful.
+    // This is only performed for non-incremental builds, as ccache cannot deal with these.
+    //
+    // We skip this on Windows hosts for now because of command line length issues (see CI failure
+    // in https://github.com/rust-lang/rust/pull/158888#issuecomment-4960306292).
+    if let Some(ref ccache) = builder.config.ccache
+        && build_compiler.stage == 0
+        && !cfg!(windows)
+        && !builder.config.incremental
+    {
+        cargo.env("RUSTC_WRAPPER", ccache);
+    }
+
+    rustc_cargo_env(builder, cargo, target, crates);
+}
+
+fn apply_dylib_lto(builder: &Builder<'_>, build_compiler: &Compiler, cargo: &mut Cargo) {
     if is_lto_stage(build_compiler) {
         match builder.config.rust_lto {
             RustcLto::Thin | RustcLto::Fat => {
@@ -1447,67 +1718,48 @@ pub fn rustc_cargo(
     } else if builder.config.rust_lto == RustcLto::Off {
         cargo.rustflag("-Clto=off");
     }
-
-    // With LLD, we can use ICF (identical code folding) to reduce the executable size
-    // of librustc_driver/rustc and to improve i-cache utilization.
-    //
-    // -Wl,[link options] doesn't work on MSVC. However, /OPT:ICF (technically /OPT:REF,ICF)
-    // is already on by default in MSVC optimized builds, which is interpreted as --icf=all:
-    // https://github.com/llvm/llvm-project/blob/3329cec2f79185bafd678f310fafadba2a8c76d2/lld/COFF/Driver.cpp#L1746
-    // https://github.com/rust-lang/rust/blob/f22819bcce4abaff7d1246a56eec493418f9f4ee/compiler/rustc_codegen_ssa/src/back/linker.rs#L827
-    if builder.config.bootstrap_override_lld.is_used() && !build_compiler.host.is_msvc() {
-        cargo.rustflag("-Clink-args=-Wl,--icf=all");
-    }
-
-    if builder.config.rust_profile_use.is_some() && builder.config.rust_profile_generate.is_some() {
-        panic!("Cannot use and generate PGO profiles at the same time");
-    }
-    let is_collecting = if let Some(path) = &builder.config.rust_profile_generate {
-        if build_compiler.stage == 1 {
-            cargo.rustflag(&format!("-Cprofile-generate={path}"));
-            // Apparently necessary to avoid overflowing the counters during
-            // a Cargo build profile
-            cargo.rustflag("-Cllvm-args=-vp-counters-per-site=4");
-            true
-        } else {
-            false
-        }
-    } else if let Some(path) = &builder.config.rust_profile_use {
-        if build_compiler.stage == 1 {
-            cargo.rustflag(&format!("-Cprofile-use={path}"));
-            if builder.is_verbose() {
-                cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if is_collecting {
-        // Ensure paths to Rust sources are relative, not absolute.
-        cargo.rustflag(&format!(
-            "-Cllvm-args=-static-func-strip-dirname-prefix={}",
-            builder.config.src.components().count()
-        ));
-    }
-
-    // The stage0 compiler changes infrequently and does not directly depend on code
-    // in the current working directory. Therefore, caching it with sccache should be
-    // useful.
-    // This is only performed for non-incremental builds, as ccache cannot deal with these.
-    if let Some(ref ccache) = builder.config.ccache
-        && build_compiler.stage == 0
-        && !builder.config.incremental
-    {
-        cargo.env("RUSTC_WRAPPER", ccache);
-    }
-
-    rustc_cargo_env(builder, cargo, target);
 }
 
-pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
+// Trust: only rustc_llvm consumes the native LLVM configuration. Walk raw
+// local metadata conservatively: in_tree_crates prunes optional backends by
+// host configuration, which may differ from the selected compiler target.
+// Empty selection retains the full compiler route; unknown roots still refuse.
+fn compiler_crates_need_llvm(builder: &Builder<'_>, crates: &[String]) -> bool {
+    if crates.is_empty() {
+        return true;
+    }
+    let mut pending = crates.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let krate =
+            builder.crates.get(name).unwrap_or_else(|| panic!("metadata missing for {name}"));
+        if name == "rustc_llvm" || krate.deps.contains("rustc_llvm") {
+            return true;
+        }
+        // Non-workspace path dependencies have no metadata node here. The
+        // named LLVM consumer above remains required even if its node is absent.
+        pending.extend(
+            krate.deps.iter().filter(|dep| builder.crates.contains_key(*dep)).map(String::as_str),
+        );
+    }
+    false
+}
+
+fn rustc_cargo_env(
+    builder: &Builder<'_>,
+    cargo: &mut Cargo,
+    target: TargetSelection,
+    crates: &[String],
+) {
+    // Trust: stable admission policy. Clean obtains the changing build identity from
+    // its native host, without embedding it in the elaborator dependency graph.
+    cargo.env(
+        "CFG_TRUST_ORACLE_HOST",
+        if builder.version_info().sha().is_some() { "1" } else { "0" },
+    );
     // Set some configuration variables picked up by build scripts and
     // the compiler alike
     cargo
@@ -1531,10 +1783,11 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
 
     cargo.env("CFG_LIBDIR_RELATIVE", libdir_relative);
 
-    if let Some(ref ver_date) = builder.rust_info().commit_date() {
+    // Trust: a dev stage-1 build's identity names its sources, not HEAD (TB1).
+    if let Some(ref ver_date) = builder.version_info().commit_date() {
         cargo.env("CFG_VER_DATE", ver_date);
     }
-    if let Some(ref ver_hash) = builder.rust_info().sha() {
+    if let Some(ref ver_hash) = builder.version_info().sha() {
         cargo.env("CFG_VER_HASH", ver_hash);
     }
     if !builder.unstable_features() {
@@ -1566,30 +1819,54 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
         cargo.env("RUSTC_VERIFY_LLVM_IR", "1");
     }
 
+    // Trust: the `trust` channel is Trust's nightly-equivalent (it tracks
+    // nightly pins; see tests/upstream-rust/baseline.toml), so it takes the
+    // same nightly defaults. Without this, Trust builds silently kept the
+    // pre-1.101 defaults (Polonius off, next solver coherence-only) that
+    // upstream nightly left in Aug 2026. Ruling: PERF-SEP26-DEFAULTS in
+    // docs/DECISION_QUEUE.md; per-compile opt-outs -Zpolonius=off and
+    // -Znext-solver=coherence are unchanged.
+    if channel_takes_nightly_defaults(&builder.config.channel) {
+        // We want to enable Polonius Alpha and Next Trait Solver by default on nighty
+        cargo.env("CFG_DEFAULT_POLONIUS_NEXT", "1");
+        cargo.env("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY", "1");
+    }
+
     // These conditionals represent a tension between three forces:
     // - For non-check builds, we need to define some LLVM-related environment
     //   variables, requiring LLVM to have been built.
     // - For check builds, we want to avoid building LLVM if possible.
     // - Check builds and non-check builds should have the same environment if
-    //   possible, to avoid unnecessary rebuilds due to cache-busting.
+    //   possible, to avoid unnecessary rebuilds due to cache-busting (in the same stage).
     //
-    // Therefore we try to avoid building LLVM for check builds, but only if
-    // building LLVM would be expensive. If "building" LLVM is cheap
-    // (i.e. it's already built or is downloadable), we prefer to maintain a
-    // consistent environment between check and non-check builds.
-    if builder.config.llvm_enabled(target) {
-        let building_llvm_is_expensive =
-            crate::core::build_steps::llvm::prebuilt_llvm_config(builder, target, false)
-                .should_build();
+    // If we have either:
+    // - LLVM already locally built
+    // - download-ci-llvm enabled
+    // - LLVM provided externally through a llvm-config
+    //
+    // and we do a check-like build, we run rustc_llvm as normally, to maintain a
+    // consistent environment between check and non-check builds
+    //
+    // However, if neither from the above three bullet points is true, and we do a check-like build,
+    // we skip running rustc_llvm by setting the RUST_CHECK environment variable.
+    //
+    // Note that if download-ci-llvm is enabled, `prebuilt_llvm_output` will *eagerly* download
+    // LLVM from CI, thus making it locally available.
+    if builder.config.llvm_enabled(target) && compiler_crates_need_llvm(builder, crates) {
+        let building_llvm_is_expensive = prebuilt_llvm_output(builder, target).is_none();
 
-        let skip_llvm = (builder.kind == Kind::Check) && building_llvm_is_expensive;
-        if !skip_llvm {
-            rustc_llvm_env(builder, cargo, target)
+        let skip_llvm = cargo.kind().is_check_like() && building_llvm_is_expensive;
+        if skip_llvm {
+            cargo.env("RUST_CHECK", "1");
+        } else {
+            rustc_llvm_env(builder, cargo, target);
         }
     }
 
     // See also the "JEMALLOC_SYS_WITH_LG_PAGE" setting in the tool build step.
-    if builder.config.jemalloc(target) && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none() {
+    if builder.config.allocator(target) == Allocator::Jemalloc
+        && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none()
+    {
         // Build jemalloc on AArch64 with support for page sizes up to 64K
         // See: https://github.com/rust-lang/rust/pull/135081
         if target.starts_with("aarch64") {
@@ -1600,27 +1877,45 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
             cargo.env("JEMALLOC_SYS_WITH_LG_PAGE", "14");
         }
     }
+
+    // Plumb the `rust.wasm-panic-unwind-default` configuration option into the
+    // `rustc_target` crate.
+    if builder.config.wasm_panic_unwind_default {
+        cargo.env("CFG_WASM_PANIC_UNWIND_DEFAULT", "1");
+    }
 }
 
 /// Pass down configuration from the LLVM build into the build of
 /// rustc_llvm and rustc_codegen_llvm.
 ///
-/// Note that this has the side-effect of _building LLVM_, which is sometimes
+/// Note that calling this function has the side-effect of _building LLVM_, which is sometimes
 /// unwanted (e.g. for check builds).
 fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelection) {
-    if builder.config.is_rust_llvm(target) {
+    let llvm_output = builder.ensure(llvm::Llvm { target });
+    if builder.config.is_rust_llvm(&llvm_output, target) {
         cargo.env("LLVM_RUSTLLVM", "1");
     }
     if builder.config.llvm_enzyme {
         cargo.env("LLVM_ENZYME", "1");
     }
-    let llvm::LlvmResult { host_llvm_config, .. } = builder.ensure(llvm::Llvm { target });
     if builder.config.llvm_offload {
         builder.ensure(llvm::OmpOffload { target });
         cargo.env("LLVM_OFFLOAD", "1");
     }
 
-    cargo.env("LLVM_CONFIG", &host_llvm_config);
+    // This always has to be the host LLVM config, because it is executed by rustc_llvm
+    cargo.env("LLVM_CONFIG", builder.host_llvm_config());
+    // Declared dependency input, never an ambient pkg-config search override.
+    if let Some(directory) = builder
+        .config
+        .target_config
+        .get(&builder.host_target)
+        .and_then(|config| config.llvm_zstd_pkg_config_dir.as_ref())
+    {
+        cargo.env("LLVM_ZSTD_PC_DIR", directory);
+    } else {
+        cargo.env("LLVM_ZSTD_PC_DIR", "");
+    }
 
     // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
     // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by
@@ -1632,7 +1927,7 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
     // found. This is to avoid the linker errors about undefined references to
     // `__llvm_profile_instrument_memop` when linking `rustc_driver`.
     let mut llvm_linker_flags = String::new();
-    if builder.config.llvm_profile_generate
+    if builder.config.llvm_pgo.generate_profile.is_some()
         && target.is_msvc()
         && let Some(ref clang_cl_path) = builder.config.llvm_clang_cl
     {
@@ -1673,7 +1968,7 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
         );
         cargo.env("LLVM_STATIC_STDCPP", file);
     }
-    if builder.llvm_link_shared() {
+    if llvm_output.link_shared() {
         cargo.env("LLVM_LINK_SHARED", "1");
     }
     if builder.config.llvm_use_libcxx {
@@ -1681,6 +1976,9 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
     }
     if builder.config.llvm_assertions {
         cargo.env("LLVM_ASSERTIONS", "1");
+    }
+    if builder.cxx_tool(target).is_like_gnu() || builder.cc_tool(target).is_like_gnu() {
+        cargo.env("LLVM_COMPILER_IS_GNU_LIKE", "1");
     }
 }
 
@@ -1734,10 +2032,6 @@ impl RustcLink {
 impl Step for RustcLink {
     type Output = ();
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     /// Same as `StdLink`, only for librustc
     fn run(self, builder: &Builder<'_>) {
         let build_compiler = self.build_compiler;
@@ -1774,19 +2068,20 @@ fn trust_cg_builtin_enabled_for_host(backends: &[CodegenBackendKind]) -> bool {
     backends.contains(&CodegenBackendKind::TrustCg)
 }
 
-impl Step for BuiltinTrustCg {
+impl CommandLineStep for BuiltinTrustCg {
     type Output = Compiler;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        if !trust_cg_builtin_enabled_for_any_host(
+        // Trust: upstream 1.101 asserts every step registers at least one
+        // pathset (core::builder::cli_paths sanity check), so the path is
+        // registered unconditionally; `make_run` gates per host, so a broad
+        // `x build compiler` with trust-cg disabled selects this step and
+        // skips it instead of running a step that can only fail. (Before
+        // 1.101 the path was left unregistered while disabled.)
+        let _ = trust_cg_builtin_enabled_for_any_host(
             run.builder.hosts.iter().map(|host| run.builder.config.enabled_codegen_backends(*host)),
-        ) {
-            // This is a builtin backend, not an independently buildable
-            // plugin.  Registering its source path while it is disabled makes
-            // a broad `x build compiler` select a step that can only fail.
-            return run.never();
-        }
+        );
         run.path("compiler/rustc_codegen_trust_cg")
             .alias("rustc_codegen_trust_cg")
             .alias("rustc-codegen-trust_cg")
@@ -1864,7 +2159,7 @@ pub fn compiler_file(
     }
     let mut cmd = command(compiler);
     cmd.args(builder.cc_handled_cflags(target, c));
-    cmd.args(builder.cc_unhandled_cflags(target, GitRepo::Rustc, c));
+    cmd.args(builder.cc_unhandled_cflags(target, c));
     cmd.arg(format!("-print-file-name={file}"));
     let out = cmd.run_capture_stdout(builder).stdout();
     PathBuf::from(out.trim())
@@ -1883,12 +2178,37 @@ impl Sysroot {
     }
 }
 
+/// The environment variable that names, to trust-cg-verify's build script,
+/// the sysroot whose compiler will host it (first-party/trust-cg,
+/// crates/trust-cg-verify/build.rs). Not `TRUST_`-prefixed: authenticated
+/// Targo refuses that prefix as build-script authority.
+pub(crate) const AY_RECORD_HOST_SYSROOT_ENV: &str = "TOOLCHAIN_AY_RECORD_HOST_SYSROOT";
+
+/// The directory `Sysroot` assembles a locally built `compiler`'s sysroot in
+/// (`build/<host>/stage<N>`, `stage0-sysroot` for stage 0) — computed without
+/// assembling it, so a `check` names the same sysroot a `build` assembles.
+/// Forced-recompile test sysroots and CI downloads are `Sysroot`'s own cases.
+pub(crate) fn local_sysroot_dir(builder: &Builder<'_>, compiler: Compiler) -> PathBuf {
+    let host_dir = builder.out.join(compiler.host);
+    if compiler.stage == 0 {
+        host_dir.join("stage0-sysroot")
+    } else {
+        host_dir.join(format!("stage{}", compiler.stage))
+    }
+}
+
+/// Source aliases actually planted by `Sysroot`, shared with artifact observation.
+pub(crate) fn sysroot_source_aliases(stage: u32, download_rustc: bool) -> &'static [&'static str] {
+    match (stage == 0, download_rustc) {
+        (true, true) => &[],
+        (true, false) => &["lib/rustlib/rustc-src/rust"],
+        (false, true) => &["lib/rustlib/src/rust"],
+        (false, false) => &["lib/rustlib/src/rust", "lib/rustlib/rustc-src/rust"],
+    }
+}
+
 impl Step for Sysroot {
     type Output = PathBuf;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     /// Returns the sysroot that `compiler` is supposed to use.
     /// For the stage0 compiler, this is stage0-sysroot (because of the initial std build).
@@ -1898,14 +2218,13 @@ impl Step for Sysroot {
         let host_dir = builder.out.join(compiler.host);
 
         let sysroot_dir = |stage| {
-            if stage == 0 {
-                host_dir.join("stage0-sysroot")
-            } else if self.force_recompile && stage == compiler.stage {
+            if stage != 0 && self.force_recompile && stage == compiler.stage {
                 host_dir.join(format!("stage{stage}-test-sysroot"))
-            } else if builder.download_rustc() && compiler.stage != builder.top_stage {
+            } else if stage != 0 && builder.download_rustc() && compiler.stage != builder.top_stage
+            {
                 host_dir.join("ci-rustc-sysroot")
             } else {
-                host_dir.join(format!("stage{stage}"))
+                local_sysroot_dir(builder, Compiler::new(stage, compiler.host))
             }
         };
         let sysroot = sysroot_dir(compiler.stage);
@@ -1998,44 +2317,25 @@ impl Step for Sysroot {
         // so that any tools relying on `rust-src` also work for local builds,
         // and also for translating the virtual `/rustc/$hash` back to the real
         // directory (for running tests with `rust.remap-debuginfo = true`).
-        if compiler.stage != 0 {
-            let sysroot_lib_rustlib_src = sysroot.join("lib/rustlib/src");
-            t!(fs::create_dir_all(&sysroot_lib_rustlib_src));
-            let sysroot_lib_rustlib_src_rust = sysroot_lib_rustlib_src.join("rust");
-            if let Err(e) =
-                symlink_dir(&builder.config, &builder.src, &sysroot_lib_rustlib_src_rust)
-            {
+        // rustc-src is already part of CI rustc's sysroot. Local stage 0 also
+        // plants it, so consumers must declare BOTH kinds at their actual stages.
+        for relative in sysroot_source_aliases(compiler.stage, builder.download_rustc()) {
+            let source_alias = sysroot.join(relative);
+            t!(fs::create_dir_all(source_alias.parent().unwrap()));
+            if let Err(e) = symlink_dir(&builder.config, &builder.src, &source_alias) {
                 eprintln!(
                     "ERROR: creating symbolic link `{}` to `{}` failed with {}",
-                    sysroot_lib_rustlib_src_rust.display(),
+                    source_alias.display(),
                     builder.src.display(),
                     e,
                 );
-                if builder.config.rust_remap_debuginfo {
+                if *relative == "lib/rustlib/src/rust" && builder.config.rust_remap_debuginfo {
                     eprintln!(
                         "ERROR: some `tests/ui` tests will fail when lacking `{}`",
-                        sysroot_lib_rustlib_src_rust.display(),
+                        source_alias.display(),
                     );
                 }
-                build_helper::exit!(1);
-            }
-        }
-
-        // rustc-src component is already part of CI rustc's sysroot
-        if !builder.download_rustc() {
-            let sysroot_lib_rustlib_rustcsrc = sysroot.join("lib/rustlib/rustc-src");
-            t!(fs::create_dir_all(&sysroot_lib_rustlib_rustcsrc));
-            let sysroot_lib_rustlib_rustcsrc_rust = sysroot_lib_rustlib_rustcsrc.join("rust");
-            if let Err(e) =
-                symlink_dir(&builder.config, &builder.src, &sysroot_lib_rustlib_rustcsrc_rust)
-            {
-                eprintln!(
-                    "ERROR: creating symbolic link `{}` to `{}` failed with {}",
-                    sysroot_lib_rustlib_rustcsrc_rust.display(),
-                    builder.src.display(),
-                    e,
-                );
-                build_helper::exit!(1);
+                helpers::exit_process(1);
             }
         }
 
@@ -2048,15 +2348,26 @@ fn restore_user_facing_tools(builder: &Builder<'_>, compiler: Compiler, sysroot:
         return;
     }
 
-    // Restoring an existing tool is cheap and prevents sysroot assembly from
-    // deleting it. Only a local build constructs the batteries-on runtime
-    // here. Dist/install/test steps have explicit component graphs; eagerly
-    // building the full surface would bypass their stage and selection policy.
-    if crate::core::build_steps::tool::should_ensure_default_verifier_tool_bins(
+    // Trust: restore existing artifacts and build only compiler prerequisites
+    // here. Final Targo needs the completed compiler, so selected frontend/CLI
+    // construction belongs to the post-assembly finish, after Sysroot is cached.
+    // Dist/install/test retain their explicit component graphs.
+    let partial_source_build = crate::core::build_steps::tool::is_partial_stage1_source_build(
+        builder.kind,
+        compiler.stage,
+        builder.top_stage,
+        builder.config.include_default_paths,
+        &builder.paths,
+    );
+    if partial_source_build {
+        builder.info(
+            "Partial stage1 source build: unrelated verifier tools are not rebuilt; this is not a complete SDK",
+        );
+    } else if crate::core::build_steps::tool::should_ensure_default_verifier_tool_bins(
         builder.kind,
         compiler.stage,
     ) {
-        crate::core::build_steps::tool::ensure_default_verifier_tool_bins(
+        crate::core::build_steps::tool::ensure_sysroot_verifier_prerequisites(
             builder, compiler, sysroot,
         );
     }
@@ -2065,8 +2376,9 @@ fn restore_user_facing_tools(builder: &Builder<'_>, compiler: Compiler, sysroot:
 
     let bindir = sysroot.join("bin");
     t!(fs::create_dir_all(&bindir));
-    // A single built tool can intentionally back both its upstream-compatible
-    // binary and Trust alias, for example `cargo` and `targo`.
+    // A single built tool can intentionally back both its Trust name and one
+    // upstream-compatible alias: the `targo` artifact is installed as `targo`
+    // and as the `cargo` compatibility entry point.
     for (src_name, dst_name) in crate::core::build_steps::tool::restored_sysroot_bins(builder) {
         let src_exe = exe(src_name, compiler.host);
         let src = tools_dir.join(&src_exe);
@@ -2114,7 +2426,10 @@ fn restore_local_compiler_aliases(builder: &Builder<'_>, compiler: Compiler, sys
         return;
     }
 
-    let build_compiler = builder.compiler(compiler.stage - 1, builder.config.host_target);
+    // Trust: restoration observes already-produced stamps and images. Selecting
+    // their exact stage/host must not assemble a previous compiler merely to
+    // discover that no artifact exists, or make Sysroot a compiler build root.
+    let build_compiler = Compiler::new(compiler.stage - 1, builder.config.host_target);
     materialize_local_compiler_aliases(builder, compiler, sysroot, build_compiler);
 }
 
@@ -2142,6 +2457,74 @@ fn materialize_local_compiler_aliases(
         &bindir.join(exe("trustc", compiler.host)),
         FileType::Executable,
     );
+}
+
+/// Trust (E0464, 2026-09-14): is this sysroot file a RUSTC-PRIVATE compiler artifact —
+/// one of the `rustc_*` crates a rustc-private tool links against — rather than part of
+/// the standard library?
+///
+/// Asked of the file's CRATE NAME, taken from the artifact stem, not of a substring of
+/// the whole path: a path test would also match `.../rustlib/rustc_foo/...` directories
+/// and would miss the Windows `rustc_driver-<hash>.dll` spelling, which carries no `lib`
+/// prefix. Both mistakes have real precedent in this file.
+///
+/// Deliberately NOT matched: `rustc_std_workspace_core` / `_alloc` / `_std`, which are
+/// std-side shims that a rustc-private tool's std half genuinely needs, and whose names
+/// merely begin with `rustc_`.
+// Trust: check-only sysroots use the same artifact-role boundary.
+pub(super) fn is_rustc_private_artifact(path: &Path) -> bool {
+    // MUST be gated on a library extension. `cp_link_filtered` applies its predicate to
+    // DIRECTORIES as well as files and skips the whole subtree when it returns true, so
+    // an unextended name test would drop a directory that merely begins with `rustc_`
+    // and silently truncate the copy. A crate artifact always carries one of these.
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !matches!(extension, "rlib" | "rmeta" | "dylib" | "so" | "dll" | "a") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    let crate_name = stem.split('-').next().unwrap_or(stem);
+    if !crate_name.starts_with("rustc_") {
+        return false;
+    }
+    // NOT every `rustc_*` crate is compiler-private. The standard library itself
+    // depends on several, and dropping one of those does not produce a tidy failure —
+    // it produces `E0463: can't find crate for 'rustc_demangle' which 'std' depends on`
+    // multiplied across every downstream crate. Measured when this filter first shipped
+    // with only the `rustc_std_workspace_` exception: 0 E0464 (the bug was fixed) and
+    // 2571 NEW errors (the cure was worse).
+    //
+    // The list started as a DERIVATION and was then NARROWED BY MEASUREMENT, which is
+    // the part worth keeping. Deriving it from the manifests —
+    //
+    //     grep -hoE '^rustc[-_][a-z_-]+' library/*/Cargo.toml | sort -u
+    //
+    // (where `rustc-dep-of-std` is a FEATURE, not a crate) — yields `rustc_demangle`,
+    // `rustc_literal_escaper` and `rustc_apfloat`. That is a SUPERSET: a manifest names
+    // what the library is BUILT with, while this sysroot only has to carry what the
+    // PREBUILT std rlib still references. Measured by dropping all three and reading the
+    // failures: the only missing crate was `rustc_demangle` (11 occurrences, plus 10
+    // cascading `std`). Neither of the other two was wanted.
+    //
+    // SECOND MEASUREMENT, and the correction matters: a build stops at its FIRST
+    // missing crate, so that probe named the first requirement, not the requirement
+    // SET. It never reached `proc-macro2` — where `proc_macro` needs
+    // `rustc_literal_escaper` — and re-running with `rustc_demangle` restored surfaced
+    // `E0463: can't find crate for rustc_literal_escaper which proc_macro depends on`.
+    //
+    // `rustc_apfloat` is deliberately NOT here, and that is what keeping the whole
+    // superset would have cost. It is genuinely DUAL-USE — `library/compiler-builtins`
+    // declares it AND `src/tools/miri` links it as rustc-private — so exempting it left
+    // miri seeing two generations and reproduced the very
+    // `E0464: multiple candidates for rmeta dependency rustc_apfloat` this filter
+    // exists to remove. Exempting only what is measurably needed takes the lane from
+    // 30 E0464 to 0.
+    const STD_SIDE_RUSTC_CRATES: &[&str] = &["rustc_demangle", "rustc_literal_escaper"];
+    !crate_name.starts_with("rustc_std_workspace_") && !STD_SIDE_RUSTC_CRATES.contains(&crate_name)
 }
 
 fn restore_local_compiler_runtime_artifacts(
@@ -2185,13 +2568,101 @@ fn restore_local_compiler_runtime_artifacts(
     if src_libdir.exists() {
         for entry in builder.read_dir(&src_libdir) {
             let filename = entry.file_name();
-            let is_dylib_or_debug =
-                is_dylib(&entry.path()) || filename.to_str().is_some_and(is_debug_info);
-            if is_dylib_or_debug && !proc_macros.contains(&filename) {
-                builder.copy_link(&entry.path(), &rustc_libdir.join(&filename), FileType::Regular);
+            // Trust: finish the cheap name checks before opening any candidate.
+            if proc_macros.contains(&filename) {
+                continue;
+            }
+            let path = entry.path();
+            let is_dylib_or_debug = is_dylib(&path) || filename.to_str().is_some_and(is_debug_info);
+            // Trust: the name filter above CANNOT work on its own, so also test
+            // what the file actually is. See `dylib_declares_proc_macro`.
+            if is_dylib_or_debug && !is_proc_macro_dylib(&path) {
+                builder.copy_link(&path, &rustc_libdir.join(&filename), FileType::Regular);
             }
         }
     }
+}
+
+/// Trust: does this file export a proc-macro declarations symbol?
+///
+/// `restore_local_compiler_runtime_artifacts` already tried to keep proc macros
+/// out of the compiler's public libdir, by excluding FILE NAMES drawn from this
+/// build's stamp. That filter cannot work, because the libdir it copies FROM
+/// belongs to the *build compiler* — a different generation, whose `-Cmetadata`
+/// and therefore whose `-Cextra-filename` differ — so the names never match.
+/// Measured 2026-09-13: this build's displaydoc is
+/// `libdisplaydoc-213623978e25d466.dylib` while the file that reached the libdir
+/// was stage0's `libdisplaydoc-2ef9e771ac39abb5.dylib`, and all 21 of the build
+/// compiler's proc-macro dylibs were copied in.
+///
+/// That is not cosmetic. The compiler runs with this libdir on
+/// `DYLD_LIBRARY_PATH`, and dyld resolves `dlopen` of an ABSOLUTE path against
+/// that variable by LEAF NAME first — so a stale proc-macro dylib sitting there
+/// silently replaces the one rustc asked for. Because `CFG_VERSION` embeds the
+/// git short sha, the stale copy declares a different `StableCrateId`, and the
+/// load fails with `symbol not found` against a file that is perfectly good.
+/// Reproduced standalone: the same file and symbol resolve with `dlsym` when
+/// `DYLD_LIBRARY_PATH` is unset and miss when it names that libdir.
+///
+/// So test what the file IS rather than what it is called.
+fn is_proc_macro_dylib(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| dylib_declares_proc_macro(&bytes))
+}
+
+/// The byte-level half of [`is_proc_macro_dylib`], split out so it can be tested
+/// without a real dylib on disk.
+///
+/// A proc-macro dylib exports `__rustc_proc_macro_decls_<hex>__`, minted by
+/// `rustc_session::generate_proc_macro_decls_symbol` as
+/// `format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())`.
+///
+/// **`{:08x}` is a MINIMUM width of 8, not a fixed 16.** A `StableCrateId` is a
+/// uniformly distributed 64-bit hash, so it renders in 16 hex digits only when its
+/// top nibble is non-zero — 15/16 of the value space. The rest render in 8..=15.
+/// An earlier version of this predicate demanded exactly 16 and therefore missed a
+/// random ~1-in-16 of all proc-macro dylibs; measured on this tree, 58 of 1,921
+/// (3.0%), `displaydoc` and `serde_derive` among them. That is the same defect
+/// class this function exists to fix — an artifact identified by a rendering of a
+/// hash, where the rendering's width is itself input-dependent.
+///
+/// The run is bounded at 16 and NOT left open-ended, and that bound is
+/// load-bearing. `librustc_driver` contains this prefix once, from the format
+/// string that generates the symbol — but the `{:08x}` placeholder is not stored
+/// as text: the two `&str` pieces sit in the constant pool with exactly **8 bytes**
+/// of non-hex filler between them (measured: `c3 20 00 00 69 08 00 02`), followed
+/// by the literal `__`. So the guard's real margin is that those filler bytes are
+/// not hex, a constant-pool layout accident no linker guarantees. A false positive
+/// here drops `librustc_driver` from the assembled compiler's libdir and produces a
+/// compiler that cannot start — strictly worse than the bug being fixed — so the
+/// exact driver payload is pinned as a fixture in the tests.
+///
+/// Only lowercase hex is accepted: `{:08x}` never emits uppercase, so allowing
+/// `A-F` would widen the false-positive surface (UUIDs, hex dumps) for nothing.
+fn dylib_declares_proc_macro(bytes: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"__rustc_proc_macro_decls_";
+    const MIN_DIGITS: usize = 8;
+    const MAX_DIGITS: usize = 16;
+
+    // Trust: search for the first `r`, preserving every overlapping prefix. Its
+    // offset avoids false candidates in underscore-dense data. The patched
+    // memmem search is scalar too, so use the optimized single-byte loop.
+    for anchor in memchr::memchr_iter(b'r', bytes) {
+        let Some(i) = anchor.checked_sub(2) else {
+            continue;
+        };
+        let Some(rest) = bytes[i..].strip_prefix(NEEDLE) else {
+            continue;
+        };
+        let digits = rest
+            .iter()
+            .take(MAX_DIGITS + 1)
+            .take_while(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            .count();
+        if (MIN_DIGITS..=MAX_DIGITS).contains(&digits) && rest[digits..].starts_with(b"__") {
+            return true;
+        }
+    }
+    false
 }
 
 fn prune_rustc_driver_runtime_artifacts(libdir: &Path) -> std::io::Result<()> {
@@ -2286,9 +2757,9 @@ fn validate_assembled_local_compiler(builder: &Builder<'_>, compiler: Compiler, 
         drivers.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
     );
 
-    if compiler.host == builder.build.host_target {
-        command(&rustc).arg("--version").run(builder);
-        command(&trustc).arg("--version").run(builder);
+    if compiler.host == builder.sess.host_target {
+        tool_metadata_command(&rustc).arg("--version").run(builder);
+        tool_metadata_command(&trustc).arg("--version").run(builder);
     }
 }
 
@@ -2324,7 +2795,7 @@ pub struct Assemble {
     pub target_compiler: Compiler,
 }
 
-impl Step for Assemble {
+impl CommandLineStep for Assemble {
     type Output = Compiler;
     const IS_HOST: bool = true;
 
@@ -2361,11 +2832,12 @@ impl Step for Assemble {
             trace!("target_compiler.host" = ?target_compiler.host, "LLVM enabled");
 
             let target = target_compiler.host;
-            let llvm::LlvmResult { host_llvm_config, .. } = builder.ensure(llvm::Llvm { target });
+            let llvm_output = builder.ensure(llvm::Llvm { target });
             if !builder.config.dry_run() && builder.config.llvm_tools_enabled {
                 trace!("LLVM tools enabled");
 
-                let host_llvm_bin_dir = command(&host_llvm_config)
+                let host_llvm = builder.ensure(llvm::Llvm { target: builder.host_target });
+                let host_llvm_bin_dir = command(host_llvm.llvm_config())
                     .arg("--bindir")
                     .cached()
                     .run_capture_stdout(builder)
@@ -2388,11 +2860,11 @@ impl Step for Assemble {
                         // where the LLVM config is located
                         external_llvm_config.parent().unwrap().to_path_buf()
                     } else {
-                        // If we have built LLVM locally, then take the path of the host bindir
+                        // If not, then take the path of the host bindir of the host LLVM,
                         // relative to its output build directory, and then apply it to the target
                         // LLVM output build directory.
-                        let host_llvm_out = builder.llvm_out(builder.host_target);
-                        let target_llvm_out = builder.llvm_out(target);
+                        let host_llvm_out = host_llvm.root_dir();
+                        let target_llvm_out = llvm_output.root_dir();
                         if let Ok(relative_path) =
                             Path::new(&host_llvm_bin_dir).strip_prefix(host_llvm_out)
                         {
@@ -2417,15 +2889,22 @@ impl Step for Assemble {
                 let _llvm_tools_span =
                     span!(tracing::Level::TRACE, "installing llvm tools to sysroot", ?libdir_bin)
                         .entered();
-                for tool in LLVM_TOOLS {
+                for tool in dist::LLVM_TOOLS {
                     trace!("installing `{tool}`");
                     let tool_exe = exe(tool, target_compiler.host);
                     let src_path = llvm_bin_dir.join(&tool_exe);
 
-                    // When using `download-ci-llvm`, some of the tools may not exist, so skip trying to copy them.
-                    if !src_path.exists() && builder.config.llvm_from_ci {
-                        eprintln!("{} does not exist; skipping copy", src_path.display());
-                        continue;
+                    if !src_path.exists() {
+                        // When using `download-ci-llvm`, some of the tools may not exist, so skip trying to copy them.
+                        if llvm_output.kind() == LlvmKind::DownloadedFromCi {
+                            eprintln!("{} does not exist; skipping copy", src_path.display());
+                            continue;
+                        }
+                        // On older LLVM versions, llubi isn't in the default tools. Remove this
+                        // code when LLVM 23 is the minimum version.
+                        if *tool == "llubi" {
+                            continue;
+                        }
                     }
 
                     // There is a chance that these tools are being installed from an external LLVM.
@@ -2445,8 +2924,8 @@ impl Step for Assemble {
                 // soon as rustc honors `-Cstrip`. Keep the runtime next to the
                 // assembled tools; this is narrower than treating every system
                 // LLVM library as a compiler runtime dependency.
-                if target.contains("apple-darwin") && builder.config.is_system_llvm(target) {
-                    let external_llvm_libdir = command(&host_llvm_config)
+                if target.contains("apple-darwin") && llvm_output.kind() == LlvmKind::External {
+                    let external_llvm_libdir = command(host_llvm.llvm_config())
                         .arg("--libdir")
                         .cached()
                         .run_capture_stdout(builder)
@@ -2515,6 +2994,18 @@ impl Step for Assemble {
             return target_compiler;
         }
 
+        // Trust: establish the selected LLD provider before recursive compiler
+        // work. Keep the compiler-dependent wrapper and installation below.
+        if builder.config.lld_enabled {
+            builder.ensure(llvm::Lld { target: target_compiler.host });
+        }
+
+        // Trust: TPDE's existing provider checks precede compiler recursion;
+        // installation below retains the same option and Linux-host boundary.
+        if builder.config.llvm_tpde && target_compiler.host.contains("linux") {
+            builder.ensure(llvm::Tpde { target: target_compiler.host });
+        }
+
         // Get the compiler that we'll use to bootstrap ourselves.
         //
         // Note that this is where the recursive nature of the bootstrap
@@ -2548,19 +3039,24 @@ impl Step for Assemble {
 
         if builder.config.llvm_offload && !builder.config.dry_run() {
             debug!("`llvm_offload` requested");
-            let offload_install = builder.ensure(llvm::OmpOffload { target: build_compiler.host });
-            if let Some(_llvm_config) = builder.llvm_config(builder.config.host_target) {
+            if builder.is_llvm_enabled_for(builder.config.host_target) {
+                let rust_offload =
+                    builder.ensure(llvm::RustOffload { target: build_compiler.host });
                 let target_libdir =
                     builder.sysroot_target_libdir(target_compiler, target_compiler.host);
-                for p in offload_install.offload_paths() {
+                let rust_offload_dst_lib = target_libdir.join(rust_offload.rust_offload_filename());
+                builder.copy_link(
+                    &rust_offload.rust_offload_path(),
+                    &rust_offload_dst_lib,
+                    FileType::NativeLibrary,
+                );
+
+                let omp_offload = builder.ensure(llvm::OmpOffload { target: build_compiler.host });
+                for p in omp_offload.artifact_paths_with_symlink_targets() {
                     let libname = p.file_name().unwrap();
                     let dst_lib = target_libdir.join(libname);
                     builder.resolve_symlink_and_copy(&p, &dst_lib);
                 }
-                // FIXME(offload): Add amdgcn-amd-amdhsa and nvptx64-nvidia-cuda folder
-                // This one is slightly more tricky, since we have the same file twice, in two
-                // subfolders for amdgcn and nvptx64. We'll likely find two more in the future, once
-                // Intel and Spir-V support lands in offload.
             }
         }
 
@@ -2624,25 +3120,26 @@ impl Step for Assemble {
         for f in builder.read_dir(&src_libdir) {
             let filename = f.file_name().into_string().unwrap();
 
-            let is_proc_macro = proc_macros.contains(&filename);
-            let is_dylib_or_debug = is_dylib(&f.path()) || is_debug_info(&filename);
+            // `rustc_driver` statically links to stdlib, so do not copy the libstd dynamic library file.
+            // Trust keeps the apple-darwin exception from before: there the libstd
+            // dynamic library is still copied.
+            let can_be_rustc_dynamic_dep = target_compiler.host.contains("apple-darwin")
+                || !(filename.starts_with("std-") || filename.starts_with("libstd-"));
 
-            // If we link statically to stdlib, do not copy the libstd dynamic library file
-            // FIXME: Also do this for Windows once incremental post-optimization stage0 tests
-            // work without std.dll (see https://github.com/rust-lang/rust/pull/131188).
-            let can_be_rustc_dynamic_dep = if builder
-                .link_std_into_rustc_driver(target_compiler.host)
-                && !target_compiler.host.is_windows()
-                && !target_compiler.host.contains("apple-darwin")
-            {
-                let is_std = filename.starts_with("std-") || filename.starts_with("libstd-");
-                !is_std
-            } else {
-                true
-            };
+            // Trust: reject ineligible files before reading their bytes. In
+            // particular, rlib/rmeta files need no proc-macro scan at all.
+            if !can_be_rustc_dynamic_dep || proc_macros.contains(&filename) {
+                continue;
+            }
+            let path = f.path();
+            let is_dylib_or_debug = is_dylib(&path) || is_debug_info(&filename);
 
-            if is_dylib_or_debug && can_be_rustc_dynamic_dep && !is_proc_macro {
-                builder.copy_link(&f.path(), &rustc_libdir.join(&filename), FileType::Regular);
+            // Trust: the name set comes from THIS build's stamp while `src_libdir`
+            // belongs to the build compiler, a different generation whose
+            // `-Cextra-filename` differs — so names alone cannot exclude proc
+            // macros. Check every eligible dylib/debug file's actual bytes.
+            if is_dylib_or_debug && !is_proc_macro_dylib(&path) {
+                builder.copy_link(&path, &rustc_libdir.join(&filename), FileType::Regular);
             }
         }
 
@@ -2677,7 +3174,8 @@ impl Step for Assemble {
         }
 
         // In addition to `rust-lld` also install `wasm-component-ld` when
-        // is enabled. This is used by the `wasm32-wasip2` target of Rust.
+        // is enabled. This is used by targets that produce WebAssembly
+        // components in Rust such as `wasm32-wasip{2,3}`.
         if builder.tool_enabled("wasm-component-ld") {
             let wasm_component = builder.ensure(
                 crate::core::build_steps::tool::WasmComponentLd::for_use_by_compiler(
@@ -2693,6 +3191,26 @@ impl Step for Assemble {
         }
 
         maybe_install_llvm_bitcode_linker();
+
+        if builder.config.llvm_tpde {
+            debug!("`llvm_tpde` requested");
+            // The rustc TPDE integration is Linux-only for now
+            if !host.contains("linux") {
+                builder.info(&format!("host target `{host}` not supported by tpde. skipping"));
+            } else {
+                // Put TPDE next to librustc_driver.so
+                let tpde_output = builder.ensure(llvm::Tpde { target: host });
+                let target_libdir =
+                    builder.sysroot_target_libdir(target_compiler, target_compiler.host);
+                let target_dst_lib =
+                    target_libdir.join(tpde_output.plugin_path().file_name().unwrap());
+                builder.copy_link(
+                    tpde_output.plugin_path(),
+                    &target_dst_lib,
+                    FileType::NativeLibrary,
+                );
+            }
+        }
 
         // Ensure that `libLLVM.so` ends up in the newly build compiler directory,
         // so that it can be found when the newly built `rustc` is run.
@@ -2715,6 +3233,40 @@ impl Step for Assemble {
         let trustc = bindir.join(exe("trustc", host));
         debug!(src = ?rustc, dst = ?trustc, "linking trustc compiler alias");
         builder.copy_link(&rustc, &trustc, FileType::Executable);
+
+        // Trust: ship the trust-ir → trust-cg self-host backend into this
+        // sysroot's `codegen-backends/` when it is enabled for the host.
+        //
+        // ORDERING, and it is load-bearing in BOTH directions:
+        //
+        // * not earlier — the plugin is `dlopen`ed into this compiler and must
+        //   share one copy of `librustc_driver` (and `libstd`) with it, so it
+        //   links against the runtime dylibs copied into `rustc_libdir` above
+        //   and against the rustc rmetas of the build that produced them.
+        //
+        // * not later — the `Std` step immediately below compiles std USING
+        //   `target_compiler`. When `target_compiler`'s default backend is
+        //   trust-ir-cg (the self-host configuration) that compilation, and the
+        //   `--print=deployment-target` probe that sets it up, both resolve the
+        //   backend at startup and cannot start without this file. This call
+        //   used to sit at the end of `Assemble`, after the std block, and the
+        //   module docs' claim that a stage-N compiler "finds it before it
+        //   compiles a single unit of stage N+1" was true only for N+1: stage N
+        //   compiles its OWN std here, first. Measured 2026-09-14: a self-compile
+        //   with `codegen-backends = ["trust-ir-cg", "llvm", "trust-cg"]` failed
+        //   6:27 in, immediately after "Creating standalone Trust sysroot for
+        //   stage1 compiler", with `failed to find a codegen-backends folder in
+        //   the sysroot candidates: build/<host>/stage1`.
+        crate::core::build_steps::trust_ir_cg::install_into_sysroot(
+            builder,
+            build_compiler,
+            target_compiler,
+        );
+
+        // Trust: install mathematical DATA before this compiler can execute for Std.
+        crate::core::build_steps::vf5_resource::install_into_sysroot(
+            builder, build_compiler, target_compiler, &sysroot,
+        );
 
         // Build (or select an uplifted) std without linking it through the
         // build compiler's normal StdLink destination, then install that exact
@@ -2768,7 +3320,7 @@ impl Step for Assemble {
             // clean pruned sysroot, exactly as dist images do; `trustc-dev`
             // remains the supported way to get rustc_private for such a target.
             if builder.kind == Kind::Build && build_compiler.host == host {
-                add_to_sysroot(builder, &host_libdir, &host_libdir, &stamp);
+                install_local_rustc_dev(builder, target_compiler, &stamp, &std_stamp);
             }
             crate::core::build_steps::tool::ensure_user_facing_tools(
                 builder,
@@ -2778,6 +3330,33 @@ impl Step for Assemble {
         }
 
         validate_assembled_local_compiler(builder, target_compiler, &sysroot);
+
+        // Trust: final Targo binds the completed compiler image/runtime. Keep
+        // its construction out of Sysroot's own graph, while retaining every
+        // selected tool and the existing intermediate-generation policy.
+        crate::core::build_steps::tool::finish_verifier_tool_bins_after_assembly(
+            builder,
+            target_compiler,
+            &sysroot,
+        );
+
+        // Trust: that was this sysroot's last frontend install. A `targo` it
+        // ships carries its `cargo` alias, or assembly stops here.
+        crate::core::build_steps::tool::validate_sysroot_compat_aliases(
+            builder,
+            target_compiler,
+            &sysroot,
+        );
+
+        // Trust: this invocation assembled the host stage-1 compiler, so a green finish
+        // records the key of this build directory for other worktrees to seed from
+        // (`utils::trust_stage1_seed`, EW-9).
+        if target_compiler.stage == 1
+            && target_compiler.host == builder.config.host_target
+            && !builder.config.dry_run()
+        {
+            crate::utils::trust_stage1_seed::note_stage1_assembled();
+        }
 
         target_compiler
     }
@@ -2896,23 +3475,7 @@ pub(crate) fn prepare_rustc_private_tool_sysroot(
         return prepare_rustc_private_sysroot(builder, rustc_build_compiler, target, label);
     }
 
-    let mut runtime_paths = builder.rustc_lib_paths(runtime_compiler);
-    let target_runtime_libdir = builder.sysroot_target_libdir(runtime_compiler, target);
-    runtime_paths.push(target_runtime_libdir);
-    runtime_paths.dedup();
-    let runtime_dylibs = runtime_paths
-        .iter()
-        .flat_map(|path| rustc_private_runtime_dylibs(path))
-        .collect::<Vec<_>>();
-    assert!(
-        !runtime_dylibs.is_empty(),
-        "cannot build a rustc-private tool for stage{} compiler ({}): \
-         no runtime dylibs found in runtime search paths: {}",
-        runtime_compiler.stage,
-        runtime_compiler.host,
-        runtime_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "),
-    );
-    let runtime_identity = rustc_private_runtime_dylib_identity(runtime_dylibs);
+    let runtime_identity = rustc_private_tool_runtime_identity(builder, runtime_compiler);
 
     prepare_rustc_private_sysroot_with_runtime_identity(
         builder,
@@ -2921,6 +3484,62 @@ pub(crate) fn prepare_rustc_private_tool_sysroot(
         label,
         Some(&runtime_identity),
     )
+}
+
+/// The identity of the runtime a rustc-private tool built for `runtime_compiler`
+/// loads: every dylib in that compiler's own dylib directories
+/// (`Builder::rustc_lib_paths`, where the tool's rpath points: librustc_driver
+/// and libstd), by path and bytes.
+///
+/// Not the compiler's target libdir. `x build`'s rustc-dev top-up puts the
+/// compiler's proc-macro dylibs there and `x dist`'s assembly prunes them
+/// (`Assemble`), and no tool loads them when it runs. With that directory in
+/// the identity, one tool had two private sysroots, so two `-L` paths in its
+/// RUSTFLAGS, two cargo metadata hashes and two binaries: the dist archives
+/// shipped one and the local stage2 sysroot held the other, and the seed
+/// mint's `verify-archives-carry-compared` refused the cut (D8 of the first
+/// mint, 2026-10-14).
+fn rustc_private_tool_runtime_identity(
+    builder: &Builder<'_>,
+    runtime_compiler: Compiler,
+) -> String {
+    let runtime_dylibs = rustc_runtime_dylib_files(builder, runtime_compiler);
+    assert!(
+        !runtime_dylibs.is_empty(),
+        "cannot build a rustc-private tool for stage{} compiler ({}): \
+         no runtime dylibs found in runtime search paths: {}",
+        runtime_compiler.stage,
+        runtime_compiler.host,
+        builder
+            .rustc_lib_paths(runtime_compiler)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    rustc_private_runtime_dylib_identity(runtime_dylibs)
+}
+
+// Trust: enumerate the actual host runtime, not the target std output being built.
+fn rustc_runtime_dylib_files(builder: &Builder<'_>, runtime_compiler: Compiler) -> Vec<PathBuf> {
+    let mut runtime_paths = builder.rustc_lib_paths(runtime_compiler);
+    runtime_paths.dedup();
+    runtime_paths.iter().flat_map(|path| rustc_private_runtime_dylibs(path)).collect()
+}
+
+/// Trust: the shim's path and a thin launcher's mtime do not identify rustc.
+/// Hash its real launcher and host runtime bytes before reusing std or Cargo's
+/// cached version query. A static compiler legitimately has no runtime dylibs.
+pub(crate) fn std_compiler_runtime_identity(builder: &Builder<'_>, compiler: Compiler) -> String {
+    std_compiler_runtime_files_identity(
+        builder.rustc(compiler),
+        rustc_runtime_dylib_files(builder, compiler),
+    )
+}
+
+fn std_compiler_runtime_files_identity(launcher: PathBuf, mut runtime: Vec<PathBuf>) -> String {
+    runtime.push(launcher);
+    rustc_private_files_identity(b"trust-std-compiler-runtime-v1\0", &mut runtime)
 }
 
 fn prepare_rustc_private_sysroot_with_runtime_identity(
@@ -3319,6 +3938,13 @@ fn prune_public_sysroot_compiler_artifacts(dst: &Path) {
         return;
     }
 
+    // Trust: a dist/test assembly must not retain a previous local build's
+    // compiler helper population. A local build reinstalls its current stamp.
+    let private = dst.join("rustc-dependencies");
+    if private.exists() {
+        t!(fs::remove_dir_all(&private));
+    }
+
     for entry in t!(fs::read_dir(dst)) {
         let entry = t!(entry);
         let filename = entry.file_name();
@@ -3326,6 +3952,79 @@ fn prune_public_sysroot_compiler_artifacts(dst: &Path) {
         let Some(artifact) = parse_hashed_rust_artifact(filename) else { continue };
         if should_prune_public_sysroot_artifact(dst, artifact) {
             trace!(path = ?entry.path(), "removing private compiler artifact from public sysroot");
+            t!(fs::remove_file(entry.path()));
+        }
+    }
+}
+
+/// Trust: install one actual compiler producer's development closure using the
+/// same routing for ordinary local Assemble and the explicit BUILD component.
+fn install_local_rustc_dev(
+    builder: &Builder<'_>,
+    compiler: Compiler,
+    compiler_stamp: &BuildStamp,
+    std_stamp: &BuildStamp,
+) {
+    let host_libdir = builder.sysroot_target_libdir(compiler, compiler.host);
+    add_to_sysroot(builder, &host_libdir, &host_libdir, compiler_stamp);
+    // Preserve both closures without ambiguous bare std helper imports.
+    separate_compiler_std_dependencies(
+        &host_libdir,
+        &builder.read_stamp_file(std_stamp),
+        &builder.read_stamp_file(compiler_stamp),
+    );
+    dist::maybe_install_llvm_native_dev(builder, compiler.host, &builder.sysroot(compiler));
+}
+
+/// Trust: std and rustc legitimately depend on different versions of helpers
+/// such as libc/hashbrown. Keep std's exact stems public and every current
+/// compiler helper in a dependency-only directory; deleting the latter breaks
+/// direct rustc_private consumers with E0460, while leaving both public causes
+/// bare helper imports to fail with E0464.
+fn separate_compiler_std_dependencies(
+    dst: &Path,
+    std_entries: &[(PathBuf, DependencyType)],
+    compiler_entries: &[(PathBuf, DependencyType)],
+) {
+    let mut std_stems: HashMap<String, HashSet<String>> = HashMap::new();
+    for (path, _) in std_entries {
+        let Some(filename) = path.file_name().and_then(OsStr::to_str) else { continue };
+        let Some(artifact) = parse_hashed_rust_artifact(filename) else { continue };
+        std_stems
+            .entry(artifact.crate_name.to_owned())
+            .or_default()
+            .insert(artifact.stem.to_owned());
+    }
+    let current: HashSet<_> = compiler_entries
+        .iter()
+        .filter_map(|(path, _)| path.file_name().map(OsStr::to_owned))
+        .collect();
+    let private = dst.join("rustc-dependencies");
+    for entry in t!(fs::read_dir(dst)) {
+        let entry = t!(entry);
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else { continue };
+        let Some(artifact) = parse_hashed_rust_artifact(name) else { continue };
+        let Some(stems) = std_stems.get(artifact.crate_name) else { continue };
+        if stems.contains(artifact.stem) {
+            continue;
+        }
+        if current.contains(&filename) {
+            t!(fs::create_dir_all(&private));
+            let private_path = private.join(&filename);
+            // Trust: repeated assembly can give these paths the same inode.
+            // POSIX rename then does nothing, leaving the helper public too.
+            // Remove the old destination so the move always removes that name.
+            t!(match fs::remove_file(&private_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            });
+            t!(fs::rename(entry.path(), private_path));
+            record_sysroot_install(&private, name);
+        } else {
+            // A public helper from an earlier build is in neither active
+            // population. Do not export it as part of the new private closure.
             t!(fs::remove_file(entry.path()));
         }
     }
@@ -3381,13 +4080,10 @@ mod tests;
 /// build stamp, and thus be included in dist archives and copied into sysroots by default.
 /// Note that some kinds of artifacts are copied automatically (e.g. native libraries).
 pub enum ArtifactKeepMode {
-    /// Only keep .rlib files, ignore .rmeta files
-    OnlyRlib,
+    // Trust: omit the unconstructed OnlyDylib mode; native libraries are retained below.
     /// Only keep .rmeta files, ignore .rlib files
     OnlyRmeta,
     /// Keep both .rlib and .rmeta files.
-    /// This is essentially only useful when using `-Zno-embed-metadata`, in which case both the
-    /// .rlib and .rmeta files are needed for compilation/linking.
     BothRlibAndRmeta,
     /// Custom logic for keeping an artifact
     /// It receives the filename of an artifact, and returns true if it should be kept.
@@ -3404,8 +4100,6 @@ pub fn run_cargo(
 ) -> Vec<PathBuf> {
     // `target_root_dir` looks like $dir/$target/release
     let target_root_dir = stamp.path().parent().unwrap();
-    // `target_build_dir` looks like $dir/$target/release/build
-    let target_build_dir = target_root_dir.join("build");
     // `host_root_dir` looks like $dir/release
     let host_root_dir = target_root_dir
         .parent()
@@ -3423,7 +4117,7 @@ pub fn run_cargo(
         let (filenames_vec, crate_types) = match msg {
             CargoMessage::CompilerArtifact {
                 filenames,
-                target: CargoTarget { crate_types },
+                target: CargoTarget { crate_types, .. },
                 ..
             } => {
                 let mut f: Vec<String> = filenames.into_iter().map(|s| s.into_owned()).collect();
@@ -3443,7 +4137,6 @@ pub fn run_cargo(
                 true
             } else {
                 match &artifact_keep_mode {
-                    ArtifactKeepMode::OnlyRlib => filename.ends_with(".rlib"),
                     ArtifactKeepMode::OnlyRmeta => filename.ends_with(".rmeta"),
                     ArtifactKeepMode::BothRlibAndRmeta => {
                         filename.ends_with(".rmeta") || filename.ends_with(".rlib")
@@ -3476,7 +4169,7 @@ pub fn run_cargo(
 
             // If this was output in the `deps` dir then this is a precise file
             // name (hash included) so we start tracking it.
-            if filename.starts_with(&target_build_dir) {
+            if is_precise_cargo_artifact(filename, target_root_dir) {
                 deps.push((filename.to_path_buf(), DependencyType::Target));
                 continue;
             }
@@ -3503,7 +4196,7 @@ pub fn run_cargo(
     });
 
     if !ok {
-        crate::exit!(1);
+        helpers::exit_process(1);
     }
 
     if builder.config.dry_run() {
@@ -3512,20 +4205,9 @@ pub fn run_cargo(
 
     // Ok now we need to actually find all the files listed in `toplevel`. We've
     // got a list of prefix/extensions and we need to find the hashed copy in
-    // the `build` folder corresponding to each top-level artifact.
-    //
-    // Cargo's build folder is structured as `build/<pkg>/<hash>/out/<artifacts>` so
-    // we need to traverse multiple directory layers to get to actual files.
-    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
-    let contents = target_build_dir
-        .read_dir()
-        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", target_build_dir.display(), e))
-        .map(|e| e.unwrap())
-        .flat_map(|e| read_dir(&e.path()))
-        .flat_map(|e| read_dir(&e.path()))
-        .flat_map(|e| read_dir(&e.path()))
-        .map(|e| (e.path(), e.file_name().into_string().unwrap(), t!(e.metadata())))
-        .collect::<Vec<_>>();
+    // active Cargo layout corresponding to each top-level artifact. Trust:
+    // accept both layouts; the stage0 compatibility lane uses shared `deps`.
+    let contents = cargo_artifact_candidates(target_root_dir);
     for (top_level_path, prefix, extension, expected_len) in toplevel {
         let candidates = contents
             .iter()
@@ -3568,6 +4250,33 @@ pub fn run_cargo(
     }
     t!(fs::write(stamp.path(), &new_contents));
     deps.into_iter().map(|(d, _)| d).collect()
+}
+
+// Trust: Cargo reports exact dependency paths in either supported layout.
+// Treating an already-hashed legacy `deps/libfoo-HASH.rmeta` as a top-level
+// alias incorrectly searches for `libfoo-HASH-OTHERHASH.rmeta`.
+// Upstream 1.101: example artifacts are likewise already hashed
+// (`examples/libfoo-HASH.rmeta`, e.g. trust-os's `dirfd` example under
+// `x.py check --all-targets`); treating one as a top-level alias searches
+// for a second hash that does not exist and panics the check.
+fn is_precise_cargo_artifact(path: &Path, target_root_dir: &Path) -> bool {
+    path.starts_with(target_root_dir.join("deps"))
+        || path.starts_with(target_root_dir.join("build"))
+        || path.starts_with(target_root_dir.join("examples"))
+}
+
+// Trust: top-level aliases still require byte-for-byte matching, whether Cargo
+// stores their hashed counterparts in `deps` or `build/<pkg>/<hash>/out`.
+fn cargo_artifact_candidates(target_root_dir: &Path) -> Vec<(PathBuf, String, fs::Metadata)> {
+    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
+    let unit_outputs = read_dir(&target_root_dir.join("build"))
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()));
+    read_dir(&target_root_dir.join("deps"))
+        .chain(unit_outputs)
+        .map(|e| (e.path(), e.file_name().into_string().unwrap(), t!(e.metadata())))
+        .collect()
 }
 
 fn resolve_top_level_artifact<'a>(
@@ -3685,6 +4394,10 @@ pub fn stream_cargo(
                     // Forward JSON to stdout.
                     println!("{line}");
                 }
+                // Trust: every unit this run's cargo reports is a root of the prune that
+                // follows a successful run (`utils::trust_prune`).
+                #[cfg(unix)]
+                crate::utils::trust_prune::note_cargo_message(&msg);
                 cb(msg)
             }
             // If this was informational, just print it out and continue
@@ -3704,16 +4417,29 @@ pub fn stream_cargo(
     status.success()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct CargoTarget<'a> {
-    crate_types: Vec<Cow<'a, str>>,
+    pub crate_types: Vec<Cow<'a, str>>,
+    #[serde(default)]
+    pub doc: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(tag = "reason", rename_all = "kebab-case")]
 pub enum CargoMessage<'a> {
-    CompilerArtifact { filenames: Vec<Cow<'a, str>>, target: CargoTarget<'a> },
-    BuildScriptExecuted,
+    CompilerArtifact {
+        filenames: Vec<Cow<'a, str>>,
+        target: CargoTarget<'a>,
+        // Trust: whether cargo found the unit up to date and compiled nothing; the prune
+        // after a successful run roots the unit either way (`utils::trust_prune`).
+        #[serde(default)]
+        fresh: bool,
+    },
+    // Trust: the `OUT_DIR` of the build-script run unit, which the prune roots.
+    BuildScriptExecuted {
+        #[serde(default)]
+        out_dir: Option<Cow<'a, str>>,
+    },
     BuildFinished,
 }
 

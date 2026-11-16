@@ -135,23 +135,26 @@ echo "targo:  $TARGO_BIN  ($("$TARGO_BIN" --unverified --version 2>&1 | head -1)
 # which takes it itself.
 # ---------------------------------------------------------------------------
 #
-# `--pid $$` is LOAD-BEARING and was missing. `acquire` defaults the holder pid
-# to its OWN `$$` — the pid of the `bash trust_build_lock.sh` subprocess, which
-# exits the instant it prints the token. The lock on disk therefore named a DEAD
+# `--pid $$` is LOAD-BEARING and was missing. The former shell owner defaulted
+# the holder pid to its own short-lived administrative process, which exited as
+# soon as it printed the token. Native acquisition requires an explicit durable
+# owner. The old lock on disk therefore named a DEAD
 # holder from the moment it was taken, and reclaim of a dead holder is automatic,
 # so the very next acquirer walked straight through it. Measured 2026-08-29:
 # `status` reported `free` while a census sweep was running, and a second
 # invocation acquired the lock without waiting. A lock that self-releases is a
 # silent instrument — worse than none, because it reads as protection.
 # `scripts/run_measurement_sweep.sh` already passes `--pid $$`; this now matches.
-LOCK_TOKEN=""
-if [ -x "$REPO/scripts/trust_build_lock.sh" ]; then
-  LOCK_TOKEN="$(bash "$REPO/scripts/trust_build_lock.sh" acquire \
-      --kind measurement --purpose "call-summary census" --pid $$ --wait 120 2>/dev/null \
-      | tail -1)"
-  # shellcheck disable=SC2064
-  [ -n "$LOCK_TOKEN" ] && trap "bash '$REPO/scripts/trust_build_lock.sh' release '$LOCK_TOKEN' >/dev/null 2>&1" EXIT
-fi
+INHERITED_LOCK_TOKEN="${TRUST_BUILD_LOCK_TOKEN:-}"
+LOCK_TOKEN="$("$TARGO_BIN" trust repo lock acquire --repo-root "$REPO" \
+    --kind measurement --purpose "call-summary census" --pid $$ --wait 120)" || exit 3
+[ -n "$LOCK_TOKEN" ] || { echo 'native measurement lease returned no token' >&2; exit 3; }
+release_measurement_lock() {
+  if [ "$LOCK_TOKEN" != "$INHERITED_LOCK_TOKEN" ]; then
+    "$TARGO_BIN" trust repo lock release "$LOCK_TOKEN" --repo-root "$REPO" >/dev/null 2>&1
+  fi
+}
+trap release_measurement_lock EXIT
 
 # ---------------------------------------------------------------------------
 # Optional: produce a real corpus.
@@ -318,8 +321,7 @@ restore_submodule_lock() {
 }
 cleanup_lock_snapshot() { [ -n "$LOCK_SNAPSHOT" ] && rm -f "$LOCK_SNAPSHOT"; return 0; }
 if [ -n "$LOCK_TOKEN" ]; then
-  # shellcheck disable=SC2064
-  trap "restore_submodule_lock; cleanup_lock_snapshot; bash '$REPO/scripts/trust_build_lock.sh' release '$LOCK_TOKEN' >/dev/null 2>&1" EXIT
+  trap 'restore_submodule_lock; cleanup_lock_snapshot; release_measurement_lock' EXIT
 else
   trap 'restore_submodule_lock; cleanup_lock_snapshot' EXIT
 fi

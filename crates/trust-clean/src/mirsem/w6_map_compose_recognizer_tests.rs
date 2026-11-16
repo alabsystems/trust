@@ -584,6 +584,7 @@ fn second_call_in_none_arm_declines() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
     };
     let callees = registry(&func, "map_add1::{closure#0}");
     assert!(sem_adt_map_compose_of_discriminant_switch(&func, &callees).is_none());

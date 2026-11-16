@@ -16,7 +16,7 @@
 
 use trust_cg_lower::function::Function as LirFunction;
 use trust_cg_lower::instructions::{Block, Instruction, Opcode, Value};
-use trust_types::fx::FxHashSet;
+use trust_types::fx::{FxHashMap, FxHashSet};
 
 /// Errors detected during LIR validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,10 +78,26 @@ pub fn validate_lir(func: &LirFunction) -> Result<(), Vec<ValidationError>> {
         function_params.insert(Value(i));
     }
 
+    let dominators = immediate_dominators(func);
+
     for (block_id, bb) in block_order {
+        // Defined on entry to this block: the function's arguments, this
+        // block's parameters, and every value a STRICT dominator defines —
+        // each path from the entry to here has run that definition. A block
+        // the entry does not reach has no dominators and sees only its own.
         let mut block_defined = function_params.clone();
         for (val, _ty) in &bb.params {
             block_defined.insert(*val);
+        }
+        let mut dominator = dominators.get(&block_id).copied().flatten();
+        while let Some(up) = dominator {
+            if let Some(up_bb) = func.blocks.get(&up) {
+                block_defined.extend(up_bb.params.iter().map(|(value, _)| *value));
+                block_defined.extend(
+                    up_bb.instructions.iter().flat_map(|instr| instr.results.iter().copied()),
+                );
+            }
+            dominator = dominators.get(&up).copied().flatten();
         }
         let mut seen_results: FxHashSet<Value> = FxHashSet::default();
 
@@ -145,6 +161,112 @@ pub fn validate_lir(func: &LirFunction) -> Result<(), Vec<ValidationError>> {
     }
 
     if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Visit the branch targets of one instruction.
+fn for_each_branch_target(opcode: &Opcode, mut f: impl FnMut(Block)) {
+    match opcode {
+        Opcode::Jump { dest } => f(*dest),
+        Opcode::Brif { then_dest, else_dest, .. } => {
+            f(*then_dest);
+            f(*else_dest);
+        }
+        Opcode::Switch { cases, default } => {
+            for (_, block) in cases {
+                f(*block);
+            }
+            f(*default);
+        }
+        Opcode::Invoke { normal_dest, unwind_dest, .. } => {
+            f(*normal_dest);
+            f(*unwind_dest);
+        }
+        _ => {}
+    }
+}
+
+/// The immediate dominator of every block the entry reaches (`None` for the
+/// entry itself); a block the entry does not reach is absent. The iterative
+/// algorithm of Cooper, Harvey and Kennedy over reverse postorder.
+fn immediate_dominators(func: &LirFunction) -> FxHashMap<Block, Option<Block>> {
+    let successors = |block: Block| -> Vec<Block> {
+        let mut out = Vec::new();
+        if let Some(bb) = func.blocks.get(&block) {
+            for instr in &bb.instructions {
+                for_each_branch_target(&instr.opcode, |target| {
+                    if func.blocks.contains_key(&target) {
+                        out.push(target);
+                    }
+                });
+            }
+        }
+        out
+    };
+    // Postorder by an explicit stack, from the entry.
+    let mut postorder = Vec::new();
+    let mut visited = FxHashSet::default();
+    let mut predecessors: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+    if func.blocks.contains_key(&func.entry_block) {
+        visited.insert(func.entry_block);
+        let mut stack = vec![(func.entry_block, successors(func.entry_block), 0usize)];
+        while let Some((_, succs, next)) = stack.last_mut() {
+            if let Some(&succ) = succs.get(*next) {
+                *next += 1;
+                if visited.insert(succ) {
+                    let succ_succs = successors(succ);
+                    stack.push((succ, succ_succs, 0));
+                }
+            } else {
+                let Some((block, succs, _)) = stack.pop() else { break };
+                for succ in succs {
+                    predecessors.entry(succ).or_default().push(block);
+                }
+                postorder.push(block);
+            }
+        }
+    }
+    let order: FxHashMap<Block, usize> =
+        postorder.iter().enumerate().map(|(index, block)| (*block, index)).collect();
+    let mut idom: FxHashMap<Block, Block> = FxHashMap::default();
+    idom.insert(func.entry_block, func.entry_block);
+    let intersect = |idom: &FxHashMap<Block, Block>, mut a: Block, mut b: Block| {
+        while a != b {
+            while order[&a] < order[&b] {
+                a = idom[&a];
+            }
+            while order[&b] < order[&a] {
+                b = idom[&b];
+            }
+        }
+        a
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block in postorder.iter().rev() {
+            if block == func.entry_block {
+                continue;
+            }
+            let mut new_idom = None;
+            for &pred in predecessors.get(&block).map_or(&[][..], Vec::as_slice) {
+                if idom.contains_key(&pred) {
+                    new_idom = Some(match new_idom {
+                        None => pred,
+                        Some(current) => intersect(&idom, pred, current),
+                    });
+                }
+            }
+            if let Some(new_idom) = new_idom
+                && idom.get(&block) != Some(&new_idom)
+            {
+                idom.insert(block, new_idom);
+                changed = true;
+            }
+        }
+    }
+    idom.into_iter()
+        .map(|(block, dom)| (block, (block != func.entry_block).then_some(dom)))
+        .collect()
 }
 
 fn validate_instruction_operands(
@@ -218,10 +340,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         }
     }
 
@@ -272,10 +405,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -309,10 +453,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert_eq!(errors.len(), 1);
@@ -358,10 +513,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert_eq!(errors.len(), 2);
@@ -414,10 +580,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(
@@ -460,10 +637,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(
@@ -510,10 +698,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
@@ -562,10 +761,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
@@ -606,10 +816,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -650,10 +871,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -700,10 +932,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         // Should have at least 3 distinct error kinds
@@ -778,10 +1021,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -834,10 +1088,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -919,18 +1184,55 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
 
     #[test]
     fn test_validate_undefined_value_across_blocks() {
-        // Value defined in block0 is NOT visible to block1 through args.
+        // Value defined in block0 is NOT visible to block1: the entry block2
+        // reaches block1 without passing block0, so block0 does not dominate
+        // it. (A value of a DOMINATING block is visible:
+        // `a_value_defined_in_a_dominating_block_is_defined`.)
         let mut blocks = HashMap::new();
+        blocks.insert(
+            Block(2),
+            LirBlock {
+                params: vec![],
+                instructions: vec![
+                    Instruction {
+                        opcode: Opcode::Iconst { ty: LirType::I8, imm: 1 },
+                        args: vec![],
+                        results: vec![Value(5)],
+                    },
+                    Instruction {
+                        opcode: Opcode::Brif {
+                            cond: Value(5),
+                            then_dest: Block(0),
+                            else_dest: Block(1),
+                        },
+                        args: vec![],
+                        results: vec![],
+                    },
+                ],
+                ..Default::default()
+            },
+        );
         blocks.insert(
             Block(0),
             LirBlock {
@@ -969,17 +1271,28 @@ mod tests {
             blocks,
             block_order: vec![],
             trust_ir_origins: HashMap::new(),
-            entry_block: Block(0),
+            entry_block: Block(2),
             stack_slots: vec![],
             value_types: HashMap::new(),
             pure_callees: Default::default(),
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
@@ -1018,10 +1331,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -1067,10 +1391,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         let missing_target_count = errors
@@ -1132,10 +1467,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         assert!(errors.iter().any(|e| matches!(
@@ -1197,10 +1543,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         // This is a valid scenario by current validator rules (dup check is per-block).
         assert!(validate_lir(&func).is_ok());
@@ -1269,10 +1626,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
     }
@@ -1320,10 +1688,21 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         let errors = validate_lir(&func).unwrap_err();
         let undef_count =
@@ -1362,11 +1741,154 @@ mod tests {
             // trust-cg's LirFunction carries the libm callees ISel may treat as
             // pure; the bridge asserts no libm purity, and empty is that claim.
             libm_pure_callees: Default::default(),
+            // Trust: trust-cg 5300b401 pins the AAPCS64 hidden return-buffer (sret)
+            // convention on the function (`abi_sret_param`) and on its direct callees
+            // (`sret_arg_callees`). The bridge lowers no `ParamAttrs::sret` and never
+            // reads it, so it can classify neither side; None/empty is that statement,
+            // and it is byte-for-byte the convention trust-cg emitted before the pin.
+            abi_sret_param: None,
+            sret_arg_callees: Default::default(),
+            sret_arg_indirect_callees: Default::default(),
             debug_meta: Default::default(),
             debug_value_bindings: vec![],
             stack_protector: Default::default(),
             eh_info: Default::default(),
+            eh_type_table: Default::default(),
+            stack_limit: None,
+            target_features: Vec::new(),
         };
         assert!(validate_lir(&func).is_ok());
+    }
+
+    /// The bridge's own lowering of two ordinary bodies. A block with one
+    /// predecessor takes that predecessor's values directly, and a loop
+    /// header's parameter is read in the blocks it dominates. Both are
+    /// correct LIR; ISel accepts them and they run. The validator judges a
+    /// use by DOMINANCE (review 6 of ticket 216 cg): before that it accepted
+    /// only a value defined in the same block, and `sum_loop` validated only
+    /// while its lowering never exited (the entry block read the formal's
+    /// entry value on every pass).
+    #[test]
+    fn a_value_defined_in_a_dominating_block_is_defined() {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody,
+        };
+        let body = |blocks: Vec<BasicBlock>, locals: Vec<Ty>, arg_count: usize| VerifiableBody {
+            locals: locals
+                .into_iter()
+                .enumerate()
+                .map(|(index, ty)| LocalDecl { index, ty, name: None })
+                .collect(),
+            blocks,
+            arg_count,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        };
+        let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+            place: Place::local(local),
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let one = || Operand::Constant(ConstValue::Uint(1, 64));
+        // fn sum_loop(mut n: u64) -> u64 { while n != 0 { n -= 1 } n }
+        let sum_loop = body(
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(1)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![assign(
+                        1,
+                        Rvalue::BinaryOp(BinOp::Sub, Operand::Copy(Place::local(1)), one()),
+                    )],
+                    terminator: Terminator::Goto(BlockId(0)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(0, Rvalue::Use(Operand::Copy(Place::local(1))))],
+                    terminator: Terminator::Return,
+                },
+            ],
+            vec![Ty::u64(), Ty::u64()],
+            1,
+        );
+        // fn two(a: u64) -> u64 { let x = a + 1; /* goto */ x }
+        let two_blocks = body(
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(
+                        2,
+                        Rvalue::BinaryOp(BinOp::Add, Operand::Copy(Place::local(1)), one()),
+                    )],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![assign(0, Rvalue::Use(Operand::Copy(Place::local(2))))],
+                    terminator: Terminator::Return,
+                },
+            ],
+            vec![Ty::u64(), Ty::u64(), Ty::u64()],
+            1,
+        );
+        for (name, body) in [("sum_loop", sum_loop), ("two_blocks", two_blocks)] {
+            let lir = crate::lower::lower_body_to_lir(name, &body).expect("lowers");
+            if let Err(errors) = validate_lir(&lir) {
+                panic!("{name}: the bridge's lowering must validate: {errors:?}");
+            }
+        }
+    }
+
+    /// A value defined on ONE path into a join is not defined at the join:
+    /// the block that defines it does not dominate the use.
+    #[test]
+    fn a_value_defined_on_one_arm_of_a_diamond_is_undefined_at_the_join() {
+        let mut func = make_valid_function();
+        let block = |instructions: Vec<Instruction>| LirBlock {
+            params: vec![],
+            instructions,
+            ..Default::default()
+        };
+        let inst = |opcode: Opcode, args: Vec<Value>, results: Vec<Value>| Instruction {
+            opcode,
+            args,
+            results,
+        };
+        func.signature = Signature { params: vec![LirType::I32], returns: vec![LirType::I32] };
+        func.blocks.clear();
+        func.blocks.insert(
+            Block(0),
+            block(vec![inst(
+                Opcode::Brif { cond: Value(0), then_dest: Block(1), else_dest: Block(2) },
+                vec![],
+                vec![],
+            )]),
+        );
+        func.blocks.insert(
+            Block(1),
+            block(vec![
+                inst(Opcode::Iconst { ty: LirType::I32, imm: 7 }, vec![], vec![Value(1)]),
+                inst(Opcode::Jump { dest: Block(3) }, vec![], vec![]),
+            ]),
+        );
+        func.blocks
+            .insert(Block(2), block(vec![inst(Opcode::Jump { dest: Block(3) }, vec![], vec![])]));
+        func.blocks.insert(Block(3), block(vec![inst(Opcode::Return, vec![Value(1)], vec![])]));
+        let errors = validate_lir(&func).unwrap_err();
+        assert_eq!(
+            errors,
+            vec![ValidationError::UndefinedValue { block: Block(3), value: Value(1) }]
+        );
     }
 }

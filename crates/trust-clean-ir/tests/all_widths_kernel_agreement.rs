@@ -131,9 +131,7 @@ fn kernel_agrees_at(carrier: Carrier, decl_tpl: &str, name: &str, args: &[u128])
                 carrier.ty(),
                 i128::try_from(*a).expect("an admitted carrier value fits an i128"),
             )
-            .unwrap_or_else(|e| {
-                panic!("{a} must be a valid {} argument: {e:?}", carrier.clean)
-            })
+            .unwrap_or_else(|e| panic!("{a} must be a valid {} argument: {e:?}", carrier.clean))
         })
         .collect();
     let outcome = interp
@@ -175,12 +173,21 @@ fn kernel_agrees_at(carrier: Carrier, decl_tpl: &str, name: &str, args: &[u128])
 #[test]
 fn every_admitted_width_projects_and_holds_its_constant() {
     for c in WIDTHS {
-        assert_eq!(kernel_agrees_at(c, "def pick (a : {C}) (b : {C}) : {C} := a", "pick", &[7, 9]), 7);
-        assert_eq!(kernel_agrees_at(c, "def snd (a : {C}) (b : {C}) : {C} := b", "snd", &[7, 9]), 9);
+        assert_eq!(
+            kernel_agrees_at(c, "def pick (a : {C}) (b : {C}) : {C} := a", "pick", &[7, 9]),
+            7
+        );
+        assert_eq!(
+            kernel_agrees_at(c, "def snd (a : {C}) (b : {C}) : {C} := b", "snd", &[7, 9]),
+            9
+        );
         assert_eq!(kernel_agrees_at(c, "def seven (a : {C}) : {C} := 7", "seven", &[3]), 7);
         // The projection at the boundary: a value the NEXT width down cannot
         // hold must survive being projected at this one.
-        assert_eq!(kernel_agrees_at(c, "def pick (a : {C}) (b : {C}) : {C} := a", "pick", &[c.max(), 0]), c.max());
+        assert_eq!(
+            kernel_agrees_at(c, "def pick (a : {C}) (b : {C}) : {C} := a", "pick", &[c.max(), 0]),
+            c.max()
+        );
     }
 }
 
@@ -277,11 +284,7 @@ fn the_kernel_oracle_rejects_a_wrong_answer_at_every_width() {
         let tc = TypeChecker::new(&env);
 
         // The right answer, which the rows above rely on being accepted.
-        assert!(
-            tc.is_def_eq(&reduced, &c.of_nat(0)),
-            "{}: MAX + 1 must reduce to 0",
-            c.clean,
-        );
+        assert!(tc.is_def_eq(&reduced, &c.of_nat(0)), "{}: MAX + 1 must reduce to 0", c.clean,);
         // The answer a body emitted one width too wide would give, reduced into
         // this carrier so the rejection cannot be about representability.
         assert!(

@@ -1,38 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only alignment checks for Trust Cargo manifests.
+"""Audit local patch targets, external fabric consumers, and solver fanout.
 
-The Trust repository has several Cargo entry points for different developer
-workflows. Four separate jobs live here, and only the second is about drift:
-
-1. Patch-table coverage across the root, `crates/` and `targo-trust`
-   manifests. Cargo patches are per-workspace and not transitive, so a source
-   redirect present in one entry point and missing from another can let that
-   workspace resolve a sibling from its live remote instead of the checked-out
-   submodule. Root is the baseline. A narrowly enumerated omission is permitted
-   only while the omitted package is absent from that workspace's committed
-   lock; this avoids Cargo's nondeterministic `[[patch.unused]]` churn without
-   weakening any reachable dependency edge.
-
-2. Root/`crates/` workspace membership. The two workspaces deliberately
-   overlap and deliberately do not coincide (see the header comments in both
-   manifests), so this is reported and, under
-   `--workspace-drift-advisory`, does not fail. Patch and fanout findings still
-   fail in that mode.
-
-3. The default dependency-fanout policy: `trust-bmc`, `trust-router`,
-   `trust-types` and `trust-wp` must keep the native solver backends behind
-   optional deps and non-default features, so that depending on the routing
-   layer does not pull ay/trust-mc into a consumer's tree.
-   `--fanout-tree-proof` proves it against a real `cargo tree` rather than the
-   manifest text. This policy is independent of how many workspaces exist and
-   outlives any consolidation of them.
-
-4. Local patch integrity and the standalone temporal boundary. Every local
-   patch must resolve inside this checkout to a manifest declaring the expected
-   package. The fabric fixture must remain an unpatched external consumer, and
-   every Git revision in its committed lock must still be declared by the local
-   path-dependency closure. This catches stale locks without pretending a
-   hard-coded list of optional first-party crates proves Cargo resolution.
+Targo resolves one canonical workspace. There are no parallel workspace patch
+or membership tables to compare. These checks cover policies Cargo does not:
+local patch identity, isolated consumer revisions and optional solver boundaries.
 """
 
 from __future__ import annotations
@@ -40,11 +11,43 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import os
+import shutil
 import re
 import subprocess
-from dataclasses import dataclass
+import sys
 from pathlib import Path
 from typing import Any
+
+
+def prefer_real_toml_parser() -> None:
+    """Re-exec under Python >= 3.11 when no real TOML parser is importable.
+
+    The subset parser below (`load_manifest_fallback`) exists so this checker
+    can run on Python 3.8-3.10, but it reads only the TOML subset the manifests
+    used when it was written. They have since grown triple-quoted strings, and
+    on this repo's machines the default `python3` is 3.9 — so the required
+    `fast.cargo-manifest-alignment` row crashed with a SyntaxError and exited 1,
+    the same code as a real finding (measured 2026-09-27: red since 2026-09-10,
+    and not for any alignment reason). Same shim, same interpreter search order,
+    as scripts/validate_upstream_rust_compat_summary.py.
+    """
+    if sys.version_info >= (3, 11):
+        return
+    try:
+        import tomli  # noqa: F401
+    except ModuleNotFoundError:
+        pass
+    else:
+        return
+    for minor in (14, 13, 12, 11):
+        candidate = shutil.which(f"python3.{minor}")
+        if candidate:
+            os.execv(candidate, [candidate, *sys.argv])
+
+
+if __name__ == "__main__":
+    prefer_real_toml_parser()
 
 try:
     import tomllib
@@ -57,42 +60,7 @@ except ModuleNotFoundError:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-MANIFESTS = {
-    "root": REPO_ROOT / "Cargo.toml",
-    "crates": REPO_ROOT / "crates" / "Cargo.toml",
-    "targo-trust": REPO_ROOT / "targo-trust" / "Cargo.toml",
-}
-
-WORKSPACE_LOCKS = {
-    "root": REPO_ROOT / "Cargo.lock",
-    "crates": REPO_ROOT / "crates" / "Cargo.lock",
-    "targo-trust": REPO_ROOT / "targo-trust" / "Cargo.lock",
-}
-
-# These packages are intentionally absent from the named workspace graphs.
-# Keeping their patches anyway creates `[[patch.unused]]` rows whose ordering
-# Cargo does not stabilize across lock regeneration. This is not a blanket
-# patch-alignment waiver: check_patch_alignment accepts one of these omissions
-# only while the package name is absent from that workspace's committed lock.
-# If a feature or dependency makes the package reachable, the same check turns
-# red and requires the local patch before publication.
-_TRUST_IR_SOURCES = (
-    "https://github.com/alabsystems/trust-ir",
-    "https://github.com/alabsystems/trust-ir.git",
-    "ssh://git@github.com/alabsystems/trust-ir.git",
-    "ssh://git@github.com:22/alabsystems/trust-ir.git",
-)
-DORMANT_PATCH_OMISSIONS = {
-    "crates": frozenset(
-        (source, "trust-ir-conformance") for source in _TRUST_IR_SOURCES
-    ),
-    "targo-trust": frozenset(
-        [
-            *((source, "trust-ir-conformance") for source in _TRUST_IR_SOURCES),
-            ("https://github.com/ufmg-smite/carcara", "carcara"),
-        ]
-    ),
-}
+MANIFESTS = {"root": REPO_ROOT / "Cargo.toml"}
 
 TEMPORAL_MANIFEST = REPO_ROOT / "crates" / "trust-spec-temporal" / "Cargo.toml"
 TEMPORAL_FABRIC_MANIFEST = (
@@ -111,67 +79,54 @@ LOCK_GIT_SOURCE_RE = re.compile(
 )
 
 FANOUT_POLICY_MANIFESTS = {
+    "trust-coordinator": REPO_ROOT / "crates" / "trust-coordinator" / "Cargo.toml",
+    "trust-file-lock": REPO_ROOT / "crates" / "trust-file-lock" / "Cargo.toml",
+    "trust-rand": REPO_ROOT / "crates" / "trust-rand" / "Cargo.toml",
     "trust-bmc": REPO_ROOT / "crates" / "trust-bmc" / "Cargo.toml",
     "trust-router": REPO_ROOT / "crates" / "trust-router" / "Cargo.toml",
     "trust-types": REPO_ROOT / "crates" / "trust-types" / "Cargo.toml",
+    "trust-semantics": REPO_ROOT / "crates" / "trust-semantics" / "Cargo.toml",
     "trust-wp": REPO_ROOT / "crates" / "trust-wp" / "Cargo.toml",
 }
 
-ROOT_WORKSPACE_ADVISORY_DETAIL = """\
-workspace membership policy:
-  Root Cargo.toml is also the rustc workspace. The standalone crates/Cargo.toml
-  manifest intentionally exists for Trust pipeline iteration without requiring
-  every Trust crate to participate in root rustc workspace commands.
-  Keeping drift advisory is acceptable only if root-workspace commands are not
-  expected to cover every crates/ workspace member.
-
-  Suggested root Cargo.toml comment if the drift remains intentional:
-    # trust: intentionally omitted from the root rustc workspace; covered by
-    # crates/Cargo.toml and scripts/check_cargo_manifest_alignment.py.
-
-  If fixing the drift, validate at minimum:
-    cargo metadata --manifest-path Cargo.toml --no-deps --format-version 1
-    cargo metadata --manifest-path crates/Cargo.toml --no-deps --format-version 1
-    cargo check --manifest-path Cargo.toml -p trust-clean -p trust-upstream-compat
-    cargo check --manifest-path crates/Cargo.toml -p trust-clean -p trust-upstream-compat
-
-  Because root Cargo.toml has no default-members list, adding root members can
-  broaden default root workspace commands. Validate any rustc/x.py path that
-  assumes the previous root workspace membership set.
-"""
-
-ROOT_WORKSPACE_ADVISORY_SUMMARY = """\
-  policy: root Cargo.toml is the rustc workspace; crates/Cargo.toml is the
-  standalone Trust pipeline workspace. This advisory is acceptable while root
-  workspace commands are not expected to cover every crates/ member.
-  details: rerun without --workspace-drift-advisory for manifest-fix guidance.
-"""
-
 FANOUT_SPLIT_PROOF_COMMANDS = (
-    "cargo tree --manifest-path crates/Cargo.toml -p trust-bmc --edges normal --prefix none "
+    "targo tree --manifest-path Cargo.toml -p trust-bmc --edges normal --prefix none "
     "| rg '^(ay-bindings|trust-mc-core|trust-mc-driver)' && false || true",
-    "cargo tree --manifest-path crates/Cargo.toml -p trust-router --edges normal --prefix none "
+    "targo tree --manifest-path Cargo.toml -p trust-router --edges normal --prefix none "
     "| rg '^(ay-bindings|trust-mc-core|trust-mc-driver)' && false || true",
-    "cargo check --manifest-path crates/Cargo.toml -p trust-bmc",
-    "cargo check --manifest-path crates/Cargo.toml -p trust-router",
-    "cargo check --manifest-path crates/Cargo.toml -p trust-bmc --features trust-mc-native-solver",
-    "cargo test --manifest-path crates/Cargo.toml -p trust-bmc manifest --lib",
+    "targo --unverified check --manifest-path Cargo.toml -p trust-bmc",
+    "targo --unverified check --manifest-path Cargo.toml -p trust-router",
+    "targo --unverified check --manifest-path Cargo.toml -p trust-bmc --features trust-mc-native-solver",
+    "targo --unverified test --manifest-path Cargo.toml -p trust-bmc manifest --lib",
+    "targo tree --manifest-path Cargo.toml -p trust-coordinator --edges normal,build --prefix none",
+    "targo --unverified check --manifest-path Cargo.toml -p trust-coordinator",
 )
 
-FANOUT_TREE_PROOF_PACKAGES = ("trust-bmc", "trust-router")
+FANOUT_TREE_PROOF_PACKAGES = ("trust-bmc", "trust-router", "trust-coordinator")
 FANOUT_TREE_FORBIDDEN_DEFAULT_PACKAGES = ("ay-bindings", "trust-mc-core", "trust-mc-driver")
 
 
-@dataclass(frozen=True)
-class PatchEntry:
-    source: str
-    crate: str
-    value: tuple[tuple[str, str], ...]
+class FallbackParseRefused(Exception):
+    """The subset parser met TOML it does not implement.
+
+    Kept distinct from every alignment finding: a checker that cannot read its
+    input has not run, and must not exit with the code that means "misaligned".
+    """
+
+
+FALLBACK_REFUSED_EXIT = 2
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
     if tomllib is None:
-        return load_manifest_fallback(path)
+        try:
+            return load_manifest_fallback(path)
+        except (SyntaxError, ValueError) as exc:
+            raise FallbackParseRefused(
+                f"{path}: the Python 3.8-3.10 subset TOML parser cannot read this "
+                f"manifest ({type(exc).__name__}: {exc}). No alignment verdict was "
+                f"reached. Run under Python >= 3.11, or install tomli."
+            ) from exc
     with path.open("rb") as manifest:
         return tomllib.load(manifest)
 
@@ -385,56 +340,6 @@ def load_manifest_fallback(path: Path) -> dict[str, Any]:
         assign_nested(manifest, table, key.strip(), parse_basic_value(value))
 
     return manifest
-
-
-def normalize_path(manifest_path: Path, value: str) -> str:
-    path = Path(value)
-    if path.is_absolute():
-        resolved = path.resolve()
-        try:
-            return resolved.relative_to(REPO_ROOT).as_posix()
-        except ValueError:
-            return resolved.as_posix()
-    resolved = (manifest_path.parent / path).resolve()
-    try:
-        return resolved.relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        return resolved.as_posix()
-
-
-def normalize_patch_value(manifest_path: Path, value: Any) -> tuple[tuple[str, str], ...]:
-    if isinstance(value, str):
-        return (("version", value),)
-    if not isinstance(value, dict):
-        return (("value", repr(value)),)
-
-    normalized: list[tuple[str, str]] = []
-    for key, raw in sorted(value.items()):
-        if key == "path" and isinstance(raw, str):
-            normalized.append((key, normalize_path(manifest_path, raw)))
-        else:
-            normalized.append((key, str(raw)))
-    return tuple(normalized)
-
-
-def patch_entries(name: str, manifest_path: Path, manifest: dict[str, Any]) -> set[PatchEntry]:
-    del name
-    patches = manifest.get("patch", {})
-    entries: set[PatchEntry] = set()
-    if not isinstance(patches, dict):
-        return entries
-    for source, crates in patches.items():
-        if not isinstance(crates, dict):
-            continue
-        for crate, value in crates.items():
-            entries.add(
-                PatchEntry(
-                    source=str(source),
-                    crate=str(crate),
-                    value=normalize_patch_value(manifest_path, value),
-                )
-            )
-    return entries
 
 
 def relative_display(path: Path) -> str:
@@ -710,16 +615,6 @@ def check_temporal_fabric_lock_source_revs(lock_text: str | None = None) -> list
     return errors
 
 
-def workspace_list(manifest: dict[str, Any], key: str) -> set[str]:
-    workspace = manifest.get("workspace", {})
-    if not isinstance(workspace, dict):
-        return set()
-    values = workspace.get(key, [])
-    if not isinstance(values, list):
-        return set()
-    return {str(value).rstrip("/") for value in values}
-
-
 def workspace_table(manifest: dict[str, Any], key: str) -> dict[str, Any]:
     workspace = manifest.get("workspace", {})
     if not isinstance(workspace, dict):
@@ -787,7 +682,7 @@ def feature_edges_containing(edges: list[str], needles: tuple[str, ...]) -> list
 
 def fanout_split_proof_guidance() -> str:
     lines = [
-        "trust-bmc default fanout split completion requires cargo tree evidence:",
+        "trust-bmc default fanout split completion requires targo tree evidence:",
     ]
     lines.extend(f"  {command}" for command in FANOUT_SPLIT_PROOF_COMMANDS)
     return "\n".join(lines)
@@ -796,6 +691,49 @@ def fanout_split_proof_guidance() -> str:
 def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list[str]:
     """Lock default lightweight paths away from native solver fanout."""
     errors: list[str] = []
+
+    coordinator = manifests["trust-coordinator"]
+    if (
+        set(coordinator.get("dependencies", {}))
+        != {"libc", "serde", "serde_json", "sha2", "thiserror", "trust-budget", "trust-file-lock", "trust-rand"}
+        or any(
+            value != {"workspace": True}
+            for value in coordinator.get("dependencies", {}).values()
+        )
+        or coordinator.get("build-dependencies", {})
+        or coordinator.get("features", {})
+    ):
+        errors.append("trust-coordinator must keep its fixed solver-free dependency boundary")
+    if coordinator.get("target", {}):
+        errors.append("trust-coordinator platform dependencies must remain in trust-file-lock")
+
+    # Shared ownership must stay independent of daemon, cache and solver code.
+    # Check the new leaf transitively rather than merely allowing its name.
+    file_lock = manifests["trust-file-lock"]
+    if (
+        set(file_lock.get("dependencies", {})) != {"libc", "thiserror"}
+        or any(value != {"workspace": True}
+               for value in file_lock.get("dependencies", {}).values())
+        or any(file_lock.get(table, {}) for table in
+               ("build-dependencies", "target", "features"))
+    ):
+        errors.append("trust-file-lock must keep its fixed solver-free ownership boundary")
+
+    # Admission incarnations use the existing OS entropy leaf. Keep that
+    # dependency solver-free transitively, not merely allowed by name.
+    entropy = manifests["trust-rand"]
+    if any(entropy.get(table, {}) for table in (
+        "dependencies", "build-dependencies", "target", "features"
+    )):
+        errors.append("trust-rand must remain an unconditional dependency-free entropy leaf")
+
+    # The shared range layer must not turn a pure VC-generator dependency
+    # into an implicit request for the optional Discharge Try implementation.
+    semantic_types = manifests["trust-semantics"].get("dependencies", {}).get("trust-types")
+    if (not isinstance(semantic_types, dict)
+            or semantic_types.get("default-features") is not False
+            or set(semantic_types.get("features", ())) & {"default", "try-sugar"}):
+        errors.append("trust-semantics must keep trust-types default and try-sugar features disabled")
 
     trust_types = manifests["trust-types"]
     if not dependency_is_optional(trust_types, "ay-bindings"):
@@ -863,6 +801,9 @@ def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list
 
     trust_router = manifests["trust-router"]
     router_default = set(feature_edges(trust_router, "default"))
+    # The two retired backend features stay listed, as trust-wp-backend does: a
+    # name that is not declared costs nothing here, and it keeps a revival from
+    # landing as a default.
     forbidden_router_defaults = {
         "ay-backend",
         "trust-build",
@@ -883,166 +824,120 @@ def check_dependency_fanout_policy(manifests: dict[str, dict[str, Any]]) -> list
             "trust-router must not restore the retired TrustWP backend dependency; "
             "historical wire decoding belongs to the zero-capability trust-wp adapter"
         )
-    for dep in ("ay", "ay-bindings", "trust-mc-verifier", "trust-vc-core"):
+    for dep in ("ay", "ay-bindings"):
         if not dependency_is_optional(trust_router, dep):
+            errors.append(f"trust-router {dep} dependency must stay optional")
+    # Retired with their features; if either comes back it must come back optional.
+    for dep in ("trust-mc-verifier", "trust-vc-core"):
+        if dependency_is_declared(trust_router, dep) and not dependency_is_optional(trust_router, dep):
             errors.append(f"trust-router {dep} dependency must stay optional")
 
     trust_wp = manifests["trust-wp"]
-    for dep in ("trust-wp-core", "trust-wp-ay", "trust-ir"):
+    for dep in ("trust-wp-core", "trust-ir"):
         if not dependency_is_optional(trust_wp, dep):
             errors.append(f"trust-wp {dep} dependency must stay optional")
 
     return errors
 
 
-def locked_package_names(lock_path: Path) -> set[str]:
-    """Return package names from one committed Cargo lock, fail closed."""
-    lock = load_manifest(lock_path)
-    packages = lock.get("package", [])
-    if not isinstance(packages, list):
-        raise ValueError(f"{relative_display(lock_path)} has no package array")
-    names: set[str] = set()
-    for package in packages:
-        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
-            raise ValueError(
-                f"{relative_display(lock_path)} has a malformed package row"
-            )
-        names.add(package["name"])
-    return names
+def wp_facade_sources() -> dict[str, str]:
+    root = REPO_ROOT / "crates" / "trust-wp" / "src"
+    return {
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("*.rs"))
+    }
 
 
-def check_patch_alignment(
-    manifests: dict[str, dict[str, Any]],
-    *,
-    lock_packages: dict[str, set[str]] | None = None,
+def check_wp_native_facade_retirement(
+    manifest: dict[str, Any],
+    workspace: dict[str, Any],
+    sources: dict[str, str],
 ) -> list[str]:
+    """Keep the retired request/body API out of the historical WP facade.
+
+    This holds a concrete retirement and dependency boundary; it does not
+    establish semantic equivalence or prove the absence of arbitrary decoders.
+    Native body verification belongs to first-party trust-wp-lib via the router.
+    """
     errors: list[str] = []
-    by_manifest = {
-        name: patch_entries(name, MANIFESTS[name], manifest)
-        for name, manifest in manifests.items()
-    }
-
-    if lock_packages is None:
-        try:
-            lock_packages = {
-                name: locked_package_names(path)
-                for name, path in WORKSPACE_LOCKS.items()
-            }
-        except (OSError, ValueError) as error:
-            return [f"cannot audit dormant patch omissions against locks: {error}"]
-
-    baseline_name = "root"
-    baseline = by_manifest[baseline_name]
-    for name, entries in by_manifest.items():
-        if name == baseline_name:
-            continue
-        missing_all = baseline - entries
-        omissions = DORMANT_PATCH_OMISSIONS.get(name, frozenset())
-        missing = sorted(
-            (
-                entry
-                for entry in missing_all
-                if (entry.source, entry.crate) not in omissions
-                or entry.crate in lock_packages.get(name, set())
-            ),
-            key=lambda entry: (entry.source, entry.crate),
-        )
-        extra = sorted(entries - baseline, key=lambda entry: (entry.source, entry.crate))
-        if missing or extra:
-            errors.append(f"{name} patch table drifts from {baseline_name}:")
-            for entry in missing:
-                errors.append(
-                    f"  missing {entry.source} {entry.crate} = {dict(entry.value)}"
-                )
-            for entry in extra:
-                errors.append(
-                    f"  extra {entry.source} {entry.crate} = {dict(entry.value)}"
-                )
-    return errors
-
-
-def check_workspace_membership(
-    manifests: dict[str, dict[str, Any]], *, advisory_summary: bool = False
-) -> list[str]:
-    root_members = workspace_list(manifests["root"], "members")
-    root_excludes = workspace_list(manifests["root"], "exclude")
-    crates_members = workspace_list(manifests["crates"], "members")
-    crates_excludes = workspace_list(manifests["crates"], "exclude")
-
-    expected_root_members = {f"crates/{member}" for member in crates_members}
-    expected_root_excludes = {f"crates/{member}" for member in crates_excludes}
-    missing = sorted(
-        member
-        for member in expected_root_members - root_members
-        if member not in root_excludes and member not in expected_root_excludes
-    )
-
-    if not missing:
-        return []
-
-    errors = ["root workspace is missing crates workspace members:"]
-    errors.extend(f"  {member}" for member in missing)
-    if advisory_summary:
-        errors.extend(ROOT_WORKSPACE_ADVISORY_SUMMARY.rstrip().splitlines())
-        return errors
-    errors.extend(root_workspace_fix_guidance(manifests, missing))
-    return errors
-
-
-def missing_workspace_deps_for_member(member: str, root_manifest: dict[str, Any]) -> list[str]:
-    manifest_path = REPO_ROOT / member / "Cargo.toml"
-    if not manifest_path.exists():
-        return []
-
-    member_manifest = load_manifest(manifest_path)
-    root_workspace_deps = workspace_table(root_manifest, "dependencies")
-    deps: set[str] = set()
-    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-        raw_deps = member_manifest.get(section, {})
-        if not isinstance(raw_deps, dict):
-            continue
-        for name, value in raw_deps.items():
+    tables = dependency_tables(manifest)
+    # Tests and platform-specific aliases must not restore this solver edge.
+    for owner in [manifest, *manifest.get("target", {}).values()]:
+        if isinstance(owner, dict) and isinstance(owner.get("dev-dependencies"), dict):
+            tables.append(owner["dev-dependencies"])
+    inherited = workspace_table(workspace, "dependencies")
+    for table in tables:
+        for alias, value in table.items():
+            resolved = value
             if isinstance(value, dict) and value.get("workspace") is True:
-                deps.add(str(name))
+                resolved = inherited.get(alias, value)
+            package = resolved.get("package", alias) if isinstance(resolved, dict) else alias
+            if package in {"trust-wp-ay", "trust-wp-lib"}:
+                errors.append(
+                    f"trust-wp facade must not restore retired native solver dependency {package} "
+                    f"(alias {alias}); use first-party trust-wp-lib through the router"
+                )
+    if "lib.rs" not in sources:
+        errors.append("trust-wp facade library source is missing; retirement cannot be checked")
+    if "native.rs" in sources:
+        errors.append("trust-wp facade must not restore retired src/native.rs")
+    retired = re.compile(
+        r"\b(?:NativeTrustWpRequest|NativePureBody|NativeTrustWpMir|NativeTrustWpExpr|verify_native)\b"
+    )
+    for path, source in sources.items():
+        if retired.search(source):
+            errors.append(f"trust-wp facade {path} restores a retired native request/body API")
+    return errors
 
-    return sorted(dep for dep in deps if dep not in root_workspace_deps)
 
 
-def root_workspace_fix_guidance(
-    manifests: dict[str, dict[str, Any]], missing_members: list[str]
-) -> list[str]:
-    lines = [
-        "",
-        *ROOT_WORKSPACE_ADVISORY_DETAIL.rstrip().splitlines(),
-        "",
-        "exact root Cargo.toml changes for a manifest-fix lane:",
-        "  add these entries under [workspace].members:",
-    ]
-    lines.extend(f'    "{member}",' for member in missing_members)
+def check_shared_integer_bounds(manifest: dict[str, Any], source: str) -> list[str]:
+    """Hold the concrete VC/semantics bound consolidation, not arbitrary equivalence."""
+    errors: list[str] = []
+    dependency = manifest.get("dependencies", {}).get("trust-semantics")
+    if (not isinstance(dependency, dict) or dependency.get("workspace") is not True
+            or dependency.get("optional") is True):
+        errors.append("trust-vcgen must use the workspace trust-semantics production dependency")
+    names = {"signed_min", "signed_max", "type_min_formula", "type_max_formula"}
+    imports: set[str] = set()
+    for match in re.finditer(r"\buse\s+trust_semantics\s*::\s*\{([^}]+)\}", source):
+        imports.update(part.strip() for part in match.group(1).split(",") if part.strip())
+    if not names <= imports:
+        errors.append("trust-vcgen range must import all canonical integer bounds from trust-semantics")
+    restored = re.findall(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?fn\s+"
+        r"(signed_min|signed_max|type_min_formula|type_max_formula)\s*\(",
+        source, re.MULTILINE,
+    )
+    if restored:
+        errors.append("trust-vcgen range must not restore duplicate integer bounds: "
+                      + ", ".join(sorted(set(restored))))
+    return errors
 
-    missing_deps: dict[str, list[str]] = {
-        member: missing_workspace_deps_for_member(member, manifests["root"])
-        for member in missing_members
-    }
-    needed_deps = sorted({dep for deps in missing_deps.values() for dep in deps})
-    if needed_deps:
-        lines.append("  add these entries under [workspace.dependencies]:")
-        for dep in needed_deps:
-            crates_value = workspace_table(manifests["crates"], "dependencies").get(dep)
-            if isinstance(crates_value, dict) and isinstance(crates_value.get("path"), str):
-                path = normalize_path(MANIFESTS["crates"], crates_value["path"])
-                lines.append(f'    {dep} = {{ path = "{path}" }}')
-            else:
-                lines.append(f"    {dep} = <copy from crates/Cargo.toml>")
-        lines.append("  missing workspace deps by newly added member:")
-        for member, deps in missing_deps.items():
-            if deps:
-                lines.append(f"    {member}: {', '.join(deps)}")
-    else:
-        lines.append("  no additional [workspace.dependencies] entries are required.")
 
-    return lines
-
+def shared_integer_bounds_self_check() -> list[str]:
+    manifest = load_manifest(REPO_ROOT / "crates/trust-vcgen/Cargo.toml")
+    source = (REPO_ROOT / "crates/trust-vcgen/src/range.rs").read_text(encoding="utf-8")
+    failures = check_shared_integer_bounds(manifest, source)
+    if failures:
+        return ["current shared integer bounds should pass: " + "; ".join(failures)]
+    for name in ("signed_min", "signed_max", "type_min_formula", "type_max_formula"):
+        self_check_error_contains(
+            check_shared_integer_bounds(manifest, source + f"\nfn {name}() {{}}\n"),
+            "must not restore duplicate integer bounds", failures, f"restored bound {name}",
+        )
+    case = copy.deepcopy(manifest)
+    dependency = case["dependencies"].pop("trust-semantics")
+    case.setdefault("dev-dependencies", {})["trust-semantics"] = dependency
+    self_check_error_contains(
+        check_shared_integer_bounds(case, source), "production dependency", failures,
+        "shared bounds moved back to test-only dependency",
+    )
+    self_check_error_contains(
+        check_shared_integer_bounds(manifest, source.replace("use trust_semantics::", "use old_copy::")),
+        "must import all canonical integer bounds", failures, "shared bounds import removed",
+    )
+    return failures
 
 def self_check_error_contains(
     errors: list[str], expected: str, failures: list[str], case_name: str
@@ -1053,40 +948,6 @@ def self_check_error_contains(
 
 def run_self_check() -> list[str]:
     failures: list[str] = []
-    manifests = {
-        name: load_manifest(path)
-        for name, path in MANIFESTS.items()
-    }
-    lock_packages = {
-        name: locked_package_names(path)
-        for name, path in WORKSPACE_LOCKS.items()
-    }
-    patch_errors = check_patch_alignment(
-        manifests, lock_packages=lock_packages
-    )
-    if patch_errors:
-        failures.append(
-            "current patch coverage should pass: " + "; ".join(patch_errors)
-        )
-
-    case_locks = copy.deepcopy(lock_packages)
-    case_locks["targo-trust"].add("carcara")
-    self_check_error_contains(
-        check_patch_alignment(manifests, lock_packages=case_locks),
-        "missing https://github.com/ufmg-smite/carcara carcara",
-        failures,
-        "dormant patch becomes reachable",
-    )
-
-    case = copy.deepcopy(manifests)
-    del case["crates"]["patch"]["https://github.com/alabsystems/ay"]["ay"]
-    self_check_error_contains(
-        check_patch_alignment(case, lock_packages=lock_packages),
-        "missing https://github.com/alabsystems/ay ay",
-        failures,
-        "reachable patch omission",
-    )
-
     local_patch_manifests = {
         name: load_manifest(path)
         for name, path in LOCAL_PATCH_MANIFESTS.items()
@@ -1121,6 +982,62 @@ def run_self_check() -> list[str]:
     baseline_errors = check_dependency_fanout_policy(fanout_manifests)
     if baseline_errors:
         failures.append("current fanout policy should pass: " + "; ".join(baseline_errors))
+
+    for table in ("dependencies", "build-dependencies"):
+        for dependency in ("ay", "trust-router"):
+            case = copy.deepcopy(fanout_manifests)
+            case["trust-coordinator"].setdefault(table, {})[dependency] = {"workspace": True}
+            self_check_error_contains(
+                check_dependency_fanout_policy(case),
+                "trust-coordinator must keep its fixed solver-free dependency boundary",
+                failures,
+                f"coordinator {table} {dependency} fanout regression",
+            )
+    for table in ("dependencies", "build-dependencies", "target", "features"):
+        case = copy.deepcopy(fanout_manifests)
+        case["trust-file-lock"].setdefault(table, {})["ay"] = {"workspace": True}
+        self_check_error_contains(
+            check_dependency_fanout_policy(case),
+            "trust-file-lock must keep its fixed solver-free ownership boundary",
+            failures,
+            f"file ownership {table} fanout regression",
+        )
+    for value in ({"path": "../shadow-lock"}, {"workspace": True, "package": "ay"}):
+        case = copy.deepcopy(fanout_manifests)
+        case["trust-file-lock"]["dependencies"]["libc"] = value
+        self_check_error_contains(
+            check_dependency_fanout_policy(case),
+            "trust-file-lock must keep its fixed solver-free ownership boundary",
+            failures,
+            "file ownership workspace identity regression",
+        )
+    for table in ("dependencies", "build-dependencies", "target", "features"):
+        case = copy.deepcopy(fanout_manifests)
+        case["trust-rand"][table] = {"solver": {"workspace": True}}
+        self_check_error_contains(
+            check_dependency_fanout_policy(case),
+            "trust-rand must remain an unconditional dependency-free entropy leaf",
+            failures,
+            f"entropy leaf {table} fanout regression",
+        )
+    case = copy.deepcopy(fanout_manifests)
+    case["trust-coordinator"]["dependencies"]["trust-rand"] = {"path": "../shadow-rand"}
+    self_check_error_contains(
+        check_dependency_fanout_policy(case),
+        "trust-coordinator must keep its fixed solver-free dependency boundary",
+        failures,
+        "coordinator entropy workspace identity regression",
+    )
+    case = copy.deepcopy(fanout_manifests)
+    case["trust-coordinator"].setdefault("target", {})["cfg(unix)"] = {
+        "dependencies": {"ay": {"workspace": True}}
+    }
+    self_check_error_contains(
+        check_dependency_fanout_policy(case),
+        "trust-coordinator platform dependencies must remain in trust-file-lock",
+        failures,
+        "coordinator platform fanout regression",
+    )
 
     case = copy.deepcopy(local_patch_manifests)
     case["root"]["patch"]["https://github.com/alabsystems/ay"]["ay"] = {
@@ -1192,13 +1109,13 @@ def run_self_check() -> list[str]:
     )
 
     required_proof_fragments = (
-        "cargo tree --manifest-path crates/Cargo.toml -p trust-bmc",
-        "cargo tree --manifest-path crates/Cargo.toml -p trust-router",
+        "targo tree --manifest-path Cargo.toml -p trust-bmc",
+        "targo tree --manifest-path Cargo.toml -p trust-router",
         "rg '^(ay-bindings|trust-mc-core|trust-mc-driver)'",
-        "cargo check --manifest-path crates/Cargo.toml -p trust-bmc",
-        "cargo check --manifest-path crates/Cargo.toml -p trust-router",
-        "cargo check --manifest-path crates/Cargo.toml -p trust-bmc --features trust-mc-native-solver",
-        "cargo test --manifest-path crates/Cargo.toml -p trust-bmc manifest --lib",
+        "targo --unverified check --manifest-path Cargo.toml -p trust-bmc",
+        "targo --unverified check --manifest-path Cargo.toml -p trust-router",
+        "targo --unverified check --manifest-path Cargo.toml -p trust-bmc --features trust-mc-native-solver",
+        "targo --unverified test --manifest-path Cargo.toml -p trust-bmc manifest --lib",
     )
     proof_text = "\n".join(FANOUT_SPLIT_PROOF_COMMANDS)
     for fragment in required_proof_fragments:
@@ -1327,20 +1244,90 @@ def run_self_check() -> list[str]:
         "trust-wp native core regression",
     )
 
+    for dependency in (
+        {"workspace": True},
+        {"path": "../trust-types", "default-features": True},
+        {"path": "../trust-types", "default-features": False, "features": ["try-sugar"]},
+        {"path": "../trust-types", "default-features": False, "features": ["default"]},
+    ):
+        case = copy.deepcopy(fanout_manifests)
+        case["trust-semantics"]["dependencies"]["trust-types"] = dependency
+        self_check_error_contains(
+            check_dependency_fanout_policy(case),
+            "trust-semantics must keep trust-types default and try-sugar features disabled",
+            failures, f"semantic range feature fanout {dependency}",
+        )
+
+    failures.extend(wp_retirement_self_check())
+    failures.extend(shared_integer_bounds_self_check())
+
     return failures
 
 
-def cargo_tree_normal_edges(package: str) -> subprocess.CompletedProcess[str]:
+def wp_retirement_self_check() -> list[str]:
+    failures: list[str] = []
+    facade = load_manifest(FANOUT_POLICY_MANIFESTS["trust-wp"])
+    workspace = load_manifest(MANIFESTS["root"])
+    sources = wp_facade_sources()
+    baseline = check_wp_native_facade_retirement(facade, workspace, sources)
+    if baseline:
+        failures.append("current WP facade retirement should pass: " + "; ".join(baseline))
+    for section in ("dependencies", "build-dependencies", "dev-dependencies"):
+        for package in ("trust-wp-ay", "trust-wp-lib"):
+            for target in (False, True):
+                case = copy.deepcopy(facade)
+                owner = (
+                    case.setdefault("target", {}).setdefault("cfg(unix)", {}) if target else case
+                )
+                owner.setdefault(section, {})["renamed-native-solver"] = {
+                    "package": package, "version": "0"
+                }
+                self_check_error_contains(
+                    check_wp_native_facade_retirement(case, workspace, sources),
+                    "must not restore retired native solver dependency",
+                    failures, f"WP retired solver {package} {section} target={target}",
+                )
+    case = copy.deepcopy(facade)
+    case.setdefault("dependencies", {})["renamed-native-solver"] = {"workspace": True}
+    inherited = copy.deepcopy(workspace)
+    inherited.setdefault("workspace", {}).setdefault("dependencies", {})[
+        "renamed-native-solver"
+    ] = {"package": "trust-wp-ay", "version": "0"}
+    self_check_error_contains(
+        check_wp_native_facade_retirement(case, inherited, sources),
+        "must not restore retired native solver dependency", failures, "WP workspace solver alias",
+    )
+    self_check_error_contains(
+        check_wp_native_facade_retirement(facade, workspace, {}),
+        "library source is missing", failures, "WP missing facade source",
+    )
+    for path, text, expected in (
+        ("native.rs", "", "must not restore retired src/native.rs"),
+        ("renamed.rs", "pub struct NativePureBody {}", "restores a retired native request/body API"),
+        ("lib.rs", "pub use other::NativeTrustWpRequest;", "restores a retired native request/body API"),
+        ("renamed.rs", "pub fn verify_native() {}", "restores a retired native request/body API"),
+    ):
+        self_check_error_contains(
+            check_wp_native_facade_retirement(facade, workspace, {**sources, path: text}),
+            expected, failures, f"WP retired native API {path} {text}",
+        )
+
+    return failures
+
+
+def cargo_tree_edges(package: str, edges: str = "normal") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            "cargo",
+            # Trust toolchain, never stock cargo (CLAUDE.md "Build"); `tree`
+            # takes no lane, so it is bare `targo tree`.
+            "targo",
             "tree",
             "--manifest-path",
-            "crates/Cargo.toml",
+            "Cargo.toml",
             "-p",
             package,
             "--edges",
-            "normal",
+            edges,
             "--prefix",
             "none",
         ],
@@ -1355,10 +1342,12 @@ def cargo_tree_normal_edges(package: str) -> subprocess.CompletedProcess[str]:
 def run_fanout_tree_proof() -> list[str]:
     failures: list[str] = []
     for package in FANOUT_TREE_PROOF_PACKAGES:
-        result = cargo_tree_normal_edges(package)
+        result = cargo_tree_edges(
+            package, "normal,build" if package == "trust-coordinator" else "normal"
+        )
         if result.returncode != 0:
             failures.append(
-                f"{package}: cargo tree failed with exit {result.returncode}: "
+                f"{package}: targo tree failed with exit {result.returncode}: "
                 + result.stderr.strip()
             )
             continue
@@ -1367,9 +1356,16 @@ def run_fanout_tree_proof() -> list[str]:
             for line in result.stdout.splitlines()
             if any(line.startswith(f"{forbidden} ") for forbidden in FANOUT_TREE_FORBIDDEN_DEFAULT_PACKAGES)
         ]
+        if package == "trust-coordinator":
+            matched.extend(
+                line for line in result.stdout.splitlines()
+                if line.strip() and line.split(maxsplit=1)[0].startswith(
+                    ("ay", "clean", "trust-router", "trust-cg", "trust-mc", "trust-vc")
+                )
+            )
         if matched:
             failures.append(
-                f"{package}: default normal dependency tree still contains forbidden fanout:\n"
+                f"{package}: default dependency tree still contains forbidden fanout:\n"
                 + "\n".join(f"  {line}" for line in matched)
             )
     return failures
@@ -1377,14 +1373,6 @@ def run_fanout_tree_proof() -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--workspace-drift-advisory",
-        action="store_true",
-        help=(
-            "report root/crates workspace membership drift without failing; "
-            "patch table drift still fails"
-        ),
-    )
     parser.add_argument(
         "--self-check",
         action="store_true",
@@ -1394,7 +1382,7 @@ def parse_args() -> argparse.Namespace:
         "--fanout-tree-proof",
         action="store_true",
         help=(
-            "prove default trust-bmc/trust-router normal trees exclude "
+            "prove default trust-bmc/trust-router normal and coordinator normal/build trees exclude "
             "ay-bindings, trust-mc-core, and trust-mc-driver"
         ),
     )
@@ -1423,12 +1411,6 @@ def main() -> int:
         print("Cargo default fanout tree proof passed.")
         return 0
 
-    manifests = {
-        name: load_manifest(path)
-        for name, path in MANIFESTS.items()
-    }
-
-    patch_errors = check_patch_alignment(manifests)
     local_patch_manifests = {
         name: load_manifest(path)
         for name, path in LOCAL_PATCH_MANIFESTS.items()
@@ -1439,50 +1421,36 @@ def main() -> int:
     fabric_manifest = load_manifest(TEMPORAL_FABRIC_MANIFEST)
     fabric_boundary_errors = check_temporal_fabric_boundary(fabric_manifest)
     fabric_lock_errors = check_temporal_fabric_lock_source_revs()
-    membership_errors = check_workspace_membership(
-        manifests, advisory_summary=args.workspace_drift_advisory
-    )
     fanout_manifests = {
         name: load_manifest(path)
         for name, path in FANOUT_POLICY_MANIFESTS.items()
     }
     fanout_errors = check_dependency_fanout_policy(fanout_manifests)
+    wp_retirement_errors = check_wp_native_facade_retirement(
+        fanout_manifests["trust-wp"], local_patch_manifests["root"], wp_facade_sources()
+    )
+    integer_bound_errors = check_shared_integer_bounds(
+        load_manifest(REPO_ROOT / "crates/trust-vcgen/Cargo.toml"),
+        (REPO_ROOT / "crates/trust-vcgen/src/range.rs").read_text(encoding="utf-8"),
+    )
     errors = [
-        *patch_errors,
+        *integer_bound_errors,
         *local_patch_errors,
         *fabric_boundary_errors,
         *fabric_lock_errors,
-        *membership_errors,
         *fanout_errors,
+        *wp_retirement_errors,
     ]
 
     if errors:
-        advisory_only = (
-            args.workspace_drift_advisory
-            and not patch_errors
-            and not local_patch_errors
-            and not fabric_boundary_errors
-            and not fabric_lock_errors
-            and not fanout_errors
-        )
-        if advisory_only:
-            print("Cargo manifest alignment advisory:")
-        else:
-            print("Cargo manifest alignment check failed:")
-        if not patch_errors and not local_patch_errors:
-            print(
-                "patch tables are aligned across root, crates, and targo-trust, "
-                "and local targets are valid."
-            )
+        print("Cargo manifest policy check failed:")
         if not fabric_boundary_errors and not fabric_lock_errors:
             print("temporal fabric external boundary and lock revisions are coherent.")
         if not fanout_errors:
             print("dependency fanout manifest policy is preserved.")
-        if not membership_errors:
-            print("root workspace membership includes all crates workspace members.")
         for error in errors:
             print(error)
-        return 0 if advisory_only else 1
+        return 1
 
     print(
         "Cargo manifest alignment, local patch integrity, temporal fabric boundary, "
@@ -1492,4 +1460,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except FallbackParseRefused as refusal:
+        print(f"REFUSED: {refusal}", file=sys.stderr)
+        raise SystemExit(FALLBACK_REFUSED_EXIT)

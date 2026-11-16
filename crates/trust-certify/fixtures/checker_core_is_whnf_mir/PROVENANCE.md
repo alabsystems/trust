@@ -172,6 +172,14 @@ and everything it reaches), captured 2026-07-17 from the in-tree stage2 fork at 
 
 Extraction (the recipe CHANGED since the section above — measured):
 
+> 2026-09-28 (all ALab systems build with Trust): both recipes here are
+> the RECORD of how this fixture was minted and stay as run. A re-mint drives
+> `targo`, not a raw `cargo` (the aterm reroute stub, or stock); since
+> `targo --unverified` appends `-Ztrust-verify=off` to every unit last and the dump
+> needs verification on, re-enable it per crate with a RUSTC_WRAPPER as in
+> `crates/trust-clean/fixtures/census-m6-cleankernel-2026-07-08/dump-target-rustc-wrapper.sh`.
+> Not re-measured for this fixture.
+
 ```bash
 FORK="$PWD/build/aarch64-apple-darwin/stage2/bin/rustc"
 RUSTC="$FORK" RUSTC_BOOTSTRAP=1 \

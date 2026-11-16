@@ -49,6 +49,11 @@ pub struct SsaForm {
 /// Returns a vector where `idom[b]` is the immediate dominator of block `b`.
 /// The entry block dominates itself (by convention `idom[entry] = entry`).
 pub(crate) fn compute_idom(cfg: &Cfg) -> Vec<usize> {
+    let preds = compute_predecessors(cfg);
+    compute_idom_with_preds(cfg, &preds)
+}
+
+fn compute_idom_with_preds(cfg: &Cfg, preds: &[Vec<usize>]) -> Vec<usize> {
     let n = cfg.block_count();
     if n == 0 {
         return vec![];
@@ -57,9 +62,6 @@ pub(crate) fn compute_idom(cfg: &Cfg) -> Vec<usize> {
     let entry = cfg.entry;
     let mut idom = vec![usize::MAX; n];
     idom[entry] = entry;
-
-    // Compute predecessors.
-    let preds = compute_predecessors(cfg);
 
     // Iterative dominator computation (Cooper, Harvey, Kennedy).
     let rpo = reverse_postorder(cfg);
@@ -111,9 +113,17 @@ fn intersect(idom: &[usize], rpo_index: &[usize], mut a: usize, mut b: usize) ->
 
 /// Compute dominance frontiers from the idom tree.
 pub(crate) fn compute_dom_frontiers(cfg: &Cfg, idom: &[usize]) -> Vec<FxHashSet<usize>> {
+    let preds = compute_predecessors(cfg);
+    compute_dom_frontiers_with_preds(cfg, idom, &preds)
+}
+
+fn compute_dom_frontiers_with_preds(
+    cfg: &Cfg,
+    idom: &[usize],
+    preds: &[Vec<usize>],
+) -> Vec<FxHashSet<usize>> {
     let n = cfg.block_count();
     let mut df: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); n];
-    let preds = compute_predecessors(cfg);
 
     for b in 0..n {
         if preds[b].len() < 2 {
@@ -201,12 +211,12 @@ fn dom_tree_children(idom: &[usize]) -> Vec<Vec<usize>> {
 fn rename_variables(
     cfg: &Cfg,
     idom: &[usize],
+    preds: &[Vec<usize>],
     defined_vars: &FxHashMap<usize, Vec<String>>,
     phi_nodes: &mut FxHashMap<usize, Vec<PhiNode>>,
     max_versions: &mut FxHashMap<String, u32>,
 ) {
     let children = dom_tree_children(idom);
-    let preds = compute_predecessors(cfg);
     // Version stacks: top of stack = current reaching definition version.
     let mut stacks: FxHashMap<String, Vec<u32>> = FxHashMap::default();
     // Initialize stacks with version 0 (the entry/initial definition).
@@ -223,7 +233,7 @@ fn rename_variables(
         cfg.entry,
         cfg,
         &children,
-        &preds,
+        preds,
         defined_vars,
         phi_nodes,
         max_versions,
@@ -243,28 +253,40 @@ fn rename_block(
     max_versions: &mut FxHashMap<String, u32>,
     stacks: &mut FxHashMap<String, Vec<u32>>,
 ) {
-    let mut push_count: FxHashMap<String, usize> = FxHashMap::default();
-
     // Process phi nodes at this block: each phi is a new definition.
     if let Some(phis) = phi_nodes.get_mut(&block) {
         for phi in phis.iter_mut() {
-            let counter = max_versions.entry(phi.dest.name.clone()).or_insert(0);
-            *counter += 1;
-            phi.dest.version = *counter;
-            let stack = stacks.entry(phi.dest.name.clone()).or_default();
-            stack.push(*counter);
-            *push_count.entry(phi.dest.name.clone()).or_insert(0) += 1;
+            let version = if let Some(counter) = max_versions.get_mut(phi.dest.name.as_str()) {
+                *counter += 1;
+                *counter
+            } else {
+                max_versions.insert(phi.dest.name.clone(), 1);
+                1
+            };
+            phi.dest.version = version;
+            if let Some(stack) = stacks.get_mut(phi.dest.name.as_str()) {
+                stack.push(version);
+            } else {
+                stacks.insert(phi.dest.name.clone(), vec![version]);
+            }
         }
     }
 
     // Process ordinary definitions in this block.
     if let Some(vars) = defined_vars.get(&block) {
         for var in vars {
-            let counter = max_versions.entry(var.clone()).or_insert(0);
-            *counter += 1;
-            let stack = stacks.entry(var.clone()).or_default();
-            stack.push(*counter);
-            *push_count.entry(var.clone()).or_insert(0) += 1;
+            let version = if let Some(counter) = max_versions.get_mut(var.as_str()) {
+                *counter += 1;
+                *counter
+            } else {
+                max_versions.insert(var.clone(), 1);
+                1
+            };
+            if let Some(stack) = stacks.get_mut(var.as_str()) {
+                stack.push(version);
+            } else {
+                stacks.insert(var.clone(), vec![version]);
+            }
         }
     }
 
@@ -280,7 +302,7 @@ fn rename_block(
                     for phi in succ_phis.iter_mut() {
                         if pos < phi.operands.len() {
                             let current_version = stacks
-                                .get(&phi.operands[pos].1.name)
+                                .get(phi.operands[pos].1.name.as_str())
                                 .and_then(|s| s.last().copied())
                                 .unwrap_or(0);
                             phi.operands[pos].1.version = current_version;
@@ -292,15 +314,21 @@ fn rename_block(
     }
 
     // Recurse into dominated children.
-    let dom_children = children[block].clone();
-    for child in dom_children {
+    for &child in &children[block] {
         rename_block(child, cfg, children, preds, defined_vars, phi_nodes, max_versions, stacks);
     }
 
     // Pop stacks to restore state.
-    for (var, count) in &push_count {
-        if let Some(stack) = stacks.get_mut(var) {
-            for _ in 0..*count {
+    if let Some(vars) = defined_vars.get(&block) {
+        for var in vars {
+            if let Some(stack) = stacks.get_mut(var.as_str()) {
+                stack.pop();
+            }
+        }
+    }
+    if let Some(phis) = phi_nodes.get(&block) {
+        for phi in phis {
+            if let Some(stack) = stacks.get_mut(phi.dest.name.as_str()) {
                 stack.pop();
             }
         }
@@ -320,20 +348,21 @@ pub(crate) fn construct_ssa(
     cfg: &Cfg,
     defined_vars: &FxHashMap<usize, Vec<String>>,
 ) -> Result<SsaForm, LiftError> {
-    let idom = compute_idom(cfg);
-    let dom_frontiers = compute_dom_frontiers(cfg, &idom);
+    let preds = compute_predecessors(cfg);
+    let idom = compute_idom_with_preds(cfg, &preds);
+    let dom_frontiers = compute_dom_frontiers_with_preds(cfg, &idom, &preds);
 
     // Phase 1: Place phi nodes.
     // For each variable, find all blocks where it is defined, then place
     // phi nodes at the dominance frontier (iterated).
     let mut phi_nodes: FxHashMap<usize, Vec<PhiNode>> = FxHashMap::default();
     let mut max_versions: FxHashMap<String, u32> = FxHashMap::default();
-    let preds = compute_predecessors(cfg);
 
     // Collect all variable names.
     let all_vars: FxHashSet<&String> = defined_vars.values().flatten().collect();
 
     for var_name in all_vars {
+        max_versions.entry(var_name.clone()).or_insert(0);
         // Blocks that define this variable.
         let mut def_blocks: FxHashSet<usize> = FxHashSet::default();
         for (&block_id, vars) in defined_vars {
@@ -379,7 +408,7 @@ pub(crate) fn construct_ssa(
     }
 
     // Phase 2: Rename variables to fill in correct version numbers.
-    rename_variables(cfg, &idom, defined_vars, &mut phi_nodes, &mut max_versions);
+    rename_variables(cfg, &idom, &preds, defined_vars, &mut phi_nodes, &mut max_versions);
 
     Ok(SsaForm { phi_nodes, max_versions })
 }

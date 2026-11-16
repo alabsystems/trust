@@ -1,0 +1,226 @@
+{
+  "name": "license_gated_admitted_under_any_policy",
+  "def_path": "trust_ir_laws::laws::license_gated_admitted_under_any_policy",
+  "span": {
+    "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+    "line_start": 273,
+    "col_start": 0,
+    "line_end": 277,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir_laws::UnlicensedBodyPolicy",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Refuse",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Permit",
+                "discriminant": 1,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "unlicensed"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir_laws::GateShape",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Absent",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Ungated",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Gated",
+                "discriminant": 2,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 2
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "trust_ir_laws::GateShape",
+                      "variant": 2,
+                      "active_field": null,
+                      "args": "trust_ir_laws::GateShape"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+                "line_start": 276,
+                "col_start": 24,
+                "line_end": 276,
+                "col_end": 40
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "trust_ir_laws::license_admits_body",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+              "line_start": 276,
+              "col_start": 4,
+              "line_end": 276,
+              "col_end": 53
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 18354624647166368809,
+              "def_index": 17,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 18354624647166368809,
+              "krate_name": "trust_ir_laws"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "StorageDead": 2
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/laws.rs",
+        "line_start": 274,
+        "col_start": 12,
+        "line_end": 274,
+        "col_end": 18
+      },
+      "body": "__trust_lowered_compiler_contract__:result"
+    }
+  ],
+  "preconditions": [],
+  "postconditions": [
+    {
+      "Var": [
+        "_0",
+        "Bool"
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [],
+    "ensures": [
+      "result"
+    ],
+    "invariants": []
+  }
+}

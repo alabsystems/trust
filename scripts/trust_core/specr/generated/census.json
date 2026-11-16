@@ -1,0 +1,1546 @@
+{
+ "adt_recursive_groups": [
+  [
+   "Discriminator"
+  ],
+  [
+   "LayoutStrategy"
+  ],
+  [
+   "UnsafeCellStrategy"
+  ],
+  [
+   "Type",
+   "Variant"
+  ],
+  [
+   "PlaceExpr",
+   "ValueExpr"
+  ],
+  [
+   "Value"
+  ]
+ ],
+ "adts": 64,
+ "constructs_supported_uses": {
+  "call:closure-expression-argument": 2,
+  "call:closure-value": 10,
+  "call:closure-variable-argument": 8,
+  "call:implicit-reborrow": 4,
+  "call:method-resolved-by-arity": 8,
+  "call:spec-function": 672,
+  "expr:arith": 42,
+  "expr:assign": 16,
+  "expr:bitwise": 4,
+  "expr:block": 388,
+  "expr:closure": 69,
+  "expr:closure-value": 1,
+  "expr:comparison": 47,
+  "expr:compound-assign": 3,
+  "expr:deref": 4,
+  "expr:div-rem": 8,
+  "expr:equality": 153,
+  "expr:field": 279,
+  "expr:if": 127,
+  "expr:if-let": 18,
+  "expr:index": 65,
+  "expr:library-constant": 32,
+  "expr:literal": 277,
+  "expr:match": 103,
+  "expr:neg": 4,
+  "expr:not": 33,
+  "expr:option-constructor": 42,
+  "expr:option-result-constructor": 17,
+  "expr:question-mark": 333,
+  "expr:question-mark-on-never": 1,
+  "expr:question-mark-on-nondet": 1,
+  "expr:range": 3,
+  "expr:ret": 142,
+  "expr:return": 17,
+  "expr:shift": 9,
+  "expr:short-circuit": 35,
+  "expr:spec-constant": 37,
+  "expr:struct-literal": 51,
+  "expr:struct-update-syntax": 6,
+  "expr:tuple": 67,
+  "expr:tuple-struct-constructor": 1,
+  "expr:unit-variant": 104,
+  "expr:variable": 1305,
+  "expr:variant-constructor": 119,
+  "lib:Align::from_bits_const": 2,
+  "lib:Align::from_bytes": 7,
+  "lib:Int::from": 6,
+  "lib:List::new": 2,
+  "lib:Map::new": 4,
+  "lib:Offset::from_bytes": 1,
+  "lib:Set::new": 3,
+  "lib:Size::from_bits_const": 2,
+  "lib:Size::from_bytes": 14,
+  "lib:Size::from_bytes_const": 3,
+  "lib:ThreadId::from": 1,
+  "lib:adt:Endianness.decode": 2,
+  "lib:adt:Endianness.encode": 2,
+  "lib:align.bytes": 6,
+  "lib:align.is_aligned": 6,
+  "lib:align.max": 1,
+  "lib:align.min": 2,
+  "lib:bool.cmp": 1,
+  "lib:int.bring_in_bounds": 3,
+  "lib:int.cmp": 4,
+  "lib:int.in_bounds": 8,
+  "lib:int.is_power_of_two": 1,
+  "lib:int.pow": 1,
+  "lib:int.rem_euclid": 2,
+  "lib:iter.all": 2,
+  "lib:iter.collect": 1,
+  "lib:iter.enumerate": 2,
+  "lib:iter.find": 3,
+  "lib:iter.find_map": 1,
+  "lib:iter.map": 1,
+  "lib:iter.next": 2,
+  "lib:list.all": 2,
+  "lib:list.any": 6,
+  "lib:list.collect": 1,
+  "lib:list.flat_map": 1,
+  "lib:list.fold_with_idx": 1,
+  "lib:list.get": 6,
+  "lib:list.index_at": 2,
+  "lib:list.is_empty": 4,
+  "lib:list.last": 2,
+  "lib:list.len": 66,
+  "lib:list.map": 3,
+  "lib:list.map_with_idx": 1,
+  "lib:list.mutate_at": 12,
+  "lib:list.pop": 3,
+  "lib:list.push": 8,
+  "lib:list.set": 3,
+  "lib:list.sort_by_key": 1,
+  "lib:list.subslice_with_length": 5,
+  "lib:list.try_map": 9,
+  "lib:list.try_mutate_at": 2,
+  "lib:list.write_subslice_at_index": 6,
+  "lib:list.zip": 9,
+  "lib:map.contains_key": 8,
+  "lib:map.get": 15,
+  "lib:map.insert": 4,
+  "lib:map.into_iter": 1,
+  "lib:map.iter": 7,
+  "lib:map.keys": 4,
+  "lib:map.len": 2,
+  "lib:map.remove": 1,
+  "lib:map.values": 3,
+  "lib:option.expect": 1,
+  "lib:option.is_none": 8,
+  "lib:option.is_some": 5,
+  "lib:option.map": 2,
+  "lib:option.map_or": 1,
+  "lib:option.unwrap": 26,
+  "lib:option.unwrap_or": 2,
+  "lib:ordering.is_eq": 1,
+  "lib:ordering.is_ge": 1,
+  "lib:ordering.is_gt": 1,
+  "lib:ordering.is_le": 1,
+  "lib:ordering.is_lt": 1,
+  "lib:ordering.is_ne": 1,
+  "lib:ordering.then": 1,
+  "lib:pick": 3,
+  "lib:predict": 1,
+  "lib:result.expect": 2,
+  "lib:result.is_err": 2,
+  "lib:result.is_ok": 2,
+  "lib:result.unwrap": 4,
+  "lib:set.contains": 3,
+  "lib:set.insert": 5,
+  "lib:set.try_insert": 2,
+  "lib:size.align_to": 3,
+  "lib:size.bits": 6,
+  "lib:size.bytes": 52,
+  "lib:size.is_zero": 1,
+  "macro:assert!": 17,
+  "macro:assert_eq!": 8,
+  "macro:list!": 19,
+  "macro:list_repeat!": 5,
+  "macro:panic!": 76,
+  "macro:throw!": 1,
+  "macro:throw_abort!": 1,
+  "macro:throw_deadlock!": 1,
+  "macro:throw_ill_formed!": 49,
+  "macro:throw_machine_stop!": 1,
+  "macro:throw_memory_leak!": 1,
+  "macro:throw_ub!": 137,
+  "macro:unreachable!": 2,
+  "macro:write!": 1,
+  "pattern:binding": 994,
+  "pattern:enum-variant": 118,
+  "pattern:literal": 2,
+  "pattern:option": 75,
+  "pattern:or": 17,
+  "pattern:struct": 144,
+  "pattern:tuple": 178,
+  "pattern:tuple-variant": 254,
+  "pattern:wildcard": 114,
+  "stmt:for-loop": 39,
+  "stmt:let": 431,
+  "stmt:let-else": 112,
+  "stmt:use-glob-import": 19,
+  "stmt:use-rename": 1,
+  "stmt:while-loop": 2,
+  "typing:collect-turbofish": 1,
+  "typing:empty-collection-from-use-site": 4,
+  "typing:let-annotation-with-inferred-part": 1
+ },
+ "emission_groups": {
+  "mutual": [
+   [
+    "MRf.PlaceExpr.check_wf",
+    "MRf.ValueExpr.check_wf"
+   ],
+   [
+    "MRf.Machine.check_ptr",
+    "MRf.Machine.check_ptr_metadata",
+    "MRf.Machine.check_value"
+   ],
+   [
+    "MRf.Machine.eval_place",
+    "MRf.Machine.eval_value"
+   ]
+  ],
+  "non_recursive": 150,
+  "self_recursive": 0
+ },
+ "functions": [
+  {
+   "file": "prelude/target.md",
+   "item": "<x86_64 as Target>::valid_size",
+   "kind": "fn",
+   "lean": "MRf.x86_64.Target.valid_size",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::align",
+   "kind": "fn",
+   "lean": "MRf.IntType.align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "Type::layout",
+   "kind": "fn",
+   "lean": "MRf.Type.layout",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "Type::meta_kind",
+   "kind": "fn",
+   "lean": "MRf.Type.meta_kind",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "TupleHeadLayout::capped_tail_align",
+   "kind": "fn",
+   "lean": "MRf.TupleHeadLayout.capped_tail_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "TupleHeadLayout::tail_offset",
+   "kind": "fn",
+   "lean": "MRf.TupleHeadLayout.tail_offset",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "TupleHeadLayout::full_size_and_align",
+   "kind": "fn",
+   "lean": "MRf.TupleHeadLayout.full_size_and_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "TupleHeadLayout::head_size_and_align",
+   "kind": "fn",
+   "lean": "MRf.TupleHeadLayout.head_size_and_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "LayoutStrategy::is_sized",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.is_sized",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "LayoutStrategy::expect_size",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.expect_size",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "LayoutStrategy::expect_align",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.expect_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "LayoutStrategy::compute_size_and_align",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.compute_size_and_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "LayoutStrategy::meta_kind",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.meta_kind",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::usize_ty",
+   "kind": "fn",
+   "lean": "MRf.IntType.usize_ty",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::can_represent",
+   "kind": "fn",
+   "lean": "MRf.IntType.can_represent",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::bring_in_bounds",
+   "kind": "fn",
+   "lean": "MRf.IntType.bring_in_bounds",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::with_overflow",
+   "kind": "fn",
+   "lean": "MRf.IntType.with_overflow",
+   "status": "translated"
+  },
+  {
+   "construct": "qualified-self-path",
+   "detail": "",
+   "file": "lang/types.md",
+   "item": "unit_ty",
+   "kind": "fn",
+   "lean": "MRf.fn.unit_ty",
+   "status": "refused-body"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Type::decode",
+   "kind": "fn",
+   "lean": "MRf.Type.decode",
+   "refused_arms": [
+    {
+     "arm": 4,
+     "construct": "collect-without-expected-type",
+     "detail": ""
+    }
+   ],
+   "status": "translated-with-refused-arms"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Type::encode",
+   "kind": "fn",
+   "lean": "MRf.Type.encode",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "decode_ptr",
+   "kind": "fn",
+   "lean": "MRf.fn.decode_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "encode_ptr",
+   "kind": "fn",
+   "lean": "MRf.fn.encode_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "PointerMetaKind::ty",
+   "kind": "fn",
+   "lean": "MRf.PointerMetaKind.ty",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "PtrType::as_wide_pair",
+   "kind": "fn",
+   "lean": "MRf.PtrType.as_wide_pair",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "PointerMetaKind::decode_value",
+   "kind": "fn",
+   "lean": "MRf.PointerMetaKind.decode_value",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "PointerMetaKind::encode_as_value",
+   "kind": "fn",
+   "lean": "MRf.PointerMetaKind.encode_as_value",
+   "status": "translated"
+  },
+  {
+   "construct": "polymorphic-function-in-mutual-recursion",
+   "detail": "MRf.Type.decode, MRf.fn.decode_discriminant",
+   "file": "lang/representation.md",
+   "item": "decode_discriminant",
+   "kind": "fn",
+   "lean": "MRf.fn.decode_discriminant",
+   "status": "refused-body"
+  },
+  {
+   "construct": "polymorphic-function-in-mutual-recursion",
+   "detail": "MRf.Type.encode, MRf.fn.encode_discriminant",
+   "file": "lang/representation.md",
+   "item": "encode_discriminant",
+   "kind": "fn",
+   "lean": "MRf.fn.encode_discriminant",
+   "status": "refused-body"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "ensure_else_ub",
+   "kind": "fn",
+   "lean": "MRf.fn.ensure_else_ub",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::check_ptr_metadata",
+   "kind": "fn",
+   "lean": "MRf.Machine.check_ptr_metadata",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::check_ptr",
+   "kind": "fn",
+   "lean": "MRf.Machine.check_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::check_value",
+   "kind": "fn",
+   "lean": "MRf.Machine.check_value",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::typed_store",
+   "kind": "fn",
+   "lean": "MRf.Machine.typed_store",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::typed_load",
+   "kind": "fn",
+   "lean": "MRf.Machine.typed_load",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "<AbstractByte as DefinedRelation>::le_defined",
+   "kind": "fn",
+   "lean": "MRf.AbstractByte.DefinedRelation.le_defined",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "<ThinPointer as DefinedRelation>::le_defined",
+   "kind": "fn",
+   "lean": "MRf.ThinPointer.DefinedRelation.le_defined",
+   "status": "translated"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "<PointerMeta as DefinedRelation>::le_defined",
+   "kind": "fn",
+   "lean": "MRf.PointerMeta.DefinedRelation.le_defined",
+   "status": "translated"
+  },
+  {
+   "construct": "library-method",
+   "detail": "option<PointerMeta>.le_defined",
+   "file": "lang/representation.md",
+   "item": "<Pointer as DefinedRelation>::le_defined",
+   "kind": "fn",
+   "lean": "MRf.Pointer.DefinedRelation.le_defined",
+   "status": "refused-body"
+  },
+  {
+   "construct": "library-method",
+   "detail": "list<Value>.le_defined",
+   "file": "lang/representation.md",
+   "item": "<Value as DefinedRelation>::le_defined",
+   "kind": "fn",
+   "lean": "MRf.Value.DefinedRelation.le_defined",
+   "status": "refused-body"
+  },
+  {
+   "file": "lang/representation.md",
+   "item": "Machine::transmute",
+   "kind": "fn",
+   "lean": "MRf.Machine.transmute",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "ensure_wf",
+   "kind": "fn",
+   "lean": "MRf.fn.ensure_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "IntType::check_wf",
+   "kind": "fn",
+   "lean": "MRf.IntType.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "TupleHeadLayout::check_wf",
+   "kind": "fn",
+   "lean": "MRf.TupleHeadLayout.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "LayoutStrategy::check_wf",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "LayoutStrategy::check_aligned",
+   "kind": "fn",
+   "lean": "MRf.LayoutStrategy.check_aligned",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "UnsafeCellStrategy::check_cells",
+   "kind": "fn",
+   "lean": "MRf.UnsafeCellStrategy.check_cells",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "UnsafeCellStrategy::check_wf",
+   "kind": "fn",
+   "lean": "MRf.UnsafeCellStrategy.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "PointeeInfo::check_wf",
+   "kind": "fn",
+   "lean": "MRf.PointeeInfo.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "PtrType::check_wf",
+   "kind": "fn",
+   "lean": "MRf.PtrType.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Type::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Type.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Discriminator::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Discriminator.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Constant::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Constant.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "ValueExpr::check_wf",
+   "kind": "fn",
+   "lean": "MRf.ValueExpr.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "PlaceExpr::check_wf",
+   "kind": "fn",
+   "lean": "MRf.PlaceExpr.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "ArgumentExpr::check_wf",
+   "kind": "fn",
+   "lean": "MRf.ArgumentExpr.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Statement::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Statement.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "is_atomic_binop",
+   "kind": "fn",
+   "lean": "MRf.fn.is_atomic_binop",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Terminator::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Terminator.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Function::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Function.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Function::check_next_block",
+   "kind": "fn",
+   "lean": "MRf.Function.check_next_block",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Function::check_unwind_block",
+   "kind": "fn",
+   "lean": "MRf.Function.check_unwind_block",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Relocation::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Relocation.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/well-formed.md",
+   "item": "Program::check_wf",
+   "kind": "fn",
+   "lean": "MRf.Program.check_wf",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::new",
+   "kind": "fn",
+   "lean": "MRf.Machine.new",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::step",
+   "kind": "fn",
+   "lean": "MRf.Machine.step",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::active_thread",
+   "kind": "fn",
+   "lean": "MRf.Machine.active_thread",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::mutate_active_thread",
+   "kind": "fn",
+   "lean": "MRf.Machine.mutate_active_thread",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Machine.cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::mutate_cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Machine.mutate_cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::try_mutate_cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Machine.try_mutate_cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::mutate_cur_stack",
+   "kind": "fn",
+   "lean": "MRf.Machine.mutate_cur_stack",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Thread::cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Thread.cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Thread::mutate_cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Thread.mutate_cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Thread::try_mutate_cur_frame",
+   "kind": "fn",
+   "lean": "MRf.Thread.try_mutate_cur_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "StackFrame::jump_to_block",
+   "kind": "fn",
+   "lean": "MRf.StackFrame.jump_to_block",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::new_thread",
+   "kind": "fn",
+   "lean": "MRf.Machine.new_thread",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::fn_from_ptr",
+   "kind": "fn",
+   "lean": "MRf.Machine.fn_from_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::vtable_from_ptr",
+   "kind": "fn",
+   "lean": "MRf.Machine.vtable_from_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::reset_data_race_tracking",
+   "kind": "fn",
+   "lean": "MRf.Machine.reset_data_race_tracking",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::vtable_lookup",
+   "kind": "fn",
+   "lean": "MRf.Machine.vtable_lookup",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::compute_size",
+   "kind": "fn",
+   "lean": "MRf.Machine.compute_size",
+   "status": "translated"
+  },
+  {
+   "file": "lang/machine.md",
+   "item": "Machine::compute_align",
+   "kind": "fn",
+   "lean": "MRf.Machine.compute_align",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/expressions.md",
+   "item": "Machine::eval_value",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_value",
+   "refused_arms": [
+    {
+     "arm": 4,
+     "construct": "closure-return-type-inference-through-question-mark",
+     "detail": ""
+    }
+   ],
+   "status": "translated-with-refused-arms"
+  },
+  {
+   "file": "lang/step/expressions.md",
+   "item": "Machine::eval_constant",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_constant",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/expressions.md",
+   "item": "Machine::place_load",
+   "kind": "fn",
+   "lean": "MRf.Machine.place_load",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/expressions.md",
+   "item": "Machine::eval_place",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_place",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "Machine::eval_statement",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_statement",
+   "refused_arms": [
+    {
+     "arm": 2,
+     "construct": "closure-bound-to-local-without-parameter-types",
+     "detail": ""
+    }
+   ],
+   "status": "translated-with-refused-arms"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "Machine::place_store",
+   "kind": "fn",
+   "lean": "MRf.Machine.place_store",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "Machine::retag_val",
+   "kind": "fn",
+   "lean": "MRf.Machine.retag_val",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "ConcurrentMemory::deinit",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.deinit",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "StackFrame::storage_live",
+   "kind": "fn",
+   "lean": "MRf.StackFrame.storage_live",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/statements.md",
+   "item": "StackFrame::storage_dead",
+   "kind": "fn",
+   "lean": "MRf.StackFrame.storage_dead",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::eval_terminator",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_terminator",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::jump_to_block",
+   "kind": "fn",
+   "lean": "MRf.Machine.jump_to_block",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "check_abi_compatibility",
+   "kind": "fn",
+   "lean": "MRf.fn.check_abi_compatibility",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::prepare_for_inplace_passing",
+   "kind": "fn",
+   "lean": "MRf.Machine.prepare_for_inplace_passing",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::eval_argument",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_argument",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::create_frame",
+   "kind": "fn",
+   "lean": "MRf.Machine.create_frame",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::eval_call",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_call",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/terminators.md",
+   "item": "Machine::terminate_active_thread",
+   "kind": "fn",
+   "lean": "MRf.Machine.terminate_active_thread",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_un_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_un_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_int_un_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_int_un_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_count_ones",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_count_ones",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_cast_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_cast_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_bin_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_bin_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_int_bin_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_int_bin_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::eval_rel_op",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_rel_op",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::compare_ptr",
+   "kind": "fn",
+   "lean": "MRf.Machine.compare_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::ptr_offset_wrapping",
+   "kind": "fn",
+   "lean": "MRf.Machine.ptr_offset_wrapping",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/operators.md",
+   "item": "Machine::ptr_offset_inbounds",
+   "kind": "fn",
+   "lean": "MRf.Machine.ptr_offset_inbounds",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::eval_intrinsic",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_intrinsic",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "unit_value",
+   "kind": "fn",
+   "lean": "MRf.fn.unit_value",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "unit_type",
+   "kind": "fn",
+   "lean": "MRf.fn.unit_type",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::exit",
+   "kind": "fn",
+   "lean": "MRf.Machine.exit",
+   "status": "translated"
+  },
+  {
+   "construct": "write-to-DynWrite",
+   "detail": "output through a shared stream handle is not modelled",
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::eval_print",
+   "kind": "fn",
+   "lean": "MRf.Machine.eval_print",
+   "status": "refused-body"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::spawn",
+   "kind": "fn",
+   "lean": "MRf.Machine.spawn",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::join",
+   "kind": "fn",
+   "lean": "MRf.Machine.join",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/intrinsics.md",
+   "item": "Machine::load_raw_data",
+   "kind": "fn",
+   "lean": "MRf.Machine.load_raw_data",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/locks.md",
+   "item": "Machine::lock_create",
+   "kind": "fn",
+   "lean": "MRf.Machine.lock_create",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/locks.md",
+   "item": "Machine::lock_acquire",
+   "kind": "fn",
+   "lean": "MRf.Machine.lock_acquire",
+   "status": "translated"
+  },
+  {
+   "file": "lang/step/locks.md",
+   "item": "Machine::lock_release",
+   "kind": "fn",
+   "lean": "MRf.Machine.lock_release",
+   "status": "translated"
+  },
+  {
+   "file": "mem/pointer.md",
+   "item": "ThinPointer::wrapping_offset",
+   "kind": "fn",
+   "lean": "MRf.ThinPointer.wrapping_offset",
+   "status": "translated"
+  },
+  {
+   "file": "mem/pointer.md",
+   "item": "ThinPointer::widen",
+   "kind": "fn",
+   "lean": "MRf.ThinPointer.widen",
+   "status": "translated"
+  },
+  {
+   "file": "mem/pointer.md",
+   "item": "PtrType::safe_pointee",
+   "kind": "fn",
+   "lean": "MRf.PtrType.safe_pointee",
+   "status": "translated"
+  },
+  {
+   "file": "mem/pointer.md",
+   "item": "PtrType::meta_kind",
+   "kind": "fn",
+   "lean": "MRf.PtrType.meta_kind",
+   "status": "translated"
+  },
+  {
+   "file": "mem/interface.md",
+   "item": "AbstractByte::data",
+   "kind": "fn",
+   "lean": "MRf.AbstractByte.data",
+   "status": "translated"
+  },
+  {
+   "file": "mem/interface.md",
+   "item": "AbstractByte::provenance_frag",
+   "kind": "fn",
+   "lean": "MRf.AbstractByte.provenance_frag",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::new",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.new",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "Allocation::size",
+   "kind": "fn",
+   "lean": "MRf.Allocation.size",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "Allocation::overlaps",
+   "kind": "fn",
+   "lean": "MRf.Allocation.overlaps",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::allocate",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.allocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::deallocate",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.deallocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::check_ptr",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.check_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::store",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.store",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::load",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.load",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "BasicMemory::leak_check",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.leak_check",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::new",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.new",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::allocate",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.allocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::deallocate",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.deallocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::store",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.store",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::load",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.load",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::dereferenceable",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.dereferenceable",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::new_call",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.new_call",
+   "status": "translated"
+  },
+  {
+   "file": "mem/basic.md",
+   "item": "<BasicMemory as Memory>::leak_check",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.leak_check",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::new",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.new",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::allocate",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.allocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::deallocate",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.deallocate",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::store",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.store",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::load",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.load",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::dereferenceable",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.dereferenceable",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::signed_dereferenceable",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.signed_dereferenceable",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::retag_ptr",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.retag_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::end_call",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.end_call",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::leak_check",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.leak_check",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::check_data_races",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.check_data_races",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "ConcurrentMemory::reset_accesses",
+   "kind": "fn",
+   "lean": "MRf.ConcurrentMemory.reset_accesses",
+   "status": "translated"
+  },
+  {
+   "file": "mem/concurrent.md",
+   "item": "Access::races",
+   "kind": "fn",
+   "lean": "MRf.Access.races",
+   "status": "translated"
+  },
+  {
+   "file": "mem/intptrcast.md",
+   "item": "IntPtrCast::new",
+   "kind": "fn",
+   "lean": "MRf.IntPtrCast.new",
+   "status": "translated"
+  },
+  {
+   "file": "mem/intptrcast.md",
+   "item": "IntPtrCast::expose",
+   "kind": "fn",
+   "lean": "MRf.IntPtrCast.expose",
+   "status": "translated"
+  },
+  {
+   "file": "mem/intptrcast.md",
+   "item": "IntPtrCast::int2ptr",
+   "kind": "fn",
+   "lean": "MRf.IntPtrCast.int2ptr",
+   "status": "translated"
+  },
+  {
+   "file": "mem/interface.md",
+   "item": "<BasicMemory as Memory>::signed_dereferenceable",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.signed_dereferenceable",
+   "status": "translated"
+  },
+  {
+   "file": "mem/interface.md",
+   "item": "<BasicMemory as Memory>::retag_ptr",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.retag_ptr",
+   "status": "translated"
+  },
+  {
+   "file": "mem/interface.md",
+   "item": "<BasicMemory as Memory>::end_call",
+   "kind": "fn",
+   "lean": "MRf.BasicMemory.Memory.end_call",
+   "status": "translated"
+  },
+  {
+   "file": "prelude/target.md",
+   "item": "x86_64::PTR_SIZE",
+   "kind": "const",
+   "lean": "MRf.x86_64.PTR_SIZE",
+   "status": "translated"
+  },
+  {
+   "file": "prelude/target.md",
+   "item": "x86_64::PTR_ALIGN",
+   "kind": "const",
+   "lean": "MRf.x86_64.PTR_ALIGN",
+   "status": "translated"
+  },
+  {
+   "file": "prelude/target.md",
+   "item": "x86_64::INT_MAX_ALIGN",
+   "kind": "const",
+   "lean": "MRf.x86_64.INT_MAX_ALIGN",
+   "status": "translated"
+  },
+  {
+   "file": "prelude/target.md",
+   "item": "x86_64::ENDIANNESS",
+   "kind": "const",
+   "lean": "MRf.x86_64.ENDIANNESS",
+   "status": "translated"
+  },
+  {
+   "file": "prelude/target.md",
+   "item": "x86_64::MAX_ATOMIC_SIZE",
+   "kind": "const",
+   "lean": "MRf.x86_64.MAX_ATOMIC_SIZE",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::I8",
+   "kind": "const",
+   "lean": "MRf.IntType.I8",
+   "status": "translated"
+  },
+  {
+   "file": "lang/types.md",
+   "item": "IntType::I32",
+   "kind": "const",
+   "lean": "MRf.IntType.I32",
+   "status": "translated"
+  }
+ ],
+ "input_files": [
+  {
+   "code_lines": 65,
+   "path": "prelude/main.md"
+  },
+  {
+   "code_lines": 26,
+   "path": "prelude/target.md"
+  },
+  {
+   "code_lines": 2,
+   "path": "lang/prelude.md"
+  },
+  {
+   "code_lines": 1,
+   "path": "mem/prelude.md"
+  },
+  {
+   "code_lines": 493,
+   "path": "lang/syntax.md"
+  },
+  {
+   "code_lines": 283,
+   "path": "lang/types.md"
+  },
+  {
+   "code_lines": 22,
+   "path": "lang/values.md"
+  },
+  {
+   "code_lines": 529,
+   "path": "lang/representation.md"
+  },
+  {
+   "code_lines": 844,
+   "path": "lang/well-formed.md"
+  },
+  {
+   "code_lines": 309,
+   "path": "lang/machine.md"
+  },
+  {
+   "code_lines": 226,
+   "path": "lang/step/expressions.md"
+  },
+  {
+   "code_lines": 134,
+   "path": "lang/step/statements.md"
+  },
+  {
+   "code_lines": 384,
+   "path": "lang/step/terminators.md"
+  },
+  {
+   "code_lines": 383,
+   "path": "lang/step/operators.md"
+  },
+  {
+   "code_lines": 470,
+   "path": "lang/step/intrinsics.md"
+  },
+  {
+   "code_lines": 128,
+   "path": "lang/step/locks.md"
+  },
+  {
+   "code_lines": 144,
+   "path": "mem/pointer.md"
+  },
+  {
+   "code_lines": 111,
+   "path": "mem/interface.md"
+  },
+  {
+   "code_lines": 259,
+   "path": "mem/basic.md"
+  },
+  {
+   "code_lines": 130,
+   "path": "mem/concurrent.md"
+  },
+  {
+   "code_lines": 26,
+   "path": "mem/intptrcast.md"
+  }
+ ],
+ "item_kinds": {
+  "enum": 33,
+  "fn": 11,
+  "impl": 121,
+  "struct": 31,
+  "trait": 3,
+  "type": 8,
+  "use": 6
+ },
+ "minirust_revision": "e8666821f7ee06282199e126a623679f8df85a36",
+ "output_lines": 2509,
+ "output_sha256": "c3aa8cef33a80fadccd1d27a52e652c3212d7dcf574259dc0a869d0d501c3c47",
+ "refused_items": [
+  {
+   "construct": "impl-on-library-type",
+   "detail": "List (trait DefinedRelation)",
+   "item": "lang/representation.md: impl DefinedRelation for List::le_defined"
+  },
+  {
+   "construct": "impl-on-library-type",
+   "detail": "Option (trait DefinedRelation)",
+   "item": "lang/representation.md: impl DefinedRelation for Option::le_defined"
+  }
+ ]
+}

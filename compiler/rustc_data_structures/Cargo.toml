@@ -12,9 +12,10 @@ arrayvec = { version = "0.7", default-features = false }
 bitflags = "2.4.1"
 either = "1.0"
 elsa = "1.11.0"
-ena = "0.14.3"
+ena = "0.14.4"
 indexmap = "2.14.0"
 jobserver_crate = { version = "0.1.28", package = "jobserver" }
+jobserver_utils = { path = "../../src/jobserver_utils" }
 measureme = "12.0.1"
 parking_lot = "0.12"
 rustc-hash = "2.0.0"
@@ -31,9 +32,9 @@ smallvec = { version = "1.8.1", features = [
     "union",
     "may_dangle",
 ] }
-stacker = "0.1.17"
+stacker = "0.1.25"
 tempfile = "3.2"
-thin-vec = "0.2.18"
+thin-vec = "0.2.21"
 tracing = "0.1"
 # tidy-alphabetical-end
 
@@ -64,3 +65,14 @@ memmap2 = "0.2.1"
 
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies]
 portable-atomic = "1.5.1"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+trust-build-cpu = { path = "../../crates/trust-build-cpu", features = ["jobserver", "observations", "native-host"] } # Trust: worker-owned runtime admission.
+
+# Trust: SDK custody capture is supported only by the native Linux/Mac client.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies.trust-resource-controller]
+path = "../../crates/trust-resource-controller"
+features = ["client"]
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies.trust-resource-provenance]
+path = "../../crates/trust-resource-provenance"

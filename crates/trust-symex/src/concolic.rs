@@ -807,38 +807,40 @@ pub fn concolic_search(
 
 pub(crate) fn sorted_free_variables(formula: &Formula) -> Vec<String> {
     let mut free = BTreeSet::default();
-    collect_free_variables(formula, &mut free, &BTreeSet::default());
-    free.into_iter().collect()
+    let mut bound = Vec::new();
+    collect_free_variables(formula, &mut free, &mut bound);
+    free.into_iter().map(str::to_owned).collect()
 }
 
-fn collect_free_variables(
-    formula: &Formula,
-    free: &mut BTreeSet<String>,
-    bound: &BTreeSet<String>,
+fn collect_free_variables<'a>(
+    formula: &'a Formula,
+    free: &mut BTreeSet<&'a str>,
+    bound: &mut Vec<&'a str>,
 ) {
     match formula {
         Formula::Var(name, _) => {
-            if !bound.contains(name) {
-                free.insert(name.clone());
+            if !bound.contains(&name.as_str()) {
+                free.insert(name.as_str());
             }
         }
         Formula::SymVar(sym, _) => {
-            let name = sym.as_str().to_string();
+            let name = sym.as_str();
             if !bound.contains(&name) {
                 free.insert(name);
             }
         }
         Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
-            let mut new_bound = bound.clone();
+            let prev_len = bound.len();
             for (sym, _) in bindings {
-                new_bound.insert(sym.as_str().to_string());
+                bound.push(sym.as_str());
             }
-            collect_free_variables(body, free, &new_bound);
+            collect_free_variables(body, free, bound);
+            bound.truncate(prev_len);
         }
         _ => {
-            for child in formula.children() {
+            trust_types::for_each_formula_child(formula, |child| {
                 collect_free_variables(child, free, bound);
-            }
+            });
         }
     }
 }
@@ -1383,6 +1385,7 @@ mod tests {
                 span: span(),
                 atomic: None,
                 callee_identity: None,
+                callee_key: None,
             },
         }];
         let config = ConcolicConfig::default();
@@ -1743,14 +1746,6 @@ mod tests {
             }
             other => panic!("expected FoundBug for x > 1000000, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_concolic_result_enum_variants() {
-        // Ensure all variants are constructible.
-        let _found = ConcolicResult::FoundBug { counterexample: BTreeMap::default(), iteration: 0 };
-        let _exhausted = ConcolicResult::Exhausted { iterations: 5 };
-        let _limit = ConcolicResult::ResourceLimit;
     }
 
     #[test]

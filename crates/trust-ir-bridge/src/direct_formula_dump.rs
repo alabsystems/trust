@@ -397,8 +397,11 @@ mod tests {
     /// The four seal/version refusals, each named.
     #[test]
     fn parser_refuses_torn_or_foreign_files() {
-        let rows =
-            vec![record("overflow", 0, DumpedOutcome::Withheld { reason: "opaque-operand".into() })];
+        let rows = vec![record(
+            "overflow",
+            0,
+            DumpedOutcome::Withheld { reason: "opaque-operand".into() },
+        )];
         let good = render_direct_formula_dump("fixture", &rows).expect("render");
 
         // Missing seal.
@@ -460,10 +463,7 @@ mod tests {
             FormulaDecline::WrongOperandCount { expected: 1, got: 2 },
             FormulaDecline::RenderFailed,
             FormulaDecline::SyntheticNameCollision,
-            FormulaDecline::NestedOperandWidthMismatch {
-                outer: (32, false),
-                inner: (64, false),
-            },
+            FormulaDecline::NestedOperandWidthMismatch { outer: (32, false), inner: (64, false) },
         ];
         for decline in declines {
             assert!(

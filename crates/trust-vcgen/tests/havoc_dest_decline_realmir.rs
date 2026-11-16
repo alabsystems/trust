@@ -75,6 +75,9 @@
 //! `same_crate_callee_is_not_reclassified` below kill its removal.
 use trust_types::{Formula, VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 /// Stack for the generation/solver thread. Real extracted MIR carries deep
 /// recursive `Formula` walks; the libtest default 2 MiB stack overflows on the
 /// intrinsic fixtures (the same allowance `intrinsic_semantics_realmir` makes,
@@ -113,7 +116,7 @@ fn safety_rows(name: &str) -> Vec<(String, String)> {
                 let verdict = if tag.starts_with("decline:") {
                     "UNKNOWN".to_string()
                 } else {
-                    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+                    let router = test_router::deterministic_test_router();
                     match router
                         .verify_all(std::slice::from_ref(vc))
                         .into_iter()

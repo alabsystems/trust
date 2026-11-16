@@ -13,6 +13,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
 use std::fmt::Write;
 
 use trust_types::{
@@ -144,7 +145,7 @@ impl HtmlReportGenerator {
         html.push_str(&Self::render_hardened_context(report));
         html.push_str(&Self::render_functions(report, config));
         html.push_str(&Self::render_footer(report));
-        html.push_str(&Self::render_script());
+        html.push_str(Self::render_script());
         html.push_str("</body>\n</html>\n");
 
         html
@@ -274,11 +275,34 @@ impl HtmlReportGenerator {
              <h1>{title}</h1>\n\
              <div class=\"meta\">Crate: <strong>{crate_name}</strong> \
              | Trust v{version} | Generated: {ts}</div>\n\
+             {gate}\
              </div>\n",
             title = escape_html(&config.title),
             crate_name = escape_html(&report.crate_name),
             version = escape_html(&report.metadata.trust_version),
             ts = escape_html(&report.metadata.timestamp),
+            gate = Self::render_gate_lane(report),
+        )
+    }
+
+    /// The gate lane, and every requirement Cargo project configuration
+    /// supplied and the run adopted, so a lane chosen by a project file is
+    /// visible in the published page (DECISION_QUEUE "Project policy cannot
+    /// loosen the lane — 2026-10-07"). Empty for a report without a gate.
+    fn render_gate_lane(report: &JsonProofReport) -> String {
+        let Some(gate) = report.verification_gate.as_ref() else {
+            return String::new();
+        };
+        let requirements = gate.project_requirements.as_ref().map_or_else(String::new, |reqs| {
+            format!(
+                " | Project requirements (Cargo configuration, adopted for this run): \
+                 <strong class=\"project-requirements\">{}</strong>",
+                escape_html(&reqs.items().join(", "))
+            )
+        });
+        format!(
+            "<div class=\"meta\">Gate lane: <strong>{lane}</strong>{requirements}</div>\n",
+            lane = escape_html(&gate.lane),
         )
     }
 
@@ -527,25 +551,40 @@ impl HtmlReportGenerator {
                         loc = loc_cell,
                     );
 
+                    // Trust (TINV step 10.7): the premises the row rests on.
+                    for premise in &ob.assumes {
+                        let colspan = if config.include_source { 5 } else { 4 };
+                        let _ = writeln!(
+                            out,
+                            "<tr><td colspan=\"{colspan}\"><div class=\"reason\">{premise}</div></td></tr>",
+                            premise = escape_html(premise),
+                        );
+                    }
+
                     // Counterexample detail row
                     if config.include_counterexamples
-                        && let ObligationOutcome::Failed { counterexample: Some(cex) } = &ob.outcome
+                        && let ObligationOutcome::Failed { counterexample: Some(cex), .. } =
+                            &ob.outcome
                     {
                         let colspan = if config.include_source { 5 } else { 4 };
-                        let vars: Vec<String> = cex
-                            .variables
-                            .iter()
-                            .map(|v| {
-                                format!("{} = {}", escape_html(&v.name), escape_html(&v.display))
-                            })
-                            .collect();
+                        let mut vars = String::new();
+                        for (i, v) in cex.variables.iter().enumerate() {
+                            if i > 0 {
+                                vars.push_str(", ");
+                            }
+                            let _ = write!(
+                                vars,
+                                "{} = {}",
+                                escape_html_cow(&v.name),
+                                escape_html_cow(&v.display)
+                            );
+                        }
                         let _ = writeln!(
                             out,
                             "<tr><td colspan=\"{colspan}\">\
                                  <div class=\"cex\">\
                                  <div class=\"cex-label\">Counterexample</div>\
                                  {vars}</div></td></tr>",
-                            vars = vars.join(", "),
                         );
                     }
 
@@ -595,29 +634,30 @@ impl HtmlReportGenerator {
     }
 
     fn render_footer(report: &JsonProofReport) -> String {
-        let mut solvers: Vec<String> = report
+        let mut solvers: Vec<&str> = report
             .functions
             .iter()
-            .flat_map(|f| f.obligations.iter().map(|o| o.solver.clone()))
+            .flat_map(|f| f.obligations.iter().map(|o| o.solver.as_str()))
             .collect();
-        solvers.sort();
+        solvers.sort_unstable();
         solvers.dedup();
 
-        let solver_list = if solvers.is_empty() { "none".to_string() } else { solvers.join(", ") };
+        let solver_list: Cow<'static, str> =
+            if solvers.is_empty() { Cow::Borrowed("none") } else { Cow::Owned(solvers.join(", ")) };
 
-        let timestamp = escape_html(&report.metadata.timestamp);
+        let timestamp = escape_html_cow(&report.metadata.timestamp);
 
         format!(
             "<div class=\"footer\">Generated by Trust v{version} \
              | Solvers: {solvers} | {ts}</div>\n",
-            version = escape_html(&report.metadata.trust_version),
-            solvers = escape_html(&solver_list),
+            version = escape_html_cow(&report.metadata.trust_version),
+            solvers = escape_html_cow(&solver_list),
             ts = timestamp,
         )
     }
 
     /// Render minimal inline JavaScript for filtering and column sorting.
-    fn render_script() -> String {
+    fn render_script() -> &'static str {
         "<script>\n\
          function trustFilter(v){\n\
            var b=document.querySelector('.fbtn[data-filter=\"'+v+'\"]');\n\
@@ -652,13 +692,30 @@ impl HtmlReportGenerator {
            for(var i=0;i<rows.length;i++)tb.appendChild(rows[i]);\n\
          }\n\
          </script>\n"
-            .to_string()
     }
 }
 
 // ---------------------------------------------------------------------------
 // Public escape function
 // ---------------------------------------------------------------------------
+
+fn escape_html_cow(s: &str) -> Cow<'_, str> {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// Escape a string for safe inclusion in HTML content.
 ///
@@ -667,11 +724,7 @@ impl HtmlReportGenerator {
 /// file paths, counterexample values) into HTML output.
 #[must_use]
 pub fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
+    escape_html_cow(s).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +757,9 @@ fn obligation_display(outcome: &ObligationOutcome) -> (&'static str, &'static st
     match outcome {
         ObligationOutcome::Proved { .. } => ("s-proved", "PROVED"),
         ObligationOutcome::RuntimeChecked { .. } => ("s-runtime", "RUNTIME"),
+        ObligationOutcome::Failed { basis, .. } if !basis.is_refuted() => {
+            ("s-failed", "FAILED (unproved, no counterexample; failed closed)")
+        }
         ObligationOutcome::Failed { .. } => ("s-failed", "FAILED"),
         ObligationOutcome::Unknown { .. } => ("s-unknown", "UNKNOWN"),
         ObligationOutcome::Timeout { .. } => ("s-timeout", "TIMEOUT"),
@@ -1108,6 +1164,48 @@ mod tests {
         let html = HtmlReportGenerator::generate(&cr, &config);
 
         assert!(html.contains("#ffffff"));
+    }
+
+    /// DECISION_QUEUE "Project policy cannot loosen the lane — 2026-10-07": the
+    /// published page names the gate lane and every adopted project
+    /// requirement, and says nothing about requirements when none were set.
+    #[test]
+    fn html_header_names_gate_lane_and_project_requirements() {
+        let mut report = build_json_report("lane_crate", &[]);
+        assert!(!generate_html_report(&report).contains("Gate lane:"));
+
+        let gate = |requirements: serde_json::Value| -> VerificationGateReport {
+            let mut gate = serde_json::json!({
+                "lane": "advisory",
+                "decision": "fail",
+                "exit_code": 1,
+                "counts": {"total": 0, "proved": 0, "failed": 0, "unknown": 0,
+                           "runtime_checked": 0, "assumed": 0, "mandated": 0},
+            });
+            if !requirements.is_null() {
+                gate["project_requirements"] = requirements;
+            }
+            serde_json::from_value(gate).expect("gate deserializes")
+        };
+        report.verification_gate = Some(gate(serde_json::Value::Null));
+        let html = generate_html_report(&report);
+        assert!(html.contains("Gate lane: <strong>advisory</strong>"), "{html}");
+        assert!(!html.contains("Project requirements"), "{html}");
+
+        report.verification_gate = Some(gate(serde_json::json!({
+            "policy": "advisory", "level": "L1", "profile": "default",
+            "include_dependencies": false, "ir_lower": "strict",
+            "verification_required": true,
+        })));
+        let html = generate_html_report(&report);
+        assert!(
+            html.contains(
+                "<strong class=\"project-requirements\">policy=advisory, level=L1, \
+                 profile=default, include-dependencies=no, ir-lower=strict, \
+                 verification=required</strong>"
+            ),
+            "{html}"
+        );
     }
 
     // 10. Collapsed sections (max_depth=0)

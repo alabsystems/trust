@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 // trust_vcgen/contracts.rs: Contract-based VC generation
 //
 // Converts parsed function contracts into verification conditions.
@@ -83,6 +84,9 @@ fn bind_compiler_loop_contracts_inner(
     specs: &[LoopContractSpec],
     compiler_bundle: Option<&CompilerContractBundle>,
 ) -> Vec<(usize, String)> {
+    if specs.is_empty() {
+        return Vec::new();
+    }
     let loops = crate::termination::detect_loops(&func.body);
     let mut failures = Vec::new();
     let mut bindings: FxHashMap<u32, Result<BlockId, String>> = FxHashMap::default();
@@ -95,16 +99,15 @@ fn bind_compiler_loop_contracts_inner(
         if bindings.contains_key(&spec.source_loop_id) {
             continue;
         }
-        let group: Vec<_> = specs
+        let evidence_is_consistent = specs
             .iter()
             .filter(|candidate| candidate.source_loop_id == spec.source_loop_id)
-            .collect();
-        let evidence_is_consistent = group.iter().all(|candidate| {
-            candidate.loop_head == spec.loop_head
-                && candidate.header_span == spec.header_span
-                && candidate.source_hir_local_id == spec.source_hir_local_id
-                && candidate.mir_header == spec.mir_header
-        });
+            .all(|candidate| {
+                candidate.loop_head == spec.loop_head
+                    && candidate.header_span == spec.header_span
+                    && candidate.source_hir_local_id == spec.source_hir_local_id
+                    && candidate.mir_header == spec.mir_header
+            });
         let binding = if !evidence_is_consistent {
             Err(format!(
                 "e45.loop-source.inconsistent-group: source loop {} carries inconsistent HIR/MIR/span evidence across its clauses",
@@ -136,21 +139,31 @@ fn bind_compiler_loop_contracts_inner(
             // `detect_loops` has one row per back-edge, so a multi-latch loop
             // can repeat the same header. De-duplicate by semantic MIR block
             // identity before requiring a unique match.
-            let candidates: FxHashSet<_> = loops
-                .iter()
-                .filter_map(|loop_info| {
-                    let header = func.body.blocks.get(loop_info.header.0)?;
-                    let terminator_span = terminator_source_span(&header.terminator);
-                    source_span_contains(&spec.header_span, &terminator_span)
-                        .then_some(loop_info.header)
-                })
-                .collect();
-            match candidates.len() {
-                1 => Ok(*candidates.iter().next().expect("one candidate")),
-                0 => pair_loop_from_body_source_evidence(func, &loops, spec),
-                count => Err(format!(
-                    "source loop {} ambiguously matched {count} MIR natural-loop headers using its header span",
-                    spec.source_loop_id
+            let mut matched_header: Option<BlockId> = None;
+            let mut extra_headers: FxHashSet<BlockId> = FxHashSet::default();
+            for loop_info in &loops {
+                let Some(header) = func.body.blocks.get(loop_info.header.0) else { continue };
+                let Some(terminator_span) = terminator_source_span(&header.terminator) else {
+                    continue;
+                };
+                if !source_span_contains(&spec.header_span, terminator_span) {
+                    continue;
+                }
+                match matched_header {
+                    None => matched_header = Some(loop_info.header),
+                    Some(first) if first == loop_info.header => {}
+                    Some(_) => {
+                        extra_headers.insert(loop_info.header);
+                    }
+                }
+            }
+            match (matched_header, extra_headers.len()) {
+                (Some(header), 0) => Ok(header),
+                (None, _) => pair_loop_from_body_source_evidence(func, &loops, spec),
+                (Some(_), extra) => Err(format!(
+                    "source loop {} ambiguously matched {} MIR natural-loop headers using its header span",
+                    spec.source_loop_id,
+                    1 + extra
                 )),
             }
         };
@@ -268,86 +281,76 @@ fn pair_loop_from_body_source_evidence(
     spec: &LoopContractSpec,
 ) -> Result<BlockId, String> {
     // `detect_loops` has one row per back-edge. Collapse multi-latch rows by
-    // semantic header identity and retain the earliest contained evidence for
-    // that header before checking uniqueness.
-    let mut by_header: FxHashMap<BlockId, SourceSpan> = FxHashMap::default();
+    // semantic header identity before checking uniqueness.
+    let mut by_header: FxHashSet<BlockId> = FxHashSet::default();
+    let mut single_header: Option<BlockId> = None;
     for loop_info in loops {
-        let Some(span) = earliest_contained_loop_span(func, loop_info, &spec.loop_head) else {
+        if by_header.contains(&loop_info.header) {
             continue;
-        };
-        by_header
-            .entry(loop_info.header)
-            .and_modify(|current| {
-                if source_span_order_key(&span) < source_span_order_key(current) {
-                    *current = span.clone();
-                }
-            })
-            .or_insert(span);
+        }
+        if has_contained_loop_span(func, loop_info, &spec.loop_head) {
+            by_header.insert(loop_info.header);
+            single_header = Some(loop_info.header);
+        }
     }
-    let mut candidates = by_header.into_iter().collect::<Vec<_>>();
-    candidates.sort_by_key(|(_, span)| source_span_order_key(span));
-    match candidates.as_slice() {
-        [] => Err(format!(
+    match by_header.len() {
+        0 => Err(format!(
             "source loop {} could not be paired with a MIR natural-loop header using header or earliest contained in-loop source evidence",
             spec.source_loop_id
         )),
-        [(header, _)] => Ok(*header),
-        _ => Err(format!(
+        1 => single_header.ok_or_else(|| {
+            format!(
+                "source loop {} could not be paired with a MIR natural-loop header using header or earliest contained in-loop source evidence",
+                spec.source_loop_id
+            )
+        }),
+        n => Err(format!(
             "source loop {} ambiguously covered {} MIR natural-loop headers using contained source evidence; span fallback requires exactly one distinct header",
             spec.source_loop_id,
-            candidates.len()
+            n
         )),
     }
 }
 
-fn source_span_order_key(span: &SourceSpan) -> (u32, u32, u32, u32) {
-    (span.line_start, span.col_start, span.line_end, span.col_end)
-}
-
-/// The earliest source span within a natural loop's blocks (statement spans
-/// plus span-bearing terminators) that is CONTAINED in `outer`. `None` when no
+/// Whether any source span within a natural loop's blocks (statement spans
+/// plus span-bearing terminators) is CONTAINED in `outer`. `false` when no
 /// in-loop span falls inside `outer` — pairing then fails closed. Containment
 /// is the pairing evidence itself: fn-signature-spanned argument copies and
 /// other out-of-loop-source spans that ride along in the natural-loop block
 /// set are simply skipped rather than poisoning the choice.
-fn earliest_contained_loop_span(
+fn has_contained_loop_span(
     func: &VerifiableFunction,
     loop_info: &crate::termination::LoopInfo,
     outer: &SourceSpan,
-) -> Option<SourceSpan> {
-    let mut earliest: Option<SourceSpan> = None;
-    let mut consider = |span: &SourceSpan| {
-        if span.file.is_empty() || !source_span_contains(outer, span) {
-            return;
-        }
-        if earliest
-            .as_ref()
-            .is_none_or(|current| source_span_order_key(span) < source_span_order_key(current))
-        {
-            earliest = Some(span.clone());
-        }
-    };
+) -> bool {
+    let is_contained = |span: &SourceSpan| !span.file.is_empty() && source_span_contains(outer, span);
     for block_id in &loop_info.body_blocks {
         let Some(block) = func.body.blocks.get(block_id.0) else { continue };
         for statement in &block.stmts {
-            if let Statement::Assign { span, .. } = statement {
-                consider(span);
+            if let Statement::Assign { span, .. } = statement
+                && is_contained(span)
+            {
+                return true;
             }
         }
-        consider(&terminator_source_span(&block.terminator));
+        if let Some(span) = terminator_source_span(&block.terminator)
+            && is_contained(span)
+        {
+            return true;
+        }
     }
-    earliest
+    false
 }
 
-fn terminator_source_span(term: &Terminator) -> SourceSpan {
+fn terminator_source_span(term: &Terminator) -> Option<&SourceSpan> {
     match term {
         Terminator::SwitchInt { span, .. }
         | Terminator::Call { span, .. }
         | Terminator::TailCall { span, .. }
         | Terminator::Assert { span, .. }
         | Terminator::Drop { span, .. }
-        | Terminator::Opaque { span, .. } => span.clone(),
-        _ => SourceSpan::default(),
+        | Terminator::Opaque { span, .. } => Some(span),
+        _ => None,
     }
 }
 
@@ -390,11 +393,18 @@ pub(crate) fn is_spec_model_var(name: &str) -> bool {
 /// satisfiable by havoc regardless of the function body, so a solver "SAT"
 /// over it mints an assignment that is NOT a program counterexample.
 pub(crate) fn ungrounded_spec_model_vars(formula: &Formula) -> Vec<String> {
-    let mut vars: Vec<String> =
-        formula.free_variables().into_iter().filter(|name| is_spec_model_var(name)).collect();
-    vars.sort();
+    let mut vars: Vec<&str> = Vec::new();
+    trust_types::for_each_free_variable_name(formula, &mut |name| {
+        if is_spec_model_var(name) {
+            vars.push(name);
+        }
+    });
+    if vars.is_empty() {
+        return Vec::new();
+    }
+    vars.sort_unstable();
     vars.dedup();
-    vars
+    vars.into_iter().map(str::to_string).collect()
 }
 
 /// Build the fail-closed, NON-REFUTABLE obligation for an `#[ensures]` whose
@@ -516,14 +526,18 @@ impl LoopInvariantFeedbackCandidate {
 #[derive(Debug, Clone)]
 pub struct LoopInvariantFeedbackContext {
     function_payload: String,
+    semantic_function_digest: String,
     interval_environment: crate::abstract_interp::IntervalDomain,
 }
 
 fn proof_gated_function_digest(function_payload: &str) -> String {
-    trust_types::stable_sha256_hex(
-        format!("trust.e4.function-payload.v1:{}:{function_payload}", function_payload.len())
-            .as_bytes(),
-    )
+    let len_str = function_payload.len().to_string();
+    trust_types::stable_sha256_hex_parts(&[
+        b"trust.e4.function-payload.v1:",
+        len_str.as_bytes(),
+        b":",
+        function_payload.as_bytes(),
+    ])
 }
 
 /// Prepare exact production E4 reconstruction once for all invariant pairs in
@@ -545,6 +559,12 @@ pub fn prepare_loop_invariant_feedback_validation(
     // abstract interpretation. Otherwise an unrelated unmodeled precondition
     // could make exact production E4 rows impossible to recognize.
     let tail_call_expanded = func.with_tail_calls_expanded();
+    let semantic_function_digest = match &tail_call_expanded {
+        std::borrow::Cow::Borrowed(_) => proof_gated_function_digest(&function_payload),
+        std::borrow::Cow::Owned(expanded) => {
+            proof_gated_function_digest(&serde_json::to_string(expanded).ok()?)
+        }
+    };
     let arithmetic_safe_func =
         crate::generate::without_unmodeled_contract_arithmetic(tail_call_expanded.as_ref());
     let interval_environment =
@@ -552,7 +572,11 @@ pub fn prepare_loop_invariant_feedback_validation(
     if crate::gen_work_tripped() {
         return None;
     }
-    Some(LoopInvariantFeedbackContext { function_payload, interval_environment })
+    Some(LoopInvariantFeedbackContext {
+        function_payload,
+        semantic_function_digest,
+        interval_environment,
+    })
 }
 
 /// Validate that an E4 pair is an exact production reconstruction and return a
@@ -585,6 +609,26 @@ pub fn loop_invariant_feedback_candidate_with_context(
     consecution: &VerificationCondition,
 ) -> Option<LoopInvariantFeedbackCandidate> {
     let _work_scope = crate::gen_work_scope();
+    let (
+        VcKind::LoopInvariantInitiation {
+            invariant: actual_init_invariant,
+            header_block: actual_init_header,
+        },
+        VcKind::LoopInvariantConsecution {
+            invariant: actual_cons_invariant,
+            header_block: actual_cons_header,
+        },
+    ) = (&initiation.kind, &consecution.kind)
+    else {
+        return None;
+    };
+    if actual_init_header != actual_cons_header
+        || actual_init_invariant != actual_cons_invariant
+        || initiation.function.as_str() != func.name
+        || consecution.function.as_str() != func.name
+    {
+        return None;
+    }
     if serde_json::to_string(func).ok()? != context.function_payload {
         return None;
     }
@@ -604,6 +648,13 @@ pub fn loop_invariant_feedback_candidate_with_context(
         let Some((header_block, expr)) = loop_contract_body(&contract.body) else {
             continue;
         };
+        if header_block != *actual_init_header
+            || expr != *actual_init_invariant
+            || contract.span != initiation.location
+            || contract.span != consecution.location
+        {
+            continue;
+        }
         let mut expected = Vec::with_capacity(2);
         generate_loop_invariant_vcs(
             reconstruction_func,
@@ -647,9 +698,7 @@ pub fn loop_invariant_feedback_candidate_with_context(
             // E5 regeneration also uses the shared TailCall semantic view.  Seal
             // feedback to that exact view while the opaque context above stays
             // byte-bound to the unmodified source payload.
-            function_digest: proof_gated_function_digest(
-                &serde_json::to_string(semantic_func).ok()?,
-            ),
+            function_digest: context.semantic_function_digest.clone(),
             function_name: func.name.clone(),
             function_def_path: func.def_path.clone(),
             header_block,
@@ -718,14 +767,25 @@ pub fn regenerate_loop_decreases_with_invariant_feedback_vcs(
     func: &VerifiableFunction,
     feedback: &[LoopInvariantFeedbackCandidate],
 ) -> Vec<VerificationCondition> {
+    if let Some(vc) = crate::memory_image_vc(func) {
+        return vec![vc];
+    }
     if let Err(error) = crate::validate_function(func) {
         return vec![crate::generate::malformed_trust_ir_vc(func, &error)];
     }
 
     let mut vcs = Vec::new();
+    let mut current_function_digest: Option<Option<String>> = None;
     for (contract_index, contract) in func.contracts.iter().enumerate() {
         if matches!(contract.kind, ContractKind::Decreases) {
-            append_loop_decreases_contract_vc(func, contract_index, contract, feedback, &mut vcs);
+            append_loop_decreases_contract_vc(
+                func,
+                contract_index,
+                contract,
+                feedback,
+                &mut current_function_digest,
+                &mut vcs,
+            );
         }
     }
     vcs
@@ -736,6 +796,7 @@ fn append_loop_decreases_contract_vc(
     contract_index: usize,
     contract: &Contract,
     feedback: &[LoopInvariantFeedbackCandidate],
+    current_function_digest: &mut Option<Option<String>>,
     vcs: &mut Vec<VerificationCondition>,
 ) {
     if contract.body.starts_with(UNPAIRED_LOOP_CONTRACT_PREFIX) {
@@ -754,6 +815,7 @@ fn append_loop_decreases_contract_vc(
             header_block,
             expr,
             feedback,
+            current_function_digest,
             vcs,
         );
     }
@@ -770,6 +832,23 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
     vcs: &mut Vec<VerificationCondition>,
     feedback: &[LoopInvariantFeedbackCandidate],
 ) {
+    if let Some(vc) = crate::memory_image_vc(func) {
+        vcs.push(vc);
+        return;
+    }
+    if func.contracts.is_empty() {
+        return;
+    }
+    // INTRINSIC-RESIDUAL-1: the E4 rows below assume `func.preconditions`, so they
+    // read it through the 128-bit parameter type-range view every other entry reads
+    // (`generate::with_param_type_range_facts`; no clone for a body without a
+    // 128-bit parameter). That keeps a caller who hands this function the extracted
+    // body directly (the E4 feedback validator) on the exact rows `generate_vcs`
+    // emitted for it. Only the E4 arm takes the view: the E5 arm seals feedback to
+    // the digest of the function it is GIVEN, which must stay the caller's.
+    let mut ranged = None;
+    let mut fn_sym: Option<Symbol> = None;
+    let mut current_function_digest: Option<Option<String>> = None;
     for (contract_index, contract) in func.contracts.iter().enumerate() {
         let kind = match &contract.kind {
             ContractKind::Requires => VcKind::Precondition { callee: func.name.clone() },
@@ -836,7 +915,14 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                 continue;
             }
             ContractKind::Decreases => {
-                append_loop_decreases_contract_vc(func, contract_index, contract, feedback, vcs);
+                append_loop_decreases_contract_vc(
+                    func,
+                    contract_index,
+                    contract,
+                    feedback,
+                    &mut current_function_digest,
+                    vcs,
+                );
                 continue;
             }
             // trust-wp-style contract VC generation.
@@ -849,8 +935,10 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                     ));
                     continue;
                 };
+                let ranged =
+                    ranged.get_or_insert_with(|| crate::generate::with_param_type_range_facts(func));
                 generate_loop_invariant_vcs(
-                    func,
+                    ranged.as_ref(),
                     contract_index,
                     contract,
                     header_block,
@@ -876,10 +964,10 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                 }
                 vcs.push(VerificationCondition {
                     kind: VcKind::TypeRefinementViolation {
-                        variable: variable.clone(),
+                        variable,
                         predicate: predicate_str,
                     },
-                    function: func.name.as_str().into(),
+                    function: *fn_sym.get_or_insert_with(|| func.name.as_str().into()),
                     location: contract.span.clone(),
                     formula: Formula::Not(Box::new(parsed)),
                     contract_metadata: Some(trust_wp_metadata()),
@@ -890,10 +978,11 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
             ContractKind::Modifies => {
                 // Parse comma-separated variable list, generate frame VCs
                 let vars = parse_modifies_body(&contract.body);
+                let fn_sym = *fn_sym.get_or_insert_with(|| func.name.as_str().into());
                 // Collect all function locals not in the modifies set
                 for local in &func.body.locals {
                     let name = local.name.as_deref().unwrap_or("");
-                    if !name.is_empty() && !vars.contains(&name.to_string()) {
+                    if !name.is_empty() && !vars.iter().any(|v| v == name) {
                         // Trust #integrity: the frame VC compares old/new of an
                         // unmodified local and MUST use that local's real sort, not a
                         // hardcoded Int. A bool/typed local given Int sort yields an
@@ -903,15 +992,15 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
                         vcs.push(VerificationCondition {
                             kind: VcKind::FrameConditionViolation {
                                 variable: name.to_string(),
-                                function: func.name.as_str().into(),
+                                function: func.name.clone(),
                             },
-                            function: func.name.as_str().into(),
+                            function: fn_sym,
                             location: contract.span.clone(),
                             // Frame condition: old(var) == new(var) for unmodified vars.
                             // Check negation: NOT(old == new) is SAT iff frame is violated.
                             formula: Formula::Not(Box::new(Formula::Eq(
-                                Box::new(Formula::Var(format!("{name}__old"), sort.clone())),
-                                Box::new(Formula::Var(name.to_string(), sort)),
+                                Box::new(Formula::var_owned(format!("{name}__old"), sort.clone())),
+                                Box::new(Formula::var(name, sort)),
                             ))),
                             contract_metadata: Some(trust_wp_metadata()),
                             obligation: None,
@@ -1023,7 +1112,7 @@ pub(crate) fn check_contracts_with_loop_invariant_feedback(
 
         vcs.push(VerificationCondition {
             kind,
-            function: func.name.as_str().into(),
+            function: *fn_sym.get_or_insert_with(|| func.name.as_str().into()),
             location: contract.span.clone(),
             formula,
             // Definition-site `Requires` rows are bookkeeping assumptions, not
@@ -1077,6 +1166,44 @@ pub(crate) fn spec_unverifiable_vc(
         function: func.name.as_str().into(),
         location: span,
         // Direct solver callers must not be able to report proof either.
+        formula: Formula::Bool(true),
+        contract_metadata,
+        obligation: None,
+    }
+}
+
+/// Retain the actual source question at the unconstrained-return-call
+/// tripwire. A missing authored index keeps the generic refusal: inferred or
+/// unbound rows must not acquire source correspondence by resembling a clause.
+pub(crate) fn unconstrained_return_call_vc(
+    func: &VerifiableFunction,
+    span: SourceSpan,
+    source_predicate: &Formula,
+    contract_metadata: Option<ContractMetadata>,
+) -> VerificationCondition {
+    let source_index =
+        contract_metadata.and_then(|metadata| metadata.source_contract_index).filter(|index| {
+            func.contracts
+                .get(*index)
+                .is_some_and(|contract| contract.kind == ContractKind::Ensures)
+        });
+    let Some(source_contract_index) = source_index else {
+        return spec_unverifiable_vc(
+            func,
+            span,
+            "the return slot is the result of a call whose value no conjunct constrains; refusing a refutable query over a free return value",
+            &format!("{source_predicate:?}"),
+            contract_metadata,
+        );
+    };
+    VerificationCondition {
+        kind: VcKind::DeclinedContractBody(Box::new(trust_types::ContractBodyDecline {
+            cause: trust_types::ContractBodyDeclineCause::UnconstrainedReturnCall,
+            source_contract_index,
+            source_predicate: source_predicate.clone(),
+        })),
+        function: func.name.as_str().into(),
+        location: span,
         formula: Formula::Bool(true),
         contract_metadata,
         obligation: None,
@@ -1218,13 +1345,17 @@ fn generate_loop_invariant_vcs(
 
     let mut initiation = disjunction(
         entry_contexts
-            .iter()
+            .into_iter()
             .map(|context| {
                 let invariant_at_entry = substitute_formula_state(&invariant, &context.state);
+                let pre_len = if context.function_entry { typed_preconditions.len() } else { 0 };
                 let mut assumptions =
-                    if context.function_entry { typed_preconditions.clone() } else { Vec::new() };
-                assumptions.extend(context.assumptions.clone());
-                assumptions.push(context.guard.clone());
+                    Vec::with_capacity(pre_len + context.assumptions.len() + 2);
+                if context.function_entry {
+                    assumptions.extend(typed_preconditions.iter().cloned());
+                }
+                assumptions.extend(context.assumptions);
+                assumptions.push(context.guard);
                 assumptions.push(Formula::Not(Box::new(invariant_at_entry)));
                 conjunction(assumptions)
             })
@@ -1236,12 +1367,12 @@ fn generate_loop_invariant_vcs(
     // invariant whose body falsifies P leaves a satisfiable violation formula.
     let mut preservation = disjunction(
         transitions
-            .iter()
+            .into_iter()
             .map(|transition| {
                 let invariant_after = substitute_formula_state(&invariant, &transition.post_state);
                 Formula::And(vec![
                     invariant.clone(),
-                    transition.guard.clone(),
+                    transition.guard,
                     Formula::Not(Box::new(invariant_after)),
                 ])
             })
@@ -1250,8 +1381,7 @@ fn generate_loop_invariant_vcs(
     let machine_required = formula_uses_unmodeled_machine_arithmetic(&invariant)
         || formula_contains_machine_encoding(&preservation);
     if machine_required {
-        let combined = Formula::And(vec![initiation.clone(), preservation.clone()]);
-        let scan = machine_domain_scan(func, &combined);
+        let scan = machine_domain_scan_pair(func, &initiation, &preservation);
         // ONE declared domain for the whole formula is the original path and is
         // untouched. When the leaves disagree, the formula is NOT refused
         // outright any more: each comparison is translated at its operands' own
@@ -1269,12 +1399,7 @@ fn generate_loop_invariant_vcs(
             // into `i == total` leaves `0 == 0`, whose own scan declares
             // nothing. The domain that decides it is the one the loop's
             // variables declare, and `initiation` alone has lost them.
-            None => machine_faithful_translate_joined_under(
-                func,
-                formula,
-                scan.exact_join(),
-                true,
-            ),
+            None => machine_faithful_translate_joined_under(func, formula, scan.exact_join(), true),
         };
         let Some(machine_initiation) = translate(&initiation) else {
             let detail = match scan.uniform() {
@@ -1315,9 +1440,10 @@ fn generate_loop_invariant_vcs(
         ));
         return;
     }
+    let fn_sym: Symbol = func.name.as_str().into();
     vcs.push(VerificationCondition {
         kind: VcKind::LoopInvariantInitiation { invariant: expr.clone(), header_block },
-        function: func.name.as_str().into(),
+        function: fn_sym,
         location: contract.span.clone(),
         formula: initiation,
         contract_metadata: Some(trust_wp_metadata_for_source(contract_index)),
@@ -1326,7 +1452,7 @@ fn generate_loop_invariant_vcs(
 
     vcs.push(VerificationCondition {
         kind: VcKind::LoopInvariantConsecution { invariant: expr, header_block },
-        function: func.name.as_str().into(),
+        function: fn_sym,
         location: contract.span.clone(),
         formula: preservation,
         contract_metadata: Some(trust_wp_metadata_for_source(contract_index)),
@@ -1341,6 +1467,7 @@ fn generate_loop_decreases_vc(
     header_block: usize,
     expr: String,
     feedback: &[LoopInvariantFeedbackCandidate],
+    current_function_digest: &mut Option<Option<String>>,
     vcs: &mut Vec<VerificationCondition>,
 ) {
     let Some(parsed) = parse_spec_expr(&expr) else {
@@ -1401,34 +1528,42 @@ fn generate_loop_decreases_vc(
     // obligations; the default first pass supplies no candidates. Function
     // def-path + header + source span checks prevent loop/function leakage, and
     // de-duplication avoids changing the query for duplicate candidates.
-    let current_function_digest =
-        serde_json::to_string(func).ok().map(|payload| proof_gated_function_digest(&payload));
-    for invariant in feedback.iter().filter(|invariant| {
-        current_function_digest.as_ref() == Some(&invariant.function_digest)
-            && invariant.function_name == func.name
-            && invariant.function_def_path == func.def_path
-            && invariant.header_block == header_block
-            && func.contracts.iter().any(|candidate| {
-                matches!(candidate.kind, ContractKind::LoopInvariant)
-                    && candidate.span == invariant.source_span
-                    && loop_contract_body(&candidate.body).is_some_and(|(header, text)| {
-                        header == header_block && text == invariant.source_text
+    if !feedback.is_empty() {
+        for invariant in feedback.iter().filter(|invariant| {
+            invariant.header_block == header_block
+                && invariant.function_name == func.name
+                && invariant.function_def_path == func.def_path
+                && current_function_digest
+                    .get_or_insert_with(|| {
+                        serde_json::to_string(func)
+                            .ok()
+                            .map(|payload| proof_gated_function_digest(&payload))
                     })
-            })
-    }) {
-        if !assumptions.iter().any(|existing| existing == &invariant.predicate) {
-            assumptions.push(invariant.predicate.clone());
+                    .as_ref()
+                    == Some(&invariant.function_digest)
+                && func.contracts.iter().any(|candidate| {
+                    matches!(candidate.kind, ContractKind::LoopInvariant)
+                        && candidate.span == invariant.source_span
+                        && loop_contract_body(&candidate.body).is_some_and(|(header, text)| {
+                            header == header_block && text == invariant.source_text
+                        })
+                })
+        }) {
+            if !assumptions.iter().any(|existing| existing == &invariant.predicate) {
+                assumptions.push(invariant.predicate.clone());
+            }
         }
     }
     let machine_domain = uniform_machine_domain(func, &measure);
     let mut violation = disjunction(
         transitions
-            .iter()
+            .into_iter()
             .map(|transition| {
                 let after = substitute_formula_state(&measure, &transition.post_state);
                 let progress_violation = Formula::Ge(Box::new(after), Box::new(measure.clone()));
-                let mut path_assumptions = assumptions.clone();
-                path_assumptions.push(transition.guard.clone());
+                let mut path_assumptions = Vec::with_capacity(assumptions.len() + 2);
+                path_assumptions.extend(assumptions.iter().cloned());
+                path_assumptions.push(transition.guard);
                 path_assumptions.push(match machine_domain {
                     // Unsigned Machine{w} values are intrinsically natural
                     // numbers. An Int-style negative premise would invent
@@ -1481,7 +1616,7 @@ fn generate_loop_decreases_vc(
 fn conjunction(mut formulas: Vec<Formula>) -> Formula {
     match formulas.len() {
         0 => Formula::Bool(true),
-        1 => formulas.pop().unwrap(),
+        1 => formulas.pop().unwrap_or(Formula::Bool(true)),
         _ => Formula::And(formulas),
     }
 }
@@ -1579,14 +1714,37 @@ fn body_locals_have_canonical_positions(func: &VerifiableFunction) -> bool {
     // authorities disagree. Rustc extraction emits this dense invariant; fail
     // closed when a public caller does not, rather than binding an E4 source
     // name to a different local.
-    func.body.locals.iter().enumerate().all(|(position, decl)| decl.index == position)
+    crate::all_locals_canonical(func)
+}
+
+fn func_has_collection_arg(func: &VerifiableFunction, mutable_filter: Option<bool>) -> bool {
+    if func.body.arg_count == 0 {
+        return false;
+    }
+    let end = func.body.arg_count.saturating_add(1).min(func.body.locals.len());
+    func.body.locals.get(1..end).is_some_and(|args| {
+        args.iter().any(|decl| {
+            let Ty::Ref { mutable, inner } = &decl.ty else {
+                return false;
+            };
+            if mutable_filter.is_some_and(|want| *mutable != want) {
+                return false;
+            }
+            match inner.as_ref() {
+                Ty::Slice { elem } | Ty::Array { elem, .. } => {
+                    read_only_collection_element_sort(elem).is_some()
+                }
+                _ => false,
+            }
+        })
+    })
 }
 
 fn read_only_collection_shape_for_local(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<ReadOnlyCollectionModel> {
-    if !body_locals_have_canonical_positions(func) || local == 0 || local > func.body.arg_count {
+    if local == 0 || local > func.body.arg_count {
         return None;
     }
     let decl = func.body.locals.get(local)?;
@@ -1599,6 +1757,9 @@ fn read_only_collection_shape_for_local(
         _ => return None,
     };
     let elem_sort = read_only_collection_element_sort(elem)?;
+    if !body_locals_have_canonical_positions(func) {
+        return None;
+    }
     let name = crate::place_to_var_name(func, &trust_types::Place::local(local));
     let access = if *mutable {
         CollectionAccess::ExclusiveMutable
@@ -1637,17 +1798,13 @@ fn safe_shared_collection_call_preserves_local(
     is_unsafe_sig: bool,
     local: usize,
 ) -> bool {
-    let touched = args
-        .iter()
-        .filter(|operand| operand_mentions_local_anywhere(operand, local))
-        .collect::<Vec<_>>();
     // A call destination is a definition even when the old collection value is
     // not also passed as an argument. Reject that reseat before the no-touch
     // fast path.
     if place_mentions_local_anywhere(dest, local) {
         return false;
     }
-    if touched.is_empty() {
+    if !args.iter().any(|operand| operand_mentions_local_anywhere(operand, local)) {
         return true;
     }
     if is_foreign || is_unsafe_sig {
@@ -1666,12 +1823,13 @@ fn safe_shared_collection_call_preserves_local(
     if read_only_collection_element_sort(elem).is_none() {
         return false;
     }
-    touched.into_iter().all(|operand| {
-        matches!(
-            operand,
-            Operand::Copy(place)
-                if place.local == local && place.projections.is_empty()
-        )
+    args.iter().all(|operand| {
+        !operand_mentions_local_anywhere(operand, local)
+            || matches!(
+                operand,
+                Operand::Copy(place)
+                    if place.local == local && place.projections.is_empty()
+            )
     })
 }
 
@@ -1706,6 +1864,25 @@ fn is_normalized_usize_ty(ty: &Ty) -> bool {
     *ty == Ty::usize() || matches!(ty, Ty::PtrSizedInt { signed: false, .. })
 }
 
+fn place_uses_collection_only_as_element_read(
+    func: &VerifiableFunction,
+    place: &trust_types::Place,
+    local: usize,
+) -> bool {
+    if place.local != local {
+        return true;
+    }
+    match read_only_collection_index_projection(place, local) {
+        Some(Projection::Index(index_local)) => func
+            .body
+            .locals
+            .get(*index_local)
+            .is_some_and(|decl| decl.index == *index_local && is_normalized_usize_ty(&decl.ty)),
+        Some(Projection::ConstantIndex { from_end: false, .. }) => true,
+        _ => false,
+    }
+}
+
 fn operand_uses_collection_only_as_element_read(
     func: &VerifiableFunction,
     operand: &Operand,
@@ -1718,15 +1895,7 @@ fn operand_uses_collection_only_as_element_read(
     // in valid rustc MIR.  Do not give a fabricated Move-out-of-borrow the same
     // semantics at the public TrustIr boundary.
     let Operand::Copy(place) = operand else { return false };
-    match read_only_collection_index_projection(place, local) {
-        Some(Projection::Index(index_local)) => func
-            .body
-            .locals
-            .get(*index_local)
-            .is_some_and(|decl| decl.index == *index_local && is_normalized_usize_ty(&decl.ty)),
-        Some(Projection::ConstantIndex { from_end: false, .. }) => true,
-        _ => false,
-    }
+    place_uses_collection_only_as_element_read(func, place, local)
 }
 
 fn exact_read_only_collection_len_place(place: &trust_types::Place, local: usize) -> bool {
@@ -1785,7 +1954,7 @@ fn fixed_array_slice_view_cast_model(
     (source_elem == target_elem).then_some(model)
 }
 
-fn place_mentions_local_anywhere(place: &trust_types::Place, local: usize) -> bool {
+pub(crate) fn place_mentions_local_anywhere(place: &trust_types::Place, local: usize) -> bool {
     place.local == local
         || place
             .projections
@@ -1793,11 +1962,11 @@ fn place_mentions_local_anywhere(place: &trust_types::Place, local: usize) -> bo
             .any(|projection| matches!(projection, Projection::Index(index) if *index == local))
 }
 
-fn operand_mentions_local_anywhere(operand: &Operand, local: usize) -> bool {
+pub(crate) fn operand_mentions_local_anywhere(operand: &Operand, local: usize) -> bool {
     operand_place(operand).is_some_and(|place| place_mentions_local_anywhere(place, local))
 }
 
-fn rvalue_mentions_local_anywhere(rvalue: &Rvalue, local: usize) -> bool {
+pub(crate) fn rvalue_mentions_local_anywhere(rvalue: &Rvalue, local: usize) -> bool {
     match rvalue {
         Rvalue::Use(operand)
         | Rvalue::UnaryOp(_, operand)
@@ -1820,7 +1989,7 @@ fn rvalue_mentions_local_anywhere(rvalue: &Rvalue, local: usize) -> bool {
     }
 }
 
-fn statement_mentions_local_anywhere(statement: &Statement, local: usize) -> bool {
+pub(crate) fn statement_mentions_local_anywhere(statement: &Statement, local: usize) -> bool {
     match statement {
         Statement::Assign { place, rvalue, .. } => {
             place_mentions_local_anywhere(place, local)
@@ -1840,7 +2009,7 @@ fn statement_mentions_local_anywhere(statement: &Statement, local: usize) -> boo
     }
 }
 
-fn terminator_mentions_local_anywhere(terminator: &Terminator, local: usize) -> bool {
+pub(crate) fn terminator_mentions_local_anywhere(terminator: &Terminator, local: usize) -> bool {
     match terminator {
         Terminator::SwitchInt { discr, .. } => operand_mentions_local_anywhere(discr, local),
         Terminator::Call { args, dest, .. } => {
@@ -1955,6 +2124,7 @@ struct ExactSliceRawMetadataPair {
 /// type, is moved once into `PtrMetadata`, and occurs nowhere else in the
 /// function. It therefore grants no authority for general raw-pointer aliases,
 /// dereferences, mutation, or provenance reasoning.
+#[inline]
 fn exact_slice_raw_metadata_pair(
     func: &VerifiableFunction,
     collection_local: usize,
@@ -2060,7 +2230,7 @@ fn rvalue_preserves_read_only_collection(
         Rvalue::Len(_) => true,
         Rvalue::Discriminant(place) => place.local != local,
         Rvalue::CopyForDeref(place) => {
-            operand_uses_collection_only_as_element_read(func, &Operand::Copy(place.clone()), local)
+            place_uses_collection_only_as_element_read(func, place, local)
         }
         Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => place.local != local,
         // An explicitly unsupported rvalue has not been audited for hidden
@@ -2082,21 +2252,40 @@ fn exact_shared_collection_alias_definition(
     else {
         return None;
     };
-    if !place.projections.is_empty()
-        || place.local == source_local
-        || source.local != source_local
+    if !place.projections.is_empty() || source.local != source_local {
+        return None;
+    }
+    exact_shared_collection_alias_copy(func, place.local, source).then_some(place.local)
+}
+
+/// `alias_local = copy source` is an exact alias of a shared slice/array reference:
+/// a bare `source`, an `alias_local` that is neither `source` nor a parameter, and the
+/// same `&[T]` / `&[T; N]` type on both sides. The shape half of
+/// [`exact_shared_collection_alias_definition`], shared with
+/// `read_only_collection_model_for_local`, which resolves the alias's one value
+/// through the seam rather than from a statement.
+fn exact_shared_collection_alias_copy(
+    func: &VerifiableFunction,
+    alias_local: usize,
+    source: &trust_types::Place,
+) -> bool {
+    if alias_local == source.local
         || !source.projections.is_empty()
-        || place.local <= func.body.arg_count
+        || alias_local <= func.body.arg_count
     {
-        return None;
+        return false;
     }
-    let source_decl = func.body.locals.get(source_local)?;
-    let alias_decl = func.body.locals.get(place.local)?;
-    if source_decl.ty != alias_decl.ty {
-        return None;
-    }
-    let Ty::Ref { mutable: false, inner } = &source_decl.ty else { return None };
-    matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. }).then_some(place.local)
+    let (Some(source_decl), Some(alias_decl)) =
+        (func.body.locals.get(source.local), func.body.locals.get(alias_local))
+    else {
+        return false;
+    };
+    source_decl.ty == alias_decl.ty
+        && matches!(
+            &source_decl.ty,
+            Ty::Ref { mutable: false, inner }
+                if matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. })
+        )
 }
 
 /// Validate one shared local alias as a pure, non-escaping view of its source
@@ -2112,25 +2301,16 @@ fn read_only_collection_alias_is_stable(
     alias_local: usize,
     source_local: usize,
 ) -> bool {
-    let definitions = func
-        .body
-        .blocks
-        .iter()
-        .flat_map(|block| block.stmts.iter())
-        .filter(|statement| {
-            exact_shared_collection_alias_definition(func, statement, source_local)
-                == Some(alias_local)
-        })
-        .count();
-    if definitions != 1 {
-        return false;
-    }
+    let mut has_definition = false;
 
     for (block_index, block) in func.body.blocks.iter().enumerate() {
         for (statement_index, statement) in block.stmts.iter().enumerate() {
             if exact_shared_collection_alias_definition(func, statement, source_local)
                 == Some(alias_local)
             {
+                if std::mem::replace(&mut has_definition, true) {
+                    return false;
+                }
                 continue;
             }
             if exact_slice_raw_metadata_pair(func, alias_local, block_index, statement_index)
@@ -2219,7 +2399,7 @@ fn read_only_collection_alias_is_stable(
             _ => return false,
         }
     }
-    true
+    has_definition
 }
 
 /// One compiler-shaped, entry-dominating exclusive reborrow of a mutable
@@ -2264,12 +2444,20 @@ fn exact_exclusive_collection_reborrow_source(
     func: &VerifiableFunction,
     statement: &Statement,
 ) -> Option<(usize, usize)> {
-    let mut matches = (1..=func.body.arg_count).filter_map(|source| {
-        exact_exclusive_collection_reborrow_definition(func, statement, source)
-            .map(|alias| (source, alias))
-    });
-    let pair = matches.next()?;
-    matches.next().is_none().then_some(pair)
+    let Statement::Assign {
+        rvalue: Rvalue::Ref { mutable: true, place: source },
+        ..
+    } = statement
+    else {
+        return None;
+    };
+    let source_local = source.local;
+    if source_local == 0 || source_local > func.body.arg_count {
+        return None;
+    }
+    let alias_local =
+        exact_exclusive_collection_reborrow_definition(func, statement, source_local)?;
+    Some((source_local, alias_local))
 }
 
 fn exact_terminal_mutable_alias_return(
@@ -2464,26 +2652,31 @@ fn exclusive_mutable_collection_alias_pair_is_stable(
     let mut alias_model = source_model.clone();
     alias_model.local = alias_local;
 
-    let definitions = func
-        .body
-        .blocks
-        .iter()
-        .flat_map(|block| {
-            block.stmts.iter().enumerate().filter_map(move |(index, statement)| {
-                (exact_exclusive_collection_reborrow_definition(func, statement, source_local)
-                    == Some(alias_local))
-                .then_some((block.id, index))
-            })
-        })
-        .collect::<Vec<_>>();
-    let [(definition_block, definition_index)] = definitions.as_slice() else {
+    // Single streaming scan: the source may have at most one exclusive reborrow
+    // across the entire body (no second exclusive view can coexist in this
+    // whole-body model), and that sole reborrow must define `alias_local`.
+    let mut sole_definition: Option<(BlockId, usize)> = None;
+    for block in &func.body.blocks {
+        for (index, statement) in block.stmts.iter().enumerate() {
+            if let Some(defined_alias) =
+                exact_exclusive_collection_reborrow_definition(func, statement, source_local)
+            {
+                if defined_alias != alias_local
+                    || sole_definition.replace((block.id, index)).is_some()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    let Some((definition_block, definition_index)) = sole_definition else {
         return false;
     };
-    if *definition_block != BlockId(0)
+    if definition_block != BlockId(0)
         || func.body.blocks.iter().any(|block| {
             block.id != BlockId(0) && terminator_edges_to(&block.terminator, BlockId(0)) != 0
         })
-        || func.body.blocks[0].stmts.iter().take(*definition_index).any(|statement| {
+        || func.body.blocks[0].stmts.iter().take(definition_index).any(|statement| {
             !matches!(statement, Statement::StorageLive(local) if *local == alias_local)
                 && (statement_mentions_local_anywhere(statement, source_local)
                     || statement_mentions_local_anywhere(statement, alias_local))
@@ -2491,36 +2684,30 @@ fn exclusive_mutable_collection_alias_pair_is_stable(
     {
         return false;
     }
-    // No second exclusive view of the source can coexist in this whole-body
-    // model. Sequential lifetime reasoning is deliberately outside this lane.
-    if func
-        .body
-        .blocks
-        .iter()
-        .flat_map(|block| block.stmts.iter())
-        .filter(|statement| {
-            exact_exclusive_collection_reborrow_definition(func, statement, source_local).is_some()
-        })
-        .count()
-        != 1
-    {
-        return false;
-    }
 
     let mut terminal_escapes = 0usize;
     for (block_index, block) in func.body.blocks.iter().enumerate() {
-        let mut terminal_reborrow_matches = (0..block.stmts.len()).filter_map(|statement_index| {
-            exact_terminal_mutable_alias_reborrow_return(
-                func,
-                block_index,
-                statement_index,
-                alias_local,
-            )
-        });
-        let terminal_reborrow = terminal_reborrow_matches.next();
-        if terminal_reborrow_matches.next().is_some() {
-            return false;
-        }
+        let terminal_reborrow = if block.id == BlockId(block_index)
+            && matches!(block.terminator, Terminator::Return)
+            && block.stmts.len() >= 4
+        {
+            let mut terminal_reborrow_matches =
+                (0..=block.stmts.len() - 4).filter_map(|statement_index| {
+                    exact_terminal_mutable_alias_reborrow_return(
+                        func,
+                        block_index,
+                        statement_index,
+                        alias_local,
+                    )
+                });
+            let first = terminal_reborrow_matches.next();
+            if terminal_reborrow_matches.next().is_some() {
+                return false;
+            }
+            first
+        } else {
+            None
+        };
         for (statement_index, statement) in block.stmts.iter().enumerate() {
             if exact_exclusive_collection_reborrow_definition(func, statement, source_local)
                 == Some(alias_local)
@@ -2549,7 +2736,7 @@ fn exclusive_mutable_collection_alias_pair_is_stable(
                 return false;
             }
             if matches!(statement, Statement::StorageLive(local) if *local == alias_local)
-                && !(block.id == BlockId(0) && statement_index < *definition_index)
+                && !(block.id == BlockId(0) && statement_index < definition_index)
             {
                 return false;
             }
@@ -2682,25 +2869,37 @@ fn exclusive_mutable_collection_alias_model_for_local(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<ReadOnlyCollectionModel> {
-    let pairs = (1..=func.body.arg_count)
-        .flat_map(|source_local| {
-            func.body.blocks.iter().flat_map(move |block| {
-                block.stmts.iter().filter_map(move |statement| {
-                    exact_exclusive_collection_reborrow_definition(func, statement, source_local)
-                        .map(|alias_local| (source_local, alias_local))
-                })
-            })
-        })
-        .filter(|(source, alias)| local == *source || local == *alias)
-        .collect::<Vec<_>>();
-    let [(source_local, alias_local)] = pairs.as_slice() else {
-        return None;
-    };
-    if !exclusive_mutable_collection_alias_pair_is_stable(func, *source_local, *alias_local) {
+    if local == 0 || !func_has_collection_arg(func, Some(true)) {
         return None;
     }
-    let mut model = read_only_collection_shape_for_local(func, *source_local)?;
-    model.local = if local == *alias_local { *alias_local } else { *source_local };
+    if !func.body.locals.get(local).is_some_and(|decl| {
+        matches!(
+            &decl.ty,
+            Ty::Ref { mutable: true, inner }
+                if matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. })
+        )
+    }) {
+        return None;
+    }
+    let mut sole_pair: Option<(usize, usize)> = None;
+    for block in &func.body.blocks {
+        for statement in &block.stmts {
+            if let Some((source_local, alias_local)) =
+                exact_exclusive_collection_reborrow_source(func, statement)
+                && (local == source_local || local == alias_local)
+            {
+                if sole_pair.replace((source_local, alias_local)).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    let (source_local, alias_local) = sole_pair?;
+    if !exclusive_mutable_collection_alias_pair_is_stable(func, source_local, alias_local) {
+        return None;
+    }
+    let mut model = read_only_collection_shape_for_local(func, source_local)?;
+    model.local = if local == alias_local { alias_local } else { source_local };
     Some(model)
 }
 
@@ -3109,12 +3308,14 @@ fn read_only_collection_arg_is_stable(func: &VerifiableFunction, local: usize) -
                     // array-to-slice view followed immediately by PtrMetadata.
                     // Admit only that exact pair; the recognizer proves the view
                     // local has no retained/escaping use anywhere else.
-                    if exact_fixed_array_slice_metadata_pair(
-                        func,
-                        local,
-                        block_index,
-                        statement_index,
-                    ) {
+                    if matches!(rvalue, Rvalue::Cast(..))
+                        && exact_fixed_array_slice_metadata_pair(
+                            func,
+                            local,
+                            block_index,
+                            statement_index,
+                        )
+                    {
                         continue;
                     }
                     if exact_slice_raw_metadata_pair(func, local, block_index, statement_index)
@@ -3281,18 +3482,40 @@ fn read_only_collection_model_for_local(
     if let Some(model) = read_only_collection_shape_for_local(func, local) {
         return read_only_collection_arg_is_stable(func, local).then_some(model);
     }
-
-    let mut sources = (1..=func.body.arg_count).filter(|source_local| {
-        func.body.blocks.iter().any(|block| {
-            block.stmts.iter().any(|statement| {
-                exact_shared_collection_alias_definition(func, statement, *source_local)
-                    == Some(local)
-            })
+    if local <= func.body.arg_count
+        || !func_has_collection_arg(func, Some(false))
+        || !func.body.locals.get(local).is_some_and(|decl| {
+            matches!(
+                &decl.ty,
+                Ty::Ref { mutable: false, inner }
+                    if matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. })
+            )
         })
-    });
-    let source_local = sources.next()?;
-    if sources.next().is_some()
-        || !read_only_collection_arg_is_stable(func, source_local)
+    {
+        return None;
+    }
+
+    // Trust: 2026-11-09 (VCGEN-SEAM-PERF-REDS-1) — the alias's ONE value is asked of
+    // the seam. `local_defs::unique_value_def` sees every write channel (a `Call`
+    // destination beside the copy, a partial or unlocatable write, a mutable alias)
+    // and answers only when `local` holds exactly one value, written by one
+    // whole-local `Assign`. Only `local = copy <shared collection parameter>` names a
+    // source, and `read_only_collection_alias_is_stable` below still re-checks every
+    // use of the alias. (PERF-460 had replaced the per-parameter scan with a hand
+    // `Assign`-only scan keyed on `local`; its verdicts were right only because that
+    // re-check refuses a `Call` destination, and the seam is where the question lives.)
+    let Some(Rvalue::Use(Operand::Copy(source))) = crate::local_defs::unique_value_def(func, local)
+    else {
+        return None;
+    };
+    let source_local = source.local;
+    if source_local == 0
+        || source_local > func.body.arg_count
+        || !exact_shared_collection_alias_copy(func, local, source)
+    {
+        return None;
+    }
+    if !read_only_collection_arg_is_stable(func, source_local)
         || !read_only_collection_alias_is_stable(func, local, source_local)
     {
         return None;
@@ -3306,16 +3529,50 @@ fn exact_collection_model_for_local(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<ReadOnlyCollectionModel> {
-    if let Some(model) = read_only_collection_shape_for_local(func, local)
-        && model.is_exclusive_mutable()
-    {
-        if exclusive_mutable_collection_arg_is_stable(func, local) {
-            return Some(model);
-        }
-        return exclusive_mutable_collection_alias_model_for_local(func, local);
+    if local == 0 {
+        return None;
     }
-    exclusive_mutable_collection_alias_model_for_local(func, local)
-        .or_else(|| read_only_collection_model_for_local(func, local))
+    let decl = func.body.locals.get(local)?;
+    let Ty::Ref { mutable, inner } = &decl.ty else {
+        return None;
+    };
+    if !matches!(inner.as_ref(), Ty::Slice { .. } | Ty::Array { .. }) {
+        return None;
+    }
+    if *mutable {
+        if let Some(model) = read_only_collection_shape_for_local(func, local) {
+            if exclusive_mutable_collection_arg_is_stable(func, local) {
+                return Some(model);
+            }
+            return exclusive_mutable_collection_alias_model_for_local(func, local);
+        }
+        exclusive_mutable_collection_alias_model_for_local(func, local)
+    } else {
+        read_only_collection_model_for_local(func, local)
+    }
+}
+
+fn unique_local_decl_for_formula_name<'a>(
+    func: &'a VerifiableFunction,
+    name: &str,
+) -> Option<&'a trust_types::LocalDecl> {
+    let parsed_local_index = canonical_formula_local_index(name);
+    match crate::lookup_formula_local_decl(func, name, parsed_local_index) {
+        crate::FormulaLocalDeclLookup::None => None,
+        crate::FormulaLocalDeclLookup::Unique(decl) => {
+            (crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name)
+                .then_some(decl)
+        }
+        crate::FormulaLocalDeclLookup::Ambiguous => {
+            let mut named = func.body.locals.iter().filter(|decl| {
+                local_may_have_var_name(decl, name, parsed_local_index)
+                    && crate::place_to_var_name(func, &trust_types::Place::local(decl.index))
+                        == name
+            });
+            let decl = named.next()?;
+            named.next().is_none().then_some(decl)
+        }
+    }
 }
 
 fn read_only_collection_model_for_name(
@@ -3327,14 +3584,8 @@ fn read_only_collection_model_for_name(
     // `xs` can shadow a stable argument `xs`, disappear from
     // `exact_collection_model_for_local`, and let the source predicate borrow
     // the outer argument's array identity.
-    let mut named = func.body.locals.iter().filter(|decl| {
-        crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
-    });
-    let local = named.next()?.index;
-    if named.next().is_some() {
-        return None;
-    }
-    exact_collection_model_for_local(func, local)
+    let decl = unique_local_decl_for_formula_name(func, name)?;
+    exact_collection_model_for_local(func, decl.index)
 }
 
 /// Rebind the executable spec parser's canonical literal-index place spelling
@@ -3355,14 +3606,12 @@ fn read_only_collection_literal_index_for_name(
         || base.contains('[')
         || base.contains(']')
         || index_text.is_empty()
+        || (index_text.len() > 1 && index_text.starts_with('0'))
         || !index_text.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
     }
     let index = index_text.parse::<i128>().ok()?;
-    if index.to_string() != index_text {
-        return None;
-    }
     let model = read_only_collection_model_for_name(func, base)?;
     if let ReadOnlyCollectionLength::Fixed(length) = &model.length {
         let index = u64::try_from(index).ok()?;
@@ -3373,12 +3622,35 @@ fn read_only_collection_literal_index_for_name(
     Some(Formula::Select(Box::new(model.base_formula()), Box::new(Formula::Int(index))))
 }
 
+/// Match the exact positional spelling emitted for a local. Integer parsing
+/// alone also accepts a leading `+`, which must not create a synthetic alias.
+/// Exact declared source names are resolved separately by each caller.
+fn canonical_formula_local_index(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix('_')?;
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+#[inline]
+fn local_may_have_var_name(
+    decl: &trust_types::LocalDecl,
+    name: &str,
+    parsed_local_index: Option<usize>,
+) -> bool {
+    decl.name.as_deref() == Some(name) || parsed_local_index == Some(decl.index)
+}
+
 fn body_has_formula_local_name(func: &VerifiableFunction, name: &str) -> bool {
-    func.body.locals.iter().any(|decl| {
-        decl.name.as_deref() == Some(name)
-            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
-            || format!("_{}", decl.index) == name
-    })
+    let parsed_local_index = canonical_formula_local_index(name);
+    !matches!(
+        crate::lookup_formula_local_decl(func, name, parsed_local_index),
+        crate::FormulaLocalDeclLookup::None
+    )
 }
 
 fn type_loop_formula(
@@ -3392,14 +3664,22 @@ fn type_loop_formula(
         return None;
     }
     let mut replacements = FxHashMap::default();
-    for name in formula.free_variables() {
-        if let Some(model) = read_only_collection_model_for_name(func, &name) {
-            replacements.insert(name, model.base_formula());
-            continue;
+    let mut seen_vars: FxHashSet<&str> = FxHashSet::default();
+    let mut failed = false;
+    trust_types::for_each_free_variable_name(&formula, &mut |name| {
+        if failed || !seen_vars.insert(name) {
+            return;
         }
-        if let Some(element) = read_only_collection_literal_index_for_name(func, &name) {
-            replacements.insert(name, element);
-            continue;
+        let unique_decl = unique_local_decl_for_formula_name(func, name);
+        if let Some(decl) = unique_decl
+            && let Some(model) = exact_collection_model_for_local(func, decl.index)
+        {
+            replacements.insert(name.to_string(), model.base_formula());
+            return;
+        }
+        if let Some(element) = read_only_collection_literal_index_for_name(func, name) {
+            replacements.insert(name.to_string(), element);
+            return;
         }
         // Extraction canonicalizes an admitted source `xs.len()` precondition
         // to the same `xs__slice_len` leaf used by bounds VCs and modular σ
@@ -3414,37 +3694,42 @@ fn type_loop_formula(
             // ambiguous. The compiler query rejects the same collision before
             // transport; repeat the check at this public reconstruction
             // boundary so a forged formula cannot borrow collection identity.
-            if body_has_formula_local_name(func, &name)
+            if body_has_formula_local_name(func, name)
                 || body_has_formula_local_name(func, &model.length_name())
             {
-                return None;
+                failed = true;
+                return;
             }
-            replacements.insert(name, model.length_formula());
-            continue;
+            replacements.insert(name.to_string(), model.length_formula());
+            return;
         }
         if let Some(base) = name.strip_suffix("__len")
             && let Some(model) = read_only_collection_model_for_name(func, base)
         {
-            if body_has_formula_local_name(func, &name)
+            if body_has_formula_local_name(func, name)
                 || body_has_formula_local_name(func, &model.length_name())
             {
-                return None;
+                failed = true;
+                return;
             }
-            replacements.insert(name, model.length_formula());
-            continue;
+            replacements.insert(name.to_string(), model.length_formula());
+            return;
         }
-        let mut matches = func.body.locals.iter().filter(|decl| {
-            crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
-        });
-        let decl = matches.next()?;
-        if matches.next().is_some()
-            || !matches!(decl.ty, Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char)
-        {
-            return None;
+        let Some(decl) = unique_decl else {
+            failed = true;
+            return;
+        };
+        if !matches!(decl.ty, Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char) {
+            failed = true;
+            return;
         }
-        replacements.insert(name.clone(), Formula::Var(name, crate::sort_for_ty(&decl.ty)));
+        let owned = name.to_string();
+        replacements.insert(owned.clone(), Formula::Var(owned, crate::sort_for_ty(&decl.ty)));
+    });
+    if failed {
+        return None;
     }
-    let typed = substitute_formula_state(&formula, &replacements);
+    let typed = substitute_formula_state_owned(formula, &replacements);
     formula_has_sort(&typed, expected_sort).then_some(typed)
 }
 
@@ -3459,18 +3744,19 @@ pub(crate) fn formula_uses_unmodeled_machine_arithmetic(formula: &Formula) -> bo
     // That is a constant, not a machine operation, and rejecting it drops
     // ordinary range facts such as `x >= -1000` before the BV bridge sees
     // them. Nested constant negations are equally literal-only.
-    if formula_integer_literal(formula).is_some() {
-        return false;
-    }
-    matches!(
-        formula,
+    match formula {
+        Formula::Int(_) => false,
+        Formula::Neg(_) if formula_integer_literal(formula).is_some() => false,
         Formula::Add(..)
-            | Formula::Sub(..)
-            | Formula::Mul(..)
-            | Formula::Div(..)
-            | Formula::Rem(..)
-            | Formula::Neg(..)
-    ) || formula.children().into_iter().any(formula_uses_unmodeled_machine_arithmetic)
+        | Formula::Sub(..)
+        | Formula::Mul(..)
+        | Formula::Div(..)
+        | Formula::Rem(..)
+        | Formula::Neg(..) => true,
+        _ => !trust_types::all_formula_children(formula, |c| {
+            !formula_uses_unmodeled_machine_arithmetic(c)
+        }),
+    }
 }
 
 /// Trust (I5 cross-authority call modeling — `WrappingBinOp`): is `formula`
@@ -3511,6 +3797,30 @@ pub(crate) fn formula_uses_unmodeled_machine_arithmetic(formula: &Formula) -> bo
 /// definitional clause's truth does. What this recognizer guarantees is
 /// narrower and structural: no clause of any OTHER arithmetic shape can
 /// launder through the exemption.
+///
+/// IT IS ALSO SIGN-BLIND, and that half is sharper than the width half this doc
+/// already concedes. The function takes a `&Formula` and nothing else: no `func`, no
+/// width, no signedness. The unsigned single-`Ite` form is ACCEPTED on a SIGNED domain
+/// at the matching width, where it is false — the unsigned reduction lands in
+/// `[0, 2^w)` while a signed band is `[-2^(w-1), 2^(w-1))`, so for `i8` this clause
+/// reads `200` where `100i8.wrapping_add(100)` is `-56`. It is simultaneously TOO
+/// NARROW: it refuses the signed two-`Ite` form that the same shared
+/// `wrapping_binop_modular_ite` constructor mints, because its else-branch test admits
+/// only bare `Add`/`Sub`. Pinned both ways by
+/// `the_modular_recognizer_is_sign_blind_and_the_func_aware_predicate_is_not`.
+///
+/// CONSEQUENCE FOR REUSE, which is the reason this paragraph exists: this predicate is
+/// admissible ONLY behind a producer gate that establishes unsignedness and width
+/// EXTERNALLY. The one production producer does exactly that (the Clean-origin
+/// `WrappingBinOp` arm in `rustc_mir_transform::trust_verify`: unsigned only, width in
+/// {8,16,32,64}, uniform across the whole signature, literals in band). It is a shape
+/// assertion that one producer's gate happens to make true, NOT a check. Do not move it
+/// to a site whose clauses arrive without that gate — in particular not to the
+/// `SpecUnverifiable` lane, whose carrier `func.postconditions` is explicitly open to
+/// synthetic producers. Where a decision needs the domain, use
+/// [`machine_faithful_clause_admissible`], which takes `func`, resolves `(width,
+/// signed)` from the declared local types, and is constructor-verified at that resolved
+/// domain; it answers correctly on the i8 case above.
 pub(crate) fn formula_is_exact_modular_wrapping_definition(formula: &Formula) -> bool {
     let Formula::Eq(dest, rhs) = formula else {
         return false;
@@ -3572,6 +3882,71 @@ pub(crate) fn formula_is_exact_modular_wrapping_definition(formula: &Formula) ->
     operand_ok(x) && operand_ok(y)
 }
 
+/// Trust (2026-09-28): is `formula` EXACTLY `d == x / c` or `d == x % c`, with
+/// `d` and `x` Int-sorted variables and `c` a POSITIVE integer literal? This is the
+/// second, and last, shape the machine-arithmetic injection filter exempts,
+/// beside [`formula_is_exact_modular_wrapping_definition`].
+///
+/// # Why its Int reading IS the machine result, on any integer domain
+///
+/// A positive literal divisor rules out both ways Rust's `/` and `%` leave
+/// mathematical arithmetic. It cannot be zero (the panic), and it cannot be
+/// `-1` (the `MIN / -1` overflow). The quotient's magnitude is at most `|x|`, and
+/// the remainder's is below `c`, so neither leaves `x`'s type. Both SMT paths
+/// encode `Div`/`Rem` as TRUNCATED division (`ay_bridge.rs`, and the smtlib text
+/// path since round 7), which is Rust's semantics for a negative `x` too. So,
+/// unlike the modular recognizer, this one needs no external sign or width gate.
+///
+/// Minted today only by the Clean-origin `RawBinOp` and `SelectBeqGeneral` caller
+/// summaries (`rustc_mir_transform::trust_verify`): `/` and `%` by a positive
+/// numeral, `>>` by an in-range numeral (`x / 2^k`), and `&` with a `2^k - 1`
+/// mask (`x % 2^k`), either as the returned value or as a decision operand of
+/// `d == ite([¬](lhs == rhs), then_arm, else_arm)` over parameter/literal arms,
+/// all at one unsigned width.
+pub(crate) fn formula_is_exact_division_by_positive_literal(formula: &Formula) -> bool {
+    let Formula::Eq(dest, rhs) = formula else {
+        return false;
+    };
+    if !matches!(dest.as_ref(), Formula::Var(_, Sort::Int)) {
+        return false;
+    }
+    formula_is_exact_division_value_by_positive_literal(rhs)
+}
+
+/// The value fragment shared by caller-summary injection and machine-width
+/// body-fact translation. Keeping one recognizer prevents the latter from
+/// accepting an arbitrary conditional that the injection gate would refuse.
+fn formula_is_exact_division_value_by_positive_literal(rhs: &Formula) -> bool {
+    let is_exact_div_rem = |expr: &Formula| -> bool {
+        let (Formula::Div(x, c) | Formula::Rem(x, c)) = expr else {
+            return false;
+        };
+        matches!(x.as_ref(), Formula::Var(_, Sort::Int))
+            && matches!(c.as_ref(), Formula::Int(v) if *v > 0)
+    };
+    if is_exact_div_rem(rhs) {
+        return true;
+    }
+    let Formula::Ite(cond, then_arm, else_arm) = rhs else {
+        return false;
+    };
+    let arm_ok = |arm: &Formula| matches!(arm, Formula::Var(_, Sort::Int) | Formula::Int(_));
+    if !arm_ok(then_arm.as_ref()) || !arm_ok(else_arm.as_ref()) {
+        return false;
+    }
+    let eq_cond = match cond.as_ref() {
+        Formula::Not(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Formula::Eq(lhs, rhs_cmp) = eq_cond else {
+        return false;
+    };
+    let cmp_operand_ok = |op: &Formula| arm_ok(op) || is_exact_div_rem(op);
+    cmp_operand_ok(lhs.as_ref())
+        && cmp_operand_ok(rhs_cmp.as_ref())
+        && (is_exact_div_rem(lhs.as_ref()) || is_exact_div_rem(rhs_cmp.as_ref()))
+}
+
 /// Function-aware version of [`formula_uses_unmodeled_machine_arithmetic`].
 ///
 /// A small source arithmetic fragment is exact when the function contract
@@ -3579,28 +3954,57 @@ pub(crate) fn formula_is_exact_modular_wrapping_definition(formula: &Formula) ->
 /// signed `0 - x` agrees with mathematical subtraction whenever a declared
 /// precondition proves `x > MIN`. This is the shape emitted for a guarded
 /// `wrapping_neg` contract; retaining it restores the body-aware obligation
-/// without admitting unchecked machine arithmetic generally.
+/// without admitting unchecked machine arithmetic generally. Unsigned bare-variable
+/// remainder by a positive in-domain literal is total and Int-exact too; the
+/// shared definedness check retains that node without enabling general `/`/`%`.
 pub(crate) fn formula_uses_unmodeled_machine_arithmetic_in_function(
     func: &VerifiableFunction,
     formula: &Formula,
 ) -> bool {
-    if formula_integer_literal(formula).is_some()
-        || zero_subtraction_is_exact_under_preconditions(func, formula)
-    {
-        return false;
-    }
-    matches!(
-        formula,
-        Formula::Add(..)
+    fn visit(
+        func: &VerifiableFunction,
+        formula: &Formula,
+        allow_remainder: bool,
+        canonical_locals: &mut Option<bool>,
+    ) -> bool {
+        match formula {
+            Formula::Int(_) => return false,
+            Formula::Neg(_) if formula_integer_literal(formula).is_some() => return false,
+            Formula::Sub(..) if zero_subtraction_is_exact_under_preconditions(func, formula) => {
+                return false;
+            }
+            Formula::Rem(..)
+                if allow_remainder
+                    && *canonical_locals
+                        .get_or_insert_with(|| body_locals_have_canonical_positions(func))
+                    && trust_types::unsigned_literal_remainder_is_exact(formula, |name| {
+                        // This carrier has no target pointer width. Reuse the
+                        // existing bare fixed-width unsigned declaration check;
+                        // never infer a `usize` domain from the host.
+                        bare_unsigned_var_width(func, name).map(|width| (width, false))
+                    }) =>
+            {
+                return false;
+            }
+            Formula::Add(..)
             | Formula::Sub(..)
             | Formula::Mul(..)
             | Formula::Div(..)
             | Formula::Rem(..)
-            | Formula::Neg(..)
-    ) || formula
-        .children()
-        .into_iter()
-        .any(|child| formula_uses_unmodeled_machine_arithmetic_in_function(func, child))
+            | Formula::Neg(..) => return true,
+            _ => {}
+        }
+        // A bound Int is not the similarly named unsigned body local. Keep
+        // the previous arithmetic behavior beneath binders; the new exact
+        // remainder exception may use only an unshadowed declaration.
+        let allow_remainder =
+            allow_remainder && !matches!(formula, Formula::Forall(..) | Formula::Exists(..));
+        !trust_types::all_formula_children(formula, |child| {
+            !visit(func, child, allow_remainder, canonical_locals)
+        })
+    }
+    let mut canonical_locals = None;
+    visit(func, formula, true, &mut canonical_locals)
 }
 
 fn formula_integer_literal(formula: &Formula) -> Option<i128> {
@@ -3633,15 +4037,35 @@ fn zero_subtraction_is_exact_under_preconditions(
 }
 
 fn signed_machine_local_min(func: &VerifiableFunction, name: &str) -> Option<i128> {
-    let mut matches = func.body.locals.iter().filter(|decl| {
-        decl.name.as_deref() == Some(name)
-            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == name
-            || (decl.index == 0 && name == "_0")
-    });
-    let decl = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
+    let parsed_local_index = canonical_formula_local_index(name);
+    let decl = match crate::lookup_formula_local_decl(func, name, parsed_local_index) {
+        crate::FormulaLocalDeclLookup::None => return None,
+        crate::FormulaLocalDeclLookup::Unique(decl) => {
+            if decl.name.as_deref() != Some(name)
+                && !(decl.index == 0 && name == "_0")
+                && crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) != name
+            {
+                return None;
+            }
+            decl
+        }
+        crate::FormulaLocalDeclLookup::Ambiguous => {
+            let mut matches = func.body.locals.iter().filter(|decl| {
+                decl.name.as_deref() == Some(name)
+                    || (parsed_local_index == Some(decl.index)
+                        && crate::place_to_var_name(
+                            func,
+                            &trust_types::Place::local(decl.index),
+                        ) == name)
+                    || (decl.index == 0 && name == "_0")
+            });
+            let decl = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            decl
+        }
+    };
     let Ty::Int { width, signed: true } = decl.ty else { return None };
     match width {
         1..=127 => Some(-(1_i128 << (width - 1))),
@@ -3688,50 +4112,74 @@ fn signed_machine_local_min(func: &VerifiableFunction, name: &str) -> Option<i12
 // exactly the reading a SPEC-domain clause must never get.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MachineVarDomain {
+    Bool,
+    Int(u32, bool),
+    NonMachine,
+}
+
+/// PERF-COMPILER-VCGEN-750: resolve a formula variable name to its machine domain
+/// (`Bool`, `Int(width, signed)`, or `NonMachine`) in a single `lookup_formula_local_decl`
+/// probe, checking the synthetic `__len` slice-length fallback only when no local in
+/// `func.body.locals` matches `local_part`.
+fn classify_machine_var(func: &VerifiableFunction, name: &str) -> MachineVarDomain {
+    // Version tokens never change a variable's type; match on the base name.
+    let base = name.split('#').next().unwrap_or(name);
+    let (local_part, field) = match base.split_once('.') {
+        Some((local_part, field)) => match field.parse::<usize>() {
+            Ok(index) => (local_part, Some(index)),
+            Err(_) => return MachineVarDomain::NonMachine,
+        },
+        None => (base, None),
+    };
+    let parsed_local_index = canonical_formula_local_index(local_part);
+    match crate::lookup_formula_local_decl(func, local_part, parsed_local_index) {
+        crate::FormulaLocalDeclLookup::Unique(decl) => {
+            let ty = match field {
+                None => newtype_carrier_ty(&decl.ty),
+                Some(index) => match struct_or_tuple_field_ty(&decl.ty, index) {
+                    Some(ty) => ty,
+                    None => return MachineVarDomain::NonMachine,
+                },
+            };
+            match ty {
+                Ty::Bool => MachineVarDomain::Bool,
+                Ty::Int { width, signed } if rust_machine_width_supported(*width) => {
+                    MachineVarDomain::Int(*width, *signed)
+                }
+                Ty::PtrSizedInt { signed } => MachineVarDomain::Int(64, *signed),
+                _ => MachineVarDomain::NonMachine,
+            }
+        }
+        crate::FormulaLocalDeclLookup::None => {
+            // A source `xs.len()` is compiler-lowered to the synthetic `xs__len` leaf
+            // and rebound by `type_loop_formula` to the exact stable slice model.
+            // Preserve its source `usize` domain here: otherwise an ordinary
+            // `i <= xs.len()` invariant combines a 64-bit `i` with an untyped Int
+            // length and is spuriously rejected as mixed-domain. Fixed-array lengths
+            // are constants and never need this synthetic-variable case.
+            if field.is_none()
+                && let Some(collection_name) = local_part.strip_suffix("__len")
+                && let Some(model) = read_only_collection_model_for_name(func, collection_name)
+                && matches!(model.length, ReadOnlyCollectionLength::Slice)
+            {
+                return MachineVarDomain::Int(64, false);
+            }
+            MachineVarDomain::NonMachine
+        }
+        crate::FormulaLocalDeclLookup::Ambiguous => MachineVarDomain::NonMachine,
+    }
+}
+
 /// Resolve a formula variable name to the machine-integer `(width, signed)` of
 /// the local (or checked-op tuple field) it denotes, `None` for every other
 /// shape. Handles the postcondition lane's naming conventions: SSA version
 /// tokens (`x#s1_0`), the return slot (`_0`), raw local names (`_3`), source
 /// names, and single tuple-field projections (`_3.0`, the checked-op value).
 fn machine_int_ty_for_var(func: &VerifiableFunction, name: &str) -> Option<(u32, bool)> {
-    // Version tokens never change a variable's type; match on the base name.
-    let base = name.split('#').next().unwrap_or(name);
-    let (local_part, field) = match base.split_once('.') {
-        Some((local_part, field)) => (local_part, Some(field.parse::<usize>().ok()?)),
-        None => (base, None),
-    };
-    // A source `xs.len()` is compiler-lowered to the synthetic `xs__len` leaf
-    // and rebound by `type_loop_formula` to the exact stable slice model.
-    // Preserve its source `usize` domain here: otherwise an ordinary
-    // `i <= xs.len()` invariant combines a 64-bit `i` with an untyped Int
-    // length and is spuriously rejected as mixed-domain. Fixed-array lengths
-    // are constants and never need this synthetic-variable case.
-    if field.is_none()
-        && !body_has_formula_local_name(func, local_part)
-        && let Some(collection_name) = local_part.strip_suffix("__len")
-        && let Some(model) = read_only_collection_model_for_name(func, collection_name)
-        && matches!(model.length, ReadOnlyCollectionLength::Slice)
-    {
-        return Some((64, false));
-    }
-    let mut matches = func.body.locals.iter().filter(|decl| {
-        decl.name.as_deref() == Some(local_part)
-            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == local_part
-            || format!("_{}", decl.index) == local_part
-    });
-    let decl = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
-    let ty = match field {
-        None => newtype_carrier_ty(&decl.ty),
-        Some(index) => struct_or_tuple_field_ty(&decl.ty, index)?,
-    };
-    match ty {
-        Ty::Int { width, signed } if rust_machine_width_supported(*width) => {
-            Some((*width, *signed))
-        }
-        Ty::PtrSizedInt { signed } => Some((64, *signed)),
+    match classify_machine_var(func, name) {
+        MachineVarDomain::Int(width, signed) => Some((width, signed)),
         _ => None,
     }
 }
@@ -3841,29 +4289,7 @@ fn newtype_carrier_ty(ty: &Ty) -> &Ty {
 /// integer be translated at another variable's width. Both go through
 /// [`struct_or_tuple_field_ty`], so the two can only ever agree.
 fn var_is_bool_local(func: &VerifiableFunction, name: &str) -> bool {
-    let base = name.split('#').next().unwrap_or(name);
-    let (local_part, field) = match base.split_once('.') {
-        Some((local_part, field)) => match field.parse::<usize>() {
-            Ok(index) => (local_part, Some(index)),
-            Err(_) => return false,
-        },
-        None => (base, None),
-    };
-    let mut matches = func.body.locals.iter().filter(|decl| {
-        decl.name.as_deref() == Some(local_part)
-            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == local_part
-            || format!("_{}", decl.index) == local_part
-    });
-    let Some(decl) = matches.next() else { return false };
-    if matches.next().is_some() {
-        return false;
-    }
-    match field {
-        None => matches!(newtype_carrier_ty(&decl.ty), Ty::Bool),
-        Some(index) => {
-            matches!(struct_or_tuple_field_ty(&decl.ty, index), Some(Ty::Bool))
-        }
-    }
+    matches!(classify_machine_var(func, name), MachineVarDomain::Bool)
 }
 
 /// Whether an authored arithmetic-bearing clause is eligible for the
@@ -3874,10 +4300,11 @@ fn var_is_bool_local(func: &VerifiableFunction, name: &str) -> bool {
 /// that principal LHS domain but may carry Rust's independently typed integer
 /// RHS; [`machine_faithful_shift_amount`] authenticates its exact masked
 /// encoding and translates that count at its own declared domain. Spec-level
-/// `/`/`%` are refused: SMT's total bvudiv/bvsdiv assign a zero divisor a value
-/// where the authored Rust expression traps, so such a clause keeps its visible
-/// `unsupported_machine_arithmetic` row until a definedness premise lane
-/// lands. This predicate gates ADMISSION only; it grants nothing — the final VC
+/// `/` is refused; `%` is admitted only for a positive representable literal
+/// divisor. SMT's total division/remainder assigns trapping inputs a value. Literal
+/// remainder is total by the shared `is_total_machine_remainder_divisor`
+/// check; every other authored division/remainder keeps its visible unsupported
+/// row. This predicate gates ADMISSION only; it grants nothing — the final VC
 /// still has to translate (`machine_faithful_vc_formula`) and prove.
 pub(crate) fn machine_faithful_clause_admissible(
     func: &VerifiableFunction,
@@ -3921,50 +4348,132 @@ fn machine_domain_scan(
     func: &VerifiableFunction,
     formula: &Formula,
 ) -> crate::machine_domain::DomainScan {
-    use crate::machine_domain::{DomainScan, MachineDomain};
-    let mut scan = DomainScan::default();
-    fn collect(func: &VerifiableFunction, node: &Formula, scan: &mut DomainScan) {
-        // Rust permits the RHS of a shift to have a different integer width
-        // and signedness from the shifted value.  The exact body encoding
-        // normalizes that count inside the shift node; it therefore must not
-        // select (or conflict with) the principal Machine{w} domain.  The
-        // shift translator independently authenticates and translates the
-        // skipped count at its own declared domain.
-        if let Formula::BvShl(value, _, _)
-        | Formula::BvLShr(value, _, _)
-        | Formula::BvAShr(value, _, _) = node
-        {
-            collect(func, value, scan);
-            return;
-        }
-        let name = match node {
-            Formula::Var(name, sort) if !matches!(sort, Sort::Bool) => Some(name.as_str()),
-            Formula::SymVar(sym, sort) if !matches!(sort, Sort::Bool) => Some(sym.as_str()),
-            _ => None,
-        };
-        if let Some(name) = name
-            && !var_is_bool_local(func, name)
-        {
-            match machine_int_ty_for_var(func, name)
-                .and_then(|(width, signed)| MachineDomain::new(width, signed))
-            {
+    let mut scan = crate::machine_domain::DomainScan::default();
+    machine_domain_scan_into(func, formula, &mut scan);
+    scan
+}
+
+fn machine_domain_scan_pair(
+    func: &VerifiableFunction,
+    first: &Formula,
+    second: &Formula,
+) -> crate::machine_domain::DomainScan {
+    let mut scan = crate::machine_domain::DomainScan::default();
+    machine_domain_scan_into(func, first, &mut scan);
+    machine_domain_scan_into(func, second, &mut scan);
+    scan
+}
+
+fn machine_domain_scan_into(
+    func: &VerifiableFunction,
+    node: &Formula,
+    scan: &mut crate::machine_domain::DomainScan,
+) {
+    use crate::machine_domain::MachineDomain;
+    // Rust permits the RHS of a shift to have a different integer width
+    // and signedness from the shifted value.  The exact body encoding
+    // normalizes that count inside the shift node; it therefore must not
+    // select (or conflict with) the principal Machine{w} domain.  The
+    // shift translator independently authenticates and translates the
+    // skipped count at its own declared domain.
+    if let Formula::BvShl(value, _, _) | Formula::BvLShr(value, _, _) | Formula::BvAShr(value, _, _) =
+        node
+    {
+        machine_domain_scan_into(func, value, scan);
+        return;
+    }
+    let name = match node {
+        Formula::Var(name, sort) if !matches!(sort, Sort::Bool) => Some(name.as_str()),
+        Formula::SymVar(sym, sort) if !matches!(sort, Sort::Bool) => Some(sym.as_str()),
+        _ => None,
+    };
+    if let Some(name) = name {
+        match classify_machine_var(func, name) {
+            MachineVarDomain::Bool => {}
+            MachineVarDomain::Int(width, signed) => match MachineDomain::new(width, signed) {
                 Some(domain) => scan.observe(domain),
                 None => scan.observe_non_machine(name),
-            }
-        }
-        for child in node.children() {
-            collect(func, child, scan);
+            },
+            MachineVarDomain::NonMachine => scan.observe_non_machine(name),
         }
     }
-    collect(func, formula, &mut scan);
-    scan
+    trust_types::for_each_formula_child(node, |child| {
+        machine_domain_scan_into(func, child, scan);
+    });
+}
+
+// Trust: this is a definedness/type check, never a source-text or callee-name
+// exemption. On an unsigned w-bit value and 0 < c < 2^w, Rust x % c equals
+// bvurem_w(x, c) for every x, with no zero/overflow exceptional case.
+fn unsigned_literal_remainder_is_exact(
+    func: &VerifiableFunction,
+    formula: &Formula,
+    width: u32,
+    signed: bool,
+) -> bool {
+    if signed || !rust_machine_width_supported(width) {
+        return false;
+    }
+    let Formula::Rem(lhs, rhs) = formula else { return false };
+    let name = match lhs.as_ref() {
+        Formula::Var(name, Sort::Int) => name.as_str(),
+        Formula::SymVar(name, Sort::Int) => name.as_str(),
+        _ => return false,
+    };
+    if machine_int_ty_for_var(func, name) != Some((width, false)) {
+        return false;
+    }
+    match rhs.as_ref() {
+        Formula::Int(n) if *n > 0 => machine_literal_pattern(*n, width, false).is_some(),
+        Formula::UInt(n) if *n > 0 => machine_unsigned_literal_pattern(*n, width, false).is_some(),
+        _ => false,
+    }
+}
+
+// Trust: the exact Int-valued selector emitted by a typed unsigned Clean
+// summary also has a declared-width reading. Only a (possibly negated)
+// equality of bare typed leaves / exact remainders, with at least one such
+// remainder and bare in-range arms, is accepted. In particular this is NOT a
+// generic Ite fallback for the raw arithmetic inside wrapping constructors.
+fn unsigned_remainder_selector_is_exact(
+    func: &VerifiableFunction,
+    formula: &Formula,
+    width: u32,
+    signed: bool,
+) -> bool {
+    if signed || !rust_machine_width_supported(width) {
+        return false;
+    }
+    let leaf = |f: &Formula| match f {
+        Formula::Var(name, Sort::Int) => machine_int_ty_for_var(func, name) == Some((width, false)),
+        Formula::SymVar(name, Sort::Int) => {
+            machine_int_ty_for_var(func, name.as_str()) == Some((width, false))
+        }
+        Formula::Int(n) => machine_literal_pattern(*n, width, false).is_some(),
+        Formula::UInt(n) => machine_unsigned_literal_pattern(*n, width, false).is_some(),
+        _ => false,
+    };
+    let Formula::Ite(cond, then_arm, else_arm) = formula else { return false };
+    let cond = match cond.as_ref() {
+        Formula::Not(inner) => inner.as_ref(),
+        other => other,
+    };
+    let Formula::Eq(left, right) = cond else { return false };
+    let rem = |f: &Formula| unsigned_literal_remainder_is_exact(func, f, width, signed);
+    leaf(then_arm)
+        && leaf(else_arm)
+        && (leaf(left) || rem(left))
+        && (leaf(right) || rem(right))
+        && (rem(left) || rem(right))
 }
 
 /// Whether every node of `formula` lowers into the declared-width machine
 /// fragment. Mirrors `machine_faithful_vc_formula`'s coverage so admission
 /// and translation can never disagree on the CLAUSE; the body-def side may
-/// additionally carry `/`/`%` (`allow_div_rem`), which are wrap-exact for the
-/// executions that reach `Return`.
+/// additionally carry general `/`/`%` (`allow_div_rem`), which are wrap-exact
+/// for the executions that reach `Return`. Source clauses admit only remainder
+/// by a total literal divisor (`is_total_machine_remainder_divisor`),
+/// independently of that flag.
 fn clause_in_machine_fragment(
     func: &VerifiableFunction,
     formula: &Formula,
@@ -4052,7 +4561,14 @@ fn rust_shift_literal_pattern(value: u128, width: u32) -> Option<i128> {
     Some((value & mask) as i128)
 }
 
-fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula>> {
+/// Rust's shift COUNT at the shifted value's `width`: `BvAnd(IntToBv(amount,
+/// width), width - 1)`, i.e. `amount.rem_euclid(width)` for an Int-sorted count
+/// of any integer type (`IntToBv` reduces modulo `2^width`, which `width`
+/// divides). The one spelling of a plain MIR `Shl`/`Shr` count in this crate:
+/// [`symbolic_binop`] here and `chc::try_binop_to_formula` both emit it, and
+/// [`machine_faithful_shift_amount`] authenticates it. `None` for a width
+/// `trust_widthconv` does not support.
+pub(crate) fn rust_shift_amount_formula(amount: &Formula, width: u32) -> Option<Box<Formula>> {
     if !rust_machine_width_supported(width) {
         return None;
     }
@@ -4143,14 +4659,20 @@ fn machine_faithful_shift_amount(
 /// the mask is provably the identity on it: an integer LITERAL `k` with
 /// `0 <= k < width`.
 ///
-/// WHY THIS EXISTS. There are TWO emitters of a body shift and they do not
+/// WHY THIS EXISTS. There were TWO emitters of a body shift and they did not
 /// spell the count the same way. `contracts::rust_shift_amount_formula` emits
 /// the masked form `BvAnd(IntToBv(k, w), w - 1, w)`, which
 /// [`machine_faithful_shift_amount`] authenticates. `chc::try_binop_to_formula`
-/// emits the shift as `BvToInt(BvShl(IntToBv(lhs, w), IntToBv(rhs, w), w), w,
-/// signed)` with the count UNMASKED — and that is the spelling a real body's
-/// `_3 = Shl(_4, const 1)` block definition arrives in. The authenticator
+/// emitted the shift as `BvToInt(BvShl(IntToBv(lhs, w), IntToBv(rhs, w), w), w,
+/// signed)` with the count UNMASKED — and that was the spelling a real body's
+/// `_3 = Shl(_4, const 1)` block definition arrived in. The authenticator
 /// therefore refused a body definition that this same crate had written.
+///
+/// Since 2026-10-03 `chc::try_binop_to_formula` emits the masked count too
+/// (the unmasked one was not merely unreadable but WRONG: it defined
+/// `x << 33u32` as `0` where a plain MIR shift computes `x << 1`), so the body
+/// definitions reach the masked arm above. This function remains for any
+/// unmasked spelling that still arrives, and admits only the identity case.
 ///
 /// MEASURED consequence, before this: `ensures ret.0 == var.0 * 2` over
 /// `ay-proof-common`'s actual `Literal::positive` body (`Literal(var.0 << 1)`)
@@ -4167,8 +4689,10 @@ fn machine_faithful_shift_amount(
 /// the authenticated spelling would have produced. Everything else DECLINES and
 /// keeps the existing visible fail-closed row:
 ///
-///   * `k >= width` — the count rustc's `Overflow(Shl)` assert rejects. Rust
-///     has no value for that shift, so there is nothing exact to emit;
+///   * `k >= width` — an UNMASKED spelling does not say whether its emitter
+///     meant Rust's mask (`k.rem_euclid(width)`, the plain MIR `Shl`/`Shr`
+///     value) or SMT-LIB's saturating shift, so there is nothing exact to
+///     emit;
 ///   * a negative literal;
 ///   * a NON-literal count. A symbolic count genuinely needs the mask (rustc
 ///     masks at runtime), so an unmasked symbolic count is a spelling this
@@ -4263,9 +4787,8 @@ fn closed_int_value_exact_at(term: &Formula, width: u32, signed: bool) -> Option
             let right = closed_int_value_exact_at(b, width, signed)?;
             // i128::checked_rem alone misses narrower MIN % -1: its zero
             // result fits, but Rust's operation overflows at the declared width.
-            let width_min = signed.then(|| {
-                if width == 128 { i128::MIN } else { -(1_i128 << (width - 1)) }
-            });
+            let width_min =
+                signed.then(|| if width == 128 { i128::MIN } else { -(1_i128 << (width - 1)) });
             if right == -1 && width_min == Some(left) {
                 return None;
             }
@@ -4474,6 +4997,58 @@ fn machine_faithful_translate(
                 let (a, b) = value_pair(a, b)?;
                 Formula::BvMul(a, b, width)
             }
+            // Caller summaries already admit this exact positive-literal
+            // selector shape. Translate its condition and arms in the same
+            // declared domain as the assembled body VC. Source-clause Ite
+            // admission is unchanged: this arm is for body facts only, and
+            // every operand still passes the ordinary width/range checks.
+            Formula::Ite(cond, then_arm, else_arm)
+                if allow_div_rem
+                    && formula_is_exact_division_value_by_positive_literal(formula) =>
+            {
+                Formula::Ite(
+                    Box::new(prop(cond)?),
+                    Box::new(value(then_arm)?),
+                    Box::new(value(else_arm)?),
+                )
+            }
+            // Trust (2026-10-05, NEG-WRAP-OFF-1): the wrap-exact value definition
+            // of a bare signed MIR `Neg` (`guards::bare_neg_wrap_ite`,
+            // `ite(x == MIN, MIN, -x)`). In the declared-width reading it IS
+            // `0 -w x` — two's-complement negation maps `MIN` to `MIN` — so it
+            // translates exactly as the bare `Neg` node did before the definition
+            // became exact. CONSTRUCTOR-VERIFIED like the modular arm below: the
+            // node must be byte-identical to the shared constructor's output at
+            // THIS declared domain, so no other `Ite` launders into the fragment.
+            Formula::Ite(_, _, otherwise) if matches!(otherwise.as_ref(), Formula::Neg(_)) => {
+                let Formula::Neg(x) = otherwise.as_ref() else { return None };
+                if !signed || crate::guards::bare_neg_wrap_ite(x, width).as_ref() != Some(formula) {
+                    return None;
+                }
+                Formula::BvSub(
+                    Box::new(Formula::BitVec { value: 0, width }),
+                    Box::new(value(x)?),
+                    width,
+                )
+            }
+            // Trust: exact unsigned literal-remainder selector, with every
+            // condition/arm independently checked at the declared domain.
+            // A BODY fact only (the typed Clean summary relation), like the
+            // positive-literal division selector arm above: `machine_faithful_clause_admissible`
+            // translates an authored clause with `allow_div_rem == false`, and
+            // an authored conditional is not admitted through this arm
+            // (VCGEN-LIB-REDS-1; pinned by
+            // `literal_remainder_select_summary_preserves_assembled_machine_vc`).
+            Formula::Ite(cond, then_arm, else_arm)
+                if allow_div_rem
+                    && unsigned_remainder_selector_is_exact(func, formula, width, signed) =>
+            {
+                Formula::Ite(
+                    Box::new(prop(cond)?),
+                    Box::new(value(then_arm)?),
+                    Box::new(value(else_arm)?),
+                )
+            }
             // Trust (2026-08-20, bare-BinaryOp wrapping): the modular-`Ite`
             // value definition the shared wrapping constructor mints
             // (`generate::wrapping_binop_modular_ite`) for a bare
@@ -4512,7 +5087,10 @@ fn machine_faithful_translate(
                 let (a, b) = value_pair(a, b)?;
                 if signed { Formula::BvSDiv(a, b, width) } else { Formula::BvUDiv(a, b, width) }
             }
-            Formula::Rem(a, b) if allow_div_rem => {
+            Formula::Rem(a, b)
+                if allow_div_rem
+                    || trust_types::is_total_machine_remainder_divisor(b, width, signed) =>
+            {
                 let (a, b) = value_pair(a, b)?;
                 if signed { Formula::BvSRem(a, b, width) } else { Formula::BvURem(a, b, width) }
             }
@@ -4586,9 +5164,8 @@ fn machine_faithful_translate_joined_under(
 ) -> Option<Formula> {
     use crate::machine_domain::{MachineDomain, join};
 
-    let prop = |f: &Formula| {
-        machine_faithful_translate_joined_under(func, f, ambient, allow_div_rem)
-    };
+    let prop =
+        |f: &Formula| machine_faithful_translate_joined_under(func, f, ambient, allow_div_rem);
 
     // Mirrors `machine_faithful_translate`'s `operand_is_prop`: a comparison
     // operand is a proposition iff it is boolean structure or names a
@@ -4645,8 +5222,7 @@ fn machine_faithful_translate_joined_under(
             // is pre-existing in the whole-formula gate, which borrows the
             // ambient domain for a closed atom with no such check.
             (None, None) => {
-                let is_bare_literal =
-                    |f: &Formula| matches!(f, Formula::Int(_) | Formula::UInt(_));
+                let is_bare_literal = |f: &Formula| matches!(f, Formula::Int(_) | Formula::UInt(_));
                 if !is_bare_literal(left) || !is_bare_literal(right) {
                     return None;
                 }
@@ -4740,8 +5316,8 @@ fn machine_faithful_translate_joined_under(
 /// caller emits the visible fail-closed row) when any conjunct steps outside
 /// the fragment — mixed integer widths in the body, collection/float/pointer
 /// facts, quantifiers. Body-def `/`/`%` are allowed (wrap-exact on every
-/// execution that reaches `Return`); the CLAUSE was already admitted without
-/// them.
+/// execution that reaches `Return`); the CLAUSE independently admits only
+/// remainder by a total literal divisor.
 pub(crate) fn machine_faithful_vc_formula(
     func: &VerifiableFunction,
     formula: &Formula,
@@ -4751,9 +5327,8 @@ pub(crate) fn machine_faithful_vc_formula(
 }
 
 fn formula_contains_machine_encoding(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |node| {
-        found |= matches!(
+    trust_types::any_formula_node(formula, &mut |node| {
+        matches!(
             node,
             Formula::BitVec { .. }
                 | Formula::BvAdd(..)
@@ -4776,9 +5351,8 @@ fn formula_contains_machine_encoding(formula: &Formula) -> bool {
                 | Formula::BvSLe(..)
                 | Formula::BvToInt(..)
                 | Formula::IntToBv(..)
-        );
-    });
-    found
+        )
+    })
 }
 
 fn formula_establishes_above(formula: &Formula, name: &str, minimum: i128) -> bool {
@@ -4808,10 +5382,14 @@ fn formula_has_sort(formula: &Formula, expected: Sort) -> bool {
 }
 
 fn initial_symbolic_state(func: &VerifiableFunction) -> FxHashMap<String, Formula> {
-    let mut state = FxHashMap::default();
+    let mut state =
+        FxHashMap::with_capacity_and_hasher(func.body.locals.len(), Default::default());
+    let has_collection_arg = func_has_collection_arg(func, None);
     for decl in &func.body.locals {
         let name = crate::place_to_var_name(func, &trust_types::Place::local(decl.index));
-        if let Some(model) = exact_collection_model_for_local(func, decl.index) {
+        if let Some(model) =
+            has_collection_arg.then(|| exact_collection_model_for_local(func, decl.index)).flatten()
+        {
             if model.local == model.source_local {
                 state.insert(model.name.clone(), model.base_formula());
                 state.insert(model.length_name(), model.length_formula());
@@ -4821,7 +5399,7 @@ fn initial_symbolic_state(func: &VerifiableFunction) -> FxHashMap<String, Formul
                 // transitions start at the dominated header rather than bb0,
                 // so install the canonical identity here as well as replaying
                 // the definition on function-entry initiation paths.
-                state.insert(name.clone(), model.base_formula());
+                state.insert(name, model.base_formula());
             }
         } else {
             state.insert(name.clone(), Formula::Var(name, crate::sort_for_ty(&decl.ty)));
@@ -4840,44 +5418,69 @@ fn initial_symbolic_state(func: &VerifiableFunction) -> FxHashMap<String, Formul
 /// replaced bound occurrences and could turn `forall i. P(i)` into a claim about
 /// a same-named MIR local.
 fn substitute_formula_state(formula: &Formula, state: &FxHashMap<String, Formula>) -> Formula {
-    let mut occupied = formula_symbol_names(formula);
-    occupied.extend(state.keys().cloned());
-    for replacement in state.values() {
-        occupied.extend(formula_symbol_names(replacement));
+    if state.is_empty() {
+        return formula.clone();
+    }
+    substitute_formula_state_owned(formula.clone(), state)
+}
+
+fn substitute_formula_state_owned(formula: Formula, state: &FxHashMap<String, Formula>) -> Formula {
+    if state.is_empty() {
+        return formula;
+    }
+    match formula {
+        Formula::Var(ref name, _) => return state.get(name).cloned().unwrap_or(formula),
+        Formula::SymVar(ref name, _) => {
+            return state.get(name.as_str()).cloned().unwrap_or(formula);
+        }
+        Formula::Bool(_)
+        | Formula::Int(_)
+        | Formula::UInt(_)
+        | Formula::BitVec { .. } => return formula,
+        _ => {}
     }
     let mut fresh_counter = 0usize;
+    if !trust_types::any_formula_node(&formula, &mut |node| {
+        matches!(node, Formula::Forall(..) | Formula::Exists(..))
+    }) {
+        let mut occupied = FxHashSet::default();
+        return substitute_formula_state_rec(formula, state, &mut occupied, &mut fresh_counter);
+    }
+    let mut occupied = formula_symbol_names(&formula);
+    occupied.extend(state.keys().cloned());
+    for replacement in state.values() {
+        extend_formula_symbol_names(replacement, &mut occupied);
+    }
     substitute_formula_state_rec(formula, state, &mut occupied, &mut fresh_counter)
 }
 
 fn substitute_formula_state_rec(
-    formula: &Formula,
+    formula: Formula,
     state: &FxHashMap<String, Formula>,
     occupied: &mut FxHashSet<String>,
     fresh_counter: &mut usize,
 ) -> Formula {
     match formula {
-        Formula::Var(name, _) => state.get(name).cloned().unwrap_or_else(|| formula.clone()),
-        Formula::SymVar(name, _) => {
-            state.get(name.as_str()).cloned().unwrap_or_else(|| formula.clone())
-        }
+        Formula::Var(ref name, _) => state.get(name).cloned().unwrap_or(formula),
+        Formula::SymVar(ref name, _) => state.get(name.as_str()).cloned().unwrap_or(formula),
         Formula::Forall(bindings, body) => substitute_formula_state_quantifier(
             true,
-            bindings,
-            body,
+            &bindings,
+            &body,
             state,
             occupied,
             fresh_counter,
         ),
         Formula::Exists(bindings, body) => substitute_formula_state_quantifier(
             false,
-            bindings,
-            body,
+            &bindings,
+            &body,
             state,
             occupied,
             fresh_counter,
         ),
-        _ => formula.clone().map_children(&mut |child| {
-            substitute_formula_state_rec(&child, state, occupied, fresh_counter)
+        other => other.map_children(&mut |child| {
+            substitute_formula_state_rec(child, state, occupied, fresh_counter)
         }),
     }
 }
@@ -4890,38 +5493,55 @@ fn substitute_formula_state_quantifier(
     occupied: &mut FxHashSet<String>,
     fresh_counter: &mut usize,
 ) -> Formula {
-    let replacement_free: FxHashSet<String> =
-        state.values().flat_map(|replacement| replacement.free_variables()).collect();
-    let original_binding_names: Vec<String> =
-        bindings.iter().map(|(name, _)| name.as_str().to_string()).collect();
     let mut renamed_bindings = bindings.to_vec();
-    let mut renamed_body = body.clone();
-    let mut renamed = FxHashSet::default();
-    for original in &original_binding_names {
-        if replacement_free.contains(original) && renamed.insert(original.clone()) {
+    let mut renamed_body: Option<Formula> = None;
+    let mut renamed: FxHashSet<&str> = FxHashSet::default();
+    let mut replacement_free: Option<FxHashSet<&str>> = None;
+    for (original_sym, _) in bindings {
+        let original = original_sym.as_str();
+        let free = replacement_free.get_or_insert_with(|| {
+            let mut set = FxHashSet::default();
+            for replacement in state.values() {
+                trust_types::for_each_free_variable_name(replacement, &mut |name| {
+                    set.insert(name);
+                });
+            }
+            set
+        });
+        if free.contains(original) && renamed.insert(original) {
             let fresh = fresh_loop_state_binder(occupied, fresh_counter);
             for (binding, _) in &mut renamed_bindings {
                 if binding.as_str() == original {
                     *binding = Symbol::intern(&fresh);
                 }
             }
-            renamed_body =
-                alpha_rename_loop_state_bound_occurrences(&renamed_body, original, &fresh);
+            let current_body = renamed_body.take().unwrap_or_else(|| body.clone());
+            renamed_body = Some(alpha_rename_loop_state_bound_occurrences(
+                current_body,
+                original,
+                &fresh,
+            ));
         }
     }
 
     // Original binder spellings shadow same-named state entries even when the
     // binder was alpha-renamed above. Fresh spellings are removed as a defensive
     // guard too, although the allocator makes a state-key collision impossible.
-    let mut visible_state = state.clone();
-    for name in &original_binding_names {
-        visible_state.remove(name);
-    }
-    for (name, _) in &renamed_bindings {
-        visible_state.remove(name.as_str());
-    }
-    let substituted =
-        substitute_formula_state_rec(&renamed_body, &visible_state, occupied, fresh_counter);
+    let any_shadowed = bindings.iter().any(|(name, _)| state.contains_key(name.as_str()))
+        || renamed_bindings.iter().any(|(name, _)| state.contains_key(name.as_str()));
+    let body_to_sub = renamed_body.unwrap_or_else(|| body.clone());
+    let substituted = if any_shadowed {
+        let mut visible_state = state.clone();
+        for (name, _) in bindings {
+            visible_state.remove(name.as_str());
+        }
+        for (name, _) in &renamed_bindings {
+            visible_state.remove(name.as_str());
+        }
+        substitute_formula_state_rec(body_to_sub, &visible_state, occupied, fresh_counter)
+    } else {
+        substitute_formula_state_rec(body_to_sub, state, occupied, fresh_counter)
+    };
     if is_forall {
         Formula::Forall(renamed_bindings, Box::new(substituted))
     } else {
@@ -4929,20 +5549,21 @@ fn substitute_formula_state_quantifier(
     }
 }
 
-fn alpha_rename_loop_state_bound_occurrences(formula: &Formula, from: &str, to: &str) -> Formula {
+fn alpha_rename_loop_state_bound_occurrences(formula: Formula, from: &str, to: &str) -> Formula {
     match formula {
-        Formula::Var(name, sort) if name == from => Formula::Var(to.to_string(), sort.clone()),
-        Formula::SymVar(name, sort) if name.as_str() == from => {
+        Formula::Var(ref name, ref sort) if name == from => {
+            Formula::Var(to.to_string(), sort.clone())
+        }
+        Formula::SymVar(ref name, ref sort) if name.as_str() == from => {
             Formula::SymVar(Symbol::intern(to), sort.clone())
         }
-        Formula::Forall(bindings, _) | Formula::Exists(bindings, _)
+        Formula::Forall(ref bindings, _) | Formula::Exists(ref bindings, _)
             if bindings.iter().any(|(name, _)| name.as_str() == from) =>
         {
-            formula.clone()
+            formula
         }
-        _ => formula
-            .clone()
-            .map_children(&mut |child| alpha_rename_loop_state_bound_occurrences(&child, from, to)),
+        other => other
+            .map_children(&mut |child| alpha_rename_loop_state_bound_occurrences(child, from, to)),
     }
 }
 
@@ -4959,7 +5580,12 @@ fn fresh_loop_state_binder(occupied: &mut FxHashSet<String>, fresh_counter: &mut
 
 fn formula_symbol_names(formula: &Formula) -> FxHashSet<String> {
     let mut names = FxHashSet::default();
-    formula.visit(&mut |node| match node {
+    extend_formula_symbol_names(formula, &mut names);
+    names
+}
+
+fn extend_formula_symbol_names(formula: &Formula, names: &mut FxHashSet<String>) {
+    trust_types::visit_formula_nodes(formula, &mut |node| match node {
         Formula::Var(name, _) => {
             names.insert(name.clone());
         }
@@ -4988,7 +5614,6 @@ fn formula_symbol_names(formula: &Formula) -> FxHashSet<String> {
         }
         _ => {}
     });
-    names
 }
 
 #[derive(Clone)]
@@ -5380,21 +6005,22 @@ fn symbolic_loop_transitions_with_ancestors(
     let mut active_headers = ancestors.to_vec();
     active_headers.push(header);
 
-    let loop_infos = crate::termination::detect_loops(&func.body)
-        .into_iter()
-        .filter(|info| info.header == header)
-        .collect::<Vec<_>>();
-    if loop_infos.is_empty() {
+    let all_loop_infos = crate::termination::detect_loops(&func.body);
+    let mut in_loop: FxHashSet<_> = FxHashSet::default();
+    let mut latches: FxHashSet<_> = FxHashSet::default();
+    for info in &all_loop_infos {
+        if info.header == header {
+            in_loop.extend(info.body_blocks.iter().copied());
+            latches.insert(info._latch);
+        }
+    }
+    if latches.is_empty() {
         return Err("e45.transition.no-natural-loop".to_string());
     }
-    let in_loop: FxHashSet<_> =
-        loop_infos.iter().flat_map(|info| info.body_blocks.iter().copied()).collect();
-    let latches: FxHashSet<_> = loop_infos.iter().map(|info| info._latch).collect();
-    let loop_domains = natural_loop_domains(func);
-    let nested_headers = loop_domains
-        .keys()
-        .filter(|candidate| **candidate != header && in_loop.contains(candidate))
-        .copied()
+    let nested_headers = all_loop_infos
+        .iter()
+        .map(|info| info.header)
+        .filter(|candidate| *candidate != header && in_loop.contains(candidate))
         .collect::<FxHashSet<_>>();
     let header_block = func
         .body
@@ -5784,12 +6410,14 @@ fn exact_call_frame(
     //     `&mut`, and (6) proves no raw pointer to it was ever formed here, but
     //     the argument that no alias reached the callee by some other route is
     //     not one this walk can make. Refuse loudly instead.
-    if func
-        .body
-        .locals
-        .iter()
-        .filter_map(|decl| exact_collection_model_for_local(func, decl.index))
-        .any(|model| model.is_exclusive_mutable())
+    if func_has_collection_arg(func, Some(true))
+        && func
+            .body
+            .locals
+            .iter()
+            .filter(|decl| matches!(&decl.ty, Ty::Ref { mutable: true, .. }))
+            .filter_map(|decl| exact_collection_model_for_local(func, decl.index))
+            .any(|model| model.is_exclusive_mutable())
     {
         return Err(format!(
             "e45.transition.call-effect.exclusive-mutable-collection-in-scope: bb{bb}"
@@ -6294,7 +6922,7 @@ fn switch_edge_formula(
 fn disjunction(mut formulas: Vec<Formula>) -> Formula {
     match formulas.len() {
         0 => Formula::Bool(false),
-        1 => formulas.pop().unwrap(),
+        1 => formulas.pop().unwrap_or(Formula::Bool(false)),
         _ => Formula::Or(formulas),
     }
 }
@@ -6418,10 +7046,7 @@ fn checked_update_shape_is_authenticated(
     if !machine_rhs_matches_lhs_type(func, *op, &lhs_ty, rhs) {
         return false;
     }
-    let Some(tuple_decl) = func.body.locals.iter().find(|decl| decl.index == tuple_local) else {
-        return false;
-    };
-    let Ty::Tuple(fields) = &tuple_decl.ty else {
+    let Some(Ty::Tuple(fields)) = crate::local_ty_ref(func, tuple_local) else {
         return false;
     };
     if fields.as_slice() != [lhs_ty, Ty::Bool] {
@@ -6523,6 +7148,7 @@ fn apply_symbolic_exclusive_mutable_store(
     state: &mut FxHashMap<String, Formula>,
     machine_arithmetic_guard: Option<&Formula>,
 ) -> Option<()> {
+    read_only_collection_index_projection(place, place.local)?;
     let model = exact_collection_model_for_local(func, place.local)?;
     let projection = exact_exclusive_mutable_store_projection(func, place, &model)?;
     let index = match projection {
@@ -6557,14 +7183,25 @@ fn apply_symbolic_statements(
     state: &mut FxHashMap<String, Formula>,
     machine_arithmetic_guard: Option<&Formula>,
 ) -> Option<()> {
-    let block_index = func.body.blocks.iter().position(|candidate| std::ptr::eq(candidate, block));
+    let mut cached_block_index: Option<Option<usize>> = None;
     let mut statements = block.stmts.iter().enumerate().peekable();
     while let Some((statement_index, statement)) = statements.next() {
         let raw_metadata_pair = match statement {
-            Statement::Assign { rvalue: Rvalue::AddressOf(false, source), .. } => block_index
-                .and_then(|block_index| {
+            Statement::Assign { rvalue: Rvalue::AddressOf(false, source), .. } => {
+                let block_index = *cached_block_index.get_or_insert_with(|| {
+                    func.body
+                        .blocks
+                        .get(block.id.0)
+                        .is_some_and(|candidate| std::ptr::eq(candidate, block))
+                        .then_some(block.id.0)
+                        .or_else(|| {
+                            func.body.blocks.iter().position(|candidate| std::ptr::eq(candidate, block))
+                        })
+                });
+                block_index.and_then(|block_index| {
                     exact_slice_raw_metadata_pair(func, source.local, block_index, statement_index)
-                }),
+                })
+            }
             _ => None,
         };
         if let Some(pair) = raw_metadata_pair {
@@ -6619,6 +7256,14 @@ fn apply_symbolic_statements(
         }
         match statement {
             Statement::Assign { place, rvalue, .. } if place.projections.is_empty() => {
+                if let Rvalue::Cast(_, target_ty) = rvalue
+                    && machine_integer_ty(target_ty)
+                    && exact_integer_cast_local_ty(func, place.local) != Some(target_ty)
+                {
+                    // Do not install a correctly encoded value in a differently
+                    // typed or ambiguously named destination slot.
+                    return None;
+                }
                 let dest = crate::place_to_var_name(func, place);
                 if let Rvalue::CheckedBinaryOp(op, lhs, rhs) = rvalue {
                     let value =
@@ -6685,8 +7330,8 @@ fn symbolic_read_only_collection_select(
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
     let Operand::Copy(place) = operand else { return None };
-    let model = exact_collection_model_for_local(func, place.local)?;
     let index_projection = read_only_collection_index_projection(place, place.local)?;
+    let model = exact_collection_model_for_local(func, place.local)?;
     let index = match index_projection {
         Projection::Index(local) => {
             let decl = func.body.locals.get(*local)?;
@@ -6713,10 +7358,10 @@ fn symbolic_read_only_collection_len(
     place: &trust_types::Place,
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
-    let model = exact_collection_model_for_local(func, place.local)?;
     if !exact_read_only_collection_len_place(place, place.local) {
         return None;
     }
+    let model = exact_collection_model_for_local(func, place.local)?;
     current_collection_base(func, &model, state)?;
     let expected = model.length_formula();
     let current = state.get(&model.length_name())?.clone();
@@ -6733,6 +7378,104 @@ fn symbolic_fixed_array_slice_view_cast(
     // whose view is retained or escapes makes the source model unavailable.
     let model = fixed_array_slice_view_cast_model(func, operand, target_ty, true)?;
     Some(model.base_formula())
+}
+
+/// This cast increment reads/writes whole scalar locals only. In particular,
+/// resolving the final type of a dereference is not evidence that its memory
+/// read has an exact symbolic denotation. The existing collection view cast
+/// continues to use its separate, stricter admission path.
+fn exact_integer_cast_local_ty(func: &VerifiableFunction, local: usize) -> Option<&Ty> {
+    let decl = func.body.locals.get(local)?;
+    if decl.index != local || !machine_integer_ty(&decl.ty) {
+        return None;
+    }
+    let name = crate::place_to_var_name(func, &Place::local(local));
+    let parsed_local_index = canonical_formula_local_index(&name);
+    if crate::unique_local_decl(func, local).is_some()
+        && match crate::lookup_formula_local_decl(func, &name, parsed_local_index) {
+            crate::FormulaLocalDeclLookup::None => true,
+            crate::FormulaLocalDeclLookup::Unique(d) => std::ptr::eq(d, decl),
+            crate::FormulaLocalDeclLookup::Ambiguous => false,
+        }
+    {
+        return Some(&decl.ty);
+    }
+    let mut index_matches = 0usize;
+    let mut name_matches = 0usize;
+    for other in &func.body.locals {
+        if other.index == local {
+            index_matches += 1;
+            if index_matches > 1 {
+                return None;
+            }
+            name_matches += 1;
+            if name_matches > 1 {
+                return None;
+            }
+            continue;
+        }
+        if local_may_have_var_name(other, &name, parsed_local_index)
+            && crate::place_to_var_name(func, &Place::local(other.index)) == name
+        {
+            name_matches += 1;
+            if name_matches > 1 {
+                return None;
+            }
+        }
+    }
+    if index_matches != 1 || name_matches != 1 {
+        return None;
+    }
+    Some(&decl.ty)
+}
+
+fn symbolic_machine_integer_cast(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    target_ty: &Ty,
+    state: &FxHashMap<String, Formula>,
+) -> Option<Formula> {
+    if !machine_integer_ty(target_ty) {
+        return None;
+    }
+    let (source_width, source_signed) = match operand {
+        Operand::Copy(place) | Operand::Move(place) if place.projections.is_empty() => {
+            let source_ty = exact_integer_cast_local_ty(func, place.local)?;
+            (source_ty.int_width()?, source_ty.is_signed())
+        }
+        Operand::Constant(ConstValue::Uint(value, width))
+            if rust_machine_width_supported(*width)
+                && (*width == 128 || *value < (1u128 << width)) =>
+        {
+            (*width, false)
+        }
+        // ConstValue::Int has no declared source width. Do not borrow the
+        // generic operand-type helper's i64/i128 guess; signed constants,
+        // symbolic/opaque constants, projections, and future operands remain
+        // explicit gaps in this closed transition fragment.
+        _ => return None,
+    };
+    let value = symbolic_operand(func, operand, state)?;
+    if !formula_has_sort(&value, Sort::Int) {
+        return None;
+    }
+    // First interpret the value in its *source* carrier. Extending a negative
+    // signed value and extending an unsigned value with the same low bits
+    // differ. Then take the low target bits and interpret their target sign:
+    // this covers truncation, sign/zero extension, and same-width re-signing.
+    // PtrSizedInt uses the model's existing explicitly pinned 64-bit target.
+    let source = Formula::BvToInt(
+        Box::new(Formula::IntToBv(Box::new(value), source_width)),
+        source_width,
+        source_signed,
+    );
+    let target_width = target_ty.int_width()?;
+    let result = Formula::BvToInt(
+        Box::new(Formula::IntToBv(Box::new(source), target_width)),
+        target_width,
+        target_ty.is_signed(),
+    );
+    formula_has_sort(&result, Sort::Int).then_some(result)
 }
 
 fn symbolic_read_only_collection_metadata_len(
@@ -6800,7 +7543,11 @@ fn symbolic_rvalue(
         Rvalue::Use(operand) => symbolic_operand(func, operand, state),
         Rvalue::Len(place) => symbolic_read_only_collection_len(func, place, state),
         Rvalue::Cast(operand, target_ty) => {
-            symbolic_fixed_array_slice_view_cast(func, operand, target_ty)
+            if machine_integer_ty(target_ty) {
+                symbolic_machine_integer_cast(func, operand, target_ty, state)
+            } else {
+                symbolic_fixed_array_slice_view_cast(func, operand, target_ty)
+            }
         }
         Rvalue::UnaryOp(UnOp::PtrMetadata, operand) => {
             symbolic_read_only_collection_metadata_len(func, operand, state)
@@ -6808,44 +7555,42 @@ fn symbolic_rvalue(
         Rvalue::BinaryOp(op, lhs, rhs) => {
             symbolic_binop(func, *op, lhs, rhs, state, machine_arithmetic_guard)
         }
-        Rvalue::UnaryOp(UnOp::Neg, operand)
-            if crate::operand_ty_cow(func, operand).as_deref().is_some_and(machine_integer_ty) =>
-        {
-            let ty = crate::operand_ty_cow(func, operand)?;
-            let width = ty.int_width()?;
-            let signed = ty.is_signed();
-            let operand = symbolic_operand(func, operand, state)?;
-            Some(Formula::BvToInt(
-                Box::new(Formula::BvSub(
-                    Box::new(Formula::BitVec { value: 0, width }),
-                    Box::new(Formula::IntToBv(Box::new(operand), width)),
-                    width,
-                )),
-                width,
-                signed,
-            ))
-        }
-        Rvalue::UnaryOp(UnOp::Not, operand)
-            if crate::operand_ty_cow(func, operand).as_deref().is_some_and(machine_integer_ty) =>
-        {
-            let ty = crate::operand_ty_cow(func, operand)?;
-            let width = ty.int_width()?;
-            let signed = ty.is_signed();
-            let operand = symbolic_operand(func, operand, state)?;
-            Some(Formula::BvToInt(
-                Box::new(Formula::BvNot(
-                    Box::new(Formula::IntToBv(Box::new(operand), width)),
-                    width,
-                )),
-                width,
-                signed,
-            ))
-        }
         Rvalue::UnaryOp(UnOp::Neg, operand) => {
-            Some(Formula::Neg(Box::new(symbolic_operand(func, operand, state)?)))
+            let operand_f = symbolic_operand(func, operand, state)?;
+            if let Some(ty) =
+                crate::operand_ty_cow(func, operand).filter(|ty| machine_integer_ty(ty.as_ref()))
+            {
+                let width = ty.int_width()?;
+                let signed = ty.is_signed();
+                return Some(Formula::BvToInt(
+                    Box::new(Formula::BvSub(
+                        Box::new(Formula::BitVec { value: 0, width }),
+                        Box::new(Formula::IntToBv(Box::new(operand_f), width)),
+                        width,
+                    )),
+                    width,
+                    signed,
+                ));
+            }
+            Some(Formula::Neg(Box::new(operand_f)))
         }
         Rvalue::UnaryOp(UnOp::Not, operand) => {
-            Some(Formula::Not(Box::new(symbolic_operand(func, operand, state)?)))
+            let operand_f = symbolic_operand(func, operand, state)?;
+            if let Some(ty) =
+                crate::operand_ty_cow(func, operand).filter(|ty| machine_integer_ty(ty.as_ref()))
+            {
+                let width = ty.int_width()?;
+                let signed = ty.is_signed();
+                return Some(Formula::BvToInt(
+                    Box::new(Formula::BvNot(
+                        Box::new(Formula::IntToBv(Box::new(operand_f), width)),
+                        width,
+                    )),
+                    width,
+                    signed,
+                ));
+            }
+            Some(Formula::Not(Box::new(operand_f)))
         }
         _ => None,
     }
@@ -6869,36 +7614,70 @@ fn symbolic_binop(
         if !machine_rhs_matches_lhs_type(func, op, ty, rhs) {
             return None;
         }
-        let lhs_bv = Box::new(Formula::IntToBv(Box::new(lhs_formula.clone()), width));
-        let rhs_bv = Box::new(Formula::IntToBv(Box::new(rhs_formula.clone()), width));
-        let machine_value = match op {
-            BinOp::Add => Some(Formula::BvAdd(lhs_bv, rhs_bv, width)),
-            BinOp::Sub => Some(Formula::BvSub(lhs_bv, rhs_bv, width)),
-            BinOp::Mul => Some(Formula::BvMul(lhs_bv, rhs_bv, width)),
-            BinOp::Div if signed => Some(Formula::BvSDiv(lhs_bv, rhs_bv, width)),
-            BinOp::Div => Some(Formula::BvUDiv(lhs_bv, rhs_bv, width)),
-            BinOp::Rem if signed => Some(Formula::BvSRem(lhs_bv, rhs_bv, width)),
-            BinOp::Rem => Some(Formula::BvURem(lhs_bv, rhs_bv, width)),
-            BinOp::BitAnd => Some(Formula::BvAnd(lhs_bv, rhs_bv, width)),
-            BinOp::BitOr => Some(Formula::BvOr(lhs_bv, rhs_bv, width)),
-            BinOp::BitXor => Some(Formula::BvXor(lhs_bv, rhs_bv, width)),
-            BinOp::Shl => {
-                Some(Formula::BvShl(lhs_bv, rust_shift_amount_formula(&rhs_formula, width)?, width))
-            }
-            BinOp::Shr if signed => Some(Formula::BvAShr(
-                lhs_bv,
-                rust_shift_amount_formula(&rhs_formula, width)?,
-                width,
-            )),
-            BinOp::Shr => Some(Formula::BvLShr(
-                lhs_bv,
-                rust_shift_amount_formula(&rhs_formula, width)?,
-                width,
-            )),
-            _ => None,
+        let wrap_machine = |machine_value: Formula| {
+            Some(Formula::BvToInt(Box::new(machine_value), width, signed))
         };
-        if let Some(machine_value) = machine_value {
-            return Some(Formula::BvToInt(Box::new(machine_value), width, signed));
+        let to_bv = |f: Formula| Box::new(Formula::IntToBv(Box::new(f), width));
+        match op {
+            BinOp::Add => {
+                return wrap_machine(Formula::BvAdd(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::Sub => {
+                return wrap_machine(Formula::BvSub(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::Mul => {
+                return wrap_machine(Formula::BvMul(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::Div if signed => {
+                return wrap_machine(Formula::BvSDiv(
+                    to_bv(lhs_formula),
+                    to_bv(rhs_formula),
+                    width,
+                ));
+            }
+            BinOp::Div => {
+                return wrap_machine(Formula::BvUDiv(
+                    to_bv(lhs_formula),
+                    to_bv(rhs_formula),
+                    width,
+                ));
+            }
+            BinOp::Rem if signed => {
+                return wrap_machine(Formula::BvSRem(
+                    to_bv(lhs_formula),
+                    to_bv(rhs_formula),
+                    width,
+                ));
+            }
+            BinOp::Rem => {
+                return wrap_machine(Formula::BvURem(
+                    to_bv(lhs_formula),
+                    to_bv(rhs_formula),
+                    width,
+                ));
+            }
+            BinOp::BitAnd => {
+                return wrap_machine(Formula::BvAnd(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::BitOr => {
+                return wrap_machine(Formula::BvOr(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::BitXor => {
+                return wrap_machine(Formula::BvXor(to_bv(lhs_formula), to_bv(rhs_formula), width));
+            }
+            BinOp::Shl => {
+                let shift = rust_shift_amount_formula(&rhs_formula, width)?;
+                return wrap_machine(Formula::BvShl(to_bv(lhs_formula), shift, width));
+            }
+            BinOp::Shr if signed => {
+                let shift = rust_shift_amount_formula(&rhs_formula, width)?;
+                return wrap_machine(Formula::BvAShr(to_bv(lhs_formula), shift, width));
+            }
+            BinOp::Shr => {
+                let shift = rust_shift_amount_formula(&rhs_formula, width)?;
+                return wrap_machine(Formula::BvLShr(to_bv(lhs_formula), shift, width));
+            }
+            _ => {}
         }
     }
     let width = ty.as_deref().and_then(Ty::int_width);
@@ -6940,14 +7719,37 @@ fn guarded_unit_increment(before: &Formula, after: &Formula) -> bool {
 
 fn bare_unsigned_formula_width(func: &VerifiableFunction, formula: &Formula) -> Option<u32> {
     let Formula::Var(name, _) = formula else { return None };
-    let mut matching = func.body.locals.iter().filter(|decl| {
-        decl.name.as_deref() == Some(name)
-            || crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) == *name
-    });
-    let decl = matching.next()?;
-    if matching.next().is_some() {
-        return None;
-    }
+    bare_unsigned_var_width(func, name)
+}
+
+fn bare_unsigned_var_width(func: &VerifiableFunction, name: &str) -> Option<u32> {
+    let parsed_local_index = canonical_formula_local_index(name);
+    let decl = match crate::lookup_formula_local_decl(func, name, parsed_local_index) {
+        crate::FormulaLocalDeclLookup::None => return None,
+        crate::FormulaLocalDeclLookup::Unique(decl) => {
+            if decl.name.as_deref() != Some(name)
+                && crate::place_to_var_name(func, &trust_types::Place::local(decl.index)) != name
+            {
+                return None;
+            }
+            decl
+        }
+        crate::FormulaLocalDeclLookup::Ambiguous => {
+            let mut matching = func.body.locals.iter().filter(|decl| {
+                decl.name.as_deref() == Some(name)
+                    || (parsed_local_index == Some(decl.index)
+                        && crate::place_to_var_name(
+                            func,
+                            &trust_types::Place::local(decl.index),
+                        ) == name)
+            });
+            let decl = matching.next()?;
+            if matching.next().is_some() {
+                return None;
+            }
+            decl
+        }
+    };
     match decl.ty {
         Ty::Int { width, signed: false } => Some(width),
         _ => None,
@@ -6996,18 +7798,21 @@ fn symbolic_operand(
     operand: &Operand,
     state: &FxHashMap<String, Formula>,
 ) -> Option<Formula> {
+    if matches!(operand, Operand::Constant(value) if value.contains_memory_image()) {
+        return None;
+    }
     if let Some(select) = symbolic_read_only_collection_select(func, operand, state) {
         return Some(select);
     }
     match operand {
         Operand::Copy(_) | Operand::Move(_) => {
-            Some(substitute_formula_state(&crate::operand_to_formula(func, operand), state))
+            Some(substitute_formula_state_owned(crate::operand_to_formula(func, operand), state))
         }
         Operand::Constant(trust_types::ConstValue::OpaqueScalar { .. })
         | Operand::Symbolic(_)
         | Operand::Unsupported { .. } => None,
         Operand::Constant(_) => {
-            Some(substitute_formula_state(&crate::operand_to_formula(func, operand), state))
+            Some(substitute_formula_state_owned(crate::operand_to_formula(func, operand), state))
         }
         // This exact transition subset is closed: future operand variants must
         // be reviewed instead of silently becoming unconstrained formulae.
@@ -7056,11 +7861,272 @@ fn trust_wp_metadata_for_source(source_contract_index: usize) -> ContractMetadat
 }
 
 #[cfg(test)]
+mod integer_cast_tests;
+
+#[cfg(test)]
+mod unsigned_literal_remainder_tests;
+
+#[cfg(test)]
 mod tests {
-    use trust_router::{InProcessAyBackend, VerificationBackend};
+    use trust_router::VerificationBackend;
     use trust_types::{ConstValue, Place};
 
     use super::*;
+
+    #[test]
+    fn canonical_formula_local_body_names_reject_numeric_aliases() {
+        let func = contract_test_function(vec![]);
+        for name in ["_0", "_1", "x"] {
+            assert!(body_has_formula_local_name(&func, name), "{name}");
+        }
+        for name in
+            ["_+0", "_+1", "_00", "_01", "_-0", "_-1", "_ 1", "_١", "_", "_184467440737095516160"]
+        {
+            assert!(!body_has_formula_local_name(&func, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn canonical_formula_local_integer_types_reject_numeric_aliases() {
+        let mut func = contract_test_function(vec![]);
+        for name in ["_0", "_1", "_1#s1_0", "x", "x#s1_0"] {
+            assert_eq!(machine_int_ty_for_var(&func, name), Some((64, false)), "{name}");
+        }
+        for name in
+            ["_+0", "_+1", "_+1#s1_0", "_00", "_01", "_-1", "_١", "_", "_184467440737095516160"]
+        {
+            assert_eq!(machine_int_ty_for_var(&func, name), None, "{name}");
+        }
+        // Exact declared source aliases retain their original meaning. Only
+        // inferred positional spellings require canonical decimal digits.
+        func.body.locals[1].name = Some("_+1".into());
+        assert!(body_has_formula_local_name(&func, "_+1"));
+        assert_eq!(machine_int_ty_for_var(&func, "_+1"), Some((64, false)));
+    }
+
+    #[test]
+    fn canonical_formula_local_boolean_types_reject_numeric_aliases() {
+        let mut func = contract_test_function(vec![]);
+        func.body.locals.push(LocalDecl { index: 2, ty: Ty::Bool, name: Some("flag".into()) });
+        for name in ["_2", "_2#s1_0", "flag", "flag#s1_0"] {
+            assert!(var_is_bool_local(&func, name), "{name}");
+        }
+        for name in ["_+2", "_+2#s1_0", "_02", "_-2", "_٢", "_", "_184467440737095516160"] {
+            assert!(!var_is_bool_local(&func, name), "{name}");
+        }
+        func.body.locals[2].name = Some("_+2".into());
+        assert!(var_is_bool_local(&func, "_+2"));
+    }
+
+    #[test]
+    fn authored_literal_remainder_preserves_machine_domain_and_definedness() {
+        let mut func = feedback_loop_function();
+        let n = || Box::new(Formula::Var("n".into(), Sort::Int));
+        let int = |v| Box::new(Formula::Int(v));
+        for signed in [false, true] {
+            func.body.locals[1].ty = if signed { Ty::i32() } else { Ty::u32() };
+            let value = Formula::Rem(n(), int(2));
+            let clause = Formula::Eq(Box::new(value.clone()), int(0));
+            assert!(machine_faithful_clause_admissible(&func, &clause));
+            let dividend = Box::new(Formula::Var("n".into(), Sort::BitVec(32)));
+            let divisor = Box::new(Formula::BitVec { value: 2, width: 32 });
+            let expected = if signed {
+                Formula::BvSRem(dividend, divisor, 32)
+            } else {
+                Formula::BvURem(dividend, divisor, 32)
+            };
+            assert_eq!(
+                machine_faithful_translate(&func, &value, 32, signed, false, Polarity::Value),
+                Some(expected),
+            );
+            for divisor in [int(0), int(-1), int(1_i128 << 32), n()] {
+                let unsafe_clause = Formula::Eq(Box::new(Formula::Rem(n(), divisor)), int(0));
+                assert!(!machine_faithful_clause_admissible(&func, &unsafe_clause));
+            }
+            // This change does not admit authored division or infer that a
+            // computed divisor stays nonzero after machine-width wrapping.
+            for value in [
+                Formula::Div(n(), int(2)),
+                Formula::Rem(n(), Box::new(Formula::Add(int(1), int(1)))),
+            ] {
+                assert!(!machine_faithful_clause_admissible(
+                    &func,
+                    &Formula::Eq(Box::new(value), int(0)),
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn literal_remainder_select_summary_preserves_assembled_machine_vc() {
+        let var = |name: &str| Box::new(Formula::Var(name.into(), Sort::Int));
+        let lit = |value| Box::new(Formula::Int(value));
+        let select = |divisor, arm| {
+            Formula::Ite(
+                Box::new(Formula::Eq(Box::new(Formula::Rem(var("n"), divisor)), lit(0))),
+                lit(0),
+                arm,
+            )
+        };
+        for signed in [false, true] {
+            let mut func = feedback_loop_function();
+            let ty = if signed { Ty::i32() } else { Ty::u32() };
+            func.body.locals[0].ty = ty.clone();
+            func.body.locals[1].ty = ty.clone();
+            func.body.return_ty = ty;
+            let polynomial = if signed { 17 } else { 0xEDB8_8320 };
+            let summary_value = select(lit(2), lit(polynomial));
+            let remainder = || Box::new(Formula::Rem(var("n"), lit(2)));
+            let nonzero_remainder = if signed {
+                Formula::Not(Box::new(Formula::Eq(remainder(), lit(0))))
+            } else {
+                Formula::Eq(remainder(), lit(1))
+            };
+            let post = Formula::Or(vec![
+                Formula::And(vec![
+                    Formula::Eq(remainder(), lit(0)),
+                    Formula::Eq(var("_0"), lit(0)),
+                ]),
+                Formula::And(vec![nonzero_remainder, Formula::Eq(var("_0"), lit(polynomial))]),
+            ]);
+            assert!(machine_faithful_clause_admissible(&func, &post));
+            let summary = Formula::Eq(var("_0"), Box::new(summary_value.clone()));
+            assert!(formula_is_exact_division_by_positive_literal(&summary));
+            assert!(
+                !machine_faithful_clause_admissible(&func, &summary),
+                "this body-summary support must not widen authored conditional admission"
+            );
+            let assembled = Formula::And(vec![summary, Formula::Not(Box::new(post))]);
+            let machine = machine_faithful_vc_formula(&func, &assembled).expect(
+                "the admitted CRC-style clause and exact body summary must translate together",
+            );
+            assert_eq!(trust_types::check_formula_sort(&machine), Ok(Sort::Bool));
+            let dividend = Box::new(Formula::Var("n".into(), Sort::BitVec(32)));
+            let divisor = Box::new(Formula::BitVec { value: 2, width: 32 });
+            let expected_remainder = if signed {
+                Formula::BvSRem(dividend, divisor, 32)
+            } else {
+                Formula::BvURem(dividend, divisor, 32)
+            };
+            assert_eq!(
+                machine_faithful_translate(
+                    &func,
+                    &summary_value,
+                    32,
+                    signed,
+                    true,
+                    Polarity::Value,
+                ),
+                Some(Formula::Ite(
+                    Box::new(Formula::Eq(
+                        Box::new(expected_remainder),
+                        Box::new(Formula::BitVec { value: 0, width: 32 }),
+                    )),
+                    Box::new(Formula::BitVec { value: 0, width: 32 }),
+                    Box::new(Formula::BitVec { value: polynomial, width: 32 }),
+                )),
+            );
+            for divisor in [
+                lit(0),
+                lit(-1),
+                lit(1_i128 << 32),
+                var("n"),
+                Box::new(Formula::Add(lit(1), lit(1))),
+            ] {
+                let unsafe_summary =
+                    Formula::Eq(var("_0"), Box::new(select(divisor, lit(polynomial))));
+                assert!(machine_faithful_vc_formula(&func, &unsafe_summary).is_none());
+            }
+            let computed_arm = Formula::Eq(
+                var("_0"),
+                Box::new(select(lit(2), Box::new(Formula::Add(var("n"), lit(1))))),
+            );
+            assert!(machine_faithful_vc_formula(&func, &computed_arm).is_none());
+            let wide_arm = Formula::Eq(var("_0"), Box::new(select(lit(2), lit(1_i128 << 32))));
+            assert!(machine_faithful_vc_formula(&func, &wide_arm).is_none());
+            let generic_select = Formula::Eq(
+                var("_0"),
+                Box::new(Formula::Ite(
+                    Box::new(Formula::Eq(var("n"), lit(0))),
+                    lit(0),
+                    lit(polynomial),
+                )),
+            );
+            assert!(machine_faithful_vc_formula(&func, &generic_select).is_none());
+            func.body.locals[2].ty = Ty::u64();
+            let mixed_domain = Formula::Eq(
+                var("_0"),
+                Box::new(Formula::Ite(
+                    Box::new(Formula::Eq(Box::new(Formula::Rem(var("i"), lit(2))), lit(0))),
+                    lit(0),
+                    lit(polynomial),
+                )),
+            );
+            assert!(machine_faithful_vc_formula(&func, &mixed_domain).is_none());
+        }
+    }
+
+    /// Trust (2026-09-28): the exact-division exemption admits `d == x / c` and
+    /// `d == x % c` with a POSITIVE literal `c`, and nothing near it: a zero or
+    /// negative divisor, a variable divisor, a computed dividend, another
+    /// operator, and a non-`Eq` head all stay filtered.
+    #[test]
+    fn exact_division_exemption_is_structural_and_positive_only() {
+        let var = |name: &str| Box::new(Formula::Var(name.into(), Sort::Int));
+        let lit = |value: i128| Box::new(Formula::Int(value));
+        let eq = |rhs: Formula| Formula::Eq(var("_0"), Box::new(rhs));
+        for admitted in [
+            eq(Formula::Div(var("x"), lit(10))),
+            eq(Formula::Rem(var("x"), lit(7))),
+            eq(Formula::Rem(var("x"), lit(1 << 64))),
+            eq(Formula::Ite(
+                Box::new(Formula::Eq(Box::new(Formula::Rem(var("x"), lit(2))), lit(0))),
+                lit(0),
+                lit(0xEDB8_8320),
+            )),
+            eq(Formula::Ite(
+                Box::new(Formula::Not(Box::new(Formula::Eq(
+                    var("x"),
+                    Box::new(Formula::Div(var("y"), lit(8))),
+                )))),
+                var("x"),
+                lit(1),
+            )),
+        ] {
+            assert!(formula_uses_unmodeled_machine_arithmetic(&admitted));
+            assert!(formula_is_exact_division_by_positive_literal(&admitted), "{admitted:?}");
+        }
+        for refused in [
+            eq(Formula::Div(var("x"), lit(0))),
+            eq(Formula::Div(var("x"), lit(-1))),
+            eq(Formula::Rem(var("x"), var("y"))),
+            eq(Formula::Div(Box::new(Formula::Add(var("x"), lit(1))), lit(2))),
+            eq(Formula::Mul(var("x"), lit(2))),
+            Formula::Le(var("_0"), Box::new(Formula::Div(var("x"), lit(2)))),
+            eq(Formula::Ite(
+                Box::new(Formula::Eq(Box::new(Formula::Div(var("x"), lit(0))), lit(0))),
+                lit(0),
+                lit(1),
+            )),
+            eq(Formula::Ite(
+                Box::new(Formula::Eq(Box::new(Formula::Rem(var("x"), lit(2))), lit(0))),
+                Box::new(Formula::Add(var("x"), lit(1))),
+                lit(0),
+            )),
+        ] {
+            assert!(!formula_is_exact_division_by_positive_literal(&refused), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn memory_image_symbolic_contract_operand_is_unavailable() {
+        use crate::memory_image_tests::{function, image, nested_image};
+        let func = function(Rvalue::Use(Operand::Constant(ConstValue::Uint(7, 8))));
+        let state = FxHashMap::default();
+        for value in [image(0), image(8), nested_image(8)] {
+            assert!(symbolic_operand(&func, &Operand::Constant(value), &state).is_none());
+        }
+    }
 
     /// DIRECT test of the two field/carrier resolutions, at the helpers rather
     /// than through an assembled VC — the layer where a wrong answer becomes a
@@ -7078,14 +8144,16 @@ mod tests {
                 ("0".to_string(), Ty::Int { width: 8, signed: false }),
                 ("1".to_string(), Ty::Int { width: 32, signed: false }),
                 ("2".to_string(), Ty::Bool),
-            ],
-            variants: Vec::new(),
+            ]
+            .into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         assert!(matches!(
             struct_or_tuple_field_ty(&packed, 0),
@@ -7113,6 +8181,7 @@ mod tests {
                 enum_layout: None,
                 adt_kind: kind,
                 arbitrary_precision: None,
+                validity_wrapper: None,
             }
         };
         for kind in [None, Some(trust_types::AdtKind::Union), Some(trust_types::AdtKind::Enum)] {
@@ -7128,14 +8197,15 @@ mod tests {
         // and declines rather than picking a reading.
         let newtype = Ty::Adt {
             name: "Literal".to_string(),
-            fields: vec![("0".to_string(), Ty::Int { width: 32, signed: false })],
-            variants: Vec::new(),
+            fields: vec![("0".to_string(), Ty::Int { width: 32, signed: false })].into(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         assert!(matches!(newtype_carrier_ty(&newtype), Ty::Int { width: 32, signed: false }));
         let inconsistent = {
@@ -7147,13 +8217,15 @@ mod tests {
                     name: "V".to_string(),
                     discriminant: 0,
                     fields: Vec::new(),
-                }],
+                }]
+                .into(),
                 disc_index_safe: false,
                 faithful_enum_repr: None,
                 layout: None,
                 enum_layout: None,
                 adt_kind: Some(trust_types::AdtKind::Struct),
                 arbitrary_precision: None,
+                validity_wrapper: None,
             }
         };
         assert!(
@@ -7175,6 +8247,17 @@ mod tests {
         assert!(matches!(newtype_carrier_ty(&tuple), Ty::Tuple(_)));
     }
 
+    /// `fn contract_fn(x: usize) -> usize { x }`: one block, `_0 = copy _1;
+    /// return`, with the given contracts attached.
+    ///
+    /// The return-slot write is load-bearing. rustc writes the return place
+    /// before every `Return` of an inhabited, non-ZST return type, and since
+    /// 5fd50cf220 a `result` clause over a path with no such write is refused
+    /// ("postcondition result has no established return-path value"; pinned by
+    /// `contract_fixture_without_a_return_write_is_refused_not_verified` below
+    /// and by `tests/wide_return_join.rs`). Without the write every `ensures`
+    /// test here would measure that refusal instead of the contract lane
+    /// (VCGEN-LIB-REDS-1).
     fn contract_test_function(contracts: Vec<Contract>) -> VerifiableFunction {
         VerifiableFunction {
             name: "contract_fn".to_string(),
@@ -7187,7 +8270,11 @@ mod tests {
                 ],
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
-                    stmts: vec![],
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
                     terminator: Terminator::Return,
                 }],
                 arg_count: 1,
@@ -7198,7 +8285,31 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
+    }
+
+    /// [`contract_test_function`] with the parsed clause carriers filled the way the
+    /// producer fills them (`trust-mir-extract`'s `parse_contract_specs_with_typed`):
+    /// every authored `requires` in `preconditions` (`false` when it does not parse)
+    /// and every parseable `ensures` in `postconditions`. A `requires` present only
+    /// as `contracts` text is one the assumption gate DROPPED, so
+    /// `entry_hypothesis::dropped_requires_clauses` arms its refusal for every row
+    /// that reads the parameter. Since the fixture's `result` is `x`, a test about an
+    /// ASSUMED precondition must use this carrier (VCGEN-LIB-REDS-1).
+    fn producer_shaped_contract_function(contracts: Vec<Contract>) -> VerifiableFunction {
+        let mut func = contract_test_function(contracts);
+        for contract in &func.contracts {
+            let parsed = parse_spec_expr(&contract.body);
+            match contract.kind {
+                ContractKind::Requires => {
+                    func.preconditions.push(parsed.unwrap_or(Formula::Bool(false)));
+                }
+                ContractKind::Ensures => func.postconditions.extend(parsed),
+                _ => {}
+            }
+        }
+        func
     }
 
     #[test]
@@ -7351,6 +8462,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -7538,6 +8650,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -7617,7 +8730,7 @@ mod tests {
 
     #[test]
     fn wrong_inner_invariant_stays_public_sat_and_good_row_has_checked_ay_proof() {
-        let backend = InProcessAyBackend::new().with_timeout(30_000);
+        let backend = crate::test_router::test_ay_backend();
 
         let good = compositional_nested_loop_function();
         let mut good_rows = Vec::new();
@@ -7784,6 +8897,7 @@ mod tests {
             ],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -7882,6 +8996,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -8520,9 +9635,41 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("inspect"),
         };
         assert!(read_only_collection_alias_is_stable(&called_alias, 4, 1));
         assert_collection_loop_is_supported(&called_alias);
+
+        // Trust: 2026-11-09 (VCGEN-SEAM-PERF-REDS-1) — the `pmod` shape for this
+        // resolver: the alias is ALSO a `Call` destination, so it holds two values
+        // (`copy xs` and whatever `other_view` returns). Its one value is asked of the
+        // seam, which sees the `Call` channel, so it has no model. The source's
+        // stability is a whole-body fact over EVERY exact alias of it, so the reseated
+        // alias also withdraws the model of the untouched second alias, and the loop
+        // fails closed visibly rather than minting E4 rows.
+        let mut call_reseated_alias = called_alias.clone();
+        call_reseated_alias.body.blocks[3].terminator = Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: "other_view".into(),
+            args: vec![],
+            dest: Place::local(4),
+            target: Some(BlockId(4)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("other_view"),
+        };
+        assert!(
+            crate::local_defs::unique_value_def(&call_reseated_alias, 4).is_none(),
+            "an alias written by a copy AND a call destination holds two values",
+        );
+        assert!(read_only_collection_model_for_local(&call_reseated_alias, 4).is_none());
+        assert!(!read_only_collection_alias_is_stable(&call_reseated_alias, 4, 1));
+        assert!(!read_only_collection_arg_is_stable(&call_reseated_alias, 1));
+        assert!(read_only_collection_model_for_local(&call_reseated_alias, 6).is_none());
+        assert_collection_loop_is_explicitly_unsupported(&call_reseated_alias);
 
         let mut overwritten_source = base();
         overwritten_source.body.blocks[2].terminator = Terminator::Call {
@@ -8536,6 +9683,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("replacement"),
         };
         assert!(!read_only_collection_arg_is_stable(&overwritten_source, 1));
         assert_collection_loop_is_explicitly_unsupported(&overwritten_source);
@@ -8593,6 +9741,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("inspect"),
         };
         assert!(
             read_only_collection_arg_is_stable(&collection_call, 1),
@@ -8648,6 +9797,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("replace"),
         };
         let reseat = exact_call_frame(
             &collection_destination,
@@ -8687,6 +9837,7 @@ mod tests {
             is_foreign: true,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("foreign_inspect"),
         };
         assert!(!read_only_collection_arg_is_stable(&foreign_collection_call, 1));
         assert_collection_loop_is_explicitly_unsupported(&foreign_collection_call);
@@ -8713,6 +9864,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("inspect_element"),
         };
         assert!(!read_only_collection_arg_is_stable(&projected_collection_call, 1));
         assert_collection_loop_is_explicitly_unsupported(&projected_collection_call);
@@ -8739,6 +9891,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: true,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("escape"),
         };
         assert_collection_loop_is_explicitly_unsupported(&escaping_alias);
         assert!(
@@ -9150,6 +10303,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("escape"),
         };
         assert_collection_loop_is_explicitly_unsupported(&call_escape);
 
@@ -9306,6 +10460,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("escape"),
         };
         assert!(!exclusive_mutable_collection_arg_is_stable(&call_escape, 1));
         assert_collection_loop_is_explicitly_unsupported(&call_escape);
@@ -9572,6 +10727,38 @@ mod tests {
         );
     }
 
+    /// The shape `contract_test_function` had before VCGEN-LIB-REDS-1 — `return`
+    /// with `_0` never written — is REFUSED, not verified: the `ensures` becomes
+    /// exactly one fail-closed row and no `Postcondition`. This is why the
+    /// fixture writes `_0 = copy _1`, and it fails if `result` may ever again
+    /// name an unestablished return value.
+    #[test]
+    fn contract_fixture_without_a_return_write_is_refused_not_verified() {
+        let mut func = contract_test_function(vec![Contract {
+            kind: ContractKind::Ensures,
+            span: SourceSpan::default(),
+            body: "result >= 0".to_string(),
+        }]);
+        func.body.blocks[0].stmts.clear();
+
+        let vcs = crate::generate_vcs(&func);
+
+        assert!(
+            !vcs.iter().any(|vc| matches!(vc.kind, VcKind::Postcondition)),
+            "an unwritten return slot must not yield a refutable row: {vcs:#?}"
+        );
+        let refusals: Vec<_> = vcs
+            .iter()
+            .filter(|vc| {
+                matches!(&vc.kind, VcKind::UnsupportedMir { kind, detail, .. }
+                    if kind == SPEC_UNVERIFIABLE_KIND
+                        && detail.contains("no established return-path value"))
+            })
+            .collect();
+        assert_eq!(refusals.len(), 1, "exactly one visible refusal row: {vcs:#?}");
+        assert_eq!(refusals[0].formula, Formula::Bool(true));
+    }
+
     #[test]
     fn test_ensures_generates_postcondition_vc() {
         let func = contract_test_function(vec![Contract {
@@ -9584,9 +10771,68 @@ mod tests {
 
         assert_eq!(vcs.len(), 1);
         assert!(matches!(vcs[0].kind, VcKind::Postcondition));
+        // The body's return write `_0 = x`, the declared return carrier, and the
+        // unchanged negated clause. (Before VCGEN-LIB-REDS-1 the fixture never wrote
+        // `_0`, so this row had no body fact and `result` named nothing the body
+        // established.) The carrier range is conjoined once per carrier occurrence;
+        // the repeat is the same conjunct and changes nothing.
+        let carrier = crate::range::rust_type_range_constraint(
+            &Formula::var("_0", Sort::Int),
+            &func.body.return_ty,
+        )
+        .expect("declared return carrier");
         assert_eq!(
             vcs[0].formula,
-            Formula::Not(Box::new(parse_spec_expr("result >= 0").expect("spec should parse"))),
+            Formula::And(vec![
+                Formula::Eq(
+                    Box::new(Formula::var("_0", Sort::Int)),
+                    Box::new(Formula::var("x", Sort::Int)),
+                ),
+                Formula::And(vec![
+                    carrier.clone(),
+                    carrier,
+                    Formula::Not(Box::new(
+                        parse_spec_expr("result >= 0").expect("spec should parse"),
+                    )),
+                ]),
+            ]),
+        );
+        // What the corrected program means: `{ x }` over a `usize` satisfies the
+        // clause, and a clause it violates is refuted, not refused. `result >= 0` is
+        // discharged by the carrier range alone, so `result == x` pins that the row
+        // reads the body's return write: it proves only through `_0 = x`.
+        let backend = crate::test_router::test_ay_backend();
+        assert!(
+            matches!(backend.verify(&vcs[0]), trust_types::VerificationResult::Proved { .. }),
+            "`result >= 0` holds for every `usize` result"
+        );
+        let returned = contract_test_function(vec![Contract {
+            kind: ContractKind::Ensures,
+            span: SourceSpan::default(),
+            body: "result == x".to_string(),
+        }]);
+        let rows: Vec<_> = crate::generate_vcs(&returned)
+            .into_iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert!(
+            matches!(backend.verify(&rows[0]), trust_types::VerificationResult::Proved { .. }),
+            "`{{ x }}` returns `x`"
+        );
+        let violated = contract_test_function(vec![Contract {
+            kind: ContractKind::Ensures,
+            span: SourceSpan::default(),
+            body: "result > x".to_string(),
+        }]);
+        let rows: Vec<_> = crate::generate_vcs(&violated)
+            .into_iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert!(
+            matches!(backend.verify(&rows[0]), trust_types::VerificationResult::Failed { .. }),
+            "`result > x` is false for `{{ x }}`"
         );
     }
 
@@ -9691,7 +10937,7 @@ mod tests {
     /// and must not be caught by the item-position refusal.
     #[test]
     fn refusing_item_invariant_leaves_requires_and_ensures_refutable() {
-        let func = contract_test_function(vec![
+        let func = producer_shaped_contract_function(vec![
             Contract {
                 kind: ContractKind::Requires,
                 span: SourceSpan::default(),
@@ -9709,10 +10955,41 @@ mod tests {
         let post: Vec<_> =
             vcs.iter().filter(|vc| matches!(vc.kind, VcKind::Postcondition)).collect();
         assert_eq!(post.len(), 1, "`ensures` keeps exactly one Postcondition row: {vcs:#?}");
+        // The assumed `requires`, the declared return carrier (once per occurrence
+        // of `_0`), the body's return write `_0 = x` and the unchanged negated clause
+        // (VCGEN-LIB-REDS-1: the fixture now writes `_0` and carries its `requires`
+        // as the producer does).
+        let carrier = crate::range::rust_type_range_constraint(
+            &Formula::var("_0", Sort::Int),
+            &func.body.return_ty,
+        )
+        .expect("declared return carrier");
         assert_eq!(
             post[0].formula,
-            Formula::Not(Box::new(parse_spec_expr("result >= 0").expect("spec should parse"))),
+            Formula::And(vec![
+                parse_spec_expr("n > 0").expect("spec should parse"),
+                Formula::And(vec![
+                    carrier.clone(),
+                    carrier,
+                    Formula::And(vec![
+                        Formula::Eq(
+                            Box::new(Formula::var("_0", Sort::Int)),
+                            Box::new(Formula::var("x", Sort::Int)),
+                        ),
+                        Formula::Not(Box::new(
+                            parse_spec_expr("result >= 0").expect("spec should parse"),
+                        )),
+                    ]),
+                ]),
+            ]),
             "the postcondition stays a real refutable obligation",
+        );
+        assert!(
+            matches!(
+                crate::test_router::test_ay_backend().verify(post[0]),
+                trust_types::VerificationResult::Proved { .. }
+            ),
+            "the solver decides the row: `{{ x }}` over a `usize` satisfies `result >= 0`",
         );
         assert!(
             vcs.iter().any(|vc| matches!(vc.kind, VcKind::Precondition { .. })),
@@ -10041,7 +11318,7 @@ mod tests {
 
     #[test]
     fn test_multiple_contracts() {
-        let func = contract_test_function(vec![
+        let func = producer_shaped_contract_function(vec![
             Contract {
                 kind: ContractKind::Requires,
                 span: SourceSpan::default(),
@@ -10202,6 +11479,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::finish"),
         };
 
         let (solver_vcs, discharged) = crate::generate_vcs_with_discharge(&func);
@@ -10230,6 +11508,56 @@ mod tests {
                 .expect("feedback predicate has the exact u32 machine reading");
         assert!(formula_contains(&e5_formula(&raw), &machine_predicate));
         assert!(formula_contains(&e5_formula(&augmented), &machine_predicate));
+    }
+
+    /// T3 C07p: the E5 regeneration writes both variants into the caller's context through
+    /// the row oracle, and a regenerated row that equals a body row is that body row's
+    /// node: the same row, field for field, over the same formula node.
+    #[test]
+    fn e5_regenerated_rows_are_the_body_rows_nodes() {
+        use trust_types::vc_context::{Oracle, ParityCount, VcContext, same_row};
+
+        let func = feedback_loop_function();
+        let (solver_vcs, discharged) = crate::generate_vcs_with_discharge(&func);
+        let body: Vec<VerificationCondition> =
+            solver_vcs.into_iter().chain(discharged.into_iter().map(|(vc, _)| vc)).collect();
+        let mut rows = VcContext::new();
+        let body_ids = crate::intern_checked_rows(&mut rows, &body);
+        let (raw, augmented) =
+            crate::regenerate_loop_decreases_with_invariant_feedback_production_variants_rows(
+                &func,
+                &[],
+                &mut rows,
+            )
+            .expect("exact production E5 variants");
+        let (tree_raw, tree_augmented) =
+            crate::regenerate_loop_decreases_with_invariant_feedback_production_variants(
+                &func,
+                &[],
+            )
+            .expect("exact production E5 variants");
+        assert_eq!((raw.len(), augmented.len()), (1, 1));
+        assert!(same_row(&raw[0], &tree_raw[0]));
+        assert!(same_row(&augmented[0], &tree_augmented[0]));
+        let checked = (body.len() + raw.len() + augmented.len()) as u64;
+        assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: checked, mismatches: 0 });
+        // Every row agreed, so the regenerated rows are the last two, raw then augmented.
+        let regenerated: Vec<_> = rows.row_ids().skip(body.len()).collect();
+        assert_eq!(regenerated.len(), 2);
+        let mut shared = 0;
+        for (vc, id) in raw.iter().chain(&augmented).zip(&regenerated) {
+            for (body_vc, body_id) in body.iter().zip(&body_ids) {
+                if !same_row(vc, body_vc) {
+                    continue;
+                }
+                let body_id = body_id.expect("the body row was interned");
+                let regenerated_row = rows.row(*id).expect("a row of this context");
+                let body_row = rows.row(body_id).expect("a row of this context");
+                assert_eq!(regenerated_row, body_row);
+                shared += 1;
+            }
+        }
+        assert!(shared > 0, "the production E5 row is one of the regenerated variants");
     }
 
     #[test]
@@ -10492,10 +11820,7 @@ mod tests {
         let mut opaque = feedback_loop_function();
         opaque.body.blocks[2].stmts = vec![Statement::Assign {
             place: Place::local(2),
-            rvalue: Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
-                width: 32,
-                signed: false,
-            })),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::opaque_scalar(32, false))),
             span: SourceSpan::default(),
         }];
         assert_no_e4(&opaque, "an opaque scalar cannot become an exact loop-transition value");
@@ -11012,11 +12337,7 @@ mod tests {
         let mut unsigned_into_signed = func.clone();
         unsigned_into_signed.body.locals[2].ty = Ty::i64();
         assert_eq!(
-            machine_faithful_translate_joined(
-                &unsigned_into_signed,
-                &Formula::Le(n(), i()),
-                true,
-            ),
+            machine_faithful_translate_joined(&unsigned_into_signed, &Formula::Le(n(), i()), true,),
             Some(Formula::BvSLe(
                 Box::new(Formula::BvZeroExt(
                     Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
@@ -11041,11 +12362,7 @@ mod tests {
         let mut signed_into_unsigned = func.clone();
         signed_into_unsigned.body.locals[1].ty = Ty::i32();
         assert_eq!(
-            machine_faithful_translate_joined(
-                &signed_into_unsigned,
-                &Formula::Le(n(), i()),
-                true,
-            ),
+            machine_faithful_translate_joined(&signed_into_unsigned, &Formula::Le(n(), i()), true,),
             None,
         );
 
@@ -11104,10 +12421,7 @@ mod tests {
         // domain is exact only for literals, so this must not translate at all.
         let closed_sum = Formula::And(vec![
             Formula::Eq(
-                Box::new(Formula::Add(
-                    Box::new(Formula::Int(255)),
-                    Box::new(Formula::Int(1)),
-                )),
+                Box::new(Formula::Add(Box::new(Formula::Int(255)), Box::new(Formula::Int(1)))),
                 Box::new(Formula::Int(0)),
             ),
             Formula::Le(n(), i()),
@@ -11147,10 +12461,7 @@ mod tests {
         );
         // A final result that fits cannot excuse an overflowing intermediate,
         // including when the closed term is nested inside an open operand.
-        let nested = Formula::Add(
-            n(),
-            Box::new(Formula::Sub(Box::new(overflow()), int(1))),
-        );
+        let nested = Formula::Add(n(), Box::new(Formula::Sub(Box::new(overflow()), int(1))));
         assert_eq!(
             machine_faithful_translate(&func, &nested, 32, false, true, Polarity::Value),
             None,
@@ -11171,10 +12482,7 @@ mod tests {
         let int = |value| Box::new(Formula::Int(value));
         let n = || Box::new(Formula::Var("n".into(), Sort::Int));
         let bv = |value| Box::new(Formula::BitVec { value, width: 32 });
-        let exact = Formula::Ge(
-            n(),
-            Box::new(Formula::Add(int(4_294_967_294), int(1))),
-        );
+        let exact = Formula::Ge(n(), Box::new(Formula::Add(int(4_294_967_294), int(1))));
         let expected = Formula::BvULe(
             Box::new(Formula::BvAdd(bv(4_294_967_294), bv(1), 32)),
             Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
@@ -11184,10 +12492,7 @@ mod tests {
             machine_faithful_translate(&func, &exact, 32, false, true, Polarity::Prop),
             Some(expected.clone()),
         );
-        assert_eq!(
-            machine_faithful_translate_joined(&func, &exact, true),
-            Some(expected),
-        );
+        assert_eq!(machine_faithful_translate_joined(&func, &exact, true), Some(expected),);
         // Open arithmetic remains machine-width arithmetic; never widen it.
         assert_eq!(
             machine_faithful_translate(
@@ -11198,18 +12503,12 @@ mod tests {
                 true,
                 Polarity::Value,
             ),
-            Some(Formula::BvAdd(
-                Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
-                bv(1),
-                32,
-            )),
+            Some(Formula::BvAdd(Box::new(Formula::Var("n".into(), Sort::BitVec(32))), bv(1), 32,)),
         );
         // Explicit BV operations already declare wrapping semantics.
         let wrapped = Formula::BvAdd(bv(4_294_967_295), bv(1), 32);
         assert_eq!(
-            machine_faithful_translate(
-                &func, &wrapped, 32, false, true, Polarity::Value,
-            ),
+            machine_faithful_translate(&func, &wrapped, 32, false, true, Polarity::Value,),
             Some(wrapped.clone()),
         );
         // The authenticated body wrapping constructor stays the same operation,
@@ -11223,9 +12522,7 @@ mod tests {
         )
         .expect("supported wrapping addition");
         assert_eq!(
-            machine_faithful_translate(
-                &func, &encoded, 32, false, true, Polarity::Value,
-            ),
+            machine_faithful_translate(&func, &encoded, 32, false, true, Polarity::Value,),
             Some(wrapped),
         );
         // Bare u128 literals do not pass through the conservative i128
@@ -11396,6 +12693,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -11579,6 +12877,28 @@ mod tests {
         );
     }
 
+    /// Does this formula still carry mathematical-`Int` arithmetic?
+    ///
+    /// The point of admitting a clause through `machine_faithful_clause_admissible` is
+    /// that the `Add`/`Sub`/`Mul` the unmodeled filter exists to stop is REPLACED by the
+    /// declared-width BV reading, not merely tolerated. These two pins assert the
+    /// replacement actually happened, so an admission that silently kept the Int
+    /// spelling would fail here rather than pass quietly.
+    fn formula_contains_int_arithmetic(formula: &Formula) -> bool {
+        if matches!(
+            formula,
+            Formula::Add(..)
+                | Formula::Sub(..)
+                | Formula::Mul(..)
+                | Formula::Div(..)
+                | Formula::Rem(..)
+                | Formula::Neg(..)
+        ) {
+            return true;
+        }
+        formula.children().into_iter().any(formula_contains_int_arithmetic)
+    }
+
     #[test]
     fn dropped_arithmetic_precondition_cannot_authorize_signed_zero_subtraction() {
         let x = || Formula::Var("x".into(), Sort::Int);
@@ -11609,10 +12929,86 @@ mod tests {
             "a useful bound inside a dropped arithmetic conjunction must not authorize `0 - x`",
         );
         let vcs = crate::generate_vcs(&func);
-        assert!(
-            !vcs.iter().any(|vc| matches!(vc.kind, VcKind::Postcondition)),
-            "the unauthorized signed subtraction must never reach a solver-capable postcondition: {vcs:#?}",
+
+        // REWRITTEN 2026-09-25 (formula-only symmetry). This used to assert that the
+        // signed subtraction reaches NO solver-capable postcondition. That pinned the
+        // SOURCE-CARRIED vs FORMULA-ONLY asymmetry, not a soundness property: the very
+        // same clause written as a source `Contract` already minted a `Postcondition`
+        // row before this change. The assertion below proves that rather than asserting
+        // it — the two carriers must now agree.
+        //
+        // The ensures row cannot false-PROVE: the body returns `x`, and `x == 0 - x`
+        // fails for `x = 1` (VCGEN-LIB-REDS-1: before the fixture wrote `_0`, the
+        // clause was refused for want of a return-path value); and the row that IS
+        // emitted is the declared-width BV reading, carrying no `Int` arithmetic.
+        // `x = 1` satisfies the dropped `requires`, so this refutation alone cannot
+        // show the premise stayed dropped; the `result > i32::MIN` row below can.
+        let mut source_carried = func.clone();
+        source_carried.postconditions.clear();
+        source_carried.contracts.push(Contract {
+            kind: ContractKind::Ensures,
+            body: "result == 0 - x".into(),
+            span: SourceSpan::default(),
+        });
+        let source_posts: Vec<_> = crate::generate_vcs(&source_carried)
+            .into_iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .map(|vc| vc.formula)
+            .collect();
+        let formula_posts: Vec<_> = vcs
+            .iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .map(|vc| vc.formula.clone())
+            .collect();
+        assert_eq!(
+            formula_posts, source_posts,
+            "the formula-only carrier must now produce exactly the source-carried row: \
+             {vcs:#?}",
         );
+        assert!(
+            !formula_posts.iter().any(formula_contains_int_arithmetic),
+            "the admitted ensures must reach the solver as declared-width BV, with no \
+             Int arithmetic left: {formula_posts:#?}",
+        );
+        let refuted = vcs
+            .iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .map(|vc| crate::test_router::test_ay_backend().verify(vc))
+            .collect::<Vec<_>>();
+        assert!(
+            !refuted.is_empty()
+                && refuted
+                    .iter()
+                    .all(|result| matches!(result, trust_types::VerificationResult::Failed { .. })),
+            "`{{ x }}` violates `result == 0 - x` at `x = 1`: {refuted:#?}",
+        );
+
+        // The dropped premise does not reach the row (VCGEN-LIB-REDS-1). Its useful
+        // conjunct `x > i32::MIN` is the ONLY fact that proves `result > i32::MIN` for
+        // `{ x }`, so the row must refute at `x = i32::MIN`; were the stripped
+        // `requires` assumed after all, it would prove.
+        let mut leak_probe = func.clone();
+        leak_probe.postconditions = vec![Formula::Gt(
+            Box::new(Formula::Var("_0".into(), Sort::Int)),
+            Box::new(Formula::Int(-2_147_483_648)),
+        )];
+        let probe_rows: Vec<_> = crate::generate_vcs(&leak_probe)
+            .into_iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .collect();
+        assert_eq!(probe_rows.len(), 1, "{probe_rows:#?}");
+        assert!(
+            matches!(
+                crate::test_router::test_ay_backend().verify(&probe_rows[0]),
+                trust_types::VerificationResult::Failed { .. }
+            ),
+            "the stripped `x > i32::MIN` must not be assumed: {:#?}",
+            probe_rows[0].formula,
+        );
+
+        // THE SUBSTANTIVE RULE, unchanged: the non-admissible REQUIRES — a useful bound
+        // conjoined with a wrapping tautology — is still stripped and still disclosed. A
+        // premise has no paired translation gate, so it is never retained.
         let unknowns: Vec<_> = vcs
             .iter()
             .filter(|vc| {
@@ -11622,10 +13018,124 @@ mod tests {
             .collect();
         assert_eq!(
             unknowns.len(),
-            2,
-            "both formula-only clauses rejected by sanitization must remain visible: {vcs:#?}",
+            1,
+            "the rejected formula-only REQUIRES must remain visible: {vcs:#?}",
         );
         assert!(unknowns.iter().all(|vc| vc.formula == Formula::Bool(true)));
+        assert!(
+            !vcs.iter().any(|vc| matches!(vc.kind, VcKind::Precondition { .. })),
+            "the dropped arithmetic precondition must authorize nothing: {vcs:#?}",
+        );
+    }
+
+    /// A `u8` loop whose invariant lives on the header block, so a retained PREMISE
+    /// reaches `LoopInvariantInitiation` — the lane that bypasses the entry-fact
+    /// funnel a straight-line body is filtered by.
+    fn u8_loop_with_header_invariant() -> VerifiableFunction {
+        VerifiableFunction {
+            name: "u8_loop".to_string(),
+            def_path: "test::u8_loop".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                    LocalDecl { index: 1, ty: Ty::u8(), name: Some("d".into()) },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: Some("cond".into()) },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(2),
+                            rvalue: Rvalue::BinaryOp(
+                                BinOp::Gt,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(0, 8)),
+                            ),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(2)),
+                            targets: vec![(1, BlockId(2))],
+                            otherwise: BlockId(3),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 1,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![Contract {
+                kind: ContractKind::LoopInvariant,
+                span: SourceSpan::default(),
+                body: "bb1: d >= 1".to_string(),
+            }],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
+    /// THE REQUIRES-SIDE VECTOR, committed permanently.
+    ///
+    /// This is the false proof that decided the shape of the formula-only symmetry
+    /// change (`entry.rs`, `without_unmodeled_contract_arithmetic`), and it is
+    /// PREMISE-side. A retained postcondition is a GOAL that is translated wholesale
+    /// into declared-width QF_BV or fails closed; a retained PRECONDITION has no such
+    /// paired gate. Exempting one put `Ge(Sub(d, 1), 0)` into a `LoopInvariantInitiation`
+    /// row as live mathematical-`Int` arithmetic over a `u8`: at `d = 0` the Int reading
+    /// of `d - 1 >= 0` is FALSE while the u8 reading wraps to 255, so the initiation
+    /// goal was discharged against arithmetic the machine never performs.
+    ///
+    /// It must be a LOOP. A straight-line body cannot catch this: there the retained
+    /// premise is inert, re-filtered by `path_defs.rs`'s entry-fact funnel before it
+    /// reaches any row. The loop-invariant lane bypasses that funnel, which is the
+    /// whole reason this fixture carries a header invariant.
+    ///
+    /// BORN RED, measured: exempting `strips_pre` the way `strips_post` is exempted
+    /// makes this test fail on the `LoopInvariantInitiation` row.
+    #[test]
+    fn a_machine_arithmetic_requires_never_reaches_a_loop_invariant_row() {
+        let clause_subterm =
+            Formula::Sub(Box::new(Formula::Var("d".into(), Sort::Int)), Box::new(Formula::Int(1)));
+        let mut func = u8_loop_with_header_invariant();
+        func.preconditions
+            .push(Formula::Ge(Box::new(clause_subterm.clone()), Box::new(Formula::Int(0))));
+
+        fn contains(haystack: &Formula, needle: &Formula) -> bool {
+            haystack == needle
+                || haystack.children().into_iter().any(|child| contains(child, needle))
+        }
+
+        let vcs = crate::generate_vcs(&func);
+        for vc in &vcs {
+            assert!(
+                !contains(&vc.formula, &clause_subterm),
+                "a machine-arithmetic REQUIRES must never leak into a row as Int \
+                 arithmetic — {:?}: {:#?}",
+                vc.kind,
+                vc.formula,
+            );
+        }
+        assert!(
+            vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                if kind == SPEC_UNVERIFIABLE_KIND)),
+            "and it must stay VISIBLE rather than be silently dropped: {vcs:#?}",
+        );
     }
 
     #[test]
@@ -11642,17 +13152,32 @@ mod tests {
                     if kind == SPEC_UNVERIFIABLE_KIND)
             })
             .collect();
+        // REWRITTEN 2026-09-25 (formula-only symmetry). The REQUIRES half is the real
+        // rule and is unchanged: a premise has no paired translation gate, so it is
+        // stripped and stays visible. The ENSURES half is now admitted — it is a GOAL
+        // that is translated wholesale into declared-width QF_BV — so it trades its
+        // disclosure for a refutable row in the same pass. `result + 1 > result` is the
+        // canonical false-PROVE vector and it must come back REFUTABLE, never proved.
         assert_eq!(
             unknowns.len(),
-            2,
-            "formula-only Requires and Ensures must not disappear during sanitization: {vcs:#?}",
+            1,
+            "the formula-only Requires must not disappear during sanitization: {vcs:#?}",
         );
         assert!(unknowns.iter().all(|vc| vc.formula == Formula::Bool(true)));
         assert!(
-            !vcs.iter().any(|vc| {
-                matches!(vc.kind, VcKind::Precondition { .. } | VcKind::Postcondition)
-            }),
-            "rejected formula-only clauses must have no solver-capable contract row",
+            !vcs.iter().any(|vc| matches!(vc.kind, VcKind::Precondition { .. })),
+            "the rejected formula-only Requires must have no solver-capable row",
+        );
+        let posts: Vec<_> = vcs
+            .iter()
+            .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
+            .map(|vc| vc.formula.clone())
+            .collect();
+        assert_eq!(posts.len(), 1, "the admitted Ensures must get one row: {vcs:#?}");
+        assert!(
+            !posts.iter().any(formula_contains_int_arithmetic),
+            "the admitted Ensures must be the declared-width BV reading, with no Int \
+             arithmetic left: {posts:#?}",
         );
         assert!(
             vcs.iter().any(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. })),
@@ -11821,6 +13346,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = crate::generate_vcs(&func);
@@ -11865,6 +13391,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let vcs = crate::generate_vcs(&func);
@@ -11951,5 +13478,101 @@ mod tests {
         let vcs = crate::generate_vcs(&func);
 
         assert!(matches!(vcs[0].kind, VcKind::UnsupportedMir { .. }));
+    }
+
+    #[test]
+    fn wave519_contracts_symbolic_operand_and_loop_formula_resolution_parity() {
+        let mut func = contract_test_function(vec![]);
+        func.body.arg_count = 3;
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::usize(), name: None },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::i32()) }) },
+                name: Some("xs".into()),
+            },
+            LocalDecl { index: 2, ty: Ty::usize(), name: Some("i".into()) },
+            LocalDecl { index: 3, ty: Ty::Bool, name: Some("ok".into()) },
+        ];
+        func.body.blocks = vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![],
+            terminator: Terminator::Return,
+        }];
+
+        let mut state = FxHashMap::default();
+        state.insert(
+            "xs".into(),
+            Formula::Var("xs".into(), Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int))),
+        );
+        state.insert("xs__len".into(), Formula::Var("xs__len".into(), Sort::Int));
+        state.insert("i".into(), Formula::Int(3));
+
+        // Leaf fast path in `substitute_formula_state_owned`.
+        assert_eq!(
+            substitute_formula_state_owned(Formula::Var("i".into(), Sort::Int), &state),
+            Formula::Int(3)
+        );
+        assert_eq!(
+            substitute_formula_state_owned(Formula::Var("unmapped".into(), Sort::Int), &state),
+            Formula::Var("unmapped".into(), Sort::Int)
+        );
+        assert_eq!(
+            substitute_formula_state_owned(Formula::Int(42), &state),
+            Formula::Int(42)
+        );
+
+        // Non-indexed Copy(xs) rejects immediately without selecting an element.
+        assert_eq!(
+            symbolic_read_only_collection_select(&func, &Operand::Copy(Place::local(1)), &state),
+            None
+        );
+        // Indexed Copy((*xs)[i]) resolves to Select(xs, 3).
+        let indexed_place = Place {
+            local: 1,
+            projections: vec![Projection::Deref, Projection::Index(2)],
+        };
+        assert_eq!(
+            symbolic_read_only_collection_select(&func, &Operand::Copy(indexed_place), &state),
+            Some(Formula::Select(
+                Box::new(Formula::Var(
+                    "xs".into(),
+                    Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int))
+                )),
+                Box::new(Formula::Int(3)),
+            ))
+        );
+        // Non-deref Len(xs) rejects immediately; Deref Len(*xs) resolves to xs__len.
+        assert_eq!(symbolic_read_only_collection_len(&func, &Place::local(1), &state), None);
+        assert_eq!(
+            symbolic_read_only_collection_len(
+                &func,
+                &Place { local: 1, projections: vec![Projection::Deref] },
+                &state,
+            ),
+            Some(Formula::Var("xs__len".into(), Sort::Int))
+        );
+
+        // Single-pass `unique_local_decl_for_formula_name` in `type_loop_formula`:
+        // `parse_spec_expr` emits `Sort::Int` leaves for `ok`, `i`, and `xs__slice_len`,
+        // which `type_loop_formula` retypes using each local's declared `Ty` and the
+        // collection model's `length_formula()`.
+        let untyped = Formula::And(vec![
+            Formula::Var("ok".into(), Sort::Int),
+            Formula::Lt(
+                Box::new(Formula::Var("i".into(), Sort::Int)),
+                Box::new(Formula::Var("xs__slice_len".into(), Sort::Int)),
+            ),
+        ]);
+        assert_eq!(
+            type_loop_formula(&func, untyped, Sort::Bool),
+            Some(Formula::And(vec![
+                Formula::Var("ok".into(), Sort::Bool),
+                Formula::Lt(
+                    Box::new(Formula::Var("i".into(), Sort::Int)),
+                    Box::new(Formula::Var("xs__len".into(), Sort::Int)),
+                ),
+            ]))
+        );
     }
 }

@@ -77,6 +77,7 @@ fn author_alu_vf(name: &str, op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

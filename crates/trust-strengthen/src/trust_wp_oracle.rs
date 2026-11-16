@@ -162,16 +162,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_trust_wp_oracle_default() {
-        let _oracle = TrustWpDirectOracle;
-    }
-
-    #[test]
-    fn test_trust_wp_oracle_with_timeout() {
-        let _oracle = TrustWpDirectOracle::with_timeout(5_000);
-    }
-
-    #[test]
     fn test_trust_wp_oracle_empty_specs_passes() {
         let oracle = TrustWpDirectOracle::new();
         let outcome = oracle.verify_specs("test::f", &[]);

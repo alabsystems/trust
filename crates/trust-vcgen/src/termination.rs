@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/termination.rs: Termination checking via decreases clauses
 //
 // Extracts loop variants and recursive function decreases measures from MIR,
@@ -20,6 +20,9 @@
 //   - Detect self-calls (Call terminator where func matches the function name).
 //   - Generate VC that the decreases measure at the call site is strictly less
 //     than the measure at function entry.
+//   - A member of a multi-member recursion SCC (compiler facts, keyed on
+//     DefIds) is charged at EVERY call into its SCC instead, the callee's
+//     measure substituted: see `termination/recursion_scc.rs` (2026-09-25).
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
@@ -27,10 +30,26 @@
 use trust_types::fx::FxHashSet;
 use trust_types::*;
 
-const RECURSION_DECREASES_UNSUPPORTED_KIND: &str = "ContractKind::Decreases::Recursion";
+/// The `UnsupportedMir` kind of the visible, never-provable marker an authored or
+/// budget-tripped recursion measure publishes when it cannot cover every
+/// recursive edge (`unsupported_recursion_decreases_vc`). Exported (D9,
+/// 2026-09-27) because the compiler's `termination-unmeasured` charge treats this
+/// marker, like any `NonTermination { context: RECURSION_TERMINATION_CONTEXT }`
+/// row, as the lane having made a VISIBLE termination statement for the function.
+pub const RECURSION_DECREASES_UNSUPPORTED_KIND: &str = "ContractKind::Decreases::Recursion";
+
+/// The `context` of every recursion `NonTermination` row this lane mints (the
+/// direct-self inferred, compound and authored lanes, and the recursion-SCC lane).
+/// A loop row carries `"loop"`. Exported for the same D9 reader as the marker kind
+/// above, so the compiler matches the constant, not a copy of the literal.
+pub const RECURSION_TERMINATION_CONTEXT: &str = "recursion";
+
+// Trust (2026-09-25): the recursion-SCC (mutual recursion) lane lives in its own
+// file so this one does not grow; see its module comment.
+mod recursion_scc;
 
 fn fallback_loop_measure_symbol(measure: &str, phase: &str) -> String {
-    crate::generated_formula_symbol("termination", &format!("{measure}_{phase}"))
+    format!("__trust_termination__{measure}_{phase}")
 }
 
 /// A detected loop in the MIR control flow graph.
@@ -74,8 +93,26 @@ pub(crate) fn detect_loops(body: &VerifiableBody) -> Vec<LoopInfo> {
     if n == 0 {
         return Vec::new();
     }
-    let dom = compute_dominators(body);
+    if crate::generate::cached_terminator_presence_for_body(body)
+        .is_some_and(|tp| !tp.has_back_edge)
+    {
+        return Vec::new();
+    }
+    // Fast path for forward-only DAG CFGs: if every in-range successor `v` of every
+    // block `u` (`u.id.0 < n`) satisfies `u.id.0 < v.0`, then every block `b < n` is
+    // reachable from the virtual root in the augmented dominator graph via a path in
+    // `{root} ∪ {0..=b}`, so no `v > u` can ever dominate `u`.
+    let has_non_forward_edge = body.blocks.iter().any(|block| {
+        block.id.0 < n
+            && terminator_any_successor(&block.terminator, |succ| {
+                succ.0 < n && succ.0 <= block.id.0
+            })
+    });
+    if !has_non_forward_edge {
+        return Vec::new();
+    }
     let preds = compute_predecessors(body);
+    let dom = compute_dominators_with_preds(body, &preds);
     let mut loops = Vec::new();
 
     for block in &body.blocks {
@@ -83,14 +120,13 @@ pub(crate) fn detect_loops(body: &VerifiableBody) -> Vec<LoopInfo> {
         if latch.0 >= n {
             continue;
         }
-        for header in block_successors(&block.terminator) {
+        for_each_block_successor(&block.terminator, |header| {
             // Back-edge iff the successor (`header`) dominates this block
             // (`latch`). A self-loop (header == latch) qualifies because every
             // block dominates itself.
-            let is_back_edge =
-                header.0 < n && dom.get(latch.0).is_some_and(|d| d.contains(&header.0));
+            let is_back_edge = header.0 < n && dom.dominates(header.0, latch.0);
             if !is_back_edge {
-                continue;
+                return;
             }
             // Recover the standard natural-loop body by walking predecessors
             // backwards from the latch and stopping at the header. Block IDs
@@ -102,7 +138,7 @@ pub(crate) fn detect_loops(body: &VerifiableBody) -> Vec<LoopInfo> {
             let body_blocks = natural_loop_blocks(header, latch, &preds);
 
             loops.push(LoopInfo { header, _latch: latch, body_blocks });
-        }
+        });
     }
 
     loops
@@ -116,19 +152,22 @@ fn compute_predecessors(body: &VerifiableBody) -> Vec<Vec<usize>> {
         if block.id.0 >= n {
             continue;
         }
-        for succ in block_successors(&block.terminator) {
+        for_each_block_successor(&block.terminator, |succ| {
             if succ.0 < n {
                 preds[succ.0].push(block.id.0);
             }
-        }
+        });
     }
     preds
 }
 
 /// The natural-loop block set for one proven back-edge `latch -> header`.
 fn natural_loop_blocks(header: BlockId, latch: BlockId, preds: &[Vec<usize>]) -> Vec<BlockId> {
+    if latch == header {
+        return vec![header];
+    }
     let mut members: FxHashSet<usize> = [header.0, latch.0].into_iter().collect();
-    let mut work = if latch == header { Vec::new() } else { vec![latch.0] };
+    let mut work = vec![latch.0];
     while let Some(block) = work.pop() {
         let Some(block_preds) = preds.get(block) else {
             continue;
@@ -140,25 +179,85 @@ fn natural_loop_blocks(header: BlockId, latch: BlockId, preds: &[Vec<usize>]) ->
         }
     }
     let mut members: Vec<_> = members.into_iter().map(BlockId).collect();
-    members.sort_by_key(|id| id.0);
+    members.sort_unstable_by_key(|id| id.0);
     members
 }
 
-/// Compute the dominator sets for every block via iterative dataflow.
+/// The dominator relation of a body's CFG (`block_successors`), rooted at the entry.
 ///
-/// `dominators[b]` is the set of block indices that dominate block `b` (every
-/// path from entry to `b` passes through them). A block always dominates
-/// itself; the entry block (index 0) is dominated only by itself.
-///
-/// Standard forward dataflow to a fixpoint:
+/// `dominates(a, b)` answers exactly what the retired dense sets answered for
+/// `dominators[b].contains(&a)` — the GREATEST fixpoint of
 ///   dom(entry) = {entry}
-///   dom(b)     = {b} ∪ (⋂ dom(p) for p ∈ preds(b))
+///   dom(b)     = {b} ∪ (⋂ dom(p) for p ∈ preds(b))      (an empty ⋂ is ∅)
+/// — but from a dominator TREE: O(n + e) memory and O(1) per query, where the dense
+/// `Vec<FxHashSet<usize>>` was Θ(n²) memory, Θ(n²) per refinement round, and carried
+/// an iteration cap (`n² + n + 16`) for totality.
+///
+/// WHY THE TREE IS THAT FIXPOINT. Add a virtual root `R` with an edge to the entry and
+/// to every block that has no predecessor. For a block reachable from `R`, the
+/// equations above are the textbook dominator equations of the augmented graph with
+/// `R` removed from every set (a predecessor-less block `s` gets `{s}`, exactly the
+/// `∅`-intersection case; the entry gets `{entry}`, since `R -> entry` is an edge),
+/// whose greatest solution is the true dominator relation — the tree's ancestor
+/// relation. A block NOT reachable from `R` lies only on predecessor cycles that no
+/// source enters, so the greatest fixpoint never removes anything from its initial
+/// value, the set of ALL blocks: it is dominated by every block.
+/// `termination_dominators_parity` compares the two on random graphs.
+pub(crate) struct Dominators {
+    n: usize,
+    tree: crate::generate::cfg_index::DomTree,
+}
+
+impl Dominators {
+    /// `a` dominates `b` (`dominators[b].contains(&a)` of the retired dense sets).
+    pub(crate) fn dominates(&self, a: usize, b: usize) -> bool {
+        if a >= self.n || b >= self.n {
+            return false;
+        }
+        if !self.tree.reachable(b as u32) {
+            return true;
+        }
+        self.tree.dominates(a as u32, b as u32)
+    }
+}
+
+/// Compute the dominator relation of `body` (see [`Dominators`]).
 ///
 /// `body.blocks` is indexed by `BlockId` (`blocks[i].id.0 == i`), matching the
-/// convention used throughout vcgen (e.g. `generate.rs` indexes
-/// `func.body.blocks[block_id.0]` directly), so block indices double as
-/// positions. A defensive iteration cap keeps this total even on malformed IR.
-fn compute_dominators(body: &VerifiableBody) -> Vec<FxHashSet<usize>> {
+/// convention used throughout vcgen, so block indices double as positions.
+pub(crate) fn compute_dominators(body: &VerifiableBody) -> Dominators {
+    let preds = compute_predecessors(body);
+    compute_dominators_with_preds(body, &preds)
+}
+
+fn compute_dominators_with_preds(body: &VerifiableBody, preds: &[Vec<usize>]) -> Dominators {
+    use crate::generate::cfg_index::{Csr, DomTree};
+    let n = body.blocks.len();
+    let root = n as u32;
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(n.saturating_mul(2));
+    for (b, ps) in preds.iter().enumerate() {
+        for &p in ps {
+            edges.push((p as u32, b as u32));
+        }
+    }
+    if n > 0 {
+        edges.push((root, 0));
+    }
+    for (b, ps) in preds.iter().enumerate() {
+        if b != 0 && ps.is_empty() {
+            edges.push((root, b as u32));
+        }
+    }
+    let rev: Vec<(u32, u32)> = edges.iter().map(|&(a, b)| (b, a)).collect();
+    let succ = Csr::from_edges(n + 1, &edges);
+    let pred_csr = Csr::from_edges(n + 1, &rev);
+    Dominators { n, tree: DomTree::build(root, &succ, &pred_csr) }
+}
+
+/// The retired dense dominator sets, kept as the parity reference for
+/// [`compute_dominators`].
+#[cfg(test)]
+pub(crate) fn compute_dominators_dense(body: &VerifiableBody) -> Vec<FxHashSet<usize>> {
     let n = body.blocks.len();
     if n == 0 {
         return Vec::new();
@@ -171,15 +270,9 @@ fn compute_dominators(body: &VerifiableBody) -> Vec<FxHashSet<usize>> {
     let mut dom: Vec<FxHashSet<usize>> = vec![all; n];
     dom[ENTRY] = std::iter::once(ENTRY).collect();
 
-    let cap = n.saturating_mul(n).saturating_add(n).saturating_add(16);
-    let mut iters = 0usize;
     let mut changed = true;
     while changed {
         changed = false;
-        iters += 1;
-        if iters > cap {
-            break;
-        }
         for i in 0..n {
             if i == ENTRY {
                 continue;
@@ -205,7 +298,13 @@ fn compute_dominators(body: &VerifiableBody) -> Vec<FxHashSet<usize>> {
 
 /// Detect recursive call sites (calls to the same function).
 pub(crate) fn detect_recursive_calls(func: &VerifiableFunction) -> Vec<RecursiveCallSite> {
+    if crate::generate::cached_terminator_presence_for_body(&func.body)
+        .is_some_and(|tp| !tp.has_call && !tp.has_tail_call)
+    {
+        return Vec::new();
+    }
     let mut sites = Vec::new();
+    let mut own: Option<&str> = None;
 
     for block in &func.body.blocks {
         let (callee, args, span) = match &block.terminator {
@@ -213,7 +312,8 @@ pub(crate) fn detect_recursive_calls(func: &VerifiableFunction) -> Vec<Recursive
             | Terminator::TailCall { func, args, span, .. } => (func, args, span),
             _ => continue,
         };
-        if is_direct_self_call(func, callee) {
+        let own = *own.get_or_insert_with(|| direct_call_identity(&func.def_path));
+        if is_direct_self_call_with_own(func, own, block.id, callee) {
             sites.push(RecursiveCallSite {
                 block: block.id,
                 args: args.clone(),
@@ -234,16 +334,193 @@ pub(crate) fn detect_recursive_calls(func: &VerifiableFunction) -> Vec<Recursive
 /// `other::f::<u32>` cannot be mistaken for self recursion. Its terminal-
 /// turbofish spelling leaves one trailing `::`; remove that separator only
 /// when generic text was actually stripped.
-fn is_direct_self_call(func: &VerifiableFunction, callee: &str) -> bool {
-    fn direct_call_identity(path: &str) -> String {
-        let mut identity = trust_types::strip_generics(path);
-        if identity != path && identity.ends_with("::") {
-            identity.truncate(identity.len() - 2);
-        }
-        identity
-    }
+#[cfg(test)]
+fn is_direct_self_call(func: &VerifiableFunction, block: BlockId, callee: &str) -> bool {
+    is_direct_self_call_with_own(func, direct_call_identity(&func.def_path), block, callee)
+}
 
-    direct_call_identity(callee) == direct_call_identity(&func.def_path)
+fn is_direct_self_call_with_own(
+    func: &VerifiableFunction,
+    own: &str,
+    block: BlockId,
+    callee: &str,
+) -> bool {
+    // Trust (ARGS-FINGERPRINT-READ-1 round 2, 2026-10-07): a callee carrying the
+    // duplicate-crate-name argument fingerprint is NEVER a self call. The producer
+    // writes it exactly when a def in the call's generic arguments — for a trait
+    // method that includes `Self` — lives in a crate whose rendered name does not
+    // identify it, so the qualifier this comparison keeps (`<W<dupty::T> as Tr>`)
+    // may name either of two impls. MEASURED (round-1 review, `mut/chain.rs`): with
+    // the tag stripped, `<W<dup_b::T> as Tr>::f::<G>` inside `<W<dup_a::T> as Tr>::f`
+    // read as a self call and the non-recursive caller got a PROVED descent row
+    // while the callee loops; the same edge without `<G>` was already proved on the
+    // preview3 stage 1, because `direct_call_identity` drops ONE trailing group and
+    // the tag was it. FAIL CLOSED: the edge becomes a non-self call, which both
+    // recursion lanes report as an uncertainty.
+    //
+    // Trust (ARGS-FINGERPRINT-READ-1 round 3, 2026-10-07): and a block the
+    // COMPILER did not file as a possible self call (decided from `DefId`s,
+    // `crate::compiler_admits_direct_self_call`) is never one, whatever it
+    // renders. The rendered def path is not an identity: two local impls whose
+    // self types differ only in a same-named crate (`W<dup_a::T>` / `W<dup_b::T>`,
+    // or `W<other::T>` / `W<T>` in a Cargo bin+lib pair) render ONE path, and a
+    // MONOMORPHIC call into the other impl has no generic argument to tag.
+    // MEASURED (`chain_ng.rs` on the preview3 stage 1 `7be75e9a80` and on round 2;
+    // `r3/binlib.rs` on round 2): the non-recursive caller got a PROVED "recursion
+    // measure `n` may not decrease" row while its callee loops. The set only
+    // removes classifications; with no compiler context the path decides alone.
+    if !callee.trim_end().starts_with(own) {
+        return false;
+    }
+    if trust_types::args_display_may_name_a_same_named_crate(callee) {
+        return false;
+    }
+    if direct_call_identity(callee) == own {
+        return crate::compiler_admits_direct_self_call(&func.def_path, block);
+    }
+    // Trust (GENERIC-CALL-KEY-ALIAS-1 with ARGS-FINGERPRINT-READ-1 round 4,
+    // 2026-10-10): since GENERIC-CALL-KEY-ALIAS-1 the extractor also writes
+    // `::<__trust_alias@…>` on a trait call it CANNOT resolve (its arguments name a
+    // type or const parameter), not only on one it resolved elsewhere. Inside
+    // `impl<X> Tr for W<X>`, the where-clause call `<W<X> as Tr>::f(n)` is such a
+    // call, and it runs this very body: the compiler files it from `DefId`s
+    // (`SelfCallClass::ImplementedTraitItem`, unique def path). Reading every
+    // alias as "never a self call" withdrew it from both recursion lanes, and D9's
+    // `skipped` charge alone let `where_clause_self_call_unique_path.rs` build rc 0
+    // where main refused it (MEASURED, the integrated stage 1 of `dca9c7d015`
+    // against main `912bbdf300`). An alias whose untagged path is this function's
+    // own is therefore a self call exactly when the compiler's INSTALLED set files
+    // its block; with no set it stays a non-self call, as before.
+    //
+    // Trust (GCKA-SELF-CALL-2, 2026-10-10): the extractor no longer tags a call at
+    // its caller's own identity arguments to the trait item the caller implements
+    // (the where-clause call above is one), so such a call reaches the untagged
+    // comparison above. This branch still reads a tagged one, such as a self call
+    // whose def path another local function also renders.
+    strip_local_key_alias_tag(callee).is_some_and(|base| direct_call_identity(base) == own)
+        && crate::compiler_files_direct_self_call(&func.def_path, block)
+}
+
+/// The path of a callee whose ONLY terminal group is the extractor's local
+/// definition key alias tag (`::<__trust_alias@` + 32 hex digits + `>`,
+/// `trust_mir_extract::convert::tag_local_definition_key_alias`), with that group
+/// removed; `None` for any other spelling.
+fn strip_local_key_alias_tag(callee: &str) -> Option<&str> {
+    const OPEN: &str = "::<__trust_alias@";
+    let trimmed = callee.trim_end();
+    let body = trimmed.strip_suffix('>')?;
+    let at = body.rfind(OPEN)?;
+    let hex = &body[at + OPEN.len()..];
+    (hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| &trimmed[..at])
+}
+
+/// A call path with ONLY a terminal turbofish removed (`crate::f::<u32>` ->
+/// `crate::f`; `<S as Tr>::f::<u32>` -> `<S as Tr>::f`).
+///
+/// Trust (2026-09-16, refuted): this used `trust_types::strip_generics`, which
+/// erases EVERY `<...>` group — including a leading `<Self as Trait>` qualifier
+/// — so `<crate::U as crate::Tr>::f` and `<crate::S as crate::Tr>::f` both
+/// reduced to `::f` and compared EQUAL. Mutual recursion through two impls'
+/// same-named trait method was classified as a direct self call, the inferred
+/// lane saw no non-self call, and it minted a PROVED `[termination]` descent row
+/// on a function that never returns (`S::f(1) -> U::f(0) -> U::g(0) ->
+/// S::f(2) -> ...`, stack overflow at runtime). The qualifier is IDENTITY, not a
+/// generic argument, and is kept verbatim; only the trailing `::<...>` that
+/// rustc spells on a direct generic call is dropped.
+// REBASE (2026-09-21): the parameter is spelled `callee`, not `path`. This takes a
+// rendered CALLEE PATH, and the unsafe-mint campaign's forgeable-key scan
+// (`sep_engine::tests::every_forgeable_key_predicate_in_this_crate_is_classified_\
+// and_refuses_a_user_rebuild`) classifies a `&str` first parameter BY ITS NAME:
+// `path` put this in the FILE-PATH class, where the only permitted disposition is
+// `NotATrustDecision` — and this predicate decides direct self-recursion, which is
+// what the inferred `[termination]` descent row rests on. Spelling it `callee` puts
+// it in the callee-path class the scan already tracks (158+ members), which is what
+// it actually is. Behaviour is unchanged.
+//
+// Trust (ARGS-FINGERPRINT-READ-1 round 2, 2026-10-07): the duplicate-crate-name
+// argument fingerprint `::<__trust_args@HEX>` is KEPT here, so a tagged callee keeps
+// its tag as its last `::<…>` group and never equals a bare def path. Round 1
+// stripped it, and the review MEASURED why that is wrong: the producer writes the
+// tag exactly when an argument names a crate whose rendered name does not identify
+// it, and the impl's own `Self` (`W<dup_a::T>` vs `W<dup_b::T>`, both rendering
+// `W<dupty::T>`) is part of the path this function keeps. Stripped, the call
+// `<W<dup_b::T> as Tr>::f::<G>` inside `<W<dup_a::T> as Tr>::f` read as a SELF call,
+// and the non-recursive caller got a PROVED "recursion measure n may not decrease"
+// row while its callee loops forever. A generic fn's own self call `down::<T>` is
+// not tagged (a `ty::Param` names no crate), so it is seen as in an ordinary graph.
+fn direct_call_identity(callee: &str) -> &str {
+    let trimmed = callee.trim_end();
+    if !trimmed.ends_with('>') {
+        return trimmed;
+    }
+    // Walk back over the balanced terminal `<...>` group, ignoring `->` return-type arrows.
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0usize;
+    let mut open = None;
+    for (index, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b'>' if index == 0 || bytes[index - 1] != b'-' => depth += 1,
+            b'<' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    open = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match open {
+        // Trust (ARGS-FINGERPRINT-READ-1 round 3, 2026-10-07): a verifier marker
+        // group (`::<__trust_alias@…>`, `::<__trust_args@…>`, a total-call
+        // sentinel) is IDENTITY, never a turbofish, and is kept. `__trust_alias@`
+        // is written exactly when a call wears a local definition key WITHOUT
+        // running that definition (SUMMARY-NAME-COLLIDE-1); stripping it made such
+        // a call equal the key it was tagged away from, and so a self call.
+        // `@` and a leading `__trust_` group cannot be spelled by a turbofish a
+        // user writes as the WHOLE group content of a real self call (a type
+        // named `__trust_x` keeps the path whole too, so it fails closed).
+        Some(open)
+            if trimmed[..open].ends_with("::") && !trimmed[open + 1..].starts_with("__trust_") =>
+        {
+            &trimmed[..open - 2]
+        }
+        // A terminal group not introduced by `::` is a qualifier or a malformed
+        // spelling, never a turbofish: keep the path whole (no self-call match
+        // unless byte-identical).
+        _ => trimmed,
+    }
+}
+
+/// Trust (2026-09-16, refuted): a recursion descent row is a WHOLE-FUNCTION
+/// termination claim (`UNSAT means the function terminates`), but it speaks only
+/// about the self-call edges. `loop { if n == 0 { return; } f(n - 1); }` proved
+/// its descent (`n - 1 < n`) and was fully green under strict AND certify — and
+/// never returns for `n > 0`: the descent returns and the loop re-runs with `n`
+/// unchanged. The loop lane mints nothing for a loop whose measure it cannot
+/// bind, so the false descent row was the body's ONLY termination verdict. A
+/// CFG back-edge therefore makes both recursion lanes uncertain: the measure
+/// relates the self-call to the entry, not the loop's iterations to each other.
+/// Fail-closed: the authored lane reports it (`decreases` on the LOOP is the
+/// fix), the inferred lane mints nothing.
+fn enclosing_loop_uncertainty(
+    has_recursive_calls: bool,
+    loops: &[LoopInfo],
+) -> Option<String> {
+    // A body with no recursive edge makes no descent claim: an authored clause
+    // there is vacuous by construction and stays visible alongside whatever the
+    // loop lane mints (pinned by
+    // `test_nonrecursive_exact_decreases_stays_visible_alongside_loop_obligations`).
+    if !has_recursive_calls {
+        return None;
+    }
+    let first = loops.first()?;
+    Some(format!(
+        "a recursion measure cannot cover the loop headed at bb{} (back-edge from bb{}): the \
+         self-call's descent says nothing about the loop's own iterations — add a `decreases` \
+         clause to the loop, or restructure it as recursion",
+        first.header.0, first._latch.0
+    ))
 }
 
 /// Return why an authored recursion measure cannot be related to every call
@@ -256,10 +533,24 @@ fn is_direct_self_call(func: &VerifiableFunction, callee: &str) -> bool {
 /// lane. Once any such edge exists, emitting only the recognized self-call
 /// rows—or a vacuous row when no self call was recognized—would overstate what
 /// the authored clause actually proved.
+#[cfg(test)]
 fn authored_recursion_identity_uncertainty(func: &VerifiableFunction) -> Option<String> {
+    let recursive_calls = detect_recursive_calls(func);
+    let loops = detect_loops(&func.body);
+    authored_recursion_identity_uncertainty_with(func, &recursive_calls, &loops)
+}
+
+fn authored_recursion_identity_uncertainty_with(
+    func: &VerifiableFunction,
+    recursive_calls: &[RecursiveCallSite],
+    loops: &[LoopInfo],
+) -> Option<String> {
+    if let Some(detail) = enclosing_loop_uncertainty(!recursive_calls.is_empty(), loops) {
+        return Some(detail);
+    }
     func.body.blocks.iter().find_map(|block| match &block.terminator {
         Terminator::Call { func: callee, .. } | Terminator::TailCall { func: callee, .. }
-            if !is_direct_self_call(func, callee) =>
+            if !recursive_calls.iter().any(|site| site.block == block.id) =>
         {
             Some(format!(
                 "function-level decreases cannot classify non-self call `{callee}` in bb{} as \
@@ -296,6 +587,62 @@ fn authored_recursion_identity_uncertainty(func: &VerifiableFunction) -> Option<
     })
 }
 
+/// Trust (refuted 2026-09-16): the INFERRED lane's twin of
+/// `authored_recursion_identity_uncertainty`. The inferred direct-self-call
+/// descent rows are minted under `NonTermination { recursion }` — a
+/// whole-function termination claim ("UNSAT means the function terminates") —
+/// yet the lane used to run no topology gate at all, so `f(n) { back(n); f(n-1) }`
+/// with `back(x) { f(x) }` shipped a PROVED `[termination]` row and overflowed
+/// the stack (measured; the authored lane refuses the identical topology with
+/// "cannot classify non-self call"). The gate is the authored one with a single
+/// relaxation: a non-self call the COMPILER judged NON-REENTRANT — a vanilla
+/// sysroot routine, installed through the `VcgenContext` — cannot re-enter this
+/// crate and is not an uncertainty, so `fact(n - 1)?.checked_mul(n as u64)`
+/// keeps its proof. Missing context classifies nothing (fail-closed).
+fn inferred_recursion_identity_uncertainty(
+    func: &VerifiableFunction,
+    recursive_calls: &[RecursiveCallSite],
+    loops: &[LoopInfo],
+) -> Option<String> {
+    if let Some(detail) = enclosing_loop_uncertainty(!recursive_calls.is_empty(), loops) {
+        return Some(detail);
+    }
+    func.body.blocks.iter().find_map(|block| match &block.terminator {
+        Terminator::Call { func: callee, .. } | Terminator::TailCall { func: callee, .. }
+            if !recursive_calls.iter().any(|site| site.block == block.id)
+                && !crate::callee_is_nonreentrant_for(&func.def_path, callee) =>
+        {
+            Some(format!(
+                "inferred recursion measure cannot classify non-self call `{callee}` in bb{} as \
+                 non-recursive",
+                block.id.0
+            ))
+        }
+        Terminator::Drop { .. } => Some(format!(
+            "inferred recursion measure cannot classify Drop in bb{} as non-recursive",
+            block.id.0
+        )),
+        Terminator::Opaque { kind, .. } => Some(format!(
+            "inferred recursion measure cannot classify opaque terminator `{kind}` in bb{} as \
+             non-recursive",
+            block.id.0
+        )),
+        Terminator::Call { .. }
+        | Terminator::TailCall { .. }
+        | Terminator::Goto(_)
+        | Terminator::SwitchInt { .. }
+        | Terminator::Return
+        | Terminator::Assert { .. }
+        | Terminator::Unreachable
+        | Terminator::Resume => None,
+        _ => Some(format!(
+            "inferred recursion measure cannot classify an unrecognized terminator in bb{} as \
+             non-recursive",
+            block.id.0
+        )),
+    })
+}
+
 /// Find integer variables modified in a set of blocks.
 ///
 /// Returns (local_index, variable_name) pairs for locals that are assigned
@@ -305,10 +652,17 @@ pub(crate) fn modified_int_locals(
     blocks: &[BlockId],
 ) -> Vec<(usize, String)> {
     let mut modified = Vec::new();
-    let block_set: FxHashSet<usize> = blocks.iter().map(|b| b.0).collect();
+    let blocks_sorted = blocks.is_sorted_by_key(|b| b.0);
+    let in_blocks = |id: BlockId| {
+        if blocks_sorted {
+            blocks.binary_search_by_key(&id.0, |b| b.0).is_ok()
+        } else {
+            blocks.contains(&id)
+        }
+    };
 
     for block in &func.body.blocks {
-        if !block_set.contains(&block.id.0) {
+        if !in_blocks(block.id) {
             continue;
         }
         for stmt in &block.stmts {
@@ -316,11 +670,10 @@ pub(crate) fn modified_int_locals(
                 && let Some(decl) = func.body.locals.get(place.local)
                 && decl.ty.is_integer()
                 && place.projections.is_empty()
+                && !modified.iter().any(|(idx, _)| *idx == place.local)
             {
                 let name = decl.name.clone().unwrap_or_else(|| format!("_{}", place.local));
-                if !modified.iter().any(|(idx, _)| *idx == place.local) {
-                    modified.push((place.local, name));
-                }
+                modified.push((place.local, name));
             }
         }
     }
@@ -334,7 +687,27 @@ pub(crate) fn modified_int_locals(
 /// must not be relabeled as `LoopVariant`; doing so would attach one expression
 /// to an arbitrary backedge.
 pub(crate) fn extract_decreases_contracts(func: &VerifiableFunction) -> Vec<DecreasesClause> {
-    func.contracts
+    decreases_clauses_of(&func.contracts)
+}
+
+/// Trust (2026-09-25): the function-level recursion `decreases` measures of a
+/// contract list, read EXACTLY as [`check_termination`] reads them (loop-local
+/// and unpaired loop clauses excluded, the compiler-lowering marker stripped).
+///
+/// The compiler uses this to compute a recursion-SCC member's measure from the
+/// member's own contract bundle, so the measure its callers compare against is
+/// the one the member's own rows are checked with (see
+/// `RecursionSccContext::own_measure`, which re-checks the equality).
+#[must_use]
+pub fn function_level_recursion_measures(contracts: &[Contract]) -> Vec<String> {
+    decreases_clauses_of(contracts).into_iter().map(|clause| clause.measure).collect()
+}
+
+fn decreases_clauses_of(contracts: &[Contract]) -> Vec<DecreasesClause> {
+    if contracts.is_empty() {
+        return Vec::new();
+    }
+    contracts
         .iter()
         // A `bbN:` prefix is a first-class loop-local E5 clause.  It is
         // consumed by `contracts::generate_loop_decreases_vc`; treating it as
@@ -394,12 +767,25 @@ fn recursion_decreases_measure(body: &str) -> &str {
 /// machinery still functions.
 pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<VerificationCondition>) {
     let loops = detect_loops(&func.body);
+    // Trust (2026-09-25, mutual recursion): a member of a multi-member
+    // recursion SCC is charged by the SCC lane for EVERY recursive edge (self
+    // calls included) and never reaches the direct-self lanes below, whose
+    // "mint nothing" arms are exactly how `a(n) { b(n) } b(n) { a(n) }` used to
+    // verify. Loop rows are generated identically either way.
+    if let Some(scc) = crate::recursion_scc_context_for(&func.def_path) {
+        recursion_scc::check_recursion_scc_termination(func, &scc, &loops, vcs);
+        generate_loop_termination_vcs(func, &loops, vcs);
+        return;
+    }
     let recursive_calls = detect_recursive_calls(func);
+    if recursive_calls.is_empty() && loops.is_empty() && func.contracts.is_empty() {
+        return;
+    }
     let decreases_clauses = extract_decreases_contracts(func);
     let authored_recursion_uncertainty = if decreases_clauses.is_empty() {
         None
     } else {
-        authored_recursion_identity_uncertainty(func)
+        authored_recursion_identity_uncertainty_with(func, &recursive_calls, &loops)
     };
 
     // An authored recursion measure is proof surface even on a non-recursive
@@ -433,7 +819,7 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
                 let source_contract_index = unique_recursion_decreases_contract_index(func, clause);
                 vcs.push(VerificationCondition {
                     kind: VcKind::NonTermination {
-                        context: "recursion".to_string(),
+                        context: RECURSION_TERMINATION_CONTEXT.to_string(),
                         measure: clause.measure.clone(),
                     },
                     function: func.name.as_str().into(),
@@ -454,7 +840,220 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
     }
 
     // Generate VCs for loops
-    for loop_info in &loops {
+    generate_loop_termination_vcs(func, &loops, vcs);
+
+    // The function-level authored clause was accounted for before loop
+    // generation. With no recursive edge there are no call-site decrease
+    // obligations to add, and re-validating here would duplicate its marker.
+    if authored_recursion_uncertainty.is_some() || recursive_calls.is_empty() {
+        return;
+    }
+    // Trust (refuted 2026-09-16): the INFERRED lane runs the same whole-body
+    // topology gate as the authored one (relaxed only for compiler-judged
+    // non-reentrant callees). When it fires the lane mints NOTHING — no
+    // descent row under the whole-function `termination` label, and no
+    // marker either: a visible no-fallback marker (Unknown) would make every
+    // recursive function with an unclassified helper call fatal on every lane.
+    // Trust (D9, ruled 2026-09-27): "nothing" here is no longer silence. The
+    // compiler charges every direct self call of a function for which this lane
+    // made no recursion statement as an `assumption:termination-unmeasured` row
+    // (CONDITIONAL on the default lane, refused under `certify`) — see
+    // `compiler/rustc_mir_transform/src/trust_verify/termination_unmeasured.rs`.
+    // That charge reads exactly this all-or-nothing contract: a recursion row or
+    // `RECURSION_DECREASES_UNSUPPORTED_KIND` marker for the function means every
+    // recursive site was covered, NO such row means none was. Never mint a
+    // PARTIAL set (pinned by
+    // `inferred_recursion_rows_cover_every_self_call_site_or_none`).
+    if decreases_clauses.is_empty()
+        && inferred_recursion_identity_uncertainty(func, &recursive_calls, &loops).is_some()
+    {
+        return;
+    }
+
+    // Generate VCs for recursive calls. Function-level `decreases` is authored
+    // proof surface, so it must never disappear merely because this lane cannot
+    // bind its expression. Today the exact supported fragment is one uniquely
+    // named integer parameter. Anything else gets ONE visible, non-refutable
+    // UnsupportedMir row for the function (rather than one row per call).
+    let explicit_clause = match validated_explicit_recursion_clause(func, &decreases_clauses) {
+        Ok(clause) => clause,
+        Err((span, detail)) => {
+            vcs.push(unsupported_recursion_decreases_vc(func, span, detail));
+            return;
+        }
+    };
+
+    // Compound `bound - counter` measure — the additive extension for
+    // increasing-counter recursions (`cover(.., naxes, d)` counts `d` UP toward
+    // `naxes`; the bare single-decreasing-param lane cannot bind such a shape).
+    // Attempted ONLY in the inference regime (no authored function-level
+    // `decreases`, which is exact proof surface we must never override) and ONLY
+    // when EVERY fail-closed soundness guard in `infer_compound_recursion_measure`
+    // holds. When it fires the emitted VC is UNSAT (Proved) by construction (see
+    // `compound_recursion_vcs`), so this can only upgrade a bare-measure Unknown
+    // to Proved — it never flips an existing verdict and never admits a
+    // genuinely non-terminating recursion. `compound_recursion_vcs` is
+    // all-or-nothing: a row for every site or none, and "none" leaves the
+    // function with no recursion statement, which the compiler's D9 charge
+    // reads as unmeasured (review F3, 2026-09-27).
+    if explicit_clause.is_none()
+        && let Some(compound) = infer_compound_recursion_measure(func, &recursive_calls)
+    {
+        vcs.extend(compound_recursion_vcs(func, &recursive_calls, &compound));
+        return;
+    }
+
+    let inferred_measure = || {
+        if func.body.arg_count == 0 {
+            return "unknown".to_string();
+        }
+        let end = (func.body.arg_count + 1).min(func.body.locals.len());
+        func.body.locals[1..end]
+            .iter()
+            .find(|decl| decl.ty.int_width().is_some())
+            .and_then(|decl| decl.name.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let measure = explicit_clause.map_or_else(inferred_measure, |clause| clause.measure.clone());
+    let explicit_source_contract_index =
+        explicit_clause.and_then(|clause| unique_recursion_decreases_contract_index(func, clause));
+    let mut recursion_vcs = Vec::new();
+    let mut explicit_binding_failure = None;
+    // Trust (verifier-perf, MEASURED 2026-08-31): the per-call-site path-guard
+    // conjoin below needs two whole-CFG analyses that are pure functions of
+    // `func`. Build them ONCE for the whole loop instead of once per recursive
+    // call site. On `trust-spec-elab` this single call site was 99.9% of the R1
+    // pre-pass's thread time (driver `sha256:6bf8876323cc…d60b2`): `elab_term`,
+    // an 815-basic-block recursive syn tree-walker, paid two whole-CFG fixpoints
+    // at EVERY one of its recursive edges. The cache holds a shared borrow of
+    // `func`, so it cannot observe a mutation — see `FuncAnalysisScope`.
+    // Trust (L0 termination guarantee): this loop is one of the VC-generation
+    // walks the budget docs claim to bound. Measured 2026-08-31, it polled
+    // nothing. A trip drops the whole recursion set and records ONE unsupported
+    // row below — never a silent absence, and never a Proved.
+    let mut budget_tripped = false;
+    // Trust (refuted 2026-09-16, round 2): an inferred binding miss at ONE
+    // self-call site used to `continue` while a sibling site still minted its
+    // descent row under the whole-function `termination` label — so
+    // `f(a - 1); let j = a / 3; f(a)` shipped a PROVED `[termination]` row and
+    // overflowed the stack (the site sharing a block with the division was
+    // silently dropped). A miss at any site now withholds every inferred row.
+    let mut inferred_binding_miss = false;
+    let exact_preconditions = exact_recursion_preconditions(func);
+    for call_site in &recursive_calls {
+        if trust_types::verify_budget::budget_exhausted() {
+            budget_tripped = true;
+            break;
+        }
+        let Some((measure_entry, measure_call, binding_facts, exact_site_span)) =
+            recursion_measure_bindings(func, call_site, &measure)
+        else {
+            if explicit_clause.is_some() {
+                explicit_binding_failure = Some(call_site.span.clone());
+                break;
+            }
+            // An inferred measure is heuristic coverage only. A binding miss
+            // therefore means no row, never a synthetic refutation — and (round
+            // 2) no row for the SIBLING sites either: a partial set would be a
+            // whole-function claim the unbound site was never checked against.
+            inferred_binding_miss = true;
+            break;
+        };
+
+        let not_decreasing = Formula::Or(vec![
+            Formula::Ge(Box::new(measure_call), Box::new(measure_entry.clone())),
+            Formula::Lt(Box::new(measure_entry), Box::new(Formula::Int(0))),
+        ]);
+        let core = if binding_facts.is_empty() {
+            not_decreasing
+        } else {
+            let mut clauses = binding_facts;
+            clauses.push(not_decreasing);
+            Formula::And(clauses)
+        };
+        recursion_vcs.push(VerificationCondition {
+            kind: VcKind::NonTermination {
+                context: RECURSION_TERMINATION_CONTEXT.to_string(),
+                measure: measure.clone(),
+            },
+            function: func.name.as_str().into(),
+            // Optimized MIR may coarsen distinct Call terminators to the same
+            // body-wide source span.  A checked-chain binding carries the exact
+            // predecessor Assert span that authenticated its machine-arithmetic
+            // value; use that compiler-owned provenance to keep per-callsite
+            // source rows distinguishable.  Direct operands retain the Call span.
+            location: exact_site_span.unwrap_or_else(|| call_site.span.clone()),
+            // Conjoin the recursive call site's DOMINATING PATH GUARDS as a
+            // reachability hypothesis. `not_decreasing` is a VIOLATION formula
+            // (proved by refutation search), so it counts only where the call
+            // is actually reached. Without this, `walk(a, n-1, i)` under
+            // `if n > 0` had its decrease VC solved with `n` unconstrained, and
+            // PDR found the spurious `n = 0` counterexample against an
+            // under-specified obligation (measured on
+            // r1_recursive_self_stable_index: "[termination] FAILED ...
+            // verified_counterexample = true"). The guard `n > 0` makes
+            // `guard ∧ (call_measure >= entry_measure ∨ entry < 0)` UNSAT —
+            // `n - 1 < n` and `n > 0 ⇒ n - 1 >= 0` — so the measure genuinely
+            // decreases on every reachable recursive edge. Same shared path-guard
+            // builder the per-statement arithmetic/bounds lanes use; a call
+            // reachable UNconditionally gets no extra hypothesis and is
+            // unchanged.
+            formula: crate::generate::v2_conjoin_path_guards_for_hardened(
+                func,
+                call_site.block,
+                conjoin_exact_preconditions(&exact_preconditions, core),
+            ),
+            contract_metadata: source_contract_metadata(explicit_source_contract_index),
+            obligation: None,
+        });
+    }
+    if let Some(span) = explicit_binding_failure {
+        vcs.push(unsupported_recursion_decreases_vc(
+            func,
+            span,
+            format!(
+                "function-level decreases parameter `{measure}` could not be bound to every \
+                 recursive call under exact machine semantics"
+            ),
+        ));
+    } else if inferred_binding_miss {
+        // Mint nothing: a visible no-fallback marker would make every recursive
+        // function with an unbindable site fatal. Trust (D9, 2026-09-27): the
+        // absence is no longer silent — the compiler charges every self call of
+        // a function this lane left row-less as `assumption:termination-unmeasured`
+        // (`trust_verify/termination_unmeasured.rs`), which is why a partial row
+        // set must never be pushed here (see the comment above the topology gate).
+    } else if budget_tripped {
+        // Fail closed, LOUDLY. Dropping the partial `recursion_vcs` silently
+        // would make an unchecked recursive edge indistinguishable from a
+        // checked one — an obligation that DISAPPEARS is not one that proved.
+        // Emit the same unsupported row the binding-failure arm emits, so the
+        // truncation is a visible non-proof rather than an absence.
+        vcs.push(unsupported_recursion_decreases_vc(
+            func,
+            func.span.clone(),
+            format!(
+                "per-function verification budget exhausted before every recursive call site \
+                 could be checked against decreases measure `{measure}`"
+            ),
+        ));
+    } else {
+        vcs.extend(recursion_vcs);
+    }
+}
+
+/// Generate the loop-lane `NonTermination` rows for every detected loop.
+///
+/// Factored out of [`check_termination`] (2026-09-25) so the recursion-SCC
+/// lane runs the SAME loop generation as the direct-self lanes; the body is
+/// unchanged.
+fn generate_loop_termination_vcs(
+    func: &VerifiableFunction,
+    loops: &[LoopInfo],
+    vcs: &mut Vec<VerificationCondition>,
+) {
+    let mut dominators: Option<Dominators> = None;
+    for loop_info in loops {
         // An authored loop-local E5 measure has an exact transition VC in the
         // contract lane.  Do not also emit a heuristic measure for the same
         // header: the duplicate can false-fail a sound authored proof and, more
@@ -494,11 +1093,9 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
         // fail-closed binding gate; an unsafe first local must not hide a later
         // valid one. Function-level `decreases` belongs to recursion.
         let inferred = modified.iter().find_map(|(local, name)| {
-            loop_measure_bindings(func, loop_info, name)
+            loop_measure_bindings_with_dom(func, loop_info, name, &mut dominators)
                 .map(|(before, after)| (*local, name.clone(), before, after))
         });
-        let fallback_measure =
-            modified.first().map(|(_, name)| name.clone()).unwrap_or_else(|| "unknown".to_string());
 
         // Locate the span from the loop header block
         let span = func
@@ -532,23 +1129,24 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
                     if loop_has_exit(&func.body, loop_info) {
                         continue;
                     }
-                    (
-                        None,
-                        fallback_measure.clone(),
-                        Formula::Var(
-                            fallback_loop_measure_symbol(&fallback_measure, "before"),
-                            Sort::Int,
-                        ),
-                        Formula::Var(
-                            fallback_loop_measure_symbol(&fallback_measure, "after"),
-                            Sort::Int,
-                        ),
-                        false,
-                    )
+                    let fallback_measure = modified
+                        .first()
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let before = Formula::Var(
+                        fallback_loop_measure_symbol(&fallback_measure, "before"),
+                        Sort::Int,
+                    );
+                    let after = Formula::Var(
+                        fallback_loop_measure_symbol(&fallback_measure, "after"),
+                        Sort::Int,
+                    );
+                    (None, fallback_measure, before, after, false)
                 }
             };
 
-        let lower_bound = Formula::Ge(Box::new(measure_before.clone()), Box::new(Formula::Int(0)));
+        let lower_bound = has_unsigned_type_bound
+            .then(|| Formula::Ge(Box::new(measure_before.clone()), Box::new(Formula::Int(0))));
         let not_decreasing = Formula::Or(vec![
             // measure_after >= measure_before (didn't decrease)
             Formula::Ge(Box::new(measure_after), Box::new(measure_before.clone())),
@@ -560,177 +1158,19 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
         // at every iteration. Carry it in the raw VC just as the recursion
         // lane does; relying on a function-entry precondition here would be
         // an unsound substitute for a loop invariant.
-        let core = if has_unsigned_type_bound {
-            Formula::And(vec![lower_bound, not_decreasing])
-        } else {
-            not_decreasing
+        let core = match lower_bound {
+            Some(lower_bound) => Formula::And(vec![lower_bound, not_decreasing]),
+            None => not_decreasing,
         };
 
         vcs.push(VerificationCondition {
-            kind: VcKind::NonTermination { context: "loop".to_string(), measure: measure.clone() },
+            kind: VcKind::NonTermination { context: "loop".to_string(), measure },
             function: func.name.as_str().into(),
             location: span,
             formula: conjoin_loop_invariant_preconditions(func, measure_local, core),
             contract_metadata: None,
             obligation: None,
         });
-    }
-
-    // The function-level authored clause was accounted for before loop
-    // generation. With no recursive edge there are no call-site decrease
-    // obligations to add, and re-validating here would duplicate its marker.
-    if authored_recursion_uncertainty.is_some() || recursive_calls.is_empty() {
-        return;
-    }
-
-    // Generate VCs for recursive calls. Function-level `decreases` is authored
-    // proof surface, so it must never disappear merely because this lane cannot
-    // bind its expression. Today the exact supported fragment is one uniquely
-    // named integer parameter. Anything else gets ONE visible, non-refutable
-    // UnsupportedMir row for the function (rather than one row per call).
-    let explicit_clause = match validated_explicit_recursion_clause(func, &decreases_clauses) {
-        Ok(clause) => clause,
-        Err((span, detail)) => {
-            vcs.push(unsupported_recursion_decreases_vc(func, span, detail));
-            return;
-        }
-    };
-
-    // Compound `bound - counter` measure — the additive extension for
-    // increasing-counter recursions (`cover(.., naxes, d)` counts `d` UP toward
-    // `naxes`; the bare single-decreasing-param lane cannot bind such a shape).
-    // Attempted ONLY in the inference regime (no authored function-level
-    // `decreases`, which is exact proof surface we must never override) and ONLY
-    // when EVERY fail-closed soundness guard in `infer_compound_recursion_measure`
-    // holds. When it fires the emitted VC is UNSAT (Proved) by construction (see
-    // `compound_recursion_vcs`), so this can only upgrade a bare-measure Unknown
-    // to Proved — it never flips an existing verdict and never admits a
-    // genuinely non-terminating recursion.
-    if explicit_clause.is_none()
-        && let Some(compound) = infer_compound_recursion_measure(func, &recursive_calls)
-    {
-        vcs.extend(compound_recursion_vcs(func, &recursive_calls, &compound));
-        return;
-    }
-
-    let inferred_measure = || {
-        if func.body.arg_count == 0 {
-            return "unknown".to_string();
-        }
-        let end = (func.body.arg_count + 1).min(func.body.locals.len());
-        func.body.locals[1..end]
-            .iter()
-            .find(|decl| decl.ty.int_width().is_some())
-            .and_then(|decl| decl.name.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-    let measure = explicit_clause.map_or_else(inferred_measure, |clause| clause.measure.clone());
-    let explicit_source_contract_index =
-        explicit_clause.and_then(|clause| unique_recursion_decreases_contract_index(func, clause));
-    let mut recursion_vcs = Vec::new();
-    let mut explicit_binding_failure = None;
-    // Trust (verifier-perf, MEASURED 2026-08-31): the per-call-site path-guard
-    // conjoin below needs two whole-CFG analyses that are pure functions of
-    // `func`. Build them ONCE for the whole loop instead of once per recursive
-    // call site. On `trust-spec-elab` this single call site was 99.9% of the R1
-    // pre-pass's thread time (driver `sha256:6bf8876323cc…d60b2`): `elab_term`,
-    // an 815-basic-block recursive syn tree-walker, paid two whole-CFG fixpoints
-    // at EVERY one of its recursive edges. The cache holds a shared borrow of
-    // `func`, so it cannot observe a mutation — see `FuncAnalysisScope`.
-    // Trust (L0 termination guarantee): this loop is one of the VC-generation
-    // walks the budget docs claim to bound. Measured 2026-08-31, it polled
-    // nothing. A trip drops the whole recursion set and records ONE unsupported
-    // row below — never a silent absence, and never a Proved.
-    let mut budget_tripped = false;
-    for call_site in &recursive_calls {
-        if trust_types::verify_budget::budget_exhausted() {
-            budget_tripped = true;
-            break;
-        }
-        let Some((measure_entry, measure_call, binding_facts, exact_site_span)) =
-            recursion_measure_bindings(func, call_site, &measure)
-        else {
-            if explicit_clause.is_some() {
-                explicit_binding_failure = Some(call_site.span.clone());
-                break;
-            }
-            // An inferred measure is heuristic coverage only. A binding miss
-            // therefore means no row, never a synthetic refutation.
-            continue;
-        };
-
-        let not_decreasing = Formula::Or(vec![
-            Formula::Ge(Box::new(measure_call), Box::new(measure_entry.clone())),
-            Formula::Lt(Box::new(measure_entry), Box::new(Formula::Int(0))),
-        ]);
-        let core = if binding_facts.is_empty() {
-            not_decreasing
-        } else {
-            let mut clauses = binding_facts;
-            clauses.push(not_decreasing);
-            Formula::And(clauses)
-        };
-        recursion_vcs.push(VerificationCondition {
-            kind: VcKind::NonTermination {
-                context: "recursion".to_string(),
-                measure: measure.clone(),
-            },
-            function: func.name.as_str().into(),
-            // Optimized MIR may coarsen distinct Call terminators to the same
-            // body-wide source span.  A checked-chain binding carries the exact
-            // predecessor Assert span that authenticated its machine-arithmetic
-            // value; use that compiler-owned provenance to keep per-callsite
-            // source rows distinguishable.  Direct operands retain the Call span.
-            location: exact_site_span.unwrap_or_else(|| call_site.span.clone()),
-            // Conjoin the recursive call site's DOMINATING PATH GUARDS as a
-            // reachability hypothesis. `not_decreasing` is a VIOLATION formula
-            // (proved by refutation search), so it counts only where the call
-            // is actually reached. Without this, `walk(a, n-1, i)` under
-            // `if n > 0` had its decrease VC solved with `n` unconstrained, and
-            // PDR found the spurious `n = 0` counterexample against an
-            // under-specified obligation (measured on
-            // r1_recursive_self_stable_index: "[termination] FAILED ...
-            // verified_counterexample = true"). The guard `n > 0` makes
-            // `guard ∧ (call_measure >= entry_measure ∨ entry < 0)` UNSAT —
-            // `n - 1 < n` and `n > 0 ⇒ n - 1 >= 0` — so the measure genuinely
-            // decreases on every reachable recursive edge. Same shared path-guard
-            // builder the per-statement arithmetic/bounds lanes use; a call
-            // reachable UNconditionally gets no extra hypothesis and is
-            // unchanged.
-            formula: crate::generate::v2_conjoin_path_guards_for_hardened(
-                func,
-                call_site.block,
-                conjoin_recursion_preconditions(func, core),
-            ),
-            contract_metadata: source_contract_metadata(explicit_source_contract_index),
-            obligation: None,
-        });
-    }
-    if let Some(span) = explicit_binding_failure {
-        vcs.push(unsupported_recursion_decreases_vc(
-            func,
-            span,
-            format!(
-                "function-level decreases parameter `{measure}` could not be bound to every \
-                 recursive call under exact machine semantics"
-            ),
-        ));
-    } else if budget_tripped {
-        // Fail closed, LOUDLY. Dropping the partial `recursion_vcs` silently
-        // would make an unchecked recursive edge indistinguishable from a
-        // checked one — an obligation that DISAPPEARS is not one that proved.
-        // Emit the same unsupported row the binding-failure arm emits, so the
-        // truncation is a visible non-proof rather than an absence.
-        vcs.push(unsupported_recursion_decreases_vc(
-            func,
-            func.span.clone(),
-            format!(
-                "per-function verification budget exhausted before every recursive call site \
-                 could be checked against decreases measure `{measure}`"
-            ),
-        ));
-    } else {
-        vcs.extend(recursion_vcs);
     }
 }
 
@@ -781,19 +1221,21 @@ fn validated_explicit_recursion_clause<'a>(
     func: &VerifiableFunction,
     decreases_clauses: &'a [DecreasesClause],
 ) -> Result<Option<&'a DecreasesClause>, (SourceSpan, String)> {
-    let explicit: Vec<_> = decreases_clauses
+    if decreases_clauses.is_empty() {
+        return Ok(None);
+    }
+    let mut explicit = decreases_clauses
         .iter()
-        .filter(|clause| matches!(clause.kind, DecreasesKind::Recursion))
-        .collect();
-    match explicit.as_slice() {
-        [] => Ok(None),
-        [clause]
+        .filter(|clause| matches!(clause.kind, DecreasesKind::Recursion));
+    match (explicit.next(), explicit.next()) {
+        (None, _) => Ok(None),
+        (Some(clause), None)
             if unique_parameter_local_by_name(func, &clause.measure)
                 .is_some_and(|decl| decl.ty.int_width().is_some()) =>
         {
-            Ok(Some(*clause))
+            Ok(Some(clause))
         }
-        [clause] => Err((
+        (Some(clause), None) => Err((
             clause.span.clone(),
             format!(
                 "function-level decreases expression `{}` is outside the exact supported \
@@ -801,15 +1243,34 @@ fn validated_explicit_recursion_clause<'a>(
                 clause.measure
             ),
         )),
-        clauses => Err((
-            clauses.first().map(|clause| clause.span.clone()).unwrap_or_default(),
+        (Some(first), Some(_)) => Err((
+            first.span.clone(),
             format!(
                 "{} function-level decreases clauses require unsupported lexicographic \
                  recursion semantics",
-                clauses.len()
+                2 + explicit.count()
             ),
         )),
     }
+}
+
+#[inline]
+fn local_may_match_var_name_with_idx(
+    decl: &LocalDecl,
+    name: &str,
+    parsed_idx: Option<usize>,
+) -> bool {
+    decl.name.as_deref() == Some(name) || parsed_idx == Some(decl.index)
+}
+
+/// Look up a `BasicBlock` by `BlockId` in O(1) when `body.blocks` is indexed
+/// by `BlockId`, falling back to a linear scan on non-contiguous synthetic bodies.
+#[inline]
+fn block_by_id(body: &VerifiableBody, id: BlockId) -> Option<&BasicBlock> {
+    body.blocks
+        .get(id.0)
+        .filter(|b| b.id == id)
+        .or_else(|| body.blocks.iter().find(|b| b.id == id))
 }
 
 /// Conjoin only authored entry facts whose meaning remains exact at the
@@ -818,7 +1279,10 @@ fn validated_explicit_recursion_clause<'a>(
 /// canonical mismatch). Every free name must map uniquely to a bare argument
 /// local that is globally immutable; projected, synthetic, return, temp, and
 /// versioned names are all dropped fail-closed.
-fn conjoin_recursion_preconditions(func: &VerifiableFunction, formula: Formula) -> Formula {
+pub(super) fn exact_recursion_preconditions(func: &VerifiableFunction) -> Vec<Formula> {
+    if func.preconditions.is_empty() {
+        return Vec::new();
+    }
     let mut preconditions = Vec::new();
     for precondition in &func.preconditions {
         if crate::contracts::formula_uses_unmodeled_machine_arithmetic_in_function(
@@ -827,27 +1291,57 @@ fn conjoin_recursion_preconditions(func: &VerifiableFunction, formula: Formula) 
         ) {
             continue;
         }
-        let exact = precondition.free_variables().iter().all(|name| {
-            let mut matching = func.body.locals.iter().filter(|decl| {
-                decl.index > 0
-                    && decl.index <= func.body.arg_count
-                    && crate::place_to_var_name(func, &Place::local(decl.index)) == *name
-            });
-            let Some(local) = matching.next() else {
+        let exact = trust_types::all_free_variable_names(precondition, &mut |name| {
+            if func.body.arg_count == 0 {
                 return false;
-            };
-            matching.next().is_none() && !local_ever_mutated(func, local.index)
+            }
+            let parsed_idx = name.strip_prefix('_').and_then(|rest| rest.parse::<usize>().ok());
+            match crate::lookup_formula_local_decl(func, name, parsed_idx) {
+                crate::FormulaLocalDeclLookup::None => false,
+                crate::FormulaLocalDeclLookup::Unique(local) => {
+                    local.index > 0
+                        && local.index <= func.body.arg_count
+                        && crate::place_to_var_name(func, &Place::local(local.index)) == name
+                        && !local_ever_mutated(func, local.index)
+                }
+                crate::FormulaLocalDeclLookup::Ambiguous => {
+                    let mut matching = func.body.locals.iter().filter(|decl| {
+                        decl.index > 0
+                            && decl.index <= func.body.arg_count
+                            && local_may_match_var_name_with_idx(decl, name, parsed_idx)
+                            && crate::place_to_var_name(func, &Place::local(decl.index)) == name
+                    });
+                    let Some(local) = matching.next() else {
+                        return false;
+                    };
+                    matching.next().is_none() && !local_ever_mutated(func, local.index)
+                }
+            }
         });
         if exact {
             preconditions.push(precondition.clone());
         }
     }
-    if preconditions.is_empty() {
+    preconditions
+}
+
+pub(super) fn conjoin_exact_preconditions(
+    exact_preconditions: &[Formula],
+    formula: Formula,
+) -> Formula {
+    if exact_preconditions.is_empty() {
         formula
     } else {
-        preconditions.push(formula);
-        Formula::And(preconditions)
+        let mut clauses = Vec::with_capacity(exact_preconditions.len() + 1);
+        clauses.extend_from_slice(exact_preconditions);
+        clauses.push(formula);
+        Formula::And(clauses)
     }
+}
+
+#[cfg(test)]
+fn conjoin_recursion_preconditions(func: &VerifiableFunction, formula: Formula) -> Formula {
+    conjoin_exact_preconditions(&exact_recursion_preconditions(func), formula)
 }
 
 /// Conjoin only function-entry facts that remain true at every loop iteration.
@@ -864,19 +1358,33 @@ fn conjoin_loop_invariant_preconditions(
     measure_local: Option<usize>,
     formula: Formula,
 ) -> Formula {
+    if func.preconditions.is_empty() {
+        return formula;
+    }
     let mut invariants = Vec::new();
     for precondition in &func.preconditions {
-        let is_invariant = precondition.free_variables().iter().all(|name| {
-            let mut matching =
-                func.body.locals.iter().filter(|decl| {
-                    crate::place_to_var_name(func, &Place::local(decl.index)) == *name
-                });
-            let Some(local) = matching.next() else {
-                return false;
-            };
-            matching.next().is_none()
-                && Some(local.index) != measure_local
-                && !local_ever_mutated(func, local.index)
+        let is_invariant = trust_types::all_free_variable_names(precondition, &mut |name| {
+            let parsed_idx = name.strip_prefix('_').and_then(|rest| rest.parse::<usize>().ok());
+            match crate::lookup_formula_local_decl(func, name, parsed_idx) {
+                crate::FormulaLocalDeclLookup::None => false,
+                crate::FormulaLocalDeclLookup::Unique(local) => {
+                    Some(local.index) != measure_local
+                        && crate::place_to_var_name(func, &Place::local(local.index)) == name
+                        && !local_ever_mutated(func, local.index)
+                }
+                crate::FormulaLocalDeclLookup::Ambiguous => {
+                    let mut matching = func.body.locals.iter().filter(|decl| {
+                        local_may_match_var_name_with_idx(decl, name, parsed_idx)
+                            && crate::place_to_var_name(func, &Place::local(decl.index)) == name
+                    });
+                    let Some(local) = matching.next() else {
+                        return false;
+                    };
+                    matching.next().is_none()
+                        && Some(local.index) != measure_local
+                        && !local_ever_mutated(func, local.index)
+                }
+            }
         });
         if is_invariant {
             invariants.push(precondition.clone());
@@ -912,10 +1420,20 @@ fn conjoin_loop_invariant_preconditions(
 /// through the step block's unique IN-LOOP Assert-predecessor — see
 /// `resolve_loop_checked_step_chain` (the rung-F loop-lane port of the
 /// recursion lane's a82a7c83e4 checked-chain resolution).
+#[cfg(test)]
 fn loop_measure_bindings(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
     measure: &str,
+) -> Option<(Formula, Formula)> {
+    loop_measure_bindings_with_dom(func, loop_info, measure, &mut None)
+}
+
+fn loop_measure_bindings_with_dom(
+    func: &VerifiableFunction,
+    loop_info: &LoopInfo,
+    measure: &str,
+    dominators_slot: &mut Option<Dominators>,
 ) -> Option<(Formula, Formula)> {
     let param_local = unique_parameter_local_by_name(func, measure)?;
     // The lower-bound proof below is over the integer value model. For an
@@ -934,8 +1452,8 @@ fn loop_measure_bindings(
     // The step must execute on every path that reaches this latch. A sole
     // assignment somewhere in the natural-loop set is insufficient: it may
     // sit behind a branch that the backedge bypasses.
-    let dominators = compute_dominators(&func.body);
-    if !dominators.get(loop_info._latch.0).is_some_and(|set| set.contains(&assignment_block.0)) {
+    let dominators = dominators_slot.get_or_insert_with(|| compute_dominators(&func.body));
+    if !dominators.dominates(assignment_block.0, loop_info._latch.0) {
         return None;
     }
     // SF-1 (adversarial-verify finding, docs/design-notes/
@@ -950,13 +1468,19 @@ fn loop_measure_bindings(
     // dominates every latch of this header (single-latch loops are unaffected;
     // this can only remove Proved outcomes, never mint one).
     let header = loop_info.header;
-    for block in &func.body.blocks {
-        let is_back_edge_source = block_successors(&block.terminator).contains(&header)
-            && dominators.get(block.id.0).is_some_and(|d| d.contains(&header.0));
-        if is_back_edge_source
-            && !dominators.get(block.id.0).is_some_and(|d| d.contains(&assignment_block.0))
-        {
-            return None;
+    if assignment_block != header {
+        for block in &func.body.blocks {
+            if block.id == loop_info._latch || block.id == assignment_block {
+                continue;
+            }
+            // PERF-COMPILER-VCGEN-747: test both O(1) `DomTree::dominates` conditions
+            // before walking `block.terminator`'s successor targets.
+            if !dominators.dominates(assignment_block.0, block.id.0)
+                && dominators.dominates(header.0, block.id.0)
+                && terminator_any_successor(&block.terminator, |s| s == header)
+            {
+                return None;
+            }
         }
     }
     if loop_measure_has_write_risk(func, loop_info, param_local.index) {
@@ -999,11 +1523,19 @@ fn loop_measure_has_write_risk(
     loop_info: &LoopInfo,
     measure_local: usize,
 ) -> bool {
-    let in_loop: FxHashSet<usize> = loop_info.body_blocks.iter().map(|id| id.0).collect();
-    for block in &func.body.blocks {
-        let block_is_in_loop = in_loop.contains(&block.id.0);
-        for stmt in &block.stmts {
-            match stmt {
+    let body_blocks = &loop_info.body_blocks;
+    let blocks_sorted = body_blocks.is_sorted_by_key(|b| b.0);
+    let in_loop = |id: BlockId| {
+        if blocks_sorted {
+            body_blocks.binary_search_by_key(&id.0, |b| b.0).is_ok()
+        } else {
+            body_blocks.contains(&id)
+        }
+    };
+    crate::any_local_write_candidate(func, &func.body.blocks, measure_local, |block, item| {
+        let block_is_in_loop = in_loop(block.id);
+        match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place, rvalue, .. } => {
                     if block_is_in_loop
                         && place.local == measure_local
@@ -1014,33 +1546,27 @@ fn loop_measure_has_write_risk(
                     // An escape created anywhere in the function can be used
                     // by a call in the loop, so this is deliberately a
                     // whole-body gate rather than a loop-local one.
-                    if matches!(rvalue, Rvalue::Ref { mutable: true, place } if place.local == measure_local)
+                    matches!(rvalue, Rvalue::Ref { mutable: true, place } if place.local == measure_local)
                         || matches!(rvalue, Rvalue::AddressOf(_, place) if place.local == measure_local)
-                    {
-                        return true;
-                    }
                 }
-                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
-                    if block_is_in_loop && place.local == measure_local =>
-                {
-                    return true;
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
+                    block_is_in_loop && place.local == measure_local
                 }
-                Statement::Intrinsic { .. } | Statement::Unsupported { .. } if block_is_in_loop => {
-                    return true;
+                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => block_is_in_loop,
+                _ => false,
+            },
+            None => {
+                if !block_is_in_loop {
+                    return false;
                 }
-                _ => {}
+                match &block.terminator {
+                    Terminator::Call { dest, .. } if dest.local == measure_local => true,
+                    Terminator::Opaque { .. } => true,
+                    _ => false,
+                }
             }
         }
-        if !block_is_in_loop {
-            continue;
-        }
-        match &block.terminator {
-            Terminator::Call { dest, .. } if dest.local == measure_local => return true,
-            Terminator::Opaque { .. } => return true,
-            _ => {}
-        }
-    }
-    false
+    })
 }
 
 /// Every non-measure input to the arithmetic step must denote one stable value
@@ -1097,11 +1623,30 @@ fn recursion_measure_bindings(
     measure: &str,
 ) -> Option<(Formula, Formula, Vec<Formula>, Option<SourceSpan>)> {
     let measure_decl = unique_parameter_local_by_name(func, measure)?;
+    let param_pos = measure_decl.index.checked_sub(1)?;
+    recursion_measure_bindings_at(func, call.block, &call.args, measure_decl, param_pos)
+}
+
+/// [`recursion_measure_bindings`] with the call argument chosen by POSITION
+/// rather than by the caller's own parameter index.
+///
+/// A direct self call reads the caller's measure parameter back out of its own
+/// argument list, so the two coincide. A call into ANOTHER member of the
+/// recursion SCC compares the caller's entry measure (`measure_decl`) against
+/// the CALLEE's measure at the call, which is the argument at the callee's
+/// measure position (`arg_pos`, supplied by the compiler from the callee's
+/// `DefId`). The argument's value is resolved exactly as for a self call.
+fn recursion_measure_bindings_at(
+    func: &VerifiableFunction,
+    call_block: BlockId,
+    call_args: &[Operand],
+    measure_decl: &LocalDecl,
+    arg_pos: usize,
+) -> Option<(Formula, Formula, Vec<Formula>, Option<SourceSpan>)> {
     if measure_decl.ty.int_width().is_none() {
         return None;
     }
-    let param_pos = measure_decl.index.checked_sub(1)?;
-    let arg = call.args.get(param_pos)?;
+    let arg = call_args.get(arg_pos)?;
     let entry =
         Formula::Var(crate::place_to_var_name(func, &Place::local(measure_decl.index)), Sort::Int);
     // rung-F checked-chain: when the measure argument is the `.0` unpack of
@@ -1110,7 +1655,7 @@ fn recursion_measure_bindings(
     // Assert(!_3.1) -> bbC: _4 = _3.0; call self(_4)`), substitute the
     // Assert-success value (`Sub(n, 1)`) for the otherwise-free temp. See
     // `resolve_checked_arg_chain` for the fail-closed applicability guards.
-    let block = func.body.blocks.iter().find(|b| b.id == call.block)?;
+    let block = block_by_id(&func.body, call_block)?;
     let (call_arg, exact_site_span) =
         if let Some((checked, span)) = resolve_checked_arg_chain(func, block, arg) {
             (checked, Some(span))
@@ -1221,16 +1766,15 @@ fn infer_compound_recursion_measure(
     if value_params.len() < 2 {
         return None;
     }
+    let mut dominators: Option<Dominators> = None;
+    let mut recur_blocks: Option<Vec<usize>> = None;
     for &counter_local in &value_params {
         let Some(counter_pos) = counter_local.checked_sub(1) else {
             continue;
         };
         // `counter` must be a strictly-increasing step of ITSELF at every call.
         let counter_increases = recursive_calls.iter().all(|call| {
-            func.body
-                .blocks
-                .iter()
-                .find(|b| b.id == call.block)
+            block_by_id(&func.body, call.block)
                 .zip(call.args.get(counter_pos))
                 .is_some_and(|(block, arg)| {
                     resolve_counter_increment(func, block, arg, counter_local).is_some()
@@ -1256,8 +1800,11 @@ fn infer_compound_recursion_measure(
             if !bound_unchanged {
                 continue;
             }
+            let dom = dominators.get_or_insert_with(|| compute_dominators(&func.body));
+            let rblocks = recur_blocks
+                .get_or_insert_with(|| recursive_calls.iter().map(|c| c.block.0).collect());
             if let Some(strict) =
-                find_dominating_bound_guard(func, recursive_calls, counter_local, bound_local)
+                find_dominating_bound_guard_with_dom(func, dom, rblocks, counter_local, bound_local)
             {
                 return Some(CompoundRecursionMeasure { bound_local, counter_local, strict });
             }
@@ -1279,8 +1826,7 @@ fn resolve_counter_increment(
     // (a) debug `counter + k`: `_A = _T.0` with `_T = CheckedAdd(counter, k)` in
     //     the unique no-overflow Assert predecessor (exact `counter + k` value).
     if let Some((formula, _span)) = resolve_checked_arg_chain(func, call_block, arg) {
-        let expected_counter =
-            crate::operand_to_formula(func, &Operand::Copy(Place::local(counter_local)));
+        let expected_counter = crate::place_to_formula(func, &Place::local(counter_local));
         if let Some(k) = counter_increment_from_formula(&formula, &expected_counter) {
             return Some(k);
         }
@@ -1349,6 +1895,9 @@ fn resolve_saturating_add_increment(
         Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
         _ => return None,
     };
+    if crate::local_defs::is_parameter(func, temp) {
+        return None;
+    }
     let Terminator::Call { func: callee, args, .. } =
         crate::local_defs::unique_value_call(func, temp)?
     else {
@@ -1399,7 +1948,8 @@ fn operand_reads_unchanged_local(
         return true;
     }
     let hop = place.local;
-    crate::local_defs::is_single_static_assignment(func, hop)
+    !crate::local_defs::is_parameter(func, hop)
+        && crate::local_defs::is_single_static_assignment(func, hop)
         && matches!(
             crate::local_defs::unique_value_def(func, hop),
             Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
@@ -1418,14 +1968,18 @@ fn operand_reads_unchanged_local(
 /// base case is the guard-TRUE / value-1 edge and recursion is the guard-FALSE /
 /// value-0 edge); `G` dominates every recursive-call block; and the base
 /// (value-1) edge cannot reach any recursive-call block. Fail-closed on any miss.
-fn find_dominating_bound_guard(
+fn find_dominating_bound_guard_with_dom(
     func: &VerifiableFunction,
-    recursive_calls: &[RecursiveCallSite],
+    dominators: &Dominators,
+    recur_blocks: &[usize],
     counter_local: usize,
     bound_local: usize,
 ) -> Option<bool> {
-    let dominators = compute_dominators(&func.body);
-    let recur_blocks: Vec<usize> = recursive_calls.iter().map(|c| c.block.0).collect();
+    if crate::generate::cached_terminator_presence_for_body(&func.body)
+        .is_some_and(|tp| !tp.has_switch_int)
+    {
+        return None;
+    }
     for guard in &func.body.blocks {
         let Terminator::SwitchInt { discr, targets, otherwise, .. } = &guard.terminator else {
             continue;
@@ -1440,9 +1994,7 @@ fn find_dominating_bound_guard(
             continue;
         };
         // `G` must dominate every recursive-call block.
-        let dominates_all = recur_blocks
-            .iter()
-            .all(|&rb| dominators.get(rb).is_some_and(|d| d.contains(&guard.id.0)));
+        let dominates_all = recur_blocks.iter().all(|&rb| dominators.dominates(guard.id.0, rb));
         if !dominates_all {
             continue;
         }
@@ -1450,7 +2002,7 @@ fn find_dominating_bound_guard(
         // reach a recursive call, otherwise control could arrive at the call with
         // the guard TRUE (`counter >= bound`) and the fact would be unsound.
         let base_tgt = bool_switch_value_target(targets, *otherwise, 1);
-        if block_reaches_any_block(func, base_tgt, &recur_blocks) {
+        if block_reaches_any_block(func, base_tgt, recur_blocks) {
             continue;
         }
         return Some(strict);
@@ -1516,11 +2068,7 @@ fn bool_switch_value_target(
 /// Forward CFG reachability: `true` if any block in `targets` is reachable from
 /// `start` (inclusive) along normal successor edges. Used to prove a base-case
 /// edge cannot reach a recursive call.
-fn block_reaches_any_block(
-    func: &VerifiableFunction,
-    start: BlockId,
-    targets: &[usize],
-) -> bool {
+fn block_reaches_any_block(func: &VerifiableFunction, start: BlockId, targets: &[usize]) -> bool {
     let mut seen: FxHashSet<usize> = FxHashSet::default();
     let mut stack = vec![start.0];
     while let Some(b) = stack.pop() {
@@ -1530,10 +2078,10 @@ fn block_reaches_any_block(
         if targets.contains(&b) {
             return true;
         }
-        if let Some(block) = func.body.blocks.iter().find(|bb| bb.id.0 == b) {
-            for succ in block_successors(&block.terminator) {
+        if let Some(block) = block_by_id(&func.body, BlockId(b)) {
+            for_each_block_successor(&block.terminator, |succ| {
                 stack.push(succ.0);
-            }
+            });
         }
     }
     false
@@ -1544,6 +2092,16 @@ fn block_reaches_any_block(
 /// the strictly-increasing step makes `M_call = bound - (counter + k)` strictly
 /// less than `M_entry = bound - counter` (`k >= 1`), and the conjoined
 /// well-foundedness fact refutes the `M_entry < 0` disjunct.
+///
+/// ALL OR NOTHING: one row for EVERY site in `recursive_calls`, or an empty
+/// `Vec`. A miss at any one site (its block not found, its counter increment not
+/// re-resolved, or an increment `k` that does not fit `i128`) withholds every row,
+/// never just that site's. A partial set would be read as "vcgen covered every
+/// self call" by the compiler's D9 `termination-unmeasured` exemption
+/// (`compiler/rustc_mir_transform/src/trust_verify/termination_unmeasured.rs`),
+/// which would then leave the uncovered site uncharged: the silent green D9
+/// closes. An empty set leaves the function with no recursion statement, so D9
+/// charges every site instead (review F3, 2026-09-27).
 fn compound_recursion_vcs(
     func: &VerifiableFunction,
     recursive_calls: &[RecursiveCallSite],
@@ -1557,46 +2115,50 @@ fn compound_recursion_vcs(
     };
     let bound_var = || Formula::Var(bound_name.clone(), Sort::Int);
     let counter_var = || Formula::Var(counter_name.clone(), Sort::Int);
-    let mut vcs = Vec::new();
+    // M_entry = bound - counter ; M_call = bound - (counter + k).
+    let measure_entry = Formula::Sub(Box::new(bound_var()), Box::new(counter_var()));
+    let entry_lt_zero = Formula::Lt(Box::new(measure_entry.clone()), Box::new(Formula::Int(0)));
+    // Well-foundedness fact from the dominating base guard (guard (3)).
+    let well_founded = if compound.strict {
+        Formula::Lt(Box::new(counter_var()), Box::new(bound_var()))
+    } else {
+        Formula::Le(Box::new(counter_var()), Box::new(bound_var()))
+    };
+    let exact_preconditions = exact_recursion_preconditions(func);
+    let mut vcs = Vec::with_capacity(recursive_calls.len());
     for call in recursive_calls {
-        let Some(block) = func.body.blocks.iter().find(|b| b.id == call.block) else {
-            continue;
+        // Every call bound during inference, so a miss below is not expected; if
+        // one happens it must not DROP just this site's row (a partial set, see
+        // the doc comment): the whole function gets no row.
+        let Some(block) = block_by_id(&func.body, call.block) else {
+            return Vec::new();
         };
         let Some(k) = call
             .args
             .get(counter_pos)
             .and_then(|arg| resolve_counter_increment(func, block, arg, compound.counter_local))
         else {
-            // Every call bound during inference; a miss here can only DROP a row,
-            // never manufacture a proof. Skip it.
-            continue;
+            return Vec::new();
         };
+        // Reachable in principle: a `u128` counter stepped by `k >= 2^127`.
         let Ok(k_int) = i128::try_from(k) else {
-            continue;
+            return Vec::new();
         };
-        // M_entry = bound - counter ; M_call = bound - (counter + k).
-        let measure_entry = Formula::Sub(Box::new(bound_var()), Box::new(counter_var()));
         let counter_call = Formula::Add(Box::new(counter_var()), Box::new(Formula::Int(k_int)));
         let measure_call = Formula::Sub(Box::new(bound_var()), Box::new(counter_call));
         let not_decreasing = Formula::Or(vec![
             Formula::Ge(Box::new(measure_call), Box::new(measure_entry.clone())),
-            Formula::Lt(Box::new(measure_entry), Box::new(Formula::Int(0))),
+            entry_lt_zero.clone(),
         ]);
-        // Well-foundedness fact from the dominating base guard (guard (3)).
-        let well_founded = if compound.strict {
-            Formula::Lt(Box::new(counter_var()), Box::new(bound_var()))
-        } else {
-            Formula::Le(Box::new(counter_var()), Box::new(bound_var()))
-        };
-        let core = Formula::And(vec![well_founded, not_decreasing]);
+        let core = Formula::And(vec![well_founded.clone(), not_decreasing]);
         vcs.push(VerificationCondition {
             kind: VcKind::NonTermination {
-                context: "recursion".to_string(),
+                context: RECURSION_TERMINATION_CONTEXT.to_string(),
                 measure: measure_label.clone(),
             },
             function: func.name.as_str().into(),
             location: call.span.clone(),
-            formula: conjoin_recursion_preconditions(func, core),
+            formula: conjoin_exact_preconditions(&exact_preconditions, core),
             contract_metadata: None,
             // Pre-obligation-record semantics: this producer does not write the
             // authenticated obligation record (None is stripped from the stable
@@ -1716,7 +2278,10 @@ fn resolve_checked_arg_chain(
     // Entry is reached directly when the function starts. An explicit CFG
     // predecessor targeting bb0 cannot establish that its Assert ran before
     // the entry block's first execution.
-    if call_block.id.0 == 0 {
+    if call_block.id.0 == 0
+        || crate::generate::cached_terminator_presence_for_body(&func.body)
+            .is_some_and(|tp| !tp.has_assert)
+    {
         return None;
     }
     // Guard 1: optimized MIR passes `_T.0` directly; unoptimized MIR first
@@ -1755,6 +2320,8 @@ fn resolve_checked_arg_chain(
         }
         _ => return None,
     };
+    let (pred, op, lhs, rhs) =
+        checked_chain_through_assert_pred(func, call_block, tuple_local, &[])?;
     let writes_tuple = call_block
         .stmts
         .iter()
@@ -1762,17 +2329,13 @@ fn resolve_checked_arg_chain(
     if writes_tuple {
         return None;
     }
-    let mut chain_locals = vec![tuple_local];
-    if let Some(arg_local) = arg_local {
-        chain_locals.push(arg_local);
-    }
-    if block_has_nonassign_write_risk(call_block, &chain_locals) {
+    let chain_buf = [tuple_local, arg_local.unwrap_or(tuple_local)];
+    let chain_locals = if arg_local.is_some() { &chain_buf[..2] } else { &chain_buf[..1] };
+    if block_has_nonassign_write_risk(call_block, chain_locals) {
         return None;
     }
 
-    let (pred, op, lhs, rhs) =
-        checked_chain_through_assert_pred(func, call_block, tuple_local, &[])?;
-    Some((checked_op_formula(func, op, lhs, rhs), terminator_span(&pred.terminator)))
+    Some((checked_op_formula(func, op, lhs, rhs)?, terminator_span(&pred.terminator)))
 }
 
 /// Shared guards 2–4 of the checked-chain resolution (extracted verbatim from
@@ -1797,13 +2360,29 @@ fn checked_chain_through_assert_pred<'a>(
     tuple_local: usize,
     mutable_operand_allowance: &[usize],
 ) -> Option<(&'a BasicBlock, BinOp, &'a Operand, &'a Operand)> {
-    // Guard 2: unique predecessor, and it is the no-overflow Assert on `_T.1`.
-    let mut preds =
-        func.body.blocks.iter().filter(|b| block_successors(&b.terminator).contains(&block.id));
-    let pred = preds.next()?;
-    if preds.next().is_some() {
+    // PERF-COMPILER-VCGEN-695: if cached terminator presence shows the body has no
+    // `Terminator::Assert`, no predecessor can be an assert block. Otherwise resolve
+    // the unique predecessor in O(1) via `v2_predecessors` when available.
+    if crate::generate::cached_terminator_presence_for_body(&func.body)
+        .is_some_and(|tp| !tp.has_assert)
+    {
         return None;
     }
+    // Guard 2: unique predecessor, and it is the no-overflow Assert on `_T.1`.
+    let pred = if let Some(preds_map) = crate::fn_memo::v2_predecessors(func) {
+        preds_map.sole_predecessor(func, block.id)?
+    } else {
+        let mut preds = func
+            .body
+            .blocks
+            .iter()
+            .filter(|b| terminator_any_successor(&b.terminator, |s| s == block.id));
+        let pred = preds.next()?;
+        if preds.next().is_some() {
+            return None;
+        }
+        pred
+    };
     let Terminator::Assert { cond, expected: false, target, .. } = &pred.terminator else {
         return None;
     };
@@ -1880,14 +2459,14 @@ fn checked_op_formula(
     op: BinOp,
     lhs: &Operand,
     rhs: &Operand,
-) -> Formula {
+) -> Option<Formula> {
     let l = crate::operand_to_formula(func, lhs);
     let r = crate::operand_to_formula(func, rhs);
     match op {
-        BinOp::Add => Formula::Add(Box::new(l), Box::new(r)),
-        BinOp::Sub => Formula::Sub(Box::new(l), Box::new(r)),
-        BinOp::Mul => Formula::Mul(Box::new(l), Box::new(r)),
-        _ => unreachable!("checked_chain_through_assert_pred gates to Add|Sub|Mul"),
+        BinOp::Add => Some(Formula::Add(Box::new(l), Box::new(r))),
+        BinOp::Sub => Some(Formula::Sub(Box::new(l), Box::new(r))),
+        BinOp::Mul => Some(Formula::Mul(Box::new(l), Box::new(r))),
+        _ => None,
     }
 }
 
@@ -1950,7 +2529,10 @@ fn resolve_loop_checked_step_chain(
     measure_local: usize,
 ) -> Option<Formula> {
     // Loop guard: never resolve a step living in the function entry block.
-    if step_block_id.0 == 0 {
+    if step_block_id.0 == 0
+        || crate::generate::cached_terminator_presence_for_body(&func.body)
+            .is_some_and(|tp| !tp.has_assert)
+    {
         return None;
     }
     // Step shape: `n = Copy/Move(_T.0)` (the whole-local destination is
@@ -1962,7 +2544,15 @@ fn resolve_loop_checked_step_chain(
         return None;
     }
     let tuple_local = src.local;
-    let step_block = func.body.blocks.iter().find(|b| b.id == step_block_id)?;
+    let step_block = block_by_id(&func.body, step_block_id)?;
+    let (pred, op, lhs, rhs) =
+        checked_chain_through_assert_pred(func, step_block, tuple_local, &[measure_local])?;
+    // Loop guard: the Assert-predecessor must be part of THIS loop's body —
+    // an outside pred is a once-before-the-loop computation (loop-invariant
+    // step), not a per-iteration decrement.
+    if !loop_info.body_blocks.contains(&pred.id) {
+        return None;
+    }
     let writes_tuple = step_block
         .stmts
         .iter()
@@ -1973,15 +2563,7 @@ fn resolve_loop_checked_step_chain(
     if block_has_nonassign_write_risk(step_block, &[tuple_local, measure_local]) {
         return None;
     }
-    let (pred, op, lhs, rhs) =
-        checked_chain_through_assert_pred(func, step_block, tuple_local, &[measure_local])?;
-    // Loop guard: the Assert-predecessor must be part of THIS loop's body —
-    // an outside pred is a once-before-the-loop computation (loop-invariant
-    // step), not a per-iteration decrement.
-    if !loop_info.body_blocks.contains(&pred.id) {
-        return None;
-    }
-    Some(checked_op_formula(func, op, lhs, rhs))
+    checked_op_formula(func, op, lhs, rhs)
 }
 
 /// Non-`Assign` write channels inside one block that could interpose on the
@@ -2017,8 +2599,8 @@ fn block_has_nonassign_write_risk(block: &BasicBlock, locals: &[usize]) -> bool 
 /// ANY `Opaque` terminator in the body at all. Fail-closed: over-reporting
 /// mutation only declines the resolution.
 fn local_ever_mutated(func: &VerifiableFunction, local: usize) -> bool {
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
+    crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
+        Some(stmt) => {
             // EXHAUSTIVE statement classification (no wildcard) so a new
             // write channel cannot silently bypass this guard.
             match stmt {
@@ -2027,20 +2609,16 @@ fn local_ever_mutated(func: &VerifiableFunction, local: usize) -> bool {
                         return true;
                     }
                     match rvalue {
-                        Rvalue::Ref { mutable: true, place: p } if p.local == local => {
-                            return true;
-                        }
-                        Rvalue::AddressOf(_, p) if p.local == local => return true,
-                        _ => {}
+                        Rvalue::Ref { mutable: true, place: p } if p.local == local => true,
+                        Rvalue::AddressOf(_, p) if p.local == local => true,
+                        _ => false,
                     }
                 }
                 Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
-                    if place.local == local {
-                        return true;
-                    }
+                    place.local == local
                 }
                 // Unknown write channels — fail closed.
-                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => return true,
+                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => true,
                 // Genuinely non-writing markers.
                 Statement::StorageLive(_)
                 | Statement::StorageDead(_)
@@ -2048,19 +2626,18 @@ fn local_ever_mutated(func: &VerifiableFunction, local: usize) -> bool {
                 | Statement::PlaceMention(_)
                 | Statement::Coverage
                 | Statement::ConstEvalCounter
-                | Statement::Nop => {}
+                | Statement::Nop => false,
                 // `Statement` is #[non_exhaustive]: a future variant is an
                 // unknown write channel — fail closed.
-                _ => return true,
+                _ => true,
             }
         }
-        match &block.terminator {
-            Terminator::Call { dest, .. } if dest.local == local => return true,
-            Terminator::Opaque { .. } => return true,
-            _ => {}
-        }
-    }
-    false
+        None => match &block.terminator {
+            Terminator::Call { dest, .. } if dest.local == local => true,
+            Terminator::Opaque { .. } => true,
+            _ => false,
+        },
+    })
 }
 
 /// Look up exactly one function parameter by its canonical verifier name.
@@ -2096,21 +2673,26 @@ fn assignments_to_local_in_body<'a>(
     body_blocks: &[BlockId],
     local_idx: usize,
 ) -> Vec<(BlockId, &'a Rvalue)> {
-    let in_loop: FxHashSet<usize> = body_blocks.iter().map(|b| b.0).collect();
+    let blocks_sorted = body_blocks.is_sorted_by_key(|b| b.0);
+    let in_loop = |id: BlockId| {
+        if blocks_sorted {
+            body_blocks.binary_search_by_key(&id.0, |b| b.0).is_ok()
+        } else {
+            body_blocks.contains(&id)
+        }
+    };
     let mut out = Vec::new();
-    for block in &func.body.blocks {
-        if !in_loop.contains(&block.id.0) {
-            continue;
+    crate::visit_local_write_stmts(func, &func.body.blocks, local_idx, |block, stmt| {
+        if !in_loop(block.id) {
+            return;
         }
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt
-                && place.local == local_idx
-                && place.projections.is_empty()
-            {
-                out.push((block.id, rvalue));
-            }
+        if let Statement::Assign { place, rvalue, .. } = stmt
+            && place.local == local_idx
+            && place.projections.is_empty()
+        {
+            out.push((block.id, rvalue));
         }
-    }
+    });
     out
 }
 
@@ -2129,22 +2711,52 @@ fn exact_loop_step_formula(func: &VerifiableFunction, r: &Rvalue) -> Option<Form
     }
 }
 
-/// Get all successor block IDs from a terminator.
-fn block_successors(term: &Terminator) -> Vec<BlockId> {
+/// Invoke `f` on each successor block ID of `term` without allocating a `Vec`.
+#[inline]
+fn for_each_block_successor(term: &Terminator, mut f: impl FnMut(BlockId)) {
     match term {
-        Terminator::Goto(target) => vec![*target],
-        Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut succs: Vec<BlockId> = targets.iter().map(|(_, t)| *t).collect();
-            succs.push(*otherwise);
-            succs
+        Terminator::Goto(target) | Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => {
+            f(*target);
         }
-        Terminator::Return | Terminator::Unreachable => vec![],
-        Terminator::Call { target, .. } => target.iter().copied().collect(),
-        Terminator::TailCall { .. } => Vec::new(),
-        Terminator::Assert { target, .. } => vec![*target],
-        Terminator::Drop { target, .. } => vec![*target],
-        Terminator::Opaque { targets, .. } => targets.clone(),
-        _ => vec![],
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            for &(_, target) in targets {
+                f(target);
+            }
+            f(*otherwise);
+        }
+        Terminator::Call { target: Some(target), .. } => {
+            f(*target);
+        }
+        Terminator::Opaque { targets, .. } => {
+            for &target in targets {
+                f(target);
+            }
+        }
+        Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::Call { target: None, .. }
+        | Terminator::TailCall { .. }
+        | _ => {}
+    }
+}
+
+/// Return `true` if any successor block ID of `term` satisfies `pred`.
+#[inline]
+fn terminator_any_successor(term: &Terminator, mut pred: impl FnMut(BlockId) -> bool) -> bool {
+    match term {
+        Terminator::Goto(target) | Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => {
+            pred(*target)
+        }
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.iter().any(|&(_, target)| pred(target)) || pred(*otherwise)
+        }
+        Terminator::Call { target: Some(target), .. } => pred(*target),
+        Terminator::Opaque { targets, .. } => targets.iter().copied().any(pred),
+        Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::Call { target: None, .. }
+        | Terminator::TailCall { .. }
+        | _ => false,
     }
 }
 
@@ -2164,16 +2776,28 @@ fn block_successors(term: &Terminator) -> Vec<BlockId> {
 /// The body-block set is the exact natural-loop set recovered by
 /// `detect_loops`; block allocation order is never used as CFG structure.
 fn loop_has_exit(body: &VerifiableBody, loop_info: &LoopInfo) -> bool {
-    let in_loop: FxHashSet<usize> = loop_info.body_blocks.iter().map(|b| b.0).collect();
-    for bid in &loop_info.body_blocks {
-        let Some(bb) = body.blocks.iter().find(|b| b.id == *bid) else {
+    let body_blocks = &loop_info.body_blocks;
+    let blocks_sorted = body_blocks.is_sorted_by_key(|b| b.0);
+    let in_loop = |id: BlockId| {
+        if blocks_sorted {
+            body_blocks.binary_search_by_key(&id.0, |b| b.0).is_ok()
+        } else {
+            body_blocks.contains(&id)
+        }
+    };
+    for bid in body_blocks {
+        let Some(bb) = block_by_id(body, *bid) else {
             continue;
         };
-        let succs = block_successors(&bb.terminator);
-        if succs.is_empty() {
-            return true;
-        }
-        if succs.iter().any(|s| !in_loop.contains(&s.0)) {
+        let mut has_any_succ = false;
+        let mut has_exit_succ = false;
+        for_each_block_successor(&bb.terminator, |s| {
+            has_any_succ = true;
+            if !has_exit_succ && !in_loop(s) {
+                has_exit_succ = true;
+            }
+        });
+        if !has_any_succ || has_exit_succ {
             return true;
         }
     }
@@ -2200,7 +2824,7 @@ fn loop_has_exit(body: &VerifiableBody, loop_info: &LoopInfo) -> bool {
 fn loop_is_coroutine_protocol_sink(func: &VerifiableFunction, loop_info: &LoopInfo) -> bool {
     !loop_info.body_blocks.is_empty()
         && loop_info.body_blocks.iter().all(|bid| {
-            func.body.blocks.iter().find(|b| b.id == *bid).is_some_and(|bb| {
+            block_by_id(&func.body, *bid).is_some_and(|bb| {
                 matches!(
                     &bb.terminator,
                     Terminator::Assert {
@@ -2317,6 +2941,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2411,6 +3036,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2489,6 +3115,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2557,6 +3184,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2627,6 +3255,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("test::factorial"),
                             is_foreign: false,
                             func: "test::factorial".to_string(),
                             args: vec![Operand::Copy(Place::local(3))],
@@ -2672,6 +3301,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2697,6 +3327,7 @@ mod tests {
             is_foreign,
             is_unsafe_sig,
             callee_identity,
+            callee_key,
             ..
         } = func.body.blocks[3].terminator.clone()
         else {
@@ -2710,6 +3341,7 @@ mod tests {
             is_foreign,
             is_unsafe_sig,
             callee_identity,
+            callee_key,
         };
         func.body.blocks.truncate(4);
         func
@@ -2773,6 +3405,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -2959,14 +3592,83 @@ mod tests {
         // relation that makes the cross edge a non-back-edge.
         let func = loopless_cross_edge_function();
         let dom = compute_dominators(&func.body);
-        assert_eq!(dom.len(), 4);
         // Entry dominates everything reachable; each block dominates itself.
-        assert!(dom[0].contains(&0));
-        assert!(dom[1].contains(&1) && dom[1].contains(&0));
-        assert!(dom[2].contains(&2) && dom[2].contains(&0));
+        assert!(dom.dominates(0, 0));
+        assert!(dom.dominates(1, 1) && dom.dominates(0, 1));
+        assert!(dom.dominates(2, 2) && dom.dominates(0, 2));
         // The crux: bb1 must NOT dominate bb2 (bb2 is reachable via bb0 only),
         // which is exactly why bb2 -> bb1 is not a back-edge.
-        assert!(!dom[2].contains(&1), "bb1 must not dominate bb2");
+        assert!(!dom.dominates(1, 2), "bb1 must not dominate bb2");
+        assert!(!dom.dominates(0, 4) && !dom.dominates(4, 0), "out of range is never a dominator");
+    }
+
+    /// The tree answers exactly what the retired dense greatest-fixpoint sets
+    /// answered, for every ordered pair of blocks of random CFGs — including
+    /// predecessor-less blocks, unreachable cycles no source enters (dominated by
+    /// every block), self-loops and back edges into the entry.
+    #[test]
+    fn termination_dominators_parity() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let mut pairs = 0usize;
+        for _ in 0..300 {
+            let n = 1 + next(14) as usize;
+            let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for v in 1..n {
+                if next(4) != 0 {
+                    succs[next(v as u64) as usize].push(v);
+                }
+            }
+            for _ in 0..next(2 * n as u64 + 1) {
+                succs[next(n as u64) as usize].push(next(n as u64) as usize);
+            }
+            let blocks: Vec<BasicBlock> = (0..n)
+                .map(|i| {
+                    let terminator = match succs[i].as_slice() {
+                        [] => Terminator::Return,
+                        [t] => Terminator::Goto(BlockId(*t)),
+                        [first, rest @ ..] => Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(0)),
+                            targets: rest
+                                .iter()
+                                .enumerate()
+                                .map(|(k, t)| (k as u128, BlockId(*t)))
+                                .collect(),
+                            otherwise: BlockId(*first),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    };
+                    BasicBlock { id: BlockId(i), stmts: vec![], terminator }
+                })
+                .collect();
+            let body = VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::u32(), name: None }],
+                blocks,
+                arg_count: 0,
+                return_ty: Ty::u32(),
+                datatype_defs: Default::default(),
+            };
+            let dense = compute_dominators_dense(&body);
+            let tree = compute_dominators(&body);
+            for b in 0..n + 1 {
+                for a in 0..n + 1 {
+                    let want = dense.get(b).is_some_and(|d| d.contains(&a));
+                    assert_eq!(
+                        tree.dominates(a, b),
+                        want,
+                        "does {a} dominate {b}? succs {succs:?}"
+                    );
+                    pairs += 1;
+                }
+            }
+        }
+        assert!(pairs > 5_000);
     }
 
     #[test]
@@ -3133,11 +3835,11 @@ mod tests {
         *callee = "test::rec_cs::<u32>".to_string();
 
         assert!(
-            !is_direct_self_call(&func, "rec_cs::<u32>"),
+            !is_direct_self_call(&func, BlockId(0), "rec_cs::<u32>"),
             "a bare terminal name must not alias an unrelated exact def-path"
         );
-        assert!(is_direct_self_call(&func, "test::rec_cs::<u32>"));
-        assert!(!is_direct_self_call(&func, "other::rec_cs::<u32>"));
+        assert!(is_direct_self_call(&func, BlockId(0), "test::rec_cs::<u32>"));
+        assert!(!is_direct_self_call(&func, BlockId(0), "other::rec_cs::<u32>"));
         assert_eq!(detect_recursive_calls(&func).len(), 1);
 
         let mut vcs = Vec::new();
@@ -3152,6 +3854,672 @@ mod tests {
         assert_eq!(
             vcs[0].contract_metadata.and_then(|metadata| metadata.source_contract_index),
             Some(0)
+        );
+    }
+
+    /// Trust (refuted 2026-09-16): a direct self-call beside a non-self call the
+    /// compiler did not classify mints NO inferred `termination` row (it may be
+    /// mutual recursion through that call); the same body mints its descent row
+    /// once the context says the callee is non-reentrant.
+    #[test]
+    fn inferred_recursion_lane_mints_nothing_beside_an_unclassified_non_self_call() {
+        let mut func = recursive_checked_sub_function();
+        // bb4 used to `Return`; make it call `test::back` first, then return in bb5.
+        func.body.blocks[4].terminator = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: None,
+            is_foreign: false,
+            func: "test::back".to_string(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(0),
+            target: Some(BlockId(5)),
+            span: SourceSpan::default(),
+            atomic: None,
+        };
+        func.body.blocks.push(BasicBlock {
+            id: BlockId(5),
+            stmts: vec![],
+            terminator: Terminator::Return,
+        });
+        assert_eq!(detect_recursive_calls(&func).len(), 1, "the direct self-call is still seen");
+
+        let count_termination_rows = |vcs: &[VerificationCondition]| {
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count()
+        };
+
+        // No context: `test::back` is unclassified — no termination claim at all.
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            count_termination_rows(&vcs),
+            0,
+            "an unclassified non-self call withholds the claim"
+        );
+
+        // The compiler says `test::back` is a non-reentrant (vanilla sysroot) callee.
+        let mut names = trust_types::fx::FxHashSet::default();
+        names.insert("test::back".to_string());
+        let _scope = crate::enter_vcgen_context(
+            &crate::VcgenContext::for_function(func.def_path.clone())
+                .with_nonreentrant_callees(names),
+        );
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(count_termination_rows(&vcs), 1, "a non-reentrant callee keeps the descent row");
+        drop(_scope);
+
+        // A context owned by ANOTHER function stamps nothing (fail-closed).
+        let mut names = trust_types::fx::FxHashSet::default();
+        names.insert("test::back".to_string());
+        let _other = crate::enter_vcgen_context(
+            &crate::VcgenContext::for_function("test::someone_else")
+                .with_nonreentrant_callees(names),
+        );
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(count_termination_rows(&vcs), 0);
+    }
+
+    /// Trust (refuted 2026-09-16, round 2): a binding miss at one self-call site
+    /// (its block carries a division the measure binder does not model) must
+    /// withhold the sibling site's descent row too — the lane mints nothing.
+    #[test]
+    fn inferred_recursion_lane_mints_nothing_when_any_self_call_site_fails_to_bind() {
+        let mut func = recursive_checked_sub_function();
+        // bb4 used to `Return`; make it a SECOND self-call site whose block also
+        // computes `_5 = _1 / 3`, then return in bb5.
+        func.body.locals.push(LocalDecl { index: 5, ty: Ty::u32(), name: None });
+        func.body.blocks[4].stmts.push(Statement::Assign {
+            place: Place::local(5),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Div,
+                Operand::Copy(Place::local(1)),
+                Operand::Constant(ConstValue::Uint(3, 32)),
+            ),
+            span: SourceSpan::default(),
+        });
+        func.body.blocks[4].terminator = Terminator::Call {
+            unwind: UnwindEdge::Unreachable,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: None,
+            is_foreign: false,
+            func: "test::rec_cs".to_string(),
+            args: vec![Operand::Copy(Place::local(1))],
+            dest: Place::local(0),
+            target: Some(BlockId(5)),
+            span: SourceSpan::default(),
+            atomic: None,
+        };
+        func.body.blocks.push(BasicBlock {
+            id: BlockId(5),
+            stmts: vec![],
+            terminator: Terminator::Return,
+        });
+        assert_eq!(detect_recursive_calls(&func).len(), 2);
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            0,
+            "one unbindable site withholds every inferred termination row"
+        );
+        // Positive control: the same second site WITHOUT the division binds, and
+        // both sites mint (the second one is refutable — `n` does not decrease).
+        func.body.blocks[4].stmts.clear();
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            2
+        );
+    }
+
+    /// Trust (D9, 2026-09-27): the ALL-OR-NOTHING contract the compiler's
+    /// `assumption:termination-unmeasured` charge reads. Its exemption is "this
+    /// lane made a recursion statement for the function" (a recursion row, or the
+    /// `RECURSION_DECREASES_UNSUPPORTED_KIND` marker); that is sound only if a
+    /// direct-self function never gets a recursion row for SOME of its
+    /// `detect_recursive_calls` sites and none for the rest.
+    ///
+    /// Review F3 (2026-09-27): each fixture states which side of the contract it
+    /// is on, so a regression that makes every lane mint nothing fails here too
+    /// (`rows == 0` alone would satisfy the contract vacuously). The binding
+    /// fixtures must mint one row per site; the declining ones must mint none. The
+    /// compound fixture runs under the context the compiler would install (its
+    /// `saturating_add` step judged non-reentrant) — without it the topology gate
+    /// withholds every row and the compound lane never runs.
+    #[test]
+    fn inferred_recursion_rows_cover_every_self_call_site_or_none() {
+        // `rec_cs` with its `Return` in bb4 replaced by a second self call, the
+        // round-2 shape above; `division` puts the unmodeled `_1 / 3` in its block.
+        let two_sites = |division: bool| {
+            let mut func = recursive_checked_sub_function();
+            func.body.locals.push(LocalDecl { index: 5, ty: Ty::u32(), name: None });
+            if division {
+                func.body.blocks[4].stmts.push(Statement::Assign {
+                    place: Place::local(5),
+                    rvalue: Rvalue::BinaryOp(
+                        BinOp::Div,
+                        Operand::Copy(Place::local(1)),
+                        Operand::Constant(ConstValue::Uint(3, 32)),
+                    ),
+                    span: SourceSpan::default(),
+                });
+            }
+            func.body.blocks[4].terminator = Terminator::Call {
+                unwind: UnwindEdge::Unreachable,
+                is_unsafe_sig: false,
+                callee_identity: None,
+                callee_key: None,
+                is_foreign: false,
+                func: "test::rec_cs".to_string(),
+                args: vec![Operand::Copy(Place::local(1))],
+                dest: Place::local(0),
+                target: Some(BlockId(5)),
+                span: SourceSpan::default(),
+                atomic: None,
+            };
+            func.body.blocks.push(BasicBlock {
+                id: BlockId(5),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            });
+            func
+        };
+        // (label, fixture, binds at every site, callees the compiler would judge
+        // non-reentrant, the measure label a binding fixture's rows must carry)
+        let fixtures: [(&str, VerifiableFunction, bool, &[&str], Option<&str>); 7] = [
+            ("checked decrement (binds)", recursive_checked_sub_function(), true, &[], None),
+            ("no argument (no measure)", recursive_no_args_function(), false, &[], None),
+            ("raw machine decrement (declined)", recursive_function(), false, &[], None),
+            ("two sites, one unbindable", two_sites(true), false, &[], None),
+            ("two sites, both bind", two_sites(false), true, &[], None),
+            ("authored decreases", recursive_with_decreases(), true, &[], Some("n")),
+            (
+                "compound bound - counter",
+                compound_temp_step(),
+                true,
+                &[SAT_ADD],
+                Some("bound - counter"),
+            ),
+        ];
+        for (label, func, binds, nonreentrant, measure_label) in fixtures {
+            let sites = detect_recursive_calls(&func).len();
+            assert!(sites > 0, "{label}: the fixture must call itself");
+            let _scope = (!nonreentrant.is_empty()).then(|| {
+                let names: trust_types::fx::FxHashSet<String> =
+                    nonreentrant.iter().map(|name| (*name).to_string()).collect();
+                crate::enter_vcgen_context(
+                    &crate::VcgenContext::for_function(func.def_path.clone())
+                        .with_nonreentrant_callees(names),
+                )
+            });
+            let mut vcs = Vec::new();
+            check_termination(&func, &mut vcs);
+            let recursion_rows: Vec<&VerificationCondition> = vcs
+                .iter()
+                .filter(|vc| {
+                    matches!(&vc.kind, VcKind::NonTermination { context, .. }
+                        if context == RECURSION_TERMINATION_CONTEXT)
+                })
+                .collect();
+            let rows = recursion_rows.len();
+            let marker = vcs.iter().any(|vc| {
+                matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. }
+                    if kind == RECURSION_DECREASES_UNSUPPORTED_KIND)
+            });
+            // The contract itself: never a partial set.
+            assert!(
+                marker || rows == 0 || rows == sites,
+                "{label}: {rows} recursion row(s) for {sites} self-call site(s) is a PARTIAL \
+                 termination claim: {vcs:#?}"
+            );
+            // Which side of it this fixture is on.
+            if binds {
+                assert!(
+                    rows == sites && rows > 0 && !marker,
+                    "{label}: a binding fixture must mint one recursion row per self-call site \
+                     ({sites}), got {rows} (marker: {marker}): {vcs:#?}"
+                );
+                if let Some(expected) = measure_label {
+                    assert!(
+                        recursion_rows.iter().all(|vc| matches!(&vc.kind,
+                            VcKind::NonTermination { measure, .. } if measure == expected)),
+                        "{label}: every row must carry the measure `{expected}`: {vcs:#?}"
+                    );
+                }
+            } else {
+                assert!(
+                    rows == 0 && !marker,
+                    "{label}: a declining fixture must mint no recursion statement at all (the \
+                     compiler's D9 charge covers it), got {rows} row(s) (marker: {marker}): \
+                     {vcs:#?}"
+                );
+            }
+        }
+    }
+
+    /// Review F3 (2026-09-27): `compound_recursion_vcs` is all-or-nothing. A site
+    /// it cannot re-resolve (here: a call site whose block is not in the body)
+    /// withholds EVERY row, not just that site's; the complete site set still
+    /// mints one row per site.
+    #[test]
+    fn compound_recursion_vcs_withholds_every_row_on_any_site_miss() {
+        let func = compound_temp_step();
+        let calls = detect_recursive_calls(&func);
+        assert_eq!(calls.len(), 1, "one recursive call: {calls:?}");
+        let compound = infer_compound_recursion_measure(&func, &calls)
+            .expect("the `bound - counter` measure is inferred for the control");
+        assert_eq!(compound_recursion_vcs(&func, &calls, &compound).len(), 1);
+
+        let mut with_miss = calls.clone();
+        let mut phantom = calls[0].clone();
+        phantom.block = BlockId(99);
+        with_miss.push(phantom);
+        assert!(
+            compound_recursion_vcs(&func, &with_miss, &compound).is_empty(),
+            "a miss at one site must withhold the sibling site's row too"
+        );
+
+        // The same with the miss FIRST: order does not matter.
+        with_miss.reverse();
+        assert!(compound_recursion_vcs(&func, &with_miss, &compound).is_empty());
+    }
+
+    /// Refuted 2026-09-16: `strip_generics` erased the `<Self as Trait>` qualifier,
+    /// so two impls' same-named trait method compared EQUAL and mutual recursion
+    /// through them was a "direct self call" — a PROVED descent row on a function
+    /// that overflows the stack. Identity keeps the qualifier; only a terminal
+    /// turbofish is stripped.
+    #[test]
+    fn direct_call_identity_keeps_the_qualified_self_and_strips_only_a_turbofish() {
+        assert_eq!(direct_call_identity("crate::f::<u32>"), "crate::f");
+        assert_eq!(direct_call_identity("crate::f"), "crate::f");
+        assert_eq!(
+            direct_call_identity("<crate::S as crate::Tr>::f::<u32>"),
+            "<crate::S as crate::Tr>::f"
+        );
+        assert_eq!(
+            direct_call_identity("<crate::S as crate::Tr>::f"),
+            "<crate::S as crate::Tr>::f"
+        );
+        assert_ne!(
+            direct_call_identity("<crate::U as crate::Tr>::f"),
+            direct_call_identity("<crate::S as crate::Tr>::f"),
+            "two impls' same-named method are two identities"
+        );
+        // A nested turbofish is stripped as one balanced group.
+        assert_eq!(direct_call_identity("crate::f::<Vec<u32>>"), "crate::f");
+        // A dangling `<` never panics and never matches anything else.
+        assert_eq!(direct_call_identity("crate::f::<u32"), "crate::f::<u32");
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 2: a tagged callee is never a self call. The
+    /// tag means an argument (a trait method's `Self` included) names a crate whose
+    /// rendered name does not identify it, so two impls' methods can render one
+    /// qualified path; `direct_call_identity` drops ONE trailing group, and for a
+    /// tagged call that group is the tag. The measured exploit shape: the call
+    /// `<W<dup_b::T> as Tr>::f` from inside `<W<dup_a::T> as Tr>::f`, both
+    /// rendering `<m::W<dupty::T> as m::Tr>::f`.
+    #[test]
+    fn a_callee_carrying_the_argument_fingerprint_is_never_a_self_call() {
+        let tag = trust_types::render_trailing_args_fingerprint(0x452d_e392_92df_0dda, 0xf58d);
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<dupty::T> as m::Tr>::f".to_string();
+        assert!(is_direct_self_call(&func, BlockId(0), "<m::W<dupty::T> as m::Tr>::f"));
+        assert!(!is_direct_self_call(
+            &func,
+            BlockId(0),
+            &format!("<m::W<dupty::T> as m::Tr>::f{tag}")
+        ));
+        assert!(!is_direct_self_call(
+            &func,
+            BlockId(0),
+            &format!("<m::W<dupty::T> as m::Tr>::f::<G>{tag}")
+        ));
+        func.def_path = "m::down".to_string();
+        assert!(is_direct_self_call(&func, BlockId(0), "m::down::<T>"));
+        assert!(!is_direct_self_call(&func, BlockId(0), &format!("m::down::<T>{tag}")));
+        // The identity reader itself keeps the tag (round 3: a verifier marker group
+        // is never stripped as a turbofish).
+        let tagged = format!("crate::f::<T>{tag}");
+        assert_eq!(direct_call_identity(&tagged), tagged);
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 3: a verifier marker group is identity, not a
+    /// turbofish. `::<__trust_alias@…>` is written exactly when a call wears a local
+    /// definition key WITHOUT running that definition; stripping it made the call
+    /// equal that key again, i.e. a self call of the body it was tagged away from.
+    #[test]
+    fn direct_call_identity_keeps_a_verifier_marker_group() {
+        let alias = "<m::W<k::V> as m::Tr>::get::<__trust_alias@00112233445566778899aabbccddeeff>";
+        assert_eq!(direct_call_identity(alias), alias);
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<k::V> as m::Tr>::get".to_string();
+        assert!(is_direct_self_call(&func, BlockId(0), "<m::W<k::V> as m::Tr>::get"));
+        assert!(!is_direct_self_call(&func, BlockId(0), alias));
+        // An ordinary turbofish is still stripped.
+        assert_eq!(direct_call_identity("crate::f::<u32>"), "crate::f");
+        // Every verifier marker group is kept, the argument fingerprint included.
+        let args = "crate::f::<__trust_args@00112233445566778899aabbccddeeff>";
+        assert_eq!(direct_call_identity(args), args);
+    }
+
+    /// GENERIC-CALL-KEY-ALIAS-1 with ARGS-FINGERPRINT-READ-1 round 4 (2026-10-10):
+    /// the extractor now tags a trait call it cannot resolve
+    /// (`<W<X> as Tr>::f::<__trust_alias@…>` inside `impl<X> Tr for W<X>`, a
+    /// where-clause call that runs this body). Such an alias is a self call exactly
+    /// when the compiler's INSTALLED set files its block and its untagged path is
+    /// this body's own; no frame, an empty set, another owner's frame, another
+    /// base path, a malformed tag or the argument fingerprint keep it a non-self
+    /// call. Before the fix the filed frame read no self call, so the inferred lane
+    /// minted no descent row and only D9's `skipped` charge remained
+    /// (`where_clause_self_call_unique_path.rs` built rc 0 where main refuses it).
+    #[test]
+    fn an_unresolved_call_alias_of_this_body_is_a_self_call_only_where_the_compiler_files_it() {
+        let own = "<m::W<X> as m::Tr>::f";
+        let alias = format!("{own}::<__trust_alias@00112233445566778899aabbccddeeff>");
+        let mut func = recursive_checked_sub_function();
+        func.def_path = own.to_string();
+        let mut call_block = None;
+        for block in &mut func.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                *f = alias.clone();
+                call_block = Some(block.id);
+            }
+        }
+        let call_block = call_block.expect("fixture has one call");
+        let descent_rows = |func: &VerifiableFunction| {
+            let mut vcs = Vec::new();
+            check_termination(func, &mut vcs);
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count()
+        };
+        // No compiler frame: the alias stays a non-self call (round 3's rule).
+        assert_eq!(detect_recursive_calls(&func).len(), 0);
+        assert_eq!(descent_rows(&func), 0);
+        // The compiler filed the block: a self call, and the descent row is minted,
+        // as for the untagged spelling.
+        let filed = crate::VcgenContext::for_function(own.to_string())
+            .with_direct_self_call_blocks(Some([call_block.0].into_iter().collect()));
+        crate::with_vcgen_context(&filed, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 1);
+            assert_eq!(descent_rows(&func), 1);
+            // Another base path, a malformed tag and the argument fingerprint are
+            // never self calls, filed or not.
+            let other = "<m::W<Y> as m::Tr>::f::<__trust_alias@00112233445566778899aabbccddeeff>";
+            assert!(!is_direct_self_call(&func, call_block, other));
+            assert!(!is_direct_self_call(
+                &func,
+                call_block,
+                &format!("{own}::<__trust_alias@0011>")
+            ));
+            assert!(!is_direct_self_call(
+                &func,
+                call_block,
+                &format!("{own}::<__trust_alias@00112233445566778899aabbccddeefg>")
+            ));
+            let args = trust_types::render_trailing_args_fingerprint(0x1, 0x23);
+            assert!(!is_direct_self_call(&func, call_block, &format!("{own}{args}")));
+        });
+        // The compiler did not file it: no self call.
+        let unfiled = crate::VcgenContext::for_function(own.to_string())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&unfiled, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 0);
+        });
+        // Another owner's set never lends a filing.
+        let other_owner = crate::VcgenContext::for_function("m::other".to_string())
+            .with_direct_self_call_blocks(Some([call_block.0].into_iter().collect()));
+        crate::with_vcgen_context(&other_owner, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 0);
+        });
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 3: the rendered def path is not an identity.
+    /// `impl Tr for W<dup_a::T>` and `impl Tr for W<dup_b::T>` (or `W<other::T>` /
+    /// `W<T>` in a Cargo bin+lib pair) render ONE path, and a monomorphic call into
+    /// the other impl carries no generic argument to tag. The compiler's
+    /// `DefId`-decided self-call blocks are a conjunct: a block it did not file is
+    /// never a self call, and the inferred lane then mints no descent row. MEASURED
+    /// shape: `chain_ng.rs` (PROVED "recursion measure `n` may not decrease" on the
+    /// non-recursive caller, preview3 and round 2).
+    #[test]
+    fn compiler_self_call_blocks_gate_a_rendered_self_call() {
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<dupty::T> as m::Tr>::f".to_string();
+        let mut call_block = None;
+        for block in &mut func.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                *f = "<m::W<dupty::T> as m::Tr>::f".to_string();
+                call_block = Some(block.id);
+            }
+        }
+        let call_block = call_block.expect("fixture has one call");
+        let descent_rows = |func: &VerifiableFunction| {
+            let mut vcs = Vec::new();
+            check_termination(func, &mut vcs);
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count()
+        };
+        // No compiler context: the rendered path decides alone (pre-round-3).
+        assert_eq!(detect_recursive_calls(&func).len(), 1);
+        assert_eq!(descent_rows(&func), 1);
+        // The compiler filed the block as a self call: unchanged.
+        let filed = crate::VcgenContext::for_function(func.def_path.clone())
+            .with_direct_self_call_blocks(Some([call_block.0].into_iter().collect()));
+        crate::with_vcgen_context(&filed, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 1);
+            assert_eq!(descent_rows(&func), 1);
+        });
+        // The compiler did NOT file it (the call resolves to the other impl): no
+        // self call, no descent row.
+        let unfiled = crate::VcgenContext::for_function(func.def_path.clone())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&unfiled, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 0);
+            assert_eq!(descent_rows(&func), 0, "a call into the other impl is not a self call");
+        });
+        // Another function's set never crosses (owner check).
+        let other_owner = crate::VcgenContext::for_function("m::other".to_string())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&other_owner, || {
+            assert_eq!(detect_recursive_calls(&func).len(), 1);
+        });
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 4: `generate_vcs` pushes a FRESH frame, and
+    /// round 3's set did not cross onto it, so every regeneration under the
+    /// compiler's frame (the R1 oracle; vcgen-internal regenerations) compared
+    /// rendered paths alone. The fresh frame of the SAME owner now inherits the
+    /// set; another owner's never crosses.
+    #[test]
+    fn generate_vcs_fresh_frame_inherits_the_compiler_self_call_blocks() {
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<dupty::T> as m::Tr>::f".to_string();
+        for block in &mut func.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                *f = "<m::W<dupty::T> as m::Tr>::f".to_string();
+            }
+        }
+        let recursion_rows = |vcs: Vec<VerificationCondition>| {
+            vcs.iter()
+                .filter(|vc| {
+                    matches!(&vc.kind, VcKind::NonTermination { context, .. }
+                        if context == RECURSION_TERMINATION_CONTEXT)
+                })
+                .count()
+        };
+        // No frame: the rendered path decides alone, and the descent row is minted.
+        let unframed = recursion_rows(crate::generate_vcs(&func));
+        assert!(unframed > 0, "fixture must mint a recursion row without context");
+        // Under the compiler's frame that did NOT file the block, the fresh frame of
+        // `generate_vcs` keeps that answer: no self call, no recursion row.
+        let unfiled = crate::VcgenContext::for_function(func.def_path.clone())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&unfiled, || {
+            assert_eq!(recursion_rows(crate::generate_vcs(&func)), 0);
+        });
+        // Another owner's frame lends nothing.
+        let other_owner = crate::VcgenContext::for_function("m::other".to_string())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&other_owner, || {
+            assert_eq!(recursion_rows(crate::generate_vcs(&func)), unframed);
+        });
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 5 (review of round 3, item iii): the
+    /// discharge entry points (`generate_vcs_with_discharge`,
+    /// `generate_vcs_with_discharge_and_summaries`) pushed a bare `for_function`
+    /// frame through round 4, so under a compiler frame that did NOT file the block
+    /// they still minted the descent row from the rendered path alone. Each now inherits
+    /// the set from a frame of the same owner, and never from another owner's.
+    #[test]
+    fn discharge_entry_fresh_frames_inherit_the_compiler_self_call_blocks() {
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<dupty::T> as m::Tr>::f".to_string();
+        for block in &mut func.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                *f = "<m::W<dupty::T> as m::Tr>::f".to_string();
+            }
+        }
+        let is_recursion_row = |vc: &VerificationCondition| {
+            matches!(&vc.kind, VcKind::NonTermination { context, .. }
+                if context == RECURSION_TERMINATION_CONTEXT)
+        };
+        let count = |(solver, pre): (
+            Vec<VerificationCondition>,
+            Vec<(VerificationCondition, VerificationResult)>,
+        )| {
+            solver.iter().filter(|vc| is_recursion_row(vc)).count()
+                + pre.iter().filter(|(vc, _)| is_recursion_row(vc)).count()
+        };
+        let summaries = crate::modular::SummaryDatabase::new();
+        let plain = || count(crate::generate_vcs_with_discharge(&func));
+        let with_summaries =
+            || count(crate::generate_vcs_with_discharge_and_summaries(&func, &summaries));
+        // No frame: the rendered path decides alone, and both entries mint the row.
+        let (plain_unframed, summaries_unframed) = (plain(), with_summaries());
+        assert!(plain_unframed > 0, "fixture must mint a recursion row without context");
+        assert!(summaries_unframed > 0, "fixture must mint a recursion row without context");
+        // Under the owner's frame that did NOT file the block: no self call, no row.
+        let unfiled = crate::VcgenContext::for_function(func.def_path.clone())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&unfiled, || {
+            assert_eq!(plain(), 0, "generate_vcs_with_discharge must inherit the set");
+            assert_eq!(
+                with_summaries(),
+                0,
+                "generate_vcs_with_discharge_and_summaries must inherit the set"
+            );
+        });
+        // Another owner's frame lends nothing.
+        let other_owner = crate::VcgenContext::for_function("m::other".to_string())
+            .with_direct_self_call_blocks(Some(std::collections::BTreeSet::new()));
+        crate::with_vcgen_context(&other_owner, || {
+            assert_eq!(plain(), plain_unframed);
+            assert_eq!(with_summaries(), summaries_unframed);
+        });
+    }
+
+    /// ARGS-FINGERPRINT-READ-1 round 6 (review of round 5): round 5 also made
+    /// `generate_full_assert_refutation_vcs` and the TINV row generator inherit the
+    /// self-call set, but no test can fail on that: the set's only reader is
+    /// `is_direct_self_call` (through `check_termination`, reached only from
+    /// `generate/entry.rs`), and neither path reaches it. This pins the premise of that
+    /// statement for the assert-refutation entry: on the fixture whose discharge entries
+    /// DO mint a recursion row, it mints none with no frame, so a set has nothing to
+    /// withdraw there. (The TINV generator mints only `TinvRowKey`-keyed type-invariant
+    /// rows.) If this fails, the inheritance in `generate/assert_refutation.rs` becomes
+    /// verdict-bearing and needs a pin like the discharge one above.
+    #[test]
+    fn full_assert_refutation_entry_mints_no_recursion_row_for_the_set_to_withdraw() {
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<m::W<dupty::T> as m::Tr>::f".to_string();
+        for block in &mut func.body.blocks {
+            if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                *f = "<m::W<dupty::T> as m::Tr>::f".to_string();
+            }
+        }
+        let (solver, pre) = crate::generate_vcs_with_discharge(&func);
+        let minted = solver
+            .iter()
+            .chain(pre.iter().map(|(vc, _)| vc))
+            .filter(|vc| matches!(&vc.kind, VcKind::NonTermination { .. }))
+            .count();
+        assert!(minted > 0, "premise: the discharge entry mints a recursion row here");
+        let refutation = crate::generate_full_assert_refutation_vcs(&func);
+        assert_eq!(
+            refutation
+                .iter()
+                .filter(|vc| matches!(&vc.kind, VcKind::NonTermination { .. }))
+                .count(),
+            0,
+            "the full assert-refutation entry now mints termination rows: pin its set inheritance"
+        );
+    }
+
+    #[test]
+    fn same_named_trait_method_of_another_impl_is_not_a_self_call() {
+        let mut func = recursive_checked_sub_function();
+        func.def_path = "<test::S as test::Tr>::f".to_string();
+        let retarget = |func: &mut VerifiableFunction, callee: &str| {
+            for block in &mut func.body.blocks {
+                if let Terminator::Call { func: f, .. } = &mut block.terminator {
+                    *f = callee.to_string();
+                }
+            }
+        };
+        // Positive control: the self call spelled with OUR qualifier is direct and
+        // the inferred lane mints its descent row.
+        retarget(&mut func, "<test::S as test::Tr>::f");
+        assert_eq!(detect_recursive_calls(&func).len(), 1);
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            1
+        );
+        // The other impl's same-named method is NOT a self call: no recursive edge
+        // is recognized, and the lane mints nothing (a non-self call it cannot
+        // classify withholds the claim).
+        retarget(&mut func, "<test::U as test::Tr>::f");
+        assert_eq!(detect_recursive_calls(&func).len(), 0);
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            0,
+            "mutual recursion through a name collision must not mint a descent row"
+        );
+    }
+
+    /// Refuted 2026-09-16: `loop { if n == 0 { return; } f(n - 1); }` proved its
+    /// descent and was fully green, and never returns for `n > 0`. A back-edge in a
+    /// recursive body withholds the inferred row.
+    #[test]
+    fn inferred_recursion_lane_mints_nothing_inside_an_enclosing_loop() {
+        let mut func = recursive_checked_sub_function();
+        // Control first: the loop-free body mints its descent row.
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            1
+        );
+        // Re-enter the entry block after the self call returns: a natural loop.
+        let last = func.body.blocks.len() - 1;
+        assert!(matches!(func.body.blocks[last].terminator, Terminator::Return));
+        func.body.blocks[last].terminator = Terminator::Goto(BlockId(0));
+        assert!(!detect_loops(&func.body).is_empty(), "premise: the body now has a back-edge");
+        assert_eq!(detect_recursive_calls(&func).len(), 1, "premise: the self call is unchanged");
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert_eq!(
+            vcs.iter().filter(|vc| matches!(vc.kind, VcKind::NonTermination { .. })).count(),
+            0,
+            "the descent says nothing about the loop's iterations"
         );
     }
 
@@ -3184,6 +4552,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let mut vcs = Vec::new();
         check_termination(&func, &mut vcs);
@@ -3303,6 +4672,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3327,6 +4697,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("test::spin_rec"),
                             is_foreign: false,
                             func: "test::spin_rec".to_string(),
                             args: vec![],
@@ -3346,6 +4717,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3518,16 +4890,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_decreases_kind_equality() {
-        assert_eq!(DecreasesKind::Recursion, DecreasesKind::Recursion);
-        assert_eq!(
-            DecreasesKind::LoopVariant { header_block: 0 },
-            DecreasesKind::LoopVariant { header_block: 0 }
-        );
-        assert_ne!(DecreasesKind::LoopVariant { header_block: 0 }, DecreasesKind::Recursion);
-    }
-
     // --- rung-F u32-bound: unsigned-measure type bound on recursion VCs ---
     // (docs/design/2026-07-10-structural-fold-lane.md §1 last bullet)
 
@@ -3594,6 +4956,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("test::spin_same"),
                             is_foreign: false,
                             func: "test::spin_same".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -3613,6 +4976,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3641,6 +5005,7 @@ mod tests {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("test::wrap"),
                             is_foreign: false,
                             func: "test::wrap".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -3660,6 +5025,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -3727,8 +5093,8 @@ mod tests {
                 Box::new(Formula::Var("n".into(), Sort::Int)),
                 Box::new(Formula::Int(1)),
             )),
-            Operand::Constant(ConstValue::OpaqueScalar { width: 32, signed: false }),
-            Operand::Unsupported { kind: "test".into(), detail: "opaque operand".into() },
+            Operand::Constant(ConstValue::opaque_scalar(32, false)),
+            Operand::unsupported("test", "opaque operand"),
             Operand::Copy(Place { local: 1, projections: vec![Projection::Field(0)] }),
         ];
         for arg in unsafe_args {
@@ -3823,13 +5189,16 @@ mod tests {
     #[test]
     fn authored_recursion_vacuity_has_an_explicit_known_benign_terminator_set() {
         let self_call = recursive_same_arg_function().body.blocks[0].terminator.clone();
+        // Targets are bb1 (the `Return` block): a terminator that jumps back to bb0 forms a
+        // loop, which the 2026-09-16 enclosing-loop gate rightly reports on a recursive
+        // body — the question here is terminator KIND, not CFG shape.
         let known_benign = [
             self_call,
-            Terminator::Goto(BlockId(0)),
+            Terminator::Goto(BlockId(1)),
             Terminator::SwitchInt {
                 discr: Operand::Constant(ConstValue::Bool(true)),
-                targets: vec![(1, BlockId(0))],
-                otherwise: BlockId(0),
+                targets: vec![(1, BlockId(1))],
+                otherwise: BlockId(1),
                 exhaustive_enum_unreachable: false,
                 span: SourceSpan::default(),
             },
@@ -3839,7 +5208,7 @@ mod tests {
                 cond: Operand::Constant(ConstValue::Bool(true)),
                 expected: true,
                 msg: AssertMessage::Custom("known benign control edge".to_string()),
-                target: BlockId(0),
+                target: BlockId(1),
                 span: SourceSpan::default(),
             },
             Terminator::Unreachable,
@@ -3889,6 +5258,7 @@ mod tests {
             unwind: trust_types::UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::helper"),
             is_foreign: false,
             func: "test::helper".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -3952,6 +5322,7 @@ mod tests {
                     unwind: trust_types::UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("test::helper"),
                     is_foreign: false,
                     func: "test::helper".to_string(),
                     args: vec![],
@@ -4259,6 +5630,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("test::rec_cs"),
                             is_foreign: false,
                             func: "test::rec_cs".to_string(),
                             args: vec![Operand::Move(Place::local(4))],
@@ -4278,6 +5650,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4553,6 +5926,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4891,6 +6265,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -4913,6 +6288,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
             unwind: UnwindEdge::Unreachable,
         }
     }
@@ -5174,7 +6550,7 @@ mod tests {
 
     /// THE CAPTURED BODY, not a synthetic one. `-Ztrust-dump=mir` of
     ///
-    /// ```ignore
+    /// ```ignore (illustrative)
     /// #[inline(never)]
     /// pub fn bad(bound: usize, counter: usize, mut step: usize, c: bool) -> usize {
     ///     if counter >= bound { return 0; }

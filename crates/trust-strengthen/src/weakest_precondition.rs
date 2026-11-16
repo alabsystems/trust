@@ -115,13 +115,270 @@ pub fn wp_transform(formula: &Formula, statement: &Statement) -> Formula {
     }
 }
 
+/// Owned-accumulator WP step used when folding statement paths right-to-left,
+/// avoiding intermediate root `Formula` clones on `Assume`, `Assert`, `Skip`,
+/// `Sequence`, and non-occurring `Assign` statements.
+fn wp_transform_owned(formula: Formula, statement: &Statement) -> Formula {
+    match statement {
+        Statement::Assign { var, expr, .. } => {
+            substitute_opt(&formula, var, expr).unwrap_or(formula)
+        }
+        Statement::Assume(condition) => {
+            Formula::Implies(Box::new(condition.clone()), Box::new(formula))
+        }
+        Statement::Assert(condition) => Formula::And(vec![condition.clone(), formula]),
+        Statement::Conditional { condition, then_branch, else_branch } => {
+            let then_wp = compute_weakest_precondition(&formula, then_branch);
+            let else_wp = compute_weakest_precondition_owned(formula, else_branch);
+            Formula::And(vec![
+                Formula::Implies(Box::new(condition.clone()), Box::new(then_wp)),
+                Formula::Implies(
+                    Box::new(Formula::Not(Box::new(condition.clone()))),
+                    Box::new(else_wp),
+                ),
+            ])
+        }
+        Statement::Loop { invariant, .. } => invariant.clone().unwrap_or(Formula::Bool(false)),
+        Statement::Sequence(stmts) => compute_weakest_precondition_owned(formula, stmts),
+        Statement::Skip => formula,
+    }
+}
+
+fn compute_weakest_precondition_owned(postcondition: Formula, path: &[Statement]) -> Formula {
+    path.iter().rev().fold(postcondition, wp_transform_owned)
+}
+
 /// Compute the weakest precondition for a sequence of statements.
 ///
 /// Processes statements right-to-left: wp(S1; S2; ... Sn, Q) by starting
 /// with Q and folding backward through the statement list.
 #[must_use]
 pub fn compute_weakest_precondition(postcondition: &Formula, path: &[Statement]) -> Formula {
-    path.iter().rev().fold(postcondition.clone(), |acc, stmt| wp_transform(&acc, stmt))
+    if path.is_empty() {
+        return postcondition.clone();
+    }
+    compute_weakest_precondition_owned(postcondition.clone(), path)
+}
+
+#[inline]
+fn substitute_slice(children: &[Formula], var: &str, expr: &Formula) -> Option<Vec<Formula>> {
+    for (idx, child) in children.iter().enumerate() {
+        if let Some(first_changed) = substitute_opt(child, var, expr) {
+            let mut out = Vec::with_capacity(children.len());
+            out.extend_from_slice(&children[..idx]);
+            out.push(first_changed);
+            for rest in &children[idx + 1..] {
+                out.push(substitute_opt(rest, var, expr).unwrap_or_else(|| rest.clone()));
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+#[inline]
+fn substitute_binary(
+    lhs: &Formula,
+    rhs: &Formula,
+    var: &str,
+    expr: &Formula,
+    ctor: impl FnOnce(Box<Formula>, Box<Formula>) -> Formula,
+) -> Option<Formula> {
+    match (substitute_opt(lhs, var, expr), substitute_opt(rhs, var, expr)) {
+        (None, None) => None,
+        (Some(l), None) => Some(ctor(Box::new(l), Box::new(rhs.clone()))),
+        (None, Some(r)) => Some(ctor(Box::new(lhs.clone()), Box::new(r))),
+        (Some(l), Some(r)) => Some(ctor(Box::new(l), Box::new(r))),
+    }
+}
+
+#[inline]
+fn substitute_ternary(
+    a: &Formula,
+    b: &Formula,
+    c: &Formula,
+    var: &str,
+    expr: &Formula,
+    ctor: impl FnOnce(Box<Formula>, Box<Formula>, Box<Formula>) -> Formula,
+) -> Option<Formula> {
+    match (
+        substitute_opt(a, var, expr),
+        substitute_opt(b, var, expr),
+        substitute_opt(c, var, expr),
+    ) {
+        (None, None, None) => None,
+        (oa, ob, oc) => Some(ctor(
+            Box::new(oa.unwrap_or_else(|| a.clone())),
+            Box::new(ob.unwrap_or_else(|| b.clone())),
+            Box::new(oc.unwrap_or_else(|| c.clone())),
+        )),
+    }
+}
+
+/// Single-pass `O(N)` capture-avoiding substitution returning `None` when `var`
+/// does not occur free in `formula` (eliminating quadratic `formula_mentions_free_var`
+/// re-walks at every AST depth and avoiding clones of unchanged subtrees).
+fn substitute_opt(formula: &Formula, var: &str, expr: &Formula) -> Option<Formula> {
+    match formula {
+        Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) | Formula::BitVec { .. } => None,
+        Formula::Var(name, _) => (name == var).then(|| expr.clone()),
+
+        Formula::Not(inner) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::Not(Box::new(next)))
+        }
+        Formula::Neg(inner) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::Neg(Box::new(next)))
+        }
+        Formula::And(children) => substitute_slice(children, var, expr).map(Formula::And),
+        Formula::Or(children) => substitute_slice(children, var, expr).map(Formula::Or),
+
+        Formula::Implies(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Implies),
+        Formula::Eq(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Eq),
+        Formula::Lt(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Lt),
+        Formula::Le(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Le),
+        Formula::Gt(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Gt),
+        Formula::Ge(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Ge),
+        Formula::Add(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Add),
+        Formula::Sub(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Sub),
+        Formula::Mul(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Mul),
+        Formula::Div(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Div),
+        Formula::Rem(lhs, rhs) => substitute_binary(lhs, rhs, var, expr, Formula::Rem),
+
+        Formula::Ite(cond, then_f, else_f) => {
+            substitute_ternary(cond, then_f, else_f, var, expr, Formula::Ite)
+        }
+
+        // Quantifiers: do NOT substitute if the variable is bound
+        Formula::Forall(bindings, body) => {
+            if bindings.iter().any(|(name, _)| name == var) {
+                None
+            } else {
+                substitute_opt(body, var, expr)
+                    .map(|next| Formula::Forall(bindings.clone(), Box::new(next)))
+            }
+        }
+        Formula::Exists(bindings, body) => {
+            if bindings.iter().any(|(name, _)| name == var) {
+                None
+            } else {
+                substitute_opt(body, var, expr)
+                    .map(|next| Formula::Exists(bindings.clone(), Box::new(next)))
+            }
+        }
+
+        // Array operations
+        Formula::Select(array, index) => {
+            substitute_binary(array, index, var, expr, Formula::Select)
+        }
+        Formula::Store(array, index, value) => {
+            substitute_ternary(array, index, value, var, expr, Formula::Store)
+        }
+        // A constant array's value is an ordinary operand; its sorts bind nothing.
+        Formula::ConstArray { index_sort, elem_sort, value } => {
+            substitute_opt(value, var, expr).map(|next| Formula::ConstArray {
+                index_sort: index_sort.clone(),
+                elem_sort: elem_sort.clone(),
+                value: Box::new(next),
+            })
+        }
+
+        // Bitvector operations: substitute both operands
+        Formula::BvAdd(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvAdd(nl, nr, w))
+        }
+        Formula::BvSub(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvSub(nl, nr, w))
+        }
+        Formula::BvMul(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvMul(nl, nr, w))
+        }
+        Formula::BvUDiv(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvUDiv(nl, nr, w))
+        }
+        Formula::BvSDiv(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvSDiv(nl, nr, w))
+        }
+        Formula::BvURem(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvURem(nl, nr, w))
+        }
+        Formula::BvSRem(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvSRem(nl, nr, w))
+        }
+        Formula::BvAnd(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvAnd(nl, nr, w))
+        }
+        Formula::BvOr(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvOr(nl, nr, w))
+        }
+        Formula::BvXor(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvXor(nl, nr, w))
+        }
+        Formula::BvNot(inner, w) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::BvNot(Box::new(next), *w))
+        }
+        Formula::BvShl(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvShl(nl, nr, w))
+        }
+        Formula::BvLShr(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvLShr(nl, nr, w))
+        }
+        Formula::BvAShr(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvAShr(nl, nr, w))
+        }
+
+        // Bitvector comparisons
+        Formula::BvULt(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvULt(nl, nr, w))
+        }
+        Formula::BvULe(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvULe(nl, nr, w))
+        }
+        Formula::BvSLt(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvSLt(nl, nr, w))
+        }
+        Formula::BvSLe(l, r, w) => {
+            let w = *w;
+            substitute_binary(l, r, var, expr, |nl, nr| Formula::BvSLe(nl, nr, w))
+        }
+
+        // Bitvector conversions
+        Formula::BvToInt(inner, w, signed) => substitute_opt(inner, var, expr)
+            .map(|next| Formula::BvToInt(Box::new(next), *w, *signed)),
+        Formula::IntToBv(inner, w) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::IntToBv(Box::new(next), *w))
+        }
+        Formula::BvExtract { inner, high, low } => {
+            substitute_opt(inner, var, expr).map(|next| Formula::BvExtract {
+                inner: Box::new(next),
+                high: *high,
+                low: *low,
+            })
+        }
+        Formula::BvConcat(l, r) => substitute_binary(l, r, var, expr, Formula::BvConcat),
+        Formula::BvZeroExt(inner, bits) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::BvZeroExt(Box::new(next), *bits))
+        }
+        Formula::BvSignExt(inner, bits) => {
+            substitute_opt(inner, var, expr).map(|next| Formula::BvSignExt(Box::new(next), *bits))
+        }
+        _ => None,
+    }
 }
 
 /// Substitute all occurrences of variable `var` with expression `expr` in a formula.
@@ -129,223 +386,7 @@ pub fn compute_weakest_precondition(postcondition: &Formula, path: &[Statement])
 /// This is the core operation for assignment WP: Q[x <- e].
 #[must_use]
 pub fn substitute(formula: &Formula, var: &str, expr: &Formula) -> Formula {
-    match formula {
-        Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) | Formula::BitVec { .. } => {
-            formula.clone()
-        }
-
-        Formula::Var(name, _sort) => {
-            if name == var {
-                expr.clone()
-            } else {
-                formula.clone()
-            }
-        }
-
-        Formula::Not(inner) => Formula::Not(Box::new(substitute(inner, var, expr))),
-
-        Formula::And(children) => {
-            Formula::And(children.iter().map(|c| substitute(c, var, expr)).collect())
-        }
-
-        Formula::Or(children) => {
-            Formula::Or(children.iter().map(|c| substitute(c, var, expr)).collect())
-        }
-
-        Formula::Implies(lhs, rhs) => Formula::Implies(
-            Box::new(substitute(lhs, var, expr)),
-            Box::new(substitute(rhs, var, expr)),
-        ),
-
-        Formula::Eq(lhs, rhs) => {
-            Formula::Eq(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Lt(lhs, rhs) => {
-            Formula::Lt(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Le(lhs, rhs) => {
-            Formula::Le(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Gt(lhs, rhs) => {
-            Formula::Gt(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Ge(lhs, rhs) => {
-            Formula::Ge(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Add(lhs, rhs) => {
-            Formula::Add(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Sub(lhs, rhs) => {
-            Formula::Sub(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Mul(lhs, rhs) => {
-            Formula::Mul(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Div(lhs, rhs) => {
-            Formula::Div(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Rem(lhs, rhs) => {
-            Formula::Rem(Box::new(substitute(lhs, var, expr)), Box::new(substitute(rhs, var, expr)))
-        }
-
-        Formula::Neg(inner) => Formula::Neg(Box::new(substitute(inner, var, expr))),
-
-        Formula::Ite(cond, then_f, else_f) => Formula::Ite(
-            Box::new(substitute(cond, var, expr)),
-            Box::new(substitute(then_f, var, expr)),
-            Box::new(substitute(else_f, var, expr)),
-        ),
-
-        // Quantifiers: do NOT substitute if the variable is bound
-        Formula::Forall(bindings, body) => {
-            if bindings.iter().any(|(name, _)| name == var) {
-                formula.clone() // var is shadowed by the quantifier
-            } else {
-                Formula::Forall(bindings.clone(), Box::new(substitute(body, var, expr)))
-            }
-        }
-
-        Formula::Exists(bindings, body) => {
-            if bindings.iter().any(|(name, _)| name == var) {
-                formula.clone() // var is shadowed by the quantifier
-            } else {
-                Formula::Exists(bindings.clone(), Box::new(substitute(body, var, expr)))
-            }
-        }
-
-        // Array operations
-        Formula::Select(array, index) => Formula::Select(
-            Box::new(substitute(array, var, expr)),
-            Box::new(substitute(index, var, expr)),
-        ),
-
-        Formula::Store(array, index, value) => Formula::Store(
-            Box::new(substitute(array, var, expr)),
-            Box::new(substitute(index, var, expr)),
-            Box::new(substitute(value, var, expr)),
-        ),
-
-        // Bitvector operations: substitute both operands
-        Formula::BvAdd(l, r, w) => Formula::BvAdd(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvSub(l, r, w) => Formula::BvSub(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvMul(l, r, w) => Formula::BvMul(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvUDiv(l, r, w) => Formula::BvUDiv(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvSDiv(l, r, w) => Formula::BvSDiv(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvURem(l, r, w) => Formula::BvURem(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvSRem(l, r, w) => Formula::BvSRem(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvAnd(l, r, w) => Formula::BvAnd(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvOr(l, r, w) => Formula::BvOr(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvXor(l, r, w) => Formula::BvXor(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvNot(inner, w) => Formula::BvNot(Box::new(substitute(inner, var, expr)), *w),
-        Formula::BvShl(l, r, w) => Formula::BvShl(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvLShr(l, r, w) => Formula::BvLShr(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvAShr(l, r, w) => Formula::BvAShr(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-
-        // Bitvector comparisons
-        Formula::BvULt(l, r, w) => Formula::BvULt(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvULe(l, r, w) => Formula::BvULe(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvSLt(l, r, w) => Formula::BvSLt(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-        Formula::BvSLe(l, r, w) => Formula::BvSLe(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-            *w,
-        ),
-
-        // Bitvector conversions
-        Formula::BvToInt(inner, w, signed) => {
-            Formula::BvToInt(Box::new(substitute(inner, var, expr)), *w, *signed)
-        }
-        Formula::IntToBv(inner, w) => Formula::IntToBv(Box::new(substitute(inner, var, expr)), *w),
-        Formula::BvExtract { inner, high, low } => Formula::BvExtract {
-            inner: Box::new(substitute(inner, var, expr)),
-            high: *high,
-            low: *low,
-        },
-        Formula::BvConcat(l, r) => Formula::BvConcat(
-            Box::new(substitute(l, var, expr)),
-            Box::new(substitute(r, var, expr)),
-        ),
-        Formula::BvZeroExt(inner, bits) => {
-            Formula::BvZeroExt(Box::new(substitute(inner, var, expr)), *bits)
-        }
-        Formula::BvSignExt(inner, bits) => {
-            Formula::BvSignExt(Box::new(substitute(inner, var, expr)), *bits)
-        }
-        _ => formula.clone(),
-    }
+    substitute_opt(formula, var, expr).unwrap_or_else(|| formula.clone())
 }
 
 #[cfg(test)]
@@ -824,5 +865,54 @@ mod tests {
                 Formula::Eq(Box::new(var("x")), Box::new(var("old_x"))),
             ])
         );
+    }
+
+    #[test]
+    fn wave492_substitute_opt_and_wp_owned_match_oracle() {
+        let deep = Formula::And(vec![
+            Formula::Gt(Box::new(var("untouched_a")), Box::new(int(0))),
+            Formula::Forall(
+                vec![("x".into(), Sort::Int)],
+                Box::new(Formula::Gt(Box::new(var("x")), Box::new(int(1)))),
+            ),
+            Formula::Or(vec![
+                Formula::Lt(Box::new(var("untouched_b")), Box::new(int(10))),
+                Formula::Ite(
+                    Box::new(Formula::Eq(Box::new(var("x")), Box::new(int(2)))),
+                    Box::new(Formula::BvAdd(Box::new(bv_var("x", 32)), Box::new(bv_var("z", 32)), 32)),
+                    Box::new(bv_var("z", 32)),
+                ),
+            ]),
+        ]);
+        assert!(substitute_opt(&deep, "missing_var", &int(99)).is_none());
+
+        let replaced = substitute(&deep, "x", &var("w"));
+        let expected = Formula::And(vec![
+            Formula::Gt(Box::new(var("untouched_a")), Box::new(int(0))),
+            Formula::Forall(
+                vec![("x".into(), Sort::Int)],
+                Box::new(Formula::Gt(Box::new(var("x")), Box::new(int(1)))),
+            ),
+            Formula::Or(vec![
+                Formula::Lt(Box::new(var("untouched_b")), Box::new(int(10))),
+                Formula::Ite(
+                    Box::new(Formula::Eq(Box::new(var("w")), Box::new(int(2)))),
+                    Box::new(Formula::BvAdd(Box::new(var("w")), Box::new(bv_var("z", 32)), 32)),
+                    Box::new(bv_var("z", 32)),
+                ),
+            ]),
+        ]);
+        assert_eq!(replaced, expected);
+
+        let path = vec![
+            Statement::Assume(Formula::Gt(Box::new(var("w")), Box::new(int(0)))),
+            Statement::Skip,
+            assign("unused", int(7)),
+            assign("x", var("w")),
+        ];
+        let wp_via_path = compute_weakest_precondition(&deep, &path);
+        let wp_via_ref =
+            path.iter().rev().fold(deep.clone(), |acc, stmt| wp_transform(&acc, stmt));
+        assert_eq!(wp_via_path, wp_via_ref);
     }
 }

@@ -1,0 +1,21 @@
+# NOTE: Do not autogenerate
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# RUN: python3 %s 8000 | tpde-llc --target=x86_64 | %objdump | FileCheck %s
+# RUN: python3 %s 8000 | tpde-llc --target=aarch64 | %objdump | FileCheck %s
+
+# Test for a function call with many arguments.
+
+# CHECK: <f>:
+
+import sys
+
+n = int(sys.argv[1])
+print(f"declare void @g(i32{', i32 ' * n})")
+print("define void @f(ptr %p) {")
+for i in range(n):
+    print(f"  %l{i} = load volatile i32, ptr %p")
+print("  call void @g(i32 0" + "".join(f", i32 %l{i}" for i in range(n)) + ")")
+print("  ret void")
+print('}')

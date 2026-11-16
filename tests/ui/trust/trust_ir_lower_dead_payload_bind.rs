@@ -1,7 +1,9 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
 //@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
-#![feature(box_patterns)]
+// Upstream 1.101: `box` patterns were removed; `deref_patterns` is the
+// replacement spelling for binding through a `Box`.
+#![feature(deref_patterns)]
 //! Trust (wave-UPB): an enum payload binding that is PROVABLY UNREAD is
 //! SKIPPED, not read. Both arms are pure skips — no bind pushed, no
 //! instruction emitted, no pointer minted, no bytes read — so every attack
@@ -24,7 +26,7 @@ pub enum E {
 /// Dead `box` bindings in every spelling, plus a dead `ref mut`.
 pub fn dead_binds(e: &mut E) -> u32 {
     match e {
-        E::V(box _) => 1,
+        E::V(deref!(_)) => 1,
         E::W(ref mut _q) => 2,
     }
 }
@@ -32,7 +34,7 @@ pub fn dead_binds(e: &mut E) -> u32 {
 /// The fence: the identical shape with the binding READ must still bind it.
 pub fn live_bind_still_read(e: E) -> u32 {
     match e {
-        E::V(box b) => b + 10,
+        E::V(deref!(b)) => b + 10,
         E::W(w) => w + 20,
     }
 }

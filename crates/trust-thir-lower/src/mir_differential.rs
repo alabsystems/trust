@@ -359,6 +359,18 @@ fn report(
     }
 }
 
+/// Does a `TRUST_DIFF_CANON_DUMP` def-path substring select `def`?
+///
+/// `with_no_trimmed_paths!` because this is a FILTER COMPARISON, not diagnostic text. A bare
+/// `def_path_str` runs the `trimmed_def_paths` query, which arms rustc's `must_produce_diag`: a
+/// differential mismatch is a coverage row, not a diagnostic, so with the dump variable set a
+/// crate that compiles without emitting one ICEs at `DiagCtxt` teardown. Trimming would also make
+/// the substring test depend on which other names happen to be importable in this compilation.
+fn canon_dump_filter_selects_this_def(tcx: TyCtxt<'_>, def: LocalDefId, want: &str) -> bool {
+    rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def.to_def_id()))
+        .contains(want)
+}
+
 /// Compare the shim-derived MIR against the freshly THIR-built MIR for one body.
 ///
 /// `built` is the in-scope `Body` the `mir_built` hook holds (never a query — cycle-safe,
@@ -376,6 +388,16 @@ pub fn compare_derived<'tcx>(
             tcx,
             DerivedVerdict::DerivedUnsupported,
             format!("producer: {} unsupported THIR shape(s)", lowered.unsupported.len()),
+            NO_NORMS,
+        );
+    }
+    // A concrete liberated signature does not retire the declared opaque provenance of the
+    // unsubstituted body. Decline before the shim can manufacture an agreement at that type.
+    if lowered.unsubstituted_opaque_return {
+        return report(
+            tcx,
+            DerivedVerdict::DerivedUnsupported,
+            "unsubstituted body declares an opaque return (coverage-only)",
             NO_NORMS,
         );
     }
@@ -597,8 +619,14 @@ pub fn compare_derived<'tcx>(
         match (canon_markers(&vf_built.body), canon_markers(&vf_derived.body)) {
             (Ok(mb), Ok(md)) => {
                 if mb == md {
-                    r.markers_exact = true;
-                    r.markers_detail = format!("{} marker line(s) identical", mb.len());
+                    // Trust (F3 rework): the same storage rule over the REAL derived body, whose
+                    // assert messages carry operands the extraction drops.
+                    if let Some(why) = mir_storage_dead_use(&derived.body) {
+                        r.markers_detail = format!("marker channel(derived MIR): {why}");
+                    } else {
+                        r.markers_exact = true;
+                        r.markers_detail = format!("{} marker line(s) identical", mb.len());
+                    }
                 } else {
                     r.markers_detail = format!("markers differ: {}", first_diff(&mb, &md));
                 }
@@ -618,7 +646,7 @@ pub fn compare_derived<'tcx>(
     let detail = match std::env::var("TRUST_DIFF_CANON_DUMP") {
         Ok(want)
             if !want.is_empty()
-                && (want == "1" || tcx.def_path_str(def.to_def_id()).contains(&want)) =>
+                && (want == "1" || canon_dump_filter_selects_this_def(tcx, def, &want)) =>
         {
             format!(
                 "{detail}\n--- built ({} lines) ---\n{}\n--- derived ({} lines) ---\n{}",
@@ -737,21 +765,14 @@ fn benign_unwind<'tcx>(body: &mir::Body<'tcx>, ua: &mir::UnwindAction) -> Result
     }
 }
 
-/// Collect every `Call`'s pinned payload (`RawCall`) in the canonical DFS preorder, while
-/// verifying per-terminator fragment shape: `Call` needs a `Some` return target, a benign
-/// unwind, and a `Constant` func operand of interned `FnDef` type; `Assert` needs a benign
-/// unwind; `FalseEdge`/`FalseUnwind` follow their REAL target — exactly the extraction's
-/// convention (`convert_terminator`), so this walk visits the same blocks the semantic
-/// channel reasons about. Any other terminator fails closed.
 /// Trust (B4 de-risk pre-tranche, RFC TRUST_IR_V2 §B4): the borrow kind of ONE callee
 /// parameter, read from the callee's instantiated signature.
 ///
 /// `NotARef` is a POSITIVE claim ("this parameter is not a reference"), so it is only ever
 /// minted where the signature was actually consulted. "We could not consult a signature" is
-/// spelled by a `None` ENTRY in [`arg_borrow_kinds_in_dfs_order`], never by a vec of `NotARef`
-/// — an absent record must deny the consumer a permission, not grant one.
+/// spelled by an ABSENT entry in [`CallArgKinds`], never by a vec of `NotARef` — an absent
+/// record must deny the consumer a permission, not grant one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Trust: INERT until the escape classifier consumes it (see below).
 pub(crate) enum ArgBorrowKind {
     /// Not a reference (`i32`, `String`, a raw pointer, ...). A RAW POINTER is deliberately
     /// here and not in `Shared`: `*const T` carries no no-write guarantee (the callee may cast
@@ -765,41 +786,26 @@ pub(crate) enum ArgBorrowKind {
     Mut,
 }
 
-/// Trust (B4 de-risk pre-tranche): per-ARG borrow kinds for every call, in the SAME canonical
-/// DFS preorder [`raw_calls_in_dfs_order`] produces — index `i` here describes call `#i` there.
+/// Trust (B4 de-risk pre-tranche): per-CALL argument borrow kinds keyed by ORIGINAL BLOCK ID
+/// — the form `canonicalize` consumes (see [`Graph::arg_kinds`]).
 ///
 /// WHY THIS EXISTS. `mir_differential` has two walks over two types: the call channel walks a
 /// rustc `mir::Body` WITH `tcx`, while `canonicalize` — which owns the escape classification
 /// ("ref local _N used by value (escape) outside fragment") — walks a `VerifiableBody` with no
 /// `tcx` and no rustc types. A signature fact the classifier needs must therefore be CARRIED.
-/// The eventual use is B4's pre-tranche: a scalar slot whose address reaches a `&T` parameter
-/// cannot be written through, so the conservative set can shrink per ARG instead of per CALL.
+/// Its use is the shared-parameter exemption: a `&T` parameter with `T: Freeze` cannot be
+/// written through, so the escape check can relax per ARG instead of per CALL (see
+/// [`operand_expr_call_arg`]).
 ///
-/// WHY IT DERIVES FROM `raw_calls_in_dfs_order` RATHER THAN RE-WALKING. Keying these facts to
-/// the wrong argument would hand a no-write exemption to a parameter that IS written — the
-/// manufactured-agreement failure mode, the one this comparator exists to prevent. Deriving
-/// from the same list that pins callee identity makes the alignment hold BY CONSTRUCTION
-/// rather than by a second traversal that has to be kept in sync: the caller collects `b_calls`
-/// and `d_calls` in this same order and has already proven them equal callee-for-callee, so
-/// ordinal `i` denotes the same callee on both sides.
-///
-/// A `None` entry means NOT RECORDED — a non-`FnDef` callee (fn pointer / indirect call), or a
-/// signature whose inputs cannot be read. Consumers must treat `None` as
-/// conservative-everything. Never returns a partial vec for a call.
-///
-/// Per-CALL argument borrow kinds keyed by ORIGINAL BLOCK ID — the form `canonicalize`
-/// consumes (see [`Graph::arg_kinds`]).
-///
-/// WHY A SECOND KEYING EXISTS BESIDE [`arg_borrow_kinds_in_dfs_order`]. That one is keyed by
-/// DFS ordinal and derives from `raw_calls_in_dfs_order`, which makes its alignment hold by
-/// construction FOR THE CALL CHANNEL — the caller collects `b_calls`/`d_calls` in the same
-/// order and proves them equal callee-for-callee, so ordinal `i` denotes the same callee on
-/// both sides. That argument does NOT carry to the classifier, which walks a
-/// `VerifiableBody`, a different IR: matching a DFS ordinal produced by walking
-/// `mir::Body` against a position in a walk of `VerifiableBody` reintroduces exactly the
-/// keeping-two-traversals-in-sync problem, and a mis-key here hands a no-write exemption to
-/// a parameter that IS written — the manufactured-agreement failure this comparator exists
-/// to prevent.
+/// WHY BLOCK-KEYED AND NOT KEYED BY THE CALL CHANNEL'S DFS ORDINAL. The ordinal of
+/// [`raw_calls_in_dfs_order`] aligns by construction FOR THE CALL CHANNEL — the caller
+/// collects `b_calls`/`d_calls` in the same order and proves them equal callee-for-callee, so
+/// ordinal `i` denotes the same callee on both sides. That argument does NOT carry to the
+/// classifier, which walks a `VerifiableBody`, a different IR: matching a DFS ordinal produced
+/// by walking `mir::Body` against a position in a walk of `VerifiableBody` reintroduces
+/// exactly the keeping-two-traversals-in-sync problem, and a mis-key here hands a no-write
+/// exemption to a parameter that IS written — the manufactured-agreement failure this
+/// comparator exists to prevent.
 ///
 /// A block id is a TOTAL key instead, and it survives end to end: a MIR block has exactly
 /// one terminator (hence at most one call), `convert.rs` stamps
@@ -808,8 +814,8 @@ pub(crate) enum ArgBorrowKind {
 /// STATEMENTS, not blocks. So the `b` the classifier holds IS the rustc block index and the
 /// lookup is local, with no cross-IR correspondence to maintain.
 ///
-/// AN ABSENT ENTRY MEANS NOT RECORDED and must DENY the exemption — never grant it. Same
-/// discipline as the `None` entry in the DFS-ordered form.
+/// AN ABSENT ENTRY MEANS NOT RECORDED and must DENY the exemption — never grant it. A
+/// non-`FnDef` callee (fn pointer / indirect call) is the case that produces one.
 pub(crate) type CallArgKinds = HashMap<usize, Vec<ArgBorrowKind>>;
 
 /// [`CallArgKinds`] for `body`: for every block whose terminator is a `Call` with an interned
@@ -819,13 +825,11 @@ pub(crate) type CallArgKinds = HashMap<usize, Vec<ArgBorrowKind>>;
 /// Blocks with a non-`FnDef` callee (fn pointer / indirect call) get NO entry, which the
 /// consumer must read as conservative-everything. A call is never given a partial vec.
 ///
-/// The classification is [`arg_borrow_kinds_in_dfs_order`]'s, extracted so both keyings mint
-/// `Shared` under exactly one rule — including the `Freeze` requirement, whose absence would
-/// hand the exemption to `&Cell<U>`.
+/// Every kind is minted by [`arg_borrow_kind_of`], the one rule for `Shared` — including the
+/// `Freeze` requirement, whose absence would hand the exemption to `&Cell<U>`.
 ///
-/// INERT: nothing consumes the exemption yet. See [`operand_expr_call_arg`] for the one
-/// question that must be answered before it can be enabled.
-#[allow(dead_code)] // Trust: INERT — see above.
+/// Called by [`compare_derived`] for BOTH bodies; the kinds reach
+/// [`operand_expr_call_arg`] through [`Graph::arg_kinds`].
 fn arg_borrow_kinds_by_block<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,
@@ -836,7 +840,7 @@ fn arg_borrow_kinds_by_block<'tcx>(
         let mir::TerminatorKind::Call { func, .. } = &term.kind else { continue };
         let Some(fn_ty) = func.constant().map(|c| c.const_.ty()) else { continue };
         let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() else { continue };
-        let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder();
+        let sig = tcx.fn_sig(*def_id).instantiate(tcx, args.skip_binder()).skip_binder();
         out.insert(bb.as_usize(), sig.inputs().iter().map(|t| arg_borrow_kind_of(tcx, *t)).collect());
     }
     out
@@ -844,9 +848,9 @@ fn arg_borrow_kinds_by_block<'tcx>(
 
 /// The ONE rule that mints an [`ArgBorrowKind`] from a parameter type.
 ///
-/// Extracted so the DFS-ordered and block-keyed collectors cannot drift: a `Shared` minted
-/// under a weaker rule in one of them would be a silent hole, and this classification is the
-/// entire basis of the no-write exemption.
+/// Kept as the ONE mint site so no collector can drift from it: a `Shared` minted under a
+/// weaker rule anywhere would be a silent hole, and this classification is the entire basis
+/// of the no-write exemption.
 fn arg_borrow_kind_of<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     t: rustc_middle::ty::Ty<'tcx>,
@@ -894,35 +898,12 @@ fn arg_borrow_kind_of<'tcx>(
     }
 }
 
-/// INERT AS OF THIS COMMIT: nothing reads the result yet. It is landed and proved
-/// behaviour-neutral first so the classifier change that consumes it is a small diff with a
-/// clean before/after — the same two-step used for the topological intern (#174).
-#[allow(dead_code)] // Trust: INERT — see above.
-fn arg_borrow_kinds_in_dfs_order<'tcx>(
-    tcx: rustc_middle::ty::TyCtxt<'tcx>,
-    calls: &[RawCall<'tcx>],
-) -> Vec<Option<Vec<ArgBorrowKind>>> {
-    calls
-        .iter()
-        .map(|(fn_ty, _arity, _normal)| {
-            let rustc_middle::ty::TyKind::FnDef(def_id, args) = fn_ty.kind() else {
-                return None;
-            };
-            let sig = tcx.fn_sig(*def_id).instantiate(tcx, args).skip_binder();
-            Some(
-                // Trust (2026-08-20): this used to inline a SECOND copy of the classification,
-                // which is precisely the drift `arg_borrow_kind_of`'s doc comment says the
-                // extraction exists to prevent — and the copy did not carry the escaping
-                // bound-var guard, so a future consumer of this INERT keying would have
-                // inherited the `&dyn Trait` ICE verbatim. Both keyings now mint through the
-                // one rule; the A6 interior-mutability reasoning that stood here lives on that
-                // function, next to the guard, rather than being duplicated and re-drifting.
-                sig.inputs().iter().map(|t| arg_borrow_kind_of(tcx, *t)).collect(),
-            )
-        })
-        .collect()
-}
-
+/// Collect every `Call`'s pinned payload (`RawCall`) in the canonical DFS preorder, while
+/// verifying per-terminator fragment shape: `Call` needs a `Some` return target, a benign
+/// unwind, and a `Constant` func operand of interned `FnDef` type; `Assert` needs a benign
+/// unwind; `FalseEdge`/`FalseUnwind` follow their REAL target — exactly the extraction's
+/// convention (`convert_terminator`), so this walk visits the same blocks the semantic
+/// channel reasons about. Any other terminator fails closed.
 fn raw_calls_in_dfs_order<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,
@@ -942,7 +923,7 @@ fn raw_calls_in_dfs_order<'tcx>(
         seen[bb.as_usize()] = true;
         let term = body.basic_blocks[bb].terminator();
         let succs: Vec<mir::BasicBlock> = match &term.kind {
-            mir::TerminatorKind::Goto { target } => vec![*target],
+            mir::TerminatorKind::Goto { target, .. } => vec![*target],
             mir::TerminatorKind::SwitchInt { targets, .. } => {
                 let mut v: Vec<mir::BasicBlock> = targets.iter().map(|(_, t)| t).collect();
                 v.push(targets.otherwise());
@@ -3466,32 +3447,12 @@ fn place_expr(place: &Place, env: &Env) -> CanonResult<String> {
     Ok(expr)
 }
 
-/// Symbolic expression for an operand. `Copy` and `Move` both read the place's current value
-/// (see module docs for why that is sound in this scalar fragment).
-///
-/// Trust (wave-GH2) L8 CAVEAT: the fold's original premise — "move-ness only matters to
-/// borrowck/analysis, which never see the derived body" — is FALSE for one codegen-visible shape:
-/// a MEMORY-ABI (indirectly passed) struct call ARG. codegen_ssa gives a memory-backed `Copy` arg
-/// a defensive fresh-alloca+memcpy while `Move` passes the place's own address, so a Copy-vs-Move
-/// skew there is correct-but-byte-DIVERGENT object code. The comparator deliberately KEEPS the
-/// fold (canonical VALUE equality is the right semantics here); the parity is enforced where it
-/// belongs: the shim re-spells one-shot struct call-result temps as `Move` (built's as_operand
-/// discipline), and `flip.rs::gate_derived_body` fail-closes any residual memory-ABI whole-struct
-/// `Copy` call arg. Immediate/Pair operands remain genuinely spelling-blind in codegen.
 /// [`operand_expr`] for an operand in ARGUMENT position, told whether the callee's matching
 /// parameter is `&T` with `T: Freeze` ([`ArgBorrowKind::Shared`]).
 ///
-/// TODAY THIS IS EXACTLY `operand_expr`. `shared_exempt` is plumbed and honestly derived —
-/// block-keyed ([`CallArgKinds`]), `Freeze`-guarded at the mint — but it grants NOTHING yet,
-/// so this lane is behaviour-neutral by construction. That is deliberate, and it is the same
-/// two-step [`arg_borrow_kinds_in_dfs_order`] used: land the fact, prove it changes nothing,
-/// then change behaviour in a diff small enough to argue about.
-///
-/// WHAT THE EXEMPTION WOULD PERMIT. `place_expr` fails closed on a by-value read of a
-/// `refs`-bound local — "ref local _N used by value (escape) outside fragment" — because the
-/// referent is a body-local snapshot. `Shared` answers one objection to admitting it: the
-/// callee provably cannot WRITE through the parameter, so the alias cannot be invalidated by
-/// the call.
+/// `shared_exempt` is derived block-keyed ([`CallArgKinds`], `Freeze`-guarded at the mint)
+/// and it ACTS: when set, a bare by-value read of a `refs`-bound local renders as an escape
+/// address (`ref(eN)`) instead of failing closed. Unset, this is exactly `operand_expr`.
 ///
 /// WHAT IT PERMITS, AND WHY THAT IS SOUND. `place_expr` fails closed on a by-value read of a
 /// `refs`-bound local — "ref local _N used by value (escape) outside fragment" — because the
@@ -3537,6 +3498,18 @@ fn operand_expr_call_arg(
     operand_expr(op, env, norms)
 }
 
+/// Symbolic expression for an operand. `Copy` and `Move` both read the place's current value
+/// (see module docs for why that is sound in this scalar fragment).
+///
+/// Trust (wave-GH2) L8 CAVEAT: the fold's original premise — "move-ness only matters to
+/// borrowck/analysis, which never see the derived body" — is FALSE for one codegen-visible shape:
+/// a MEMORY-ABI (indirectly passed) struct call ARG. codegen_ssa gives a memory-backed `Copy` arg
+/// a defensive fresh-alloca+memcpy while `Move` passes the place's own address, so a Copy-vs-Move
+/// skew there is correct-but-byte-DIVERGENT object code. The comparator deliberately KEEPS the
+/// fold (canonical VALUE equality is the right semantics here); the parity is enforced where it
+/// belongs: the shim re-spells one-shot struct call-result temps as `Move` (built's as_operand
+/// discipline), and `flip.rs::gate_derived_body` fail-closes any residual memory-ABI whole-struct
+/// `Copy` call arg. Immediate/Pair operands remain genuinely spelling-blind in codegen.
 fn operand_expr(op: &Operand, env: &Env, norms: &NormCounter) -> CanonResult<String> {
     match op {
         Operand::Copy(p) => place_expr(p, env),
@@ -3581,6 +3554,259 @@ fn const_expr(cv: &ConstValue) -> CanonResult<String> {
     }
 }
 
+/// Trust (F3, reworked 2026-09-29 after the review): every access one `Assign` makes, in
+/// evaluation order, as `(local, kind)`: `r` a read (an operand, a `Discriminant`/`Len`/
+/// `CopyForDeref` place, an `Index` local, the pointer a `Deref` projection reads), `w` a
+/// direct write (the destination with no `Deref`), `&` a borrow (`&`/`&raw` of a place
+/// rooted at the local without a `Deref`), and `*` an access THROUGH a pointer (any place
+/// with a `Deref` projection — the pointee is unknown, so it is recorded body-wide).
+fn place_accesses(p: &Place, kind: char, out: &mut Vec<(usize, char)>) {
+    let through = p.projections.iter().any(|pr| matches!(pr, Projection::Deref));
+    out.push((p.local, if through { 'r' } else { kind }));
+    for pr in &p.projections {
+        if let Projection::Index(l) = pr {
+            out.push((*l, 'r'));
+        }
+    }
+    if through {
+        out.push((usize::MAX, '*'));
+    }
+}
+
+fn operand_accesses(o: &Operand, out: &mut Vec<(usize, char)>) -> CanonResult<()> {
+    match o {
+        Operand::Copy(p) | Operand::Move(p) => place_accesses(p, 'r', out),
+        Operand::Constant(_) => {}
+        _ => return Err("marker channel: operand outside fragment".to_string()),
+    }
+    Ok(())
+}
+
+fn statement_accesses(s: &Statement) -> CanonResult<Vec<(usize, char)>> {
+    let mut out = Vec::new();
+    match s {
+        Statement::Assign { place, rvalue, .. } => {
+            match rvalue {
+                Rvalue::Use(o) | Rvalue::UnaryOp(_, o) | Rvalue::Cast(o, _) | Rvalue::Repeat(o, _) => {
+                    operand_accesses(o, &mut out)?
+                }
+                Rvalue::BinaryOp(_, a, b)
+                | Rvalue::CheckedBinaryOp(_, a, b)
+                | Rvalue::UncheckedBinaryOp(_, a, b) => {
+                    operand_accesses(a, &mut out)?;
+                    operand_accesses(b, &mut out)?;
+                }
+                Rvalue::Ref { place: p, .. } | Rvalue::AddressOf(_, p) => {
+                    place_accesses(p, '&', &mut out)
+                }
+                Rvalue::Aggregate(_, ops) => {
+                    for o in ops {
+                        operand_accesses(o, &mut out)?;
+                    }
+                }
+                Rvalue::Discriminant(p) | Rvalue::Len(p) | Rvalue::CopyForDeref(p) => {
+                    place_accesses(p, 'r', &mut out)
+                }
+                Rvalue::PtrOffset { ptr, count } => {
+                    operand_accesses(ptr, &mut out)?;
+                    operand_accesses(count, &mut out)?;
+                }
+                _ => return Err("marker channel: rvalue outside fragment".to_string()),
+            }
+            place_accesses(place, 'w', &mut out);
+        }
+        // `PlaceMention` emits no code (LEDGER L1) but rustc's own storage check counts it as
+        // a use, so the liveness core sees it; the rendering does not.
+        Statement::PlaceMention(p) => place_accesses(p, 'm', &mut out),
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// The accesses a (fine-walk-admitted) terminator makes: the switch discriminant, the assert
+/// condition, every call argument and the call destination, `_0` at `return`. A `Call` also
+/// records `*`: the callee may access through any pointer it can reach.
+fn terminator_accesses(t: &Terminator) -> CanonResult<Vec<(usize, char)>> {
+    let mut out = Vec::new();
+    match t {
+        Terminator::SwitchInt { discr, .. } => operand_accesses(discr, &mut out)?,
+        Terminator::Assert { cond, .. } => operand_accesses(cond, &mut out)?,
+        Terminator::Call { args, dest, .. } => {
+            for a in args {
+                operand_accesses(a, &mut out)?;
+            }
+            place_accesses(dest, 'w', &mut out);
+            out.push((usize::MAX, '*'));
+        }
+        Terminator::Return => out.push((0, 'r')),
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// Trust (F3 rework): one storage event of the liveness core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageEvent {
+    Live(usize),
+    Dead(usize),
+    Use(usize),
+}
+
+/// Trust (F3 rework): rustc's `-Zlint-mir` storage rule (`rustc_mir_transform/src/lint.rs`:
+/// "use of local, which has no storage here"), TyCtxt-free: a MAYBE-STORAGE-DEAD forward
+/// dataflow (`MaybeStorageDead`: `StorageDead` gens, `StorageLive` kills, join = union; at
+/// entry every tracked local above `arg_count` — a local with any marker — is dead), and the
+/// FIRST use of a local while it may be storage-dead. `blocks[i]` is block `i`'s events in
+/// order and its successors; blocks not reachable from block 0 are not checked.
+pub(crate) fn first_storage_dead_use(
+    blocks: &[(Vec<StorageEvent>, Vec<usize>)],
+    arg_count: usize,
+) -> Option<(usize, usize)> {
+    let mut tracked: HashSet<usize> = HashSet::new();
+    for (events, _) in blocks {
+        for e in events {
+            if let StorageEvent::Live(l) | StorageEvent::Dead(l) = e {
+                tracked.insert(*l);
+            }
+        }
+    }
+    if blocks.is_empty() || tracked.is_empty() {
+        return None;
+    }
+    let transfer = |state: &mut HashSet<usize>, e: &StorageEvent| match e {
+        StorageEvent::Live(l) => {
+            state.remove(l);
+        }
+        StorageEvent::Dead(l) => {
+            state.insert(*l);
+        }
+        StorageEvent::Use(_) => {}
+    };
+    let mut entry: Vec<Option<HashSet<usize>>> = vec![None; blocks.len()];
+    entry[0] = Some(tracked.iter().copied().filter(|l| *l > arg_count).collect());
+    let mut work = vec![0usize];
+    while let Some(b) = work.pop() {
+        let mut state = entry[b].clone().unwrap_or_default();
+        for e in &blocks[b].0 {
+            transfer(&mut state, e);
+        }
+        for &s in &blocks[b].1 {
+            if s >= blocks.len() {
+                continue;
+            }
+            let grown = match &mut entry[s] {
+                Some(prev) => {
+                    let before = prev.len();
+                    prev.extend(state.iter().copied());
+                    prev.len() != before
+                }
+                slot @ None => {
+                    *slot = Some(state.clone());
+                    true
+                }
+            };
+            if grown {
+                work.push(s);
+            }
+        }
+    }
+    for (b, (events, _)) in blocks.iter().enumerate() {
+        let Some(mut state) = entry[b].clone() else { continue };
+        for e in events {
+            transfer(&mut state, e);
+            if let StorageEvent::Use(l) = e {
+                if state.contains(l) {
+                    return Some((b, *l));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The liveness core's input from an extracted body: every fine-walk block's markers and
+/// accesses in order, and its fine-walk successors (unwind edges are dropped, as in the marker
+/// walk; a block outside the walk contributes nothing — `canon_markers` refuses a marker there
+/// on its own).
+fn verifiable_storage_events(
+    body: &VerifiableBody,
+    walked: &HashMap<usize, usize>,
+    raw_succs: &dyn Fn(usize) -> CanonResult<Vec<usize>>,
+) -> CanonResult<Vec<(Vec<StorageEvent>, Vec<usize>)>> {
+    let mut out = Vec::with_capacity(body.blocks.len());
+    for (i, bb) in body.blocks.iter().enumerate() {
+        if !walked.contains_key(&i) {
+            out.push((Vec::new(), Vec::new()));
+            continue;
+        }
+        let mut events = Vec::new();
+        for st in &bb.stmts {
+            match st {
+                Statement::StorageLive(l) => events.push(StorageEvent::Live(*l)),
+                Statement::StorageDead(l) => events.push(StorageEvent::Dead(*l)),
+                _ => {
+                    for (l, k) in statement_accesses(st)? {
+                        if k != '*' {
+                            events.push(StorageEvent::Use(l));
+                        }
+                    }
+                }
+            }
+        }
+        let succs = raw_succs(i)?;
+        for (l, k) in terminator_accesses(&bb.terminator)? {
+            if k != '*' {
+                events.push(StorageEvent::Use(l));
+            }
+        }
+        out.push((events, succs));
+    }
+    Ok(out)
+}
+
+/// Trust (F3 rework): the liveness core over the REAL derived MIR body, so every use rustc's
+/// own `Visitor` sees — assert-message operands, call operands, projections — is checked,
+/// with `PlaceContext::is_use()` exactly as `lint.rs` applies it. TyCtxt-free; `None` = every
+/// use is inside its local's storage.
+pub(crate) fn mir_storage_dead_use(body: &mir::Body<'_>) -> Option<String> {
+    use rustc_middle::mir::visit::{PlaceContext, Visitor};
+    struct Uses(Vec<StorageEvent>);
+    impl<'tcx> Visitor<'tcx> for Uses {
+        fn visit_local(&mut self, local: mir::Local, context: PlaceContext, _: mir::Location) {
+            if context.is_use() {
+                self.0.push(StorageEvent::Use(local.as_usize()));
+            }
+        }
+    }
+    let mut blocks = Vec::with_capacity(body.basic_blocks.len());
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        let mut events = Vec::new();
+        for (i, st) in data.statements.iter().enumerate() {
+            let loc = mir::Location { block: bb, statement_index: i };
+            match st.kind {
+                mir::StatementKind::StorageLive(l) => events.push(StorageEvent::Live(l.as_usize())),
+                mir::StatementKind::StorageDead(l) => events.push(StorageEvent::Dead(l.as_usize())),
+                _ => {
+                    let mut v = Uses(Vec::new());
+                    v.visit_statement(st, loc);
+                    events.extend(v.0);
+                }
+            }
+        }
+        let mut succs = Vec::new();
+        if let Some(t) = &data.terminator {
+            let loc = mir::Location { block: bb, statement_index: data.statements.len() };
+            let mut v = Uses(Vec::new());
+            v.visit_terminator(t, loc);
+            events.extend(v.0);
+            succs.extend(t.successors().map(|s| s.as_usize()));
+        }
+        blocks.push((events, succs));
+    }
+    first_storage_dead_use(&blocks, body.arg_count)
+        .map(|(b, l)| format!("use of _{l} in bb{b} while its storage may be dead"))
+}
+
 /// The EXACT storage-marker channel (module docs step 5; LEDGER L2 retirement): render every
 /// `StorageLive`/`StorageDead` of `body` as one line, in a deterministic fine-grained walk.
 /// Compared line-for-line between derived and built by `compare_derived`; any inequality (or
@@ -3599,6 +3825,19 @@ fn const_expr(cv: &ConstValue) -> CanonResult<String> {
 ///   * Local names are alpha-renamed by first marker appearance (LEDGER L13): a bijective
 ///     renaming of storage slots is observationally identical for `llvm.lifetime` intrinsics
 ///     (per-slot semantics); event order, positions, and types are still exact.
+///   * (F3) ... and each line carries its local's COMPLETE ACCESS LIST in the fine walk —
+///     every read, direct write and borrow of it, with position (`statement_accesses`,
+///     `terminator_accesses`: operands, `Discriminant`/`Len` places, `Index` locals, the
+///     pointer a `Deref` reads, the switch discriminant, the assert condition, call arguments
+///     and destination, `_0` at `return`) — and, if the local is ever borrowed, the position of
+///     every access THROUGH a pointer anywhere in the body (derefs and calls). Equal lines
+///     therefore mean: same markers at the same positions, and every marked local accessed at
+///     exactly the same positions in the same ways on both sides, so the alpha renaming is the
+///     one the data statements see for every DIRECT access. Accesses through a pointer are
+///     bound by position only (the pointee is not tracked). Assert-MESSAGE operands are not in
+///     the extracted body; the real-MIR liveness check in `compare_derived` covers them.
+///   * (F3) Before rendering, the body must pass rustc's `-Zlint-mir` storage rule
+///     (`first_storage_dead_use`): no access of a local where its storage may be dead.
 ///   * Blocks OUTSIDE the walk (assert-unwind cleanup subgraphs, dead code) must be
 ///     marker-free, else the channel fails closed — a marker can never hide there.
 fn canon_markers(body: &VerifiableBody) -> CanonResult<Vec<String>> {
@@ -3660,6 +3899,38 @@ fn canon_markers(body: &VerifiableBody) -> CanonResult<Vec<String>> {
             }
         }
     }
+    // Trust (F3 rework): the liveness rule first — a derived body whose data statements
+    // touch a local outside its storage is refused whatever its marker lines say.
+    let events = verifiable_storage_events(body, &fine_of, &raw_succs)?;
+    if let Some((b, l)) = first_storage_dead_use(&events, body.arg_count) {
+        return Err(format!("storage: use of _{l} in bb{b} while its storage may be dead"));
+    }
+    // Every access of every local, in the fine walk, and every access THROUGH a pointer.
+    let mut accesses: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut through: Vec<String> = Vec::new();
+    for (fine, &b) in fine_order.iter().enumerate() {
+        let mut k = 0usize;
+        for st in &body.blocks[b].stmts {
+            if !matches!(st, Statement::Assign { .. }) {
+                continue;
+            }
+            for (l, kind) in statement_accesses(st)? {
+                if kind == '*' {
+                    through.push(format!("b{fine}.{k}"));
+                } else {
+                    accesses.entry(l).or_default().push(format!("{kind}@b{fine}.{k}"));
+                }
+            }
+            k += 1;
+        }
+        for (l, kind) in terminator_accesses(&body.blocks[b].terminator)? {
+            if kind == '*' {
+                through.push(format!("b{fine}.T"));
+            } else {
+                accesses.entry(l).or_default().push(format!("{kind}@b{fine}.T"));
+            }
+        }
+    }
     let mut out: Vec<String> = Vec::new();
     let mut names: HashMap<usize, usize> = HashMap::new();
     for (fine, &b) in fine_order.iter().enumerate() {
@@ -3701,10 +3972,13 @@ fn canon_markers(body: &VerifiableBody) -> CanonResult<Vec<String>> {
                 .get(local)
                 .filter(|d| d.index == local)
                 .ok_or_else(|| format!("marker on missing local _{local}"))?;
+            let acc = accesses.get(&local).map(|v| v.join(",")).unwrap_or_default();
+            let borrowed = accesses.get(&local).is_some_and(|v| v.iter().any(|a| a.starts_with('&')));
+            let via = if borrowed { format!(" via:[{}]", through.join(",")) } else { String::new() };
             out.push(format!(
-                "mk b{fine}.{assigns_seen}:{} s{alpha}:{}",
+                "mk b{fine}.{assigns_seen}:{} s{alpha}:{} acc:[{acc}]{via}",
                 if live { "live" } else { "dead" },
-                canon_param_ty(&decl.ty)?
+                canon_param_ty(&decl.ty)?,
             ));
         }
     }
@@ -4286,6 +4560,7 @@ mod session_state_tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },

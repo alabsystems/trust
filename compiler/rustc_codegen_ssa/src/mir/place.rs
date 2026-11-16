@@ -3,11 +3,12 @@ use std::ops::Deref as _;
 use rustc_abi::{
     Align, BackendRepr, FieldIdx, FieldsShape, Size, TagEncoding, VariantIdx, Variants,
 };
+use rustc_middle::mir;
 use rustc_middle::mir::PlaceTy;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_middle::{bug, mir};
+use rustc_span::{DUMMY_SP, bug};
 use tracing::{debug, instrument};
 
 use super::operand::OperandValue;
@@ -93,7 +94,7 @@ pub struct PlaceRef<'tcx, V> {
 
 impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     pub fn new_sized(llval: V, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
-        PlaceRef::new_sized_aligned(llval, layout, layout.align.abi)
+        PlaceRef::new_sized_aligned(llval, layout, layout.align)
     }
 
     pub fn new_sized_aligned(
@@ -111,7 +112,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
-        if layout.peel_transparent_wrappers(bx).deref().is_scalable_vector() {
+        // FIXME(rustc_scalable_vector/stdarch_aarch64_sve): Scalable vectors aren't actually sized,
+        // but we pretend they are. Here we have to hack around that.
+        if layout.peel_transparent_wrappers_from_non_1zst(bx).deref().is_scalable_vector() {
             Self::alloca_scalable(bx, layout)
         } else {
             Self::alloca_size(bx, layout.size, layout)
@@ -124,7 +127,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         layout: TyAndLayout<'tcx>,
     ) -> Self {
         assert!(layout.is_sized(), "tried to statically allocate unsized place");
-        PlaceValue::alloca(bx, size, layout.align.abi).with_type(layout)
+        PlaceValue::alloca(bx, size, layout.align).with_type(layout)
     }
 
     /// Returns a place for an indirect reference to an unsized place.
@@ -158,8 +161,10 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         layout: TyAndLayout<'tcx>,
     ) -> Self {
         PlaceValue::new_sized(
-            bx.alloca_with_ty(layout.peel_transparent_wrappers(bx)),
-            layout.align.abi,
+            // FIXME why is this peeling at all? The LLVM type should be the same for the
+            // transparent wrapper and the inner type.
+            bx.alloca_with_ty(layout.peel_transparent_wrappers_from_non_1zst(bx)),
+            layout.align,
         )
         .with_type(layout)
     }
@@ -227,8 +232,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
         let unaligned_offset = bx.cx().const_usize(offset.bytes());
 
-        // Get the alignment of the field
-        let (_, mut unsized_align) = size_of_val::size_and_align_of_dst(bx, field.ty, meta);
+        // Get the alignment of the field. No span is available here to blame a layout error on.
+        let (_, mut unsized_align) =
+            size_of_val::size_and_align_of_dst(bx, field.ty, meta, DUMMY_SP);
 
         // For packed types, we need to cap alignment.
         if let ty::Adt(def, _) = self.layout.ty.kind()
@@ -262,7 +268,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             Err(UninhabitedVariantError) => {
                 // We play it safe by using a well-defined `abort`, but we could go for immediate UB
                 // if that turns out to be helpful.
-                bx.abort();
+                bx.abort_immediate();
             }
             Ok(Some((tag_field, imm))) => {
                 let tag_place = self.project_field(bx, tag_field.as_usize());
@@ -286,7 +292,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             layout.size
         };
 
-        let llval = bx.inbounds_nuw_gep(bx.cx().backend_type(layout), self.val.llval, &[llindex]);
+        let llval = bx.inbounds_nuw_gep(layout.size, self.val.llval, llindex);
         let align = self.val.align.restrict_for_offset(offset);
         PlaceValue::new_sized(llval, align).with_type(layout)
     }
@@ -317,6 +323,13 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
     pub fn storage_dead<Bx: BuilderMethods<'a, 'tcx, Value = V>>(&self, bx: &mut Bx) {
         bx.lifetime_end(self.val.llval, self.layout.size);
+    }
+
+    /// The same place, but with [`PlaceValue::align`] lowered to [`Align::ONE`].
+    pub fn unaligned(self) -> Self {
+        let Self { val, layout } = self;
+        let val = PlaceValue { align: Align::ONE, ..val };
+        Self { val, layout }
     }
 }
 
@@ -353,6 +366,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         for elem in place_ref.projection[base..].iter() {
             cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
+                mir::ProjectionElem::PhantomDeref => {
+                    bug!("encountered PhantomDeref in codegen")
+                }
                 mir::ProjectionElem::Field(ref field, _) => {
                     assert!(
                         !cg_base.layout.ty.is_any_ptr(),
@@ -470,7 +486,7 @@ pub(super) fn codegen_tag_value<'tcx, V>(
 ) -> Result<Option<(FieldIdx, V)>, UninhabitedVariantError> {
     // By checking uninhabited-ness first we don't need to worry about types
     // like `(u32, !)` which are single-variant but weird.
-    if layout.for_variant(cx, variant_index).is_uninhabited() {
+    if layout.is_variant_uninhabited(variant_index) {
         return Err(UninhabitedVariantError);
     }
 

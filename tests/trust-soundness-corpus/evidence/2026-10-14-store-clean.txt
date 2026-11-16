@@ -1,0 +1,35 @@
+# CLEAN_BIN=<the atpkg store clean 8606, built 2026-09-16> python3 scripts/trust-soundness-corpus.py --strict --verifiers clean-external --filter '^(ay|clean)-', 2026-10-14 (exit 1).
+# The SMT witnesses ran: ay's model for every check-sat, checked by the runner's own evaluator.
+
+trust-soundness-corpus — per entry: <reproducer verdict>:<class> / <twin verdict>:<class>
+  P proved, R refused (not proved), E error, S skipped, - not applicable
+  trustc: <home>/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+  trustc -vV: rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0) | binary: trustc
+  trust-wp: <home>/r35-corpus-tree/first-party/trust-wp @ ee480d53ad (harness toolchain <home>/Library/Application Support/aterm/pkg/store/trust/9192/bin)
+  trust-vc: <home>/r35-corpus-tree/first-party/trust-vc @ a224165545
+  trust-vc-mir: none
+  clean: <home>/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean
+  ay (SMT witness): <home>/Library/Application Support/aterm/pkg/bin/ay
+  witnesses: run
+  mode: STRICT
+  entry                                        witness  clean-external                    
+  ay-mirror-and-overload                       ok       R:ok / R:ok(nif)                  
+  ay-mirror-false-quoted                       ok       P:FALSE-PROVED / P:ok             
+  ay-mirror-ite-overload                       ok       R:ok / R:ok(nif)                  
+  clean-b03-macro-capture                      ok       R:ok / R:TWIN-LOST                
+  clean-b09-check-sat-assuming                 ok       P:FALSE-PROVED / P:ok             
+  clean-l01-cr-comment                         ok       R:ok / R:TWIN-LOST                
+  clean-q04-push-pop                           ok       P:FALSE-PROVED / P:ok             
+  clean-r1-named-reuses-declared               ok       P:FALSE-PROVED / P:ok             
+
+Totals per verifier (reproducers: proved / refused / error / skipped; twins: proved / not / skipped)
+  clean-external   reproducers 4 proved (4 FALSE-PROVED, 0 KNOWN-FALSE-PROVED) / 4 refused / 0 error / 0 skipped;  twins 4 proved / 4 not / 0 skipped
+
+FALSE-PROVED: 4  ay-mirror-false-quoted@clean-external, clean-b09-check-sat-assuming@clean-external, clean-q04-push-pop@clean-external, clean-r1-named-reuses-declared@clean-external
+KNOWN-FALSE-PROVED (open, not a pass): 0  
+TWIN-LOST (precision, not soundness): 2  clean-b03-macro-capture@clean-external, clean-l01-cr-comment@clean-external
+ERROR (no verdict): 0
+
+STRICT: 6 failing cell(s): ay-mirror-false-quoted@clean-external:reproducer=FALSE-PROVED, clean-b03-macro-capture@clean-external:twin=TWIN-LOST, clean-b09-check-sat-assuming@clean-external:reproducer=FALSE-PROVED, clean-l01-cr-comment@clean-external:twin=TWIN-LOST, clean-q04-push-pop@clean-external:reproducer=FALSE-PROVED, clean-r1-named-reuses-declared@clean-external:reproducer=FALSE-PROVED
+Gate: NON-BLOCKING until the owner records the M0.1 DECISION_QUEUE row.
+rc=1

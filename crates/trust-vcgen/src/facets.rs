@@ -27,7 +27,7 @@
 
 use trust_types::{Operand, Place, Rvalue, Statement, Terminator, Ty, VerifiableFunction};
 
-use crate::loop_analysis::detect_loops;
+use crate::loop_analysis::has_back_edge;
 
 /// One facet's scan outcome. `Established` carries the evidence tag recorded
 /// into the diagnostic table; `NotEstablished` carries the first violating
@@ -101,7 +101,7 @@ fn apply_audited_firewall(
 pub fn scan_structural_facets(func: &VerifiableFunction) -> StructuralFacetScan {
     // No callee context: every call fails closed, which is the pre-closure
     // behaviour and the right default for a caller that has no whole-set view.
-    scan_structural_facets_with_callees(func, &std::collections::BTreeSet::new())
+    scan_structural_facets_with_callees(func, &const { std::collections::BTreeSet::new() })
 }
 
 /// Scan one function, permitting calls to callees already known certified.
@@ -109,7 +109,71 @@ pub fn scan_structural_facets_with_callees(
     func: &VerifiableFunction,
     certified_callees: &std::collections::BTreeSet<String>,
 ) -> StructuralFacetScan {
-    let mut violations: Vec<Violation> = Vec::new();
+    // TG11's closed by-value reader establishes these four facets by checking
+    // each constructor path. The actual import additionally requires ODT B1.
+    if trust_types::e6_odt::read(func).is_some() {
+        let established = || FacetFinding::Established {
+            evidence: "tg11-closed-odt-reader: all constructor paths terminate in scalar leaves"
+                .into(),
+        };
+        return StructuralFacetScan {
+            pure: established(),
+            total: established(),
+            deterministic: established(),
+            no_panic: established(),
+        };
+    }
+    #[derive(Default)]
+    struct FirstViolations {
+        pure: Option<String>,
+        total: Option<String>,
+        deterministic: Option<String>,
+        no_panic: Option<String>,
+    }
+
+    impl FirstViolations {
+        fn record(&mut self, v: Violation) {
+            let need_pure = v.pure && self.pure.is_none();
+            let need_total = v.total && self.total.is_none();
+            let need_det = v.deterministic && self.deterministic.is_none();
+            let need_np = v.no_panic && self.no_panic.is_none();
+            let mut rem =
+                usize::from(need_pure) + usize::from(need_total) + usize::from(need_det) + usize::from(need_np);
+            if rem == 0 {
+                return;
+            }
+            let mut reason = Some(v.reason);
+            let mut take_or_clone = || {
+                rem -= 1;
+                if rem == 0 {
+                    reason.take().unwrap_or_default()
+                } else {
+                    reason.as_ref().cloned().unwrap_or_default()
+                }
+            };
+            if need_pure {
+                self.pure = Some(take_or_clone());
+            }
+            if need_total {
+                self.total = Some(take_or_clone());
+            }
+            if need_det {
+                self.deterministic = Some(take_or_clone());
+            }
+            if need_np {
+                self.no_panic = Some(take_or_clone());
+            }
+        }
+
+        fn all_poisoned(&self) -> bool {
+            self.pure.is_some()
+                && self.total.is_some()
+                && self.deterministic.is_some()
+                && self.no_panic.is_some()
+        }
+    }
+
+    let mut violations = FirstViolations::default();
 
     // Type gate: every local (params, temporaries, return slot) must live in
     // the v1 scalar fragment. References/raw pointers step outside purity,
@@ -129,41 +193,57 @@ pub fn scan_structural_facets_with_callees(
                 .as_deref()
                 .map(|n| format!("`{n}`"))
                 .unwrap_or_else(|| format!("_{}", local.index));
-            violations.push(Violation::all(format!(
+            violations.record(Violation::all(format!(
                 "local {who} has type {:?}, outside the v1 scalar fragment",
                 local.ty
             )));
+            if violations.all_poisoned() {
+                break;
+            }
         }
     }
 
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Some(v) = statement_violation(stmt) {
-                violations.push(v);
+    if !violations.all_poisoned() {
+        let mut impossible = None;
+        'blocks: for block in &func.body.blocks {
+            for stmt in &block.stmts {
+                if let Some(v) = statement_violation(stmt) {
+                    violations.record(v);
+                    if violations.all_poisoned() {
+                        break 'blocks;
+                    }
+                }
             }
-        }
-        if let Some(v) = terminator_violation(&block.terminator, certified_callees) {
-            violations.push(v);
+            let is_impossible_unreachable = matches!(block.terminator, Terminator::Unreachable)
+                && impossible
+                    .get_or_insert_with(|| {
+                        trust_types::e6_expr::tree::checked_option_impossible_defaults(func)
+                    })
+                    .contains(&block.id);
+            if !is_impossible_unreachable
+                && let Some(v) = terminator_violation(&block.terminator, certified_callees)
+            {
+                violations.record(v);
+                if violations.all_poisoned() {
+                    break 'blocks;
+                }
+            }
         }
     }
 
     // Back-edges: totality is structural only in their absence; the E5
     // termination lane is the successor certifier for measured loops.
-    if !detect_loops(func).is_empty() {
-        violations.push(Violation {
-            reason: "back-edge present; structural totality requires a loop-free body \
-                     (the E5 termination lane certifies measured loops)"
+    if violations.total.is_none() && has_back_edge(func) {
+        violations.total = Some(
+            "back-edge present; structural totality requires a loop-free body \
+             (the E5 termination lane certifies measured loops)"
                 .to_string(),
-            pure: false,
-            total: true,
-            deterministic: false,
-            no_panic: false,
-        });
+        );
     }
 
-    let finding = |facet: fn(&Violation) -> bool| -> FacetFinding {
-        match violations.iter().find(|v| facet(v)) {
-            Some(v) => FacetFinding::NotEstablished { reason: v.reason.clone() },
+    let finding = |reason: Option<String>| -> FacetFinding {
+        match reason {
+            Some(reason) => FacetFinding::NotEstablished { reason },
             None => FacetFinding::Established { evidence: EVIDENCE.to_string() },
         }
     };
@@ -173,20 +253,28 @@ pub fn scan_structural_facets_with_callees(
     // validator.  Intersect every positive result with that validator here, in
     // the function called by the compiler, rather than relying on a parity test
     // to notice future drift after a positive finding has escaped.
-    let audited = trust_types::facet_inference::infer_facets(std::slice::from_ref(func))
-        .get(&func.def_path)
-        .copied()
-        .unwrap_or_default();
+    let audited = if violations.all_poisoned() {
+        trust_types::facet_inference::FacetSet::default()
+    } else {
+        trust_types::facet_inference::infer_facets(std::slice::from_ref(func))
+            .get(&func.def_path)
+            .copied()
+            .unwrap_or_default()
+    };
 
     StructuralFacetScan {
-        pure: apply_audited_firewall(finding(|v| v.pure), audited.pure, "Pure"),
-        total: apply_audited_firewall(finding(|v| v.total), audited.total, "Total"),
+        pure: apply_audited_firewall(finding(violations.pure), audited.pure, "Pure"),
+        total: apply_audited_firewall(finding(violations.total), audited.total, "Total"),
         deterministic: apply_audited_firewall(
-            finding(|v| v.deterministic),
+            finding(violations.deterministic),
             audited.deterministic,
             "Deterministic",
         ),
-        no_panic: apply_audited_firewall(finding(|v| v.no_panic), audited.no_panic, "NoPanic"),
+        no_panic: apply_audited_firewall(
+            finding(violations.no_panic),
+            audited.no_panic,
+            "NoPanic",
+        ),
     }
 }
 
@@ -211,6 +299,7 @@ fn local_ty_in_fragment(ty: &Ty, index: usize, arg_count: usize) -> bool {
         // step returns (`Term { coeff, lit }`). Same imported predicate as the
         // parameter rule above, so the two positions cannot drift apart.
         || (index == 0 && trust_types::facet_inference::ty_is_scalar_struct(ty))
+        || (index > arg_count && trust_types::e6_expr::tree::option_payload(ty).is_some())
 }
 
 fn ty_in_scalar_fragment(ty: &Ty) -> bool {
@@ -232,6 +321,10 @@ fn ty_in_scalar_fragment(ty: &Ty) -> bool {
 /// panic, derefs reach through references the type gate excludes anyway.
 fn place_in_fragment(place: &Place) -> bool {
     place.projections.iter().all(|p| matches!(p, trust_types::Projection::Field(_)))
+        || matches!(
+            place.projections.as_slice(),
+            [trust_types::Projection::Downcast(1), trust_types::Projection::Field(0)]
+        )
 }
 
 fn operand_in_fragment(op: &Operand) -> bool {
@@ -294,6 +387,9 @@ fn statement_violation(stmt: &Statement) -> Option<Violation> {
                     trust_types::AggregateKind::Adt { active_field: None, .. },
                     ops,
                 ) if ops.iter().all(operand_in_fragment) => None,
+                // TG14: the authority firewall below validates the exact
+                // tagged Option payload and discriminant destination type.
+                Rvalue::Discriminant(place) if place.projections.is_empty() => None,
                 other => {
                     Some(Violation::all(format!("rvalue outside the v1 whitelist: {other:?}")))
                 }
@@ -345,6 +441,16 @@ fn terminator_violation(
             // of the cycle can enter the set before the others — so mutual and
             // self recursion are refused rather than assumed total, which is
             // the direction that matters for the Total facet.
+            // Trust (std-call-summaries P2): the panic-freedom-only intrinsic stamp
+            // names nondeterministic callees (the transcendentals, the `nsz`
+            // selections); it grants no facet, and is refused before the
+            // certified-set lookup so a same-unit spelling cannot lend it one.
+            if callee.starts_with(trust_types::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX) {
+                return Some(Violation::all(format!(
+                    "call to `{callee}`, a panic-freedom-only intrinsic stamp: the callee \
+                     is not deterministic, so it grants no facet"
+                )));
+            }
             if certified_callees.contains(callee.as_str())
                 || callee.starts_with(trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX)
                 || trust_types::RustcTotalPrimitiveMethod::classify(callee).is_some()
@@ -352,6 +458,8 @@ fn terminator_violation(
                 // (Shape A of the checked-arithmetic lane) — pure, total,
                 // deterministic, panic-free as a function into `Option`.
                 || trust_types::RustcCheckedPrimitiveMethod::classify(callee).is_some()
+                || trust_types::e6_expr::tree::wrapping_primitive(callee).is_some()
+                || trust_types::e6_expr::tree::checked_primitive(callee).is_some()
             {
                 None
             } else {
@@ -392,6 +500,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -831,14 +940,8 @@ mod tests {
                                     Operand::Copy(Place::local(2)),
                                 ),
                             ),
-                            assign(
-                                Place::local(3),
-                                Rvalue::Use(Operand::Copy(Place::field(5, 0))),
-                            ),
-                            assign(
-                                Place::local(4),
-                                Rvalue::Use(Operand::Copy(Place::field(5, 1))),
-                            ),
+                            assign(Place::local(3), Rvalue::Use(Operand::Copy(Place::field(5, 0)))),
+                            assign(Place::local(4), Rvalue::Use(Operand::Copy(Place::field(5, 1)))),
                         ],
                         terminator: Terminator::SwitchInt {
                             discr: Operand::Copy(Place::local(4)),
@@ -855,6 +958,9 @@ mod tests {
                         terminator: Terminator::Call {
                             func: cold_callee.to_string(),
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key(
+                                &cold_callee.to_string(),
+                            ),
                             args: vec![],
                             dest: Place::local(6),
                             target: Some(BlockId(3)),
@@ -932,6 +1038,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::g"),
         };
         let scan = scan_structural_facets(&f);
         for finding in [&scan.pure, &scan.total, &scan.deterministic, &scan.no_panic] {
@@ -940,5 +1047,45 @@ mod tests {
                 "callee closure is not wired; a call must fail every facet closed"
             );
         }
+    }
+
+    /// Trust (std-call-summaries P2): a call stamped with the panic-freedom-only
+    /// intrinsic prefix fails EVERY facet, Deterministic included, even when the
+    /// unit's certified set holds the stamped spelling (a hostile same-unit
+    /// function). The deterministic `@trust-rustc-intrinsic::` stamp on an exact
+    /// operation is the contrast: it is admitted.
+    #[test]
+    fn panic_free_only_intrinsic_stamp_grants_no_facet() {
+        let call = |func: &str| Terminator::Call {
+            unwind: trust_types::UnwindEdge::Unreachable,
+            func: func.to_string(),
+            args: vec![],
+            dest: Place::local(0),
+            target: Some(BlockId(2)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: None,
+        };
+        let stamped = format!(
+            "{}core::intrinsics::maximum_number_nsz_f64",
+            trust_types::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX
+        );
+        let hostile: std::collections::BTreeSet<String> = [stamped.clone()].into_iter().collect();
+        let violation = terminator_violation(&call(&stamped), &hostile)
+            .expect("the panic-freedom-only stamp must be a violation");
+        assert!(
+            violation.deterministic && violation.pure && violation.total && violation.no_panic,
+            "every facet must be poisoned: {}",
+            violation.reason
+        );
+        let exact =
+            format!("{}core::intrinsics::sqrtf64", trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX);
+        assert!(
+            terminator_violation(&call(&exact), &std::collections::BTreeSet::new()).is_none(),
+            "the deterministic stamp on an exact operation stays admitted"
+        );
     }
 }

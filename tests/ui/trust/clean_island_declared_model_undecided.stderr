@@ -1,0 +1,8 @@
+error: finite model `Example.Lockstep` was NOT checked: it has 3 reachable states, more than its state budget of 2 (`Example.Lockstep.stateBudget`). An untrusted search of all of them found no state that breaks an invariant; `def <model>.stateBudget : Nat := 3` beside the model has the kernel prove it (under a second per build). an incomplete check must be decided or explicitly declare `def Example.Lockstep.bounded : String := "reason for the incomplete check"`. Nothing is claimed about it; an authored theorem of `ScalarModel.safetyClaim Example.Lockstep` is checked as usual
+  --> $DIR/clean_island_declared_model_undecided.rs:24:5
+   |
+LL |     def Lockstep : Trust.Temporal.FiniteModel.ScalarModel :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

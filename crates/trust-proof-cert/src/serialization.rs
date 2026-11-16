@@ -16,7 +16,10 @@ use crate::chain_verifier::ProofChain;
 const CHAIN_MAGIC: &[u8; 4] = b"tRCH";
 
 /// Binary format version for proof chains.
-const CHAIN_BINARY_VERSION: u8 = 1;
+// Version 2 carries KR0's four-field ProofEvidence. Version 1 also named the
+// pre-KR0 two-field layout, so it cannot select an unambiguous positional
+// decoder. Refuse all v1 binaries; the JSON envelope remains unchanged.
+const CHAIN_BINARY_VERSION: u8 = 2;
 
 /// Envelope wrapping a ProofChain with metadata for portable serialization.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -272,12 +275,110 @@ mod tests {
         assert_eq!(restored.recorded_functions(), chain.recorded_functions());
     }
 
+    /// KR0 switch review (problem 2): a certificate whose solver carries
+    /// `ProofEvidence` (unstamped, and stamped with a reference kernel theory)
+    /// survives the positional bincode chain format byte for byte. Measured
+    /// before the fix: a `skip_serializing_if` on the evidence's two stamp
+    /// fields made this round trip fail (`Io(UnexpectedEof)`).
+    #[test]
+    fn test_binary_roundtrip_keeps_solver_evidence() {
+        let unstamped = trust_types::ProofEvidence::new(
+            trust_types::ReasoningKind::Smt,
+            trust_types::AssuranceLevel::SmtBacked,
+        );
+        let stamped = trust_types::ProofEvidence::new(
+            trust_types::ReasoningKind::Constructive,
+            trust_types::AssuranceLevel::Certified,
+        )
+        .with_kernel_reference(
+            trust_types::KernelTheoryId::LeanReferenceV1,
+            trust_types::KernelEnvDigest([0x5e; 32]),
+        );
+        let mut chain = ProofChain::new("evidence-crate");
+        for (function, evidence) in [("unstamped", unstamped), ("stamped", stamped)] {
+            let mut cert = make_cert(function);
+            cert.solver.evidence = Some(evidence);
+            chain.add_certificate(cert, vec![]);
+        }
+        let bytes = to_binary(&chain).expect("serialization");
+        let restored = from_binary(&bytes).expect("deserialization");
+        for (function, cert) in &chain.certificates {
+            assert_eq!(
+                restored.certificates.get(function).map(|c| &c.solver.evidence),
+                Some(&cert.solver.evidence),
+                "{function}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_v1_legacy_chain_is_rejected_before_deserialization() {
+        // The same v1 header covered both the old two-field evidence and the
+        // interim KR0 four-field evidence. It cannot select a safe decoder.
+        for bytes in [
+            include_bytes!("../tests/fixtures/chain-v1-with-evidence.bin").as_slice(),
+            include_bytes!("../tests/fixtures/chain-v1-without-evidence.bin").as_slice(),
+            b"tRCH\x01".as_slice(),
+        ] {
+            assert_eq!(&bytes[..5], b"tRCH\x01");
+            match from_binary(bytes).expect_err("legacy binary version must be refused") {
+                CertError::SerializationFailed { reason } => {
+                    assert_eq!(reason, "unsupported binary format version: expected 2, got 1")
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_binary_v1_header_cannot_label_current_evidence() {
+        let mut chain = sample_chain();
+        chain.certificates.get_mut("foo").expect("certificate").solver.evidence = Some(
+            trust_types::ProofEvidence::new(
+                trust_types::ReasoningKind::Constructive,
+                trust_types::AssuranceLevel::Certified,
+            )
+            .with_kernel_reference(
+                trust_types::KernelTheoryId::LeanReferenceV1,
+                trust_types::KernelEnvDigest([0x5e; 32]),
+            ),
+        );
+        let mut bytes = to_binary(&chain).expect("current serialization");
+        bytes[4] = 1;
+        match from_binary(&bytes).expect_err("interim v1 layout must also be refused") {
+            CertError::SerializationFailed { reason } => {
+                assert_eq!(reason, "unsupported binary format version: expected 2, got 1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_json_legacy_unstamped_evidence_stays_uncertified() {
+        let mut value =
+            serde_json::to_value(ProofChainEnvelope::new(sample_chain())).expect("envelope JSON");
+        value["chain"]["certificates"]["foo"]["solver"]["evidence"] = serde_json::json!({
+            "reasoning": "Constructive",
+            "assurance": "Certified"
+        });
+        let json = serde_json::to_string(&value).expect("legacy JSON");
+        let restored = from_json(&json).expect("old unstamped JSON stays readable");
+        let evidence = restored.certificates["foo"].solver.evidence.as_ref().expect("evidence");
+        assert_eq!(evidence.reasoning, trust_types::ReasoningKind::Constructive);
+        assert_eq!(evidence.assurance, trust_types::AssuranceLevel::Certified);
+        assert!(evidence.kernel_theory.is_none());
+        assert!(evidence.env_digest.is_none());
+        assert!(!evidence.is_certified());
+        assert_eq!(restored.name, "test-crate");
+        assert_eq!(restored.recorded_functions(), sample_chain().recorded_functions());
+    }
+
     #[test]
     fn test_binary_magic_bytes() {
         let chain = sample_chain();
         let bytes = to_binary(&chain).expect("serialization");
         assert_eq!(&bytes[..4], b"tRCH");
-        assert_eq!(bytes[4], 1);
+        assert_eq!(bytes[4], 2);
     }
 
     #[test]

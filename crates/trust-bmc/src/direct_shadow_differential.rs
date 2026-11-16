@@ -271,11 +271,8 @@ fn mir_lane_bundle(probe: &str) -> NativeVerificationBundle {
 
     // One owner per row-owning function, ascending FuncId (first = root), each
     // digest-bound to the exact dump bytes its body was rebuilt from.
-    let mut owner_ids: Vec<trust_ir::FuncId> = module
-        .proof_obligations
-        .iter()
-        .filter_map(|obligation| obligation.function)
-        .collect();
+    let mut owner_ids: Vec<trust_ir::FuncId> =
+        module.proof_obligations.iter().filter_map(|obligation| obligation.function).collect();
     owner_ids.sort();
     owner_ids.dedup();
     let owners: Vec<trust_ir_bridge::NativeBundleOwner> = owner_ids
@@ -287,7 +284,10 @@ fn mir_lane_bundle(probe: &str) -> NativeVerificationBundle {
                 .find(|(_, candidate)| &candidate.name == name)
                 .unwrap_or_else(|| panic!("no MIR dump bytes for owner {name}"));
             let digest: [u8; 32] = sha2::Sha256::digest(bytes).into();
-            trust_ir_bridge::NativeBundleOwner { function, source_digest: ProofDigest::sha256(digest) }
+            trust_ir_bridge::NativeBundleOwner {
+                function,
+                source_digest: ProofDigest::sha256(digest),
+            }
         })
         .collect();
 
@@ -445,12 +445,7 @@ fn key_rows(
     let mut seen: BTreeMap<ObligationKey, ProofId> = BTreeMap::new();
     for obligation in &bundle.module.proof_obligations {
         let function = obligation.function.expect("every fixture row is function-scoped");
-        let name = bundle
-            .module
-            .function_by_id(function)
-            .expect("row owner resolves")
-            .name
-            .clone();
+        let name = bundle.module.function_by_id(function).expect("row owner resolves").name.clone();
         let range = obligation
             .source
             .as_ref()
@@ -503,10 +498,7 @@ fn lane_verdicts(
         record(&row.translated.obligations, LaneVerdict::RefutedWitnessed);
     }
     for row in &evidence.not_proved {
-        record(
-            &row.translated.obligations,
-            LaneVerdict::NotProved { reason: row.reason.clone() },
-        );
+        record(&row.translated.obligations, LaneVerdict::NotProved { reason: row.reason.clone() });
     }
     verdicts
 }
@@ -516,9 +508,12 @@ fn lane_verdicts(
 /// ENUMERATED statement, never a count or an average.
 #[derive(Debug, Default)]
 struct Differential {
-    /// Both lanes state a verdict for the key and they differ on the one axis
-    /// that matters (proved vs not-proved). Refutation delivery channel
-    /// (witnessed vs stated-in-reason) is NOT a disagreement.
+    /// Both lanes state a verdict for the key and they differ on `proved()`.
+    /// Refutation delivery channel (witnessed vs stated-in-reason) is NOT a
+    /// disagreement, and neither is a refutation on one lane against an
+    /// inconclusive `NotProved` on the other: this list compares `proved()`
+    /// only. The battery pins the refutation direction per named obligation
+    /// with [`refutation_stated`].
     disagreements: Vec<String>,
     /// Keys only the direct-shadow lane states a verdict on.
     only_direct: Vec<String>,
@@ -528,7 +523,9 @@ struct Differential {
 
 /// The differential proper: for every key either lane states a verdict on,
 /// compare. PROVED on one lane and non-proved on the other is a disagreement;
-/// both-non-proved rows agree regardless of refutation delivery channel.
+/// both-non-proved rows agree whatever their channel or reason.
+/// `differential_reports_a_proved_vs_not_proved_split_and_one_lane_keys` pins
+/// each list on hand-built maps.
 fn differential(
     direct: &BTreeMap<ObligationKey, LaneVerdict>,
     mir: &BTreeMap<ObligationKey, LaneVerdict>,
@@ -608,8 +605,7 @@ mod tests {
         line: u32,
         col: u32,
     ) -> LaneVerdict {
-        let key =
-            ObligationKey { function: function.to_string(), class, line, col };
+        let key = ObligationKey { function: function.to_string(), class, line, col };
         verdicts
             .get(&key)
             .unwrap_or_else(|| {
@@ -627,6 +623,25 @@ mod tests {
     /// refutable obligation is refuted and a genuinely safe one is proved,
     /// through the shadow lane, with the expected verdict DIRECTION pinned
     /// per obligation. Prints the scorecard under `--nocapture`.
+    ///
+    /// The bounds probe (`pick`/`pick_safe`, `m1bounds`) joined the battery on
+    /// 2026-11-06 (BMC-LANE-1). It plans through the shadow planner (the direct
+    /// lane births real BoundsCheck rows), and since trust-mc TMC-1 (`496360df7`,
+    /// pinned by Trust on 2026-10-02) both lanes' element reads are admitted as a
+    /// `select` of SMT-array lanes under the access's own bounds obligation. From
+    /// then the MIR lane refuted `pick` and proved `pick_safe`, and the direct lane
+    /// proved neither: its `icmp ult usize` bounds comparison was unmodeled
+    /// (`UnsupportedComparison`, a fail-closed error rule) until trust-mc
+    /// `00e0292a8` modeled pointer-width comparisons in both native lanes. A retired
+    /// test pinned that split
+    /// (`bounds_probe_solves_on_the_mir_lane_and_the_direct_lane_fails_closed_at_its_comparison`).
+    /// From Trust `8862c94337` (2026-11-02) the MIR lane lost its verdicts too:
+    /// trust-mc `c88bca8d7`'s operand-consumption guard refused the read of the
+    /// root `[i32; 7]` parameter (NotProved, `OperandConsumption`) until trust-mc
+    /// `9cb7ffef6` granted a root array parameter its value domain. This entry
+    /// needs both fixes, `9cb7ffef6` for the MIR lane and `00e0292a8` for the
+    /// direct lane; with them both lanes refute `pick` (`i` unconstrained) and
+    /// prove `pick_safe` (`i & 3 < 7`).
     #[test]
     fn m1_differential_scorecard_agrees_and_pins_both_verdict_directions() {
         let mut shadow_refutations_stated = 0usize;
@@ -635,7 +650,7 @@ mod tests {
             &str,
             (BTreeMap<ObligationKey, LaneVerdict>, BTreeMap<ObligationKey, LaneVerdict>),
         > = BTreeMap::new();
-        for (probe, rows) in [("m1probe", 8), ("m1shift", 1)] {
+        for (probe, rows) in [("m1probe", 8), ("m1shift", 1), ("m1bounds", 2)] {
             let (direct, mir) = solved_probe(probe, rows);
             eprintln!(
                 "=== M1 differential scorecard {probe} ({} direct rows, {} MIR rows) ===",
@@ -683,9 +698,13 @@ mod tests {
         //  * `remu_safe(a, b) = a % (b | 1)` / `divu_safe(a, b) = a / (b | 1)`
         //    — the divisor is provably nonzero, and the shadow lane must
         //    PROVE it (sealed proof-grade transport, the `obligations`
-        //    channel);
+        //    channel), as must the MIR lane;
         //  * `sh_safe(a, k) = a << (k & 31)` — the masked shift is provably
-        //    in range: the second probe's single row, proved.
+        //    in range: the second probe's single row, proved on both lanes;
+        //  * `pick(a, i) = a[i]` over `a: [i32; 7]` — `i` is unconstrained, so
+        //    the bounds check is GENUINELY refutable, on both lanes;
+        //  * `pick_safe(a, i) = a[i & 3]` — the masked index is provably in
+        //    bounds, and both lanes must PROVE it.
         let (direct_probe, mir_probe) = &solved["m1probe"];
         for (function, class, line, col) in [
             ("remu", ObligationClass::RemByZero, 3, 37),
@@ -713,13 +732,41 @@ mod tests {
                 "M1 pin: the genuinely safe {function}@L{line}C{col} {class:?} must be PROVED \
                  through the shadow lane"
             );
+            // The oracle side: the MIR lane proves the same obligation
+            // (measured 2026-11-06 on this scorecard).
+            assert_eq!(
+                expect(mir_probe, "MIR", function, class, line, col),
+                LaneVerdict::Proved,
+                "MIR oracle drifted: the genuinely safe {function}@L{line}C{col} {class:?} must \
+                 be PROVED on the MIR lane"
+            );
         }
-        let (direct_shift, _) = &solved["m1shift"];
-        assert_eq!(
-            expect(direct_shift, "direct-shadow", "sh_safe", ObligationClass::Overflow, 2, 40),
-            LaneVerdict::Proved,
-            "M1 pin: the masked shift is provably in range and must be PROVED"
-        );
+        let (direct_shift, mir_shift) = &solved["m1shift"];
+        for (lane, verdicts) in [("direct-shadow", direct_shift), ("MIR", mir_shift)] {
+            assert_eq!(
+                expect(verdicts, lane, "sh_safe", ObligationClass::Overflow, 2, 40),
+                LaneVerdict::Proved,
+                "M1 pin: the masked shift is provably in range and must be PROVED on the {lane} \
+                 lane"
+            );
+        }
+        let (direct_bounds, mir_bounds) = &solved["m1bounds"];
+        let pick = ("pick", ObligationClass::Bounds, 2, 44);
+        let pick_safe = ("pick_safe", ObligationClass::Bounds, 3, 49);
+        for (lane, verdicts) in [("direct-shadow", direct_bounds), ("MIR", mir_bounds)] {
+            let refuted = expect(verdicts, lane, pick.0, pick.1, pick.2, pick.3);
+            assert!(
+                refutation_stated(&refuted),
+                "M1 pin: the unconstrained index of `pick` must be REFUTED on the {lane} lane; \
+                 got {refuted:?}"
+            );
+            assert_eq!(
+                expect(verdicts, lane, pick_safe.0, pick_safe.1, pick_safe.2, pick_safe.3),
+                LaneVerdict::Proved,
+                "M1 pin: the masked index of `pick_safe` is in bounds and must be PROVED on the \
+                 {lane} lane"
+            );
+        }
 
         // Belt over the counters: at least one stated refutation and at least
         // one proof arrived through the shadow lane across the battery.
@@ -728,6 +775,113 @@ mod tests {
         eprintln!(
             "M1 pin: shadow lane stated {shadow_refutations_stated} refutation(s) and proved \
              {shadow_proofs} obligation(s)"
+        );
+    }
+
+    /// The detector itself, on hand-built verdict maps: no fixture and no solve.
+    /// The battery above asserts every list EMPTY, so on its own it would also
+    /// pass a `differential()` that never reported anything. This test pins
+    /// each list filling exactly when it should, with its exact text:
+    ///
+    /// * (a) Proved on one lane and NotProved on the other is exactly one
+    ///   disagreement, in either direction, and its text starts with the key;
+    /// * (b) the same refutation on its two delivery channels (the
+    ///   bounded-unroll witness on `refuted`, the runner's counterexample
+    ///   refusal on `not_proved`) is no disagreement, because `differential()`
+    ///   compares `proved()` only. For the same reason a refutation against an
+    ///   inconclusive NotProved is no disagreement either; the battery pins
+    ///   the refutation direction per named obligation with
+    ///   `refutation_stated`, and this test pins that `differential()` does
+    ///   not;
+    /// * (c) a key only one lane states goes to that lane's coverage list and
+    ///   nowhere else.
+    #[test]
+    fn differential_reports_a_proved_vs_not_proved_split_and_one_lane_keys() {
+        let key = |function: &str, class: ObligationClass, line: u32, col: u32| ObligationKey {
+            function: function.to_string(),
+            class,
+            line,
+            col,
+        };
+        // The runner's `not_proved` reason for a counterexample, verbatim from
+        // the m1probe scorecard (measured 2026-11-06).
+        let stated = LaneVerdict::NotProved {
+            reason: format!(
+                "native proof-grade evidence rejected: proof evidence rejected for ChcPdr: \
+                 {COUNTEREXAMPLE_NOT_A_PROOF}"
+            ),
+        };
+        // Hand-built: a NotProved whose reason states no refutation.
+        let inconclusive = LaneVerdict::NotProved {
+            reason: "translation refused: OperandConsumption".to_string(),
+        };
+        assert!(refutation_stated(&stated), "{stated:?}");
+        assert!(refutation_stated(&LaneVerdict::RefutedWitnessed));
+        assert!(!refutation_stated(&inconclusive), "{inconclusive:?}");
+
+        let split = key("pick_safe", ObligationClass::Bounds, 3, 49);
+        let channels = key("remu", ObligationClass::RemByZero, 3, 37);
+        let refuted_vs_inconclusive = key("pick", ObligationClass::Bounds, 2, 44);
+        let both_proved = key("divu_safe", ObligationClass::DivByZero, 5, 42);
+        let direct_only = key("sh", ObligationClass::Overflow, 6, 35);
+        let mir_only = key("sh_safe", ObligationClass::Overflow, 2, 40);
+
+        let direct = BTreeMap::from([
+            (split.clone(), LaneVerdict::Proved),
+            (channels.clone(), LaneVerdict::RefutedWitnessed),
+            (refuted_vs_inconclusive.clone(), stated.clone()),
+            (both_proved.clone(), LaneVerdict::Proved),
+            (direct_only.clone(), LaneVerdict::RefutedWitnessed),
+        ]);
+        let mir = BTreeMap::from([
+            (split.clone(), inconclusive.clone()),
+            (channels.clone(), stated.clone()),
+            (refuted_vs_inconclusive.clone(), inconclusive.clone()),
+            (both_proved.clone(), LaneVerdict::Proved),
+            (mir_only.clone(), LaneVerdict::Proved),
+        ]);
+        let out = differential(&direct, &mir);
+        // (a) exactly the one split row, and nothing for (b)'s rows or the
+        // both-proved row.
+        assert_eq!(
+            out.disagreements,
+            vec![
+                "pick_safe@L3C49 Bounds: direct-shadow says Proved, MIR lane says NotProved { \
+                 reason: \"translation refused: OperandConsumption\" }"
+                    .to_string()
+            ],
+            "{out:?}"
+        );
+        assert!(out.disagreements[0].starts_with(&format!("{split}: ")), "{out:?}");
+        // (c) each one-lane key in its own lane's list, and only there.
+        assert_eq!(out.only_direct, vec!["sh@L6C35 Overflow: RefutedWitnessed".to_string()]);
+        assert_eq!(out.only_mir, vec!["sh_safe@L2C40 Overflow: Proved".to_string()]);
+
+        // (a) the other direction: proved on the MIR lane only.
+        let reversed = differential(
+            &BTreeMap::from([(split.clone(), LaneVerdict::RefutedWitnessed)]),
+            &BTreeMap::from([(split.clone(), LaneVerdict::Proved)]),
+        );
+        assert_eq!(
+            reversed.disagreements,
+            vec![
+                "pick_safe@L3C49 Bounds: direct-shadow says RefutedWitnessed, MIR lane says Proved"
+                    .to_string()
+            ],
+            "{reversed:?}"
+        );
+        assert!(reversed.only_direct.is_empty() && reversed.only_mir.is_empty(), "{reversed:?}");
+
+        // (b) the channels swapped between the lanes: still no entry anywhere.
+        let swapped = differential(
+            &BTreeMap::from([(channels.clone(), stated.clone())]),
+            &BTreeMap::from([(channels.clone(), LaneVerdict::RefutedWitnessed)]),
+        );
+        assert!(
+            swapped.disagreements.is_empty()
+                && swapped.only_direct.is_empty()
+                && swapped.only_mir.is_empty(),
+            "{swapped:?}"
         );
     }
 
@@ -771,37 +925,6 @@ mod tests {
         );
         assert!(bundle.module.proof_certificates.is_empty(), "no certificate may be minted");
         assert!(bundle.evidence_bundles.is_empty(), "no evidence may be attached to the bundle");
-    }
-
-    /// NAMED BLOCKER, pinned so it can only move consciously: the bounds
-    /// probe (`pick`/`pick_safe`, `m1bounds`) PLANS through the shadow
-    /// planner — the direct lane births real BoundsCheck rows and the sibling
-    /// requests them — but trust-mc's proof-grade admission gate refuses
-    /// `Inst::ExtractElement` unconditionally (`native.rs`: "uses
-    /// ExtractElement without an internally bound bounds derivation"), so
-    /// NEITHER lane's array-index body can be solved through this entry
-    /// today. This is the validator doing its job on a shape nobody has
-    /// modeled yet, not a defect in the shadow planner; per the mission's
-    /// boundary it is recorded, not shimmed. When trust-mc gains a bounds
-    /// derivation for ExtractElement, this test fails and the probe joins the
-    /// solved battery above.
-    #[test]
-    fn bounds_probe_is_refused_by_the_extract_element_gate_on_both_lanes() {
-        let direct_bundle = direct_shadow_bundle("m1bounds", 2);
-        let direct_refusal = runner()
-            .solve_bundle_native_proof_grade(&direct_bundle)
-            .expect_err("the ExtractElement gate refuses the direct bounds probe");
-        let (mir_bundle, mir_authority) = mir_lane_bundle_with_authority("m1bounds");
-        let mir_refusal = runner()
-            .solve_bundle_native_proof_grade_with_source_authority(&mir_bundle, &mir_authority)
-            .expect_err("the ExtractElement gate refuses the MIR bounds probe");
-        for (lane, refusal) in [("direct-shadow", direct_refusal), ("MIR", mir_refusal)] {
-            let text = refusal.to_string();
-            assert!(
-                text.contains("uses ExtractElement without an internally bound bounds derivation"),
-                "{lane}: expected the ExtractElement admission refusal, got: {text}"
-            );
-        }
     }
 
     /// The shadow lane's authority asymmetry, pinned: the SHADOW bundle is

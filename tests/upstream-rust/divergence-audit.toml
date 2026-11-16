@@ -22,6 +22,9 @@ schema_version = "0.1.0"
 # backing ledger tests/trust-added/compiletest-exceptions.toml has ZERO
 # entries; the counts froze the 2026-05-01 75-entry census. This is review
 # bookkeeping, not compatibility acceptance.
+# Trust: 2026-09-14 — rustdoc-linkcheck-drift and run-make-trust-defaults are
+# no longer blockers; both backing rows were resolved by measurement on
+# 2026-08-29.
 reviewed_on = "2026-07-24"
 owner = "@trust-release"
 
@@ -49,16 +52,17 @@ owner = "@trust-release"
 # tests/ui/linking/macos-search-path.rs — now ledgered per-test as
 # test-exc.linking.*.strict-exec-drift in
 # tests/upstream-rust/test-exceptions.toml (expire 2026-10-16).
+# Resolved 2026-10-09: both per-test rows retired (drift not reproduced).
 [[items]]
 id = "upstream.blocker.ui-diagnostic-drift"
 scope = "upstream-rust"
-status = "decomposed_to_per_test"
-ledger = "tests/upstream-rust/test-exceptions.toml#test-exc.linking.macos-ignoring-duplicate.strict-exec-drift"
+status = "resolved"
+ledger = "tests/upstream-rust/test-exceptions.toml"
 suite = "ui"
 path = "tests/ui/**"
 reason = "Retired as a category-level blocker per the PR rule (break category blockers into per-test entries): the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly two tests/ui failures in this category (tests/ui/linking/macos-ignoring-duplicate.rs, tests/ui/linking/macos-search-path.rs), both now per-test rows in tests/upstream-rust/test-exceptions.toml. The former backing row was separately resolved to the audited porter model (accepted_narrow_divergence) with the vanilla tests/ui lane green (21159 passed / 0 failed / 606 ignored, reviewed 2026-07-11)."
-compatibility_impact = "Bounded to the two ledgered per-test rows until a fresh strict executed run reclassifies them; no category-wide unknown remains recorded."
-required_action = "Confirm or retire the two per-test rows on an aarch64-apple-darwin strict stage2 run. HOST-BOUND (noted 2026-08-10): both tests are `//@ only-apple`, so a Linux lane IGNORES them and can neither confirm nor retire them — the 2026-07-12 evidence run was itself aarch64-apple-darwin. Kept in step with the per-test rows, which moved to the same date for the same reason."
+compatibility_impact = "None recorded: both per-test rows are retired and the tests carry no waiver."
+required_action = "None. Resolved 2026-10-09: both per-test rows retired after the drift failed to reproduce with installed trustc 321aaeda75 on aarch64-apple-darwin in the default, vanilla and verified lanes (evidence beside the RETIRED note in test-exceptions.toml). A recurrence is a new failure, not this item."
 expires_on = "2026-10-16"
 
 [[items]]
@@ -96,6 +100,13 @@ expires_on = "2026-09-30"
 # .stage-sysroot-skew, whose 2026-07-11 note also attributes the run's
 # rustdoc/parser rustc_private tool-build failures to the same skew (the run
 # additionally recorded one trust-router cargo-compile failure row).
+# Trust: 2026-09-27 — the "still-ACTIVE backing row" above is stale: that
+# divergences.toml row was RETIRED (status = "retired", not renewed) at its
+# 2026-10-01 expiry re-review in 284ff7b2080. Its rustdoc tool half was
+# measured clean by 7be1f1547ec (2026-08-26), its ui-fulldeps half was
+# retired by fdfbfaf5ea8, and its parser half names no test and is UNMEASURED,
+# not claimed fixed. A recurrence now reports failed_undocumented. The text
+# above is kept as the 2026-07-24 record.
 [[items]]
 id = "upstream.blocker.stage-sysroot-skew"
 scope = "upstream-rust"
@@ -103,34 +114,34 @@ status = "resolved"
 ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.stage-sysroot-skew"
 suite = "tool"
 path = "src/tools/**"
-reason = "Retired as a category-level blocker per the PR rule: the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly 71 failing tests in this category, all tests/ui-fulldeps/** rustc-private failures (E0463/E0460 from the incoherently assembled dylib-only rustc-private sysroot), now ledgered as 71 per-test rows in tests/upstream-rust/test-exceptions.toml. Harness/bootstrap root cause, not a trustc compiler regression; the fix obligation remains on the active backing divergences.toml row."
+reason = "Retired as a category-level blocker per the PR rule: the 2026-07-12 executed domination run exec-c30dc44143 recorded exactly 71 failing tests in this category, all tests/ui-fulldeps/** rustc-private failures (E0463/E0460 from the incoherently assembled dylib-only rustc-private sysroot), now ledgered as 71 per-test rows in tests/upstream-rust/test-exceptions.toml. Harness/bootstrap root cause, not a trustc compiler regression; the fix obligation remains on the active backing divergences.toml row. 2026-09-27: that backing row is no longer active; it was RETIRED (status = retired, not renewed) at its expiry re-review in 284ff7b2080, so no fix obligation remains open on it and a recurrence reports failed_undocumented."
 compatibility_impact = "Harness validity risk bounded to the 71 ledgered per-test rows plus the backing row's tool-build failures; not proof of public Trust semantic divergence."
-required_action = "DONE 2026-08-10. The root cause was fixed by `94446ac500` on 2026-07-11 — thirteen days BEFORE these rows were written, which is why re-measurement retired them rather than a new fix doing so. Fresh lane: 76 ui-fulldeps tests, 0 failed, sysroot control firing twice (reports/artifacts/2026-08-10-ui-fulldeps-lane.log). All 71 per-test rows deleted from test-exceptions.toml. The backing divergences.toml row stays ACTIVE, narrowed to the rustdoc/parser tool builds, which this run did not exercise."
+required_action = "DONE 2026-08-10. The root cause was fixed by `94446ac500` on 2026-07-11 — thirteen days BEFORE these rows were written, which is why re-measurement retired them rather than a new fix doing so. Fresh lane: 76 ui-fulldeps tests, 0 failed, sysroot control firing twice (reports/artifacts/2026-08-10-ui-fulldeps-lane.log). All 71 per-test rows deleted from test-exceptions.toml. The backing divergences.toml row stays ACTIVE, narrowed to the rustdoc/parser tool builds, which this run did not exercise. 2026-09-27: superseded — the backing row was RETIRED in 284ff7b2080 (rustdoc tool half measured clean by 7be1f1547ec on 2026-08-26; parser half names no test and is unmeasured). A new rustc_private E0463/E0460 failure gets a new per-tool row, not a reactivation."
 resolved_on = "2026-08-10"
 
 [[items]]
 id = "upstream.blocker.rustdoc-linkcheck-drift"
 scope = "upstream-rust"
-status = "blocker"
+status = "resolved"
 ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
 suite = "rustdoc"
 path = "tests/rustdoc*/**"
-reason = "rustdoc UI/output/linkcheck results differ in the strict compatibility lane. Backing row re-audited 2026-07-23: intervening branded expectations and compiler features are not a targeted root-cause fix, reviewed complete wording patch set, or fresh strict stage2 pass. EVIDENCE-REQUIRED (2026-07-24 decomposition review): this category CANNOT be broken into per-test entries — no current artifact names a concrete failing rustdoc test; the 2026-07-12 executed run's failure extract contains zero rustdoc test rows (its two rustdoc tool-build failures are attributed by the backing row to the rustc-private sysroot skew, not linkcheck drift). A fresh strict stage2 rustdoc/linkcheck lane must produce named failures before decomposition or retirement."
-compatibility_impact = "Public documentation behavior may differ; not accepted without reviewed Trust-owned wording patches."
-required_action = "Fix rustdoc/linkcheck behavior or encode reviewed Trust-owned wording changes in tests/upstream-rust/patches.toml."
-expires_on = "2026-08-06"
+reason = "Resolved 2026-08-29 by measurement and fix (backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift, status = resolved): the rustdoc-ui suite under --trust-vanilla on a stage2 built from 7a8214546 is 397 passed / 0 failed / 7 ignored, and branded 397 / 0 / 7 on the same snapshot. The 12 initial failures were all fork rebrands (fixed at source or ledgered per test in tests/upstream-rust/patches.toml), not rustdoc behaviour drift; the linkcheck half was retired 2026-07-30 as unproducible in any standard Trust build (docs = false). The 2026-07-24 EVIDENCE-REQUIRED note is met: the lane ran and named its failures."
+compatibility_impact = "None remaining recorded; a new rustdoc-ui divergence enters per test via tests/upstream-rust/patches.toml, never through this category row."
+required_action = "None; per-test naming patches live in tests/upstream-rust/patches.toml."
+resolved_on = "2026-08-29"
 
 [[items]]
 id = "upstream.blocker.run-make-trust-defaults"
 scope = "upstream-rust"
-status = "blocker"
+status = "resolved"
 ledger = "tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.run-make-trust-defaults"
 suite = "run-make"
 path = "tests/run-make/**"
-reason = "run-make tests may expose Trust naming/default-verification differences. Backing row re-audited 2026-07-23: the focused certified-monitor run-make gate is green, but no fresh vanilla-mode full run-make pass proves the inherited lane clean after substantial launch/default churn. EVIDENCE-REQUIRED (2026-07-24 decomposition review): this category CANNOT be broken into per-test entries — no current artifact names a concrete failing run-make test; the 2026-07-12 executed run's failure extract contains zero run-make rows. A fresh vanilla-mode full run-make lane must produce named failures before decomposition or retirement."
-compatibility_impact = "Trust-owned naming differences may be expected-output patches; verification leakage into vanilla upstream compatibility is a real blocker."
-required_action = "Keep vanilla upstream compatibility on no-verification semantics and patch only reviewed Trust-owned output naming."
-expires_on = "2026-08-06"
+reason = "Resolved 2026-08-29 by measurement (backing row tests/trust-comprehensive/divergences.toml#upstream.trust-compat.2026-05-07.run-make-trust-defaults, status = resolved): the full run-make suite under --trust-vanilla on a stage2 built from 7a8214546 is 348 passed / 0 failed / 160 ignored, reproducing the same day's independent 350 / 0 on 77c7fa96dc. No verification or default-behaviour leakage into inherited run-make tests remains; the naming divergences that did exist were fixed at source or ledgered per test in tests/upstream-rust/patches.toml. The 2026-07-24 EVIDENCE-REQUIRED note is met: the lane ran and named its failures."
+compatibility_impact = "None remaining recorded; a new run-make divergence enters per test via tests/upstream-rust/patches.toml, never through this category row."
+required_action = "None; per-test naming patches live in tests/upstream-rust/patches.toml."
+resolved_on = "2026-08-29"
 
 # RETIRED 2026-07-24 (all six trust-added.debt.* rows): stale bookkeeping.
 # Each row cited tests/trust-added/compiletest-exceptions.toml as its backing
@@ -146,69 +157,123 @@ expires_on = "2026-08-06"
 # claim: any new trust-added audit failure re-enters via a fresh
 # tests/trust-added/compiletest-exceptions.toml entry, never by resurrecting
 # this census.
+# DROPPED 2026-09-14: the six resolved rows reached their 2026-07-30 expiry;
+# per the crash-status precedent above, an expired resolved row is dropped,
+# not renewed.
+
+
+# Trust: manual Cargo fixture adapters outside the root tests/* reimport domain.
+# Existing expiry gate walks these rows. No failure waiver, reimport application
+# or upstream implicit-spawn-inheritance parity credit follows.
 
 [[items]]
-id = "trust-added.debt.missing-blessed-output"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 3
-reason = "Retired 2026-07-24: the backing ledger has zero entries; no missing-blessed-output row remains of the 2026-05-01 census (the final two were re-categorized as pending-compiler-behavior in 615070915d, then resolved by implementing the asserted mir-opt transforms in f2c01e5db0 and e6021fecfd)."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.tools"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/utils/tools.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "echo_wrapper and wrapped_clippy_driver: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
 
 [[items]]
-id = "trust-added.debt.pending-compiler-behavior"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 63
-reason = "Retired 2026-07-24: the backing ledger has zero entries; the 63 pending-compiler-behavior rows of the 2026-05-01 census were progressively fixed or honestly converted per the ledger's own retirement notes (22 retired 2026-07-02 ui-parity campaign; 7 of 9 cleared in c2c4747b8b; final mir-opt seeds implemented in f2c01e5db0 and e6021fecfd)."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.cache-messages"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/cache_messages.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "replay_non_json and caching_large_output: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
 
 [[items]]
-id = "trust-added.debt.diagnostic-drift"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 5
-reason = "Retired 2026-07-24: the backing ledger has zero entries; no diagnostic-drift row remains of the 2026-05-01 census."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.runner"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/jobserver.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "runner_inherits_jobserver generated runner: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
 
 [[items]]
-id = "trust-added.debt.compiler-ice"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 2
-reason = "Retired 2026-07-24: the backing ledger has zero entries; no compiler-ice row remains of the 2026-05-01 census."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.environment-wrapper"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/cargo_env_config.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "env_applied_to_target_info_discovery_rustc generated wrapper: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
 
 [[items]]
-id = "trust-added.debt.runtime-regression"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 1
-reason = "Retired 2026-07-24: the backing ledger has zero entries; no runtime-regression row remains of the 2026-05-01 census."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.fix-wrapper"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/fix.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "fix_to_broken_code pre-delegation marker wrapper: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
 
 [[items]]
-id = "trust-added.debt.environment-or-dependency-gap"
-scope = "trust-added"
-status = "resolved"
-ledger = "tests/trust-added/compiletest-exceptions.toml"
-count = 1
-reason = "Retired 2026-07-24: the backing ledger has zero entries; no environment-or-dependency-gap row remains of the 2026-05-01 census."
-compatibility_impact = "None recorded; the empty backing ledger is the accounting of record."
-required_action = "None; a new trust-added audit failure re-enters via a fresh compiletest-exceptions.toml entry."
-expires_on = "2026-07-30"
+id = "upstream.adapter.cargo-transparent-proxy-exec.rustup-proxies"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/rustup.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "real_rustc_wrapper and RustupEnvironmentBuilder generated proxies: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."
+
+[[items]]
+id = "upstream.adapter.cargo-transparent-proxy-exec.sbom-wrapper"
+scope = "upstream-cargo"
+status = "active"
+owner = "@trust-release"
+reviewed_on = "2026-10-24"
+expires_on = "2026-11-23"
+classification = "manual-harness-adapter"
+compatibility_status = "changed_fixture_coverage_no_failure_waiver"
+suite = "cargo-testsuite"
+path = "src/tools/targo/tests/testsuite/sbom.rs"
+issue = "local:docs/DECISION_QUEUE.md#targo-transparent-proxy-handoff-1-2026-10-24"
+reason = "workspace_wrapper generated wrapper: SP-1 strips unnamed descriptors across spawn. These single-threaded transparent fixtures explicitly exec the requested program on Unix, preserving the already parent-bounded table without reading MAKEFLAGS or opting into global inheritance. Arguments, output assertions and payload checks stay intact; non-Unix retains the original spawn/status path."
+compatibility_impact = "Changed coverage: Unix no longer tests implicit inheritance across a second plain spawn or its post-wait status conversion; exec propagates tool result/signals directly. This is not upstream spawn parity, a production compiler change or a failure waiver. Root patches.toml cannot apply src/tools/targo paths; this is an explicit manual adapter record only."
+required_action = "Re-review the exact adapter and full affected Cargo modules before expiry or if SP-1/upstream proxy behavior changes. Preserve plain/empty-pre_exec noninheritance negatives, first-hop sentinel exclusion and one-token roundtrip. Retire when this handoff needs no adaptation; no renewal from stale receipts."

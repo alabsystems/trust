@@ -286,7 +286,7 @@ pub(crate) fn advance_built_to_runtime<'tcx>(
     }
 
     // Stage A — the `mir_built` provider tail (its Lint passes skipped).
-    pm::run_passes(tcx, body, &[&simplify::SimplifyCfg::Initial], None, pm::Optimizations::Allowed);
+    pm::run_passes(tcx, body, &[&simplify::SimplifyCfg::Initial], None);
 
     // Stage B — the `mir_promoted` stage. `required_consts` must be computed before promotion,
     // exactly as `mir_promoted` does; `InstrumentCoverage` is in the list for parity but is
@@ -298,7 +298,6 @@ pub(crate) fn advance_built_to_runtime<'tcx>(
         body,
         &[&promote_pass, &simplify::SimplifyCfg::PromoteConsts, &coverage::InstrumentCoverage],
         Some(MirPhase::Analysis(AnalysisPhase::Initial)),
-        pm::Optimizations::Allowed,
     );
     let promoted = promote_pass.promoted_fragments.into_inner();
     if !promoted.is_empty() {

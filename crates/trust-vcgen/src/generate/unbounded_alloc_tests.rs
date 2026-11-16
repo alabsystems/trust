@@ -3,7 +3,13 @@ use trust_types::{
     UnwindEdge, VcKind, VerifiableBody, VerifiableFunction,
 };
 
-use crate::generate_vcs;
+/// Trust (ALLOC-WIDTH-1, 2026-10-08): every test here models the COMPILER on a
+/// 64-bit host, which installs the target's pointer width as a session fact
+/// (`VcgenContext::with_target_pointer_bits`). The 32-bit and no-width verdicts
+/// are pinned in `alloc_width_receiver_tests`.
+fn generate_vcs(func: &VerifiableFunction) -> Vec<trust_types::VerificationCondition> {
+    crate::with_target_pointer_bits(Some(64), || crate::generate_vcs(func))
+}
 
 /// A function whose single block tail-calls `callee(n)`, with `n` an
 /// unbounded `usize` parameter (local 1).
@@ -31,6 +37,7 @@ fn func_calling(callee: &str) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -42,6 +49,7 @@ fn func_calling(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -49,6 +57,25 @@ fn unbounded_alloc_count(func: &VerifiableFunction) -> usize {
     generate_vcs(func)
         .iter()
         .filter(|vc| matches!(&vc.kind, VcKind::UnboundedAllocation { .. }))
+        .count()
+}
+
+/// The allocation's VISIBLE obligation: its counted `UnboundedAllocation` row, or —
+/// since `1b5061bbe0` (an element-count bound cannot establish the byte capacity of
+/// an unknown layout) — the `element-size-not-derivable` Unknown that replaces that
+/// row when the element stride is not exactly known. Either way the allocation is
+/// charged; what may never happen is neither.
+fn alloc_row_count(func: &VerifiableFunction) -> usize {
+    generate_vcs(func)
+        .iter()
+        .filter(|vc| match &vc.kind {
+            VcKind::UnboundedAllocation { .. } => true,
+            VcKind::UnsupportedMir { kind, .. } => {
+                kind.starts_with("UnboundedAllocation::")
+                    && kind.ends_with("::element-size-not-derivable")
+            }
+            _ => false,
+        })
         .count()
 }
 
@@ -214,8 +241,51 @@ fn bounds_and_nonnull_fact_callees_require_canonical_owners() {
         assert!(!super::vc_callee_is_std_vec_inherent(callee), "{callee}");
     }
 
-    assert!(super::vc_callee_is_slice_inherent("core::slice::<impl [u8]>::windows", "windows"));
-    assert!(!super::vc_callee_is_slice_inherent("<[T] as mycrate::Trait>::windows", "windows"));
+    // SLICE-INHERENT-1 / ASPTR-KEY-1 (2026-10-04): both recognizers decide on the
+    // compiler-minted key first; `std_key` is what the extractor mints for a core
+    // callee (no modeled tag needed for `windows`).
+    let std_key = trust_types::CalleeKey {
+        sysroot_item: None,
+        krate_is_real_sysroot: true,
+        krate_name_is_ambiguous: false,
+        stable_crate_id: 0x1234,
+        krate_name: "core".into(),
+        foreign_block_leaf: None,
+        upstream_foreign_link_symbol: None,
+        diverging_entry: None,
+    };
+    assert!(super::vc_callee_is_slice_inherent(
+        "core::slice::<impl [u8]>::windows",
+        Some(&std_key),
+        "windows"
+    ));
+    assert!(!super::vc_callee_is_slice_inherent(
+        "<[T] as mycrate::Trait>::windows",
+        Some(&std_key),
+        "windows"
+    ));
+    assert!(!super::vc_callee_is_slice_inherent(
+        "core::slice::<impl [u8]>::windows",
+        None,
+        "windows"
+    ));
+    assert!(super::vc_callee_is_slice_inherent(
+        "core::slice::<impl [T]>::iter",
+        Some(&std_key),
+        "iter"
+    ));
+    // A user inherent method on a type named over `[T]` is not the std one
+    // (trip-count lane review, 2026-09-29) — not even under a sysroot key.
+    assert!(!super::vc_callee_is_slice_inherent(
+        "mycrate::Foo::<[T]>::iter",
+        Some(&std_key),
+        "iter"
+    ));
+    assert!(!super::vc_callee_is_slice_inherent(
+        "mycrate::Foo::<[T]>::split",
+        Some(&std_key),
+        "split"
+    ));
 
     assert!(super::is_slice_to_array_conversion("core::convert::TryInto::try_into"));
     assert!(super::is_slice_to_array_conversion(
@@ -226,8 +296,14 @@ fn bounds_and_nonnull_fact_callees_require_canonical_owners() {
         "<&[u8] as mycrate::convert::TryInto<[u8; 8]>>::try_into"
     ));
 
-    assert!(super::is_std_container_as_ptr("alloc::vec::Vec::<u8>::as_ptr"));
-    assert!(!super::is_std_container_as_ptr("mycrate::core::slice::as_ptr"));
+    let vec_as_ptr = trust_types::CalleeKey {
+        sysroot_item: Some(trust_types::SysrootItem::VecAsPtr),
+        krate_name: "alloc".into(),
+        ..std_key.clone()
+    };
+    assert!(super::is_std_container_as_ptr(Some(&vec_as_ptr)));
+    assert!(!super::is_std_container_as_ptr(Some(&std_key)));
+    assert!(!super::is_std_container_as_ptr(None));
 }
 
 /// The exact shape of the interpreter OOM: `vec![None; size]` lowers to
@@ -263,6 +339,9 @@ fn flags_unbounded_vec_macro_from_elem() {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(
+                        "std::vec::from_elem::<Option<u8>>",
+                    ),
                     is_foreign: false,
                 },
             }],
@@ -274,6 +353,7 @@ fn flags_unbounded_vec_macro_from_elem() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
         unbounded_alloc_count(&func),
@@ -316,6 +396,9 @@ fn flags_unbounded_repeat_n_collect() {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::iter::repeat_n::<u32>",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -332,6 +415,9 @@ fn flags_unbounded_repeat_n_collect() {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::iter::Iterator::collect",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -344,9 +430,10 @@ fn flags_unbounded_repeat_n_collect() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
-        unbounded_alloc_count(&func),
+        alloc_row_count(&func),
         1,
         "repeat_n(x, n).collect() with unbounded n must be flagged"
     );
@@ -356,9 +443,10 @@ fn flags_unbounded_repeat_n_collect() {
 fn from_elem_multibyte_adds_byte_aware_term() {
     // vec![0u64; n] with symbolic n: from_elem's element is a real typed
     // operand, so the failure formula carries the BYTE-aware product
-    // (elem_size 8 * n >= budget), tightening the bare element ceiling — the
-    // one MIR allocation whose element type survives (RawVec erases it
-    // elsewhere; the trust-ir layer does this in general, alloc_bound.rs).
+    // (elem_size 8 * n >= isize::MAX, the object limit where RawVec panics
+    // "capacity overflow") beside the bare element ceiling — the one MIR
+    // allocation whose element type survives (RawVec erases it elsewhere; the
+    // trust-ir layer does this in general, alloc_bound.rs).
     let func = VerifiableFunction {
         name: "from_elem_u64".to_string(),
         def_path: "test::from_elem_u64".to_string(),
@@ -388,6 +476,7 @@ fn from_elem_multibyte_adds_byte_aware_term() {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("std::vec::from_elem::<u64>"),
                     is_foreign: false,
                 },
             }],
@@ -399,6 +488,7 @@ fn from_elem_multibyte_adds_byte_aware_term() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     let vc = vcs
@@ -409,6 +499,17 @@ fn from_elem_multibyte_adds_byte_aware_term() {
     assert!(
         smt.contains("(* "),
         "byte-aware product (elem_size * count) must appear for a multi-byte from_elem: {smt}"
+    );
+    // The byte line is the object limit, `isize::MAX`. There is no 256 MiB
+    // availability budget: it was deleted with trust-ir's `ALLOC_BYTE_BUDGET`
+    // (2026-09-29), so no product is compared with 2^28 bytes.
+    assert!(
+        smt.contains(&super::ALLOC_CAPACITY_OVERFLOW_BYTES.to_string()),
+        "the byte product must be judged against the object limit isize::MAX: {smt}"
+    );
+    assert!(
+        !smt.contains(") 268435456)"),
+        "no byte product may be compared with the deleted 256 MiB budget: {smt}"
     );
 }
 
@@ -437,6 +538,7 @@ fn func_calling_const_size(callee: &str, n: i128) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -448,6 +550,7 @@ fn func_calling_const_size(callee: &str, n: i128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -462,6 +565,49 @@ fn flags_const_allocation_exactly_at_ceiling() {
         1,
         "an allocation of exactly the ceiling (1<<28) must be flagged, not waved through"
     );
+}
+
+/// W4 ITER-HOF landing round (2026-10-03): the `Box`/`Rc`/`Arc` uninitialized and
+/// zeroed SLICE constructors allocate `len` elements in one request (count at argument
+/// 0) and panic past `isize::MAX` bytes, exactly like `with_capacity(len)`. They are
+/// charged at a direct call, and — through `callee_is_call_site_allocation_sink` — are
+/// withheld as fn-item type arguments (`map(Box::<[u64]>::new_uninit_slice)`). Before
+/// this, `bulk_alloc_call` did not name them and every spelling was charged nothing
+/// (review probes r01/r02/v02/r06c/v05d panicked "capacity overflow" on `usize::MAX`).
+#[test]
+fn flags_unguarded_uninit_and_zeroed_slice_constructors() {
+    for callee in [
+        "alloc::boxed::Box::<[u64]>::new_uninit_slice",
+        "alloc::boxed::Box::<[u64]>::new_zeroed_slice",
+        "alloc::rc::Rc::<[u64]>::new_uninit_slice",
+        "alloc::sync::Arc::<[u8]>::new_zeroed_slice",
+        "alloc::boxed::Box::<[u64]>::new_uninit_slice::<__trust_elem_bytes@8>",
+        "alloc::boxed::Box::<[u64], A>::new_uninit_slice_in",
+        "alloc::sync::Arc::<[u64], A>::new_zeroed_slice_in",
+    ] {
+        assert_eq!(
+            alloc_row_count(&func_calling(callee)),
+            1,
+            "`{callee}` sized by an unbounded param must be flagged like `with_capacity`"
+        );
+        assert!(
+            super::callee_has_call_site_panic_family(callee),
+            "`{callee}` handed as a fn-item type argument must not be admitted"
+        );
+    }
+    // The fallible twins return the layout error instead of panicking.
+    for callee in [
+        "alloc::boxed::Box::<[u64]>::try_new_uninit_slice",
+        "alloc::rc::Rc::<[u64]>::try_new_zeroed_slice",
+    ] {
+        assert_eq!(unbounded_alloc_count(&func_calling(callee)), 0, "`{callee}` is fallible");
+    }
+    // A constant count whose bytes stay below both ceilings is bounded.
+    let small = func_calling_const_size(
+        "alloc::boxed::Box::<[u64]>::new_uninit_slice::<__trust_elem_bytes@8>",
+        8192,
+    );
+    assert_eq!(unbounded_alloc_count(&small), 0, "a small constant slice is bounded");
 }
 
 #[test]
@@ -504,6 +650,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::collect"),
         is_foreign: false,
     };
     let blocks = if mapped {
@@ -524,6 +671,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::map"),
                     is_foreign: false,
                 },
             },
@@ -552,6 +700,7 @@ fn range_collect_func(end: i128, mapped: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -562,7 +711,7 @@ fn flags_collect_over_huge_const_range() {
     // reconstructed from the Range bounds.
     let func = range_collect_func(1 << 28, false);
     assert_eq!(
-        unbounded_alloc_count(&func),
+        alloc_row_count(&func),
         1,
         "collect over a const range of 2^28 must be flagged"
     );
@@ -574,7 +723,7 @@ fn flags_collect_over_mapped_huge_range() {
     // through the length-preserving `map` adaptor.
     let func = range_collect_func(1 << 28, true);
     assert_eq!(
-        unbounded_alloc_count(&func),
+        alloc_row_count(&func),
         1,
         "collect over a mapped const range of 2^28 must be flagged through the adaptor"
     );
@@ -605,10 +754,15 @@ fn allows_collect_over_small_range() {
 /// own, taken from real `-Ztrust-dump=mir` bundles (see
 /// `trusted_root_spoof_iter_producer_tests` and
 /// `authenticated_std_iter_chain_tests`).
+///
+/// The sink carries the extractor's destination-size token for a 4-byte element:
+/// since D12 option (a) (2026-10-06) the grant also needs the destination's bytes
+/// per item, and a sink without the token keeps its charge.
 fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> VerifiableFunction {
     let collect_term = |iter_local: usize| Terminator::Call {
         unwind: UnwindEdge::Unreachable,
-        func: "core::iter::Iterator::collect".to_string(),
+        func: "core::iter::Iterator::collect::<alloc::vec::Vec<u32>>::<__trust_elem_bytes@4>"
+            .to_string(),
         args: vec![Operand::Move(Place::local(iter_local))],
         dest: Place::local(5),
         target: None,
@@ -616,6 +770,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::collect"),
         is_foreign: false,
     };
     let produce = |target: Option<BlockId>| Terminator::Call {
@@ -628,6 +783,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&producer.to_string()),
         is_foreign: false,
     };
     let blocks = if cloned {
@@ -646,6 +802,9 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(
+                        "core::iter::Iterator::cloned",
+                    ),
                     is_foreign: false,
                 },
             },
@@ -690,6 +849,7 @@ fn collection_collect_func(producer: &str, iter_ty: &str, cloned: bool) -> Verif
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -710,7 +870,7 @@ fn allows_collect_over_vec_iter() {
 fn allows_collect_over_hashmap_keys_cloned() {
     // Mirrors ny-cert `check_farkas`: `coeffs.keys().cloned().collect()`.
     let func = collection_collect_func(
-        "std::collections::hash_map::HashMap::<K, V>::keys",
+        "std::collections::hash_map::HashMap::<u32, u32>::keys",
         "std::collections::hash::map::Keys<'_, K, V>",
         true,
     );
@@ -846,6 +1006,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&keys_path.to_string()),
         is_foreign: false,
     };
     let blocks = vec![
@@ -864,6 +1025,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::chain"),
                 is_foreign: false,
             },
         },
@@ -880,6 +1042,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::cloned"),
                 is_foreign: false,
             },
         },
@@ -888,7 +1051,9 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
             stmts: vec![],
             terminator: Terminator::Call {
                 unwind: UnwindEdge::Unreachable,
-                func: "core::iter::Iterator::collect".to_string(),
+                func:
+                    "core::iter::Iterator::collect::<alloc::vec::Vec<u32>>::<__trust_elem_bytes@4>"
+                        .to_string(),
                 args: vec![Operand::Move(Place::local(6))],
                 dest: Place::local(7),
                 target: None,
@@ -896,6 +1061,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
                 atomic: None,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("core::iter::Iterator::collect"),
                 is_foreign: false,
             },
         },
@@ -934,6 +1100,7 @@ fn chained_keys_collect_func(keys_path: &str, keys_ty: &str) -> VerifiableFuncti
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -943,8 +1110,10 @@ fn allows_collect_over_chained_keys() {
     // `a.keys().chain(b.keys()).cloned().collect()` — a chain of two
     // materialized-collection iterators is bounded (sum of two already-gated
     // allocations), so it must not be flagged.
+    // `u32` keys: a table holds at most `MAX_LIVE / 5` of them, so the two sides
+    // together stay inside a 4-byte destination's reservation (D12 option (a)).
     let func = chained_keys_collect_func(
-        "std::collections::hash_map::HashMap::<K, V>::keys",
+        "std::collections::hash_map::HashMap::<u32, u32>::keys",
         "std::collections::hash::map::Keys<'_, K, V>",
     );
     assert_eq!(
@@ -1013,6 +1182,7 @@ fn func_calling_no_args(callee: &str) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -1024,6 +1194,7 @@ fn func_calling_no_args(callee: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1077,6 +1248,7 @@ fn func_calling_single_value(callee: &str, value_ty: Ty) -> VerifiableFunction {
                     atomic: None,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                     is_foreign: false,
                 },
             }],
@@ -1088,32 +1260,62 @@ fn func_calling_single_value(callee: &str, value_ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
 #[test]
-fn flags_oversized_box_new() {
-    // `Box::new([0u8; 1 << 40])` heap-allocates a single ~1 TiB value — the
-    // OOM/`capacity overflow` hazard the count-only gate misses (count is 1).
-    // The byte size of `[u8; 1<<40]` exceeds the availability ceiling, so it
-    // must be flagged.
+fn a_single_value_within_the_object_limit_is_not_flagged() {
+    // `Box::new([0u8; 1 << 40])` heap-allocates one ~1 TiB value. That is
+    // within the largest object a 64-bit target can hold (`isize::MAX` bytes),
+    // the one line an allocation is judged against since the 256 MiB budget
+    // was deleted with trust-ir's `ALLOC_BYTE_BUDGET` (the owner,
+    // 2026-09-29: "the lint reports only allocations whose size is not
+    // provably bounded"; docs/OWNER_RULINGS.md OW-29; trust-ir no longer reports a
+    // 512 MiB or 64 GiB constant). Its size is a constant of its type, so it is bounded.
     let huge = Ty::Array { elem: Box::new(Ty::u8()), len: 1u64 << 40 };
     let func = func_calling_single_value("alloc::boxed::Box::<[u8; 1099511627776]>::new", huge);
     assert_eq!(
         unbounded_alloc_count(&func),
-        1,
-        "an oversized single-value Box::new (a ~1 TiB value) must be flagged"
+        0,
+        "a single-value Box::new whose size is within isize::MAX is bounded by its type"
     );
 }
 
 #[test]
-fn flags_oversized_rc_and_arc_new() {
-    // The same hazard via `Rc::new` / `Arc::new` (a single oversized value).
+fn a_single_value_within_the_object_limit_is_not_flagged_through_rc_or_arc() {
+    // The same value through `Rc::new` / `Arc::new`.
     let huge = || Ty::Array { elem: Box::new(Ty::u8()), len: 1u64 << 40 };
     let rc = func_calling_single_value("alloc::rc::Rc::<[u8; 1099511627776]>::new", huge());
     let arc = func_calling_single_value("alloc::sync::Arc::<[u8; 1099511627776]>::new", huge());
-    assert_eq!(unbounded_alloc_count(&rc), 1, "oversized Rc::new must be flagged");
-    assert_eq!(unbounded_alloc_count(&arc), 1, "oversized Arc::new must be flagged");
+    assert_eq!(
+        unbounded_alloc_count(&rc),
+        0,
+        "Rc::new of a 1 TiB value is within the object limit"
+    );
+    assert_eq!(
+        unbounded_alloc_count(&arc),
+        0,
+        "Arc::new of a 1 TiB value is within the object limit"
+    );
+}
+
+#[test]
+fn a_single_value_at_the_object_limit_is_flagged() {
+    // The line itself: a single value of MORE than `isize::MAX` bytes can never
+    // be allocated (`Layout` refuses it), so it is reported. `[u8; 2^63]` is
+    // exactly the first size past `isize::MAX` on a 64-bit target. A DEFENSE
+    // check: rustc refuses such a type outright (`obj_size_bound` is `2^61` on
+    // 64 bits), so for a type the compiler accepted this arm never fires; the
+    // inclusive boundary is pinned in `alloc_width_receiver_tests`.
+    let at_limit = Ty::Array { elem: Box::new(Ty::u8()), len: 1u64 << 63 };
+    let func =
+        func_calling_single_value("alloc::boxed::Box::<[u8; 9223372036854775808]>::new", at_limit);
+    assert_eq!(
+        unbounded_alloc_count(&func),
+        1,
+        "a single value past isize::MAX bytes exceeds the largest object and must be flagged"
+    );
 }
 
 #[test]
@@ -1124,7 +1326,7 @@ fn allows_ordinary_box_new() {
     let func = func_calling_single_value("alloc::boxed::Box::<u64>::new", Ty::u64());
     assert_eq!(unbounded_alloc_count(&func), 0, "an ordinary small Box::new must not be flagged");
     // And a `Box::new` of another small primitive (4 bytes) is likewise not
-    // flagged — only an oversized value reaching the availability ceiling is.
+    // flagged — only a value past the object limit (`isize::MAX` bytes) is.
     let small = func_calling_single_value("alloc::boxed::Box::<u32>::new", Ty::u32());
     assert_eq!(unbounded_alloc_count(&small), 0, "a Box::new of a small value must not be flagged");
 }
@@ -1250,6 +1452,7 @@ fn grow_after_guard(reassign: bool, cross_block: bool) -> VerifiableFunction {
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("std::vec::Vec::<u8>::with_capacity"),
         is_foreign: false,
     };
     let reassign_stmt = || Statement::Assign {
@@ -1320,6 +1523,7 @@ fn grow_after_guard(reassign: bool, cross_block: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1465,6 +1669,9 @@ fn reseated_deref_store_drops_alloc_guard() {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::vec::Vec::<u8>::with_capacity",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -1477,6 +1684,7 @@ fn reseated_deref_store_drops_alloc_guard() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // S2c: the guard is conjoined EXEMPT, so its `n` stays bare (entry) while the
     // reseated deref-store HAVOCS the alloc count to `n#s2_2`. Soundness =
@@ -1493,4 +1701,396 @@ fn reseated_deref_store_drops_alloc_guard() {
          violation `n` (else a ~1 GiB allocation is false-PROVED safe); \
          guard={guard_n} viol={viol_n}; raw: {raw}"
     );
+}
+
+mod zero_sized_vec {
+    use trust_types::{CalleeKey, SysrootItem};
+
+    use super::*;
+
+    const OPERATIONS: &[(&str, SysrootItem, usize)] = &[
+        ("with_capacity", SysrootItem::VecWithCapacity, 0),
+        ("with_capacity_in", SysrootItem::VecWithCapacityIn, 0),
+        ("reserve", SysrootItem::VecReserve, 1),
+        ("reserve_exact", SysrootItem::VecReserveExact, 1),
+        ("resize", SysrootItem::VecResize, 1),
+        ("resize_with", SysrootItem::VecResizeWith, 1),
+        ("from_elem", SysrootItem::VecFromElem, 1),
+    ];
+
+    fn key(item: Option<SysrootItem>) -> CalleeKey {
+        CalleeKey {
+            sysroot_item: item,
+            krate_is_real_sysroot: true,
+            krate_name_is_ambiguous: false,
+            stable_crate_id: 123,
+            krate_name: "alloc".into(),
+            foreign_block_leaf: None,
+            upstream_foreign_link_symbol: None,
+            diverging_entry: None,
+        }
+    }
+
+    fn call(leaf: &str, size: &str, item: Option<SysrootItem>) -> VerifiableFunction {
+        let path = if leaf == "from_elem" {
+            format!("alloc::vec::from_elem::<user::Empty>{size}")
+        } else {
+            format!("alloc::vec::Vec::<user::Empty>::{leaf}{size}")
+        };
+        let mut f = func_calling(&path);
+        if let Terminator::Call { callee_key, args, .. } = &mut f.body.blocks[0].terminator {
+            *callee_key = Some(key(item));
+            if !matches!(leaf, "with_capacity" | "with_capacity_in") {
+                args.insert(0, Operand::Copy(Place::local(2)));
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn authenticated_zero_size_has_no_backing_allocation_for_every_vec_operation() {
+        for &(leaf, item, _) in OPERATIONS {
+            if is_additive(item) {
+                continue;
+            }
+            let f = call(leaf, "::<__trust_elem_bytes@0>", Some(item));
+            assert_eq!(unbounded_alloc_count(&f), 0, "{leaf}");
+        }
+    }
+
+    /// Review round 59: `reserve`/`reserve_exact` ADD to a length that a zero-sized
+    /// element does not bound, so `len + additional` can overflow `usize` and panic
+    /// "capacity overflow" with no backing allocation at all. Their row stays.
+    ///
+    /// Trust (2026-10-14, ALLOC-RECEIVER-ZST-1): it stays as a VISIBLE UNKNOWN
+    /// (`receiver_unknown_count`), no longer as a counted row. The counted row it was
+    /// carried no byte term at stride zero, so it was the element ceiling alone: a
+    /// guard discharged it (kernel-certified on stage 1 for `if n < 100 {
+    /// v.reserve(n) }`) and a constant count skipped it, while a full `Vec<()>`
+    /// overflows on `reserve(1)`. The old assertion (`unbounded_alloc_count == 1`)
+    /// counted that dischargeable row as the charge; it was never one. (This
+    /// module's receiver is a `u32` stand-in, which reads as no collection at all
+    /// and keeps the same Unknown; `alloc_width_receiver_tests` pins the real
+    /// `&mut Vec<()>` / `&mut VecDeque<()>` receivers and their sized controls.)
+    fn is_additive(item: SysrootItem) -> bool {
+        matches!(item, SysrootItem::VecReserve | SysrootItem::VecReserveExact)
+    }
+
+    /// The visible Unknown a live-receiver sink keeps when memory does not bound the
+    /// receiver's length (`alloc_vcs::live_receiver_length_is_bounded`).
+    fn receiver_unknown_count(func: &VerifiableFunction) -> usize {
+        generate_vcs(func)
+            .iter()
+            .filter(|vc| {
+                matches!(
+                    &vc.kind,
+                    VcKind::UnsupportedMir { kind, .. }
+                        if kind == "UnboundedAllocation::Vec::reserve::receiver-length-not-bounded"
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_zero_sized_reserve_keeps_its_row() {
+        for &(leaf, item, _) in OPERATIONS {
+            if !is_additive(item) {
+                continue;
+            }
+            let f = call(leaf, "::<__trust_elem_bytes@0>", Some(item));
+            assert_eq!(unbounded_alloc_count(&f), 0, "{leaf}: no dischargeable counted row");
+            assert_eq!(receiver_unknown_count(&f), 1, "{leaf}: the visible Unknown");
+        }
+    }
+
+    #[test]
+    fn absent_unrecognized_and_non_sysroot_keys_keep_the_allocation_row() {
+        for &(leaf, item, _) in OPERATIONS {
+            // An additive leaf keeps its charge as the receiver Unknown (see
+            // `is_additive`); every other leaf keeps its counted row.
+            let kept = |f: &VerifiableFunction| {
+                if is_additive(item) {
+                    assert_eq!(unbounded_alloc_count(f), 0, "{leaf}");
+                    receiver_unknown_count(f)
+                } else {
+                    unbounded_alloc_count(f)
+                }
+            };
+            let mut f = call(leaf, "::<__trust_elem_bytes@0>", None);
+            assert_eq!(kept(&f), 1, "untagged {leaf}");
+            if let Terminator::Call { callee_key, .. } = &mut f.body.blocks[0].terminator {
+                *callee_key = None;
+            }
+            assert_eq!(kept(&f), 1, "absent {leaf}");
+        }
+        let mut f =
+            call("with_capacity", "::<__trust_elem_bytes@0>", Some(SysrootItem::VecWithCapacity));
+        if let Terminator::Call { callee_key: Some(k), .. } = &mut f.body.blocks[0].terminator {
+            k.krate_is_real_sysroot = false;
+        }
+        assert_eq!(unbounded_alloc_count(&f), 1);
+    }
+
+    #[test]
+    fn every_unrelated_sysroot_tag_keeps_the_allocation_row() {
+        for &item in trust_types::ALL_SYSROOT_ITEMS {
+            if OPERATIONS.iter().any(|&(_, known, _)| known == item) {
+                continue;
+            }
+            let f = call("with_capacity", "::<__trust_elem_bytes@0>", Some(item));
+            assert_eq!(unbounded_alloc_count(&f), 1, "{item:?}");
+        }
+    }
+
+    #[test]
+    fn nonzero_unknown_and_source_spellable_sizes_keep_the_allocation_row() {
+        for &(leaf, item, _) in OPERATIONS {
+            for suffix in [
+                "",
+                "::<__trust_elem_bytes@1>",
+                "::<__trust_elem_bytes@4096>",
+                "::<__trust_elem_bytes_0>",
+                "::<__trust_elem_bytes@0>::<u8>",
+            ] {
+                let f = call(leaf, suffix, Some(item));
+                if is_additive(item) {
+                    // The `u32` stand-in receiver is no collection whose length
+                    // memory bounds: a visible Unknown, never a dropped call.
+                    assert_eq!(unbounded_alloc_count(&f), 0, "{leaf} {suffix}");
+                    assert_eq!(receiver_unknown_count(&f), 1, "{leaf} {suffix}");
+                } else {
+                    assert_eq!(alloc_row_count(&f), 1, "{leaf} {suffix}");
+                }
+            }
+        }
+        let mut f = func_calling("alloc::vec::Vec::<()>::with_capacity");
+        if let Terminator::Call { callee_key, .. } = &mut f.body.blocks[0].terminator {
+            *callee_key = Some(key(Some(SysrootItem::VecWithCapacity)));
+        }
+        assert_eq!(unbounded_alloc_count(&f), 1, "a type spelling alone is insufficient");
+    }
+
+    #[test]
+    fn another_containers_zero_sized_type_parameter_is_not_its_storage_size() {
+        let path = "user::Vec::<()>::with_capacity::<__trust_elem_bytes@0>";
+        assert_eq!(unbounded_alloc_count(&func_calling(path)), 1, "{path}");
+        // Trust (W4 HASHMAP r2, 2026-09-28): a std `HashMap`/`HashSet` allocation
+        // that arrives WITHOUT the extractor's hash-table token — here a plain
+        // `@0` read off its first type argument `K = ()`, the r1 stamping that
+        // sized `HashMap::<u8, [u8; 1 << 50]>` as one byte — is neither skipped as
+        // zero-sized nor charged `count * stride` any more: it fails closed as ONE
+        // visible Unknown (`hash-table-token-absent`). Still never dropped.
+        let path = "std::collections::HashMap::<(), u64>::with_capacity::<__trust_elem_bytes@0>";
+        let vcs = super::super::generate_unbounded_allocation_vcs_on_64_bit(&func_calling(path));
+        assert_eq!(vcs.len(), 1, "{path}");
+        assert!(matches!(vcs[0].kind, VcKind::UnsupportedMir { .. }), "{path}");
+    }
+
+    #[test]
+    fn zero_size_does_not_hide_missing_count_operands() {
+        for &(leaf, item, index) in OPERATIONS {
+            let mut f = call(leaf, "::<__trust_elem_bytes@0>", Some(item));
+            if let Terminator::Call { args, .. } = &mut f.body.blocks[0].terminator {
+                args.truncate(index);
+            }
+            let vcs = super::super::generate_unbounded_allocation_vcs_on_64_bit(&f);
+            assert_eq!(vcs.len(), 1, "{leaf}");
+            assert!(matches!(vcs[0].kind, VcKind::UnsupportedMir { .. }), "{leaf}");
+        }
+    }
+
+    #[test]
+    fn removing_the_backing_allocation_preserves_other_obligations() {
+        for &(leaf, item, _) in OPERATIONS {
+            if is_additive(item) {
+                continue;
+            }
+            let mut f = call(leaf, "::<__trust_elem_bytes@0>", None);
+            if let Terminator::Call { target, .. } = &mut f.body.blocks[0].terminator {
+                *target = Some(BlockId(1));
+            }
+            // The standalone generator does not add the compiler's whole-call
+            // panic obligations. Give this fixture an actual caller assertion.
+            f.body.blocks.extend([
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Constant(ConstValue::Bool(false)),
+                        expected: true,
+                        msg: trust_types::AssertMessage::Custom("caller panic remains".into()),
+                        target: BlockId(2),
+                        span: SourceSpan::default(),
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+            ]);
+            let before = generate_vcs(&f);
+            assert_eq!(unbounded_alloc_count(&f), 1, "unrecognized call: {leaf}");
+            if let Terminator::Call { callee_key, .. } = &mut f.body.blocks[0].terminator {
+                *callee_key = Some(key(Some(item)));
+            }
+            let after = generate_vcs(&f);
+            let remaining: Vec<_> = before
+                .into_iter()
+                .filter(|vc| !matches!(vc.kind, VcKind::UnboundedAllocation { .. }))
+                .collect();
+            assert!(
+                remaining.iter().any(|vc| matches!(
+                    &vc.kind, VcKind::Assertion { message } if message == "caller panic remains"
+                )),
+                "explicit assertion must remain: {leaf}"
+            );
+            assert_eq!(
+                serde_json::to_value(remaining).unwrap(),
+                serde_json::to_value(after).unwrap(),
+                "{leaf}"
+            );
+        }
+    }
+}
+
+/// fa/struct-alloc (2026-10-02): `recv.<callee>(arg)` — a two-argument method call
+/// whose receiver is local 1 and whose second argument (the bulk-alloc count index
+/// for `resize`/`reserve`) is local 2 of type `arg_ty`.
+fn method_call_with_arg(callee: &str, arg_ty: Ty) -> VerifiableFunction {
+    let mut func = func_calling(callee);
+    func.body.locals = vec![
+        LocalDecl { index: 0, ty: Ty::Unit, name: None },
+        LocalDecl { index: 1, ty: Ty::usize(), name: Some("recv".into()) },
+        LocalDecl { index: 2, ty: arg_ty, name: Some("arg".into()) },
+        LocalDecl { index: 3, ty: Ty::Unit, name: None },
+    ];
+    func.body.arg_count = 2;
+    func.body.return_ty = Ty::Unit;
+    let Terminator::Call { args, dest, .. } = &mut func.body.blocks[0].terminator else {
+        unreachable!()
+    };
+    *args = vec![Operand::Move(Place::local(1)), Operand::Move(Place::local(2))];
+    *dest = Place::local(3);
+    func
+}
+
+fn pty_size_ty() -> Ty {
+    Ty::adt("orca_pty::PtySize", vec![("rows".into(), Ty::u16()), ("cols".into(), Ty::u16())])
+}
+
+/// The `UnsupportedMir` rows the name-matched, non-integer-count arm mints.
+fn count_not_an_integer_count(func: &VerifiableFunction) -> usize {
+    generate_vcs(func)
+        .iter()
+        .filter(|vc| {
+            matches!(
+                &vc.kind,
+                VcKind::UnsupportedMir { kind, .. }
+                    if kind.starts_with("UnboundedAllocation::")
+                        && kind.ends_with("::count-not-an-integer")
+            )
+        })
+        .count()
+}
+
+#[test]
+fn struct_argument_to_user_resize_is_not_an_allocation_count() {
+    // MEASURED: orca-daemon `rpc.rs` — `_25 = PtySize { rows, cols }` passed by value
+    // to `PtySession::resize` FAILED `[unbounded_allocation] … <[T]>::resize (count
+    // _25)` with `_25 = 268435456` (seal `321aaeda7`, stage-1 `f9e47e012`). A struct
+    // is not an element count: no counted row (so no false counterexample), and one
+    // visible Unknown, because the name match alone cannot tell it from a real
+    // third-party allocator (see the ndarray test below).
+    let func = method_call_with_arg("orca_pty::PtySession::resize", pty_size_ty());
+    assert_eq!(unbounded_alloc_count(&func), 0);
+    assert_eq!(count_not_an_integer_count(&func), 1);
+    for callee in
+        ["mycrate::Grid::reserve", "mycrate::Pool::reserve_exact", "mycrate::Grid::resize_with"]
+    {
+        let func = method_call_with_arg(callee, Ty::Tuple(vec![Ty::u16(), Ty::u16()]));
+        assert_eq!(unbounded_alloc_count(&func), 0, "{callee}");
+        assert_eq!(count_not_an_integer_count(&func), 1, "{callee}");
+    }
+}
+
+#[test]
+fn struct_argument_at_count_index_zero_is_not_counted_but_stays_visible() {
+    // `with_capacity*` carries its count at index 0. A same-named constructor
+    // taking a config struct is not counted, and is not silent either.
+    for callee in ["mycrate::Pool::with_capacity", "mycrate::Map::with_capacity_and_hasher"] {
+        let func = call_with_args(callee, vec![pty_size_ty()]);
+        assert_eq!(unbounded_alloc_count(&func), 0, "{callee}");
+        assert_eq!(count_not_an_integer_count(&func), 1, "{callee}");
+    }
+}
+
+#[test]
+fn third_party_allocator_with_count_elsewhere_is_never_silent() {
+    // Review of r1 (`79f5ce3389`), MEASURED there: ndarray's
+    // `ArrayBase::reserve(&mut self, axis: Axis, additional: usize)` (argument 1 is
+    // a struct) and `ArrayBase::from_elem(shape, elem)` (argument 1 is the element,
+    // a float) are REAL caller-sized heap allocations, and r1 minted NO row for
+    // either. They must keep a visible obligation.
+    let arr = Ty::adt("ndarray::ArrayBase", vec![]);
+    let axis = Ty::adt("ndarray::Axis", vec![("0".into(), Ty::usize())]);
+    let reserve = call_with_args(
+        "ndarray::impl_owned_array::<impl ndarray::ArrayBase<S, D>>::reserve",
+        vec![Ty::Ref { mutable: true, inner: Box::new(arr) }, axis, Ty::usize()],
+    );
+    let from_elem = call_with_args(
+        "ndarray::ArrayBase::<S, D>::from_elem",
+        vec![Ty::Tuple(vec![Ty::usize(), Ty::usize()]), Ty::Float { width: 64 }],
+    );
+    for (name, func) in [("reserve", reserve), ("from_elem", from_elem)] {
+        assert_eq!(
+            unbounded_alloc_count(&func) + count_not_an_integer_count(&func),
+            1,
+            "ndarray {name}: a real allocation must keep exactly one visible row"
+        );
+        assert_eq!(count_not_an_integer_count(&func), 1, "ndarray {name}");
+    }
+}
+
+#[test]
+fn unclassifiable_count_type_keeps_its_counted_row() {
+    // Control for the fail-closed side of the type filter: a count whose type this
+    // lane cannot classify (`Unsupported`) is still charged as a count.
+    let func = method_call_with_arg(
+        "alloc::vec::Vec::<u8>::resize",
+        Ty::Unsupported { kind: "generic".into(), detail: "count".into() },
+    );
+    assert_eq!(unbounded_alloc_count(&func), 1);
+    assert_eq!(count_not_an_integer_count(&func), 0);
+}
+
+#[test]
+fn integer_count_to_resize_keeps_its_row() {
+    // Control: the real `Vec::resize(n, _)` with an unbounded `usize` count is still
+    // charged, and so (conservatively, by name) is a same-named method taking an
+    // integer — the type filter only removes rows over non-integer operands.
+    let func = method_call_with_arg("alloc::vec::Vec::<u8>::resize", Ty::usize());
+    assert_eq!(unbounded_alloc_count(&func), 1);
+    let func = method_call_with_arg("orca_pty::PtySession::resize", Ty::usize());
+    assert_eq!(alloc_row_count(&func), 1);
+    let func = method_call_with_arg("alloc::vec::Vec::<u8>::reserve", Ty::u64());
+    assert_eq!(unbounded_alloc_count(&func), 1);
+    assert_eq!(count_not_an_integer_count(&func), 0);
+}
+
+/// fa/struct-alloc r2: `callee(a1, .., an)` with each `ai` local `i` of `tys[i-1]`.
+fn call_with_args(callee: &str, tys: Vec<Ty>) -> VerifiableFunction {
+    let mut func = func_calling(callee);
+    let n = tys.len();
+    let mut locals = vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }];
+    for (i, ty) in tys.into_iter().enumerate() {
+        locals.push(LocalDecl { index: i + 1, ty, name: Some(format!("a{}", i + 1)) });
+    }
+    locals.push(LocalDecl { index: n + 1, ty: Ty::Unit, name: None });
+    func.body.locals = locals;
+    func.body.arg_count = n;
+    func.body.return_ty = Ty::Unit;
+    let Terminator::Call { args, dest, .. } = &mut func.body.blocks[0].terminator else {
+        unreachable!()
+    };
+    *args = (1..=n).map(|i| Operand::Move(Place::local(i))).collect();
+    *dest = Place::local(n + 1);
+    func
 }

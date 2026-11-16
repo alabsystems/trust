@@ -22,7 +22,7 @@
 //!   * path condition -> arithmetic safety  (`sat_add`, `sat_sub`)
 //!   * precondition   -> arithmetic safety  (`round_units`)
 //!
-//! The second route is the one `tests/ui/trust/functional_contracts.rs:12-15`
+//! The second route is the one `tests/ui/trust/functional_contracts.rs:18-21`
 //! records as historically weak ("the verifier does not yet thread a contract
 //! precondition into the dependent integer arithmetic"), so if this file fails
 //! it should fail on `round_units` alone — which is a more useful measurement

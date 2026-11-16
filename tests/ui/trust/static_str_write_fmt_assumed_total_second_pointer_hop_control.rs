@@ -3,7 +3,15 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
+//! ZERO-ROW-GATE AMENDMENT (2026-10-10, docs/DECISION_QUEUE.md ZERO-ROW-GATE): this control is now check-fail,
+//! not check-pass: `mid`, `Sink::write_str` and `render` each have zero obligations
+//! (pinned NOTEs) but a call no authenticated registry discharges, so each publishes an
+//! `unknown` row and is refused. "check-pass here means the walk refuses on the AXIOM"
+//! below now reads: the pinned NOTEs mean no obligation was added. The differential
+//! with the mutant `..._second_pointer_hop_root_stays_closed.rs` is kept by the mutant
+//! FORBIDDING that note: it must still refuse for its own reason.
+//!
 //! CONTROL for `static_str_write_fmt_assumed_total_second_pointer_hop_root_stays_closed.rs`.
 //! Read both or neither.
 //!
@@ -49,6 +57,9 @@ use core::fmt;
 fn boom() {}
 
 /// HOP 2, identical to the mutant's.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `static_str_write_fmt_assumed_total_second_pointer_hop_control::mid`
+//~v NOTE this function has no obligation of its own
 fn mid() {
     let f: fn() = boom;
     f();
@@ -59,6 +70,9 @@ pub struct Sink {
 }
 
 impl fmt::Write for Sink {
+    // ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+    //~vv ERROR Trust strict verification failed for `<static_str_write_fmt_assumed_total_second_pointer_hop_control::Sink
+    //~v NOTE this function has no obligation of its own
     fn write_str(&mut self, s: &str) -> fmt::Result {
         // HOP 1, identical to the mutant's.
         let f: fn() = mid;
@@ -68,6 +82,9 @@ impl fmt::Write for Sink {
     }
 }
 
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `static_str_write_fmt_assumed_total_second_pointer_hop_control::render`
+//~v NOTE this function has no obligation of its own
 pub fn render(sink: &mut Sink) -> fmt::Result {
     use fmt::Write as _;
     write!(sink, "constant")

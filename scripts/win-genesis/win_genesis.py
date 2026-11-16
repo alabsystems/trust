@@ -5,33 +5,50 @@ Lays out build/<host>/stage0 with compiled .exe wrappers around the installed
 stock rustc toolchain (whatever `rustc` is on PATH — use the pinned genesis
 nightly recorded in docs/GENESIS_TRUST_ROOT.md, which must be within one minor of
 src/version so bootstrap's check_stage0_version accepts it), a directory JUNCTION
-for lib/, and the stage0 stamps (stamped with `compiler_date` from src/stage0).
+for lib/, and the stage0 stamps bound to the src/stage0 extraction identity.
 Bin names match the canonical stage0 contract; only `rustc` and `cargo` are
 retained as stock compatibility aliases. Run with the Windows `py -3`. This is
 the Windows analogue of scripts/create_local_genesis_stage0.py (POSIX-only).
 """
 import json, os, shutil, subprocess, sys
+import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # scripts/win-genesis -> repo root
+# Trust: use the same cache discriminator as both bootstrap download owners.
+_identity_spec = importlib.util.spec_from_file_location(
+    "trust_stage0_identity", ROOT / "src/bootstrap/stage0_identity.py",
+)
+_identity_owner = importlib.util.module_from_spec(_identity_spec)
+_identity_spec.loader.exec_module(_identity_owner)
 HOST = "x86_64-pc-windows-msvc"
 WRAPPER_SRC = Path(__file__).resolve().parent / "genesis_wrapper.rs"
 
 def out(*a): print(*a, flush=True)
 
+# STOCK EXCEPTION (Trust lacks an x86_64-pc-windows-msvc std or host seed; measured
+# 2026-09-28: `targo --unverified check --target x86_64-pc-windows-msvc` -> E0463).
+# Windows genesis wraps the stock toolchain on PATH until a Trust Windows seed ships.
 rustc = shutil.which("rustc")
 if not rustc:
     sys.exit("rustc not on PATH")
+# Run the stock rustup proxy from the drive root, never the checkout: the dev tree
+# pins channel = "trust", which a proxy would read.
+NEUTRAL_CWD = os.path.abspath(os.sep)
 sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], text=True, check=True,
-                              capture_output=True).stdout.strip())
+                              capture_output=True, cwd=NEUTRAL_CWD).stdout.strip())
 sbin, slibexec = sysroot / "bin", sysroot / "libexec"
 
-date = None
+pin = {}
 for line in (ROOT / "src" / "stage0").read_text(encoding="utf-8").splitlines():
-    if line.startswith("compiler_date="):
-        date = line.split("=", 1)[1].strip()
+    line = line.strip()
+    if line and not line.startswith("#"):
+        key, value = line.split("=", 1)
+        pin[key.strip()] = value.strip()
+date = pin.get("compiler_date")
 if not date:
     sys.exit("src/stage0 has no compiler_date")
+stamp = _identity_owner.extraction_stamp(pin)
 
 STAGE0 = ROOT / "build" / HOST / "stage0"
 bind, libx = STAGE0 / "bin", STAGE0 / "libexec"
@@ -47,7 +64,7 @@ bind.mkdir(parents=True); libx.mkdir(parents=True)
 
 wrapper = STAGE0 / "_genesis_wrapper.exe"
 out("compiling wrapper ...")
-subprocess.run([rustc, "-O", str(WRAPPER_SRC), "-o", str(wrapper)], check=True)
+subprocess.run([rustc, "-O", str(WRAPPER_SRC), "-o", str(wrapper)], check=True, cwd=NEUTRAL_CWD)
 
 # trust_name -> (stock file, source-name, Trust public name)
 # This surface is checked against both bootstrap implementations by
@@ -159,11 +176,11 @@ r = subprocess.run(["cmd", "/c", "mklink", "/J", str(STAGE0 / "lib"), str(sysroo
 if r.returncode != 0:
     sys.exit(f"mklink /J failed: {r.stdout}{r.stderr}")
 
-(STAGE0 / ".trustc-stamp").write_text(date, encoding="utf-8")
-(STAGE0 / ".rustc-stamp").write_text(date, encoding="utf-8")
+(STAGE0 / ".trustc-stamp").write_text(stamp, encoding="utf-8")
+(STAGE0 / ".rustc-stamp").write_text(stamp, encoding="utf-8")
 (STAGE0 / "trust-local-genesis-stage0.json").write_text(json.dumps(
     {"schema": "trust.local-genesis-stage0-adapter.v1", "admission": "local-genesis-only",
-     "host": HOST, "stamp": date, "source_sysroot": str(sysroot)}, indent=2) + "\n", encoding="utf-8")
+     "host": HOST, "stamp": stamp, "source_sysroot": str(sysroot)}, indent=2) + "\n", encoding="utf-8")
 
 out(f"genesis stage0 -> {STAGE0}")
 out("bin:", sorted(p.name for p in bind.glob("*.exe")))

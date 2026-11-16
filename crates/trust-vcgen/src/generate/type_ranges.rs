@@ -5,6 +5,565 @@
 
 use super::*;
 
+/// Which part of the TYPE-RANGE BATTERY a row takes, decided by the OBLIGATION
+/// the row states — never by the lane that happened to build it.
+///
+/// Trust (2026-09-29, the hardened-twin type-range drop). The battery below used
+/// to live inline in the per-statement lane (`generate::safety`) and nowhere else,
+/// so the `unix_hardened` twin of the SAME MIR assert — built in `hardened.rs` —
+/// conjoined only `conjoin_arg_type_ranges` and was REFUTED where its primary
+/// PROVED. Measured on `while i < args.len() { i += 1 }`: `[overflow:add]`
+/// proved, `[hardened_panic_boundary] mir_assert::Overflow(Add)` refuted at
+/// `args__slice_len = 2^64` (`_5 = PtrMetadata(args)` is a `usize` LOCAL, which
+/// only `conjoin_local_type_ranges` bounds). 58 of the 78 refuted rows of a
+/// verified-lane survey of trust-ir were verifier artifacts; this was one family.
+/// One rule, stated here once, applied by every lane that states the obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeBatteryClass {
+    /// An arithmetic-overflow obligation: every range fact EXCEPT the checked-op
+    /// result copy closure's (the vacuous-UNSAT guard documented on
+    /// [`checked_arith_result_value_vars`]).
+    Arithmetic,
+    /// An index-bounds obligation: every range fact.
+    Bounds,
+    /// A TINV row (`VcKind::TypeInvariant`, `generate::tinv_rows`): the
+    /// `Arithmetic` battery — every range fact EXCEPT the checked-op result copy
+    /// closure's.
+    ///
+    /// Trust (2026-10-06, TINV parameter-range gap): TINV rows used to fall into
+    /// `Other` and take `0 <= len` alone, so an E row whose core reads only integer
+    /// PARAMETERS (`P { i: 0, n }` against `i <= n`, core `Not(0 <= n)`) carried no
+    /// hypothesis naming `n` and the situatedness gate
+    /// (`type_invariant_situatedness_refusal`) refused it — the conjunct dropped.
+    /// Every fact this battery adds is a property of a DECLARED TYPE, true of every
+    /// value the named term can hold, so it can only delete models no execution
+    /// produces; a real violation's witness respects the same ranges.
+    ///
+    /// The checked-op exclusion is kept for the reason `Arithmetic` keeps it: a U row
+    /// at an overflow `Assert` carries the assert's FAILURE condition (`_R.1`, the op
+    /// overflowed) while `_R.0` is modeled as the unbounded mathematical result, so
+    /// were any fact to tie the two, `0 <= _R.0 <= MAX` would make that row vacuously
+    /// UNSAT. MEASURED 2026-10-06 the flag is free on such a row, so the exclusion is
+    /// a fail-closed precaution (it only withholds facts), not load-bearing today.
+    TypeInvariant,
+    /// Every other obligation: the element-independent `0 <= len` only
+    /// ([`conjoin_length_nonneg_bounds`]).
+    Other,
+}
+
+impl RangeBatteryClass {
+    /// The class of a per-statement row, by its kind. `UncheckedArithmeticOverflow`
+    /// is the same out-of-range obligation as `ArithmeticOverflow` (the same
+    /// builder emits both); only the runtime-guard answer differs.
+    pub(crate) fn of_kind(kind: &VcKind) -> Self {
+        match kind {
+            VcKind::ArithmeticOverflow { .. } | VcKind::UncheckedArithmeticOverflow { .. } => {
+                Self::Arithmetic
+            }
+            VcKind::SliceBoundsCheck | VcKind::IndexOutOfBounds => Self::Bounds,
+            VcKind::TypeInvariant { .. } => Self::TypeInvariant,
+            _ => Self::Other,
+        }
+    }
+
+    /// The class of the hardened twin of a MIR `Assert` — the class of the primary
+    /// the per-statement lane builds from the SAME assert: `Overflow(Shl|Shr)` is a
+    /// shift obligation and `OverflowNeg` a negation obligation (both `Other` there),
+    /// every other `Overflow(op)` an `ArithmeticOverflow { op }` (see
+    /// `v2_build_assert_overflow_vc`), `BoundsCheck` a bounds obligation.
+    pub(crate) fn of_assert(msg: &AssertMessage) -> Self {
+        match msg {
+            AssertMessage::Overflow(BinOp::Shl | BinOp::Shr) => Self::Other,
+            AssertMessage::Overflow(_) => Self::Arithmetic,
+            AssertMessage::BoundsCheck => Self::Bounds,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// THE TYPE-RANGE BATTERY: conjoin every always-true range fact of `class` onto
+/// `formula`, one step at a time, calling `record(before, after)` after each step
+/// so a caller that carries an `ObligationRecord` can mirror it
+/// (`ob_record_conjoin_wrap`).
+///
+/// * `Arithmetic` / `Bounds`: parameter ranges, local ranges, datatype-field ranges
+///   (the last two minus the checked-op result closure for `Arithmetic`), then the
+///   slice/container length bounds.
+/// * `TypeInvariant`: exactly the `Arithmetic` battery (see the variant).
+/// * `Other`: `0 <= len` only.
+///
+/// SOUNDNESS: every fact is a property of a DECLARED TYPE (or of a length, which is
+/// a `usize`) and holds at every point of every execution, so each step can only
+/// delete models no execution produces — PROVE never becomes reachable for a real
+/// violation, whose witness respects the same ranges. The `Arithmetic` exclusion is
+/// the one place a range would be a CIRCULAR premise, and it is kept.
+///
+/// What this function does NOT decide, and each caller keeps: whether a row takes
+/// the battery at all (an `UnsupportedMir` row does not; a loop-free BOUNDS row does
+/// not in the per-statement lane — the `count_back_edges` rule in
+/// `generate::safety`, an ay proof-emission workaround recorded there).
+pub(crate) fn conjoin_type_range_battery(
+    func: &VerifiableFunction,
+    formula: Formula,
+    class: RangeBatteryClass,
+    record: &mut dyn FnMut(&Formula, &Formula),
+) -> Formula {
+    let mut step = |formula: Formula, f: &dyn Fn(Formula) -> (Formula, bool)| {
+        let (after, wrapped) = f(formula);
+        if wrapped
+            && let Formula::And(children) = &after
+            && let Some(before) = children.last()
+        {
+            record(before, &after);
+        } else {
+            record(&after, &after);
+        }
+        after
+    };
+    match class {
+        RangeBatteryClass::Other => step(formula, &|f| conjoin_length_nonneg_bounds_step(func, f)),
+        RangeBatteryClass::Arithmetic
+        | RangeBatteryClass::TypeInvariant
+        | RangeBatteryClass::Bounds => {
+            let empty_excl = FxHashSet::default();
+            let excl_rc = (class != RangeBatteryClass::Bounds)
+                .then(|| checked_arith_result_value_vars_rc(func));
+            let excl: &FxHashSet<String> = excl_rc.as_deref().unwrap_or(&empty_excl);
+            conjoin_type_range_battery_full(func, formula, excl, true, record)
+        }
+    }
+}
+
+/// Single-pass fusion of the three scalar/field type-range steps
+/// (`conjoin_arg_type_ranges_step` -> `conjoin_local_type_ranges_step` ->
+/// `conjoin_datatype_field_ranges_step`), traversing `formula` at most once
+/// instead of three times.
+pub(super) fn conjoin_arg_local_field_type_ranges(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> Formula {
+    let empty_excl = FxHashSet::default();
+    conjoin_type_range_battery_full(func, formula, &empty_excl, false, &mut |_, _| {})
+}
+
+/// As [`conjoin_arg_local_field_type_ranges`], invoking `record(before, &after)`
+/// after each of the three steps in order.
+pub(super) fn conjoin_arg_local_field_type_ranges_recorded(
+    func: &VerifiableFunction,
+    formula: Formula,
+    record: &mut dyn FnMut(&Formula, &Formula),
+) -> Formula {
+    let empty_excl = FxHashSet::default();
+    conjoin_type_range_battery_full(func, formula, &empty_excl, false, record)
+}
+
+/// Single-pass fusion of the four full-battery steps
+/// (`conjoin_arg_type_ranges_step` -> `conjoin_local_type_ranges_excluding_step` ->
+/// `conjoin_datatype_field_ranges_excluding_step` -> `conjoin_slice_len_bounds_step`),
+/// traversing `formula` once instead of four times while emitting byte-identical
+/// nested `Formula::And` layers and `record(before, &after)` callbacks.
+fn conjoin_type_range_battery_full(
+    func: &VerifiableFunction,
+    formula: Formula,
+    excl: &FxHashSet<String>,
+    include_slice_len_bounds: bool,
+    record: &mut dyn FnMut(&Formula, &Formula),
+) -> Formula {
+    let arg_summary = if func.body.arg_count > 0 {
+        let s = super::alloc_vcs::arg_type_range_summary_rc(func);
+        (!s.param_ranges.is_empty()).then_some(s)
+    } else {
+        None
+    };
+    let local_ranges = {
+        let r = local_scalar_range_map_rc(func);
+        if r.is_empty() || (!excl.is_empty() && r.keys().all(|k| excl.contains(k.as_str()))) {
+            None
+        } else {
+            Some(r)
+        }
+    };
+    let field_ranges = {
+        let r = datatype_field_range_map_rc(func);
+        if r.is_empty() || (!excl.is_empty() && r.keys().all(|k| excl.contains(k.as_str()))) {
+            None
+        } else {
+            Some(r)
+        }
+    };
+    let coll_vars = include_slice_len_bounds.then(|| coll_len_bound_vars_rc(func));
+    let empty_coll = FxHashSet::default();
+    let (coll_all, coll_non_zst) = match coll_vars.as_deref() {
+        Some((all, non_zst)) => (all, non_zst),
+        None => (&empty_coll, &empty_coll),
+    };
+
+    let (step1_prefix, step2_prefix, step3_prefix, step4_prefix) = {
+        struct Collector<'a> {
+            seen_param_int: FxHashSet<&'a str>,
+            versioned_param_bounds: Vec<Formula>,
+            versioned_param_vars: Vec<&'a str>,
+            seen_free: FxHashSet<&'a str>,
+            local_vars: Vec<&'a str>,
+            field_vars: Vec<&'a str>,
+            slice_vars: Vec<(&'a str, bool)>,
+        }
+
+        let mut col = Collector {
+            seen_param_int: FxHashSet::default(),
+            versioned_param_bounds: Vec::new(),
+            versioned_param_vars: Vec::new(),
+            seen_free: FxHashSet::default(),
+            local_vars: Vec::new(),
+            field_vars: Vec::new(),
+            slice_vars: Vec::new(),
+        };
+
+        struct Tables<'t> {
+            arg_summary: Option<&'t crate::fn_memo::ArgTypeRangeSummary>,
+            local_ranges: Option<&'t FxHashMap<String, crate::range::RustScalarRange>>,
+            field_ranges: Option<&'t FxHashMap<String, crate::range::RustScalarRange>>,
+            excl: &'t FxHashSet<String>,
+            include_slice_len_bounds: bool,
+            coll_all: &'t FxHashSet<String>,
+        }
+
+        fn classify_free_var<'a>(col: &mut Collector<'a>, tables: &Tables<'_>, var_name: &'a str) {
+            if !col.seen_free.insert(var_name) {
+                return;
+            }
+            let base = var_name.split('#').next().unwrap_or(var_name);
+            if let Some(ranges) = tables.local_ranges
+                && !tables.excl.contains(base)
+                && ranges.contains_key(base)
+            {
+                col.local_vars.push(var_name);
+            }
+            if let Some(ranges) = tables.field_ranges
+                && base.contains('.')
+                && ranges.contains_key(base)
+                && !tables.excl.contains(base)
+            {
+                col.field_vars.push(var_name);
+            }
+            if tables.include_slice_len_bounds {
+                let is_slice_len = base.ends_with("__slice_len");
+                if is_slice_len || (!tables.coll_all.is_empty() && tables.coll_all.contains(base)) {
+                    col.slice_vars.push((var_name, is_slice_len));
+                }
+            }
+        }
+
+        fn walk<'a>(
+            node: &'a Formula,
+            bound: &mut Vec<&'a trust_types::Symbol>,
+            tables: &Tables<'_>,
+            has_free_var_consumers: bool,
+            col: &mut Collector<'a>,
+        ) {
+            match node {
+                Formula::Var(name, sort) => {
+                    let n = name.as_str();
+                    if let Some(summary) = tables.arg_summary
+                        && *sort == trust_types::Sort::Int
+                        && n.contains('#')
+                        && !col.seen_param_int.contains(n)
+                        && let Some(range) =
+                            super::alloc_vcs::versioned_param_range_for_int_var(summary, n)
+                    {
+                        col.seen_param_int.insert(n);
+                        col.versioned_param_vars.push(n);
+                        col.versioned_param_bounds.push(
+                            crate::range::rust_scalar_range_constraint(
+                                &Formula::Var(name.clone(), trust_types::Sort::Int),
+                                range,
+                            ),
+                        );
+                    }
+                    if has_free_var_consumers && !bound.iter().any(|sym| sym.as_str() == n) {
+                        classify_free_var(col, tables, n);
+                    }
+                }
+                Formula::SymVar(sym, _) => {
+                    if has_free_var_consumers {
+                        let n = sym.as_str();
+                        if !(bound.contains(&sym) || bound.iter().any(|b| b.as_str() == n)) {
+                            classify_free_var(col, tables, n);
+                        }
+                    }
+                }
+                Formula::Forall(bindings, body) | Formula::Exists(bindings, body) => {
+                    let prev_len = bound.len();
+                    bound.extend(bindings.iter().map(|(sym, _)| sym));
+                    walk(body, bound, tables, has_free_var_consumers, col);
+                    bound.truncate(prev_len);
+                }
+                other => {
+                    trust_types::for_each_formula_child(other, |child| {
+                        walk(child, bound, tables, has_free_var_consumers, col);
+                    });
+                }
+            }
+        }
+
+        let tables = Tables {
+            arg_summary: arg_summary.as_deref(),
+            local_ranges: local_ranges.as_deref(),
+            field_ranges: field_ranges.as_deref(),
+            excl,
+            include_slice_len_bounds,
+            coll_all,
+        };
+        let has_free_var_consumers = tables.local_ranges.is_some()
+            || tables.field_ranges.is_some()
+            || tables.include_slice_len_bounds;
+        if tables.arg_summary.is_some() || has_free_var_consumers {
+            let mut bound = Vec::new();
+            walk(&formula, &mut bound, &tables, has_free_var_consumers, &mut col);
+        }
+
+        let (step1_prefix, step1_base_names, step1_ver_names) =
+            if let Some(summary) = arg_summary.as_deref()
+                && (!summary.base_bounds.is_empty() || !col.versioned_param_bounds.is_empty())
+            {
+                let mut bounds = Vec::with_capacity(
+                    summary.base_bounds.len() + col.versioned_param_bounds.len() + 1,
+                );
+                bounds.extend(summary.base_bounds.iter().cloned());
+                bounds.extend(col.versioned_param_bounds);
+                (bounds, summary.base_var_names.as_slice(), col.versioned_param_vars)
+            } else {
+                (Vec::new(), &[][..], Vec::new())
+            };
+        let step1_var_iter = || {
+            step1_base_names
+                .iter()
+                .map(String::as_str)
+                .chain(step1_ver_names.iter().copied())
+        };
+
+        let (step2_prefix, step2_vars) = if let Some(ranges) = local_ranges.as_deref()
+            && !(col.local_vars.is_empty()
+                && step1_base_names.is_empty()
+                && step1_ver_names.is_empty())
+        {
+            let mut names: FxHashSet<String> = FxHashSet::default();
+            for n in step1_var_iter() {
+                let base = n.split('#').next().unwrap_or(n);
+                if !excl.contains(base) && ranges.contains_key(base) && !names.contains(n) {
+                    names.insert(n.to_owned());
+                }
+            }
+            for &n in &col.local_vars {
+                if !names.contains(n) {
+                    names.insert(n.to_owned());
+                }
+            }
+            if names.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let joins = local_value_join_interval_map_rc(func);
+                let mut bounds = Vec::with_capacity(names.len() + 1);
+                let mut vars = Vec::with_capacity(names.len());
+                for name in names {
+                    let base = name.split('#').next().unwrap_or(name.as_str());
+                    if let Some(&range) = ranges.get(base) {
+                        let join = joins.get(base).copied();
+                        vars.push(name.clone());
+                        let var = Formula::Var(name, trust_types::Sort::Int);
+                        bounds.push(crate::range::rust_scalar_range_constraint(&var, range));
+                        if let Some((lo, hi)) = join {
+                            if let Some(lo) = lo {
+                                bounds.push(Formula::Ge(
+                                    Box::new(var.clone()),
+                                    Box::new(Formula::Int(lo)),
+                                ));
+                            }
+                            if let Some(hi) = hi {
+                                bounds.push(Formula::Le(
+                                    Box::new(var),
+                                    Box::new(Formula::Int(hi)),
+                                ));
+                            }
+                        }
+                    }
+                }
+                (bounds, vars)
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let (step3_prefix, step3_vars) = if let Some(ranges) = field_ranges.as_deref()
+            && !(col.field_vars.is_empty()
+                && step2_vars.is_empty()
+                && step1_base_names.is_empty()
+                && step1_ver_names.is_empty())
+        {
+            let mut names: FxHashSet<String> = FxHashSet::default();
+            for n in step2_vars.iter().map(String::as_str).chain(step1_var_iter()) {
+                let base = n.split('#').next().unwrap_or(n);
+                if base.contains('.')
+                    && ranges.contains_key(base)
+                    && !excl.contains(base)
+                    && !names.contains(n)
+                {
+                    names.insert(n.to_owned());
+                }
+            }
+            for &n in &col.field_vars {
+                if !names.contains(n) {
+                    names.insert(n.to_owned());
+                }
+            }
+            if names.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let mut bounds = Vec::with_capacity(names.len() + 1);
+                let mut vars = Vec::with_capacity(names.len());
+                for name in names {
+                    let base = name.split('#').next().unwrap_or(name.as_str());
+                    if let Some(&range) = ranges.get(base) {
+                        vars.push(name.clone());
+                        let var = Formula::Var(name, trust_types::Sort::Int);
+                        bounds.push(crate::range::rust_scalar_range_constraint(&var, range));
+                    }
+                }
+                (bounds, vars)
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let step4_prefix = if !include_slice_len_bounds
+            || (col.slice_vars.is_empty()
+                && step3_vars.is_empty()
+                && step2_vars.is_empty()
+                && step1_base_names.is_empty()
+                && step1_ver_names.is_empty())
+        {
+            Vec::new()
+        } else {
+            let mut names: FxHashSet<String> = FxHashSet::default();
+            let mut has_slice_len = false;
+            for n in step3_vars
+                .iter()
+                .map(String::as_str)
+                .chain(step2_vars.iter().map(String::as_str))
+                .chain(step1_var_iter())
+            {
+                let base = n.split('#').next().unwrap_or(n);
+                let is_slice_len = base.ends_with("__slice_len");
+                if (is_slice_len || (!coll_all.is_empty() && coll_all.contains(base)))
+                    && !names.contains(n)
+                {
+                    has_slice_len |= is_slice_len;
+                    names.insert(n.to_owned());
+                }
+            }
+            for &(n, is_slice_len) in &col.slice_vars {
+                if !names.contains(n) {
+                    has_slice_len |= is_slice_len;
+                    names.insert(n.to_owned());
+                }
+            }
+            if names.is_empty() {
+                Vec::new()
+            } else {
+                let non_zst_rc = has_slice_len.then(|| nonzst_slice_len_vars_rc(func));
+                let mut bounds = Vec::with_capacity(names.len() * 2 + 1);
+                for name in names {
+                    let base = name.split('#').next().unwrap_or(name.as_str());
+                    if base.ends_with("__slice_len") {
+                        let is_non_zst = non_zst_rc.as_ref().is_some_and(|s| s.contains(base));
+                        let var = Formula::var_owned(name, trust_types::Sort::Int);
+                        bounds.push(Formula::Ge(
+                            Box::new(var.clone()),
+                            Box::new(Formula::Int(0)),
+                        ));
+                        bounds.push(Formula::Le(
+                            Box::new(var),
+                            Box::new(len_ceiling(is_non_zst)),
+                        ));
+                        continue;
+                    }
+                    if coll_all.contains(base) {
+                        let is_non_zst = coll_non_zst.contains(base);
+                        let var = Formula::var_owned(name, trust_types::Sort::Int);
+                        bounds.push(Formula::Ge(
+                            Box::new(var.clone()),
+                            Box::new(Formula::Int(0)),
+                        ));
+                        bounds.push(Formula::Le(
+                            Box::new(var),
+                            Box::new(len_ceiling(is_non_zst)),
+                        ));
+                    }
+                }
+                bounds
+            }
+        };
+
+        (step1_prefix, step2_prefix, step3_prefix, step4_prefix)
+    };
+
+    let mut apply_prefix = |formula: Formula, mut prefix: Vec<Formula>| -> Formula {
+        if prefix.is_empty() {
+            record(&formula, &formula);
+            formula
+        } else {
+            prefix.push(formula);
+            let after = Formula::And(prefix);
+            if let Formula::And(children) = &after
+                && let Some(before) = children.last()
+            {
+                record(before, &after);
+            }
+            after
+        }
+    };
+
+    let formula = apply_prefix(formula, step1_prefix);
+    let formula = apply_prefix(formula, step2_prefix);
+    let formula = apply_prefix(formula, step3_prefix);
+    if include_slice_len_bounds {
+        apply_prefix(formula, step4_prefix)
+    } else {
+        formula
+    }
+}
+
+/// The type-range facts of the `unix_hardened` twin of a MIR `Assert` whose
+/// message is `msg`: the SAME battery its primary takes in the per-statement lane,
+/// under the same rule (`RangeBatteryClass::of_assert`), plus the parameter ranges
+/// the twin has always carried.
+///
+/// The twin keeps `conjoin_arg_type_ranges` on EVERY class, including the two the
+/// per-statement lane gives none (a loop-free bounds row, an `Other` row): dropping
+/// a fact it already had would be a regression, and a parameter range is as true
+/// there as anywhere. So the twin's hypothesis set is a SUPERSET of its primary's
+/// and of its own previous one — monotone in both directions.
+pub(crate) fn hardened_twin_type_ranges(
+    func: &VerifiableFunction,
+    msg: &AssertMessage,
+    formula: Formula,
+) -> Formula {
+    let class = RangeBatteryClass::of_assert(msg);
+    let noop = &mut |_: &Formula, _: &Formula| {};
+    match class {
+        RangeBatteryClass::Other => conjoin_type_range_battery(
+            func,
+            conjoin_arg_type_ranges(func, formula),
+            RangeBatteryClass::Other,
+            noop,
+        ),
+        RangeBatteryClass::Bounds if count_back_edges(func) == 0 => {
+            conjoin_arg_type_ranges(func, formula)
+        }
+        _ => conjoin_type_range_battery(func, formula, class, noop),
+    }
+}
+
 /// Conjoin the declared-type carrier onto every integer/`char` LOCAL/temp
 /// the `formula` references — the sibling of `conjoin_arg_type_ranges` for the
 /// NON-parameter locals (return slot + temporaries). VC-gen lowers an
@@ -25,8 +584,34 @@ use super::*;
 /// `conjoin_arg_type_ranges`); FIELD-projecting vars keep their projection chars in
 /// the var name and so never alias a bare-local key (field bounds are a separate,
 /// datatype-aware concern not modeled here).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn conjoin_local_type_ranges(func: &VerifiableFunction, formula: Formula) -> Formula {
     conjoin_local_type_ranges_excluding(func, formula, &FxHashSet::default())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn conjoin_local_type_ranges_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> (Formula, bool) {
+    conjoin_local_type_ranges_excluding_step(func, formula, &FxHashSet::default())
+}
+
+/// Restore stored local/return integer carriers after the postcondition's
+/// refusal tripwires. Keep the range mathematics and collision-safe names used
+/// by every other vcgen type-range fact; the shared selector adds no inferred
+/// join/lossless-conversion bounds and refuses checked-result functions.
+pub(super) fn conjoin_postcondition_value_type_ranges(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> Formula {
+    let bounds = trust_types::postcondition_integer_carrier_facts(
+        func,
+        &formula,
+        |decl| place_to_var_name(func, &Place::local(decl.index)),
+        crate::range::rust_type_range_constraint,
+    );
+    super::recipes::conjoin_body_facts(formula, bounds)
 }
 
 /// Base var names of checked-arith RESULT VALUES and their COPY CLOSURE: the
@@ -52,16 +637,27 @@ pub(super) fn conjoin_local_type_ranges(func: &VerifiableFunction, formula: Form
 /// assert-passed guards, and reassigned/multi-def locals (loop accumulators)
 /// are NOT in the closure (unique-def only), so their ranges remain.
 pub(super) fn checked_arith_result_value_vars(func: &VerifiableFunction) -> FxHashSet<String> {
+    checked_arith_result_value_vars_rc(func).as_ref().clone()
+}
+
+pub(super) fn checked_arith_result_value_vars_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashSet<String>> {
+    crate::fn_memo::checked_arith_result_vars(func, || compute_checked_arith_result_value_vars(func))
+}
+
+fn compute_checked_arith_result_value_vars(func: &VerifiableFunction) -> FxHashSet<String> {
     let mut set = FxHashSet::default();
+    let mut tuple_locals = FxHashSet::default();
     for decl in &func.body.locals {
         if let Ty::Tuple(fields) = &decl.ty
             && fields.len() == 2
             && fields[0].int_width().is_some()
             && matches!(fields[1], Ty::Bool)
         {
-            let place =
-                Place { local: decl.index, projections: vec![trust_types::Projection::Field(0)] };
-            set.insert(place_to_var_name(func, &place));
+            tuple_locals.insert(decl.index);
+            let base = crate::place_to_var_name(func, &Place::local(decl.index));
+            set.insert(format!("{base}.0"));
         }
     }
     if set.is_empty() {
@@ -70,23 +666,46 @@ pub(super) fn checked_arith_result_value_vars(func: &VerifiableFunction) -> FxHa
     // Copy closure: a local whose UNIQUE whole-local def is `Use(copy/move p)`
     // with `p` already in the set holds the same checked-result value. Iterate
     // to fixpoint (chains like `_0 = c; c = _R.0` resolve regardless of order).
-    loop {
-        let mut grew = false;
-        for decl in &func.body.locals {
-            let name = place_to_var_name(func, &Place::local(decl.index));
-            if set.contains(&name) {
+    let mut copy_defs: Vec<(usize, String)> = Vec::new();
+    let mut grew_initial = false;
+    for decl in &func.body.locals {
+        if let Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p))) =
+            crate::local_defs::unique_value_def(func, decl.index)
+        {
+            if !p.projections.is_empty()
+                && (p.projections.as_slice() != [trust_types::Projection::Field(0)]
+                    || !tuple_locals.contains(&p.local))
+            {
                 continue;
             }
-            if let Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p))) =
-                crate::local_defs::unique_value_def(func, decl.index)
-                && set.contains(&place_to_var_name(func, p))
-            {
-                set.insert(name);
-                grew = true;
+            let src_name = place_to_var_name(func, p);
+            if set.contains(src_name.as_str()) {
+                let name = place_to_var_name(func, &Place::local(decl.index));
+                if set.insert(name) {
+                    grew_initial = true;
+                }
+            } else if p.projections.is_empty() {
+                copy_defs.push((decl.index, src_name));
             }
         }
-        if !grew {
-            break;
+    }
+    if grew_initial && !copy_defs.is_empty() {
+        loop {
+            let mut grew = false;
+            copy_defs.retain(|(local_idx, src_name)| {
+                if set.contains(src_name.as_str()) {
+                    let name = place_to_var_name(func, &Place::local(*local_idx));
+                    if set.insert(name) {
+                        grew = true;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if !grew || copy_defs.is_empty() {
+                break;
+            }
         }
     }
     set
@@ -95,37 +714,171 @@ pub(super) fn checked_arith_result_value_vars(func: &VerifiableFunction) -> FxHa
 /// As [`conjoin_local_type_ranges`], but skips any local whose base var name is
 /// in `exclude`. Used on ArithmeticOverflow VCs to drop the CHECKED-OP RESULT
 /// copy closure's own type-ranges (see [`checked_arith_result_value_vars`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn conjoin_local_type_ranges_excluding(
     func: &VerifiableFunction,
     formula: Formula,
     exclude: &FxHashSet<String>,
 ) -> Formula {
-    let ranges = local_scalar_range_map(func);
-    if ranges.is_empty() {
-        return formula;
+    conjoin_local_type_ranges_excluding_step(func, formula, exclude).0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn conjoin_local_type_ranges_excluding_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+    exclude: &FxHashSet<String>,
+) -> (Formula, bool) {
+    let ranges = local_scalar_range_map_rc(func);
+    if ranges.is_empty()
+        || (!exclude.is_empty() && ranges.keys().all(|k| exclude.contains(k.as_str())))
+    {
+        return (formula, false);
     }
     let mut names: FxHashSet<String> = FxHashSet::default();
-    collect_formula_var_names(&formula, &mut names);
-    let mut bounds = Vec::new();
-    for name in &names {
+    trust_types::for_each_free_variable_name(&formula, &mut |n| {
         // Strip the `#…` SSA-version suffix to recover the base local name; a
         // field/deref var keeps its projection chars and so never matches a key.
-        let base = name.split('#').next().unwrap_or(name.as_str());
-        if exclude.contains(base) {
-            continue;
+        let base = n.split('#').next().unwrap_or(n);
+        if !exclude.contains(base) && ranges.contains_key(base) && !names.contains(n) {
+            names.insert(n.to_owned());
         }
+    });
+    if names.is_empty() {
+        return (formula, false);
+    }
+    let joins = local_value_join_interval_map_rc(func);
+    let mut bounds = Vec::with_capacity(names.len() + 1);
+    for name in names {
+        let base = name.split('#').next().unwrap_or(name.as_str());
         if let Some(&range) = ranges.get(base) {
-            bounds.push(crate::range::rust_scalar_range_constraint(
-                &Formula::Var(name.clone(), trust_types::Sort::Int),
-                range,
-            ));
+            let join = joins.get(base).copied();
+            let var = Formula::Var(name, trust_types::Sort::Int);
+            bounds.push(crate::range::rust_scalar_range_constraint(&var, range));
+            if let Some((lo, hi)) = join {
+                if let Some(lo) = lo {
+                    bounds.push(Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(lo))));
+                }
+                if let Some(hi) = hi {
+                    bounds.push(Formula::Le(Box::new(var), Box::new(Formula::Int(hi))));
+                }
+            }
         }
     }
     if bounds.is_empty() {
-        return formula;
+        return (formula, false);
     }
     bounds.push(formula);
-    Formula::And(bounds)
+    (Formula::And(bounds), true)
+}
+
+/// Trust (2026-10-04, loop-carried value join): `base_local_var_name -> [lo, hi]` for
+/// every non-parameter integer local whose COMPLETE set of values is a join of
+/// constants, whole-local copies and constant range-loop payloads
+/// (`callee_summaries::local_value_const_interval`). That function answers only
+/// when `local_defs::value_defs` sees every write — no parameter entry, call
+/// destination, partial write, mutable or raw alias, or unlocatable write — so the
+/// interval contains every value the local ever holds, and it bounds every SSA
+/// version of its name exactly as the type range does. Motivating shape (a3d
+/// `argmax_abs`): `let mut b = 0; for k in 1..3 { if .. { b = k } }` reads `v[b]` in
+/// the loop with `b` loop-carried; its join is `[0, 2]`, so `v[b]` on a `[f64; 3]`
+/// proves.
+///
+/// When the join refuses, the one-sided monotone-counter bounds answer instead
+/// (`callee_summaries::local_value_monotone_bounds`: constants, copies, payloads and
+/// checked `x + d` for a lower bound / `x - d` for an upper bound, by induction over
+/// the writes): `let mut k = 1; while k < 8 { .. k - 1 ..; k += 1 }` gives `k >= 1`.
+///
+/// Only locals with a constant definition, and the single-definition copies of those,
+/// are asked (the shapes either answer can bound), which keeps the per-VC cost to a
+/// statement scan for most bodies.
+pub(super) fn local_value_join_interval_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<String, (Option<i128>, Option<i128>)> {
+    local_value_join_interval_map_rc(func).as_ref().clone()
+}
+
+pub(super) fn local_value_join_interval_map_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<String, (Option<i128>, Option<i128>)>> {
+    crate::fn_memo::local_value_join_intervals(func, || compute_local_value_join_interval_map(func))
+}
+
+fn compute_local_value_join_interval_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<String, (Option<i128>, Option<i128>)> {
+    if !func
+        .body
+        .locals
+        .iter()
+        .any(|decl| decl.index > func.body.arg_count && decl.ty.int_width().is_some())
+    {
+        return FxHashMap::default();
+    }
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut candidate_set: FxHashSet<usize> = FxHashSet::default();
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            if let Statement::Assign { place, rvalue: Rvalue::Use(Operand::Constant(_)), .. } = stmt
+                && place.projections.is_empty()
+                && place.local > func.body.arg_count
+                && crate::local_ty_ref(func, place.local).is_some_and(|ty| ty.int_width().is_some())
+                && candidate_set.insert(place.local)
+            {
+                candidates.push(place.local);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return FxHashMap::default();
+    }
+    // The copy closure: `_7 = copy k` before `k - 1` reads `_7`.
+    let mut copy_defs: Vec<(usize, usize)> = func
+        .body
+        .locals
+        .iter()
+        .filter(|decl| {
+            decl.index > func.body.arg_count
+                && decl.ty.int_width().is_some()
+                && !candidate_set.contains(&decl.index)
+        })
+        .filter_map(|decl| match crate::local_defs::unique_value_def(func, decl.index) {
+            Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
+                if p.projections.is_empty() =>
+            {
+                Some((decl.index, p.local))
+            }
+            _ => None,
+        })
+        .collect();
+    loop {
+        let mut grew = false;
+        copy_defs.retain(|&(local_idx, src_local)| {
+            if candidate_set.contains(&src_local) {
+                if candidate_set.insert(local_idx) {
+                    candidates.push(local_idx);
+                    grew = true;
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if !grew {
+            break;
+        }
+    }
+    let mut map = FxHashMap::default();
+    for local in candidates {
+        let bounds = match super::callee_summaries::local_value_const_interval(func, local) {
+            Some((lo, hi)) => (Some(lo), Some(hi)),
+            None => super::callee_summaries::local_value_monotone_bounds(func, local),
+        };
+        if bounds != (None, None) {
+            map.insert(place_to_var_name(func, &Place::local(local)), bounds);
+        }
+    }
+    map
 }
 
 /// Build `base_local_var_name -> RustScalarRange` for every integer/`char`
@@ -138,14 +891,56 @@ pub(super) fn conjoin_local_type_ranges_excluding(
 pub(super) fn local_scalar_range_map(
     func: &VerifiableFunction,
 ) -> FxHashMap<String, crate::range::RustScalarRange> {
+    local_scalar_range_map_rc(func).as_ref().clone()
+}
+
+pub(super) fn local_scalar_range_map_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<String, crate::range::RustScalarRange>> {
+    crate::fn_memo::local_scalar_ranges(func, || compute_local_scalar_range_map(func))
+}
+
+fn compute_local_scalar_range_map(
+    func: &VerifiableFunction,
+) -> FxHashMap<String, crate::range::RustScalarRange> {
     let mut map = FxHashMap::default();
+    let mut lossless_conv_locals: Option<FxHashSet<usize>> = None;
     for decl in &func.body.locals {
         // Skip parameters: `conjoin_arg_type_ranges` already bounds 1..=arg_count.
         if decl.index >= 1 && decl.index <= func.body.arg_count {
             continue;
         }
-        let Some(range) = crate::range::rust_scalar_range(&decl.ty) else {
+        let Some(declared) = crate::range::rust_scalar_range(&decl.ty) else {
             continue;
+        };
+        // Trust (2026-10-03, cap from-range): a local whose every value is a
+        // lossless std conversion (`u64::from(x)`, `x: u32`) carries the SOURCE
+        // range, a subset of its declared one — see
+        // `call_facts::lossless_conversion_source_range`. The candidate set keeps
+        // the per-local `value_calls` walk off locals that are never the
+        // destination of such a call.
+        let conv_locals = lossless_conv_locals.get_or_insert_with(|| {
+            let mut locals = FxHashSet::default();
+            if super::terminator_presence_for(func).has_bare_dest_call {
+                for b in &func.body.blocks {
+                    if let Terminator::Call { func: callee, args, dest, .. } = &b.terminator
+                        && dest.projections.is_empty()
+                        && args.len() == 1
+                        && crate::local_ty_ref(func, dest.local)
+                            .and_then(crate::range::rust_scalar_range)
+                            .is_some()
+                        && std_lossless_scalar_conversion(callee).is_some()
+                    {
+                        locals.insert(dest.local);
+                    }
+                }
+            }
+            locals
+        });
+        let range = if conv_locals.contains(&decl.index) {
+            lossless_conversion_source_range(func, decl.index).unwrap_or(declared)
+        } else {
+            declared
         };
         let name = place_to_var_name(func, &Place::local(decl.index));
         map.insert(name, range);
@@ -170,11 +965,20 @@ pub(super) fn local_scalar_range_map(
 /// `place_to_var_name` of a FIELD-projecting place so it attaches only to a name the
 /// formula references; conjoining an in-range fact onto an already-in-range value is
 /// a harmless `true`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn conjoin_datatype_field_ranges(
     func: &VerifiableFunction,
     formula: Formula,
 ) -> Formula {
     conjoin_datatype_field_ranges_excluding(func, formula, &FxHashSet::default())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn conjoin_datatype_field_ranges_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> (Formula, bool) {
+    conjoin_datatype_field_ranges_excluding_step(func, formula, &FxHashSet::default())
 }
 
 /// As [`conjoin_datatype_field_ranges`], but skips any field whose base var name
@@ -183,23 +987,44 @@ pub(super) fn conjoin_datatype_field_ranges(
 /// value of a `*WithOverflow` op is a field-projecting place, so the raw result
 /// read is bounded by THIS conjoin, while its bare-local copies are bounded by
 /// `conjoin_local_type_ranges` (see [`checked_arith_result_value_vars`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn conjoin_datatype_field_ranges_excluding(
     func: &VerifiableFunction,
     formula: Formula,
     exclude: &FxHashSet<String>,
 ) -> Formula {
-    let ranges = datatype_field_range_map(func);
-    if ranges.is_empty() {
-        return formula;
+    conjoin_datatype_field_ranges_excluding_step(func, formula, exclude).0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn conjoin_datatype_field_ranges_excluding_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+    exclude: &FxHashSet<String>,
+) -> (Formula, bool) {
+    let ranges = datatype_field_range_map_rc(func);
+    if ranges.is_empty()
+        || (!exclude.is_empty() && ranges.keys().all(|k| exclude.contains(k.as_str())))
+    {
+        return (formula, false);
     }
     let mut names: FxHashSet<String> = FxHashSet::default();
-    collect_formula_var_names(&formula, &mut names);
-    let mut bounds = Vec::new();
-    for name in &names {
-        let base = name.split('#').next().unwrap_or(name.as_str());
-        if exclude.contains(base) {
-            continue;
+    trust_types::for_each_free_variable_name(&formula, &mut |n| {
+        let base = n.split('#').next().unwrap_or(n);
+        if base.contains('.')
+            && ranges.contains_key(base)
+            && !exclude.contains(base)
+            && !names.contains(n)
+        {
+            names.insert(n.to_owned());
         }
+    });
+    if names.is_empty() {
+        return (formula, false);
+    }
+    let mut bounds = Vec::with_capacity(names.len() + 1);
+    for name in names {
+        let base = name.split('#').next().unwrap_or(name.as_str());
         // `datatype_field_range_map` is keyed by the unversioned place spelling
         // (`value.0`), while a VC normally reads the reaching-definition spelling
         // (`value.0#sB_K`). Look up by the same base used by the exclusion gate,
@@ -207,17 +1032,15 @@ pub(super) fn conjoin_datatype_field_ranges_excluding(
         // Looking up by `name` silently dropped every range as soon as SSA
         // versioning was present, allowing out-of-type-range false witnesses.
         if let Some(&range) = ranges.get(base) {
-            bounds.push(crate::range::rust_scalar_range_constraint(
-                &Formula::Var(name.clone(), trust_types::Sort::Int),
-                range,
-            ));
+            let var = Formula::Var(name, trust_types::Sort::Int);
+            bounds.push(crate::range::rust_scalar_range_constraint(&var, range));
         }
     }
     if bounds.is_empty() {
-        return formula;
+        return (formula, false);
     }
     bounds.push(formula);
-    Formula::And(bounds)
+    (Formula::And(bounds), true)
 }
 
 /// Build `var_name -> RustScalarRange` for every `Copy`/`Move`/place-valued
@@ -234,10 +1057,42 @@ pub(super) fn conjoin_datatype_field_ranges_excluding(
 pub(super) fn datatype_field_range_map(
     func: &VerifiableFunction,
 ) -> FxHashMap<String, crate::range::RustScalarRange> {
+    datatype_field_range_map_rc(func).as_ref().clone()
+}
+
+pub(super) fn datatype_field_range_map_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashMap<String, crate::range::RustScalarRange>> {
+    crate::fn_memo::datatype_field_ranges(func, || compute_datatype_field_range_map(func))
+}
+
+fn compute_datatype_field_range_map<'a>(
+    func: &'a VerifiableFunction,
+) -> FxHashMap<String, crate::range::RustScalarRange> {
+    if func.body.locals.iter().all(|decl| {
+        matches!(
+            decl.ty,
+            Ty::Int { .. }
+                | Ty::PtrSizedInt { .. }
+                | Ty::Bool
+                | Ty::Float { .. }
+                | Ty::Char
+                | Ty::Unit
+                | Ty::Never
+                | Ty::Str
+                | Ty::FnPtr { .. }
+                | Ty::FnDef { .. }
+        )
+    }) {
+        return FxHashMap::default();
+    }
     let mut map = FxHashMap::default();
-    let mut record = |place: &Place| {
+    let mut seen: FxHashSet<&'a Place> = FxHashSet::default();
+    let mut record = |place: &'a Place| {
         // Only FIELD-projecting places (a bare local is bounded elsewhere).
-        if !place.projections.iter().any(|p| matches!(p, trust_types::Projection::Field(_))) {
+        if !place.projections.iter().any(|p| matches!(p, trust_types::Projection::Field(_)))
+            || !seen.insert(place)
+        {
             return;
         }
         // The field must resolve to an integer/`char` scalar — those are the
@@ -451,16 +1306,27 @@ enum FieldStep {
 /// `idx` and no `variants[v].fields[idx]` — and the caller then emits no range
 /// fact. `__tag` carries no `__v` prefix and is not in any variant's field list,
 /// so no path through here can ever answer with it.
+fn has_variant_field_prefix(s: &str, v: usize) -> bool {
+    let Some(rest) = s.strip_prefix("__v") else {
+        return false;
+    };
+    let Some((digits, _)) = rest.split_once('_') else {
+        return false;
+    };
+    !digits.is_empty()
+        && (digits == "0" || !digits.starts_with('0'))
+        && digits.parse::<usize>() == Ok(v)
+}
+
 fn enum_variant_field_ty(
     variants: &[trust_types::VariantDef],
     fields: &[(String, Ty)],
     v: usize,
     idx: usize,
 ) -> Option<Ty> {
-    let prefix = format!("__v{v}_");
     fields
         .iter()
-        .filter(|(name, _)| name.starts_with(&prefix))
+        .filter(|(name, _)| has_variant_field_prefix(name, v))
         .nth(idx)
         .or_else(|| variants.get(v).and_then(|variant| variant.fields.get(idx)))
         .map(|(_, field_ty)| field_ty.clone())
@@ -513,7 +1379,10 @@ fn is_enum_flat_view_field_name(name: &str) -> bool {
 /// Over-collecting is SOUND: a place that never reaches a VC simply never has its
 /// bound conjoined (the conjoin is gated on the name appearing FREE in the formula).
 /// An unrecognized position is skipped (conservative).
-pub(crate) fn for_each_stmt_copy_move_place(stmt: &Statement, f: &mut impl FnMut(&Place)) {
+pub(crate) fn for_each_stmt_copy_move_place<'a>(
+    stmt: &'a Statement,
+    f: &mut impl FnMut(&'a Place),
+) {
     match stmt {
         Statement::Assign { place, rvalue, .. } => {
             f(place);
@@ -533,7 +1402,10 @@ pub(crate) fn for_each_stmt_copy_move_place(stmt: &Statement, f: &mut impl FnMut
 }
 
 /// Invoke `f` on every place an rvalue reads.
-pub(super) fn for_each_rvalue_copy_move_place(rvalue: &Rvalue, f: &mut impl FnMut(&Place)) {
+pub(super) fn for_each_rvalue_copy_move_place<'a>(
+    rvalue: &'a Rvalue,
+    f: &mut impl FnMut(&'a Place),
+) {
     match rvalue {
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) | Rvalue::Repeat(op, _) => {
             for_each_operand_copy_move_place(op, f);
@@ -558,7 +1430,10 @@ pub(super) fn for_each_rvalue_copy_move_place(rvalue: &Rvalue, f: &mut impl FnMu
 
 /// Invoke `f` on every place a terminator mentions — operand reads AND the
 /// place-valued `Call` destination and `Drop` place.
-pub(crate) fn for_each_terminator_copy_move_place(term: &Terminator, f: &mut impl FnMut(&Place)) {
+pub(crate) fn for_each_terminator_copy_move_place<'a>(
+    term: &'a Terminator,
+    f: &mut impl FnMut(&'a Place),
+) {
     match term {
         Terminator::SwitchInt { discr, .. } => for_each_operand_copy_move_place(discr, f),
         Terminator::Assert { cond, .. } => for_each_operand_copy_move_place(cond, f),
@@ -574,7 +1449,10 @@ pub(crate) fn for_each_terminator_copy_move_place(term: &Terminator, f: &mut imp
 }
 
 /// Invoke `f` on the place of a `Copy`/`Move` operand (no-op for constants/symbolic).
-pub(super) fn for_each_operand_copy_move_place(op: &Operand, f: &mut impl FnMut(&Place)) {
+pub(super) fn for_each_operand_copy_move_place<'a>(
+    op: &'a Operand,
+    f: &mut impl FnMut(&'a Place),
+) {
     if let Operand::Copy(place) | Operand::Move(place) = op {
         f(place);
     }
@@ -587,7 +1465,7 @@ pub(super) fn for_each_operand_copy_move_place(op: &Operand, f: &mut impl FnMut(
 /// `Sort::Int`, so nothing stops a solver from choosing a value no execution can
 /// hold. MEASURED at clean HEAD on the ordinary, non-async, loop-free
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// match a { [] => .., [x] => .., [x, .., y] => .. }
 /// ```
 ///
@@ -778,30 +1656,44 @@ pub(super) fn for_each_operand_copy_move_place(op: &Operand, f: &mut impl FnMut(
 /// `UnOp::PtrMetadata`, a `len()`-family call). No serialized verdict bit is
 /// consulted; an unrecognized shape yields no fact.
 pub(super) fn conjoin_length_nonneg_bounds(func: &VerifiableFunction, formula: Formula) -> Formula {
-    let bases = length_nonneg_base_names(func);
+    conjoin_length_nonneg_bounds_step(func, formula).0
+}
+
+pub(super) fn conjoin_length_nonneg_bounds_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> (Formula, bool) {
+    let bases = length_nonneg_base_names_rc(func);
     if bases.is_empty() {
-        return formula;
+        return (formula, false);
     }
-    let mut names: FxHashSet<String> = FxHashSet::default();
-    collect_formula_var_names(&formula, &mut names);
-    let mut bounds: Vec<Formula> = Vec::new();
-    let mut sorted: Vec<String> = names
-        .into_iter()
-        .filter(|name| bases.contains(name.split('#').next().unwrap_or(name.as_str())))
-        .collect();
-    // Deterministic emission order: the formula is a proof input.
-    sorted.sort();
-    for name in sorted {
-        bounds.push(Formula::Ge(
-            Box::new(Formula::var_owned(name, trust_types::Sort::Int)),
-            Box::new(Formula::Int(0)),
-        ));
-    }
-    if bounds.is_empty() {
-        return formula;
-    }
+    let mut bounds: Vec<Formula> = {
+        let mut names: FxHashSet<&str> = FxHashSet::default();
+        trust_types::visit_formula_nodes(&formula, &mut |node| {
+            if let Formula::Var(name, _) = node {
+                let name = name.as_str();
+                if bases.contains(name.split('#').next().unwrap_or(name)) {
+                    names.insert(name);
+                }
+            }
+        });
+        if names.is_empty() {
+            return (formula, false);
+        }
+        let mut sorted: Vec<&str> = names.into_iter().collect();
+        // Deterministic emission order: the formula is a proof input.
+        sorted.sort_unstable();
+        let mut out = Vec::with_capacity(sorted.len() + 1);
+        for name in sorted {
+            out.push(Formula::Ge(
+                Box::new(Formula::var_owned(name.to_owned(), trust_types::Sort::Int)),
+                Box::new(Formula::Int(0)),
+            ));
+        }
+        out
+    };
     bounds.push(formula);
-    Formula::And(bounds)
+    (Formula::And(bounds), true)
 }
 
 /// Base var names of every LENGTH quantity `func` can name — the admission set
@@ -848,40 +1740,73 @@ pub(super) fn conjoin_length_nonneg_bounds(func: &VerifiableFunction, formula: F
 ///    `0 <= X` for an `X` tied to `a - b` onto the SUBTRACTION'S OWN underflow
 ///    obligation, which then "proves" itself — cannot be reached from here,
 ///    because this conjoin is gated `!range_kind` at its only call site
-///    (`generate::safety`, `generate_v2_safety_vcs_impl_with_origins`) and
+///    (`generate::safety`, `generate_v2_safety_vcs_impl_with_origins_checked`) and
 ///    `range_kind` includes every `VcKind::ArithmeticOverflow`. VERIFIED end to
 ///    end as well as by reading the gate: `fn f(a: &[u32], b: &[u32]) -> usize
 ///    { a.len() - b.len() }` keeps its `ArithmeticOverflow { op: Sub }` row
 ///    REFUTED, with a byte-identical formula, at HEAD and with this change.
 pub(super) fn length_nonneg_base_names(func: &VerifiableFunction) -> FxHashSet<String> {
+    length_nonneg_base_names_rc(func).as_ref().clone()
+}
+
+pub(super) fn length_nonneg_base_names_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashSet<String>> {
+    crate::fn_memo::length_nonneg_bases(func, || compute_length_nonneg_base_names(func))
+}
+
+fn compute_length_nonneg_base_names(func: &VerifiableFunction) -> FxHashSet<String> {
     let mut names: FxHashSet<String> = FxHashSet::default();
+    let mut has_unsigned_local = false;
     for decl in &func.body.locals {
+        if decl.ty.int_width().is_some() {
+            if !decl.ty.is_signed() {
+                has_unsigned_local = true;
+            }
+            continue;
+        }
+        if matches!(
+            decl.ty,
+            Ty::Float { .. }
+                | Ty::Bool
+                | Ty::Char
+                | Ty::Unit
+                | Ty::Never
+                | Ty::FnPtr { .. }
+                | Ty::FnDef { .. }
+        ) {
+            continue;
+        }
         if let Some(Formula::Var(name, _)) =
-            crate::slice_len_formula(func, &Operand::Copy(Place::local(decl.index)))
+            crate::place_slice_len_formula(func, &Place::local(decl.index))
             && name.ends_with("__slice_len")
         {
             names.insert(name);
         }
     }
-    let (coll_all, _non_zst) = coll_len_bound_vars(func);
-    names.extend(coll_all);
-    let mut admit_dest = |dest: &Place| {
-        if !dest.projections.is_empty() {
-            return;
-        }
-        let Some(ty) = crate::place_ty_cow(func, dest) else { return };
-        if ty.int_width().is_none() || ty.is_signed() {
-            return;
-        }
-        names.insert(place_to_var_name(func, dest));
+    let coll_vars = coll_len_bound_vars_rc(func);
+    names.extend(coll_vars.0.iter().cloned());
+    if !has_unsigned_local {
+        return names;
+    }
+    let has_bare_dest_call = super::terminator_presence_for(func).has_bare_dest_call;
+    let dest_is_unsigned_local = |dest: &Place| -> bool {
+        dest.projections.is_empty()
+            && crate::local_ty_ref(func, dest.local)
+                .is_some_and(|ty| ty.int_width().is_some() && !ty.is_signed())
     };
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             let Statement::Assign { place: dest, rvalue, .. } = stmt else { continue };
+            if !matches!(
+                rvalue,
+                Rvalue::Len(_) | Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, _)
+            ) || !dest_is_unsigned_local(dest)
+            {
+                continue;
+            }
             let is_length_read = match rvalue {
-                Rvalue::Len(src) => {
-                    crate::slice_len_formula(func, &Operand::Copy(src.clone())).is_some()
-                }
+                Rvalue::Len(src) => crate::place_slice_len_formula(func, src).is_some(),
                 Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, op) => matches!(
                     crate::ptr_metadata_model(func, op),
                     crate::PtrMetadataModel::Length(_)
@@ -889,13 +1814,19 @@ pub(super) fn length_nonneg_base_names(func: &VerifiableFunction) -> FxHashSet<S
                 _ => false,
             };
             if is_length_read {
-                admit_dest(dest);
+                names.insert(place_to_var_name(func, dest));
             }
         }
-        if let Terminator::Call { func: callee, dest, .. } = &block.terminator
+        if has_bare_dest_call
+            && let Terminator::Call { func: callee, dest, .. } = &block.terminator
+            && dest_is_unsigned_local(dest)
+            && (callee.ends_with("len")
+                || callee.ends_with("count")
+                || callee.ends_with("capacity")
+                || callee.contains('<'))
             && matches!(method_tail(callee), "len" | "count" | "capacity")
         {
-            admit_dest(dest);
+            names.insert(place_to_var_name(func, dest));
         }
     }
     names
@@ -913,13 +1844,18 @@ pub(super) fn length_nonneg_base_names(func: &VerifiableFunction) -> FxHashSet<S
 /// still discharges `while i < s.len() { i += 1 }` for the overwhelmingly common
 /// non-ZST slices, with no soundness hole on the ZST edge.
 pub(super) fn conjoin_slice_len_bounds(func: &VerifiableFunction, formula: Formula) -> Formula {
-    let mut names: FxHashSet<String> = FxHashSet::default();
-    collect_formula_var_names(&formula, &mut names);
-    let (coll_all, coll_non_zst) = coll_len_bound_vars(func);
+    conjoin_slice_len_bounds_step(func, formula).0
+}
+
+pub(super) fn conjoin_slice_len_bounds_step(
+    func: &VerifiableFunction,
+    formula: Formula,
+) -> (Formula, bool) {
+    let coll_vars = coll_len_bound_vars_rc(func);
+    let (coll_all, coll_non_zst) = (&coll_vars.0, &coll_vars.1);
     // MATCH ON THE `#`-STRIPPED BASE, exactly as the owned-container arm below
     // already does. A derived `__slice_len` term is SSA-VERSIONED wherever its
-    // base local is written (`_10__slice_len#s1_0`), and a versioned spelling
-    // does not `ends_with("__slice_len")` — so a version-blind test silently
+    // base local is written (`_10__slice_len#s1_0`), and a version-blind test silently
     // stops bounding the very term the goal mentions, and the solver is free to
     // pick a length no slice can have. `nonzst_slice_len_vars` keys on the base
     // name, so the non-ZST lookup must be normalized too. The bound is still
@@ -937,23 +1873,33 @@ pub(super) fn conjoin_slice_len_bounds(func: &VerifiableFunction, formula: Formu
     // is a DECLINE, never a false proof: the extra conjunct is enough to move
     // that fixture off an exact proof and onto a weaker path, and its
     // obligation is then reported unproved (it keeps its runtime check).
-    let base_of = |n: &str| n.split('#').next().unwrap_or(n).to_string();
-    if !names
-        .iter()
-        .any(|n| base_of(n).ends_with("__slice_len") || coll_all.contains(&base_of(n)))
-    {
-        return formula;
+    fn base_of(s: &str) -> &str {
+        s.split('#').next().unwrap_or(s)
     }
-    let non_zst = nonzst_slice_len_vars(func);
-    let mut bounds = Vec::new();
+    let mut names: FxHashSet<String> = FxHashSet::default();
+    let mut has_slice_len = false;
+    trust_types::for_each_free_variable_name(&formula, &mut |n| {
+        let base = base_of(n);
+        let is_slice_len = base.ends_with("__slice_len");
+        if (is_slice_len || (!coll_all.is_empty() && coll_all.contains(base)))
+            && !names.contains(n)
+        {
+            has_slice_len |= is_slice_len;
+            names.insert(n.to_owned());
+        }
+    });
+    if names.is_empty() {
+        return (formula, false);
+    }
+    let non_zst_rc = has_slice_len.then(|| nonzst_slice_len_vars_rc(func));
+    let mut bounds = Vec::with_capacity(names.len() * 2 + 1);
     for name in names {
         let base = base_of(&name);
         if base.ends_with("__slice_len") {
-            let var = Formula::var(&name, trust_types::Sort::Int);
+            let is_non_zst = non_zst_rc.as_ref().is_some_and(|s| s.contains(base));
+            let var = Formula::var_owned(name, trust_types::Sort::Int);
             bounds.push(Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(0))));
-            if non_zst.contains(&base) {
-                bounds.push(Formula::Le(Box::new(var), Box::new(Formula::Int(i64::MAX as i128))));
-            }
+            bounds.push(Formula::Le(Box::new(var), Box::new(len_ceiling(is_non_zst))));
             continue;
         }
         // Owned-container LENGTH abstraction (Vec/String live as an integer —
@@ -964,19 +1910,30 @@ pub(super) fn conjoin_slice_len_bounds(func: &VerifiableFunction, formula: Formu
         // (`size_of::<T>() >= 1` forces `len <= isize::MAX`; a ZST container
         // can reach `usize::MAX`, so unknown/ZST elements keep only the lower
         // bound — fail-closed toward NOT bounding).
-        if coll_all.contains(&base) {
-            let var = Formula::var(&name, trust_types::Sort::Int);
+        if coll_all.contains(base) {
+            let is_non_zst = coll_non_zst.contains(base);
+            let var = Formula::var_owned(name, trust_types::Sort::Int);
             bounds.push(Formula::Ge(Box::new(var.clone()), Box::new(Formula::Int(0))));
-            if coll_non_zst.contains(&base) {
-                bounds.push(Formula::Le(Box::new(var), Box::new(Formula::Int(i64::MAX as i128))));
-            }
+            bounds.push(Formula::Le(
+                Box::new(var),
+                Box::new(len_ceiling(is_non_zst)),
+            ));
         }
     }
     if bounds.is_empty() {
-        return formula;
+        return (formula, false);
     }
     bounds.push(formula);
-    Formula::And(bounds)
+    (Formula::And(bounds), true)
+}
+
+/// The largest length a slice or container can have: `isize::MAX` when its element
+/// is at least one byte, and the `usize::MAX` every length is bounded by otherwise.
+/// Without the second a zero-sized element's length was unbounded above, and
+/// `for (i, _) in v.iter().enumerate() { m = i + 1 }` over `&[()]` was refuted with
+/// the impossible `len == 2^64` (the trip-count lane's precondition audit, `d02`).
+fn len_ceiling(element_is_nonzero_sized: bool) -> Formula {
+    Formula::Int(if element_is_nonzero_sized { i64::MAX as i128 } else { u64::MAX as i128 })
 }
 
 /// Var names of LOCALS whose type is a crate-anchored std owned container
@@ -988,10 +1945,25 @@ pub(super) fn conjoin_slice_len_bounds(func: &VerifiableFunction, formula: Formu
 pub(super) fn coll_len_bound_vars(
     func: &VerifiableFunction,
 ) -> (FxHashSet<String>, FxHashSet<String>) {
+    coll_len_bound_vars_rc(func).as_ref().clone()
+}
+
+pub(super) fn coll_len_bound_vars_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<(FxHashSet<String>, FxHashSet<String>)> {
+    crate::fn_memo::coll_len_bound_vars(func, || compute_coll_len_bound_vars(func))
+}
+
+fn compute_coll_len_bound_vars(
+    func: &VerifiableFunction,
+) -> (FxHashSet<String>, FxHashSet<String>) {
     let mut all: FxHashSet<String> = FxHashSet::default();
     let mut non_zst: FxHashSet<String> = FxHashSet::default();
     for decl in &func.body.locals {
         let Ty::Adt { name, fields, .. } = &decl.ty else { continue };
+        if !(name.starts_with("std::") || name.starts_with("alloc::")) {
+            continue;
+        }
         let base = name.split('<').next().unwrap_or(name);
         let is_vec = base == "std::vec::Vec" || base == "alloc::vec::Vec";
         let is_string = base == "std::string::String" || base == "alloc::string::String";
@@ -1003,7 +1975,8 @@ pub(super) fn coll_len_bound_vars(
         let elem_non_zst = if is_string {
             true // element is u8
         } else {
-            first_rawptr_pointee_in_fields(fields).map(ty_is_definitely_non_zst).unwrap_or(false)
+            first_rawptr_pointee_in_fields(fields)
+                .is_some_and(|elem| slice_elem_is_definitely_non_zst(func, elem))
         };
         if elem_non_zst {
             non_zst.insert(var);
@@ -1042,6 +2015,16 @@ pub(super) fn first_rawptr_pointee_in_fields(fields: &[(String, Ty)]) -> Option<
 /// the function's slice-typed locals (params, temps, and loop-yielded sub-slices
 /// are all locals). Only these may take the `len <= isize::MAX` upper bound.
 pub(super) fn nonzst_slice_len_vars(func: &VerifiableFunction) -> FxHashSet<String> {
+    nonzst_slice_len_vars_rc(func).as_ref().clone()
+}
+
+pub(super) fn nonzst_slice_len_vars_rc(
+    func: &VerifiableFunction,
+) -> std::rc::Rc<FxHashSet<String>> {
+    crate::fn_memo::nonzst_slice_len_vars(func, || compute_nonzst_slice_len_vars(func))
+}
+
+fn compute_nonzst_slice_len_vars(func: &VerifiableFunction) -> FxHashSet<String> {
     let mut set: FxHashSet<String> = FxHashSet::default();
     for decl in &func.body.locals {
         let elem = match &decl.ty {
@@ -1053,7 +2036,7 @@ pub(super) fn nonzst_slice_len_vars(func: &VerifiableFunction) -> FxHashSet<Stri
             _ => None,
         };
         if let Some(elem) = elem
-            && ty_is_definitely_non_zst(elem)
+            && slice_elem_is_definitely_non_zst(func, elem)
         {
             set.insert(format!(
                 "{}__slice_len",
@@ -1064,26 +2047,79 @@ pub(super) fn nonzst_slice_len_vars(func: &VerifiableFunction) -> FxHashSet<Stri
     set
 }
 
-/// Conservative: true only for element types provably >= 1 byte. Recurses through
-/// Array/Tuple/Adt so `&[SomeStruct]` (any non-ZST field) is covered; returns
-/// false for `()`, empty/all-ZST tuples/structs, `[T; 0]`, and anything unknown —
-/// fail-closed toward NOT bounding, which is the sound direction.
+/// Conservative: true only for element types provably >= 1 byte — false for `()`,
+/// empty/all-ZST tuples/structs, `[T; 0]`, a zero-sized ENUM, and anything unknown
+/// (fail-closed toward NOT bounding, which is the sound direction). GRANTING: a
+/// `true` licenses `len <= isize::MAX` on a slice/`Vec` of these
+/// ([`nonzst_slice_len_vars`], [`coll_len_bound_vars`]) and on every consumer that
+/// reuses this name (`semantic_guard`, `loop_bounds`, `value_facts`).
+///
+/// Trust (ZST-ENUM-SLICE-LEN-1, 2026-10-11): this is now the alloc lane's
+/// predicate, [`super::alloc_vcs::ty_is_definitely_nonzero_sized`], and no longer a
+/// second copy of it. The copy that stood here read every `Ty::Adt` through its
+/// flattened `fields` view, and the extractor's enum rendering
+/// (`trust_mir_extract::ty_convert::lower_enum_adt`) always puts a synthetic
+/// `__tag: isize` FIRST in that view. So every enum counted as non-ZST:
+/// `enum One { A }`, `enum Two { A, B(Infallible) }`, `Option<Infallible>`, a
+/// generic `Option<T>`, and every struct, tuple or array holding one. Each of
+/// those is a ZST, so a `&[One]` can be `usize::MAX` long. MEASURED on the stage 1
+/// of `origin/main` 2bf0ad72e3 (scout probe `zstconfirm/zlib.rs`):
+/// `pub fn twice_len(a: &[One]) -> usize { a.len() * 2 }` reported
+/// `[overflow:mul]` PROVED, kernel-certified, and `TRUST_ELIDE: elided 1` under
+/// the default, certify, memory-safe and advisory policies, and a verify-off
+/// caller passing a `2^63`-long slice got `0` back where the unverified build
+/// panics. The const-generic `[One::A; N].len() * 2` was elided the same way.
+///
+/// The shared predicate reads rustc's `layout.size` when the extractor stamped
+/// one, counts an enum's VARIANTS (one with a non-ZST field, or two or more
+/// definitely-inhabited ones) instead of its fields, and routes a variantless
+/// enum rendering (`Infallible`) away from the struct arm. Its own doc has the
+/// rules. COST, accepted fail-closed: an unstamped single-variant
+/// `#[repr(u8)] enum Rep { A }` IS one byte, but the verifier lane stamps no enum
+/// layout, so a `&[Rep]` length loses its upper bound (an over-refusal, never a
+/// false proof). `docs/DECISION_QUEUE.md` ZST-ENUM-SLICE-LEN-1 records it.
+///
+/// The `Ty::Bv(0)` arm keeps this predicate's old answer for a zero-width
+/// bit-vector, which the shared one calls sized. No producer emits a `Ty::Bv`
+/// element (the extractor never renders one); it is a hand-built shape.
+///
+/// `trust_ir_bridge::lower::native_ty_is_definitely_non_zst` is a port of this
+/// function (the bridge reaches trust-vcgen only as a dev-dependency) and is kept
+/// in lockstep by the mirrored table in its `native_len_bound_tests` and
+/// `ptr_metadata_tests::slice_len_upper_bound_gate_excludes_zst_enums` here.
+///
+/// Trust (merge 2026-10-14): local main (131e8d2e551) had moved the rule to
+/// [`trust_types::alloc_model::ty_is_definitely_nonzero_sized`], which the other
+/// vcgen lanes and the bridge call directly. Both are GRANTING, so this predicate
+/// answers `true` only when BOTH say so (a `true` from either alone could only widen
+/// a length bound); [`super::alloc_vcs::elem_is_definitely_nonzero_sized`] is that
+/// conjunction. They differ on unstamped hand-built shapes: the alloc lane also
+/// refuses an unstamped `[__tag, ..]` rendering with no variant list, which the
+/// trust-types rule reads as a struct.
 pub(super) fn ty_is_definitely_non_zst(ty: &Ty) -> bool {
     match ty {
-        Ty::Bool
-        | Ty::Char
-        | Ty::Int { .. }
-        | Ty::PtrSizedInt { .. }
-        | Ty::Float { .. }
-        | Ty::Ref { .. }
-        | Ty::RawPtr { .. }
-        | Ty::FnPtr { .. } => true,
-        Ty::Bv(w) => *w > 0,
-        Ty::Array { elem, len } => *len > 0 && ty_is_definitely_non_zst(elem),
-        Ty::Tuple(tys) => tys.iter().any(ty_is_definitely_non_zst),
-        Ty::Adt { fields, .. } => fields.iter().any(|(_, t)| ty_is_definitely_non_zst(t)),
-        _ => false,
+        Ty::Bv(0) => false,
+        _ => super::alloc_vcs::elem_is_definitely_nonzero_sized(ty),
     }
+}
+
+/// Trust (2026-10-17, gate RCA precision T4): [`ty_is_definitely_non_zst`] of a slice or
+/// container ELEMENT of `func`, with a bare datatype marker resolved through the body's
+/// own definition table first (`VerifiableBody::resolved_datatype`).
+///
+/// The extractor spells a RECURSIVE type's every occurrence as the bare marker
+/// `Ty::Datatype { name, variants: [] }` and records its definition once in
+/// `body.datatype_defs` (R0). The predicate answers `false` for a marker (it carries no
+/// structure), so `&[TtE]` over `enum TtE { Ident(String), .., Group(Delim, Vec<TtE>) }`
+/// lost the `len <= isize::MAX` ceiling a one-byte-or-larger element guarantees, and
+/// aterm-wasm-abi-macros `parse.rs:373` (`while i < p.len() { .. i += 2 }`) was refuted
+/// at `p__slice_len = 2^64 - 1` (62e9854a78 moved the gate onto this predicate; the seal
+/// still read the flattened fields). The table entry is the producer's own assertion of
+/// what that exact name (generics included) means, and resolution is one level deep: a
+/// marker nested in the definition stays bare and still answers `false`, so this can
+/// only grant where the definition itself shows a sized field or two inhabited variants.
+pub(super) fn slice_elem_is_definitely_non_zst(func: &VerifiableFunction, elem: &Ty) -> bool {
+    ty_is_definitely_non_zst(&func.body.resolved_datatype(elem))
 }
 
 /// True `(width, signed)` of an integer binary operation, recovering from the
@@ -1106,8 +2142,22 @@ pub(crate) fn int_op_type(
     } else if !matches!(rhs, Operand::Constant(_)) {
         crate::operand_ty_cow(func, rhs)
     } else {
-        // Both operands constant (rustc rejects narrow-type const-arithmetic
-        // overflow at compile time, so this is rare): take the narrower width.
+        // Both operands constant: take the narrower width. For two width-less
+        // signed literals (`ConstValue::Int`) that is NOT a type, only the i64 (or
+        // i128) `operand_ty` fabricates, and the pair is not rare: rustc's lint
+        // does not reach `core::intrinsics::unchecked_div(i8::MIN, -1)`, the stable
+        // `i8::MAX.unchecked_add(1)`, or anything under
+        // `#![allow(arithmetic_overflow)]`. Trust (LITERAL-PAIR-WIDTH-1,
+        // 2026-10-13): the builders that read a width for such a pair take it from
+        // the operation's DESTINATION instead (`literal_pair_int_type` for signed
+        // `Div`/`Rem` and its suppressions, `v2_overflow_call_body`'s `Unchecked`
+        // arm). This fallback is left as it is for its remaining callers, all in
+        // `overflow_vc.rs`: the Add/Sub/Mul row builder reads the validated
+        // destination / checked-payload `operation_ty` first, so it reaches this
+        // guess only where neither exists, and the signed-128 Mul suppression and the
+        // hardened signed BV Add/Sub lane act only at width 128, which a pair reaches
+        // here only when BOTH values exceed i64 (so the operation really is 128-bit);
+        // at any other answer they decline, which keeps the row.
         match (crate::operand_ty_cow(func, lhs), crate::operand_ty_cow(func, rhs)) {
             (Some(a), Some(b)) => {
                 let wa = a.int_width().unwrap_or(u32::MAX);

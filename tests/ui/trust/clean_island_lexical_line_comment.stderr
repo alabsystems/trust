@@ -1,14 +1,8 @@
-error: unexpected closing delimiter: `}`
-  --> $DIR/clean_island_lexical_line_comment.rs:11:1
+note: Clean island kernel-checked: 2 declaration(s) registered (before, after)
+  --> $DIR/clean_island_lexical_line_comment.rs:9:5
    |
-LL | clean {
-   |       - this delimiter might not be properly closed...
-LL |     theorem before : 0 = 0 := rfl
-LL |     -- }
-   |        - ...as it matches this but it has different indentation
-LL |     theorem after : 0 = 0 := rfl
-LL | }
-   | ^ unexpected closing delimiter
-
-error: aborting due to 1 previous error
+LL | /     theorem before : 0 = 0 := rfl
+LL | |     -- }
+LL | |     theorem after : 0 = 0 := rfl
+   | |________________________________^
 

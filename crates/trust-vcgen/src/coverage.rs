@@ -205,7 +205,10 @@ impl CoverageReport {
     /// Total count of gaps across all categories.
     #[must_use]
     pub fn total_gap_count(&self) -> usize {
-        self.all_gaps().len()
+        self.rvalue_gap_count()
+            + self.terminator_gap_count()
+            + self.binop_gap_count()
+            + self.unop_gap_count()
     }
 }
 
@@ -295,7 +298,7 @@ fn analyze_rvalue_coverage() -> Vec<VariantCoverage> {
                     "ArithmeticOverflow (signed Div/Rem INT_MIN/-1)",
                     "ShiftOverflow (Shl/Shr)",
                     "FloatOverflowToInfinity (float Add/Sub/Mul/Div)",
-                    "UnsupportedMir for identity-less opaque arithmetic operands",
+                    "UnsupportedMir for unmodeled opaque arithmetic operands",
                 ],
             },
         },
@@ -307,7 +310,7 @@ fn analyze_rvalue_coverage() -> Vec<VariantCoverage> {
                     "ArithmeticOverflow (Add/Sub/Mul WithOverflow carriers)",
                     "MalformedTrustIr for non-Add/Sub/Mul checked carriers \
                      (shift obligations arise only from the plain BinaryOp spelling)",
-                    "UnsupportedMir for unmodeled checked carriers or identity-less opaque operands",
+                    "UnsupportedMir for unmodeled checked carriers or opaque operands",
                 ],
             },
         },
@@ -321,8 +324,9 @@ fn analyze_rvalue_coverage() -> Vec<VariantCoverage> {
                     "generate::slice_conversion",
                 ],
                 vc_kinds: vec![
-                    "MalformedTrustIr for non-Add/Sub/Mul or invalid integer carriers",
+                    "MalformedTrustIr for non-Add/Sub/Mul/Shl/Shr or invalid integer carriers",
                     "UncheckedArithmeticOverflow (unchecked Add/Sub/Mul; UB on overflow, no runtime guard)",
+                    "UnsupportedMir for unchecked Shl/Shr (UB outside 0..BITS; no UB-class shift kind yet)",
                     "UnsupportedMir for an explicit unsupported operand",
                 ],
             },
@@ -860,8 +864,9 @@ mod tests {
                     "generate::slice_conversion",
                 ],
                 vc_kinds: vec![
-                    "MalformedTrustIr for non-Add/Sub/Mul or invalid integer carriers",
+                    "MalformedTrustIr for non-Add/Sub/Mul/Shl/Shr or invalid integer carriers",
                     "UncheckedArithmeticOverflow (unchecked Add/Sub/Mul; UB on overflow, no runtime guard)",
+                    "UnsupportedMir for unchecked Shl/Shr (UB outside 0..BITS; no UB-class shift kind yet)",
                     "UnsupportedMir for an explicit unsupported operand",
                 ],
             }

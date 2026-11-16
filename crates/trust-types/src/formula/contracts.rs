@@ -26,7 +26,131 @@ pub struct StateMachineMetadata {
     /// Transitions: (from_state_idx, event_label, to_state_idx).
     pub transitions: Vec<(usize, String, usize)>,
     /// Labels for each state: state_idx -> list of atomic proposition labels.
+    ///
+    /// A state keyed twice is refused when deserializing: a map keeps the
+    /// last value silently, so `{"3":["bad"],"3":[]}` would otherwise erase
+    /// state 3's `bad` label unseen (and `"3"`/`"03"` name the same state).
+    #[serde(deserialize_with = "labels_keyed_once")]
     pub labels: FxHashMap<usize, Vec<String>>,
+}
+
+/// Deserialize [`StateMachineMetadata::labels`], refusing a state that is
+/// keyed twice (fail-closed: the machine checked must be the machine sent).
+fn labels_keyed_once<'de, D>(deserializer: D) -> Result<FxHashMap<usize, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LabelsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for LabelsVisitor {
+        type Value = FxHashMap<usize, Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map from state index to its atomic proposition labels")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut labels = FxHashMap::default();
+            while let Some((state, atoms)) = map.next_entry::<usize, Vec<String>>()? {
+                if labels.insert(state, atoms).is_some() {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "state {state} is labelled twice"
+                    )));
+                }
+            }
+            Ok(labels)
+        }
+    }
+
+    deserializer.deserialize_map(LabelsVisitor)
+}
+
+/// Refuse a JSON text in which some object names one key twice. serde keeps
+/// the last value without a word, so a duplicate would change what the
+/// payload means while it still parses.
+fn refuse_duplicate_json_keys(value: &str) -> Result<(), String> {
+    struct KeysOnce;
+
+    impl<'de> Deserialize<'de> for KeysOnce {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(KeysOnceVisitor)
+        }
+    }
+
+    struct KeysOnceVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for KeysOnceVisitor {
+        type Value = KeysOnce;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_i128<E>(self, _: i128) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_u128<E>(self, _: u128) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_unit<E>(self) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_none<E>(self) -> Result<KeysOnce, E> {
+            Ok(KeysOnce)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<KeysOnce, D::Error> {
+            KeysOnce::deserialize(d)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<KeysOnce, A::Error> {
+            while seq.next_element::<KeysOnce>()?.is_some() {}
+            Ok(KeysOnce)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<KeysOnce, A::Error> {
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "an object names key `{key}` twice"
+                    )));
+                }
+                map.next_value::<KeysOnce>()?;
+            }
+            Ok(KeysOnce)
+        }
+    }
+
+    serde_json::from_str::<KeysOnce>(value)
+        .map(|_| ())
+        .map_err(|e| format!("malformed {TY_TEMPORAL_MODEL_METADATA_KEY} payload: {e}"))
 }
 
 impl StateMachineMetadata {
@@ -61,6 +185,17 @@ pub const TY_TEMPORAL_MODEL_METADATA_KEY: &str = "trust.ty.temporal_model";
 /// Trust: schema marker for [`TyTemporalModelPayload`].
 pub const TY_TEMPORAL_MODEL_SCHEMA_VERSION: &str = "trust.ty.temporal-model.v1";
 
+/// Trust: schema marker for a REFUTATION-ONLY [`TyTemporalModelPayload`]: the
+/// machine is a derived model that may under-approximate the program (a
+/// bounded environment enumeration, an argued-not-proved abstraction), so
+/// only a refutation (a counterexample trace) over it is evidence. A checker
+/// that finds no counterexample must NOT report a proof (D-10/D-11 plan
+/// SD-8). A distinct schema string, not a field, so that a consumer built
+/// before this variant existed rejects the payload (fail-closed) instead of
+/// ignoring an unknown field and reporting `Proved`.
+pub const TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY: &str =
+    "trust.ty.temporal-model.refutation-only.v1";
+
 /// Trust: serialized temporal-model transport for the native ty engine.
 ///
 /// `trust-mir-extract` drops `VerificationCondition.formula` when building the
@@ -72,11 +207,23 @@ pub const TY_TEMPORAL_MODEL_SCHEMA_VERSION: &str = "trust.ty.temporal-model.v1";
 /// producer emitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TyTemporalModelPayload {
-    /// Always [`TY_TEMPORAL_MODEL_SCHEMA_VERSION`]; consumers reject others.
+    /// [`TY_TEMPORAL_MODEL_SCHEMA_VERSION`], or
+    /// [`TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY`] for a derived model whose
+    /// pass is not admitted; consumers reject others.
     pub schema_version: String,
     /// The temporal `VcKind` exactly as emitted (Temporal / Liveness /
     /// Fairness / DeadState / Deadlock), including any inline machine.
     pub vc_kind: super::VcKind,
+    /// Every atomic proposition a formula over this machine may name (the
+    /// derived model's vocabulary), whether or not some state carries it. A
+    /// REFUTATION-ONLY check refuses a payload without one and a formula or
+    /// state label naming an atom outside it: an atom no state carries is
+    /// false everywhere, so a misspelt one would otherwise check vacuously
+    /// ("no counterexample") or refute spuriously, and only the producer of
+    /// the machine knows which atoms are real (FC-7). Not serialized when
+    /// absent, so a full payload's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary: Option<std::collections::BTreeSet<String>>,
 }
 
 impl TyTemporalModelPayload {
@@ -93,9 +240,34 @@ impl TyTemporalModelPayload {
             | VcKind::Deadlock => Some(Self {
                 schema_version: TY_TEMPORAL_MODEL_SCHEMA_VERSION.to_string(),
                 vc_kind: kind.clone(),
+                vocabulary: None,
             }),
             _ => None,
         }
+    }
+
+    /// Wrap a temporal `VcKind` over a DERIVED machine: only a refutation
+    /// over it is evidence ([`TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY`]).
+    #[must_use]
+    pub fn refutation_only(kind: &super::VcKind) -> Option<Self> {
+        Self::from_vc_kind(kind).map(|mut p| {
+            p.schema_version = TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY.to_string();
+            p
+        })
+    }
+
+    /// The same payload, declaring `vocabulary` as the atoms a formula over
+    /// its machine may name ([`TyTemporalModelPayload::vocabulary`]).
+    #[must_use]
+    pub fn with_vocabulary(mut self, vocabulary: impl IntoIterator<Item = String>) -> Self {
+        self.vocabulary = Some(vocabulary.into_iter().collect());
+        self
+    }
+
+    /// Whether a checker must withhold `Proved` for this payload.
+    #[must_use]
+    pub fn is_refutation_only(&self) -> bool {
+        self.schema_version == TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY
     }
 
     /// Serialize to the metadata value string.
@@ -103,14 +275,21 @@ impl TyTemporalModelPayload {
         serde_json::to_string(self)
     }
 
-    /// Parse a metadata value string, enforcing the schema marker.
+    /// Parse a metadata value string, enforcing the schema marker. A value
+    /// in which some JSON object names one key twice is refused (serde
+    /// would keep the last value silently).
     pub fn from_metadata_value(value: &str) -> Result<Self, String> {
+        refuse_duplicate_json_keys(value)?;
         let payload: Self = serde_json::from_str(value)
             .map_err(|e| format!("malformed {TY_TEMPORAL_MODEL_METADATA_KEY} payload: {e}"))?;
-        if payload.schema_version != TY_TEMPORAL_MODEL_SCHEMA_VERSION {
+        if payload.schema_version != TY_TEMPORAL_MODEL_SCHEMA_VERSION
+            && payload.schema_version != TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY
+        {
             return Err(format!(
-                "unsupported temporal-model schema `{}` (expected `{}`)",
-                payload.schema_version, TY_TEMPORAL_MODEL_SCHEMA_VERSION
+                "unsupported temporal-model schema `{}` (expected `{}` or `{}`)",
+                payload.schema_version,
+                TY_TEMPORAL_MODEL_SCHEMA_VERSION,
+                TY_TEMPORAL_MODEL_SCHEMA_REFUTATION_ONLY
             ));
         }
         Ok(payload)

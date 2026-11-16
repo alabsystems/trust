@@ -6,7 +6,7 @@
 //! THE DEFECT (measured 2026-08-27 against veripb-alab's SATURATE per-term
 //! step). This is a TRUE clause:
 //!
-//! ```ignore
+//! ```ignore (illustrative)
 //! #[trust::ensures(move |ret: &Term| ret.coeff <= degree)]
 //! fn sat_term(degree: i64, coeff: i64, v: u32) -> Term {
 //!     let c = if coeff <= degree { coeff } else { degree };
@@ -33,9 +33,8 @@
 //! of a formula about nothing — the same failure mode as the two sibling
 //! files, one level down, on a return-slot FIELD rather than on `_0` itself.
 //!
-//! WHY THE SIBLING FIXES DO NOT REACH IT. `unify_return_slot_versions` is
-//! scoped by `is_return_slot_name`, which is `name == "_0" || name
-//! .starts_with("_0#")` — it does not match `_0.0` or `_0.0#s3_3`. The
+//! WHY THE SIBLING FIXES DO NOT REACH IT. the scalar result-read
+//! rebinding matches only `_0`; it does not rebind `_0.0` or `_0.0#s3_3`. The
 //! early-return MERGE PIN covers `&mut`-parameter places, not an ordinary
 //! local feeding an aggregate field.
 //!
@@ -70,9 +69,8 @@
 //! `ensures ret.coeff <= degree`) PROVES. Only the two together fail.
 
 use trust_types::{
-    AggregateKind, BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place,
-    Rvalue, Sort, SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody,
-    VerifiableFunction,
+    AggregateKind, BasicBlock, BinOp, BlockId, Formula, LocalDecl, Operand, Place, Rvalue, Sort,
+    SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody, VerifiableFunction,
 };
 
 use super::generate_v2_contract_vcs_impl;
@@ -100,16 +98,18 @@ fn term_ty() -> Ty {
         adt_kind: None,
         layout: None,
         name: "veripb::Term".into(),
-        fields: vec![("coeff".into(), i64_ty()), ("lit".into(), i64_ty())],
+        fields: vec![("coeff".into(), i64_ty()), ("lit".into(), i64_ty())].into(),
         variants: vec![VariantDef {
             name: "Term".into(),
             discriminant: 0,
             fields: vec![("coeff".into(), i64_ty()), ("lit".into(), i64_ty())],
-        }],
+        }]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -176,10 +176,7 @@ fn select_into_field(clause: Formula) -> VerifiableFunction {
                                 active_field: None,
                                 args: None,
                             },
-                            vec![
-                                Operand::Move(Place::local(4)),
-                                Operand::Move(Place::local(3)),
-                            ],
+                            vec![Operand::Move(Place::local(4)), Operand::Move(Place::local(3))],
                         ),
                     )],
                     Terminator::Return,
@@ -193,6 +190,7 @@ fn select_into_field(clause: Formula) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![clause],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -217,7 +215,10 @@ fn connected_names(formula: &Formula, start: &str) -> std::collections::BTreeSet
         match f {
             Formula::And(cs) => cs.iter().for_each(|c| edges(c, out)),
             Formula::Eq(l, r) => {
-                out.push((l.free_variables().into_iter().collect(), r.free_variables().into_iter().collect()));
+                out.push((
+                    l.free_variables().into_iter().collect(),
+                    r.free_variables().into_iter().collect(),
+                ));
                 edges(l, out);
                 edges(r, out);
             }

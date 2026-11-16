@@ -48,6 +48,7 @@ fn simple_binop(name: &str, op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

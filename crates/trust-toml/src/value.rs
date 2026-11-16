@@ -6,11 +6,13 @@
 //! # Why this exists at all when `from_str::<T>` is the normal path
 //!
 //! Most consumers deserialize into their own struct and never touch [`Value`].
-//! Four in this tree do not: they read a `Cargo.toml` and assert things about
+//! Some in this tree do not: they read a `Cargo.toml` and assert things about
 //! it (`crates/trust-router/tests/manifest_feature_plumbing.rs`,
-//! `crates/trust-bmc/src/verifier_api.rs:11267`), or they parse a single
-//! dependency line and re-render it (`crates/trust-deps/src/lib.rs:1600`).
-//! Those callers index by string, so the shape they need is a dynamic tree.
+//! `crates/trust-bmc/src/verifier_api.rs:11267`). The shape was also driven by
+//! a caller that parsed a single dependency line and re-rendered it — the
+//! dependency-line parser of the retired `trust-deps` crate (removed by
+//! TRUST-08, 2026-09-24). Those callers index by string, so the shape they need
+//! is a dynamic tree.
 //!
 //! # The API is the incumbent's, spelled the same way on purpose
 //!
@@ -24,9 +26,10 @@
 //!   `Display for Value` writes a *value* in inline position — `1`, `"s"`,
 //!   `{ a = 1 }` — which is a different spelling from the document form
 //!   [`crate::to_string`] produces, and this crate has not measured it. Nothing
-//!   in this tree calls it: the one caller that renders an inline value,
-//!   `crates/trust-deps/src/lib.rs:1632`, hand-rolls its own
-//!   `format_inline_toml_value` and does not go through `Display`. A `Display`
+//!   in this tree calls it: the one caller that ever rendered an inline value,
+//!   the retired `trust-deps` crate (removed by TRUST-08, 2026-09-24),
+//!   hand-rolled its own `format_inline_toml_value` and never went through
+//!   `Display`. A `Display`
 //!   that printed the *document* form would compile at every call site and
 //!   silently emit something else, which is the failure this crate exists not to
 //!   have — so the impl stays absent until a caller needs it and its exact
@@ -35,8 +38,7 @@
 //!   uses them, and each is a place for a silent numeric or ordering
 //!   difference to hide.
 
-use std::fmt;
-use std::ops;
+use std::{fmt, ops};
 
 use serde::Deserialize as _;
 

@@ -295,6 +295,7 @@ complete -c x.py -n "__fish_x.py_using_subcommand fix" -l llvm-profile-use -d 'u
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -l reproducible-artifact -d 'Additional reproducible artifacts that should be added to the reproducible artifacts archive' -r
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -l set -d 'override options in bootstrap.toml' -r -f
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -l ci -d 'Make bootstrap to behave as it\'s running on the CI environment or not' -r -f -a "{true\t'',false\t''}"
+complete -c x.py -n "__fish_x.py_using_subcommand fix" -l allow-dirty -d 'Pass `--allow-dirty` to `cargo fix`, allowing it to run even if the current git checkout has uncommitted changes'
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -s v -l verbose -d 'use verbose output (-vv for very verbose)'
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -s q -l quiet -d 'use quiet output'
 complete -c x.py -n "__fish_x.py_using_subcommand fix" -s i -l incremental -d 'use incremental compilation'
@@ -423,8 +424,10 @@ complete -c x.py -n "__fish_x.py_using_subcommand d" -l enable-bolt-settings -d 
 complete -c x.py -n "__fish_x.py_using_subcommand d" -l skip-stage0-validation -d 'Skip stage0 compiler validation'
 complete -c x.py -n "__fish_x.py_using_subcommand d" -l skip-std-check-if-no-download-rustc -d 'Skip checking the standard library if `rust.download-rustc` isn\'t available. This is mostly for RA as building the stage1 compiler to check the library tree on each code change might be too much for some computers'
 complete -c x.py -n "__fish_x.py_using_subcommand d" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c x.py -n "__fish_x.py_using_subcommand test" -l trust-repo-wp-installation -d 'Immutable current Trust installation for the stage-2 first-party/trust-wp selection' -r -F
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l test-args -d 'extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)' -r
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l compiletest-rustc-args -d 'extra options to pass the compiler when running compiletest tests' -r
+complete -c x.py -n "__fish_x.py_using_subcommand test" -l compiler-test-fixture -d 'Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)' -r -f -a "(__fish_complete_directories)"
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l extra-checks -d 'comma-separated list of other files types to check (accepts py, py:lint, py:fmt, shell, cpp, cpp:fmt, js, js:lint, js:typecheck, spellcheck)' -r
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l compare-mode -d 'mode describing what file the actual ui output will be compared to' -r
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l pass -d 'force {check,build,run}-pass tests to this mode' -r
@@ -453,8 +456,11 @@ complete -c x.py -n "__fish_x.py_using_subcommand test" -l llvm-profile-use -d '
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l reproducible-artifact -d 'Additional reproducible artifacts that should be added to the reproducible artifacts archive' -r
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l set -d 'override options in bootstrap.toml' -r -f
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l ci -d 'Make bootstrap to behave as it\'s running on the CI environment or not' -r -f -a "{true\t'',false\t''}"
+complete -c x.py -n "__fish_x.py_using_subcommand test" -l trust-repo-check -d 'Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim'
+complete -c x.py -n "__fish_x.py_using_subcommand test" -l trust-repo-parent-release-v1 -d 'Require the validated native parent\'s version-1 release handoff'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l no-fail-fast -d 'run all tests regardless of failure'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l trust-vanilla -d 'run upstream vanilla compiletest by disabling Trust verification'
+complete -c x.py -n "__fish_x.py_using_subcommand test" -l trust-verified -d 'run the VERIFIED compiletest lane: compile every test at the shipping default (`-Ztrust-verify=on -Ztrust-policy=strict`) instead of the harness\'s `-Ztrust-verify=off`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with `--trust-vanilla`'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l all-targets -d 'Run all test targets (no doc tests)'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l doc -d 'Only run doc tests'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l tests -d 'Only run unit and integration tests'
@@ -481,8 +487,10 @@ complete -c x.py -n "__fish_x.py_using_subcommand test" -l enable-bolt-settings 
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l skip-stage0-validation -d 'Skip stage0 compiler validation'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -l skip-std-check-if-no-download-rustc -d 'Skip checking the standard library if `rust.download-rustc` isn\'t available. This is mostly for RA as building the stage1 compiler to check the library tree on each code change might be too much for some computers'
 complete -c x.py -n "__fish_x.py_using_subcommand test" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c x.py -n "__fish_x.py_using_subcommand t" -l trust-repo-wp-installation -d 'Immutable current Trust installation for the stage-2 first-party/trust-wp selection' -r -F
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l test-args -d 'extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)' -r
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l compiletest-rustc-args -d 'extra options to pass the compiler when running compiletest tests' -r
+complete -c x.py -n "__fish_x.py_using_subcommand t" -l compiler-test-fixture -d 'Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)' -r -f -a "(__fish_complete_directories)"
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l extra-checks -d 'comma-separated list of other files types to check (accepts py, py:lint, py:fmt, shell, cpp, cpp:fmt, js, js:lint, js:typecheck, spellcheck)' -r
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l compare-mode -d 'mode describing what file the actual ui output will be compared to' -r
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l pass -d 'force {check,build,run}-pass tests to this mode' -r
@@ -511,8 +519,11 @@ complete -c x.py -n "__fish_x.py_using_subcommand t" -l llvm-profile-use -d 'use
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l reproducible-artifact -d 'Additional reproducible artifacts that should be added to the reproducible artifacts archive' -r
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l set -d 'override options in bootstrap.toml' -r -f
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l ci -d 'Make bootstrap to behave as it\'s running on the CI environment or not' -r -f -a "{true\t'',false\t''}"
+complete -c x.py -n "__fish_x.py_using_subcommand t" -l trust-repo-check -d 'Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim'
+complete -c x.py -n "__fish_x.py_using_subcommand t" -l trust-repo-parent-release-v1 -d 'Require the validated native parent\'s version-1 release handoff'
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l no-fail-fast -d 'run all tests regardless of failure'
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l trust-vanilla -d 'run upstream vanilla compiletest by disabling Trust verification'
+complete -c x.py -n "__fish_x.py_using_subcommand t" -l trust-verified -d 'run the VERIFIED compiletest lane: compile every test at the shipping default (`-Ztrust-verify=on -Ztrust-policy=strict`) instead of the harness\'s `-Ztrust-verify=off`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with `--trust-vanilla`'
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l all-targets -d 'Run all test targets (no doc tests)'
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l doc -d 'Only run doc tests'
 complete -c x.py -n "__fish_x.py_using_subcommand t" -l tests -d 'Only run unit and integration tests'

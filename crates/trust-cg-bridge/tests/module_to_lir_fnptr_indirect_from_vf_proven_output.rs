@@ -34,13 +34,30 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
 use std::collections::HashMap;
 
 use ay::{BigInt, Logic, Solver, Term};
 use trust_cg_bridge::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
-use trust_cg_bridge::lower_trust_ir_function_to_lir_real_calls;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_trust_ir_function_to_lir_real_calls(
+    module: &trust_ir::Module,
+    function: &trust_ir::Function,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, true)
+}
 use trust_disasm::{Instruction as DisasmInst, Opcode, decode_aarch64};
 use trust_ir::Module;
 use trust_ir::inst::Inst;
@@ -97,6 +114,7 @@ fn build_callit_arg() -> VerifiableFunction {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         },
     };
     let bb1 = BasicBlock {
@@ -123,6 +141,7 @@ fn build_callit_arg() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -156,6 +175,7 @@ fn build_callit(name: &str, return_call_result: bool) -> VerifiableFunction {
             is_unsafe_sig: false,
             is_foreign: false,
             callee_identity: None,
+            callee_key: None,
         },
     };
     let ret_rvalue = if return_call_result {
@@ -187,6 +207,7 @@ fn build_callit(name: &str, return_call_result: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

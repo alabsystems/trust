@@ -1,0 +1,46 @@
+{
+  "id": "path-guard-value-range",
+  "class": "A' (range twin of A)",
+  "title": "the slice-range lane spliced through the same path guards; buf[..len] twins certified",
+  "origin": [
+    "KH:3155-3157 (A')",
+    "closed by e14f42e8e3",
+    "crates/trust-vcgen/tests/path_guard_value_identity_realmir.rs (g01..)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "g01_range_bug",
+    "obligation": {
+      "kind": "slice",
+      "at": "acc += buf[..len].len()"
+    }
+  },
+  "twin": {
+    "function": "g01_range_ctl",
+    "obligation": {
+      "kind": "slice",
+      "at": "buf[..m].len()"
+    }
+  },
+  "witness": {
+    "input": "xs = [true], m = 3, n = 100",
+    "observed": "range end index 100 out of range for slice of length 8",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "has ambiguous multi-path return extraction (loop explicit return path) — postconditions referencing `result` would be unsound"
+    }
+  }
+}

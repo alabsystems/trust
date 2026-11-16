@@ -20,5 +20,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-trust-types = { workspace = true }
+# The bound and kernel-denotation builders use the data types only. Keep the
+# optional Discharge `?` feature opt-in for callers that actually use it.
+trust-types = { path = "../trust-types", default-features = false }
 clean-kernel = { workspace = true }

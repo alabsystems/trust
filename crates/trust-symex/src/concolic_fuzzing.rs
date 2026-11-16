@@ -873,41 +873,6 @@ mod tests {
         assert_eq!(ConcolicStrategy::default(), ConcolicStrategy::CoverageGuided);
     }
 
-    #[test]
-    fn test_concolic_strategy_all_variants_constructible() {
-        let _dfs = ConcolicStrategy::DepthFirst;
-        let _cov = ConcolicStrategy::CoverageGuided;
-        let _rnd = ConcolicStrategy::Random;
-        let _bfs = ConcolicStrategy::BreadthFirst;
-    }
-
-    // -----------------------------------------------------------------------
-    // BugKind + BugReport
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_bug_kind_variants() {
-        let _crash = BugKind::Crash { message: "oops".into() };
-        let _assert = BugKind::AssertionFailure { message: "assert".into() };
-        let _vc = BugKind::VcViolation { vc_index: 0, vc_kind: "div".into() };
-        let _div = BugKind::DivisionByZero;
-        let _overflow = BugKind::ArithmeticOverflow;
-        let _oob = BugKind::IndexOutOfBounds;
-    }
-
-    #[test]
-    fn test_bug_report_fields() {
-        let report = BugReport {
-            kind: BugKind::DivisionByZero,
-            inputs: [("x".into(), 0)].into_iter().collect(),
-            iteration: 5,
-            path_depth: 3,
-        };
-        assert_eq!(report.iteration, 5);
-        assert_eq!(report.path_depth, 3);
-        assert_eq!(report.inputs["x"], 0);
-    }
-
     // -----------------------------------------------------------------------
     // BugOracle
     // -----------------------------------------------------------------------

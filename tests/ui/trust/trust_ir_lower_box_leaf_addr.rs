@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-BLB): `&mut <box-rooted chain>.f` where the LEAF field is a thin `Box<T>`.
 //!

@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // trust_vcgen/abstract_interp/tests.rs: Tests for abstract interpretation framework
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -17,6 +17,505 @@ mod tests {
     };
     use crate::abstract_interp::transfer::{compute_successor_states, narrow_from_otherwise};
     use crate::abstract_interp::*;
+
+    // -- Loop-head narrowing through the break comparison --
+
+    /// `pub fn f() -> u32 { let mut r = 0; loop { r += 1; if r > 5 { break; } } r }`
+    /// transcribed from the real `-Ztrust-dump=mir` output, so the shape under
+    /// test is the one rustc actually emits and not an idealised one.
+    ///
+    /// ```text
+    /// bb0: _1 = 0                     -> bb1
+    /// bb1: _2 = CheckedAdd(_1, 1)     Assert(!_2.1) -> bb4     <- head, and the add
+    /// bb4: _3 = Gt(_2.0, 5)           SwitchInt(_3): 0 -> bb3, else -> bb2
+    /// bb3: _1 = _2.0                  -> bb1                    <- back edge
+    /// bb2: _0 = _2.0                  Return
+    /// ```
+    fn bottom_tested_loop(bound: u128) -> VerifiableFunction {
+        let u32_ty = Ty::Int { width: 32, signed: false };
+        let local = |index: usize, ty: Ty, name: &str| LocalDecl {
+            index,
+            ty,
+            name: Some(name.to_string()),
+        };
+        let checked = Ty::Tuple(vec![u32_ty.clone(), Ty::Bool]);
+        let sum = Place { local: 2, projections: vec![Projection::Field(0)] };
+        let overflowed = Place { local: 2, projections: vec![Projection::Field(1)] };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "f".to_string(),
+            def_path: "test::f".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    local(0, u32_ty.clone(), "_0"),
+                    local(1, u32_ty.clone(), "r"),
+                    local(2, checked, "_2"),
+                    local(3, Ty::Bool, "_3"),
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            Place::local(1),
+                            Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
+                        )],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![assign(
+                            Place::local(2),
+                            Rvalue::CheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                        )],
+                        terminator: Terminator::Assert {
+                            cond: Operand::Move(overflowed),
+                            expected: false,
+                            msg: AssertMessage::Overflow(BinOp::Add),
+                            target: BlockId(4),
+                            unwind: UnwindEdge::Unreachable,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![assign(
+                            Place::local(0),
+                            Rvalue::Use(Operand::Copy(sum.clone())),
+                        )],
+                        terminator: Terminator::Return,
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![assign(
+                            Place::local(1),
+                            Rvalue::Use(Operand::Copy(sum.clone())),
+                        )],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        stmts: vec![assign(
+                            Place::local(3),
+                            Rvalue::BinaryOp(
+                                BinOp::Gt,
+                                Operand::Copy(sum),
+                                Operand::Constant(ConstValue::Uint(bound, 32)),
+                            ),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(3)),
+                            targets: vec![(0, BlockId(3))],
+                            otherwise: BlockId(2),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                ],
+                arg_count: 0,
+                return_ty: u32_ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn break_comparison_narrows_both_edges_of_the_loop_test() {
+        // The branch read BACK onto the compared value. `narrow_from_condition`
+        // pins the bool discriminant `_3`, which this domain does not track at
+        // all, so without this step nothing constrains `_2.0` on either edge.
+        let func = bottom_tested_loop(5);
+        let block = &func.body.blocks[4];
+        let sum = crate::place_to_var_name(
+            &func,
+            &Place { local: 2, projections: vec![Projection::Field(0)] },
+        );
+        let mut state = IntervalDomain::top();
+        state.set(sum.clone(), Interval::new(0, 1000));
+        let succs = compute_successor_states(&block.terminator, &func, block, &state);
+
+        // The back edge is the `_3 == 0` arm: `!(sum > 5)`, so `sum <= 5`.
+        let back = succs.iter().find(|(id, _)| *id == BlockId(3)).expect("back edge");
+        assert_eq!(back.1.get(&sum), Interval::new(0, 5), "back edge: !(sum > 5)");
+        // The exit edge is the complement: `sum > 5`, so `sum >= 6`.
+        let exit = succs.iter().find(|(id, _)| *id == BlockId(2)).expect("exit edge");
+        assert_eq!(exit.1.get(&sum), Interval::new(6, 1000), "exit edge: sum > 5");
+    }
+
+    #[test]
+    fn the_loop_head_is_bounded_by_the_break_test() {
+        // THE FACT THE FALSE REFUTATION NEEDED. At the loop head `r` is the join
+        // of the entry constant `0` and the back edge's `_2.0 <= 5`, so it is
+        // bounded and `r + 1` cannot overflow. Before the back-substitution this
+        // was the full `i128` range, and the solver duly witnessed `r == u32::MAX`
+        // — a state the loop cannot reach — and reported the add REFUTED.
+        let func = bottom_tested_loop(5);
+        let initial = crate::abstract_interp::type_aware_initial_state(&func);
+        let config = crate::abstract_interp::transfer::FixpointConfig::for_function(&func);
+        let fp = crate::abstract_interp::transfer::fixpoint_configured(&func, initial, &config);
+        let head = &fp.block_states[&BlockId(1)];
+        assert_eq!(head.get("r"), Interval::new(0, 5), "loop head must bound r by the break test");
+    }
+
+    #[test]
+    fn the_loop_head_bound_tracks_the_break_constant() {
+        // POSITIVE CONTROL: a different break constant must move the bound with
+        // it, so the test above cannot be satisfied by a fixed answer — including
+        // the `[0, 0]` an analysis would give if it dropped the back edge.
+        for bound in [5u128, 100, 1000] {
+            let func = bottom_tested_loop(bound);
+            let initial = crate::abstract_interp::type_aware_initial_state(&func);
+            let config = crate::abstract_interp::transfer::FixpointConfig::for_function(&func);
+            let fp = crate::abstract_interp::transfer::fixpoint_configured(&func, initial, &config);
+            let r = fp.block_states[&BlockId(1)].get("r");
+            assert_eq!(
+                r,
+                Interval::new(0, i128::try_from(bound).unwrap()),
+                "bound {bound} must reach the loop head"
+            );
+        }
+    }
+
+    #[test]
+    fn post_fixpoint_repair_widens_a_state_that_is_too_tight() {
+        use crate::abstract_interp::transfer::{
+            FixpointConfig, fixpoint_configured, repair_to_post_fixpoint,
+        };
+        // Take the real, correct result and then LIE about the loop head,
+        // claiming a bound that excludes a value its own back edge propagates.
+        // That is the shape a non-monotone transfer produces, and it is the
+        // false-proof direction: an environment missing a reachable state can
+        // discharge an obligation the runtime violates.
+        let func = bottom_tested_loop(5);
+        let initial = crate::abstract_interp::type_aware_initial_state(&func);
+        let config = FixpointConfig::for_function(&func);
+        let mut fp = fixpoint_configured(&func, initial, &config);
+        assert_eq!(
+            fp.block_states[&BlockId(1)].get("r"),
+            Interval::new(0, 5),
+            "premise: the honest answer bounds the counter by 5"
+        );
+
+        fp.block_states.get_mut(&BlockId(1)).unwrap().set("r".to_string(), Interval::new(0, 4));
+        repair_to_post_fixpoint(&func, &mut fp);
+
+        // The repair may only WEAKEN, so the lie is gone. It is not required to
+        // recover the exact honest answer — Top is the safe reply — but it must
+        // no longer exclude 5.
+        let repaired = fp.block_states[&BlockId(1)].get("r");
+        assert!(
+            repaired.contains(5),
+            "a state that excluded a reachable value must be widened, got {repaired:?}"
+        );
+    }
+
+    #[test]
+    fn the_fixpoint_result_is_a_post_fixpoint() {
+        use crate::abstract_interp::transfer::{FixpointConfig, fixpoint_configured};
+        // The property every consumer assumes and nothing checked: propagating
+        // once more must not GROW any block's state. Compared over the UNION of
+        // both key sets, because a variable that grew to Top is ABSENT from the
+        // propagated state and iterating it alone misses the largest growth
+        // there is.
+        for func in [bottom_tested_loop(5), bottom_tested_loop(1000)] {
+            let initial = crate::abstract_interp::type_aware_initial_state(&func);
+            let config = FixpointConfig::for_function(&func);
+            let fp = fixpoint_configured(&func, initial, &config);
+            for block in &func.body.blocks {
+                let entry = &fp.block_states[&block.id];
+                if entry.is_unreachable {
+                    continue;
+                }
+                let mut current = entry.clone();
+                for stmt in &block.stmts {
+                    current =
+                        crate::abstract_interp::transfer::transfer_function(stmt, &func, &current);
+                }
+                for (succ, state) in
+                    compute_successor_states(&block.terminator, &func, block, &current)
+                {
+                    let stored = &fp.block_states[&succ];
+                    if state.is_unreachable {
+                        continue;
+                    }
+                    assert!(!stored.is_unreachable, "bb{} reaches bb{}", block.id.0, succ.0);
+                    for name in state.vars.keys().chain(stored.vars.keys()) {
+                        assert!(
+                            state.get(name).leq(&stored.get(name)),
+                            "bb{} -> bb{} grows `{name}`: {:?} not <= {:?}",
+                            block.id.0,
+                            succ.0,
+                            state.get(name),
+                            stored.get(name)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_block_bounds_the_counter_by_the_break_test() {
+        // The whole fixpoint, not just the head. A narrowing that stated only
+        // the half the branch gave it (`[i128::MIN, 5]` on a `u32`) was sound
+        // and useless: the copy on the back edge carried the unknown lower
+        // bound onto the counter, and every join inherited it. Meeting with the
+        // place's own type range keeps both halves.
+        let func = bottom_tested_loop(5);
+        let initial = crate::abstract_interp::type_aware_initial_state(&func);
+        let config = crate::abstract_interp::transfer::FixpointConfig::for_function(&func);
+        let fp = crate::abstract_interp::transfer::fixpoint_configured(&func, initial, &config);
+        for id in [BlockId(1), BlockId(2), BlockId(3), BlockId(4)] {
+            assert_eq!(
+                fp.block_states[&id].get("r"),
+                Interval::new(0, 5),
+                "bb{} must bound the counter",
+                id.0
+            );
+        }
+        // The entry block is the one place the counter is not yet a value, so
+        // it carries only the type range.
+        assert_eq!(
+            fp.block_states[&BlockId(0)].get("r"),
+            Interval::new(0, i128::from(u32::MAX)),
+            "entry keeps the type range"
+        );
+    }
+
+    #[test]
+    fn the_function_wide_environment_carries_the_loop_head_bound() {
+        // THE END OF THE FALSE REFUTATION'S CAUSE CHAIN. This is the environment
+        // the discharge actually consumes. It used to be the full `i128` range
+        // for the counter, which is why the solver was free to witness
+        // `r == u32::MAX` and report the add REFUTED.
+        let env = merged_interval_environment(&bottom_tested_loop(5));
+        assert_eq!(env.get("r"), Interval::new(0, 5), "the break bound must survive the join");
+    }
+
+    #[test]
+    fn the_environment_bound_tracks_the_break_constant() {
+        // POSITIVE CONTROL: no fixed answer can satisfy the test above.
+        for bound in [5u128, 100, 1000] {
+            let env = merged_interval_environment(&bottom_tested_loop(bound));
+            assert_eq!(
+                env.get("r"),
+                Interval::new(0, i128::try_from(bound).unwrap()),
+                "bound {bound} must reach the environment"
+            );
+        }
+    }
+
+    /// `pub fn g(x: u32) -> bool { x + 1 > 5 }`, straight-line: the CheckedAdd
+    /// result TUPLE `_2` and the comparison BOOL `_3` are both defined in the
+    /// entry block and read in `bb1`.
+    fn checked_add_then_compare() -> VerifiableFunction {
+        let u32_ty = Ty::Int { width: 32, signed: false };
+        let local = |index: usize, ty: Ty, name: &str| LocalDecl {
+            index,
+            ty,
+            name: Some(name.to_string()),
+        };
+        let sum = Place { local: 2, projections: vec![Projection::Field(0)] };
+        let overflowed = Place { local: 2, projections: vec![Projection::Field(1)] };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        VerifiableFunction {
+            name: "g".to_string(),
+            def_path: "test::g".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    local(0, Ty::Bool, "_0"),
+                    local(1, u32_ty.clone(), "x"),
+                    local(2, Ty::Tuple(vec![u32_ty.clone(), Ty::Bool]), "_2"),
+                    local(3, u32_ty, "_3"),
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            Place::local(2),
+                            Rvalue::CheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Uint(1, 32)),
+                            ),
+                        )],
+                        terminator: Terminator::Assert {
+                            cond: Operand::Move(overflowed),
+                            expected: false,
+                            msg: AssertMessage::Overflow(BinOp::Add),
+                            target: BlockId(1),
+                            unwind: UnwindEdge::Unreachable,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![
+                            assign(Place::local(3), Rvalue::Use(Operand::Copy(sum))),
+                            assign(
+                                Place::local(0),
+                                Rvalue::BinaryOp(
+                                    BinOp::Gt,
+                                    Operand::Copy(Place::local(3)),
+                                    Operand::Constant(ConstValue::Uint(5, 32)),
+                                ),
+                            ),
+                        ],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 1,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_environment_speaks_only_about_int_sorted_locals() {
+        // The domain tracks the CheckedAdd result TUPLE `_2` (its UNWRAPPED sum,
+        // `[1, u32::MAX + 1]`) for its own transfer, but the environment is
+        // exported as `Var(name, Int)` facts, and for `_2` that names no formula
+        // term: the checked result is the place `_2.0`. Measured before the
+        // filter on this body: `_2 in [1, 4294967296]` rode every augmented
+        // formula, a value no `u32` holds.
+        let env = merged_interval_environment(&checked_add_then_compare());
+        assert!(!env.vars.contains_key("_2"), "a tuple local is not an Int term: {env:?}");
+        assert_eq!(env.get("x"), Interval::new(0, i128::from(u32::MAX)), "params keep facts");
+        assert_eq!(
+            env.get("_3"),
+            Interval::new(0, i128::from(u32::MAX)),
+            "an Int-sorted temp keeps its (type-range) fact"
+        );
+    }
+
+    /// `pick(b: bool) -> i32 { if b { 1 } else { 2 } }` under an `ensures`, as
+    /// rustc lowers it: the contract binds the result to local 3, source-named
+    /// `__ret`, and `_0 = copy __ret` returns it. `__ret` is reserved
+    /// (`place_to_var_name` spells the local `_3`), and parameter 1 carries the
+    /// source name `param_name`.
+    fn pick_with_reserved_result_binding(param_name: &str) -> VerifiableFunction {
+        let i32_ty = Ty::Int { width: 32, signed: true };
+        let local = |index: usize, ty: Ty, name: Option<&str>| LocalDecl {
+            index,
+            ty,
+            name: name.map(str::to_string),
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let set_ret = |value: i128| {
+            assign(Place::local(3), Rvalue::Use(Operand::Constant(ConstValue::Int(value))))
+        };
+        VerifiableFunction {
+            name: "pick".to_string(),
+            def_path: "test::pick".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    local(0, i32_ty.clone(), None),
+                    local(1, Ty::Int { width: 8, signed: false }, Some(param_name)),
+                    local(2, Ty::Bool, Some("__ensures_checker")),
+                    local(3, i32_ty.clone(), Some("__ret")),
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(1)),
+                            targets: vec![(0, BlockId(2))],
+                            otherwise: BlockId(1),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![set_ret(1)],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![set_ret(2)],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![assign(
+                            Place::local(0),
+                            Rvalue::Use(Operand::Copy(Place::local(3))),
+                        )],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 1,
+                return_ty: i32_ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_environment_names_each_local_as_the_formula_does() {
+        // Seeded under the SOURCE name, the environment carried
+        // `__ret in [i32::MIN, i32::MAX]` while every transfer wrote `_3`: a
+        // fact about no term of any formula, and `_3` itself was never
+        // recognised as undefined at entry. Every key must be a formula name.
+        for param in ["b", "result", "_3"] {
+            let func = pick_with_reserved_result_binding(param);
+            let formula_names: FxHashSet<String> =
+                func.body.locals.iter().map(|l| crate::local_var_name(&func, l)).collect();
+            let env = merged_interval_environment(&func);
+            for key in env.vars.keys() {
+                assert!(
+                    formula_names.contains(key),
+                    "[{param}] env key {key:?} names no local's formula term: {env:?}"
+                );
+            }
+            assert!(!env.vars.contains_key("__ret"), "[{param}] {env:?}");
+            // The u8 parameter keeps its type range under ITS formula name — for
+            // `result` and `_3` that is `_1`, and a parameter spelled `_3`
+            // must not lend its range to local 3.
+            let param_name = crate::local_var_name(&func, &func.body.locals[1]);
+            assert_eq!(env.get(&param_name), Interval::new(0, 255), "[{param}] {env:?}");
+            let ret = env.get("_3");
+            assert!(
+                ret.lo <= 1 && ret.hi >= 2,
+                "[{param}] local 3 holds 1 and 2; its interval {ret:?} must contain both"
+            );
+        }
+    }
 
     // -- Interval arithmetic tests --
 
@@ -278,6 +777,119 @@ mod tests {
         state.set("x".into(), Interval::new(1, 10));
         let result = transfer_function(&Statement::Nop, &func, &state);
         assert_eq!(result.get("x"), Interval::new(1, 10));
+    }
+
+    /// `_c = Discriminant(e)` over an enum with the given declared discriminants, read
+    /// at `dest_ty`: the interval `transfer_function` assigns to `_c`.
+    fn discriminant_read_interval(discriminants: &[i128], dest_ty: Ty) -> Interval {
+        let variants: Vec<trust_types::VariantDef> = discriminants
+            .iter()
+            .enumerate()
+            .map(|(i, d)| trust_types::VariantDef {
+                name: format!("V{i}"),
+                discriminant: *d,
+                fields: vec![],
+            })
+            .collect();
+        let mut func = crate::tests::midpoint_function();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u8(), name: Some("ret".into()) },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
+                    name: "E".into(),
+                    fields: vec![("__tag".into(), Ty::i8())].into(),
+                    variants: variants.into(),
+                    disc_index_safe: true,
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
+                name: Some("e".into()),
+            },
+            LocalDecl { index: 2, ty: dest_ty, name: Some("c".into()) },
+        ];
+        func.body.arg_count = 1;
+        let stmt = Statement::Assign {
+            place: Place::local(2),
+            rvalue: Rvalue::Discriminant(Place::local(1)),
+            span: SourceSpan::default(),
+        };
+        let result = transfer_function(&stmt, &func, &IntervalDomain::top());
+        result.get(&crate::place_to_var_name(&func, &Place::local(2)))
+    }
+
+    /// A discriminant read is one of the DECLARED discriminants, which may be negative.
+    /// It used to be `[0, i128::MAX]` for every enum, and conjoined onto every VC that
+    /// false `c >= 0` let `t[e as usize]` PROVE over `#[repr(i8)] enum E { A = -1, B = 2 }`
+    /// (`tests/trust-falsification/mutant/repr_i8_neg_tag_index.rs`, certified by the
+    /// Clean kernel on the wrong formula). An ordinary enum keeps `[0, n - 1]`.
+    ///
+    /// Merge 2026-10-14: the read is `transfer::discriminant_read_hull` (upstream
+    /// 5f74446a760, the same fix made the same day), shared with `value_analysis`.
+    /// `VariantDef::discriminant` is the DECODED tag (`trust-mir-extract` decodes it at
+    /// the one boundary, `ty_convert.rs` "THE RAW-TAG BOUNDARY", since b4fd4c0e43a), and
+    /// every producer must agree on that integer model. A tag the destination cannot
+    /// hold (`255` read at `i8`) is no tag of it: the read is Top, never re-decoded
+    /// here into a value no other producer gives it.
+    #[test]
+    fn discriminant_read_interval_is_the_declared_discriminant_hull() {
+        assert_eq!(discriminant_read_interval(&[-1, 2], Ty::i8()), Interval::new(-1, 2));
+        assert_eq!(discriminant_read_interval(&[255, 2], Ty::i8()), Interval::TOP);
+        assert_eq!(discriminant_read_interval(&[0, 1, 2], Ty::isize()), Interval::new(0, 2));
+        assert_eq!(discriminant_read_interval(&[], Ty::isize()), Interval::TOP);
+        // `cmp::Ordering`'s discriminants are `-1`, `0` and `1`.
+        assert_eq!(discriminant_read_interval(&[-1, 0, 1], Ty::i8()), Interval::new(-1, 1));
+    }
+
+    /// `_2 = <op>(_1, const 1)` over `_1: i8` in `x`, read at `_2: i8`.
+    fn i8_binop_interval(op: BinOp, x: Interval) -> Interval {
+        let mut func = crate::tests::midpoint_function();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::i8(), name: Some("ret".into()) },
+            LocalDecl { index: 1, ty: Ty::i8(), name: Some("x".into()) },
+            LocalDecl { index: 2, ty: Ty::i8(), name: Some("y".into()) },
+        ];
+        func.body.arg_count = 1;
+        let stmt = Statement::Assign {
+            place: Place::local(2),
+            rvalue: Rvalue::BinaryOp(
+                op,
+                Operand::Copy(Place::local(1)),
+                Operand::Constant(ConstValue::Int(1)),
+            ),
+            span: SourceSpan::default(),
+        };
+        let mut state = IntervalDomain::top();
+        state.set(crate::place_to_var_name(&func, &Place::local(1)), x);
+        let result = transfer_function(&stmt, &func, &state);
+        result.get(&crate::place_to_var_name(&func, &Place::local(2)))
+    }
+
+    /// Two transfers that excluded real values, the same class as the negative
+    /// discriminant. A bare `Shl` wraps (Rust panics only on the shift amount, and
+    /// `64i8 << 1 == -128`), and `i128::checked_shl` lost bits past bit 127. A three-way
+    /// compare yields `Ordering::Less`, `-1`.
+    #[test]
+    fn shift_left_and_three_way_compare_intervals_keep_every_real_value() {
+        assert_eq!(
+            interval_shl(&Interval::constant(1 << 126), &Interval::constant(2)),
+            Interval::TOP
+        );
+        assert_eq!(
+            interval_shl(&Interval::new(1, 3), &Interval::constant(2)),
+            Interval::new(4, 12)
+        );
+        assert_eq!(
+            i8_binop_interval(BinOp::Shl, Interval::new(64, 127)),
+            Interval::new(-128, 127),
+            "an i8 result outside its type range wraps, so the full range is the answer"
+        );
+        assert_eq!(i8_binop_interval(BinOp::Shl, Interval::new(1, 3)), Interval::new(2, 6));
+        assert_eq!(i8_binop_interval(BinOp::Cmp, Interval::new(0, 10)), Interval::new(-1, 1));
     }
 
     // -- Fixpoint tests --
@@ -1094,10 +1706,15 @@ mod tests {
     }
 
     #[test]
-    fn test_interval_bitand_with_negative_is_top() {
+    fn test_interval_bitand_with_negative_is_bounded_by_the_nonnegative_mask() {
+        // `-1 & 15 == 15`, `-16 & 15 == 0`: a non-negative mask bounds the result
+        // alone, whichever side it is on.
         let a = Interval::new(-10, 10);
         let b = Interval::new(0, 15);
-        assert_eq!(interval_bitand(&a, &b), Interval::TOP);
+        assert_eq!(interval_bitand(&a, &b), Interval::new(0, 15));
+        assert_eq!(interval_bitand(&b, &a), Interval::new(0, 15));
+        // Both possibly negative: `-1 & -1 == -1`, nothing is bounded.
+        assert_eq!(interval_bitand(&a, &Interval::new(-1, 3)), Interval::TOP);
     }
 
     #[test]
@@ -1259,6 +1876,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let state = crate::abstract_interp::transfer::type_aware_initial_state(&func);
         assert!(state.vars.contains_key("n"), "u32 param n should be tracked");
@@ -1292,6 +1910,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let init = crate::abstract_interp::transfer::type_aware_initial_state(&func);
         let stmt = Statement::Assign {
@@ -1314,11 +1933,14 @@ mod tests {
         assert_eq!(type_to_interval(&Ty::Float { width: 64 }), None);
     }
 
+    /// Trust (2026-09-30): `u128` has NO representable range here. The
+    /// `[0, i128::MAX]` this test used to pin as "conservative" excludes every
+    /// value at or above 2^127, and round 10 of the callee-summary review measured
+    /// it proving, kernel-certified, an index that panicked (`x as i128 < 0`
+    /// unreachable). `discharge::type_bounds` already answered `None` (P1-12).
     #[test]
-    fn test_type_to_interval_u128_conservative() {
-        let interval = type_to_interval(&Ty::Int { width: 128, signed: false });
-        // u128::MAX doesn't fit in i128, so we use i128::MAX conservatively.
-        assert_eq!(interval, Some(Interval::new(0, i128::MAX)));
+    fn test_type_to_interval_u128_is_unknown() {
+        assert_eq!(type_to_interval(&Ty::Int { width: 128, signed: false }), None);
     }
 
     #[test]
@@ -1376,17 +1998,6 @@ mod tests {
         let c = Interval::new(0, 20);
         let stable = widened.widen(&c);
         assert_eq!(stable, widened, "widening after convergence should be stable");
-    }
-
-    #[test]
-    fn test_narrowing_recovers_precision_from_widening() {
-        // After widening: [0, MAX]. True bound is [0, 100].
-        // Narrowing should recover: [0, MAX].narrow([0, 100]) = [0, 100].
-        let wide = Interval::new(0, i128::MAX);
-        let precise = Interval::new(0, 100);
-        let narrowed = wide.narrow(&precise);
-        assert_eq!(narrowed.lo, 0);
-        assert_eq!(narrowed.hi, 100);
     }
 
     #[test]
@@ -1547,6 +2158,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let initial = type_aware_initial_state(&func);
@@ -1939,6 +2551,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let initial = type_aware_initial_state(&func);
@@ -2011,6 +2624,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let initial = type_aware_initial_state(&func);
@@ -3209,6 +3823,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let ts = extract_thresholds(&func);
         // Should contain 0, 9, 10, 11 from SwitchInt target 10, plus type bounds
@@ -3255,6 +3870,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let ts = extract_thresholds(&func);
         // Should contain 99, 100, 101 from the Lt comparison
@@ -3295,6 +3911,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let ts = extract_thresholds(&func);
         // u8 type bounds: 0 and 255
@@ -3354,11 +3971,17 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let mut state = IntervalDomain::top();
         state.set("d".to_string(), Interval::new(0, 10));
 
-        let successors = compute_successor_states(&func.body.blocks[0].terminator, &func, &state);
+        let successors = compute_successor_states(
+            &func.body.blocks[0].terminator,
+            &func,
+            &func.body.blocks[0],
+            &state,
+        );
         // Arm 0 -> d == 0
         assert_eq!(successors[0].0, BlockId(1));
         assert_eq!(successors[0].1.get("d"), Interval::constant(0));
@@ -3402,6 +4025,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let mut state = IntervalDomain::top();
         state.set("x".to_string(), Interval::new(0, 5));
@@ -3448,6 +4072,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let mut state = IntervalDomain::top();
         state.set("x".to_string(), Interval::new(0, 5));
@@ -3595,6 +4220,135 @@ mod tests {
         };
         let augmented = augment_vc_with_abstract_state(&vc, &env);
         assert_eq!(augmented.formula, vc.formula, "BV rows must not grow Int-sorted conjuncts");
+    }
+
+    fn hardened_mandate_vc(formula: Formula) -> VerificationCondition {
+        hardened_vc_of(
+            VcKind::HardenedBoundary {
+                category: HardenedVcCategory::ErrorDiscard,
+                callee: "core::result::Result::<T, E>::ok".into(),
+                detail: "error discarded".into(),
+            },
+            formula,
+        )
+    }
+
+    fn hardened_vc_of(kind: VcKind, formula: Formula) -> VerificationCondition {
+        VerificationCondition {
+            kind,
+            function: "mandate_fn".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
+    fn bounded_env() -> IntervalDomain {
+        let mut env = IntervalDomain::top();
+        env.set("x".into(), Interval::new(0, 10));
+        env.set("s__slice_len".into(), Interval::new(0, i128::MAX));
+        assert_ne!(interval_domain_to_formula(&env), Formula::Bool(true));
+        assert_ne!(interval_domain_to_formula(&env), Formula::Bool(false));
+        env
+    }
+
+    /// G3 (2026-10-27): a hardened DESIGN MANDATE's violation is the closed
+    /// constant `Bool(true)`. A reachable, non-Top environment cannot change its
+    /// satisfiability, and the compiler recognises the mandate only by that exact
+    /// formula, so the augmentation must hand the row back byte-identical (the
+    /// conjoined `(and (>= x 0) true)` was refuted, demoted to `Unknown` and made
+    /// the function a compile error).
+    #[test]
+    fn augment_leaves_closed_constant_rows_untouched_in_a_reachable_env() {
+        let env = bounded_env();
+        let vc = hardened_mandate_vc(Formula::Bool(true));
+        let augmented = augment_vc_with_abstract_state(&vc, &env);
+        assert_eq!(
+            serde_json::to_string(&augmented).expect("serialize augmented"),
+            serde_json::to_string(&vc).expect("serialize original"),
+            "a design mandate must stay byte-identical"
+        );
+        assert_eq!(augmented.formula, Formula::Bool(true));
+    }
+
+    /// Negative control for the exemption above: an UNREACHABLE environment
+    /// still conjoins onto a closed constant, so a mandate in dead code keeps
+    /// its `And([false, true])` (proved by unreachability), and a non-constant
+    /// formula in a reachable environment is still augmented.
+    #[test]
+    fn augment_still_conjoins_bottom_env_and_open_formulas() {
+        let vc = hardened_mandate_vc(Formula::Bool(true));
+        let augmented = augment_vc_with_abstract_state(&vc, &IntervalDomain::bottom());
+        assert_eq!(
+            augmented.formula,
+            Formula::And(vec![Formula::Bool(false), Formula::Bool(true)])
+        );
+
+        let mut env = IntervalDomain::top();
+        env.set("x".into(), Interval::new(0, 10));
+        let open = hardened_mandate_vc(Formula::Var("x_violated".into(), Sort::Bool));
+        let augmented = augment_vc_with_abstract_state(&open, &env);
+        assert_eq!(
+            augmented.formula,
+            Formula::And(vec![
+                interval_domain_to_formula(&env),
+                Formula::Var("x_violated".into(), Sort::Bool)
+            ])
+        );
+    }
+
+    /// G3-MANDATE-L1-ONLY-1 (G3 review, 2026-10-27): the exemption is for design
+    /// MANDATES only. An L0 unsafe/FFI row whose `Bool(true)` is a modelling-gap
+    /// fail-close (an FFI call with no summary, an unmodelled unsafe call), a
+    /// non-hardened kind's constant, and the vacuous `Bool(false)` all keep the
+    /// augmentation they had before G3, so none of them reaches the compiler in
+    /// the shape it reads as `design_mandate` (exempting every closed constant
+    /// relabelled every FFI gap in a function with a bounded local `mandated`).
+    /// MUTATION: widen the guard back to `matches!(vc.formula, Formula::Bool(_))`
+    /// and this test fails on its first row.
+    #[test]
+    fn augment_still_conjoins_unsafe_ffi_gaps_and_non_mandate_constants() {
+        let env = bounded_env();
+        let env_formula = interval_domain_to_formula(&env);
+        let gaps = [
+            hardened_vc_of(
+                VcKind::FfiBoundaryViolation {
+                    callee: "getpgrp".into(),
+                    desc: "FFI call has no summary: behavior unmodeled, cannot prove safe".into(),
+                },
+                Formula::Bool(true),
+            ),
+            hardened_vc_of(
+                VcKind::HardenedBoundary {
+                    category: HardenedVcCategory::FfiBoundary,
+                    callee: "raise".into(),
+                    detail: "no summary".into(),
+                },
+                Formula::Bool(true),
+            ),
+            hardened_vc_of(
+                VcKind::Assertion {
+                    message: "[unsafe:unmodeled-call] call to `ext` is not covered".into(),
+                },
+                Formula::Bool(true),
+            ),
+            hardened_vc_of(
+                VcKind::UnsafeOperation { desc: "raw pointer deref".into() },
+                Formula::Bool(true),
+            ),
+            hardened_vc_of(VcKind::IndexOutOfBounds, Formula::Bool(true)),
+            hardened_mandate_vc(Formula::Bool(false)),
+        ];
+        for vc in gaps {
+            let augmented = augment_vc_with_abstract_state(&vc, &env);
+            assert_eq!(
+                augmented.formula,
+                Formula::And(vec![env_formula.clone(), vc.formula.clone()]),
+                "{:?} must keep its augmentation",
+                vc.kind
+            );
+        }
     }
 
     /// The Machine{w} fence, discharge direction: the violation
@@ -3784,5 +4538,60 @@ mod tests {
         ]));
         let result = try_discharge_vc(&vc, &IntervalDomain::top());
         assert!(!result.is_discharged(), "Le(a,c) must not refute Gt(a,b)");
+    }
+
+    /// UNION-SIBLING-WRITE-1 (wave-24 review, 2026-10-12): a write through a union field
+    /// rewrites every overlapping sibling, so the statement transfer forgets each name
+    /// the union cover rebinds. Before it, `u.a = x as u64` set `u.0 ∈ [0, 2^32-1]` and
+    /// the write `u.1 = -1` left that interval on `u.0`, whose bytes now read
+    /// `u64::MAX`. A stamped STRUCT's sibling keeps its interval (the control).
+    #[test]
+    fn a_union_field_write_forgets_the_sibling_interval() {
+        fn with_two(kind: AdtKind) -> VerifiableFunction {
+            let mut two = Ty::adt("c::V2", vec![("a".into(), Ty::u64()), ("b".into(), Ty::i64())]);
+            if let Ty::Adt { adt_kind, .. } = &mut two {
+                *adt_kind = Some(kind);
+            }
+            VerifiableFunction {
+                name: "f".into(),
+                def_path: "c::f".into(),
+                span: SourceSpan::default(),
+                body: VerifiableBody {
+                    locals: [Ty::u64(), Ty::u32(), two]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, ty)| LocalDecl { index, ty, name: None })
+                        .collect(),
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: Vec::new(),
+                        terminator: Terminator::Return,
+                    }],
+                    arg_count: 1,
+                    return_ty: Ty::u64(),
+                    datatype_defs: Default::default(),
+                },
+                contracts: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                spec: Default::default(),
+                tuple_layouts: Default::default(),
+            }
+        }
+        let field = |i: usize| Place { local: 2, projections: vec![Projection::Field(i)] };
+        let write_b = Statement::Assign {
+            place: field(1),
+            rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(-1))),
+            span: SourceSpan::default(),
+        };
+        for (kind, forgotten) in [(AdtKind::Union, true), (AdtKind::Struct, false)] {
+            let func = with_two(kind);
+            let a = crate::place_to_var_name(&func, &field(0));
+            let mut state = IntervalDomain::top();
+            state.set(a.clone(), Interval::new(0, (1 << 32) - 1));
+            let result = transfer_function(&write_b, &func, &state);
+            let want = if forgotten { Interval::TOP } else { Interval::new(0, (1 << 32) - 1) };
+            assert_eq!(result.get(&a), want, "{kind:?}: `{a}` after the write of field 1");
+        }
     }
 }

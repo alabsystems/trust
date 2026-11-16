@@ -17,12 +17,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use trust_buildcache::BuildCache;
 
 use super::discovery::{NativeRustcCapabilities, canonicalize_or_self};
 use super::process_environment::scrub_proof_compiler_authority_env;
 use super::transport::parse_compiler_stderr;
 use crate::{bounded_process, input_limits};
+
+#[cfg(target_os = "linux")]
+#[path = "probe/linux_elf.rs"]
+mod linux_elf;
+#[path = "probe/linux_runtime.rs"]
+mod linux_runtime;
 
 // v7 requires the exact versioned coverage/function identity reconciliation;
 // v6 accepted and cached nonce-bound count-only rows as authenticated coverage.
@@ -72,6 +77,9 @@ pub(crate) struct TrustdRuntimeClosure {
     pub(crate) inspector_path: String,
     pub(crate) inspector_sha256: String,
     pub(crate) system_dependencies: Vec<String>,
+    /// ELF resolution is separate evidence, never a reinterpretation of Mach-O v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linux_elf: Option<linux_runtime::LinuxRuntimeClosure>,
     pub(crate) closure_sha256: String,
 }
 
@@ -100,22 +108,68 @@ impl TrustdRuntimeClosure {
             inspector_path,
             inspector_sha256,
             system_dependencies,
+            linux_elf: None,
             closure_sha256,
         };
         closure.validate()?;
         Ok(closure)
     }
 
+    #[cfg(target_os = "linux")]
+    fn from_linux_observation(
+        inspector_path: String,
+        inspector_sha256: String,
+        observation: linux_runtime::LinuxRuntimeClosure,
+    ) -> Result<Self, String> {
+        let mut closure = Self {
+            schema_version: linux_runtime::SCHEMA.to_owned(),
+            policy: "system-default-only".to_owned(),
+            loader_environment: "none".to_owned(),
+            loader_variable: None,
+            search_paths: Vec::new(),
+            directory_entries: Vec::new(),
+            concurrent_writer_policy: "exclusive-same-uid-release-host".to_owned(),
+            native_format: linux_runtime::FORMAT.to_owned(),
+            inspector_path,
+            inspector_sha256,
+            system_dependencies: observation
+                .objects
+                .iter()
+                .map(|object| object.file.target.clone())
+                .collect(),
+            linux_elf: Some(observation),
+            closure_sha256: String::new(),
+        };
+        closure.closure_sha256 = closure.calculated_sha256()?;
+        closure.validate()?;
+        Ok(closure)
+    }
+
+    fn calculated_sha256(&self) -> Result<String, String> {
+        let common = trustd_runtime_closure_sha256(
+            &self.native_format,
+            &self.concurrent_writer_policy,
+            &self.inspector_path,
+            &self.inspector_sha256,
+            &self.system_dependencies,
+        );
+        let Some(linux) = &self.linux_elf else { return Ok(common) };
+        let mut hasher = Sha256::new();
+        hasher.update(b"trust/trustd-runtime-closure/linux-elf/v1\0");
+        hash_runtime_closure_field(&mut hasher, &self.schema_version);
+        hash_runtime_closure_field(&mut hasher, &common);
+        let observation = serde_json::to_string(linux).map_err(|error| error.to_string())?;
+        hash_runtime_closure_field(&mut hasher, &observation);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.schema_version != TRUSTD_RUNTIME_CLOSURE_SCHEMA
-            || self.policy != "system-default-only"
+        if self.policy != "system-default-only"
             || self.loader_environment != "none"
             || self.loader_variable.is_some()
             || !self.search_paths.is_empty()
             || !self.directory_entries.is_empty()
             || self.concurrent_writer_policy != "exclusive-same-uid-release-host"
-            || self.native_format != "mach-o-thin"
-            || !trusted_macho_inspector_path(Path::new(&self.inspector_path))
             || !trust_types::digest::is_stable_sha256_hex(&self.inspector_sha256)
             || self.system_dependencies.len() > TRUSTD_RUNTIME_MAX_DEPENDENCIES
         {
@@ -124,19 +178,34 @@ impl TrustdRuntimeClosure {
                     .to_string(),
             );
         }
-        for (index, dependency) in self.system_dependencies.iter().enumerate() {
-            validate_macho_system_path(dependency, "dependency")?;
-            if self.system_dependencies[..index].contains(dependency) {
-                return Err("trustd runtime closure contains a duplicate system dependency".into());
+        match (self.schema_version.as_str(), self.native_format.as_str(), &self.linux_elf) {
+            (TRUSTD_RUNTIME_CLOSURE_SCHEMA, "mach-o-thin", None)
+                if trusted_macho_inspector_path(Path::new(&self.inspector_path)) =>
+            {
+                for (index, dependency) in self.system_dependencies.iter().enumerate() {
+                    validate_macho_system_path(dependency, "dependency")?;
+                    if self.system_dependencies[..index].contains(dependency) {
+                        return Err(
+                            "trustd runtime closure contains a duplicate system dependency".into(),
+                        );
+                    }
+                }
+            }
+            (linux_runtime::SCHEMA, linux_runtime::FORMAT, Some(linux)) => {
+                linux_runtime::validate(
+                    linux,
+                    &self.inspector_path,
+                    &self.inspector_sha256,
+                    &self.system_dependencies,
+                )?;
+            }
+            _ => {
+                return Err(
+                    "trustd runtime closure native format/schema/observation mismatch".into()
+                );
             }
         }
-        let expected_sha256 = trustd_runtime_closure_sha256(
-            &self.native_format,
-            &self.concurrent_writer_policy,
-            &self.inspector_path,
-            &self.inspector_sha256,
-            &self.system_dependencies,
-        );
+        let expected_sha256 = self.calculated_sha256()?;
         if self.closure_sha256 != expected_sha256 {
             return Err(
                 "trustd runtime closure digest does not bind its inspector and ordered dependency set"
@@ -331,7 +400,7 @@ fn validate_root_owned_inspector_chain(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_trustd_candidate_owner(
     path: &Path,
     owner_uid: u32,
@@ -360,7 +429,7 @@ fn validate_trustd_candidate_owner(
 /// policy, and other privileged mutation mechanisms remain part of the host
 /// TCB; concurrent effective-user mutation is the separately disclosed
 /// release-ceremony exclusion.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_trustd_candidate_authority(candidate: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::Component;
@@ -638,36 +707,22 @@ pub(crate) fn inspect_trustd_runtime_closure(
     )
 }
 
-/// Fails closed off macOS — and says why, because the old message ("unsupported
-/// on this host and fails closed") named neither the actual limit nor anywhere
-/// to look, so a Linux release attempt read as a mysterious blocker rather than
-/// a documented gate.
-///
-/// The limit is the SCHEMA, not this missing function body: `validate()`
-/// requires `native_format == "mach-o-thin"` and a `trusted_macho_inspector_path`,
-/// and `validate_for_candidate` re-inspects — so even a hand-authored JSON
-/// closure is rejected twice over. Writing an ELF arm here would not help until
-/// the schema admits one.
-///
-/// It is also not a like-for-like port. Mach-O `LC_LOAD_DYLIB` records a
-/// resolved absolute path; ELF `DT_NEEDED` records a bare SONAME (`libc.so.6`)
-/// whose resolution depends on the very loader configuration this closure
-/// exists to pin. An ELF closure is therefore weaker evidence in kind and needs
-/// its own `native_format` so no reader conflates the two. See task #43.
-#[cfg(not(target_os = "macos"))]
+/// Linux binds a separate ELF/actual-GNU-loader observation. It includes
+/// root-owned opened dependency hashes, transitive SONAME coverage, exact
+/// system loader/configuration and the candidate digest; it does not claim
+/// Mach-O load-command evidence or a hermetic kernel/system environment.
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_trustd_runtime_closure(
+    candidate: &Path,
+) -> Result<TrustdRuntimeClosure, String> {
+    linux_runtime::inspect(candidate)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn inspect_trustd_runtime_closure(
     _candidate: &Path,
 ) -> Result<TrustdRuntimeClosure, String> {
-    Err(concat!(
-        "trustd runtime-closure inspection fails closed on this host: product-proof ",
-        "version-identity and daemon-protocol evidence is producible only on macOS. ",
-        "This is a schema limit, not a missing implementation — TrustdRuntimeClosure ",
-        "requires native_format == \"mach-o-thin\" and a trusted Mach-O inspector, and ",
-        "re-validates on the candidate. An ELF arm is a schema widening whose evidence ",
-        "is weaker in kind (DT_NEEDED gives SONAMEs, not resolved paths); see task #43 ",
-        "and docs/testing-strategy.md."
-    )
-    .to_string())
+    Err("trustd runtime closure has no admitted native schema on this host".to_string())
 }
 
 const TRUST_VERIFY_PROBE_SOURCE: &str = r#"
@@ -879,12 +934,45 @@ fn output_contains_native_verification_signal(output: &Output) -> bool {
     })
 }
 
-fn native_capability_probe_cache_dir() -> PathBuf {
-    BuildCache::default_root().join("native-capability-probes").join("v7")
+// Trust: T11 — the probe cache lives under STORE-1's root,
+// `{cargo-cache-home}/trust/`, the one place every Trust cache lives (the
+// build-cache root it used, `TRUST_CACHE_DIR` else `~/.trust/cache`, was
+// deleted with trust-buildcache). There is no override: production asks this,
+// and the tests hand `detect_native_rustc_capabilities_cached_in` a directory
+// of their own instead of changing the process's `CARGO_HOME`. With no cargo
+// home, or one whose path has a group- or world-writable component (STORE-1's
+// rule: another local user could plant a positive row), there is no cache, and
+// every run probes.
+fn native_capability_probe_cache_dir() -> Option<PathBuf> {
+    let dir =
+        crate::config::cargo_home()?.join("trust").join("native-capability-probes").join("v7");
+    no_group_or_world_writable_component(&dir).then_some(dir)
 }
 
-fn native_capability_probe_cache_path(cache_key: &str) -> PathBuf {
-    native_capability_probe_cache_dir().join(format!("{cache_key}.json"))
+/// Whether no component of `path` that exists, read through its symlinks, is group- or
+/// world-writable. The components that do not exist yet are created by this user, under
+/// the ones that do. A path that cannot be resolved has no cache.
+#[cfg(unix)]
+fn no_group_or_world_writable_component(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+        return false;
+    };
+    let Ok(real) = std::fs::canonicalize(existing) else {
+        return false;
+    };
+    real.ancestors().all(|ancestor| {
+        std::fs::metadata(ancestor).is_ok_and(|metadata| metadata.permissions().mode() & 0o022 == 0)
+    })
+}
+
+#[cfg(not(unix))]
+fn no_group_or_world_writable_component(_path: &Path) -> bool {
+    true
+}
+
+fn native_capability_probe_cache_file(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    cache_dir.join(format!("{cache_key}.json"))
 }
 
 fn is_dynamic_library_name(name: &str) -> bool {
@@ -974,12 +1062,10 @@ fn native_capability_probe_cache_key(rustc: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn read_cached_native_capabilities(cache_key: &str) -> Option<NativeRustcCapabilities> {
-    let bytes = input_limits::read_bounded_file(
-        &native_capability_probe_cache_path(cache_key),
-        input_limits::MAX_RELEASE_METADATA_BYTES,
-    )
-    .ok()?;
+fn read_cached_native_capabilities(cache_file: &Path) -> Option<NativeRustcCapabilities> {
+    let bytes =
+        input_limits::read_bounded_file(cache_file, input_limits::MAX_RELEASE_METADATA_BYTES)
+            .ok()?;
     let entry: NativeCapabilityProbeCacheEntry = serde_json::from_slice(&bytes).ok()?;
     // A successful JSON probe is positive evidence about this exact compiler
     // artifact. A negative or partial row is only absence of a success signal:
@@ -1002,10 +1088,9 @@ fn read_cached_native_capabilities(cache_key: &str) -> Option<NativeRustcCapabil
 }
 
 fn write_cached_native_capabilities(
-    cache_key: &str,
+    path: &Path,
     capabilities: NativeRustcCapabilities,
 ) -> io::Result<()> {
-    let path = native_capability_probe_cache_path(cache_key);
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "capability probe cache path has no parent")
     })?;
@@ -1022,11 +1107,11 @@ fn write_cached_native_capabilities(
     let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer(&mut temp_file, &entry).map_err(io::Error::other)?;
     temp_file.write_all(b"\n")?;
-    temp_file.persist(&path).map_err(|error| error.error)?;
+    temp_file.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
-fn cache_native_capabilities(cache_key: Option<&str>, capabilities: NativeRustcCapabilities) {
+fn cache_native_capabilities(cache_file: Option<&Path>, capabilities: NativeRustcCapabilities) {
     // Persist only a fully positive probe. The current probe protocol has no
     // typed "unsupported option" response that can distinguish unsupported
     // functionality from an arbitrary nonzero compiler exit.
@@ -1034,8 +1119,8 @@ fn cache_native_capabilities(cache_key: Option<&str>, capabilities: NativeRustcC
         && capabilities.json_transport
         && capabilities.authenticated_coverage
     {
-        if let Some(cache_key) = cache_key {
-            let _ = write_cached_native_capabilities(cache_key, capabilities);
+        if let Some(cache_file) = cache_file {
+            let _ = write_cached_native_capabilities(cache_file, capabilities);
         }
     }
 }
@@ -1074,10 +1159,11 @@ fn run_native_compile_probe(rustc: &Path, json_transport: bool) -> io::Result<Na
     // default `unscoped` role, which is deliberately in scope. The probe must
     // not impersonate Cargo-owned role/package metadata.
     // The capability probe's argv is fixed: it authenticates with its OWN
-    // probe-scoped session below and deliberately receives no TRUSTFLAGS
-    // overrides — user policy (budgets, levels, profiles) cannot change what
-    // the compiler is capable of, and forwarding it would let one invocation's
-    // policy contaminate a cached cross-invocation capability verdict.
+    // probe-scoped session below and deliberately receives no run policy
+    // (budgets, levels, profiles, project requirements) — user policy cannot
+    // change what the compiler is capable of, and forwarding it would let one
+    // invocation's policy contaminate a cached cross-invocation capability
+    // verdict.
     cmd.arg("--edition")
         .arg("2021")
         .arg("--crate-name")
@@ -1097,7 +1183,7 @@ fn run_native_compile_probe(rustc: &Path, json_transport: bool) -> io::Result<Na
     }
     cmd.arg(&src);
 
-    let output = bounded_process::output(
+    let output = crate::probe_scheduler::output(
         &mut cmd,
         "native trustc capability probe",
         CAPABILITY_PROBE_MAX_STREAM_BYTES,
@@ -1120,8 +1206,23 @@ fn harden_probe_dir_permissions(_dir: &tempfile::TempDir) -> io::Result<()> {
 }
 
 pub(crate) fn detect_native_rustc_capabilities(rustc: &Path) -> NativeRustcCapabilities {
-    let cache_key = native_capability_probe_cache_key(rustc).ok();
-    if let Some(capabilities) = cache_key.as_deref().and_then(read_cached_native_capabilities) {
+    detect_native_rustc_capabilities_cached_in(
+        rustc,
+        native_capability_probe_cache_dir().as_deref(),
+    )
+}
+
+/// [`detect_native_rustc_capabilities`] with the probe cache in `cache_dir`; `None`
+/// caches nothing.
+fn detect_native_rustc_capabilities_cached_in(
+    rustc: &Path,
+    cache_dir: Option<&Path>,
+) -> NativeRustcCapabilities {
+    let cache_file = cache_dir.and_then(|dir| {
+        let cache_key = native_capability_probe_cache_key(rustc).ok()?;
+        Some(native_capability_probe_cache_file(dir, &cache_key))
+    });
+    if let Some(capabilities) = cache_file.as_deref().and_then(read_cached_native_capabilities) {
         return capabilities;
     }
 
@@ -1139,7 +1240,7 @@ pub(crate) fn detect_native_rustc_capabilities(rustc: &Path) -> NativeRustcCapab
                 json_transport: true,
                 authenticated_coverage,
             };
-            cache_native_capabilities(cache_key.as_deref(), capabilities);
+            cache_native_capabilities(cache_file.as_deref(), capabilities);
             return capabilities;
         }
     } else {
@@ -1155,7 +1256,7 @@ pub(crate) fn detect_native_rustc_capabilities(rustc: &Path) -> NativeRustcCapab
                 json_transport: false,
                 authenticated_coverage: false,
             };
-            cache_native_capabilities(cache_key.as_deref(), capabilities);
+            cache_native_capabilities(cache_file.as_deref(), capabilities);
             return capabilities;
         }
     } else {
@@ -1164,39 +1265,19 @@ pub(crate) fn detect_native_rustc_capabilities(rustc: &Path) -> NativeRustcCapab
 
     let capabilities = NativeRustcCapabilities::default();
     if completed_all_probes {
-        cache_native_capabilities(cache_key.as_deref(), capabilities);
+        cache_native_capabilities(cache_file.as_deref(), capabilities);
     }
     capabilities
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod runtime_closure_fixture;
+
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::runtime_closure_fixture::RuntimeClosureFixture;
     use super::*;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired *_ENV_LOCK); the single audited boundary.
-        fn set(key: &'static str, value: &Path) -> Self {
-            let old = env::var_os(key);
-            env::set_var(key, value);
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unknown_lints, env_mutation)] // lock-serialized env helper (see the acquired *_ENV_LOCK); the single audited boundary.
-        fn drop(&mut self) {
-            if let Some(old) = self.old.take() {
-                env::set_var(self.key, old);
-            } else {
-                env::remove_var(self.key);
-            }
-        }
-    }
 
     fn read_probe_count(path: &Path) -> u32 {
         std::fs::read_to_string(path)
@@ -1299,7 +1380,9 @@ mod tests {
 
         let output =
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
                 .args([
+                    "--ignored",
                     "--exact",
                     "pipeline::probe::tests::trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir_child",
                     "--nocapture",
@@ -1321,9 +1404,13 @@ mod tests {
 
     /// Child half of the regression above: it runs with a shim-only `PATH` and
     /// a shim `DEVELOPER_DIR` as its genuine process environment, so the
-    /// assertions below are made against real ambient lookup authority.
+    /// assertions below are made against real ambient lookup authority. A no-op
+    /// without that environment, and `#[ignore]`d so a plain run does not count
+    /// that no-op as a pass; the parent re-executes it with `--ignored --exact`.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "subprocess child: re-executed by \
+                trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir"]
     fn trustd_runtime_closure_inspection_ignores_path_shims_and_developer_dir_child() {
         let Some(fake_otool) = env::var_os(INSPECTOR_LOOKUP_SHIM_CHILD_VAR) else {
             return;
@@ -1341,10 +1428,9 @@ mod tests {
             "isolated child must begin with a shim ambient DEVELOPER_DIR"
         );
 
-        let closure = inspect_trustd_runtime_closure(
-            &std::env::current_exe().expect("current test executable"),
-        )
-        .expect("fixed native inspector must ignore ambient lookup authority");
+        let fixture = RuntimeClosureFixture::new();
+        let closure = inspect_trustd_runtime_closure(fixture.candidate())
+            .expect("fixed native inspector must ignore ambient lookup authority");
         assert_ne!(closure.inspector_path, fake_otool.display().to_string());
         assert_ne!(closure.inspector_path, "/usr/bin/otool");
         assert!(closure.inspector_path.ends_with("/llvm-otool"));
@@ -1396,21 +1482,13 @@ mod tests {
     fn trustd_runtime_closure_candidate_authority_rejects_writable_leaf_ancestor_and_symlink() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let current_exe = std::env::current_exe().expect("current test executable");
-        validate_trustd_candidate_authority(&current_exe)
-            .expect("test executable must begin under an admissible candidate authority chain");
-        let fixture = tempfile::Builder::new()
-            .prefix("trustd-candidate-authority-")
-            .tempdir_in(current_exe.parent().expect("test executable parent"))
-            .expect("candidate authority fixture");
-        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("harden fixture root");
-        let trusted_dir = fixture.path().join("trusted");
+        let fixture = RuntimeClosureFixture::new();
+        let trusted_dir = fixture.root().join("trusted");
         std::fs::create_dir(&trusted_dir).expect("create trusted candidate directory");
         std::fs::set_permissions(&trusted_dir, std::fs::Permissions::from_mode(0o700))
             .expect("harden trusted candidate directory");
         let candidate = trusted_dir.join("trustd");
-        write_executable(&candidate, "#!/bin/sh\nexit 0\n");
+        std::fs::copy(fixture.candidate(), &candidate).expect("copy real native candidate");
         let candidate = std::fs::canonicalize(&candidate).expect("canonical candidate fixture");
         validate_trustd_candidate_authority(&candidate)
             .expect("owner-private exact candidate chain must be admitted");
@@ -1439,7 +1517,7 @@ mod tests {
         std::fs::set_permissions(&trusted_dir, std::fs::Permissions::from_mode(0o700))
             .expect("restore candidate ancestor permissions");
 
-        let redirected = fixture.path().join("redirected");
+        let redirected = fixture.root().join("redirected");
         symlink(&trusted_dir, &redirected).expect("create redirected candidate ancestor");
         let redirected_candidate = redirected.join("trustd");
         let redirected_error = validate_trustd_candidate_authority(&redirected_candidate)
@@ -1498,9 +1576,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn trustd_runtime_closure_reinspection_rejects_rehashed_addition_and_ordering() {
-        let candidate = std::env::current_exe().expect("current test executable");
-        let canonical = inspect_trustd_runtime_closure(&candidate)
-            .expect("inspect current test executable runtime closure");
+        let fixture = RuntimeClosureFixture::new();
+        let candidate = fixture.candidate();
+        let canonical = inspect_trustd_runtime_closure(candidate)
+            .expect("inspect real thin native fixture runtime closure");
 
         let mut added_dependencies = canonical.system_dependencies.clone();
         added_dependencies.push("/usr/lib/libClosureAddition.dylib".to_string());
@@ -1511,24 +1590,26 @@ mod tests {
         )
         .expect("construct internally consistent added dependency closure");
         assert!(
-            added.validate_for_candidate(&candidate).is_err(),
+            added.validate_for_candidate(candidate).is_err(),
             "a rehashed dependency addition was not checked against the candidate"
         );
 
-        if canonical.system_dependencies.len() >= 2 {
-            let mut reordered_dependencies = canonical.system_dependencies.clone();
-            reordered_dependencies.swap(0, 1);
-            let reordered = TrustdRuntimeClosure::from_macho_observation(
-                canonical.inspector_path.clone(),
-                canonical.inspector_sha256.clone(),
-                reordered_dependencies,
-            )
-            .expect("construct internally consistent reordered dependency closure");
-            assert!(
-                reordered.validate_for_candidate(&candidate).is_err(),
-                "a rehashed dependency ordering change was not checked against the candidate"
-            );
-        }
+        assert!(
+            canonical.system_dependencies.len() >= 2,
+            "fixture must exercise dependency ordering"
+        );
+        let mut reordered_dependencies = canonical.system_dependencies.clone();
+        reordered_dependencies.swap(0, 1);
+        let reordered = TrustdRuntimeClosure::from_macho_observation(
+            canonical.inspector_path.clone(),
+            canonical.inspector_sha256.clone(),
+            reordered_dependencies,
+        )
+        .expect("construct internally consistent reordered dependency closure");
+        assert!(
+            reordered.validate_for_candidate(candidate).is_err(),
+            "a rehashed dependency ordering change was not checked against the candidate"
+        );
     }
 
     #[test]
@@ -1543,20 +1624,20 @@ mod tests {
         }
 
         let legacy = format!(
-            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"eligible\":1,\"processed\":1}}",
+            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"eligible\":1,\"processed\":1,\"memory\":{{\"schema\":\"trust-memory-summary/v1\",\"counters\":{{}}}}}}",
             trust_types::TRANSPORT_PREFIX
         );
         assert!(stderr_contains_json_transport(&legacy));
         assert!(!stderr_contains_authenticated_json_transport(&legacy, EXPECTED_SESSION));
 
         let wrong_session = format!(
-            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"package_name\":\"\",\"primary_package\":false,\"verification_session\":\"stale\",\"eligible\":1,\"processed\":1}}",
+            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"package_name\":\"\",\"primary_package\":false,\"verification_session\":\"stale\",\"eligible\":1,\"processed\":1,\"memory\":{{\"schema\":\"trust-memory-summary/v1\",\"counters\":{{}}}}}}",
             trust_types::TRANSPORT_PREFIX
         );
         assert!(!stderr_contains_authenticated_json_transport(&wrong_session, EXPECTED_SESSION));
 
         let current = format!(
-            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"package_name\":\"\",\"primary_package\":false,\"verification_session\":\"{}\",\"eligible\":1,\"processed\":1}}",
+            "{}{{\"type\":\"coverage_summary\",\"crate_name\":\"trust_verify_probe\",\"package_name\":\"\",\"primary_package\":false,\"verification_session\":\"{}\",\"eligible\":1,\"processed\":1,\"memory\":{{\"schema\":\"trust-memory-summary/v1\",\"counters\":{{}}}}}}",
             trust_types::TRANSPORT_PREFIX,
             EXPECTED_SESSION
         );
@@ -1567,11 +1648,16 @@ mod tests {
 
         let function =
             trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+                stable_ids: Vec::new(),
+                source_sha256: None,
+                expanded_function_identity: None,
+                modeled_facts: Vec::new(),
                 function: "trust_verify_probe::trust_verify_probe".to_string(),
                 package_name: None,
                 crate_name: Some(CAPABILITY_PROBE_CRATE.to_string()),
                 primary_package: false,
                 verification_session: EXPECTED_SESSION.to_string(),
+                runtime_checks: None,
                 results: Vec::new(),
                 proved: 0,
                 failed: 0,
@@ -1581,6 +1667,7 @@ mod tests {
                 runtime_checked: 0,
                 cached: 0,
                 total: 0,
+                transport_budget: None,
             });
         let coverage =
             trust_types::TransportMessage::CoverageSummary(trust_types::CoverageTransportSummary {
@@ -1590,11 +1677,14 @@ mod tests {
                 verification_session: EXPECTED_SESSION.to_string(),
                 eligible: 1,
                 processed: 1,
+                noted_stops: Vec::new(),
+                degraded_anchors: 0,
                 function_identities: Some(trust_types::CoverageFunctionIdentityInventory {
                     schema: trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1.to_string(),
                     eligible_functions: vec!["trust_verify_probe::trust_verify_probe".to_string()],
                     processed_functions: vec!["trust_verify_probe::trust_verify_probe".to_string()],
                 }),
+                memory: trust_types::MemorySummary::default(),
             });
         let exact = format!("{}\n{}", transport_line(&function), transport_line(&coverage));
         assert!(stderr_contains_authenticated_json_transport(&exact, EXPECTED_SESSION));
@@ -1621,7 +1711,7 @@ mod tests {
     fn exact_probe_transport_shell() -> String {
         format!(
             r#"printf '%s{{"type":"function_result","function":"trust_verify_probe::trust_verify_probe","package_name":null,"crate_name":"trust_verify_probe","primary_package":false,"verification_session":"%s","results":[],"proved":0,"failed":0,"unknown":0,"timed_out":0,"skipped":0,"runtime_checked":0,"cached":0,"total":0}}\n' '{prefix}' "$verification_session" >&2
-printf '%s{{"type":"coverage_summary","crate_name":"trust_verify_probe","package_name":"","primary_package":false,"verification_session":"%s","eligible":1,"processed":1,"function_identities":{{"schema":"{schema}","eligible_functions":["trust_verify_probe::trust_verify_probe"],"processed_functions":["trust_verify_probe::trust_verify_probe"]}}}}\n' '{prefix}' "$verification_session" >&2"#,
+printf '%s{{"type":"coverage_summary","crate_name":"trust_verify_probe","package_name":"","primary_package":false,"verification_session":"%s","eligible":1,"processed":1,"function_identities":{{"schema":"{schema}","eligible_functions":["trust_verify_probe::trust_verify_probe"],"processed_functions":["trust_verify_probe::trust_verify_probe"]}},"memory":{{"schema":"trust-memory-summary/v1","counters":{{}}}}}}\n' '{prefix}' "$verification_session" >&2"#,
             prefix = trust_types::TRANSPORT_PREFIX,
             schema = trust_types::COVERAGE_FUNCTION_IDENTITY_SCHEMA_V1,
         )
@@ -1649,14 +1739,64 @@ printf '%s{{"type":"coverage_summary","crate_name":"trust_verify_probe","package
 
     #[cfg(unix)]
     #[test]
+    fn the_probe_cache_refuses_a_group_or_world_writable_component() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = tempfile::Builder::new()
+            .prefix("targo-trust-probe-cache-mode-")
+            .tempdir()
+            .expect("tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).expect("create home");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make the root private");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))
+            .expect("make home 0755");
+        let cache = home.join("trust").join("native-capability-probes").join("v7");
+        // The temporary directory's own ancestors are the machine's; only the
+        // components below it are under test.
+        let ancestors_ok = no_group_or_world_writable_component(root.path());
+        assert_eq!(
+            no_group_or_world_writable_component(&cache),
+            ancestors_ok,
+            "a path not yet created under private directories takes their verdict"
+        );
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o775))
+            .expect("make home group-writable");
+        assert!(!no_group_or_world_writable_component(&cache), "group-writable home");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o757))
+            .expect("make home world-writable");
+        assert!(!no_group_or_world_writable_component(&cache), "world-writable home");
+
+        // A private-looking link into a writable directory is judged by its target.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777))
+            .expect("make home writable");
+        let private = root.path().join("private");
+        std::fs::create_dir(&private).expect("create private");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("make private 0700");
+        let target = home.join("cargo");
+        std::fs::create_dir(&target).expect("create link target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+            .expect("make link target 0700");
+        let link = private.join("cargo");
+        symlink(&target, &link).expect("link into the writable home");
+        assert!(
+            !no_group_or_world_writable_component(&link.join("trust")),
+            "a link whose target sits in a writable directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn native_compile_probe_reuses_positive_persistent_cache() {
         let _guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
         let harness = tempfile::Builder::new()
             .prefix("targo-trust-probe-cache-hit-")
             .tempdir()
             .expect("should create probe harness tempdir");
-        let cache_dir = harness.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("TRUST_CACHE_DIR", &cache_dir);
+        let cache_dir = harness.path().join("probe-cache");
         let rustc = harness.path().join("fake-rustc");
         let counter = harness.path().join("count.txt");
         let mode = harness.path().join("mode.txt");
@@ -1689,20 +1829,21 @@ exit 0
             exact_probe_transport_shell(),
         );
         write_executable(&rustc, &script);
+        let _fake_probe = crate::probe_scheduler::fake_compiler_for_test(&rustc);
 
-        let first = detect_native_rustc_capabilities(&rustc);
+        let first = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(first.trust_verify);
         assert!(first.json_transport);
         assert!(first.authenticated_coverage);
         assert_eq!(read_probe_count(&counter), 1);
         let key = native_capability_probe_cache_key(&rustc).expect("cache key");
         assert!(
-            native_capability_probe_cache_path(&key).is_file(),
-            "positive capability probe should be persisted under the trust buildcache root"
+            native_capability_probe_cache_file(&cache_dir, &key).is_file(),
+            "positive capability probe should be persisted in the probe cache"
         );
 
         std::fs::write(&mode, "fail\n").expect("write fail mode");
-        let second = detect_native_rustc_capabilities(&rustc);
+        let second = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(second.trust_verify);
         assert!(second.json_transport);
         assert!(second.authenticated_coverage);
@@ -1721,8 +1862,7 @@ exit 0
             .prefix("targo-trust-probe-cache-negative-")
             .tempdir()
             .expect("should create probe harness tempdir");
-        let cache_dir = harness.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("TRUST_CACHE_DIR", &cache_dir);
+        let cache_dir = harness.path().join("probe-cache");
         let rustc = harness.path().join("fake-rustc");
         let counter = harness.path().join("count.txt");
         let mode = harness.path().join("mode.txt");
@@ -1763,14 +1903,15 @@ esac
             exact_probe_transport_shell(),
         );
         write_executable(&rustc, &script);
+        let _fake_probe = crate::probe_scheduler::fake_compiler_for_test(&rustc);
 
-        let first = detect_native_rustc_capabilities(&rustc);
+        let first = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(!first.trust_verify);
         assert!(!first.json_transport);
         assert!(!first.authenticated_coverage);
         assert_eq!(read_probe_count(&counter), 2);
         let key = native_capability_probe_cache_key(&rustc).expect("cache key");
-        let cache_path = native_capability_probe_cache_path(&key);
+        let cache_path = native_capability_probe_cache_file(&cache_dir, &key);
         assert!(
             !cache_path.exists(),
             "a nonzero probe exit is not evidence that can be persisted as unsupported"
@@ -1778,12 +1919,12 @@ esac
 
         // Simulate a negative row left by an older Targo. New readers must
         // ignore it rather than preserving the stale false-negative forever.
-        write_cached_native_capabilities(&key, NativeRustcCapabilities::default())
+        write_cached_native_capabilities(&cache_path, NativeRustcCapabilities::default())
             .expect("write legacy negative row");
         assert!(cache_path.is_file());
 
         std::fs::write(&mode, "json\n").expect("write json mode");
-        let second = detect_native_rustc_capabilities(&rustc);
+        let second = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(second.trust_verify);
         assert!(second.json_transport);
         assert!(second.authenticated_coverage);
@@ -1809,8 +1950,7 @@ esac
             .prefix("targo-trust-probe-cache-partial-")
             .tempdir()
             .expect("should create probe harness tempdir");
-        let cache_dir = harness.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("TRUST_CACHE_DIR", &cache_dir);
+        let cache_dir = harness.path().join("probe-cache");
         let rustc = harness.path().join("fake-rustc");
         let counter = harness.path().join("count.txt");
         let mode = harness.path().join("mode.txt");
@@ -1860,21 +2000,22 @@ esac
             exact_probe_transport_shell(),
         );
         write_executable(&rustc, &script);
+        let _fake_probe = crate::probe_scheduler::fake_compiler_for_test(&rustc);
 
-        let first = detect_native_rustc_capabilities(&rustc);
+        let first = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(first.trust_verify);
         assert!(!first.json_transport);
         assert!(!first.authenticated_coverage);
         assert_eq!(read_probe_count(&counter), 2);
         let key = native_capability_probe_cache_key(&rustc).expect("cache key");
-        let cache_path = native_capability_probe_cache_path(&key);
+        let cache_path = native_capability_probe_cache_file(&cache_dir, &key);
         assert!(
             !cache_path.exists(),
             "a failed JSON probe must not make a partial capability result sticky"
         );
 
         std::fs::write(&mode, "json\n").expect("write json mode");
-        let second = detect_native_rustc_capabilities(&rustc);
+        let second = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(second.trust_verify);
         assert!(second.json_transport);
         assert!(second.authenticated_coverage);
@@ -1886,7 +2027,7 @@ esac
         assert!(cache_path.is_file(), "the recovered fully positive result should be cached");
 
         std::fs::write(&mode, "fail\n").expect("write fail mode");
-        let third = detect_native_rustc_capabilities(&rustc);
+        let third = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(third.trust_verify);
         assert!(third.json_transport);
         assert!(third.authenticated_coverage);
@@ -1901,8 +2042,7 @@ esac
             .prefix("targo-trust-probe-cache-stale-")
             .tempdir()
             .expect("should create probe harness tempdir");
-        let cache_dir = harness.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("TRUST_CACHE_DIR", &cache_dir);
+        let cache_dir = harness.path().join("probe-cache");
         let rustc = harness.path().join("stage2").join("bin").join("trustc");
         let driver = harness.path().join("stage2").join("lib").join("librustc_driver-test.dylib");
         std::fs::create_dir_all(rustc.parent().expect("rustc parent")).expect("create bin");
@@ -1945,15 +2085,16 @@ esac
             exact_probe_transport_shell(),
         );
         write_executable(&rustc, &script);
+        let _fake_probe = crate::probe_scheduler::fake_compiler_for_test(&rustc);
 
-        let first = detect_native_rustc_capabilities(&rustc);
+        let first = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(!first.trust_verify);
         assert!(!first.json_transport);
         assert!(!first.authenticated_coverage);
         assert_eq!(read_probe_count(&counter), 2);
         let unsupported_key = native_capability_probe_cache_key(&rustc).expect("unsupported key");
         assert!(
-            !native_capability_probe_cache_path(&unsupported_key).exists(),
+            !native_capability_probe_cache_file(&cache_dir, &unsupported_key).exists(),
             "unsupported-looking results must not be cached"
         );
 
@@ -1963,7 +2104,7 @@ esac
             unsupported_key, json_key,
             "driver artifact bytes must invalidate cached capabilities"
         );
-        let second = detect_native_rustc_capabilities(&rustc);
+        let second = detect_native_rustc_capabilities_cached_in(&rustc, Some(cache_dir.as_path()));
         assert!(second.trust_verify);
         assert!(second.json_transport);
         assert!(second.authenticated_coverage);
@@ -1973,7 +2114,7 @@ esac
             "changed driver artifact hash should force a fresh JSON probe"
         );
         assert!(
-            native_capability_probe_cache_path(&json_key).is_file(),
+            native_capability_probe_cache_file(&cache_dir, &json_key).is_file(),
             "refreshed positive compiler result should be cached under the new key"
         );
     }
@@ -2057,6 +2198,21 @@ exit 0
             marker.display()
         );
         write_executable(&rustc, &script);
+        let _fake_probe = crate::probe_scheduler::fake_compiler_for_test(&rustc);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // The explicit test seam does not admit a different command.
+            let mut undeclared = Command::new("/bin/false");
+            let error = crate::probe_scheduler::output(
+                &mut undeclared,
+                "undeclared fake probe",
+                1024,
+                Duration::from_secs(1),
+            )
+            .expect_err("another program must still require native-entry capture");
+            assert!(error.contains("probe scheduler not captured at native entry"));
+        }
 
         let probe = run_native_compile_probe(&rustc, false).expect("probe should run fake rustc");
         let output = probe.output;
@@ -2073,5 +2229,18 @@ exit 0
             !Path::new(probe_dir.trim()).exists(),
             "probe tempdir should be removed after compile probe returns"
         );
+        drop(_fake_probe);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut undeclared = Command::new(&rustc);
+            let error = crate::probe_scheduler::output(
+                &mut undeclared,
+                "uninstalled fake probe",
+                1024,
+                Duration::from_secs(1),
+            )
+            .expect_err("dropping the guard must remove its exact fake authority");
+            assert!(error.contains("probe scheduler not captured at native entry"));
+        }
     }
 }

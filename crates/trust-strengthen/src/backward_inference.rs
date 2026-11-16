@@ -433,7 +433,7 @@ pub fn parse_inference_response(
 ) -> Result<InferredSpec, SpecParseError> {
     let json_text = extract_json(response)?;
 
-    let raw_specs: Vec<RawSpecItem> = serde_json::from_str(&json_text)
+    let raw_specs: Vec<RawSpecItem> = serde_json::from_str(json_text)
         .map_err(|e| SpecParseError::InvalidJson { reason: e.to_string() })?;
 
     if raw_specs.is_empty() {
@@ -486,7 +486,7 @@ struct RawSpecItem {
 /// Trust: Extract a JSON array from LLM response text.
 ///
 /// Handles code fences, extra prose, and whitespace.
-fn extract_json(text: &str) -> Result<String, SpecParseError> {
+fn extract_json(text: &str) -> Result<&str, SpecParseError> {
     let trimmed = text.trim();
 
     // Try ```json ... ``` fences first
@@ -495,7 +495,7 @@ fn extract_json(text: &str) -> Result<String, SpecParseError> {
         if let Some(end) = after_fence.find("```") {
             let inner = after_fence[..end].trim();
             if inner.starts_with('[') {
-                return Ok(inner.to_string());
+                return Ok(inner);
             }
         }
     }
@@ -506,21 +506,21 @@ fn extract_json(text: &str) -> Result<String, SpecParseError> {
         if let Some(end) = after_fence.find("```") {
             let inner = after_fence[..end].trim();
             if inner.starts_with('[') {
-                return Ok(inner.to_string());
+                return Ok(inner);
             }
         }
     }
 
     // Try raw JSON array
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        return Ok(trimmed.to_string());
+        return Ok(trimmed);
     }
 
     // Try to find [ ... ] anywhere in the text
     if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']'))
         && start < end
     {
-        return Ok(trimmed[start..=end].to_string());
+        return Ok(&trimmed[start..=end]);
     }
 
     Err(SpecParseError::InvalidJson { reason: "no JSON array found in response".to_string() })
@@ -598,10 +598,10 @@ fn validate_one_item(
 
     // Trust: Balanced parentheses check
     let mut paren_depth: i32 = 0;
-    for ch in item.expression.chars() {
+    for ch in item.expression.bytes() {
         match ch {
-            '(' => paren_depth += 1,
-            ')' => paren_depth -= 1,
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
             _ => {}
         }
         if paren_depth < 0 {
@@ -631,15 +631,15 @@ fn validate_one_item(
 
     // Trust: Check for identifiers not in param list (soft warning)
     if !func.param_names.is_empty() {
-        let builtins = [
+        const BUILTINS: &[&str] = &[
             "result", "self", "true", "false", "len", "MAX", "MIN", "usize", "u8", "u16", "u32",
             "u64", "u128", "isize", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "old",
             "forall", "exists", "is_some", "is_none", "is_null", "is_ok", "is_err",
         ];
         for ident in extract_identifiers(&item.expression) {
             if ident.len() > 1
-                && !func.param_names.contains(&ident)
-                && !builtins.contains(&ident.as_str())
+                && !func.param_names.iter().any(|p| p == ident)
+                && !BUILTINS.contains(&ident)
                 && !ident.contains("::")
             {
                 warnings.push(format!(
@@ -652,23 +652,27 @@ fn validate_one_item(
 }
 
 /// Trust: Extract word-like identifiers from a spec expression.
-fn extract_identifiers(expr: &str) -> Vec<String> {
+fn extract_identifiers(expr: &str) -> Vec<&str> {
     let mut ids = Vec::new();
-    let mut current = String::new();
+    let mut token_start: Option<usize> = None;
 
-    for ch in expr.chars() {
+    for (idx, ch) in expr.char_indices() {
         if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if !current.is_empty() && !current.chars().next().unwrap_or('0').is_ascii_digit() {
-                ids.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
+            if token_start.is_none() {
+                token_start = Some(idx);
+            }
+        } else if let Some(start) = token_start.take() {
+            let token = &expr[start..idx];
+            if !token.as_bytes()[0].is_ascii_digit() {
+                ids.push(token);
             }
         }
     }
-    if !current.is_empty() && !current.chars().next().unwrap_or('0').is_ascii_digit() {
-        ids.push(current);
+    if let Some(start) = token_start {
+        let token = &expr[start..];
+        if !token.as_bytes()[0].is_ascii_digit() {
+            ids.push(token);
+        }
     }
 
     ids
@@ -1289,18 +1293,18 @@ This prevents division by zero."#;
     #[test]
     fn test_extract_identifiers_basic() {
         let ids = extract_identifiers("a <= usize::MAX - b");
-        assert!(ids.contains(&"a".to_string()));
-        assert!(ids.contains(&"usize".to_string()));
-        assert!(ids.contains(&"MAX".to_string()));
-        assert!(ids.contains(&"b".to_string()));
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"usize"));
+        assert!(ids.contains(&"MAX"));
+        assert!(ids.contains(&"b"));
     }
 
     #[test]
     fn test_extract_identifiers_skips_numbers() {
         let ids = extract_identifiers("x > 0 && y < 100");
-        assert!(ids.contains(&"x".to_string()));
-        assert!(ids.contains(&"y".to_string()));
-        assert!(!ids.iter().any(|i| i == "0" || i == "100"));
+        assert!(ids.contains(&"x"));
+        assert!(ids.contains(&"y"));
+        assert!(!ids.iter().any(|&i| i == "0" || i == "100"));
     }
 
     // === End-to-end pipeline test ===

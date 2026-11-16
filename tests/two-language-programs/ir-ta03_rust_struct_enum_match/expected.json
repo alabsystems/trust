@@ -1,0 +1,53 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta03_rust_struct_enum_match",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (f344fb244 2026-09-21) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@7b9146ba2ab5 sha256:c9692ee58d31e864",
+  "clean": "first-party/clean@faf434b73aac sha256:a9d64ad7f7b7ccde",
+  "trust-cg": "first-party/trust-cg@3f79b19a3d7f sha256:f24a73c879facca4"
+ },
+ "ratchets": {
+  "a.rust.struct_enum_match.carried": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.emit": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.exec": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.roundtrip": {
+   "verdict": "PASS",
+   "audit": "GAP",
+   "moved": "The pinned GAP was a lossy-text refusal naming `/enums[0]/layout` and the `/structs[0]/fields[*]/name` + `/offset` keys: text was layout-agnostic for enums and carried struct fields as a bare type list, so those fields were dropped without a spelling. trust-ir WS4.5 carries both \u2014 a `layout(..)` clause for the enum descriptor (narrowing `TextLoss::EnumLayout` to the internally inconsistent residual rather than deleting it) and `name: ty @off` for struct fields. Reaching PASS also needed the transport to stop canonicalizing; see the measured control recorded on the other roundtrip pins in this landing: 10 of 24 producer modules are non-canonical, and `bin -> text -> bin` is byte-identical 24/24 under `format::text_checked` (trust-ir bef296c7) against 14/24 under the canonicalize-first transport it replaced."
+  },
+  "a.rust.struct_enum_match.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.rust.struct_enum_match.validate": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  }
+ }
+}

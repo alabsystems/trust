@@ -4,38 +4,13 @@
 //@ normalize-stderr: "formula=.* freevars=\{[^}]*\}" -> "formula=$$FORMULA freevars=$$FREEVARS"
 //@ normalize-stderr: "sealed [0-9a-f]{64}" -> "sealed $$DIGEST"
 //@ check-pass
-//
-// SOUNDNESS GUARD (R1 def-path identity, item 2). The R1 seam renders def paths
-// through TWO different producers and their key spaces are NOT disjoint:
-//
-//   RAW  = `with_no_trimmed_paths!(tcx.def_path_str(d))`      (no crate prefix)
-//   SEAM = `trust_mir_extract::safe_def_path_str(tcx, d)`     (crate prefix)
-//
-// RAW drops exactly one leading segment (`print_crate_name` skips `LOCAL_CRATE`
-// unless `with_resolve_crate_name` is in force), so any nesting that eats one
-// segment makes the two spaces COLLIDE. Below, crate `t` contains `mod t`, and
-// the checked-in stderr shows all four renderings in ONE run:
-//
-//   RAW(t::t::helper) == "t::helper"   <- `t::helper: found Failed VC ... loc=42:8`
-//   SEAM(t::t::helper) == "t::t::helper"
-//   RAW(t::helper)     == "helper"     <- `helper: found Failed VC ... loc=49:4`
-//   SEAM(t::helper)    == "t::helper"  <- byte-identical to RAW of the OTHER DefId
-//
-// (Those `loc=` values are the line/column of the two `x / d` expressions below and
-// move with this comment; re-bless after editing it.)
-//
-// So a set keyed RAW and consulted with a SEAM key does not merely miss (lost
-// recovery) — it can HIT THE WRONG DefId (fail-open). That is why
-// `r1_generic_mono_caller_closure` is keyed through `safe_def_path_str`, the same
-// producer its sole consumer (`r1_generic_mono_coverage`) looks up with.
-//
-// This file pins the KEY SPACES with an EMPTY caller closure
-// (`covered=0 caller-closure=0` below). `generic_mono_caller_closure_collision.rs`
-// is the same collision with a NON-EMPTY one, which is where the fail-open is live.
-//
-// Falsify-once control: `caller_closure_key_space_no_collision.rs` is this file
-// with the module renamed `u`; there RAW = {`u::helper`, `helper`} and
-// SEAM = {`t::u::helper`, `t::helper`} are disjoint, and its stderr differs.
+
+// R1-MONO-SUPPRESSION-1: sealed row harvesting remains enabled, but its
+// root-only evidence cannot suppress a failed/discarded native bundle.
+// The former generic-coverage registry and transitive caller census are gone.
+// The raw diagnostic name of one helper collides with another helper's
+// crate-prefixed sealed-row key only in the collision variant. Both genuine
+// per-row sealed flips must still apply to their own source functions.
 #![allow(dead_code)]
 mod t {
     pub(crate) fn helper(x: u32, d: u32) -> u32 {

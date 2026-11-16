@@ -1,0 +1,1 @@
+{"term": {"App": [{"Const": "idT"}, {"Sort": 0}]}, "context": [{"name": "T", "entry": {"Definition": {"ty": {"Sort": 2}, "value": {"Sort": 1}}}}, {"name": "idT", "entry": {"Definition": {"ty": {"Pi": {"binder_name": "x", "domain": {"Const": "T"}, "codomain": {"Const": "T"}}}, "value": {"Lambda": {"binder_name": "x", "binder_type": {"Const": "T"}, "body": {"Var": 0}}}}}}]}

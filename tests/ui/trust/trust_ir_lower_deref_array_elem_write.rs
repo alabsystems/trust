@@ -1,6 +1,9 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
 //! Trust (wave-AI2, over wave-HM): `(*p)[K] = v` and `(*p)[K] op= v` through
 //! a `&mut [T; N]` PARAM lower as the `(*p).field = v` chain arm's RMW shape
 //! one aggregate kind over — Load the pointee, `InsertElement` at the

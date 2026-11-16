@@ -29,9 +29,6 @@
 #   TRUST_VERIFY_WORKER_THREADS=N  Full-verifier worker cap for self-verification (default 2)
 #   TRUST_FULL_VERIFY_REPORT_DIR=PATH  Durable report directory for this run
 # Trust: removed env docs for TRUST_SELF_VERIFY_TARGET / _TIMEOUT_SEC / _RUN_ID; use --target/--timeout/--run-id on `targo trust verify self`.
-#   TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT_DIR=PATH  Preserve stage2-build proof transport report
-#   TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT=PATH  Stage2-build self-verify harness report path recorded in status metrics
-#   TRUST_FULL_VERIFY_STAGE2_BUILD_TIMEOUT_SEC=N  Stage2-build proof harness timeout (0 disables)
 #   TRUST_GATE_STATUS_LOG_DIR=PATH  Preserve gate-status per-gate logs (default: report dir)
 
 set -euo pipefail
@@ -411,7 +408,6 @@ payload = {
         "post_stage_release_metadata_report": os.environ["FULL_VERIFY_POST_STAGE_RELEASE_METADATA_REPORT_PATH"],
         "capacity_report": os.environ["FULL_VERIFY_CAPACITY_REPORT_PATH"],
         "self_verify_harness_report": os.environ.get("TRUST_FULL_VERIFY_SELF_VERIFY_HARNESS_REPORT"),
-        "stage2_build_harness_report": os.environ.get("TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT"),
     },
     "full_verify_status": {
         "build_log": status_performance(status_entries),
@@ -445,7 +441,7 @@ capture_full_verify_capacity_report() {
         df -h "${TMPDIR:-.}" "${CARGO_HOME:-.}" "$FULL_VERIFY_REPORT_DIR" "$FULL_VERIFY_BUILD_ROOT" 2>&1 || true
         echo
         echo "## du -sh selected paths"
-        du -sh "$FULL_VERIFY_BUILD_ROOT" "$FULL_VERIFY_REPORT_ROOT" 2>&1 || true
+        du -shH "$FULL_VERIFY_BUILD_ROOT" "$FULL_VERIFY_REPORT_ROOT" 2>&1 || true
         echo
         echo "## cleanup guidance"
         echo "Preserve any report directory needed as reviewer evidence before deleting files."
@@ -523,8 +519,6 @@ def load_json(path):
 def harness_report_path(label):
     if label == "self-verify-harness":
         return os.environ.get("TRUST_FULL_VERIFY_SELF_VERIFY_HARNESS_REPORT")
-    if label == "stage2-build":
-        return os.environ.get("TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT")
     return None
 
 
@@ -1289,7 +1283,7 @@ cmd_build() {
     time "$PYTHON3" x.py build $VERBOSE_FLAG -j "$JOBS" 2>&1 | tee build.log
     echo ""
     log "Build complete."
-    log "Compiler: $(find build -name trustc -type f -perm +111 2>/dev/null | head -1)"
+    log "Compiler: $(find -H build -name trustc -type f -perm +111 2>/dev/null | head -1)"
     log "Build log: build.log"
 }
 
@@ -1330,11 +1324,6 @@ cmd_full_verify() {
     log "Running canonical full verification sequence."
     log "This builds stage2, checks bootstrap lineage, builds dist artifacts, and runs release gates."
     prepare_full_verify_step_logs
-    local stage2_build_harness_report_dir
-    stage2_build_harness_report_dir="${TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT_DIR:-${FULL_VERIFY_REPORT_DIR:-reports/full-verify}/stage2-build-harness}"
-    export TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT="${TRUST_FULL_VERIFY_STAGE2_BUILD_HARNESS_REPORT:-$stage2_build_harness_report_dir/self-verify-harness.report.json}"
-    local stage2_build_timeout_sec
-    stage2_build_timeout_sec="${TRUST_FULL_VERIFY_STAGE2_BUILD_TIMEOUT_SEC:-0}"
     local verify_worker_threads
     verify_worker_threads="${TRUST_VERIFY_WORKER_THREADS:-2}"
     require_positive_u16 TRUST_VERIFY_WORKER_THREADS "$verify_worker_threads"
@@ -1347,20 +1336,11 @@ cmd_full_verify() {
             --jobs "$JOBS" \
             --offline \
             --full-verifier
+    # Bootstrap is a separate unverified rebuild, never the self-verifier's
+    # evidence command. The native full verifier above owns its fixed Cargo JSON
+    # command and refuses custom --stage-command dispatch.
     run_full_verify_step stage2-build \
-        env CARGO_NET_OFFLINE=true \
-            TRUST_VERIFY_WORKER_THREADS="$verify_worker_threads" \
-            "$FULL_VERIFY_TARGO" trust verify self \
-            --repo-root "$REPO_ROOT" \
-            --report-dir "$stage2_build_harness_report_dir" \
-            --jobs "$JOBS" \
-            --offline \
-            --full-verifier \
-            --timeout "$stage2_build_timeout_sec" \
-            --target "stage2 full-bootstrap compiler/rustc library/std" \
-            --stage-label stage2-build-verification-on \
-            --stage-description "Verification-on canonical full-bootstrap stage2 build for compiler/rustc and library/std." \
-            --stage-command env -u CARGO_TARGET_DIR "$FULL_VERIFY_TARGO" --unverified run \
+        env -u CARGO_TARGET_DIR CARGO_NET_OFFLINE=true "$FULL_VERIFY_TARGO" --unverified run \
                 --locked \
                 --offline \
                 --target-dir "$FULL_VERIFY_BUILD_ROOT/bootstrap-target" \
@@ -1385,11 +1365,14 @@ cmd_full_verify() {
         env CARGO_NET_OFFLINE=true ./x dist --set llvm.ninja=false -j "$JOBS" trust-source trust-source-gpl
     run_full_verify_step gate-upstream-rust-porting \
         "$FULL_VERIFY_TARGO" trust domination upstream-tests --release
+    # Owned-dependency release readiness is the gitlink question now: every
+    # first-party pin HEAD records must be fetchable from a remote ref, or a
+    # fresh recursive clone of the release cannot reproduce it. This step ran
+    # `targo trust deps validate --production` until 2026-09-23 (TRUST-08);
+    # that verb read trust-engines.lock, which the tree does not have, so the
+    # step could not pass.
     run_full_verify_step gate-owned-dependency-release-readiness \
-        "$FULL_VERIFY_TARGO" trust deps validate \
-            --production \
-            --source git-index \
-            --json-output "${FULL_VERIFY_REPORT_DIR:-reports/full-verify}/owned-dependency-release-readiness.report.json"
+        "$FULL_VERIFY_TARGO" trust repo submodule-reachability --rev HEAD --json
     run_full_verify_step gate-status \
         env TRUST_GATE_STATUS_INCLUDE_OPTIONAL=1 \
             TRUST_GATE_STATUS_LOG_DIR="${TRUST_GATE_STATUS_LOG_DIR:-${FULL_VERIFY_REPORT_DIR:-reports/full-verify}/gate-status-logs}" \
@@ -1417,7 +1400,10 @@ cmd_status() {
     echo "Jobs:     $JOBS"
     echo "Host:     $(uname -m) $(uname -s)"
     echo "Memory:   $(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GB", $1/1024/1024/1024}')"
-    echo "bootstrap host rustc: $(rustc --version 2>/dev/null || echo 'not found')"
+    echo "trustc (PATH): $(trustc --version 2>/dev/null || echo 'not found')"
+    local stage0_rustc
+    stage0_rustc="$(sed -n 's/^rustc *= *//p' bootstrap.toml 2>/dev/null | head -1 | tr -d '"' || true)"
+    echo "stage0 (bootstrap.toml [build] rustc): ${stage0_rustc:-none set}"
     echo "cmake:    $(cmake --version 2>/dev/null | head -1 || echo 'not found')"
     echo "ninja:    $(ninja --version 2>/dev/null || echo 'not found')"
     echo ""
@@ -1427,7 +1413,8 @@ cmd_status() {
         echo "No build yet."
     fi
     local compiler
-    compiler=$(find build -name trustc -type f -perm +111 2>/dev/null | head -1)
+    # Any execute bit, using predicates shared by BSD and GNU find.
+    compiler=$(find -H build -name trustc -type f \( -perm -u+x -o -perm -g+x -o -perm -o+x \) 2>/dev/null | head -1)
     if [[ -n "$compiler" ]]; then
         echo "Compiler:  $compiler"
         "$compiler" --version 2>/dev/null || true

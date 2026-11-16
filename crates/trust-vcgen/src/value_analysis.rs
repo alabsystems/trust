@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::*;
 
 // ── Value Set ──────────────────────────────────────────────────────────────
@@ -108,18 +108,17 @@ pub fn join_value_sets(a: &ValueSet, b: &ValueSet) -> ValueSet {
         (ValueSet::Top, _) | (_, ValueSet::Top) => ValueSet::Top,
 
         (ValueSet::Exact(sa), ValueSet::Exact(sb)) => {
+            if sa.len().max(sb.len()) > MAX_EXACT_SIZE
+                && let Some(lo) = sa.first().copied().into_iter().chain(sb.first().copied()).min()
+                && let Some(hi) = sa.last().copied().into_iter().chain(sb.last().copied()).max()
+            {
+                return ValueSet::Range(lo, hi);
+            }
             let merged: BTreeSet<i64> = sa.union(sb).copied().collect();
-            if merged.len() > MAX_EXACT_SIZE {
+            if merged.len() > MAX_EXACT_SIZE
+                && let (Some(&lo), Some(&hi)) = (merged.first(), merged.last())
+            {
                 // Promote to range.
-                // SAFETY: merged is a union of two non-empty sets, so it is non-empty.
-                let lo = *merged
-                    .iter()
-                    .next()
-                    .unwrap_or_else(|| unreachable!("empty set after union of non-empty sets"));
-                let hi = *merged
-                    .iter()
-                    .next_back()
-                    .unwrap_or_else(|| unreachable!("empty set after union of non-empty sets"));
                 ValueSet::Range(lo, hi)
             } else {
                 ValueSet::Exact(merged)
@@ -227,14 +226,21 @@ impl ValueSetState {
         if other.is_unreachable {
             return self.clone();
         }
-        let mut vars = FxHashMap::default();
-        let all_keys: BTreeSet<&String> = self.vars.keys().chain(other.vars.keys()).collect();
-        for key in all_keys {
-            let a = self.get(key);
-            let b = other.get(key);
-            let joined = join_value_sets(&a, &b);
-            if !matches!(joined, ValueSet::Top) {
-                vars.insert(key.clone(), joined);
+        // A variable absent from either map denotes `ValueSet::Top`, and
+        // `join_value_sets(Top, _) == Top`, so only keys present in both maps can
+        // yield a non-Top entry. Iterate the smaller map and borrow both `ValueSet`s.
+        let (smaller, larger) = if self.vars.len() <= other.vars.len() {
+            (&self.vars, &other.vars)
+        } else {
+            (&other.vars, &self.vars)
+        };
+        let mut vars = FxHashMap::with_capacity_and_hasher(smaller.len(), Default::default());
+        for (key, a) in smaller {
+            if let Some(b) = larger.get(key) {
+                let joined = join_value_sets(a, b);
+                if !matches!(joined, ValueSet::Top) {
+                    vars.insert(key.clone(), joined);
+                }
             }
         }
         ValueSetState { vars, is_unreachable: false }
@@ -277,6 +283,42 @@ fn operand_to_value_set(
     }
 }
 
+/// Apply an assignment transfer function in place.
+fn transfer_assign_in_place(
+    target: &Place,
+    rvalue: &Rvalue,
+    func: &VerifiableFunction,
+    state: &mut ValueSetState,
+) {
+    if state.is_unreachable {
+        return;
+    }
+
+    let target_name = crate::place_to_var_name(func, target);
+    // Trust (2026-09-28): a discriminant read is its enum's DECODED tag hull,
+    // negative tags included (`crate::abstract_interp::transfer::discriminant_read_hull`
+    // has the measured false proof the old `[0, i64::MAX]` produced); Top when the
+    // hull is unknown or does not fit `i64`.
+    let mut vs = if let Rvalue::Discriminant(src) = rvalue {
+        crate::abstract_interp::transfer::discriminant_read_hull(func, src, target)
+            .and_then(|(lo, hi)| {
+                Some(ValueSet::range(i64::try_from(lo).ok()?, i64::try_from(hi).ok()?))
+            })
+            .unwrap_or(ValueSet::Top)
+    } else {
+        eval_rvalue_vs(rvalue, func, state)
+    };
+    // Trust (2026-10-05, NEG-WRAP-OFF-1): a bare integer `Neg` WRAPS (`-MIN ==
+    // MIN`; the overflow check is the separate dominating `Assert(OverflowNeg)`), so
+    // the mathematical set `eval_rvalue_vs` computes is the machine's only when it
+    // fits the destination type; otherwise the destination's full range — the
+    // interval lane's `clamp_bare_binop_to_dest_range`, here.
+    if let Rvalue::UnaryOp(UnOp::Neg, _) = rvalue {
+        vs = clamp_bare_vs_to_dest_range(vs, func, target);
+    }
+    state.set(target_name, vs);
+}
+
 /// Apply an assignment transfer function.
 #[must_use]
 pub fn transfer_assign(
@@ -286,14 +328,38 @@ pub fn transfer_assign(
     state: &ValueSetState,
 ) -> ValueSetState {
     let mut result = state.clone();
-    if result.is_unreachable {
-        return result;
-    }
-
-    let target_name = crate::place_to_var_name(func, target);
-    let vs = eval_rvalue_vs(rvalue, func, state);
-    result.set(target_name, vs);
+    transfer_assign_in_place(target, rvalue, func, &mut result);
     result
+}
+
+/// The machine-value clamp for a bare (wrapping) integer op's destination: `vs`
+/// unchanged when every member lies in the destination type's range (no input can
+/// have wrapped), else that whole range (`Top` when it is unknown or does not fit
+/// `i64`). The empty set (unreachable) passes through; `Top` stays `Top`.
+fn clamp_bare_vs_to_dest_range(vs: ValueSet, func: &VerifiableFunction, dest: &Place) -> ValueSet {
+    if vs.is_empty() || vs.is_top() {
+        return vs;
+    }
+    let range = crate::place_ty_cow(func, dest).as_deref().and_then(|ty| match ty {
+        Ty::PtrSizedInt { signed } => {
+            crate::abstract_interp::discharge::type_bounds(&Ty::Int { width: 64, signed: *signed })
+        }
+        other => crate::abstract_interp::discharge::type_bounds(other),
+    });
+    let Some((lo, hi)) = range else {
+        return ValueSet::Top;
+    };
+    let fits = match (vs.min_value(), vs.max_value()) {
+        (Some(min), Some(max)) => i128::from(min) >= lo && i128::from(max) <= hi,
+        _ => false,
+    };
+    if fits {
+        return vs;
+    }
+    match (i64::try_from(lo), i64::try_from(hi)) {
+        (Ok(lo), Ok(hi)) => ValueSet::range(lo, hi),
+        _ => ValueSet::Top,
+    }
 }
 
 /// Evaluate an rvalue to a value set.
@@ -311,11 +377,17 @@ fn eval_rvalue_vs(rvalue: &Rvalue, func: &VerifiableFunction, state: &ValueSetSt
             let a = operand_to_value_set(op, func, state);
             match a {
                 ValueSet::Exact(s) => {
-                    let negated: BTreeSet<i64> = s.iter().filter_map(|v| v.checked_neg()).collect();
-                    if negated.len() > MAX_EXACT_SIZE {
-                        ValueSet::Top
-                    } else {
-                        ValueSet::Exact(negated)
+                    // Trust (2026-10-05, NEG-WRAP-OFF-1): a member whose negation
+                    // leaves `i64` (`i64::MIN`) makes the whole set Top. It used to be
+                    // DROPPED (`filter_map`), so `{i64::MIN, 5}` negated to `{-5}` —
+                    // a set that excluded the machine's wrapped `i64::MIN`.
+                    let negated: Option<BTreeSet<i64>> =
+                        s.iter().map(|v| v.checked_neg()).collect();
+                    match negated {
+                        Some(negated) if negated.len() <= MAX_EXACT_SIZE => {
+                            ValueSet::Exact(negated)
+                        }
+                        _ => ValueSet::Top,
                     }
                 }
                 ValueSet::Range(lo, hi) => {
@@ -330,7 +402,10 @@ fn eval_rvalue_vs(rvalue: &Rvalue, func: &VerifiableFunction, state: &ValueSetSt
         }
 
         Rvalue::Len(_) => ValueSet::range(0, i64::MAX),
-        Rvalue::Discriminant(_) => ValueSet::range(0, i64::MAX),
+        // Trust (2026-09-28): Top here; `transfer_assign`, which knows the
+        // destination, narrows it to the enum's tag hull. It was `[0, i64::MAX]`,
+        // which a negative tag violates.
+        Rvalue::Discriminant(_) => ValueSet::Top,
         _ => ValueSet::Top,
     }
 }
@@ -436,24 +511,18 @@ pub fn transfer_condition(
     let mut true_state = state.clone();
     let mut false_state = state.clone();
 
-    if let Operand::Copy(place) | Operand::Move(place) = discr {
+    if let Operand::Copy(place) | Operand::Move(place) = discr
+        && let Ok(v) = i64::try_from(value)
+    {
         let name = crate::place_to_var_name(func, place);
-        if let Ok(v) = i64::try_from(value) {
-            // True branch: variable equals the switch value.
-            true_state.set(name.clone(), ValueSet::singleton(v));
-
-            // False branch: remove the value from the set.
-            let current = state.get(&name);
-            match current {
-                ValueSet::Exact(mut s) => {
-                    s.remove(&v);
-                    false_state.set(name, ValueSet::Exact(s));
-                }
-                _ => {
-                    // Can't precisely remove one value from a range/top.
-                }
-            }
+        // False branch: remove the value from the set in place.
+        if !false_state.is_unreachable
+            && let Some(ValueSet::Exact(s)) = false_state.vars.get_mut(&name)
+        {
+            s.remove(&v);
         }
+        // True branch: variable equals the switch value.
+        true_state.set(name, ValueSet::singleton(v));
     }
 
     (true_state, false_state)
@@ -461,29 +530,42 @@ pub fn transfer_condition(
 
 // ── Function-Level Analysis ────────────────────────────────────────────────
 
-/// Extract all successor block IDs from a terminator for dataflow propagation.
-fn vs_terminator_successors(term: &Terminator) -> Vec<BlockId> {
+/// Visit all successor block IDs from a terminator for dataflow propagation without allocating a `Vec`.
+fn for_each_vs_successor(term: &Terminator, mut f: impl FnMut(BlockId)) {
     match term {
-        Terminator::Goto(target) | Terminator::Drop { target, .. } => vec![*target],
+        Terminator::Goto(target)
+        | Terminator::Drop { target, .. }
+        | Terminator::Assert { target, .. } => f(*target),
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut succs: Vec<BlockId> = targets.iter().map(|(_, b)| *b).collect();
-            succs.push(*otherwise);
-            succs
+            for (_, b) in targets {
+                f(*b);
+            }
+            f(*otherwise);
         }
-        Terminator::Assert { target, .. } => vec![*target],
-        Terminator::Call { target, .. } => target.iter().copied().collect(),
-        Terminator::Opaque { targets, .. } => targets.clone(),
-        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
-        _ => vec![],
+        Terminator::Call { target: Some(target), .. } => f(*target),
+        Terminator::Opaque { targets, .. } => {
+            for &b in targets {
+                f(b);
+            }
+        }
+        Terminator::Call { target: None, .. }
+        | Terminator::Return
+        | Terminator::TailCall { .. }
+        | Terminator::Unreachable
+        | _ => {}
     }
 }
 
 /// Analyze an entire function, computing value sets at each block entry.
 #[must_use]
 pub fn analyze_function(func: &VerifiableFunction) -> FxHashMap<String, ValueSet> {
+    if func.body.blocks.is_empty() {
+        return FxHashMap::default();
+    }
     let expanded = func.with_tail_calls_expanded();
     let func = expanded.as_ref();
-    let mut block_states: FxHashMap<BlockId, ValueSetState> = FxHashMap::default();
+    let mut block_states: FxHashMap<BlockId, ValueSetState> =
+        FxHashMap::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
 
     // Initialize all blocks to bottom (unreachable).
     for block in &func.body.blocks {
@@ -492,61 +574,73 @@ pub fn analyze_function(func: &VerifiableFunction) -> FxHashMap<String, ValueSet
 
     // Entry block gets top state with argument constraints.
     let mut entry_state = ValueSetState::top();
-    for (i, local) in func.body.locals.iter().enumerate() {
-        if i == 0 || i > func.body.arg_count {
-            continue; // skip return slot and non-args
-        }
-        let name = local.name.clone().unwrap_or_else(|| format!("_{i}"));
+    for local in func.body.locals.iter().take(func.body.arg_count.saturating_add(1)).skip(1) {
+        // The formula name the transfers write (`crate::local_var_name`).
         let vs = type_to_value_set(&local.ty);
-        entry_state.set(name, vs);
+        entry_state.set(crate::local_var_name(func, local), vs);
     }
 
+    let mut worklist: VecDeque<BlockId> = VecDeque::with_capacity(func.body.blocks.len());
+    let mut in_worklist: FxHashSet<BlockId> =
+        FxHashSet::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
     if let Some(first) = func.body.blocks.first() {
         block_states.insert(first.id, entry_state);
+        worklist.push_back(first.id);
+        in_worklist.insert(first.id);
     }
 
     // Forward dataflow to fixpoint.
     let max_iterations = func.body.blocks.len() * 15 + 50;
-    let mut worklist: VecDeque<BlockId> = func.body.blocks.iter().map(|b| b.id).collect();
     let mut iteration = 0;
 
     while let Some(block_id) = worklist.pop_front() {
+        in_worklist.remove(&block_id);
         iteration += 1;
         if iteration > max_iterations {
             break;
         }
 
-        let Some(block) = func.body.blocks.iter().find(|b| b.id == block_id) else {
+        let Some(block) = func
+            .body
+            .blocks
+            .get(block_id.0)
+            .filter(|b| b.id == block_id)
+            .or_else(|| func.body.blocks.iter().find(|b| b.id == block_id))
+        else {
             continue;
         };
 
-        let entry = block_states.get(&block_id).cloned().unwrap_or_else(ValueSetState::bottom);
-        if entry.is_unreachable {
+        let Some(entry) = block_states.get(&block_id).filter(|s| !s.is_unreachable).cloned() else {
             continue;
-        }
+        };
 
         // Apply transfer functions for all statements.
         let mut current = entry;
         for stmt in &block.stmts {
             if let Statement::Assign { place, rvalue, .. } = stmt {
-                current = transfer_assign(place, rvalue, func, &current);
+                transfer_assign_in_place(place, rvalue, func, &mut current);
             }
         }
 
         // Propagate to successors.
         // Use direct terminator successor extraction (exit_targets() doesn't
         // include Assert/Call success targets).
-        let successors = vs_terminator_successors(&block.terminator);
-        for succ_id in successors {
-            let old = block_states.get(&succ_id).cloned().unwrap_or_else(ValueSetState::bottom);
-            let merged = old.join(&current);
-            if merged != old {
+        for_each_vs_successor(&block.terminator, |succ_id| {
+            let (merged, changed) = match block_states.get(&succ_id) {
+                Some(old) => {
+                    let merged = old.join(&current);
+                    let changed = &merged != old;
+                    (merged, changed)
+                }
+                None => (current.clone(), !current.is_unreachable),
+            };
+            if changed {
                 block_states.insert(succ_id, merged);
-                if !worklist.contains(&succ_id) {
+                if in_worklist.insert(succ_id) {
                     worklist.push_back(succ_id);
                 }
             }
-        }
+        });
     }
 
     // Collect the final state at the last reachable block.
@@ -557,8 +651,17 @@ pub fn analyze_function(func: &VerifiableFunction) -> FxHashMap<String, ValueSet
             continue;
         }
         for (var, vs) in &state.vars {
-            let existing = result.remove(var).unwrap_or_else(|| ValueSet::Exact(BTreeSet::new()));
-            result.insert(var.clone(), join_value_sets(&existing, vs));
+            match result.get_mut(var) {
+                Some(existing) => *existing = join_value_sets(existing, vs),
+                None => {
+                    let initial = match vs {
+                        ValueSet::Top | ValueSet::Range(_, _) => vs.clone(),
+                        ValueSet::Exact(s) if s.len() <= MAX_EXACT_SIZE => vs.clone(),
+                        _ => join_value_sets(&ValueSet::Exact(BTreeSet::new()), vs),
+                    };
+                    result.insert(var.clone(), initial);
+                }
+            }
         }
     }
     result
@@ -663,33 +766,21 @@ pub fn generate_vc_from_value_sets(
     function_name: &str,
 ) -> Vec<VerificationCondition> {
     let mut vcs = Vec::new();
+    let mut fn_sym: Option<Symbol> = None;
 
     for (var_name, vs) in analysis {
-        let var_f = Formula::Var(var_name.clone(), Sort::Int);
-
         match vs {
-            ValueSet::Exact(values) if !values.is_empty() => {
-                // Generate: var == v1 OR var == v2 OR ...
-                let clauses: Vec<Formula> = values
-                    .iter()
-                    .map(|&v| {
-                        Formula::Eq(Box::new(var_f.clone()), Box::new(Formula::Int(i128::from(v))))
-                    })
-                    .collect();
-                if clauses.len() == 1 {
+            ValueSet::Exact(values) if values.len() == 1 => {
+                if let Some(&v) = values.iter().next() {
+                    let var_f = Formula::Var(var_name.clone(), Sort::Int);
+                    let eq = Formula::Eq(Box::new(var_f), Box::new(Formula::Int(i128::from(v))));
                     vcs.push(VerificationCondition {
                         kind: VcKind::Assertion {
                             message: format!("value_analysis: {var_name} is constant"),
                         },
-                        function: function_name.into(),
+                        function: *fn_sym.get_or_insert_with(|| function_name.into()),
                         location: SourceSpan::default(),
-                        // SAFETY: we enter this branch only when clauses.len() == 1.
-                        formula: Formula::Not(Box::new(
-                            clauses
-                                .into_iter()
-                                .next()
-                                .unwrap_or_else(|| unreachable!("empty clauses despite len == 1")),
-                        )),
+                        formula: Formula::Not(Box::new(eq)),
                         contract_metadata: None,
                         obligation: None,
                     });
@@ -701,16 +792,16 @@ pub fn generate_vc_from_value_sets(
             ValueSet::Range(lo, hi) => {
                 // Generate: NOT (lo <= var AND var <= hi)
                 // If SAT, the variable escapes its computed range.
+                let var_f = Formula::Var(var_name.clone(), Sort::Int);
                 let lower =
                     Formula::Ge(Box::new(var_f.clone()), Box::new(Formula::Int(i128::from(*lo))));
-                let upper =
-                    Formula::Le(Box::new(var_f.clone()), Box::new(Formula::Int(i128::from(*hi))));
+                let upper = Formula::Le(Box::new(var_f), Box::new(Formula::Int(i128::from(*hi))));
                 let in_range = Formula::And(vec![lower, upper]);
                 vcs.push(VerificationCondition {
                     kind: VcKind::Assertion {
                         message: format!("value_analysis: {var_name} in [{lo}, {hi}]"),
                     },
-                    function: function_name.into(),
+                    function: *fn_sym.get_or_insert_with(|| function_name.into()),
                     location: SourceSpan::default(),
                     formula: Formula::Not(Box::new(in_range)),
                     contract_metadata: None,

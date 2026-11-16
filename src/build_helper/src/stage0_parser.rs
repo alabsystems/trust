@@ -25,11 +25,14 @@ pub struct Stage0Config {
     pub nightly_branch: String,
     pub compiler_dist_channel: String,
     pub rustfmt_dist_channel: String,
-    /// Trust: the oldest toolchain that can still compile this tree. A stage0
-    /// reports its version on Rust's line, never on Trust's `major.minor.dev`
+    /// Trust: the oldest compiler that can still compile this tree. A stage0
+    /// reports its version on Rust's line, never on Trust's `MAJOR.MINOR.0`
     /// line, so it is measured against this floor and
     /// `src/rust-compat-version` rather than `src/version`.
     pub min_stage0_rustc_version: String,
+    /// Oldest supported reported Cargo/Targo planner version. This is independent
+    /// of both the compiler floor and Cargo's own source compiler MSRV.
+    pub min_stage0_cargo_version: String,
 }
 
 pub fn parse_stage0_file() -> Stage0 {
@@ -63,6 +66,7 @@ fn parse_stage0_content(stage0_content: &str) -> Stage0 {
             "compiler_dist_channel" => stage0.config.compiler_dist_channel = value.to_owned(),
             "rustfmt_dist_channel" => stage0.config.rustfmt_dist_channel = value.to_owned(),
             "min_stage0_rustc_version" => stage0.config.min_stage0_rustc_version = value.to_owned(),
+            "min_stage0_cargo_version" => stage0.config.min_stage0_cargo_version = value.to_owned(),
 
             "compiler_channel_manifest_hash" => {
                 stage0.compiler.channel_manifest_hash = value.to_owned()

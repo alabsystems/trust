@@ -1,6 +1,6 @@
 //@ dont-check-compiler-stderr
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Aprivate_interfaces
 //@ edition: 2021
 //! Trust (wave-CDR): `&*r` where the pointee merely CONTAINS a DST in TAIL position -- `&Path`,
 //! `&OsStr`, `&List<T> { skel: [T] }`.
@@ -18,13 +18,14 @@
 //! clean, so the fat spelling is shipped and accepted as a param, a return, a tuple element and a
 //! call argument -- everywhere except this gate.
 //!
-//! THE AFFIRMATIVE ALLOW-LIST is the `map_ty(expr_ty) == FatPtr(ContainerLen)` conjunct, not a
-//! negation. `map_ty` mints that spelling from two sites, but only one is reachable once the
-//! first two conjuncts have required a shared `ty::Ref` on both sides -- the other is the
-//! RAW-POINTER catch-all, which a reference cannot reach. Reaching it requires
-//! `pointee_is_the_dst == false` (so `[T]`/`str`/`dyn` pointees are excluded BY CONSTRUCTION) and
-//! `pointee_meta == Len` (so `Thin`/`Unknown`, which map to `Ty::Ptr`, and `Vtable`, which maps to
-//! `None`, are excluded too).
+//! THE AFFIRMATIVE ALLOW-LIST is the `map_ty(expr_ty) == FatPtr(ContainerLen)` conjunct (since
+//! trust-ir v39 also `FatPtr(ContainerVtable)`), not a negation. `map_ty` mints those spellings
+//! from two sites, but only one is reachable once the first two conjuncts have required a shared
+//! `ty::Ref` on both sides -- the other is the RAW-POINTER catch-all, which a reference cannot
+//! reach. Reaching it requires `pointee_is_the_dst == false` (so `[T]`/`str`/`dyn` pointees are
+//! excluded BY CONSTRUCTION) and `pointee_meta == Len | Vtable` (so `Thin`/`Unknown`, which map
+//! to `Ty::Ptr`, are excluded). Before v39 `Vtable` mapped to `None` and was excluded here too;
+//! it joins on the same identity-forward argument `fat_shared_ref` already makes for `&dyn`.
 //!
 //! A `&mut` SOURCE IS REFUSED BY CONJUNCTS 1 AND 3, NOT BY 4/5, and that is worth pinning because
 //! the natural reading is the opposite. Measured: `fat_shape` of a `&mut` container pointee is

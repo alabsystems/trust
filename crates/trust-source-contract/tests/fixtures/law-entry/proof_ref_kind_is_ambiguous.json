@@ -1,0 +1,745 @@
+{
+  "name": "proof_ref_kind_is_ambiguous",
+  "def_path": "trust_ir_laws::proof_ref_kind_is_ambiguous",
+  "span": {
+    "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+    "line_start": 514,
+    "col_start": 0,
+    "line_end": 526,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir::proof::obligations::ObligationKindShape",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Precondition",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Postcondition",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "LoopInvariant",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "TypeInvariant",
+                "discriminant": 3,
+                "fields": []
+              },
+              {
+                "name": "RefinementType",
+                "discriminant": 4,
+                "fields": []
+              },
+              {
+                "name": "TranslationValidation",
+                "discriminant": 5,
+                "fields": []
+              },
+              {
+                "name": "MemorySafety",
+                "discriminant": 6,
+                "fields": []
+              },
+              {
+                "name": "PanicFreedom",
+                "discriminant": 7,
+                "fields": []
+              },
+              {
+                "name": "TemporalSafety",
+                "discriminant": 8,
+                "fields": []
+              },
+              {
+                "name": "Liveness",
+                "discriminant": 9,
+                "fields": []
+              },
+              {
+                "name": "ArithmeticSafety",
+                "discriminant": 10,
+                "fields": []
+              },
+              {
+                "name": "BoundsCheck",
+                "discriminant": 11,
+                "fields": []
+              },
+              {
+                "name": "GiveBackRefinement",
+                "discriminant": 12,
+                "fields": []
+              },
+              {
+                "name": "Termination",
+                "discriminant": 13,
+                "fields": []
+              },
+              {
+                "name": "Ownership",
+                "discriminant": 14,
+                "fields": []
+              },
+              {
+                "name": "Custom",
+                "discriminant": 15,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "kind"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                1
+              ],
+              [
+                1,
+                2
+              ],
+              [
+                2,
+                3
+              ],
+              [
+                3,
+                4
+              ],
+              [
+                4,
+                5
+              ],
+              [
+                5,
+                6
+              ],
+              [
+                8,
+                7
+              ],
+              [
+                9,
+                8
+              ]
+            ],
+            "otherwise": 9,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+              "line_start": 515,
+              "col_start": 4,
+              "line_end": 515,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 515,
+                "col_start": 4,
+                "line_end": 515,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 10
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-ir-laws-boolean-contracts/crates/trust-ir-laws/src/lib.rs",
+                "line_start": 526,
+                "col_start": 1,
+                "line_end": 526,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 3
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 6
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 7
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 8
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 10
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 11
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 12
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 13
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 14
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_3",
+                "Int"
+              ]
+            },
+            {
+              "Int": 15
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

@@ -10,6 +10,7 @@ mod capabilities;
 mod engine;
 mod engines;
 mod evidence_policy;
+mod input_capture;
 mod native_trust_ir;
 mod policy;
 mod routing;
@@ -18,15 +19,28 @@ mod util;
 
 // --- Public surface re-exports preserving `trust_router::full_verification::*` ---
 pub use engine::{
-    FullVerificationEngine, FullVerificationRunWithFreshReceipts, LiveVerificationReceiptBatch,
+    CurrentKernelProofReplay, FullVerificationEngine, FullVerificationRunWithFreshReceipts,
+    LiveVerificationReceiptBatch,
 };
 pub use engines::{
     DEFAULT_PER_OBLIGATION_TIMEOUT_MS, NativeTrustMcTrustIrEngine, NativeTyEngine,
-    required_native_engines, required_native_engines_with_timeout_ms,
+    RefutationCompleteness, RefutationOnlyVerdict, required_native_engines,
+    required_native_engines_with_timeout_ms,
+};
+pub use input_capture::{
+    CapturedVerifierInputs, VERIFIER_INPUT_PAIRED_SUBDIRECTORY, VerifierInputCapture,
+    VerifierInputCaptureFile, decode_verifier_input_pair, encode_verifier_input_pair,
 };
 pub use native_trust_ir::{
-    DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt, NativeTrustIrBindingIndex,
-    trust_wp_native_replay_metadata_entries_for_request,
+    CheckedNativeWpProof, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
+    FreshWholeFunctionChcPdrReceipt, NATIVE_BUNDLE_REPLAY_FORMULA_REF_ENCODING,
+    NativeSourceReferenceFacts, NativeTrustIrBindingIndex,
+    rehydrate_native_bundle_transport_payload, trust_wp_native_replay_metadata_entries_for_request,
+};
+#[cfg(feature = "trust-build")]
+pub use native_trust_ir::{
+    NativeSourceReferenceFactsError, NativeSourceReferenceLoadFact,
+    NativeSourceReferenceParameterFact, NativeSourceReferenceValueFact,
 };
 pub use policy::{
     FullVerificationPolicy, TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY,
@@ -42,6 +56,8 @@ pub use run_result_ext::{
     FullVerificationNativeTrustIrEvidence, FullVerificationObligationEvidence,
     FullVerificationRunResultExt,
 };
+#[cfg(feature = "trust-build")]
+pub use trust_wp::trust_wp_native_formula_from_trust_spec;
 // Re-export the typed trust_wp metadata-key constants and helpers used by both
 // the public API and the in-tree integration tests.
 pub use trust_wp::{

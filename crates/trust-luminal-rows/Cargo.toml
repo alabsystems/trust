@@ -1,0 +1,58 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# trust-luminal-rows: the exits of the Luminal capability rows
+# (tests/luminal-domination/capabilities.json, docs/PLAN.md section 4) that
+# Trust meets by a test over trust-ir's PUBLIC API at Trust's own
+# first-party/trust-ir pin. Each row is one integration-test target of the
+# row's name; the row's `exit` runs it with
+#
+#     env TRUST_IR_REQUIRE_LEAN=1 targo --unverified test --locked \
+#         -p trust-luminal-rows --test <name>
+#
+# and the target prints `LUMINAL-ROW <id> PASS` as its last line only after
+# every check of the row has passed AND SemR's executable oracle (trust-ir's
+# lean/semr, built by `lake build semr_eval`) has agreed with the reference
+# interpreter on every run. Why the tests live here and not on trust-ir main:
+# a test added there is visible to the row only after Trust's trust-ir gitlink
+# moves to it, and trust-cg and clean pin trust-ir too (a pin train); the
+# SemR differential needs only `trust_ir::binary::serialize_module`, the
+# interpreter and the `semr_eval` executable, all reachable from here.
+
+[package]
+name = "trust-luminal-rows"
+description = "The Luminal capability rows Trust meets by a trust-ir test against SemR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# `binary` exposes the canonical wire codec: SemR reads the module's binary
+# image, never its text.
+trust-ir = { workspace = true, features = ["binary"] }
+trust-ir-build = { workspace = true }
+serde_json = { workspace = true }
+
+# One target per ledger row, each its own `main` (harness = false), so the
+# row's pass line is written once, after every check, and never while libtest
+# is still running other tests or printing a test name on the same line.
+[[test]]
+name = "gather"
+harness = false
+
+[[test]]
+name = "movements"
+harness = false
+
+[[test]]
+name = "pad_mask_iota"
+harness = false
+
+[[test]]
+name = "wrapping_family"
+harness = false

@@ -1364,7 +1364,7 @@ fn git_duplicate() {
         .with_stderr_data(str![[r#"
 [UPDATING] git repository `[ROOTURL]/a`
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] b v0.5.0 (registry `dummy-registry`)
 [ERROR] failed to sync
@@ -1393,6 +1393,9 @@ fn git_complex() {
 
                 [dependencies]
                 dep_b = { path = 'dep_b' }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -1413,6 +1416,9 @@ fn git_complex() {
                     [dependencies]
                     b = {{ git = '{}' }}
                     dep_a = {{ path = 'dep_a' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 git_b.url()
             ),
@@ -1434,6 +1440,9 @@ fn git_complex() {
 
                     [dependencies]
                     a = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 git_a.url()
             ),
@@ -1749,6 +1758,9 @@ fn config_instructions_works() {
                 dep = "0.1"
                 altdep = {{version="0.1", registry="alternative"}}
                 gitdep = {{git='{}'}}
+
+                [lints.cargo]
+                default = "allow"
                 "#,
                 git_project.url()
             ),
@@ -1847,7 +1859,7 @@ fn vendor_preserves_permissions() {
 
     p.cargo("vendor --respect-source-config").run();
 
-    let umask = cargo::util::get_umask();
+    let umask = targo::util::get_umask();
     let metadata = fs::metadata(p.root().join("vendor/bar/src/lib.rs")).unwrap();
     assert_eq!(metadata.mode() & 0o777, 0o644 & !umask);
     let metadata = fs::metadata(p.root().join("vendor/bar/example.sh")).unwrap();
@@ -1881,7 +1893,7 @@ fn no_remote_dependency_no_vendor() {
 
     p.cargo("vendor")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 There is no dependency to vendor in this project.
 
 "#]])
@@ -1908,6 +1920,9 @@ fn vendor_crate_with_ws_inherit() {
                 name = "bar"
                 version.workspace = true
                 edition = "2021"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -1925,6 +1940,9 @@ fn vendor_crate_with_ws_inherit() {
 
                     [dependencies]
                     bar = {{ git = '{}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 git.url()
             ),
@@ -2109,7 +2127,7 @@ fn vendor_rename_fallback() {
     Package::new("log", "0.3.5").publish();
 
     p.cargo("vendor --respect-source-config --no-delete")
-        .env("CARGO_LOG", "cargo::ops::vendor=warn")
+        .env("CARGO_LOG", "targo::ops::cargo_vendor=warn")
         .env("__CARGO_TEST_VENDOR_FALLBACK_CP_SOURCES", "true")
         .with_status(0)
         .with_stderr_data(str![[r#"
@@ -2162,7 +2180,7 @@ fn vendor_local_registry() {
 
     p.cargo("vendor --respect-source-config")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [UNPACKING] bar v0.0.0 (registry `[ROOT]/registry`)
    Vendoring bar v0.0.0 ([ROOT]/home/.cargo/registry/src/-[HASH]/bar-0.0.0) to vendor/bar
 To use vendored sources, add this to your .cargo/config.toml for this project:

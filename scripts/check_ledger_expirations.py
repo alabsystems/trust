@@ -22,11 +22,22 @@ Usage:
                                                             # a hypothetical
                                                             # release date
 
+WHICH TREE IS JUDGED (2026-09-28). With TRUST_PUSHED_REFS unset or empty (no
+push in flight) the ledgers on disk are read, as always. With it set (the
+pre-push hook exports git's `<local_ref> <local_sha> <remote_ref> <remote_sha>`
+lines) every distinct non-deletion pushed tree is judged from git objects on
+its own, after a `SUBJECT:` line naming the refs; the working tree is never
+read. There a walked ledger the pushed tree lacks is MISSING and fails, not an
+empty ledger, and one that cannot be read fails naming it. A push of deletions
+only prints `SKIPPED: ` and exits 0.
+
 Exit codes:
     0   all active entries valid
-    1   one or more entries expired (release gate fail)
+    1   one or more entries expired (release gate fail); in a push, also a
+        ledger the pushed tree lacks or that cannot be read from it
     2   warnings only (no entries expired, but some near expiration);
-        only emitted with --strict-warn
+        only emitted with --strict-warn. Also: a malformed TRUST_PUSHED_REFS
+        line, or push context in a directory git cannot read
 
 Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0
 """
@@ -35,6 +46,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -300,16 +314,20 @@ def parse_date(value: Any) -> date | None:
 
 
 def entry_is_active(entry: dict[str, Any]) -> bool:
-    """Only `status = "active"` entries count toward the gate.
+    """Only live, expiring entries count toward the gate.
 
-    Retired/superseded/etc. entries are historical and shouldn't trigger
-    expirations. If `status` is missing we assume active (conservative
-    — better to surface a missing-field issue than silently skip).
+    `status = "active"` is the live state in most ledgers; `status = "blocker"`
+    is divergence-audit.toml's live expiring state (its category-blocker rows
+    carry `expires_on` and must be renewed or resolved like any other live
+    row). Retired/resolved/superseded/etc. entries are historical and
+    shouldn't trigger expirations. If `status` is missing we assume active
+    (conservative — better to surface a missing-field issue than silently
+    skip).
     """
     status = entry.get("status")
     if status is None:
         return True
-    return str(status).lower() == "active"
+    return str(status).lower() in ("active", "blocker")
 
 
 def render_value(value: Any) -> str:
@@ -330,6 +348,17 @@ def load_toml(path: Path) -> dict[str, Any]:
             raise RuntimeError(TOML_PARSER_ERROR) from exc
 
     return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def toml_loads(text: str) -> dict[str, Any]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(TOML_PARSER_ERROR) from exc
+    return tomllib.loads(text)
 
 
 def classify(
@@ -353,6 +382,18 @@ def walk_ledger(
     if not path.exists():
         return []
     data = load_toml(path)
+    return walk_entries(path, data, list_key, id_field, as_of, warn_days)
+
+
+def walk_entries(
+    path: Path,
+    data: dict[str, Any],
+    list_key: str,
+    id_field: str,
+    as_of: date,
+    warn_days: int,
+) -> list[EntryStatus]:
+    """The active entries of one parsed ledger, reported under `path`."""
     entries = data.get(list_key) or []
     out: list[EntryStatus] = []
     for raw in entries:
@@ -395,12 +436,16 @@ def check_exemptions() -> list[str]:
             problems.append(f"{path.relative_to(REPO_ROOT)}: exempt file is missing")
             continue
         if "expires_on" in path.read_text(encoding="utf-8"):
-            problems.append(
-                f"{path.relative_to(REPO_ROOT)} carries `expires_on` but is exempt "
-                f"from this gate ({reason}). Either drop the expiry or move the file "
-                f"into LEDGERS; an expiring row nobody checks is worse than no row."
-            )
+            problems.append(exempt_with_expiry(path, reason))
     return problems
+
+
+def exempt_with_expiry(path: Path, reason: str) -> str:
+    return (
+        f"{path.relative_to(REPO_ROOT)} carries `expires_on` but is exempt "
+        f"from this gate ({reason}). Either drop the expiry or move the file "
+        f"into LEDGERS; an expiring row nobody checks is worse than no row."
+    )
 
 
 def same_day_clusters(report: Report, limit: int) -> list[tuple[date, int]]:
@@ -424,6 +469,17 @@ def same_day_clusters(report: Report, limit: int) -> list[tuple[date, int]]:
             continue
         counts[es.expires_on] = counts.get(es.expires_on, 0) + 1
     return sorted(((d, n) for d, n in counts.items() if n > limit), key=lambda t: t[0])
+
+
+def file_report(report: Report, statuses: list[EntryStatus]) -> None:
+    for es in statuses:
+        bucket = {
+            "expired": report.expired,
+            "expiring_soon": report.expiring_soon,
+            "ok": report.ok,
+            "no_expiry": report.no_expiry,
+        }[es.status]
+        bucket.append(es)
 
 
 def build_report(as_of: date, warn_days: int) -> Report:
@@ -517,6 +573,273 @@ def render_text(report: Report, as_of: date, warn_days: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ---------------------------------------------------------------------------
+# The push reading (TRUST_PUSHED_REFS set and non-empty).
+#
+# Everything above reads the ledgers on DISK, which judges the checkout, not the
+# push (docs/issues/2026-09-28-push-lanes-judge-the-checkout-not-the-push.md,
+# case L): a non-HEAD ref carrying an expired exception passed (`expired: 0`),
+# as did HEAD with the renewal uncommitted or the ledger deleted locally, and an
+# uncommitted expiry edit refused a clean push. In a push each distinct pushed
+# tree is judged from git objects on its own, with the same buckets, the same
+# text and the same exit rule. Two things are stricter than the disk reading,
+# on purpose: a walked ledger (or the exempt file) the pushed tree LACKS is
+# named MISSING and fails, where `walk_ledger` reads a missing path as an empty
+# ledger; and a ledger that cannot be read (not a regular file, not UTF-8, not
+# TOML) fails naming the path, where the disk reading dies in a traceback.
+# Deletions have no tree and are not judged; a push of deletions only prints
+# `SKIPPED: `. A malformed TRUST_PUSHED_REFS line is exit 2.
+# ---------------------------------------------------------------------------
+
+ZERO_SHA = re.compile(r"^0+$")
+HEX_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+REGULAR_FILE_MODES = ("100644", "100755")
+
+
+class PushContextError(Exception):
+    """The push context itself cannot be used (exit 2)."""
+
+
+class TreeReadError(Exception):
+    """One file of one pushed tree could not be read. Never a pass."""
+
+
+_GIT_ENV: dict[str, str] | None = None
+
+
+def git_env() -> dict[str, str]:
+    """The environment minus git's repository-local variables (GIT_DIR, ...).
+
+    A caller's stray GIT_DIR would point every read below at another object
+    store; git names its own list, so none is hard-coded here.
+    """
+    global _GIT_ENV
+    if _GIT_ENV is None:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            raise PushContextError(
+                f"`git rev-parse --local-env-vars` failed: {proc.stderr.strip()}"
+            )
+        local = set(proc.stdout.split())
+        _GIT_ENV = {k: v for k, v in os.environ.items() if k not in local}
+    return _GIT_ENV
+
+
+def run_git(args: list[str]) -> bytes:
+    proc = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *args], capture_output=True, env=git_env()
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise TreeReadError(f"`git {' '.join(args)}` failed (exit {proc.returncode}): {err}")
+    return proc.stdout
+
+
+def parse_pushed_refs(raw: str) -> list[tuple[str, str]]:
+    """(local_ref, local_sha) per `<local_ref> <local_sha> <remote_ref> <remote_sha>` line."""
+    pushed: list[tuple[str, str]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 4 or not HEX_SHA.match(fields[1]) or not HEX_SHA.match(fields[3]):
+            raise PushContextError(
+                f"malformed TRUST_PUSHED_REFS line {line!r}; expected "
+                "`<local_ref> <local_sha> <remote_ref> <remote_sha>`"
+            )
+        pushed.append((fields[0], fields[1]))
+    return pushed
+
+
+def read_tree_file(tree: str, rel: str) -> str | None:
+    """`rel` in `tree` as text; None when the tree has no such path."""
+    listing = run_git(["ls-tree", "-z", tree, "--", rel])
+    if not listing:
+        return None
+    meta, _, _name = listing.rstrip(b"\0").partition(b"\t")
+    mode, kind, sha = meta.decode("ascii", "replace").split()
+    if kind != "blob" or mode not in REGULAR_FILE_MODES:
+        raise TreeReadError(f"not a regular file in the pushed tree ({mode} {kind})")
+    try:
+        return run_git(["cat-file", "blob", sha]).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise TreeReadError(f"not UTF-8: {exc}") from exc
+
+
+@dataclass
+class TreeVerdict:
+    label: str
+    tree: str | None
+    report: Report = field(default_factory=Report)
+    missing: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
+    exemption_problems: list[str] = field(default_factory=list)
+
+
+def judge_tree(label: str, tree: str, as_of: date, warn_days: int) -> TreeVerdict:
+    verdict = TreeVerdict(label=label, tree=tree)
+    for path, list_key, id_field in LEDGERS:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        try:
+            text = read_tree_file(tree, rel)
+        except TreeReadError as exc:
+            verdict.unreadable.append(f"{rel}: {exc}")
+            continue
+        if text is None:
+            verdict.missing.append(rel)
+            continue
+        try:
+            data = toml_loads(text)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # the parser's own decode error, whichever parser
+            verdict.unreadable.append(f"{rel}: not TOML: {exc}")
+            continue
+        file_report(verdict.report, walk_entries(path, data, list_key, id_field, as_of, warn_days))
+    for path, reason in EXEMPT_LEDGERS:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        try:
+            text = read_tree_file(tree, rel)
+        except TreeReadError as exc:
+            verdict.unreadable.append(f"{rel}: {exc}")
+            continue
+        if text is None:
+            verdict.exemption_problems.append(f"{rel}: exempt file is missing")
+        elif "expires_on" in text:
+            verdict.exemption_problems.append(exempt_with_expiry(path, reason))
+    return verdict
+
+
+def judge_pushed(args: argparse.Namespace, as_of: date, raw: str) -> int:
+    pushed = parse_pushed_refs(raw)
+    live = [(ref, sha) for ref, sha in pushed if not ZERO_SHA.match(sha)]
+    deletions = len(pushed) - len(live)
+    if not live:
+        subject = f"the pushed trees (TRUST_PUSHED_REFS: {deletions} deletion(s), nothing else)"
+        if args.json:
+            json.dump({"subject": subject, "skipped": True, "trees": []}, sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(f"SUBJECT: {subject}")
+            print("SKIPPED: deletion(s) only, no tree pushed — nothing to judge")
+        return 0
+    try:
+        run_git(["rev-parse", "--git-dir"])
+    except TreeReadError as exc:
+        raise PushContextError(f"TRUST_PUSHED_REFS is set but {REPO_ROOT} is not a git repository: {exc}")
+
+    # One verdict per distinct tree; refs sharing a tree share its label.
+    groups: dict[str, list[str]] = {}
+    verdicts: list[TreeVerdict] = []
+    for ref, sha in live:
+        try:
+            tree = run_git(["rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}"]).decode().strip()
+        except TreeReadError:
+            verdicts.append(TreeVerdict(label=f"{ref} {sha[:12]}", tree=None, unreadable=[
+                f"pushed object {sha} does not name a tree here; a push this gate "
+                "cannot read is not a pass"
+            ]))
+            continue
+        groups.setdefault(tree, []).append(f"{ref} {sha[:12]}")
+    for tree, refs in groups.items():
+        verdicts.append(judge_tree(", ".join(refs), tree, as_of, args.warn_days))
+
+    names = ", ".join(v.label for v in verdicts)
+    extra = f"; {deletions} deletion(s) not judged" if deletions else ""
+    subject = f"the pushed trees (TRUST_PUSHED_REFS: {names}{extra}), not the working tree"
+
+    worst = 0
+    # FINDING KEYS (2026-10-24, docs/DECISION_QUEUE.md INHERITED-RED): each red
+    # cause that is a fact of the pushed tree and the date (an expired row, a
+    # row with no expiry, a ledger the tree lacks) prints `FINDING: <key>`;
+    # the others (an unreadable ledger, an exemption problem, an expiry cliff)
+    # are unkeyed, and `FINDINGS: complete` is printed only when there is none,
+    # so the pre-push hook never grades an unkeyed red as one main already has.
+    finding_keys: set[str] = set()
+    unkeyed = False
+    if args.json:
+        payload = {"subject": subject, "skipped": False, "trees": []}
+    else:
+        print(f"SUBJECT: {subject}")
+    for verdict in verdicts:
+        report = verdict.report
+        clusters = same_day_clusters(report, args.max_same_day)
+        failed = bool(
+            report.expired or report.no_expiry or clusters or verdict.missing
+            or verdict.unreadable or verdict.exemption_problems
+        )
+        if failed:
+            worst = 1
+            for es in report.expired:
+                finding_keys.add(
+                    f"EXPIRED {es.ledger.relative_to(REPO_ROOT)} {es.entry_id} {es.expires_on}"
+                )
+            for es in report.no_expiry:
+                finding_keys.add(f"NO-EXPIRY {es.ledger.relative_to(REPO_ROOT)} {es.entry_id}")
+            for rel in verdict.missing:
+                finding_keys.add(f"MISSING {rel}")
+            if clusters or verdict.unreadable or verdict.exemption_problems:
+                unkeyed = True
+        elif args.strict_warn and report.expiring_soon and worst == 0:
+            worst = 2
+        tree12 = verdict.tree[:12] if verdict.tree else "unresolved"
+        if args.json:
+            payload["trees"].append({
+                "refs": verdict.label,
+                "tree": verdict.tree,
+                "missing_ledgers": verdict.missing,
+                "unreadable_ledgers": verdict.unreadable,
+                "exemption_problems": verdict.exemption_problems,
+                "report": report.as_dict(),
+            })
+        else:
+            print()
+            print(f"=== {verdict.label} (tree {tree12}) ===")
+            if verdict.tree is not None:
+                sys.stdout.write(render_text(report, as_of, args.warn_days))
+            if verdict.missing:
+                print("")
+                print("MISSING — ledgers this gate walks that the pushed tree lacks "
+                      "(an absent ledger is not an empty one):")
+                for rel in verdict.missing:
+                    print(f"  • {rel}")
+                print("Remediation: restore the ledger, or retire it from LEDGERS in "
+                      "scripts/check_ledger_expirations.py in the same commit.")
+            if verdict.unreadable:
+                print("")
+                print("UNREADABLE — a ledger this gate cannot read is not a pass:")
+                for problem in verdict.unreadable:
+                    print(f"  • {problem}")
+        sys.stdout.flush()
+        if verdict.exemption_problems:
+            print(f"EXEMPT LEDGER NO LONGER EXEMPT ({verdict.label}):", file=sys.stderr)
+            for problem in verdict.exemption_problems:
+                print(f"  {problem}", file=sys.stderr)
+        if clusters:
+            print(f"EXPIRY CLIFF ({verdict.label}) — too many active rows share one date:",
+                  file=sys.stderr)
+            for when, count in clusters:
+                print(
+                    f"  {when.isoformat()}: {count} entries (limit {args.max_same_day}). "
+                    f"On that date every push blocks until all {count} are reviewed, which "
+                    f"is how a batch gets renewed unexamined. Stagger them by cluster, each "
+                    f"with its own review question.",
+                    file=sys.stderr,
+                )
+    if args.json:
+        json.dump(payload, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+    elif worst == 1:
+        print()
+        for key in sorted(finding_keys):
+            print(f"FINDING: {key}")
+        if finding_keys and not unkeyed:
+            print("FINDINGS: complete")
+    return worst
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -566,6 +889,16 @@ def main() -> int:
     if as_of is None:
         print(f"error: invalid --as-of value: {args.as_of!r}", file=sys.stderr)
         return 1
+    raw = os.environ.get("TRUST_PUSHED_REFS", "")
+    if raw.strip():
+        try:
+            return judge_pushed(args, as_of, raw)
+        except PushContextError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except RuntimeError as exc:
+            print(exc, file=sys.stderr)
+            return 1
     try:
         report = build_report(as_of, args.warn_days)
     except RuntimeError as exc:

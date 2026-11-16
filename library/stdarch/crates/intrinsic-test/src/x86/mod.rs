@@ -32,6 +32,8 @@ impl SupportedArchitecture for X86 {
 "#;
     const RUST_PRELUDE: &str = RUST_PRELUDE;
 
+    const C_NAME_PREFIX: &str = "";
+
     fn c_compiler_flags(&self, _cli_options: &ProcessedCli) -> Vec<&str> {
         vec![
             "-maes",
@@ -98,6 +100,10 @@ impl SupportedArchitecture for X86 {
             .collect::<Vec<_>>();
 
         Self { intrinsics }
+    }
+
+    fn predicate_function(_: u32) -> String {
+        unimplemented!("no scalable vectors on x86")
     }
 }
 

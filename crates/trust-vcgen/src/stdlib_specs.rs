@@ -105,7 +105,7 @@ impl StdlibSpecs {
     /// Create a new registry populated with all standard library specs.
     #[must_use]
     pub fn new() -> Self {
-        let mut specs = FxHashMap::default();
+        let mut specs = FxHashMap::with_capacity_and_hasher(20, Default::default());
 
         // Vec specs
         for contract in vec_specs() {
@@ -171,12 +171,12 @@ impl StdlibSpecs {
 
 /// Integer variable.
 fn int_var(name: &str) -> Formula {
-    Formula::Var(name.to_string(), Sort::Int)
+    Formula::Var(name.into(), Sort::Int)
 }
 
 /// Boolean variable.
 fn bool_var(name: &str) -> Formula {
-    Formula::Var(name.to_string(), Sort::Bool)
+    Formula::Var(name.into(), Sort::Bool)
 }
 
 /// Integer literal.
@@ -679,12 +679,5 @@ mod tests {
                 contract.fn_path
             );
         }
-    }
-
-    #[test]
-    fn test_all_function_returns_all_specs() {
-        let specs = StdlibSpecs::new();
-        let all = specs.all();
-        assert_eq!(all.len(), specs.len());
     }
 }

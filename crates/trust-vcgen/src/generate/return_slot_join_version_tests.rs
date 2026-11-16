@@ -13,23 +13,12 @@
 //! clause was a refutable query over a FREE return value, and the
 //! "counterexample" was a model of that formula about nothing.
 //!
-//! `unify_return_slot_versions` exists to bridge exactly this gap, but its pin
-//! finder (`return_slot_pin_version`) collected Eq-LHS names from EVERYWHERE in
-//! the formula — including the negated clause itself. An Eq-SHAPED ensures
-//! (`result == …`) therefore always contributed its own `_0#<merged>` name, the
-//! pin set looked ambiguous ({`_0#s1_0`, `_0#s1_0_s2_0`}), and the unifier
-//! bailed. A non-Eq clause (`result >= a`) never tripped this, which is why the
-//! defect looked specific to the bool-conjunction RHS shape: `&&` both makes
-//! the clause Eq-shaped in practice AND lowers to the two-write diamond.
+//! The result read is now stamped at the exact per-predecessor return point
+//! before body facts are combined. Pin shape no longer decides which value the
+//! clause reads, and historical return-slot reads keep their own identities.
 //!
-//! THE FIX: `return_slot_pin_version` is spine-only, exactly like its sibling
-//! `formula_has_return_slot_pin` ("an equality inside the negated clause is the
-//! obligation, not a pin").
-//!
-//! Every case runs in BOTH directions: the TRUE clause must CONNECT (share one
-//! return-slot name with the pin), and its FALSE twin must connect the same way
-//! — discrimination is the solver's job, and a twin that connects to the
-//! genuine pinned value stays refutable from that value.
+//! Every case runs in BOTH directions: the TRUE clause must CONNECT to the
+//! genuine return value, and its FALSE twin must stay refutable.
 
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Rvalue, Sort,
@@ -112,7 +101,11 @@ fn bool_conj_diamond(clause: Formula) -> VerifiableFunction {
                     vec![assign(Place::local(0), cmp_x(BinOp::Le, 127))],
                     Terminator::Goto(BlockId(3)),
                 ),
-                block(2, vec![assign(Place::local(0), bool_const(false))], Terminator::Goto(BlockId(3))),
+                block(
+                    2,
+                    vec![assign(Place::local(0), bool_const(false))],
+                    Terminator::Goto(BlockId(3)),
+                ),
                 block(3, vec![], Terminator::Return),
             ],
             arg_count: 1,
@@ -123,6 +116,7 @@ fn bool_conj_diamond(clause: Formula) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![clause],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -229,6 +223,7 @@ fn straightline_eq_clause_stays_connected() {
             Box::new(Formula::Int(0)),
         ))],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let found: Vec<Formula> = generate_v2_contract_vcs_impl(&f, None)
         .into_iter()
@@ -367,41 +362,4 @@ fn bool_conj_true_clause_is_unsat_and_false_twin_stays_sat() {
         sat_rows > 0,
         "the false twin must remain refutable — unification must never credit a clause"
     );
-}
-
-/// Pin-finder unit contract: the negated clause's own equality is the
-/// OBLIGATION, not a pin — it must neither be returned as the pin version nor
-/// make a genuine spine pin look ambiguous.
-#[test]
-fn negated_clause_equality_is_not_a_pin() {
-    use super::contract_vcs::return_slot_pin_version;
-    let spine_pin = Formula::Eq(
-        Box::new(Formula::Var("_0#s1_0".into(), Sort::Bool)),
-        Box::new(Formula::Le(Box::new(x_var()), Box::new(Formula::Int(127)))),
-    );
-    let negated_clause = Formula::Not(Box::new(Formula::Eq(
-        Box::new(Formula::Var("_0#s1_0_s2_0".into(), Sort::Bool)),
-        Box::new(range_conj()),
-    )));
-    let formula = Formula::And(vec![spine_pin, negated_clause.clone()]);
-    assert_eq!(
-        return_slot_pin_version(&formula).as_deref(),
-        Some("_0#s1_0"),
-        "the spine pin is unique; the clause's Eq under Not must not shadow it"
-    );
-    // With NO spine pin there is nothing to unify onto: the clause's own
-    // equality must never be promoted into a rename target.
-    assert_eq!(return_slot_pin_version(&negated_clause), None);
-    // TWO distinct spine pins stay ambiguous (never over-unify unsoundly).
-    let two_pins = Formula::And(vec![
-        Formula::Eq(
-            Box::new(Formula::Var("_0#s1_0".into(), Sort::Bool)),
-            Box::new(Formula::Bool(true)),
-        ),
-        Formula::Eq(
-            Box::new(Formula::Var("_0#s2_0".into(), Sort::Bool)),
-            Box::new(Formula::Bool(false)),
-        ),
-    ]);
-    assert_eq!(return_slot_pin_version(&two_pins), None);
 }

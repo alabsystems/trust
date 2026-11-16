@@ -4,6 +4,8 @@
 // interprocedural facts that let a caller's VC avoid re-analysing the callee.
 
 use super::*;
+
+mod monotone_counter;
 // ======================================================================
 // Loop-invariant min/max facts (`let n = a.min(b); for i in 0..n { … }`)
 // ======================================================================
@@ -33,60 +35,478 @@ use super::*;
 /// [`crate::local_defs::is_parameter`], the one authority on the entry definition.
 pub(super) use crate::local_defs::is_parameter;
 
+/// One write the body makes to a PARAMETER's OWN storage: the parameter local
+/// (`1..=arg_count`) it reaches, and the formula name of the place written. See
+/// [`rebound_parameter_places`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParameterRebind {
+    /// The parameter local whose storage the write reaches.
+    pub parameter: usize,
+    /// [`place_to_var_name`] of the written place when that place is the parameter
+    /// itself or a chain of `Field` projections below it; otherwise the name of the
+    /// WHOLE parameter, which every name rooted at it overlaps (fail-closed).
+    pub place_name: String,
+}
+
+/// Trust (2026-10-03, KNOWN_HAZARDS R-c): THE ONE AUTHORITY on which places of a
+/// PARAMETER's own storage the body writes. A spec-surface `ensures` names a by-value
+/// parameter's ENTRY value (E2/D2, docs/design/2026-07-09-two-language-spec-surface.md),
+/// but the postcondition VC reads every name at the RETURN block, where the version
+/// oracle binds a written place to its FINAL value. Each write listed here is a place
+/// whose exit value an `ensures` read of it would silently take instead of the entry
+/// value. Two consumers ask it, so they cannot disagree:
+///
+///  * vcgen's `postcondition_references_mutated_param`, which fail-closes a clause that
+///    names one of these places to a bare `Not(post)`;
+///  * the compiler's typed-CHC attestation (`typed_chc_rebound_parameters` in
+///    `rustc_mir_transform/src/trust_verify.rs`), which must not read that placeholder
+///    as an exact payload over the parameter's entry value.
+///
+/// The channel WALK counts a write when its place, either as spelled or as
+/// `canonical_place` folds it (the storage the version oracle names it by — `*p` for
+/// `p = &mut s.a` folds to `s.a`), is rooted at a parameter and does not go through a
+/// `Deref` of a reference or raw pointer (a parameter declared
+/// `&T`/`&mut T`/`*const T`/`*mut T`, or a reference held in one of its fields, such as
+/// `Pin<&mut T>`'s). The channels:
+///
+///  * `Assign` destination, `SetDiscriminant`, `Deinit`, a `Call` destination, and an
+///    atomic call's accessed place and result place;
+///  * a `&mut` borrow (`Rvalue::Ref { mutable: true }`) of such a place: the borrow is
+///    where the alias is minted, and a later `*p = v` names a different local. Named by
+///    the borrowed place, because a reference cannot reach outside its referent;
+///  * a raw address-of (`&raw const`/`&raw mut`) of such a place: named as the WHOLE
+///    parameter, because pointer arithmetic can leave the field it was taken of. So is a
+///    place named by an `Rvalue::Unsupported` operand: the extractor lowers a mutable
+///    `Reborrow` of a user ADT to one (an alias not spelled as a `Ref`);
+///  * `Statement::Unsupported`, `Terminator::Opaque` and any statement or terminator
+///    variant this walk does not know: a write with no destination place, so EVERY
+///    parameter is named whole. (The first two already fail the body closed with an
+///    `UnsupportedMir` row.)
+///
+/// UNIONED with the `local_defs` seam (from `7f118dfc1f`, which closed the same field-store
+/// hole in vcgen independently): every parameter that
+/// `local_defs::body_is_single_static_assignment_modulo_pointee_borrows` rejects is
+/// named WHOLE as well. A parameter keeps its entry value at every program point when it
+/// is single-static-assignment: its only definition the entry, no partial write, no
+/// mutable alias of its own storage, no unlocatable write. The union only ever ADDS
+/// entries, so it is never weaker than either half. Neither half contains the other:
+///
+///  * only the walk sees a store through an owned `Box` (`LocalWrite::of_place` treats
+///    every `Deref`-first place as untouched), an atomic call's accessed place, an
+///    `Rvalue::Unsupported` operand, and a `canonical_place` fold;
+///  * only the seam sees a `Drop` of the parameter (a partial write: a custom `Drop::drop`
+///    takes `&mut self`), `Statement::Intrinsic` and `CopyNonOverlapping` (an unlocatable
+///    write, charged to every parameter), and a store through a reference HELD IN A FIELD
+///    (`(*(self.pointer)).x = ..` for `self: Pin<&mut S>`): `of_place` counts any place
+///    whose FIRST projection is not a `Deref` as a partial write of its root. The seam
+///    also names whole what the walk names per place, so after `s.b = ..` a clause over
+///    `s.a` is fail-closed too. Each of these costs proofs (DECISION_QUEUE R-c); the
+///    walk's own reasons for leaving the first three out are kept below.
+///
+/// The seam's POINTEE-borrow variant is the one the union asks, because a `&mut` borrow
+/// reached THROUGH the parameter (`reset(&mut (*self).s)`) addresses the pointee and
+/// cannot rebind the parameter itself. The strict variant marked a `&mut self` parameter
+/// rebound, and the fail-closed shortcut then turned a correct `ensures
+/// !self.s.detached` into a refutation with a counterexample
+/// (`chc-entry-inputs/wedge_refutation_attests.rs`). It draws the same line as the walk's
+/// `Deref` exclusion for a reference PARAMETER.
+///
+/// What the WALK does not count, and why each is not a write of the entry value (the seam
+/// half still counts the `Pin` case of the first, and the second and third, as listed
+/// above):
+///
+///  * a store THROUGH a reference or raw pointer (`(*self).x = ..` for `self: &mut S`,
+///    `(*(self.pointer)).x = ..` for `self: Pin<&mut S>`). It changes the pointee, which
+///    the caller owns. The unprimed pointee name in an `ensures` reads that pointee at
+///    EXIT on purpose until the PD-15 flip (docs/DECISION_QUEUE.md PD-15; pinned by
+///    `tests/ui/trust/d2-primes/wedge_primed.rs`). A `Box` is owned and is not excluded:
+///    a store through one counts (whole), and so does a `Deref` of a place whose type
+///    cannot be resolved.
+///  * `Statement::Intrinsic` (today only `assume`, which writes nothing) and
+///    `CopyNonOverlapping`, which writes through a POINTER operand. A pointer into a
+///    parameter's storage exists only after a borrow or address-of of a place rooted at
+///    it, which this walk records at the borrow.
+///  * `Terminator::Drop`: drop glue mints no defined value, so the version oracle cannot
+///    bind a later read to a value the body chose.
+///  * a shared borrow (`&s.c`). A write through it needs interior mutability; an
+///    `ensures` cannot spell an `UnsafeCell`'s contents today. The seam does not count
+///    it either. A residual, recorded in KNOWN_HAZARDS R-c.
+pub fn rebound_parameter_places(func: &VerifiableFunction) -> Vec<ParameterRebind> {
+    if func.body.arg_count == 0 {
+        return Vec::new();
+    }
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
+    let _func_scope = super::FuncAnalysisScope::enter(func);
+    let mut out: Vec<ParameterRebind> = Vec::new();
+    let mut whole_rebound: Vec<bool> = vec![false; func.body.arg_count + 1];
+    let every_parameter = |out: &mut Vec<ParameterRebind>, whole_rebound: &mut [bool]| {
+        for parameter in 1..=func.body.arg_count {
+            if whole_rebound.get(parameter).copied() == Some(true) {
+                continue;
+            }
+            if let Some(slot) = whole_rebound.get_mut(parameter) {
+                *slot = true;
+            }
+            push_rebind(
+                out,
+                ParameterRebind {
+                    parameter,
+                    place_name: place_to_var_name(func, &Place::local(parameter)),
+                },
+            );
+        }
+    };
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Statement::Assign { place, rvalue, .. } => {
+                    note_parameter_write(func, place, true, &mut out, &mut whole_rebound);
+                    match rvalue {
+                        Rvalue::Ref { mutable: true, place: borrowed } => {
+                            note_parameter_write(
+                                func,
+                                borrowed,
+                                true,
+                                &mut out,
+                                &mut whole_rebound,
+                            );
+                        }
+                        Rvalue::AddressOf(_, borrowed) => {
+                            note_parameter_write(
+                                func,
+                                borrowed,
+                                false,
+                                &mut out,
+                                &mut whole_rebound,
+                            );
+                        }
+                        Rvalue::Unsupported { operands, .. } => {
+                            for operand in operands {
+                                if let Operand::Copy(named) | Operand::Move(named) = operand {
+                                    note_parameter_write(
+                                        func,
+                                        named,
+                                        false,
+                                        &mut out,
+                                        &mut whole_rebound,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
+                    note_parameter_write(func, place, true, &mut out, &mut whole_rebound);
+                }
+                Statement::Unsupported { .. } => every_parameter(&mut out, &mut whole_rebound),
+                Statement::Intrinsic { .. }
+                | Statement::CopyNonOverlapping { .. }
+                | Statement::StorageLive(_)
+                | Statement::StorageDead(_)
+                | Statement::Retag { .. }
+                | Statement::PlaceMention(_)
+                | Statement::Coverage
+                | Statement::ConstEvalCounter
+                | Statement::Nop => {}
+                // `Statement` is `#[non_exhaustive]`: a variant added after this walk was
+                // written may write a place it does not show here. Fail closed.
+                _ => every_parameter(&mut out, &mut whole_rebound),
+            }
+        }
+        match &block.terminator {
+            Terminator::Call { dest, atomic, .. } => {
+                note_parameter_write(func, dest, true, &mut out, &mut whole_rebound);
+                if let Some(atomic) = atomic {
+                    note_parameter_write(func, &atomic.place, true, &mut out, &mut whole_rebound);
+                    if let Some(atomic_dest) = &atomic.dest {
+                        note_parameter_write(
+                            func,
+                            atomic_dest,
+                            true,
+                            &mut out,
+                            &mut whole_rebound,
+                        );
+                    }
+                }
+            }
+            Terminator::TailCall { atomic, .. } => {
+                if let Some(atomic) = atomic {
+                    note_parameter_write(func, &atomic.place, true, &mut out, &mut whole_rebound);
+                    if let Some(atomic_dest) = &atomic.dest {
+                        note_parameter_write(
+                            func,
+                            atomic_dest,
+                            true,
+                            &mut out,
+                            &mut whole_rebound,
+                        );
+                    }
+                }
+            }
+            Terminator::Opaque { .. } => every_parameter(&mut out, &mut whole_rebound),
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Drop { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => {}
+            // `Terminator` is `#[non_exhaustive]`; same fail-closed rule as above.
+            _ => every_parameter(&mut out, &mut whole_rebound),
+        }
+    }
+    // SOUNDNESS (2026-10-03, KNOWN_HAZARDS R-c; the `local_defs` half, from `7f118dfc1f`):
+    // `fn setf(mut p: Pair) -> u32 ensures result == p.a { p.a = p.a.wrapping_add(5); p.a }`
+    // exited 0 under `certify` with both postcondition rows proved, the clause's `p.0` read
+    // at `p.0#s1_0` (after the store) instead of `p.0#e`. Ask the seam instead of
+    // re-deriving it, and union its answer with the walk: a parameter that is not
+    // single-static-assignment modulo pointee borrows is named WHOLE. See the doc above
+    // for what each half sees that the other does not.
+    for parameter in 1..=func.body.arg_count {
+        if whole_rebound.get(parameter).copied() == Some(true) {
+            continue;
+        }
+        if is_parameter(func, parameter)
+            && !crate::local_defs::body_is_single_static_assignment_modulo_pointee_borrows(
+                &func.body, parameter,
+            )
+        {
+            if let Some(slot) = whole_rebound.get_mut(parameter) {
+                *slot = true;
+            }
+            push_rebind(
+                &mut out,
+                ParameterRebind {
+                    parameter,
+                    place_name: place_to_var_name(func, &Place::local(parameter)),
+                },
+            );
+        }
+    }
+    out
+}
+
+fn push_rebind(out: &mut Vec<ParameterRebind>, rebind: ParameterRebind) {
+    if !out.contains(&rebind) {
+        out.push(rebind);
+    }
+}
+
+/// Record `place` in `out` when it reaches a parameter's own storage, as written or as
+/// [`crate::canonical_place`] folds it. `nameable` is false for a raw address-of (and an
+/// unsupported rvalue's operand), whose pointer is not confined to the place it names.
+fn note_parameter_write(
+    func: &VerifiableFunction,
+    place: &Place,
+    nameable: bool,
+    out: &mut Vec<ParameterRebind>,
+    whole_rebound: &mut [bool],
+) {
+    if let Some((rebind, is_whole)) = parameter_rebind_of(func, place, nameable, whole_rebound) {
+        if is_whole && let Some(slot) = whole_rebound.get_mut(rebind.parameter) {
+            *slot = true;
+        }
+        push_rebind(out, rebind);
+    }
+    // A whole local canonicalizes to itself (`canonicalize_deref` folds only a leading
+    // `Deref`, `base_value_alias` only a projected place), so only a projected place can
+    // fold onto a parameter's storage. Skipping the rest keeps the walk linear on the
+    // temporaries that make up most destinations.
+    if !place.projections.is_empty() {
+        let canonical = crate::canonical_place(func, place);
+        if canonical != *place
+            && let Some((rebind, is_whole)) =
+                parameter_rebind_of(func, &canonical, nameable, whole_rebound)
+        {
+            if is_whole && let Some(slot) = whole_rebound.get_mut(rebind.parameter) {
+                *slot = true;
+            }
+            push_rebind(out, rebind);
+        }
+    }
+}
+
+/// True iff `place` goes through a `Deref` of a reference or raw pointer: the type of the
+/// prefix before its FIRST `Deref` is `&T`/`&mut T`/`*const T`/`*mut T`. A write there
+/// lands in memory the place's root does not own. An unresolvable prefix type answers
+/// `false` (the write is then counted: fail-closed).
+fn deref_reaches_borrowed_memory(func: &VerifiableFunction, place: &Place) -> bool {
+    let Some(first_deref) = place.projections.iter().position(|p| *p == Projection::Deref) else {
+        return false;
+    };
+    matches!(
+        crate::place_prefix_ty_cow(func, place.local, &place.projections[..first_deref]).as_deref(),
+        Some(Ty::Ref { .. } | Ty::RawPtr { .. })
+    )
+}
+
+fn parameter_rebind_of(
+    func: &VerifiableFunction,
+    place: &Place,
+    nameable: bool,
+    whole_rebound: &[bool],
+) -> Option<(ParameterRebind, bool)> {
+    if !is_parameter(func, place.local) {
+        return None;
+    }
+    let fields_only = place.projections.iter().all(|p| matches!(p, Projection::Field(_)));
+    let is_whole = place.projections.is_empty() || !nameable || !fields_only;
+    if is_whole && whole_rebound.get(place.local).copied() == Some(true) {
+        return None;
+    }
+    // A store through a reference or raw pointer writes the caller's object, not the
+    // parameter: out of scope (PD-15, see `rebound_parameter_places`).
+    if deref_reaches_borrowed_memory(func, place) {
+        return None;
+    }
+    let place_name = if !is_whole {
+        place_to_var_name(func, place)
+    } else {
+        place_to_var_name(func, &Place::local(place.local))
+    };
+    Some((ParameterRebind { parameter: place.local, place_name }, is_whole))
+}
+
 /// SOUNDNESS (P0 false proof, 2026-06-17 hunt-6): true when a `#[ensures]` postcondition
-/// references a by-value PARAMETER that the body REASSIGNS. The v2 postcondition VC binds the
+/// names a place of a PARAMETER that the body WRITES. The v2 postcondition VC binds the
 /// parameter to its RETURN-block (final, mutated) value via the path/block defs, but the
 /// `ensures` semantics snapshot the parameter's ENTRY value (`move |r| *r == a` captures `a` at
 /// entry). For `#[ensures(move |r| *r == a)] fn f(mut a:u32){ a = a.wrapping_add(1); a }` the VC
 /// checks `r == a_final` (11==11 → vacuously PROVED) while the true `r == a_entry` (11==10) is
 /// FALSE — a default-mode false proof (FULL fail-closes soundly). The caller FAIL-CLOSES on this
 /// (does not credit the proof) until proper entry-snapshot modeling lands.
+///
+/// hunt-15 Class B added the `&mut a` / `&raw mut a` borrow channel (`let p=&mut a; *p=..`,
+/// `mem::replace(&mut a, k)`, a helper `bump(&mut a)`): the store's place is `*p`, invisible
+/// to a scan of `a`'s own writes.
+///
+/// Trust (2026-10-03, KNOWN_HAZARDS R-c): both scans used to see only WHOLE-local writes, so a
+/// write to a FIELD of a by-value parameter slipped through. `fn z(mut s: S) -> u8 ensures s.a
+/// == 0 { s.a = 0; 1 }` was proved and kernel-certified under `-Ztrust-policy=certify`: the VC
+/// read `s.0` at its exit version, defined `== 0`. (`7f118dfc1f` closed the same hole here
+/// independently, for `fn setf(mut p: Pair) -> u32 ensures result == p.a`, by asking the
+/// `local_defs` seam; the two fixes are now one predicate.) The written places now come from
+/// [`rebound_parameter_places`], the one predicate the compiler's typed-CHC attestation also
+/// asks. A clause is fail-closed when one of its names overlaps a written place
+/// ([`dest_write_rebinds`]: equal, ancestor or descendant, symbolic-index alias, or the derived
+/// `__slice_len` of a reseated place). The walk's per-place names alone would leave a clause
+/// over `s.a` provable after `s.b = ..`, but the seam half of the union names a non-SSA
+/// parameter WHOLE, so today every write to a by-value parameter's own storage fail-closes
+/// every clause that names that parameter (a capability cost, DECISION_QUEUE R-c).
+pub(super) struct MutatedParamPlaces {
+    reassigned: FxHashSet<String>,
+    rebinds: Vec<ParameterRebind>,
+}
+
+impl MutatedParamPlaces {
+    pub(super) fn of(func: &VerifiableFunction) -> Self {
+        if func.body.arg_count == 0 {
+            return Self { reassigned: FxHashSet::default(), rebinds: Vec::new() };
+        }
+        let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
+        let _func_scope = super::FuncAnalysisScope::enter(func);
+        // Merge 2026-10-14: the local whole-parameter scan (review round 44: a field or
+        // element write of a by-value parameter, a non-`Deref` `&mut`/raw borrow, a call
+        // destination) is kept beside upstream's one authority and the clause is
+        // fail-closed when EITHER names it; the two were measured independently.
+        let mut reassigned: FxHashSet<String> = FxHashSet::default();
+        let mut seen_locals: FxHashSet<usize> = FxHashSet::default();
+        let mut note = |func: &VerifiableFunction, local: usize| -> bool {
+            if is_parameter(func, local) && seen_locals.insert(local) {
+                reassigned.insert(crate::place_to_var_name(func, &Place::local(local)));
+            }
+            seen_locals.len() == func.body.arg_count
+        };
+        'blocks: for block in &func.body.blocks {
+            for stmt in &block.stmts {
+                if let Statement::Assign { place, rvalue, .. } = stmt {
+                    // Review round 44: a write to a FIELD or element of a by-value
+                    // parameter (`s.a = 0`, `s.0 += 1`) changes what `ensures .. s.a`
+                    // reads at the return as surely as a whole write; only a write
+                    // THROUGH a reference parameter (`Deref` first) leaves the parameter
+                    // itself alone.
+                    if !matches!(place.projections.first(), Some(Projection::Deref))
+                        && note(func, place.local)
+                    {
+                        break 'blocks;
+                    }
+                    // SOUNDNESS (P0 false proof, 2026-06-17 hunt-15 Class B): a parameter
+                    // MUTABLY BORROWED (`&mut a` / `&raw mut a`) can be reassigned through the
+                    // borrow AFTER the entry snapshot — `let p=&mut a; *p=..` (the store's place
+                    // is `*p`, invisible to the whole-local scan above), `mem::replace(&mut a, k)`,
+                    // `mem::swap(&mut a, &mut other)`, or a helper `bump(&mut a)`. The `ensures`
+                    // captures `a` at ENTRY (`move |r| *r == a`) but the body returns the MUTATED
+                    // value, so `r == a_final` vacuously PROVES while the true `r == a_entry` is
+                    // false. The hunt-6 whole-local-reassign scan misses this &mut/AddressOf vector
+                    // exactly as the bounds lane did (hunt-5). Flag the borrowed param so the caller
+                    // fail-closes (does not credit the postcondition). Mirrors
+                    // `value_local_is_unstable` / `is_single_static_assignment`'s kill-on-Ref.
+                    if let Rvalue::Ref { mutable: true, place: bp } | Rvalue::AddressOf(_, bp) =
+                        rvalue
+                        && !matches!(bp.projections.first(), Some(Projection::Deref))
+                        && note(func, bp.local)
+                    {
+                        break 'blocks;
+                    }
+                }
+            }
+            if let Terminator::Call { dest, .. } = &block.terminator
+                && !matches!(dest.projections.first(), Some(Projection::Deref))
+                && note(func, dest.local)
+            {
+                break 'blocks;
+            }
+        }
+        // Trust (2026-10-03, KNOWN_HAZARDS R-c): ONE authority, asked here and by the
+        // compiler's typed-CHC twin. The whole-local scan that used to live here (hunt-6's
+        // whole-local `Assign`, hunt-15 Class B's whole `&mut` / raw borrow, the whole `Call`
+        // destination) is a subset of BOTH halves of `rebound_parameter_places`: of its
+        // channel walk (each is a write of a place rooted at the parameter with no `Deref`),
+        // and of the `local_defs` non-SSA test the walk is unioned with (a whole write is a
+        // second whole value, a whole borrow an escape of the parameter's own storage). It is
+        // not kept as a third copy.
+        let rebinds = rebound_parameter_places(func);
+        Self { reassigned, rebinds }
+    }
+
+    pub(super) fn references(&self, post: &Formula) -> bool {
+        if self.rebinds.is_empty() && self.reassigned.is_empty() {
+            return false;
+        }
+        trust_types::any_formula_node(post, &mut |node| {
+            node.var_name().is_some_and(|v| {
+                self.reassigned.contains(v)
+                    || self.rebinds.iter().any(|rebind| dest_write_rebinds(&rebind.place_name, v))
+                    || self.reassigned.iter().any(|n| write_rebinds(n, v))
+            })
+        })
+    }
+}
+
 pub(super) fn postcondition_references_mutated_param(
     func: &VerifiableFunction,
     post: &Formula,
 ) -> bool {
-    let mut reassigned: FxHashSet<String> = FxHashSet::default();
-    let mut note = |func: &VerifiableFunction, local: usize| {
-        if is_parameter(func, local) {
-            reassigned.insert(place_to_var_name(func, &Place { local, projections: vec![] }));
-        }
-    };
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt {
-                if place.projections.is_empty() {
-                    note(func, place.local);
-                }
-                // SOUNDNESS (P0 false proof, 2026-06-17 hunt-15 Class B): a parameter
-                // MUTABLY BORROWED (`&mut a` / `&raw mut a`) can be reassigned through the
-                // borrow AFTER the entry snapshot — `let p=&mut a; *p=..` (the store's place
-                // is `*p`, invisible to the whole-local scan above), `mem::replace(&mut a, k)`,
-                // `mem::swap(&mut a, &mut other)`, or a helper `bump(&mut a)`. The `ensures`
-                // captures `a` at ENTRY (`move |r| *r == a`) but the body returns the MUTATED
-                // value, so `r == a_final` vacuously PROVES while the true `r == a_entry` is
-                // false. The hunt-6 whole-local-reassign scan misses this &mut/AddressOf vector
-                // exactly as the bounds lane did (hunt-5). Flag the borrowed param so the caller
-                // fail-closes (does not credit the postcondition). Mirrors
-                // `value_local_is_unstable` / `is_single_static_assignment`'s kill-on-Ref.
-                if let Rvalue::Ref { mutable: true, place: bp } | Rvalue::AddressOf(_, bp) = rvalue
-                    && bp.projections.is_empty()
-                {
-                    note(func, bp.local);
-                }
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.projections.is_empty()
-        {
-            note(func, dest.local);
-        }
-    }
-    if reassigned.is_empty() {
+    if func.body.arg_count == 0
+        || !trust_types::any_formula_node(post, &mut |node| node.var_name().is_some())
+    {
         return false;
     }
-    let mut post_vars: FxHashSet<String> = FxHashSet::default();
-    collect_var_names(post, &mut post_vars);
-    post_vars.iter().any(|v| reassigned.iter().any(|n| place_names_overlap(v, n)))
+    MutatedParamPlaces::of(func).references(post)
+}
+
+pub(super) fn postcondition_references_mutated_param_cached(
+    func: &VerifiableFunction,
+    post: &Formula,
+    cache: &std::cell::OnceCell<MutatedParamPlaces>,
+) -> bool {
+    if func.body.arg_count == 0
+        || !trust_types::any_formula_node(post, &mut |node| node.var_name().is_some())
+    {
+        return false;
+    }
+    cache.get_or_init(|| MutatedParamPlaces::of(func)).references(post)
 }
 
 /// True iff `local` holds ONE value for the whole body with no field/index store, no
@@ -117,52 +537,203 @@ pub(super) use crate::local_defs::is_single_static_assignment;
 /// mutability without `UnsafeCell`, which an `Int`-typed local cannot be) and
 /// stay allowed.
 pub(super) fn local_mut_escapes(func: &VerifiableFunction, local: usize) -> bool {
-    func.body.blocks.iter().any(|block| {
-        block.stmts.iter().any(|s| {
-            matches!(s, Statement::Assign {
-                rvalue: Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(_, borrowed),
-                ..
-            } if borrowed.local == local)
-        })
+    crate::any_local_write_stmt(func, &func.body.blocks, local, |_block, s| {
+        matches!(s, Statement::Assign {
+            rvalue: Rvalue::Ref { mutable: true, place: borrowed }
+                | Rvalue::AddressOf(_, borrowed),
+            ..
+        } if borrowed.local == local)
     })
 }
 
-/// The `__slice_len` of the PARAMETER slice that `operand` reads the length of,
-/// following a `&(*param)` / `&raw const (*param)` reborrow to the parameter root.
-/// None unless the root is a parameter whose type is a slice or ref/raw-ptr to a
-/// slice — only then is the length immutable and the symbol stable.
+/// The canonical `{root}__slice_len` of the slice that `operand` reads the length of,
+/// following whole-local copies and a `&(*root)` / `&raw const (*root)` reborrow to
+/// the ROOT — and licensed by NAME at the root: `None` unless
+/// `slice_len_licence::licensed_slice_len_formula` admits the root, i.e. the place
+/// owning the length metadata is `local_defs::path_is_single_static_assignment` (a
+/// never-written parameter passes; a `mut` parameter with a body write `_1 = copy _2`
+/// refuses — whether the user spelled the reseat or `-Copt-level=1` copy-propagated a
+/// local onto the parameter; a single-write local passes; an aliased or reseated one
+/// refuses). A constant length (`&[T; N]`) needs no licence and is returned as is.
+///
+/// Trust: 2026-09-16 (round A8) — SOUNDNESS. The licence used to be `is_parameter(root)`
+/// alone ("only then is the length immutable and the symbol stable"), and every
+/// consumer — `stable_min_arg_formula` and through it `build_min_max_facts`,
+/// `build_modulo_bound_facts`, `build_division_lt_facts`, `build_division_exact_facts`,
+/// `init_rvalue_stable_len` — inlines the returned NAME into a GLOBAL fact that
+/// `generate::safety` conjoins onto every VC after the version rename. A `mut s: &[u8]`
+/// parameter reseated in the body passes `is_parameter`, and the fact `n <= s__slice_len`
+/// then binds to the post-reseat version: `fn f(mut s: &[u8], b: &[u8]) -> u8 { let n =
+/// s.len().min(100); s = b; s[..n].len() as u8 }` PROVED, kernel-certified, on the sealed
+/// driver and on stage1 at both `-O0` and `-O1`, and `f(&[1,2,3,4,5], &[1])` panics
+/// ("range end index 5 out of range for slice of length 1"). Pinned on the compiler's
+/// own MIR in `tests/escaped_local_seam_realmir.rs` (`a8_min_reseat_*`, `a8_min_loop_*`
+/// — never proved; `a8_ctl_min_*` — must prove).
+///
+/// The hops are followed to the ROOT before the licence is asked so the name minted is
+/// the root's canonical one (`s__slice_len`, the symbol the bounds obligation reads),
+/// not a copy temp's; the licence at the root walks the same chain back
+/// ([`slice_len_licence::slice_len_name_is_stable`]), so every hop is gated.
+pub(super) fn param_slice_len_place(
+    func: &VerifiableFunction,
+    place: &Place,
+    fuel: u32,
+) -> Option<Formula> {
+    let root = slice_len_root_place_from_place(func, place, fuel)?;
+    super::slice_len_licence::licensed_slice_len_formula_place(func, &root, fuel)
+}
+
 pub(super) fn param_slice_len(
     func: &VerifiableFunction,
     operand: &Operand,
     fuel: u32,
 ) -> Option<Formula> {
-    if fuel == 0 {
-        return None;
-    }
     let (Operand::Copy(p) | Operand::Move(p)) = operand else { return None };
+    param_slice_len_place(func, p, fuel)
+}
+
+/// The canonical slice length that a `PtrMetadata`/`Len` ARGUMENT of a call reads,
+/// for a fact that is VERSIONED AT THE CALL — `semantic_guard`'s per-call `Ord::min`/
+/// `max` result bounds, which `version_terminator_dest_fact` renames at the block
+/// terminal so `{root}__slice_len` becomes the version of the root live at that
+/// program point. Deliberately UNLICENSED: a versioned symbol names exactly the value
+/// read at the call, whatever the root does before or after, so the name licence
+/// [`param_slice_len`] needs for a GLOBAL fact would only withhold a true one. The
+/// argument's own name (`_4`) is kept beside it by the caller; this is the twin that
+/// reaches the obligation's symbol through the root's canonical name when the copy
+/// temp's length is tied to nothing (`_5 = copy _1; _4 = PtrMetadata(move _5)`).
+///
+/// Trust: 2026-09-16 (round A8) — the row this exists for: `fn f(mut s, b) { s = b;
+/// let n = s.len().min(100); s[..n] }` (`ctl_min_after_reseat`, correct) proved on the
+/// pristine driver ONLY through the unlicensed global fact `n <= s__slice_len` renamed
+/// onto the post-reseat version by luck of ordering; with that fact licensed away it
+/// must prove through `n <= s__slice_len#<at the call>` instead, and the reseat-AFTER
+/// twin (`min_reseat_slice_bug`, a panic) reads a later version and is name-disjoint.
+///
+/// MUST NOT be conjoined unversioned onto every VC: that is the hole
+/// [`param_slice_len`] closes.
+///
+/// THE TIME AXIS. The fact is renamed at the call's TERMINAL point, so the root's
+/// symbol is its version live at the call — which is the length the argument read
+/// only if nothing rebinds the root between the read and the call. `let n0 = s.len();
+/// s = b; let n = n0.min(100)` reads the OLD length and would be stated on the NEW one.
+/// So: every link of the read chain (the `PtrMetadata`/`Len` temp and each copy /
+/// reborrow / cast temp down to the root) must be defined in `block` itself, no
+/// statement from the earliest link to the terminator may write or alias the root
+/// on any channel, and the root may carry no mutable or raw alias anywhere in the body
+/// (a store through an earlier alias between the read and the call names a place
+/// this scan does not see). Anything else: no twin.
+pub(super) fn call_point_slice_len_of_arg(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    arg: &Operand,
+) -> Option<Formula> {
+    const FUEL: u32 = 8;
+    let (Operand::Copy(p) | Operand::Move(p)) = arg else { return None };
     if !p.projections.is_empty() {
         return None;
     }
-    // Direct: the operand IS a parameter slice / ref-to-slice.
-    if is_parameter(func, p.local)
-        && let Some(len) = crate::slice_len_formula(func, operand)
-    {
-        return Some(len);
-    }
-    // Indirect: `_t = &(*param)` / `&raw const (*param)` — follow to the root.
-    match crate::local_defs::unique_value_def(func, p.local)? {
-        Rvalue::Ref { place: referent, .. } | Rvalue::AddressOf(_, referent) => {
-            let mut root = referent.clone();
-            if root.projections.last() == Some(&trust_types::Projection::Deref) {
-                root.projections.pop();
+    let defining_index = |local: usize| -> Option<usize> {
+        block.stmts.iter().position(|s| {
+            matches!(s, Statement::Assign { place, .. } if place.local == local && place.projections.is_empty())
+        })
+    };
+    let mut earliest = defining_index(p.local)?;
+    let root_local = match crate::local_defs::unique_value_def(func, p.local)? {
+        Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)
+            if matches!(
+                crate::ptr_metadata_model(func, inner),
+                crate::PtrMetadataModel::Length(_)
+            ) =>
+        {
+            // Walk the chain link by link so each link's definition is located here.
+            let mut cur = inner;
+            let mut fuel = FUEL;
+            loop {
+                if fuel == 0 {
+                    return None;
+                }
+                fuel -= 1;
+                let (Operand::Copy(q) | Operand::Move(q)) = cur else { return None };
+                if !q.projections.is_empty() {
+                    return None;
+                }
+                let next = match crate::local_defs::unique_value_def(func, q.local) {
+                    Some(Rvalue::Ref { place: referent, .. } | Rvalue::AddressOf(_, referent)) => {
+                        earliest = earliest.min(defining_index(q.local)?);
+                        if !matches!(
+                            referent.projections.as_slice(),
+                            [] | [trust_types::Projection::Deref]
+                        ) {
+                            return None;
+                        }
+                        break referent.local;
+                    }
+                    Some(Rvalue::Use(next)) => {
+                        earliest = earliest.min(defining_index(q.local)?);
+                        next
+                    }
+                    Some(Rvalue::Cast(next, to_ty))
+                        if matches!(
+                            to_ty,
+                            Ty::Ref { inner: t, .. } | Ty::RawPtr { pointee: t, .. }
+                                if matches!(t.as_ref(), Ty::Slice { .. })
+                        ) =>
+                    {
+                        earliest = earliest.min(defining_index(q.local)?);
+                        next
+                    }
+                    // The root: a parameter, a call destination, an aggregate.
+                    _ => break q.local,
+                };
+                cur = next;
             }
-            if root.projections.is_empty() && is_parameter(func, root.local) {
-                return crate::slice_len_formula(func, &Operand::Copy(root));
-            }
-            None
         }
-        Rvalue::Use(inner) => param_slice_len(func, inner, fuel - 1),
+        Rvalue::Len(place) if place.projections.is_empty() => place.local,
+        _ => return None,
+    };
+    if local_mut_escapes(func, root_local) {
+        return None;
+    }
+    let rebinds_root = |s: &Statement| {
+        !matches!(s.local_write(root_local), trust_types::LocalWrite::Untouched)
+            || crate::stmt_escapes_local(func, s, root_local)
+    };
+    if block.stmts[earliest..].iter().any(rebinds_root) {
+        return None;
+    }
+    crate::place_slice_len_formula(func, &Place::local(root_local))
+}
+
+/// The projection-free ROOT place whose length `operand` reads, following whole-local
+/// copies (`_t = copy root`), the `&(*root)` / `&raw const (*root)` reborrow rustc
+/// spells a `&mut [T]` length read with, and a slice-preserving cast, to the local
+/// that has no such hop (a parameter, a call destination, an aggregate). NO LICENCE:
+/// the caller decides — [`param_slice_len`] licenses the root by NAME for a global
+/// fact, [`call_point_slice_len_of_arg`] versions it at the call instead.
+pub(super) fn slice_len_root_place(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    fuel: u32,
+) -> Option<Place> {
+    let (Operand::Copy(p) | Operand::Move(p)) = operand else { return None };
+    slice_len_root_place_from_place(func, p, fuel)
+}
+
+fn slice_len_root_place_from_place(
+    func: &VerifiableFunction,
+    p: &Place,
+    fuel: u32,
+) -> Option<Place> {
+    if fuel == 0 || !p.projections.is_empty() {
+        return None;
+    }
+    match crate::local_defs::unique_value_def(func, p.local) {
+        Some(Rvalue::Ref { place: referent, .. } | Rvalue::AddressOf(_, referent)) => {
+            matches!(referent.projections.as_slice(), [] | [trust_types::Projection::Deref])
+                .then(|| Place::local(referent.local))
+        }
+        Some(Rvalue::Use(inner)) => slice_len_root_place(func, inner, fuel - 1),
         // Trust (countdown-loop piece, G1): the UNSIZE coercion `&[T; N] -> &[T]`
         // (`_t = move _a as &[T]`), the shape `buf.len()` inlines to on a
         // `&mut [T; N]` parameter (`_a = &(*buf); _t = _a as &[T]; PtrMetadata(_t)`).
@@ -173,16 +744,18 @@ pub(super) fn param_slice_len(
         // unchanged). Recursing on the SOURCE operand computes the length from the
         // source's own type through the existing param-rooted arms, which only
         // resolve immutable param-anchored lengths — nothing new is trusted.
-        Rvalue::Cast(inner, to_ty)
+        Some(Rvalue::Cast(inner, to_ty))
             if matches!(
                 to_ty,
                 Ty::Ref { inner: t, .. } | Ty::RawPtr { pointee: t, .. }
                     if matches!(t.as_ref(), Ty::Slice { .. })
             ) =>
         {
-            param_slice_len(func, inner, fuel - 1)
+            slice_len_root_place(func, inner, fuel - 1)
         }
-        _ => None,
+        // No hop: the operand IS the root — a never-written parameter, a call
+        // destination, an aggregate.
+        _ => Some(Place::local(p.local)),
     }
 }
 
@@ -191,13 +764,23 @@ pub(super) fn param_slice_len(
 /// inner-result argument is a single-assignment local, and `min(inner, c) <= inner`
 /// holds unconditionally, so `dest <= Var(inner)` chains through the inner call's
 /// own (separately emitted) `inner <= a.len()` / `<= b.len()` facts.
+///
+/// NAME-ANCHOR-2 (2026-10-04): a primitive integer `Self`
+/// (`call_facts::primitive_int_ord_method`) — a user `Ord` impl may override
+/// `min`/`max`, and then `dest <= inner` is whatever its body makes it.
 pub(super) fn local_is_min_max_result(func: &VerifiableFunction, local: usize) -> bool {
-    func.body.blocks.iter().any(|block| {
-        matches!(&block.terminator,
-            Terminator::Call { func: callee, dest, .. }
-                if dest.local == local
-                    && dest.projections.is_empty()
-                    && (is_ord_min_call(callee) || is_ord_max_call(callee)))
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return false;
+    }
+    crate::any_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        matches!(term,
+        Terminator::Call { func: callee, args, dest, .. }
+            if dest.local == local
+                && dest.projections.is_empty()
+                && matches!(
+                    primitive_int_ord_method(func, callee, args, dest),
+                    Some("min" | "max")
+                ))
     })
 }
 
@@ -225,17 +808,26 @@ pub(super) fn stable_min_arg_formula(
             return param_slice_len(func, inner, fuel - 1);
         }
         Some(Rvalue::Len(place)) => {
-            return param_slice_len(func, &Operand::Copy(place.clone()), fuel - 1);
+            let root = slice_len_root_place_from_place(func, place, fuel - 1)?;
+            return super::slice_len_licence::licensed_slice_len_formula(
+                func,
+                &Operand::Copy(root),
+                fuel - 1,
+            );
         }
         // No whole-local Assign def: fall through to the min/max-result case below
         // (the inner result of a chained `.min().min()` is a Call dest, which
         // `unique_value_def` — Assign-only — does not see).
-        _ => {}
+        Some(_) => return None,
+        None => {}
     }
     // A nested `Ord::min`/`max` RESULT is a single-assignment, stable symbol;
     // `min(inner, c) <= inner` is unconditionally true, so `dest <= Var(inner)` is
     // sound and chains through `inner`'s own emitted bounds.
-    if local_is_min_max_result(func, p.local) && is_single_static_assignment(func, p.local) {
+    if is_single_static_assignment(func, p.local)
+        && !crate::local_defs::is_parameter(func, p.local)
+        && local_is_min_max_result(func, p.local)
+    {
         return Some(Formula::Var(crate::place_to_var_name(func, p), Sort::Int));
     }
     None
@@ -253,15 +845,15 @@ pub(super) fn stable_min_arg_formula(
 /// is `core::f64::<impl f64>::abs`; integer `i32::abs` (panicking) and the
 /// `::math::*` intrinsic delegate are excluded (no `::f64::`/`::f32::` segment).
 pub(super) fn fp_abs_call_width(callee: &str) -> Option<u32> {
-    let last = callee.rsplit("::").next()?;
-    let method = last.split('<').next().unwrap_or(last).trim();
-    if method != "abs" {
-        return None;
-    }
     let std_origin = callee.starts_with("core::")
         || callee.starts_with("std::")
         || callee.starts_with("alloc::");
     if !std_origin {
+        return None;
+    }
+    let last = callee.rsplit("::").next()?;
+    let method = last.split('<').next().unwrap_or(last).trim();
+    if method != "abs" {
         return None;
     }
     if callee.contains("::f64::") {
@@ -282,6 +874,9 @@ pub(super) fn fp_abs_call_width(callee: &str) -> Option<u32> {
 /// once). Fail-closed: any unrecognized/unstable/non-IEEE case emits nothing, so
 /// `dest` stays unconstrained (a missed proof, never a false proof).
 pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
     let mut facts = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
@@ -290,17 +885,6 @@ pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
         if !dest.projections.is_empty() || args.len() != 1 {
             continue;
         }
-        if fp_abs_call_width(callee).is_none() {
-            continue;
-        }
-        if !is_single_static_assignment(func, dest.local) {
-            continue;
-        }
-        // Width from the float TYPE is authoritative; skip non-float / non-IEEE.
-        let width = match crate::operand_ty_cow(func, &args[0]).as_deref() {
-            Some(trust_types::Ty::Float { width }) if *width == 64 || *width == 32 => *width,
-            _ => continue,
-        };
         // The arg must be a bare, single-static-assignment local: a global fact
         // names it unversioned, so a reassigned arg would make the equality
         // unsound at a later VC site. Projections / constants / Move-of-temp:
@@ -309,7 +893,17 @@ pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
             Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
             _ => continue,
         };
-        if !is_single_static_assignment(func, arg_local) {
+        if fp_abs_call_width(callee).is_none() {
+            continue;
+        }
+        // Width from the float TYPE is authoritative; skip non-float / non-IEEE.
+        let width = match crate::operand_ty_cow(func, &args[0]).as_deref() {
+            Some(trust_types::Ty::Float { width }) if *width == 64 || *width == 32 => *width,
+            _ => continue,
+        };
+        if !is_single_static_assignment(func, dest.local)
+            || !is_single_static_assignment(func, arg_local)
+        {
             continue;
         }
         let dest_name = crate::place_to_var_name(func, dest);
@@ -318,6 +912,155 @@ pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
         }
     }
     facts
+}
+
+/// Global value-definition facts for `dest = arg.abs()` over a std SIGNED integer
+/// (`core::num::<impl i64>::abs`): `dest == if arg < 0 { -arg } else { arg }`, in
+/// mathematical integers. The call panics for `arg == MIN` (its own overflow row is
+/// charged separately), so wherever `dest` holds a value the equation is exact; and
+/// `dest` is otherwise a free symbol the fact cannot use to constrain `arg` (every
+/// `arg` has an `|arg|`). Gated exactly like [`build_fp_abs_facts`]: a
+/// single-static-assignment `dest` and an argument that is a bare single-assignment
+/// local or a checked `l op r` field ([`int_abs_argument_value`]), named unversioned. The receiver must be a std `<impl iN>` path (a user type's
+/// `abs` is never matched). Without it `(a - b).abs() + (c - d).abs()` over `i32`
+/// casts was refuted with `dx = i64::MAX` (ordsweep2 structs/c02).
+pub(super) fn build_int_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
+    let mut facts = Vec::new();
+    for block in &func.body.blocks {
+        let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
+            continue;
+        };
+        if !dest.projections.is_empty()
+            || args.len() != 1
+            || !matches!(
+                &args[0],
+                Operand::Copy(p) | Operand::Move(p)
+                    if p.projections.is_empty()
+                        || matches!(p.projections.as_slice(), [Projection::Field(0)])
+            )
+            || !matches!(
+                crate::local_ty_ref(func, dest.local),
+                Some(trust_types::Ty::Int { signed: true, .. })
+            )
+        {
+            continue;
+        }
+        if !(callee.starts_with("core::") || callee.starts_with("std::"))
+            || !callee.contains("::num::")
+        {
+            continue;
+        }
+        let last = callee.rsplit("::").next().unwrap_or(callee);
+        if last.split('<').next().unwrap_or(last).trim() != "abs"
+            || std_num_impl_receiver_width(callee).is_none()
+            || std_num_impl_receiver_is_unsigned(callee)
+        {
+            continue;
+        }
+        match crate::operand_ty_cow(func, &args[0]).as_deref() {
+            Some(trust_types::Ty::Int { signed: true, .. }) => {}
+            _ => continue,
+        }
+        if !is_single_static_assignment(func, dest.local) {
+            continue;
+        }
+        let Some(arg_value) = int_abs_argument_value(func, block.id, &args[0]) else { continue };
+        let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+        let arg_lt = arg_value.clone();
+        let arg_neg = arg_value.clone();
+        facts.push(Formula::Eq(
+            Box::new(dest_var),
+            Box::new(Formula::Ite(
+                Box::new(Formula::Lt(Box::new(arg_lt), Box::new(Formula::Int(0)))),
+                Box::new(Formula::Neg(Box::new(arg_neg))),
+                Box::new(arg_value),
+            )),
+        ));
+    }
+    facts
+}
+
+/// The value an integer `abs` argument denotes, as a formula over single-assignment
+/// names: a bare single-assignment local, or field 0 of a single-assignment
+/// `CheckedBinaryOp(Add | Sub | Mul, l, r)` temp spelled as `l op r` (a global fact on
+/// `_t.0` itself would name nothing: the VC versions that field, see the memory note on
+/// statement-versioned checked-op fields). The temp's block must end in the assert
+/// trapping its overflow flag with `call_block` as the success target, so the call is
+/// reached only when the op did not overflow and `_t.0 == l op r` there.
+///
+/// Trust: 2026-11-09 (WRAPPING-SUB-AND-INTERVAL-NEG-1, sibling of the wrapping-`Sub`
+/// shift-amount bound) — that assert was ASSUMED ("every path to the call passed the
+/// op's overflow assert"), not checked. A `CheckedBinaryOp` is also how the lowered
+/// `add/sub/mul_with_overflow` intrinsics (`overflowing_*`) appear, with no assert:
+/// `.0` is the WRAPPED value, and stating `dest == |l op r|` over mathematical
+/// integers for it names a value `dest` never holds (out of `dest`'s type range when
+/// the op wrapped, which contradicts that range and makes every later obligation
+/// vacuous). Same success-edge check as [`bitcount_receiver_value`].
+fn int_abs_argument_value(
+    func: &VerifiableFunction,
+    call_block: BlockId,
+    arg: &Operand,
+) -> Option<Formula> {
+    let (Operand::Copy(p) | Operand::Move(p)) = arg else { return None };
+    let operand_value = |operand: &Operand| -> Option<Formula> {
+        match operand {
+            Operand::Copy(q) | Operand::Move(q)
+                if q.projections.is_empty() && is_single_static_assignment(func, q.local) =>
+            {
+                Some(Formula::Var(crate::place_to_var_name(func, q), Sort::Int))
+            }
+            Operand::Constant(_) => crate::chc::operand_to_formula_checked(func, operand).ok(),
+            _ => None,
+        }
+    };
+    match p.projections.as_slice() {
+        [] if is_single_static_assignment(func, p.local) => {
+            Some(Formula::Var(crate::place_to_var_name(func, p), Sort::Int))
+        }
+        [trust_types::Projection::Field(0)] if is_single_static_assignment(func, p.local) => {
+            let def_block = crate::find_local_write_stmt(
+                func,
+                &func.body.blocks,
+                p.local,
+                |block, stmt| {
+                    matches!(stmt, Statement::Assign { place, .. }
+                        if place.local == p.local && place.projections.is_empty())
+                    .then_some(block)
+                },
+            )?;
+            let Terminator::Assert {
+                cond: Operand::Copy(flag) | Operand::Move(flag),
+                expected: false,
+                target,
+                ..
+            } = &def_block.terminator
+            else {
+                return None;
+            };
+            if flag.local != p.local
+                || !matches!(flag.projections.as_slice(), [trust_types::Projection::Field(1)])
+                || *target != call_block
+            {
+                return None;
+            }
+            let Rvalue::CheckedBinaryOp(op, l, r) =
+                crate::local_defs::unique_value_def(func, p.local)?
+            else {
+                return None;
+            };
+            let (l, r) = (operand_value(l)?, operand_value(r)?);
+            match op {
+                BinOp::Add => Some(Formula::Add(Box::new(l), Box::new(r))),
+                BinOp::Sub => Some(Formula::Sub(Box::new(l), Box::new(r))),
+                BinOp::Mul => Some(Formula::Mul(Box::new(l), Box::new(r))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Trust (P0 const-bit-width FALSE PROOF): the RECEIVER's declared bit width read from
@@ -342,8 +1085,7 @@ pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
 /// fact at all. Mirrors `fp_abs_call_width`, which likewise takes its width from the
 /// callee path rather than the operand.
 pub(super) fn std_num_impl_receiver_width(callee: &str) -> Option<u32> {
-    if !(callee.starts_with("core::") || callee.starts_with("std::"))
-        || !callee.contains("::num::")
+    if !(callee.starts_with("core::") || callee.starts_with("std::")) || !callee.contains("::num::")
     {
         return None;
     }
@@ -362,6 +1104,91 @@ pub(super) fn std_num_impl_receiver_width(callee: &str) -> Option<u32> {
     }
 }
 
+/// A formula for the ONE value a bit-count call in `call_block` receives, for the
+/// global facts above (which are stated outside any path, so the term must denote
+/// that value wherever it is read):
+///   * a bare single-assignment local: its bare name;
+///   * field 0 of a single-assignment `CheckedBinaryOp(op, a, b)` temp whose block
+///     ends in the assert trapping that op's overflow flag with `call_block` as its
+///     success target (rustc's `f(x - 1)` shape, sweep r01g): the exact `a op b`,
+///     since the call is reached only when the op did not overflow. The temp's
+///     field carries a statement-versioned name in the VC, so its bare spelling
+///     would constrain nothing; `a` and `b` must be constants or locals whose
+///     versions collapse to the bare name.
+fn bitcount_receiver_value(
+    func: &VerifiableFunction,
+    call_block: BlockId,
+    receiver: &Operand,
+) -> Option<Formula> {
+    let (Operand::Copy(recv) | Operand::Move(recv)) = receiver else { return None };
+    if !is_single_static_assignment(func, recv.local) {
+        return None;
+    }
+    if recv.projections.is_empty() {
+        return Some(Formula::Var(crate::place_to_var_name(func, recv), Sort::Int));
+    }
+    if !matches!(recv.projections.as_slice(), [trust_types::Projection::Field(0)]) {
+        return None;
+    }
+    let block = crate::find_local_write_stmt(
+        func,
+        &func.body.blocks,
+        recv.local,
+        |block, stmt| {
+            matches!(stmt, Statement::Assign { place, .. }
+                if place.local == recv.local && place.projections.is_empty())
+            .then_some(block)
+        },
+    )?;
+    let Terminator::Assert { cond, expected: false, target, .. } = &block.terminator else {
+        return None;
+    };
+    let (Operand::Copy(flag) | Operand::Move(flag)) = cond else { return None };
+    if flag.local != recv.local
+        || !matches!(flag.projections.as_slice(), [trust_types::Projection::Field(1)])
+        || *target != call_block
+    {
+        return None;
+    }
+    let (op, a, b) = block.stmts.iter().find_map(|stmt| match stmt {
+        Statement::Assign { place, rvalue: Rvalue::CheckedBinaryOp(op, a, b), .. }
+            if place.local == recv.local && place.projections.is_empty() =>
+        {
+            Some((*op, a, b))
+        }
+        _ => None,
+    })?;
+    let term = |operand: &Operand| -> Option<Formula> {
+        match operand {
+            Operand::Constant(_) => operand_const_int(operand).map(Formula::Int),
+            Operand::Copy(p) | Operand::Move(p)
+                if p.projections.is_empty()
+                    && super::discharge::local_versions_collapse_to_bare(func, p.local) =>
+            {
+                Some(Formula::Var(crate::place_to_var_name(func, p), Sort::Int))
+            }
+            _ => None,
+        }
+    };
+    let (a, b) = (Box::new(term(a)?), Box::new(term(b)?));
+    Some(match op {
+        BinOp::Add => Formula::Add(a, b),
+        BinOp::Sub => Formula::Sub(a, b),
+        _ => return None,
+    })
+}
+
+/// The callee is a `core::num`/`std::num` inherent method of an UNSIGNED integer
+/// (`<impl u32>`, `<impl usize>`, ...), read from the same `<impl T>` segment as
+/// [`std_num_impl_receiver_width`].
+fn std_num_impl_receiver_is_unsigned(callee: &str) -> bool {
+    std_num_impl_receiver_width(callee).is_some()
+        && callee.rfind("<impl ").is_some_and(|at| {
+            let rest = &callee[at + "<impl ".len()..];
+            rest.split('>').next().is_some_and(|name| name.trim().starts_with('u'))
+        })
+}
+
 /// The bit width to use for a `[0, bits(T)]` bit-count result bound.
 ///
 /// The receiver's DECLARED width (from the callee path — see
@@ -373,7 +1200,7 @@ pub(super) fn std_num_impl_receiver_width(callee: &str) -> Option<u32> {
 ///
 /// WITNESS (a live false proof before the path became the width source, no negative
 /// numbers needed):
-/// ```ignore
+/// ```ignore (illustrative)
 /// const K: i128 = 1;
 /// let n = K.count_zeros();          // truly 127
 /// let arr = [0u8; 65];
@@ -392,6 +1219,21 @@ fn bitcount_receiver_width(
     Some(declared.max(operand_width))
 }
 
+/// The largest `ilog2` (`decimal == false`) or `ilog10` (`decimal == true`) of a
+/// `bits`-wide integer: `bits - 1`, and the decimal digit count of `2^bits - 1` less
+/// one. `None` for any other width.
+fn integer_log_max(decimal: bool, bits: u32) -> Option<i128> {
+    match (decimal, bits) {
+        (false, 8 | 16 | 32 | 64 | 128) => Some(i128::from(bits) - 1),
+        (true, 8) => Some(2),
+        (true, 16) => Some(4),
+        (true, 32) => Some(9),
+        (true, 64) => Some(19),
+        (true, 128) => Some(38),
+        _ => None,
+    }
+}
+
 /// Global result bounds for value-bounded std intrinsics — each is UNCONDITIONALLY
 /// true, so conjoining it everywhere is sound and lets a bounded index discharge:
 ///   * `n.rem_euclid(c)` for a CONSTANT divisor `c`: the Euclidean remainder is
@@ -402,22 +1244,53 @@ fn bitcount_receiver_width(
 ///     into `[_; bits+1]` is in bounds. These are LINEAR bounds ay discharges
 ///     directly (unlike an equality contradiction).
 pub(super) fn build_intrinsic_bound_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
     let mut facts = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
             continue;
         };
-        if !dest.projections.is_empty() || !is_single_static_assignment(func, dest.local) {
+        if !dest.projections.is_empty()
+            || !matches!(args.len(), 1 | 2)
+            || !matches!(
+                crate::local_ty_ref(func, dest.local),
+                Some(
+                    trust_types::Ty::Int { .. }
+                        | trust_types::Ty::PtrSizedInt { .. }
+                        | trust_types::Ty::Adt { .. }
+                )
+            )
+            || !is_std_num_intrinsic(callee)
+        {
             continue;
         }
-        let dest_var = || Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+        let tail = method_tail(callee);
+        if !matches!(
+            (tail, args.len()),
+            ("rem_euclid", 2)
+                | (
+                    "trailing_zeros"
+                        | "leading_zeros"
+                        | "count_ones"
+                        | "count_zeros"
+                        | "ilog2"
+                        | "ilog10"
+                        | "checked_ilog2"
+                        | "checked_ilog10",
+                    1
+                )
+        ) || !is_single_static_assignment(func, dest.local)
+        {
+            continue;
+        }
+        let dest_var_formula = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+        let dest_var = || dest_var_formula.clone();
         let ge0 = |facts: &mut Vec<Formula>| {
             facts.push(Formula::Ge(Box::new(dest_var()), Box::new(Formula::Int(0))));
         };
-        if !is_std_num_intrinsic(callee) {
-            continue;
-        }
-        match method_tail(callee) {
+        match tail {
             // `rem_euclid(c)` (receiver + divisor): result in `[0, |c|-1]` for `|c| >= 1`.
             "rem_euclid" if args.len() == 2 => {
                 if let Some(c) = operand_const_int(&args[1]) {
@@ -441,6 +1314,89 @@ pub(super) fn build_intrinsic_bound_facts(func: &VerifiableFunction) -> Vec<Form
                         Box::new(dest_var()),
                         Box::new(Formula::Int(width as i128)),
                     ));
+                    // Trust (2026-09-29): a NONZERO receiver has at least one set bit,
+                    // so its leading and trailing zeros are fewer than `bits`:
+                    // `recv == 0 ∨ dest <= bits - 1`. Stated on the receiver's bare
+                    // name, so the receiver must hold ONE value for the whole body.
+                    // Measured on the ordinary-Rust sweep: `if x == 0 { 0 } else { 63 -
+                    // x.leading_zeros() }` and `t[x.trailing_zeros() as usize]` into a
+                    // `[_; 64]` under `x != 0` were refuted with the count at `bits`.
+                    if matches!(tail, "leading_zeros" | "trailing_zeros")
+                        && let Some(recv_var) = bitcount_receiver_value(func, block.id, &args[0])
+                    {
+                        facts.push(Formula::Or(vec![
+                            Formula::Eq(Box::new(recv_var.clone()), Box::new(Formula::Int(0))),
+                            Formula::Le(
+                                Box::new(dest_var()),
+                                Box::new(Formula::Int(width as i128 - 1)),
+                            ),
+                        ]));
+                        // Trust (2026-10-01): for an UNSIGNED receiver `leading_zeros`
+                        // is determined by the receiver's magnitude: `lz >= k` exactly
+                        // when `recv < 2^(bits-k)`, for each `k` in `1..=bits`. Both
+                        // directions are stated, so `lz` takes its one value. A signed
+                        // receiver is excluded: a negative value has `lz == 0` while
+                        // `recv < 2^(bits-1)` holds. The declared and the operand width
+                        // must agree, since the bracket names the exact width; `u128`
+                        // is left out (`2^127` is not an `i128` literal).
+                        // Measured on the ordinary-Rust sweep (r01g):
+                        // `1u32 << (32 - (x - 1).leading_zeros())` under `x <= 1 << 31`
+                        // was refuted with `lz = 0` for `x - 1 = 1`.
+                        if tail == "leading_zeros"
+                            && let Some(declared) = std_num_impl_receiver_width(callee)
+                            && declared == width
+                            && width <= 64
+                            && matches!(
+                                crate::operand_ty_cow(func, &args[0]).as_deref(),
+                                Some(Ty::Int { signed: false, width: w }) if *w == width
+                            )
+                            && std_num_impl_receiver_is_unsigned(callee)
+                        {
+                            for k in 1..=width {
+                                let t = Formula::Int(1i128 << (width - k));
+                                let k = Formula::Int(i128::from(k));
+                                facts.push(Formula::Or(vec![
+                                    Formula::Ge(Box::new(recv_var.clone()), Box::new(t.clone())),
+                                    Formula::Ge(Box::new(dest_var()), Box::new(k.clone())),
+                                ]));
+                                facts.push(Formula::Or(vec![
+                                    Formula::Lt(Box::new(recv_var.clone()), Box::new(t)),
+                                    Formula::Lt(Box::new(dest_var()), Box::new(k)),
+                                ]));
+                            }
+                        }
+                    }
+                }
+            }
+            // Trust (2026-09-29): integer logarithms. `ilog2` of any value of a
+            // `bits`-wide type is below `bits`, and `ilog10` is at most the number
+            // of decimal digits of the type's unsigned MAX, less one (a signed
+            // type's MAX is smaller, so the same bound holds). `checked_*` returns
+            // the same value in `Some`, so the bound is stated on the `Some`
+            // payload; a `None` gives that name no value to contradict. The bare
+            // `ilog2`/`ilog10` still panic on a non-positive receiver — that row is
+            // not this fact's business. Measured on the ordinary-Rust sweep:
+            // `match x.checked_ilog10() { Some(d) => d + 1, None => 1 }` was
+            // refuted with `d = u32::MAX`.
+            "ilog2" | "ilog10" | "checked_ilog2" | "checked_ilog10" if args.len() == 1 => {
+                let method = tail;
+                if let Some(width) = bitcount_receiver_width(func, callee, &args[0])
+                    && let Some(max) = integer_log_max(method.ends_with("ilog10"), width)
+                {
+                    let result = if method.starts_with("checked_") {
+                        let payload = Place {
+                            local: dest.local,
+                            projections: vec![
+                                trust_types::Projection::Downcast(1),
+                                trust_types::Projection::Field(0),
+                            ],
+                        };
+                        Formula::Var(crate::place_to_var_name(func, &payload), Sort::Int)
+                    } else {
+                        dest_var()
+                    };
+                    facts.push(Formula::Ge(Box::new(result.clone()), Box::new(Formula::Int(0))));
+                    facts.push(Formula::Le(Box::new(result), Box::new(Formula::Int(max))));
                 }
             }
             _ => {}
@@ -483,21 +1439,23 @@ pub(super) fn build_intrinsic_bound_facts(func: &VerifiableFunction) -> Vec<Form
 /// a program that faults. `nonzero_get_reassigned_dest_still_refutes` and
 /// `nonzero_get_branch_merged_dest_still_refutes` fail when the gate is deleted.
 pub(super) fn build_nonzero_get_dest_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
     let mut facts = Vec::new();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
             continue;
         };
-        if args.len() != 1 || !dest.projections.is_empty() || !is_nonzero_get_call(callee) {
-            continue;
-        }
-        if !is_single_static_assignment(func, dest.local) {
-            continue;
-        }
-        if !matches!(
-            crate::local_ty_ref(func, dest.local),
-            Some(Ty::Int { .. } | Ty::PtrSizedInt { .. })
-        ) {
+        if args.len() != 1
+            || !dest.projections.is_empty()
+            || !matches!(
+                crate::local_ty_ref(func, dest.local),
+                Some(Ty::Int { .. } | Ty::PtrSizedInt { .. })
+            )
+            || !is_nonzero_get_call(callee)
+            || !is_single_static_assignment(func, dest.local)
+        {
             continue;
         }
         let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
@@ -543,7 +1501,17 @@ pub(super) fn build_cast_bound_facts(func: &VerifiableFunction) -> Vec<Formula> 
                 continue;
             }
             let (Operand::Copy(src_p) | Operand::Move(src_p)) = operand else { continue };
-            if !src_p.projections.is_empty() {
+            if !src_p.projections.is_empty() || crate::local_defs::is_parameter(func, cast_dst.local)
+            {
+                continue;
+            }
+            let is_bool_src = crate::operand_ty_cow(func, operand)
+                .is_some_and(|t| matches!(t.as_ref(), Ty::Bool));
+            if !is_bool_src
+                && (!super::terminator_presence_for(func).has_bare_dest_call
+                    || crate::local_defs::is_parameter(func, src_p.local)
+                    || crate::local_defs::unique_value_def(func, src_p.local).is_some())
+            {
                 continue;
             }
             // Staleness: both the source value and the cast result are single-assignment
@@ -561,9 +1529,7 @@ pub(super) fn build_cast_bound_facts(func: &VerifiableFunction) -> Vec<Formula> 
             // semantics). SOUND: the SSA gate above pins the bool's single definition,
             // and every `bool` value is 0 or 1 by construction. Otherwise fall back to
             // the const-upper-bounded producers (clamp / rem_euclid / bit-count).
-            let hi = if crate::operand_ty_cow(func, operand)
-                .is_some_and(|t| matches!(t.as_ref(), Ty::Bool))
-            {
+            let hi = if is_bool_src {
                 1
             } else {
                 match cast_source_const_upper_nonneg(func, src_p.local) {
@@ -590,12 +1556,17 @@ pub(super) fn build_cast_bound_facts(func: &VerifiableFunction) -> Vec<Formula> 
 /// needed here (`min(v,c) <= c` is an UPPER bound, `clamp` lower bound `lo` is already
 /// covered by the upper-bound path when relevant) so they are excluded.
 pub(super) fn cast_source_const_lower(func: &VerifiableFunction, local: usize) -> Option<i128> {
-    for block in &func.body.blocks {
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return None;
+    }
+    crate::find_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        if let Terminator::Call { func: callee, args, dest, .. } = term
             && dest.local == local
             && dest.projections.is_empty()
         {
-            if is_ord_max_call(callee) && args.len() == 2 {
+            // NAME-ANCHOR-2: core's `max` only (a primitive integer `Self`).
+            if primitive_int_ord_method(func, callee, args, dest) == Some("max") && args.len() == 2
+            {
                 // `max(v, c) >= c` for the const operand `c`; if BOTH are const, the
                 // result is `>= max(c1, c2)` — take the largest const operand.
                 let mut best: Option<i128> = None;
@@ -604,12 +1575,13 @@ pub(super) fn cast_source_const_lower(func: &VerifiableFunction, local: usize) -
                         best = Some(best.map_or(c, |b: i128| b.max(c)));
                     }
                 }
-                return best;
+                return Some(best);
             }
-            return None;
+            return Some(None);
         }
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
 /// Global facts propagating a DYNAMIC LOWER bound of a `max`-with-const source THROUGH
@@ -637,6 +1609,9 @@ pub(super) fn cast_source_const_lower(func: &VerifiableFunction, local: usize) -
 /// upper bound is claimed here (the source has none), and the fact is unconditionally
 /// true, so it can only ever HELP discharge a real obligation, never false-prove.
 pub(super) fn build_cast_lower_bound_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
     let mut facts = Vec::new();
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -645,11 +1620,15 @@ pub(super) fn build_cast_lower_bound_facts(func: &VerifiableFunction) -> Vec<For
             else {
                 continue;
             };
-            if !cast_dst.projections.is_empty() {
+            if !cast_dst.projections.is_empty() || crate::local_defs::is_parameter(func, cast_dst.local)
+            {
                 continue;
             }
             let (Operand::Copy(src_p) | Operand::Move(src_p)) = operand else { continue };
-            if !src_p.projections.is_empty() {
+            if !src_p.projections.is_empty()
+                || crate::local_defs::is_parameter(func, src_p.local)
+                || crate::local_defs::unique_value_def(func, src_p.local).is_some()
+            {
                 continue;
             }
             // Value-preserving widening only — the cast must be the IDENTITY on the
@@ -690,23 +1669,29 @@ pub(super) fn cast_source_const_upper_nonneg(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<i128> {
-    for block in &func.body.blocks {
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return None;
+    }
+    crate::find_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        if let Terminator::Call { func: callee, args, dest, .. } = term
             && dest.local == local
             && dest.projections.is_empty()
         {
-            if is_ord_clamp_call(callee) && args.len() == 3 {
-                let lo = operand_const_int(&args[1])?;
-                let hi = operand_const_int(&args[2])?;
-                return (0 <= lo && lo <= hi).then_some(hi);
+            // NAME-ANCHOR-2: core's `clamp` only (a primitive integer `Self`).
+            if primitive_int_ord_method(func, callee, args, dest) == Some("clamp")
+                && args.len() == 3
+            {
+                let Some(lo) = operand_const_int(&args[1]) else { return Some(None) };
+                let Some(hi) = operand_const_int(&args[2]) else { return Some(None) };
+                return Some((0 <= lo && lo <= hi).then_some(hi));
             }
             if is_std_num_intrinsic(callee)
                 && method_tail(callee) == "rem_euclid"
                 && args.len() == 2
             {
-                let c = operand_const_int(&args[1])?;
-                let m = i128::try_from(c.unsigned_abs()).ok()?;
-                return (m >= 1).then_some(m - 1);
+                let Some(c) = operand_const_int(&args[1]) else { return Some(None) };
+                let Ok(m) = i128::try_from(c.unsigned_abs()) else { return Some(None) };
+                return Some((m >= 1).then_some(m - 1));
             }
             if matches!(
                 method_tail(callee),
@@ -718,12 +1703,13 @@ pub(super) fn cast_source_const_upper_nonneg(
                 // `bitcount_receiver_width`. This propagates the same bound through the
                 // `as usize` cast, so a value-inferred width here would carry the
                 // identical false proof one hop further.
-                return bitcount_receiver_width(func, callee, &args[0]).map(i128::from);
+                return Some(bitcount_receiver_width(func, callee, &args[0]).map(i128::from));
             }
-            return None;
+            return Some(None);
         }
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
 /// The constant upper bound of a `min(a, b)` call whose dest is `local`:
@@ -731,11 +1717,15 @@ pub(super) fn cast_source_const_upper_nonneg(
 /// smaller operand). None unless `local` is the dest of a 2-arg ordered-min
 /// call with at least one constant argument.
 pub(super) fn min_call_const_upper_bound(func: &VerifiableFunction, local: usize) -> Option<i128> {
-    for block in &func.body.blocks {
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return None;
+    }
+    crate::find_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        if let Terminator::Call { func: callee, args, dest, .. } = term
             && dest.local == local
             && dest.projections.is_empty()
-            && is_ord_min_call(callee)
+            // NAME-ANCHOR-2: core's `min` only (a primitive integer `Self`).
+            && primitive_int_ord_method(func, callee, args, dest) == Some("min")
             && args.len() == 2
         {
             let mut best: Option<i128> = None;
@@ -744,10 +1734,11 @@ pub(super) fn min_call_const_upper_bound(func: &VerifiableFunction, local: usize
                     best = Some(best.map_or(c, |b: i128| b.min(c)));
                 }
             }
-            return best;
+            return Some(best);
         }
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
 /// Trust (clamp-via-helper, whole-crate summary): the constant UPPER bound this
@@ -764,7 +1755,17 @@ pub(super) fn min_call_const_upper_bound(func: &VerifiableFunction, local: usize
 pub(super) fn function_return_const_upper_bound(func: &VerifiableFunction) -> Option<i128> {
     let expanded = func.with_tail_calls_expanded();
     let func = expanded.as_ref();
+    let _func_scope = super::FuncAnalysisScope::enter(func);
+    // Trust (2026-10-03): the value-join interval of `_0` is a second, independent
+    // sound bound (see `local_value_const_interval`); keep the tighter of the two.
+    let join = local_value_const_interval(func, 0).map(|(_, hi)| hi).filter(|&hi| hi >= 0);
+    match (function_return_const_upper_bound_chain(func), join) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
 
+fn function_return_const_upper_bound_chain(func: &VerifiableFunction) -> Option<i128> {
     // Multi-return-site const shape: every return site is a constant, so the
     // LARGEST one bounds the returned value on every path. Same `>= 0` filter
     // as the SSA chain below — preserving the documented "bound is always
@@ -777,18 +1778,27 @@ pub(super) fn function_return_const_upper_bound(func: &VerifiableFunction) -> Op
     // defs (`_0 = move _k`) to the producing local. Each hop requires single
     // assignment so the traced local's bound is THE bound on every path.
     let mut local = 0usize;
+    let mut ssa_verified = false;
     for _ in 0..8 {
-        if !is_single_static_assignment(func, local) {
+        if crate::local_defs::is_parameter(func, local)
+            || !is_single_static_assignment(func, local)
+        {
             return None;
         }
         match crate::local_defs::unique_value_def(func, local) {
             Some(Rvalue::Use(Operand::Move(p) | Operand::Copy(p))) if p.projections.is_empty() => {
                 local = p.local;
             }
-            _ => break,
+            _ => {
+                ssa_verified = true;
+                break;
+            }
         }
     }
-    if !is_single_static_assignment(func, local) {
+    if !ssa_verified
+        && (crate::local_defs::is_parameter(func, local)
+            || !is_single_static_assignment(func, local))
+    {
         return None;
     }
     let b = cast_source_const_upper_nonneg(func, local)
@@ -828,42 +1838,41 @@ pub(super) fn function_return_const_sites(func: &VerifiableFunction) -> Option<V
     let func = expanded.as_ref();
 
     let mut consts: Vec<i128> = Vec::new();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
+    let poisoned =
+        crate::any_local_write_candidate(func, &func.body.blocks, 0, |block, item| match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place, rvalue, .. } => {
                     if let Rvalue::Ref { mutable: true, place: borrowed }
                     | Rvalue::AddressOf(_, borrowed) = rvalue
                         && borrowed.local == 0
                     {
-                        return None;
+                        return true;
                     }
                     if place.local != 0 {
-                        continue;
+                        return false;
                     }
                     if !place.projections.is_empty() {
-                        return None;
+                        return true;
                     }
-                    let Rvalue::Use(op) = rvalue else { return None };
-                    consts.push(operand_const_int(op)?);
+                    let Rvalue::Use(op) = rvalue else {
+                        return true;
+                    };
+                    let Some(c) = operand_const_int(op) else {
+                        return true;
+                    };
+                    consts.push(c);
+                    false
                 }
                 Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
-                    if place.local == 0 {
-                        return None;
-                    }
+                    place.local == 0
                 }
                 // Opaque write channels — cannot see what they define.
-                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => return None,
-                _ => {}
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == 0
-        {
-            return None;
-        }
-    }
-    if consts.is_empty() {
+                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => true,
+                _ => false,
+            },
+            None => matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == 0),
+        });
+    if poisoned || consts.is_empty() {
         return None;
     }
     consts.sort_unstable();
@@ -887,31 +1896,36 @@ pub(super) fn function_return_const_sites(func: &VerifiableFunction) -> Option<V
 ///     non-negative regardless of the sign of `n`);
 ///   * `trailing_zeros`/`leading_zeros`/`count_ones`/`count_zeros` → `0`.
 pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize) -> Option<i128> {
-    for block in &func.body.blocks {
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return None;
+    }
+    crate::find_local_write_term(func, &func.body.blocks, local, |_block, term| {
+        if let Terminator::Call { func: callee, args, dest, .. } = term
             && dest.local == local
             && dest.projections.is_empty()
         {
-            if is_ord_max_call(callee) && args.len() == 2 {
+            // NAME-ANCHOR-2: core's `max`/`clamp` only (a primitive integer `Self`).
+            let ord = primitive_int_ord_method(func, callee, args, dest);
+            if ord == Some("max") && args.len() == 2 {
                 let mut best: Option<i128> = None;
                 for arg in args {
                     if let Some(c) = operand_const_int(arg) {
                         best = Some(best.map_or(c, |b: i128| b.max(c)));
                     }
                 }
-                return best;
+                return Some(best);
             }
-            if is_ord_clamp_call(callee) && args.len() == 3 {
-                let lo = operand_const_int(&args[1])?;
-                let hi = operand_const_int(&args[2])?;
-                return (0 <= lo && lo <= hi).then_some(lo);
+            if ord == Some("clamp") && args.len() == 3 {
+                let Some(lo) = operand_const_int(&args[1]) else { return Some(None) };
+                let Some(hi) = operand_const_int(&args[2]) else { return Some(None) };
+                return Some((0 <= lo && lo <= hi).then_some(lo));
             }
             if is_std_num_intrinsic(callee)
                 && method_tail(callee) == "rem_euclid"
                 && args.len() == 2
             {
-                let c = operand_const_int(&args[1])?;
-                return (c != 0).then_some(0);
+                let Some(c) = operand_const_int(&args[1]) else { return Some(None) };
+                return Some((c != 0).then_some(0));
             }
             if matches!(
                 method_tail(callee),
@@ -919,15 +1933,16 @@ pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize
             ) && args.len() == 1
                 && is_std_num_intrinsic(callee)
             {
-                return match crate::operand_ty_cow(func, &args[0]).as_deref() {
+                return Some(match crate::operand_ty_cow(func, &args[0]).as_deref() {
                     Some(Ty::Int { .. }) => Some(0),
                     _ => None,
-                };
+                });
             }
-            return None;
+            return Some(None);
         }
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
 /// Trust (const-return summary): the constant LOWER bound this function's
@@ -947,28 +1962,208 @@ pub(super) fn ret_call_const_lower_bound(func: &VerifiableFunction, local: usize
 pub(super) fn function_return_const_lower_bound(func: &VerifiableFunction) -> Option<i128> {
     let expanded = func.with_tail_calls_expanded();
     let func = expanded.as_ref();
+    let _func_scope = super::FuncAnalysisScope::enter(func);
+    // Trust (2026-10-03): the value-join interval's lower end, kept when tighter.
+    let join = local_value_const_interval(func, 0).map(|(lo, _)| lo);
+    match (function_return_const_lower_bound_chain(func), join) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
 
+fn function_return_const_lower_bound_chain(func: &VerifiableFunction) -> Option<i128> {
     if let Some(consts) = function_return_const_sites(func) {
         return consts.first().copied(); // sorted ascending — the min
     }
     // Mirror of the upper chain: trace `_0` through unique whole-local
     // move/copy defs to the producing local, each hop single-assigned.
     let mut local = 0usize;
+    let mut ssa_verified = false;
     for _ in 0..8 {
-        if !is_single_static_assignment(func, local) {
+        if crate::local_defs::is_parameter(func, local)
+            || !is_single_static_assignment(func, local)
+        {
             return None;
         }
         match crate::local_defs::unique_value_def(func, local) {
             Some(Rvalue::Use(Operand::Move(p) | Operand::Copy(p))) if p.projections.is_empty() => {
                 local = p.local;
             }
-            _ => break,
+            _ => {
+                ssa_verified = true;
+                break;
+            }
         }
     }
-    if !is_single_static_assignment(func, local) {
+    if !ssa_verified
+        && (crate::local_defs::is_parameter(func, local)
+            || !is_single_static_assignment(func, local))
+    {
         return None;
     }
     ret_call_const_lower_bound(func, local)
+}
+
+/// Trust (2026-10-03, docs/issues/2026-10-03-alab-level0-precision-gaps-ranked.md,
+/// "same-crate callee return"): a constant interval containing EVERY value `local` can
+/// hold, joined over its complete set of value definitions
+/// (`local_defs::value_defs`), or `None`.
+///
+/// Each definition contributes: a constant `c` gives `[c, c]`; a whole-local copy or
+/// move recurses into that local; a `Range::next` loop payload with constant bounds
+/// (`loop_bounds::loop_var_const_range`, the yield-set fact `start <= v < end`) gives
+/// `[start, end - 1]`. ANY other definition (arithmetic, a cast, a field read) makes
+/// the whole answer `None`. `value_defs` itself returns `None` for every channel whose
+/// value has no `Rvalue`: a parameter's entry value, a call destination (which is also
+/// what refuses recursion, self or mutual), a partial write, a mutable or raw alias, an
+/// unlocatable write. So the interval is exact over what the local can hold, adds no
+/// trusted fact, and fails closed on every channel it cannot see. A copy cycle or
+/// running out of fuel is `None`.
+///
+/// Motivating shape (a3d `argmax_abs`): `let mut best = 0; for k in 1..3 { if .. { best
+/// = k } } best` returns a value in `[0, 2]`, which indexes a `[f64; 3]` at the caller;
+/// the single-assignment chain above refuses it because `best` is assigned twice.
+pub(super) fn local_value_const_interval(
+    func: &VerifiableFunction,
+    local: usize,
+) -> Option<(i128, i128)> {
+    fn join(
+        func: &VerifiableFunction,
+        local: usize,
+        fuel: u32,
+        visiting: &mut Vec<usize>,
+    ) -> Option<(i128, i128)> {
+        if fuel == 0 || visiting.contains(&local) {
+            return None;
+        }
+        if let Some((Some(start), end)) = super::loop_bounds::loop_var_const_range(func, local) {
+            return (start < end).then_some((start, end - 1));
+        }
+        let defs = crate::local_defs::value_defs(func, local)?;
+        if defs.is_empty() {
+            return None;
+        }
+        visiting.push(local);
+        let mut acc: Option<(i128, i128)> = None;
+        for (_, rvalue) in defs {
+            let interval = match rvalue {
+                Rvalue::Use(op @ Operand::Constant(_)) => {
+                    let c = operand_const_int(op)?;
+                    (c, c)
+                }
+                Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.projections.is_empty() => {
+                    join(func, p.local, fuel - 1, visiting)?
+                }
+                _ => return None,
+            };
+            acc = Some(match acc {
+                None => interval,
+                Some((lo, hi)) => (lo.min(interval.0), hi.max(interval.1)),
+            });
+        }
+        visiting.pop();
+        acc
+    }
+    join(func, local, 8, &mut Vec::new())
+}
+
+/// Trust (2026-10-04, monotone counters): one-sided constant bounds on EVERY value
+/// `local` can hold, by induction over its writes, or `None` for a side.
+///
+/// Every definition (`local_defs::value_defs`, complete: it refuses a parameter's
+/// entry value, a call destination, a partial write, a mutable or raw alias and an
+/// unlocatable write) must be a constant, a whole-local copy, a constant range-loop
+/// payload, or the `.0` of a CHECKED `x + d` / `x - d` with a constant `d >= 0` whose
+/// defining block ends in rustc's overflow `Assert` on `.1` and whose successful
+/// edge dominates EACH contributing `.0` read. Same-block or bypassing reads
+/// decline the bound (a plain `BinaryOp`, and an
+/// `overflowing_add` whose checked tuple has no such assert, can wrap and refuse). For the LOWER side an
+/// add contributes `lower(x) + d` and a subtraction refuses the side; for the UPPER
+/// side the reverse. A path that returns to a local already on the stack contributes
+/// nothing new: it can only reach the cycle through copies and the side's monotone
+/// operation, so (strong induction over the order of the writes) every value it
+/// brings is bounded by the other definitions. A side with no non-cyclic definition
+/// is `None`.
+///
+/// Motivating shape (astream_wire `crc32_tables`): `let mut k = 1; while k < 8 {
+/// t[k] = t[k - 1] ^ 1; k += 1; }` — `k >= 1` everywhere, so `k - 1` cannot underflow.
+pub(super) fn local_value_monotone_bounds(
+    func: &VerifiableFunction,
+    local: usize,
+) -> (Option<i128>, Option<i128>) {
+    monotone_counter::bounds(func, local)
+}
+
+pub(super) fn summary_candidates(
+    funcs: &[VerifiableFunction],
+) -> impl Iterator<Item = &VerifiableFunction> {
+    // Trust (2026-10-05, SUMMARY-NAME-COLLIDE-1): every lane below keys its
+    // summary on `def_path`, and a call site looks it up by its own rendered
+    // callee name. A `def_path` two of these bodies share names neither of them:
+    // a call to one would be handed the other's facts, and a single pass used to
+    // keep whichever body came LAST. So a shared key summarizes nothing, in every
+    // lane at once (`summary_key_collisions` has the measured pair and the
+    // compiler's crate-wide half of this rule).
+    let mut key_count: FxHashMap<&str, usize> = FxHashMap::default();
+    for func in funcs {
+        *key_count.entry(func.def_path.as_str()).or_default() += 1;
+    }
+    // These summaries become definitional facts at other call sites. A dead
+    // assignment must not hide an unsupported image from the admission gate
+    // simply because a particular return-value recognizer ignores that local.
+    funcs.iter().filter(move |func| {
+        key_count.get(func.def_path.as_str()) == Some(&1) && !func.body.contains_memory_image()
+    })
+}
+
+/// Trust (2026-10-05, SUMMARY-NAME-COLLIDE-1): the summary KEYS that two or more
+/// distinct owners render to — the keys no body-derived summary may be recorded
+/// under, because a call site that spells one cannot say which body it runs.
+///
+/// Each item is `(key, owner)`: a rendered `def_path` and the identity of the
+/// item it was rendered from (the compiler passes the `DefId`). The same pair
+/// given twice is one owner, not a collision, so a caller may feed one owner
+/// from two inventories.
+///
+/// WHY A KEY CAN BE SHARED. The lanes key on `safe_def_path_str`, which
+/// canonicalizes every rendered lifetime to `'_`. rustc keeps two impls apart
+/// when their self types differ only in a region under a `for<>` binder (the
+/// `coherence_leak_check` future-compatibility case, rust#56105):
+/// `impl Tr for W<for<'a> fn(&'a u8) -> &'static u8>` and
+/// `impl Tr for W<for<'a> fn(&'a u8) -> &'a u8>` are two impls with two bodies,
+/// and both methods render `<k::W<for<'_> fn(&'_ u8) -> &'_ u8> as k::Tr>::get`.
+/// MEASURED on the stage 1 of `76a6ea45b2`: with the first `get` returning `x`
+/// and the second `1`, the const-set summary `{1}` was recorded under that key,
+/// and `get(x) + 1` through the FIRST impl was kernel-certified overflow-free
+/// under certify; a binary that called it with `u32::MAX` panicked on the add
+/// (`tests/ui/trust/summary_hrtb_impl_name_collision.rs`).
+///
+/// The extracted bodies alone cannot see every such pair (an owner that is not
+/// an extracted `fn` still renders a key a call can spell), which is why the
+/// compiler runs this over EVERY local body owner and refuses the result in all
+/// of its summary lanes; [`summary_candidates`] applies the same rule to the
+/// bodies a lane is given, as the lane's own floor.
+pub fn summary_key_collisions<'a, K: Eq + std::hash::Hash>(
+    owners: impl IntoIterator<Item = (&'a str, K)>,
+) -> FxHashSet<String> {
+    let mut owner_of: FxHashMap<&'a str, Option<K>> = FxHashMap::default();
+    for (key, owner) in owners {
+        match owner_of.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Some(owner));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if slot.get().as_ref() != Some(&owner) {
+                    slot.insert(None);
+                }
+            }
+        }
+    }
+    owner_of
+        .into_iter()
+        .filter(|(_, owner)| owner.is_none())
+        .map(|(key, _)| key.to_string())
+        .collect()
 }
 
 /// Trust (clamp-via-helper): whole-crate map of function name -> constant return
@@ -980,8 +2175,9 @@ pub(super) fn function_return_const_lower_bound(func: &VerifiableFunction) -> Op
 /// const-certain, single-assigned, non-negative return bounds are recorded; the
 /// use-site emission is itself SSA-gated and staleness-versioned.
 pub fn compute_return_bound_summaries(funcs: &[VerifiableFunction]) -> FxHashMap<String, i128> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
         if let Some(b) = function_return_const_upper_bound(func) {
             // Key on `def_path` (the full `safe_def_path_str`), NOT `name` (the
             // short item name): a call site renders its callee via
@@ -1005,10 +2201,99 @@ pub fn compute_return_bound_summaries(funcs: &[VerifiableFunction]) -> FxHashMap
 pub fn compute_return_lower_bound_summaries(
     funcs: &[VerifiableFunction],
 ) -> FxHashMap<String, i128> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
         if let Some(b) = function_return_const_lower_bound(func) {
             map.insert(func.def_path.clone(), b);
+        }
+    }
+    map
+}
+
+/// Trust (2026-09-30, return-interval summary): whole-crate map of function
+/// `def_path` -> the interval its return value lies in on EVERY completed call, as
+/// `(lower, upper)`, each side present only when it is tighter than the return
+/// type's own range (a side equal to the type range says nothing). Derived by
+/// [`crate::abstract_interp::transfer::return_interval`]: the production interval
+/// fixpoint over the callee's own body, for every input. Where the recognizers
+/// above find nothing, `fn widen(x: u8) -> u32 { x as u32 + 1 }` is `[1, 256]` and
+/// `fn index(self) -> usize { self as usize }` over a four-variant enum is
+/// `[0, 3]`. Keyed on `def_path` and consumed like its siblings, at a call that
+/// reaches the summarized body.
+///
+/// `overflow_asserts_enforced` is whether this compilation keeps its overflow
+/// asserts (`-C overflow-checks`); without them an overflow assert's success edge
+/// says nothing, and the checked-result tracking is off.
+pub fn compute_return_interval_summaries(
+    funcs: &[VerifiableFunction],
+    overflow_asserts_enforced: bool,
+) -> FxHashMap<String, (Option<i128>, Option<i128>)> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
+    let mut map = FxHashMap::default();
+    for func in summary_candidates(funcs) {
+        // A function with an authored contract is used through its contract: a
+        // caller relies on what the contract says, not on what the body happens to
+        // return (`postcondition_composition_upper_bound_only.rs` pins that a weak
+        // `ensures` stays weak). The inferred-return lane draws the same line. The
+        // compiler also drops every def whose contract bundle is non-empty, since
+        // its extraction for this lane carries none.
+        if !func.contracts.is_empty() || !func.postconditions.is_empty() || !func.spec.is_empty() {
+            continue;
+        }
+        let Some(ret_ty) = crate::local_ty_ref(func, 0) else {
+            continue;
+        };
+        let Some(ty_range) = crate::abstract_interp::type_to_interval(ret_ty) else {
+            continue;
+        };
+        let _func_scope = super::FuncAnalysisScope::enter(func);
+        let Some(interval) =
+            crate::abstract_interp::transfer::return_interval(func, overflow_asserts_enforced)
+        else {
+            continue;
+        };
+        let lo = (interval.lo > ty_range.lo).then_some(interval.lo);
+        let hi = (interval.hi < ty_range.hi).then_some(interval.hi);
+        if lo.is_some() || hi.is_some() {
+            map.insert(func.def_path.clone(), (lo, hi));
+        }
+    }
+    map
+}
+
+/// Trust (2026-10-01, payload return-interval summary): whole-crate map of function
+/// `def_path` -> `(variant, lower, upper)` for a function returning a std
+/// `Option<iN>` / `Result<iN, E>`: the payload arm's variant index (`Some` = 1,
+/// `Ok` = 0) and the interval its payload lies in on every completed call, each side
+/// present only when tighter than the payload type's range. Derived by
+/// [`crate::abstract_interp::transfer::return_payload_interval`]; the same contract
+/// exclusion as [`compute_return_interval_summaries`], and consumed only at a call
+/// that reaches the summarized body, on the payload a caller extracts from that
+/// call's own result (`build_payload_interval_guard_map`).
+pub fn compute_return_payload_interval_summaries(
+    funcs: &[VerifiableFunction],
+    overflow_asserts_enforced: bool,
+) -> FxHashMap<String, (usize, Option<i128>, Option<i128>)> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
+    let mut map = FxHashMap::default();
+    for func in summary_candidates(funcs) {
+        if !func.contracts.is_empty() || !func.postconditions.is_empty() || !func.spec.is_empty() {
+            continue;
+        }
+        let _func_scope = super::FuncAnalysisScope::enter(func);
+        let Some((variant, interval, ty_range)) =
+            crate::abstract_interp::transfer::return_payload_interval(
+                func,
+                overflow_asserts_enforced,
+            )
+        else {
+            continue;
+        };
+        let lo = (interval.lo > ty_range.lo).then_some(interval.lo);
+        let hi = (interval.hi < ty_range.hi).then_some(interval.hi);
+        if lo.is_some() || hi.is_some() {
+            map.insert(func.def_path.clone(), (variant, lo, hi));
         }
     }
     map
@@ -1025,8 +2310,10 @@ pub fn compute_return_lower_bound_summaries(
 pub fn compute_return_const_set_summaries(
     funcs: &[VerifiableFunction],
 ) -> FxHashMap<String, Vec<i128>> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
+        let _func_scope = super::FuncAnalysisScope::enter(func);
         if let Some(consts) = function_return_const_sites(func)
             && consts.len() <= RETURN_CONST_SET_MAX
         {
@@ -1034,6 +2321,138 @@ pub fn compute_return_const_set_summaries(
         }
     }
     map
+}
+
+/// Trust (2026-09-23, TRUST-10): the whole-crate RETURN SUMMARIES of a same-crate
+/// callee, as GLOBAL facts about a local whose ONLY value is that call's result.
+///
+/// The three summaries above are consumed at the call site by
+/// `build_semantic_guard_map` as PATH facts, threaded to the call's success
+/// target. A path fact is weakened to nothing at a loop-header join, so it never
+/// reaches a loop BODY that reads the result only transitively — the same gap the
+/// `min`/`max` global facts were written for. bit-vec 0.9.1's
+///
+/// ```text
+/// fn reverse_bits(byte: u8) -> u8 {
+///     let mut result = 0;
+///     for i in 0..u8::bits() {                      // <u8 as BitBlock>::bits() == 8
+///         result |= ((byte >> i) & 1) << (u8::bits() - 1 - i);
+///     }
+///     result
+/// }
+/// ```
+///
+/// was reported `[shift:right] FAILED` with `_5 = 9, i = 8` and `[overflow:sub]
+/// FAILED` with `_17 = 0` — the loop bound and the in-body `u8::bits()` each
+/// havocked, although the callee is `fn bits() -> usize { 8 }` in the same crate
+/// and its const-set summary `{8}` was recorded. Replayed over all 256 inputs the
+/// function never panics: the counterexamples are not executions.
+///
+/// SOUNDNESS. Each summary holds for EVERY input and EVERY return path of the
+/// callee (the computations above fail closed otherwise), so it is a fact about
+/// every value the call can produce. It becomes a fact about the LOCAL only when
+/// that call is the local's one value on every channel, which is exactly
+/// [`crate::local_defs::unique_value_call`]: never a parameter (whose entry
+/// definition reaches a path that skips the call), no second call, no `Assign`
+/// beside it, no projected/discriminant write, no mutable or raw alias, no
+/// unlocatable write. That is the gate `build_min_upper_bound_facts` uses, and it
+/// is stricter than the path lane's `is_single_static_assignment`. Under it the
+/// fact is true of the value the local holds at every read, including a read in
+/// a later loop iteration of a call inside the loop, because every dynamic
+/// instance of the one call satisfies the summary. A panicking callee path writes
+/// no value and so reaches no read. The facts can only delete counterexamples no
+/// execution realises: `for i in 0..nine() { byte >> i }` with `nine() == 9`
+/// stays refuted (`i = 8` is a real input), and a local with a second definition
+/// gets no fact at all.
+///
+/// The callee lookup is the same `def_path`-keyed lookup the path lane already
+/// makes at the same call sites, so this adds no identity channel; an unknown
+/// callee (foreign, generic, recursive, non-constant) has no summary and emits
+/// nothing. Integer destinations only, below 128 bits (the 128-bit Int-sorted
+/// literal lanes fail closed elsewhere; this does too).
+pub(super) fn build_callee_return_summary_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    if !super::terminator_presence_for(func).has_bare_dest_call {
+        return Vec::new();
+    }
+    let mut facts = Vec::new();
+    // Candidates first, from the terminators alone: a whole-local call
+    // destination whose callee HAS a summary. Only those pay for the seam's
+    // every-channel write walk, so a body with no summarised callee (the common
+    // case) costs one pass over its blocks — or O(1) when no return summaries
+    // are installed in the active context.
+    let Some(mut candidates) = crate::with_current_callee_summaries(|summaries| {
+        if summaries.facts.return_bounds.is_empty()
+            && summaries.facts.return_lower_bounds.is_empty()
+            && summaries.facts.return_const_sets.is_empty()
+        {
+            return Vec::new();
+        }
+        func.body
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.terminator {
+                Terminator::Call { func: callee, dest, .. }
+                    if dest.projections.is_empty()
+                        && (summaries.facts.return_bounds.contains_key(callee.as_str())
+                            || summaries.facts.return_lower_bounds.contains_key(callee.as_str())
+                            || summaries.facts.return_const_sets.contains_key(callee.as_str())) =>
+                {
+                    Some(dest.local)
+                }
+                _ => None,
+            })
+            .collect::<Vec<usize>>()
+    }) else {
+        return facts;
+    };
+    if candidates.is_empty() {
+        return facts;
+    }
+    if candidates.len() > 1 {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+    for local in candidates {
+        let Some(Terminator::Call { func: callee, .. }) =
+            crate::local_defs::unique_value_call(func, local)
+        else {
+            continue;
+        };
+        let is_narrow_int = match crate::local_ty_ref(func, local) {
+            Some(Ty::Int { width, .. }) => *width < 128,
+            Some(Ty::PtrSizedInt { .. }) => true,
+            _ => false,
+        };
+        if !is_narrow_int {
+            continue;
+        }
+        let var_formula = Formula::Var(crate::place_to_var_name(func, &Place::local(local)), Sort::Int);
+        let var = || var_formula.clone();
+        if let Some(bound) = crate::callee_return_upper_bound(callee) {
+            facts.push(Formula::Le(Box::new(var()), Box::new(Formula::Int(bound))));
+        }
+        if let Some(lo) = crate::callee_return_lower_bound(callee) {
+            facts.push(Formula::Ge(Box::new(var()), Box::new(Formula::Int(lo))));
+        }
+        if let Some(consts) = crate::callee_return_const_set(callee) {
+            // FAIL CLOSED on an empty set: the membership would be `false`, and a
+            // global `false` erases every obligation in the body. The summary never
+            // records one (`function_return_const_sites` refuses), but this fact is
+            // global, so the guard is local too.
+            match consts.as_slice() {
+                [] => {}
+                [c] => facts.push(Formula::Eq(Box::new(var()), Box::new(Formula::Int(*c)))),
+                _ => {
+                    let eqs: Vec<Formula> = consts
+                        .iter()
+                        .map(|c| Formula::Eq(Box::new(var()), Box::new(Formula::Int(*c))))
+                        .collect();
+                    facts.push(Formula::Or(eqs));
+                }
+            }
+        }
+    }
+    facts
 }
 
 /// Trust (derived trivial-setter summary): the fail-closed recognizer — see
@@ -1111,6 +2530,18 @@ pub(super) fn function_trivial_setter(func: &VerifiableFunction) -> Option<Sette
                     if !place.projections.is_empty() {
                         return None; // a projected non-deref write (field store): reject
                     }
+                    // A write to a PARAMETER (`v = w`, or `p = q` reseating the
+                    // pointer) is not a trivial setter. The copy chain below is
+                    // resolved without regard to statement order, and its ambiguity
+                    // guard never sees a parameter's entry value (it is not an
+                    // `Assign`), so `*p = v; v = w` resolved the stored value to `w`:
+                    // `set(&mut a, 5, 9); buf[a]` was PROVED, kernel-certified, and
+                    // indexes out of bounds (an adversarial audit, 2026-09-30; the
+                    // 2026-09-17 pack proves it too;
+                    // `tests/ui/trust/setter_that_rewrites_its_parameter_refused.rs`).
+                    if (1..=arg_count).contains(&place.local) {
+                        return None;
+                    }
                     match rvalue {
                         // A whole-local copy `_dst = copy/move _src`: track it so the
                         // store source can be resolved through the chain.
@@ -1147,7 +2578,7 @@ pub(super) fn function_trivial_setter(func: &VerifiableFunction) -> Option<Sette
     if p < 1 || p > arg_count {
         return None;
     }
-    let (width, signed) = match &func.body.locals.iter().find(|d| d.index == p)?.ty {
+    let (width, signed) = match crate::local_ty_ref(func, p)? {
         Ty::Ref { mutable: true, inner } => match inner.as_ref() {
             Ty::Int { width, signed } if (1..128).contains(width) => (*width, *signed),
             _ => return None,
@@ -1173,10 +2604,13 @@ pub(super) fn function_trivial_setter(func: &VerifiableFunction) -> Option<Sette
     let src = match rvalue {
         Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) if q.projections.is_empty() => {
             let root = resolve_root(q.local);
-            if root >= 1 && root <= arg_count && root != p && func.body.locals.iter().any(|d| {
-                d.index == root
-                    && matches!(d.ty, Ty::Int { width: w, signed: s } if w == width && s == signed)
-            }) {
+            if root >= 1
+                && root <= arg_count
+                && root != p
+                && crate::local_ty_ref(func, root).is_some_and(|ty| {
+                    matches!(ty, Ty::Int { width: w, signed: s } if *w == width && *s == signed)
+                })
+            {
                 SetterSrc::Param(root)
             } else {
                 return None;
@@ -1216,7 +2650,7 @@ pub fn compute_trivial_setter_summaries(
     funcs: &[VerifiableFunction],
 ) -> FxHashMap<String, SetterSummary> {
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
         if let Some(summary) = function_trivial_setter(func) {
             map.insert(func.def_path.clone(), summary);
         }
@@ -1239,6 +2673,16 @@ pub(super) fn callsite_unique_mut_borrow_target(
     func: &VerifiableFunction,
     temp: usize,
 ) -> Option<usize> {
+    if crate::local_defs::is_parameter(func, temp) {
+        return None;
+    }
+    let Rvalue::Ref { mutable: true, place } = crate::local_defs::unique_value_def(func, temp)?
+    else {
+        return None;
+    };
+    if !place.projections.is_empty() {
+        return None;
+    }
     for block in &func.body.blocks {
         if let Terminator::Call { dest, .. } = &block.terminator
             && dest.local == temp
@@ -1254,10 +2698,7 @@ pub(super) fn callsite_unique_mut_borrow_target(
             }
         }
     }
-    match crate::local_defs::unique_value_def(func, temp)? {
-        Rvalue::Ref { mutable: true, place } if place.projections.is_empty() => Some(place.local),
-        _ => None,
-    }
+    Some(place.local)
 }
 
 /// Trust (derived trivial-setter summary): the exact, fully-VERSIONED post-call
@@ -1291,44 +2732,11 @@ pub(super) fn trivial_setter_callsite_fact(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
 ) -> Option<(usize, Formula)> {
-    let Terminator::Call { func: callee, args, dest, target: Some(_), .. } = &block.terminator
-    else {
+    let (target, fact) = trivial_setter_callsite_fact_unversioned(func, block)?;
+    let Formula::Eq(lhs, _) = &fact else {
         return None;
     };
-    let setter = crate::callee_setter_summary(callee)?;
-    if args.len() != setter.param_count {
-        return None;
-    }
-    let ptr_idx = setter.ptr_param.checked_sub(1)?;
-    let (Operand::Copy(pp) | Operand::Move(pp)) = args.get(ptr_idx)? else {
-        return None;
-    };
-    if !pp.projections.is_empty() {
-        return None;
-    }
-    let target = callsite_unique_mut_borrow_target(func, pp.local)?;
-    if dest.local == target
-        || !func.body.locals.iter().any(|d| {
-            d.index == target
-                && matches!(d.ty, Ty::Int { width, signed } if (width, signed) == setter.pointee)
-        })
-    {
-        return None;
-    }
-    let value = match &setter.src {
-        SetterSrc::Const(c) => Formula::Int(*c),
-        SetterSrc::Param(j) => match j.checked_sub(1).and_then(|i| args.get(i))? {
-            op @ Operand::Constant(_) => Formula::Int(operand_const_int(op)?),
-            op @ (Operand::Copy(q) | Operand::Move(q))
-                if q.projections.is_empty() && q.local != target && q.local != pp.local =>
-            {
-                operand_to_formula(func, op)
-            }
-            _ => return None,
-        },
-    };
-    let target_name = crate::place_to_var_name(func, &Place::local(target));
-    let fact = Formula::Eq(Box::new(Formula::Var(target_name.clone(), Sort::Int)), Box::new(value));
+    let target_name = lhs.var_name()?.to_string();
     // `?`: the versioner answers `None` when an argument of this call reads the
     // subject's own name. The setter recognizer already refuses the `set(&mut a,
     // a)` tautology by local (see the value-actual gate above), so this is
@@ -1356,6 +2764,9 @@ pub(super) fn trivial_setter_callsite_fact_unversioned(
         return None;
     };
     let setter = crate::callee_setter_summary(callee)?;
+    if !crate::call_reaches_summarized_body(&block.terminator) {
+        return None;
+    }
     if args.len() != setter.param_count {
         return None;
     }
@@ -1368,9 +2779,8 @@ pub(super) fn trivial_setter_callsite_fact_unversioned(
     }
     let target = callsite_unique_mut_borrow_target(func, pp.local)?;
     if dest.local == target
-        || !func.body.locals.iter().any(|d| {
-            d.index == target
-                && matches!(d.ty, Ty::Int { width, signed } if (width, signed) == setter.pointee)
+        || !crate::local_ty_ref(func, target).is_some_and(|ty| {
+            matches!(ty, Ty::Int { width, signed } if (*width, *signed) == setter.pointee)
         })
     {
         return None;
@@ -1435,48 +2845,45 @@ pub(super) fn function_return_variant_sites(
     n_variants: usize,
 ) -> Option<Vec<(usize, usize)>> {
     let mut sites: Vec<(usize, usize)> = Vec::new();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
+    let poisoned =
+        crate::any_local_write_candidate(func, &func.body.blocks, 0, |block, item| match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place, rvalue, .. } => {
                     if let Rvalue::Ref { mutable: true, place: borrowed }
                     | Rvalue::AddressOf(_, borrowed) = rvalue
                         && borrowed.local == 0
                     {
-                        return None;
+                        return true;
                     }
                     if place.local != 0 {
-                        continue;
+                        return false;
                     }
                     if !place.projections.is_empty() {
-                        return None;
+                        return true;
                     }
                     let Rvalue::Aggregate(
                         AggregateKind::Adt { name, variant, active_field: None, .. },
                         _,
                     ) = rvalue
                     else {
-                        return None;
+                        return true;
                     };
                     if name != enum_name || *variant >= n_variants {
-                        return None;
+                        return true;
                     }
                     sites.push((block.id.0, *variant));
+                    false
                 }
                 Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
-                    if place.local == 0 {
-                        return None;
-                    }
+                    place.local == 0
                 }
-                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => return None,
-                _ => {}
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == 0
-        {
-            return None;
-        }
+                Statement::Intrinsic { .. } | Statement::Unsupported { .. } => true,
+                _ => false,
+            },
+            None => matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == 0),
+        });
+    if poisoned {
+        return None;
     }
     (!sites.is_empty()).then_some(sites)
 }
@@ -1505,8 +2912,9 @@ pub(super) fn entry_prefix_switch_ordinal(func: &VerifiableFunction) -> Option<u
 /// with (caller side). Exactly three shapes, everything else `None`:
 ///   * an integer/bool CONSTANT (ground — trivially execution-invariant);
 ///   * a PINNED parameter, possibly through single-def whole-local copy/move
-///     hops: `place_source_is_stable` (no projected store, no `&mut`/`&raw`
-///     borrow, no `SetDiscriminant`/`Deinit`) PLUS zero whole-local defs — a
+///     hops: `place_source_is_stable` (no projected store, no slot-write channel —
+///     `&mut`, `&raw mut`, `&raw const` of an owned place — no
+///     `SetDiscriminant`/`Deinit`) PLUS zero whole-local defs — a
 ///     parameter is initialized at entry, so ANY body store (statement or call
 ///     dest, counted by `local_defs::value_count`) would make it two-valued;
 ///   * a local whose unique stable def is a CONSTANT assignment (`x = const c`
@@ -1537,7 +2945,7 @@ pub(super) fn entry_stable_operand_formula(
             if !crate::local_defs::never_explicitly_reseated(func, cur) {
                 return None;
             }
-            return Some(crate::operand_to_formula(func, &Operand::Copy(Place::local(cur))));
+            return Some(crate::place_to_formula(func, &Place::local(cur)));
         }
         match crate::local_defs::unique_value_def(func, cur) {
             Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q)))
@@ -1563,7 +2971,7 @@ pub(super) fn stable_unique_def_through_copies<'a>(
 ) -> Option<&'a Rvalue> {
     let mut cur = local;
     for _ in 0..8 {
-        if !crate::place_source_is_stable(func, cur) {
+        if crate::local_defs::is_parameter(func, cur) || !crate::place_source_is_stable(func, cur) {
             return None;
         }
         match crate::local_defs::unique_value_def(func, cur)? {
@@ -1709,6 +3117,7 @@ pub(crate) fn function_return_disc_summary(func: &VerifiableFunction) -> Option<
 
     let ret_ty = crate::local_ty_ref(func, 0)?;
     let (enum_name, variants) = modeled_std_enum_shape(ret_ty)?;
+    let _func_scope = super::FuncAnalysisScope::enter(func);
     let sites = function_return_variant_sites(func, enum_name, variants.len())?;
     let params: Vec<String> =
         (1..=func.body.arg_count).map(|i| place_to_var_name(func, &Place::local(i))).collect();
@@ -1738,7 +3147,7 @@ pub(crate) fn function_return_disc_summary(func: &VerifiableFunction) -> Option<
     // Belt: every free var of `cond` must be a formal — the substitution keys —
     // so instantiation can never leave a callee-internal symbol to capture a
     // same-named caller local (the `postcondition_rebindable` discipline).
-    if !cond.free_variables().iter().all(|v| params.iter().any(|p| p == v)) {
+    if !trust_types::all_free_variable_names(&cond, &mut |v| params.iter().any(|p| p == v)) {
         return None;
     }
     let vt = arm_single_site_variant(func, true_arm, &sites)?;
@@ -1775,8 +3184,9 @@ pub(crate) fn function_return_disc_summary(func: &VerifiableFunction) -> Option<
 pub fn compute_return_disc_summaries(
     funcs: &[VerifiableFunction],
 ) -> FxHashMap<String, ReturnDiscSummary> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
         if let Some(s) = function_return_disc_summary(func) {
             map.insert(func.def_path.clone(), s);
         }
@@ -1790,8 +3200,9 @@ pub fn compute_return_disc_summaries(
 pub fn compute_return_bool_pred_summaries(
     funcs: &[VerifiableFunction],
 ) -> FxHashMap<String, ReturnBoolPredSummary> {
+    let _analysis_memo = crate::gen_work_memo_scope_if_unscoped();
     let mut map = FxHashMap::default();
-    for func in funcs {
+    for func in summary_candidates(funcs) {
         if let Some(s) = function_return_bool_pred_summary(func) {
             map.insert(func.def_path.clone(), s);
         }
@@ -1857,11 +3268,13 @@ pub(super) fn function_return_bool_pred_summary(
     if returns != 1 {
         return None;
     }
+    let _func_scope = super::FuncAnalysisScope::enter(func);
     // Formal-parameter names at FULL arity — the consumer matches
     // `args.len() == params.len()`, so a multi-param helper only connects at a
     // call of the same arity (the pred actual is `args[pred_param-1]`).
-    let params: Vec<String> =
-        (1..=func.body.arg_count).map(|i| place_to_var_name(func, &Place::local(i))).collect();
+    let make_params = || -> Vec<String> {
+        (1..=func.body.arg_count).map(|i| place_to_var_name(func, &Place::local(i))).collect()
+    };
 
     // The predicate SUBJECT may be ANY parameter, not just `_1` — try each in
     // order and return the first that yields a summary. The body probes/switches
@@ -1884,35 +3297,33 @@ pub(super) fn function_return_bool_pred_summary(
             other => (modeled_std_enum_shape(other), true),
         };
         let found = if let Some((enum_name, variants)) = whole_enum {
-            let variant_tags: Vec<i128> = variants.iter().map(|v| v.discriminant).collect();
             if calls == 1 {
-                tier1_probe_body_summary(
-                    func,
-                    enum_name,
-                    variants,
-                    variant_tags.clone(),
-                    params.clone(),
-                    by_value,
-                    pred_local,
-                )
-                .or_else(|| {
-                    tier2b_probe_switch_body_summary(
+                find_param_probe(func, enum_name, by_value, pred_local).and_then(|probe| {
+                    tier1_probe_body_summary_from_probe(
                         func,
                         enum_name,
                         variants,
-                        variant_tags,
-                        params.clone(),
-                        by_value,
+                        &make_params,
                         pred_local,
+                        probe,
                     )
+                    .or_else(|| {
+                        tier2b_probe_switch_body_summary_from_probe(
+                            func,
+                            enum_name,
+                            variants,
+                            &make_params,
+                            pred_local,
+                            probe,
+                        )
+                    })
                 })
             } else if calls == 0 {
                 tier2a_switch_body_summary(
                     func,
                     enum_name,
                     variants,
-                    variant_tags,
-                    params.clone(),
+                    &make_params,
                     by_value,
                     pred_local,
                 )
@@ -1922,7 +3333,7 @@ pub(super) fn function_return_bool_pred_summary(
         } else if !by_value && calls == 1 {
             // Field subject: a `&Struct` param whose PROBED field is a modeled
             // enum (`fn is_ready(&self) -> bool { self.field.is_some() }`).
-            tier1_field_probe_body_summary(func, params.clone(), pred_local)
+            tier1_field_probe_body_summary(func, &make_params, pred_local)
         } else {
             None
         };
@@ -1982,7 +3393,9 @@ pub(super) fn find_param_probe(
             // `unique_value_def`), so the receiver could actually point
             // elsewhere and the recorded summary would be WRONG. Require each hop
             // pinned before trusting its def.
-            if !unwrap_receiver_local_is_pinned(func, local) {
+            if crate::local_defs::is_parameter(func, local)
+                || !unwrap_receiver_local_is_pinned(func, local)
+            {
                 return false;
             }
             match crate::local_defs::unique_value_def(func, local) {
@@ -2002,9 +3415,9 @@ pub(super) fn find_param_probe(
     // param `&_1` (referent `_1`, no projection).
     // The reborrow temp whose `&(*_1)`/`&_1` def we trust must itself be PINNED
     // (a `&mut`-reseated temp has a stale borrow def — audit r3 class).
-    let recv_pinned = unwrap_receiver_local_is_pinned(func, recv.local);
     let receiver_ok = if by_value {
-        recv_pinned
+        !crate::local_defs::is_parameter(func, recv.local)
+            && unwrap_receiver_local_is_pinned(func, recv.local)
             && matches!(
                 crate::local_defs::unique_value_def(func, recv.local),
                 Some(Rvalue::Ref { mutable: false, place: referent })
@@ -2012,7 +3425,8 @@ pub(super) fn find_param_probe(
             )
     } else {
         chained_to_param(func, recv.local, pred_local)
-            || (recv_pinned
+            || (!crate::local_defs::is_parameter(func, recv.local)
+                && unwrap_receiver_local_is_pinned(func, recv.local)
                 && matches!(
                     crate::local_defs::unique_value_def(func, recv.local),
                     Some(Rvalue::Ref { mutable: false, place: referent })
@@ -2051,19 +3465,11 @@ pub(super) fn straight_line_bool_arm(func: &VerifiableFunction, start: BlockId) 
         for stmt in &block.stmts {
             match stmt {
                 Statement::StorageLive(_) | Statement::StorageDead(_) => continue,
-                Statement::Assign { place, rvalue, .. }
-                    if place.local == 0
-                        && place.projections.is_empty()
-                        && value.is_none()
-                        && matches!(
-                            rvalue,
-                            Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(_)))
-                        ) =>
-                {
-                    let Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(b))) = rvalue
-                    else {
-                        unreachable!()
-                    };
+                Statement::Assign {
+                    place,
+                    rvalue: Rvalue::Use(Operand::Constant(trust_types::ConstValue::Bool(b))),
+                    ..
+                } if place.local == 0 && place.projections.is_empty() && value.is_none() => {
                     value = Some(*b);
                 }
                 _ => return None,
@@ -2083,20 +3489,30 @@ pub(super) fn tier1_probe_body_summary(
     func: &VerifiableFunction,
     enum_name: &str,
     variants: &[trust_types::VariantDef],
-    variant_tags: Vec<i128>,
-    params: Vec<String>,
+    make_params: &impl Fn() -> Vec<String>,
     by_value: bool,
     pred_local: usize,
 ) -> Option<ReturnBoolPredSummary> {
-    let (dest_local, target, probe_variant) =
-        find_param_probe(func, enum_name, by_value, pred_local)?;
+    let probe = find_param_probe(func, enum_name, by_value, pred_local)?;
+    tier1_probe_body_summary_from_probe(func, enum_name, variants, make_params, pred_local, probe)
+}
+
+fn tier1_probe_body_summary_from_probe(
+    func: &VerifiableFunction,
+    enum_name: &str,
+    variants: &[trust_types::VariantDef],
+    make_params: &impl Fn() -> Vec<String>,
+    pred_local: usize,
+    (dest_local, target, probe_variant): (usize, BlockId, &'static str),
+) -> Option<ReturnBoolPredSummary> {
     if !probe_result_reaches_return(func, dest_local, target) {
         return None;
     }
     let pred_tag = variants.iter().find(|v| v.name == probe_variant)?.discriminant;
+    let variant_tags: Vec<i128> = variants.iter().map(|v| v.discriminant).collect();
     Some(ReturnBoolPredSummary {
         enum_name: enum_name.to_string(),
-        params,
+        params: make_params(),
         pred_param: pred_local,
         pred_field: None,
         kind: ReturnBoolPredKind::Iff,
@@ -2151,21 +3567,18 @@ pub(super) fn probe_result_reaches_return(
 /// on any deviation (mirrors Tier 1's gates, with a field-projection receiver).
 pub(super) fn tier1_field_probe_body_summary(
     func: &VerifiableFunction,
-    params: Vec<String>,
+    make_params: &impl Fn() -> Vec<String>,
     pred_local: usize,
 ) -> Option<ReturnBoolPredSummary> {
     let (field_idx, dest_local, target, probe_paths, probe_variant) =
         find_field_probe(func, pred_local)?;
     // The probed field's type must be a modeled std enum whose flattened shape
     // matches the probe (Option vs Result).
-    let field_place = Place {
-        local: pred_local,
-        projections: vec![
-            trust_types::Projection::Deref,
-            trust_types::Projection::Field(field_idx),
-        ],
-    };
-    let field_ty = crate::place_ty_cow(func, &field_place)?;
+    let field_ty = crate::place_prefix_ty_cow(
+        func,
+        pred_local,
+        &[trust_types::Projection::Deref, trust_types::Projection::Field(field_idx)],
+    )?;
     let (enum_name, variants) = modeled_std_enum_shape(field_ty.as_ref())?;
     if !probe_paths.contains(&enum_name) {
         return None;
@@ -2177,7 +3590,7 @@ pub(super) fn tier1_field_probe_body_summary(
     let pred_tag = variants.iter().find(|v| v.name == probe_variant)?.discriminant;
     Some(ReturnBoolPredSummary {
         enum_name: enum_name.to_string(),
-        params,
+        params: make_params(),
         pred_param: pred_local,
         pred_field: Some(field_idx),
         kind: ReturnBoolPredKind::Iff,
@@ -2221,7 +3634,8 @@ pub(super) fn find_field_probe(
         // SOUNDNESS (aliased reseat, audit r3): each hop local must be PINNED
         // before its `&((*_1).f)` / copy def is trusted — a `&mut`-reseated
         // intermediate has a stale def and the field summary would be WRONG.
-        if !unwrap_receiver_local_is_pinned(func, cur) {
+        if crate::local_defs::is_parameter(func, cur) || !unwrap_receiver_local_is_pinned(func, cur)
+        {
             return None;
         }
         match crate::local_defs::unique_value_def(func, cur) {
@@ -2264,8 +3678,7 @@ pub(super) fn tier2a_switch_body_summary(
     func: &VerifiableFunction,
     enum_name: &str,
     variants: &[trust_types::VariantDef],
-    variant_tags: Vec<i128>,
-    params: Vec<String>,
+    make_params: &impl Fn() -> Vec<String>,
     by_value: bool,
     pred_local: usize,
 ) -> Option<ReturnBoolPredSummary> {
@@ -2273,12 +3686,12 @@ pub(super) fn tier2a_switch_body_summary(
     // (`*_1` for a `&Enum` param, `_1` for a by-value `Enum` param) — and a
     // two-way switch on it.
     let entry = func.body.blocks.first()?;
-    let real: Vec<&Statement> = entry
+    let mut real = entry
         .stmts
         .iter()
-        .filter(|s| !matches!(s, Statement::StorageLive(_) | Statement::StorageDead(_)))
-        .collect();
-    let [Statement::Assign { place: d, rvalue: Rvalue::Discriminant(src), .. }] = real.as_slice()
+        .filter(|s| !matches!(s, Statement::StorageLive(_) | Statement::StorageDead(_)));
+    let (Some(Statement::Assign { place: d, rvalue: Rvalue::Discriminant(src), .. }), None) =
+        (real.next(), real.next())
     else {
         return None;
     };
@@ -2302,10 +3715,10 @@ pub(super) fn tier2a_switch_body_summary(
     }
     let (case_tag, case_bb) = (targets[0].0, targets[0].1);
     let case_tag = i128::try_from(case_tag).ok()?;
-    if !variant_tags.contains(&case_tag) || variants.len() != 2 {
+    if variants.len() != 2 || !variants.iter().any(|v| v.discriminant == case_tag) {
         return None;
     }
-    let other_tag = *variant_tags.iter().find(|t| **t != case_tag)?;
+    let other_tag = variants.iter().find(|v| v.discriminant != case_tag)?.discriminant;
     // The case arm is reached iff `tag == case_tag`; the otherwise arm iff
     // `tag == other_tag` (2-variant, exact partition). Classify each arm's
     // return value: `Some(b)` = a provably-const `b` (straight-line to Return),
@@ -2339,9 +3752,10 @@ pub(super) fn tier2a_switch_body_summary(
         // Neither arm const — cannot conclude a tag relationship.
         (None, None) => return None,
     };
+    let variant_tags: Vec<i128> = variants.iter().map(|v| v.discriminant).collect();
     Some(ReturnBoolPredSummary {
         enum_name: enum_name.to_string(),
-        params,
+        params: make_params(),
         pred_param: pred_local,
         pred_field: None,
         kind,
@@ -2361,13 +3775,29 @@ pub(super) fn tier2b_probe_switch_body_summary(
     func: &VerifiableFunction,
     enum_name: &str,
     variants: &[trust_types::VariantDef],
-    variant_tags: Vec<i128>,
-    params: Vec<String>,
+    make_params: &impl Fn() -> Vec<String>,
     by_value: bool,
     pred_local: usize,
 ) -> Option<ReturnBoolPredSummary> {
-    let (probe_dest, target, probe_variant) =
-        find_param_probe(func, enum_name, by_value, pred_local)?;
+    let probe = find_param_probe(func, enum_name, by_value, pred_local)?;
+    tier2b_probe_switch_body_summary_from_probe(
+        func,
+        enum_name,
+        variants,
+        make_params,
+        pred_local,
+        probe,
+    )
+}
+
+fn tier2b_probe_switch_body_summary_from_probe(
+    func: &VerifiableFunction,
+    enum_name: &str,
+    variants: &[trust_types::VariantDef],
+    make_params: &impl Fn() -> Vec<String>,
+    pred_local: usize,
+    (probe_dest, target, probe_variant): (usize, BlockId, &'static str),
+) -> Option<ReturnBoolPredSummary> {
     // The probe's success block switches on the Bool result; only storage
     // annotations may precede the switch.
     let sw_block = func.body.blocks.get(target.0)?;
@@ -2404,7 +3834,7 @@ pub(super) fn tier2b_probe_switch_body_summary(
         if variants.len() != 2 {
             return None;
         }
-        variant_tags.iter().find(|t| **t != probe_tag).copied()
+        variants.iter().find(|v| v.discriminant != probe_tag).map(|v| v.discriminant)
     };
     let v_true = straight_line_bool_arm(func, true_bb);
     let v_false = straight_line_bool_arm(func, false_bb);
@@ -2432,9 +3862,10 @@ pub(super) fn tier2b_probe_switch_body_summary(
         (None, Some(true)) => (ReturnBoolPredKind::ImpliesFalse, probe_tag),
         (None, None) => return None,
     };
+    let variant_tags: Vec<i128> = variants.iter().map(|v| v.discriminant).collect();
     Some(ReturnBoolPredSummary {
         enum_name: enum_name.to_string(),
-        params,
+        params: make_params(),
         pred_param: pred_local,
         pred_field: None,
         kind,

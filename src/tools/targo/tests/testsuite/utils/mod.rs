@@ -15,7 +15,9 @@ pub fn cargo_process(arg_line: &str) -> Execs {
     execs().with_process_builder(p)
 }
 
-/// Path to the cargo binary
+/// Path to the cargo binary: the `cargo` compatibility entry point of the
+/// `targo` executable this package builds (see
+/// [`cargo_test_support::cargo_compat_alias`]).
 pub fn cargo_exe() -> PathBuf {
-    snapbox::cmd::cargo_bin!("cargo").to_path_buf()
+    cargo_test_support::cargo_compat_alias(snapbox::cmd::cargo_bin!("targo"))
 }

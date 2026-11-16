@@ -1,0 +1,82 @@
+{
+  "aslref_commit": "ffad2692c4580538e8db7bf6631aa886edfc7423",
+  "producer_source_sha256": "f6ffceb8d9ba5bc6909f2f9009fbd3935d1731026b1f9d3b400e2794dfd2ce41",
+  "producer_executable_sha256": "3a9657687eba4e1c292d519ee939d81468f4c3169839acdeaf62813f5548790a",
+  "positive_packets": [
+    {
+      "case": "zero",
+      "source_sha256": "4b880427d5237ca9c4aeada855b42ef69dce18184d40952b67a6b679fa674f69",
+      "packet_sha256": "f27c5788c6218221a36aa17c2e83f6ac53881e8a000027874fb49e258a00aece",
+      "packet_bytes": 83,
+      "source_name": "scalar",
+      "typed_name": "scalar",
+      "actual_reference_kind": "bits",
+      "actual_reference_value": "0"
+    },
+    {
+      "case": "eight",
+      "source_sha256": "44834d90dbacc83b62bd0f37b065fcb14ee7a8e95fce4a88623b4fe0dcc1b2e7",
+      "packet_sha256": "d7930f312208db30557993bf530dae2c403cea6bd63266bfc35f1c9fabbee3ec",
+      "packet_bytes": 83,
+      "source_name": "scalar",
+      "typed_name": "scalar",
+      "actual_reference_kind": "bits",
+      "actual_reference_value": "8"
+    },
+    {
+      "case": "max",
+      "source_sha256": "132a4df65a83244f4eded2e54f645725fbe4300c3f6f5386b47e20a628098dd1",
+      "packet_sha256": "93ad00fa4f7c94e6a330c2f6d11638681deb18ee6c7d26826c25b72331026b88",
+      "packet_bytes": 83,
+      "source_name": "scalar",
+      "typed_name": "scalar",
+      "actual_reference_kind": "bits",
+      "actual_reference_value": "18446744073709551615"
+    },
+    {
+      "case": "frame_offset",
+      "source_sha256": "8e18d7a189e5d060529775670db4c6287ad5a4fde9727bfefcc1927d40abf59a",
+      "packet_sha256": "8038b84a2c615d97a66d8ccf46ba3430dbf0754e3ef232fc2351904bd6612ea3",
+      "packet_bytes": 105,
+      "source_name": "stackScalar",
+      "typed_name": "stackScalar",
+      "actual_reference_kind": "bits",
+      "actual_reference_value": "4096"
+    },
+    {
+      "case": "renamed",
+      "source_sha256": "c80effc1929a45bea268658167856a3689fbed066c3add088b45999d49f2d6fc",
+      "packet_sha256": "1a710f4dfe9d0b6953b6d94dc0d3e3d4dfc3c89d9c9c31f7ecdf487b942334c0",
+      "packet_bytes": 97,
+      "source_name": "renamedScalar",
+      "typed_name": "renamedScalar",
+      "actual_reference_kind": "bits",
+      "actual_reference_value": "8"
+    },
+    {
+      "case": "integer",
+      "source_sha256": "822323a9cc6564f80806b8f2b866cac3a00cd5a6158c1b222b19ae6425111767",
+      "packet_sha256": "326d7a6ed70d8292d0efec59905cdaac7c43a73a9b7d5d60c1af9f966a550279",
+      "packet_bytes": 108,
+      "source_name": "integerScalar",
+      "typed_name": "integerScalar",
+      "actual_reference_kind": "integer",
+      "actual_reference_value": "41"
+    }
+  ],
+  "mutations": {
+    "literal": false,
+    "wire_offset_for_operator": 62,
+    "width_literal_offset": 64,
+    "unsigned_literal_offset": 65
+  },
+  "scope": "Own synthetic BSD ASL source through actual pinned parser/strict typing/reference interpreter; producer TCB, no parser or source refinement proof",
+  "requalified_producer": {
+    "source_sha256": "8942c5375ca37486c5f91c75142f38a405abd9e66dd84184c2d9d212ed129f1c",
+    "executable_sha256": "5d67f7b938d2219feb6461d10f9e80ffdec8b1f99a7679b37ca0d0d5f141fdc4",
+    "source_build_result_sha256": "93d7b8dc14c116a5956d9b8fe2ef93ddd673306f6cb5e07b4e5c4285fe3b97ad",
+    "control_result_sha256": "3eec99055a94659b6c0251cb6f2834a7487ff24c960106f687dfb9d49e10f3ec",
+    "same_six_packets": true,
+    "scope": "Fresh actual producer after exception/optimized-guard hardening; original producer origin hashes above retained"
+  }
+}

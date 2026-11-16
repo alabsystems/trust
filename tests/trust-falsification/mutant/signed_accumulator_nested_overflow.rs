@@ -1,6 +1,6 @@
 #![crate_type = "lib"]
 // MUTANT (signed-accumulator NESTED soundness): the inner reduction runs `M*LEN` times, so the
-// trip count is the WHOLE-NEST product (`total_loop_iterations`), NOT the inner array length.
+// trip count is the WHOLE-NEST product (`block_execution_bound`), NOT the inner array length.
 // With M=3_000_000 and LEN=8, k=24_000_000 and the i32 accumulator CAN overflow
 // (24_000_000 * 127 > i32::MAX), so `-full` MUST refute (exit 1). This PINS that the signed
 // reduction bound multiplies by `k`, not `LEN`: a regression that used the inner array length

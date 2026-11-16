@@ -1,0 +1,24 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta15c_lean_inductive_wrapped",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.lean.inductive_wrapped.emit": {
+   "verdict": "GAP",
+   "class": "refused",
+   "signature": "emit:clean-origin instruction-selection table has no row for this head:fallback=none",
+   "audit": "GAP"
+  },
+  "a.lean.inductive_wrapped.native": {
+   "verdict": "GAP",
+   "class": "refused",
+   "signature": "native:all-lanes-refuse:clean-origin instruction-selection table has no row for this head:uncallable=['rankOfTwo']",
+   "audit": "GAP"
+  }
+ }
+}

@@ -78,10 +78,10 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
     // Next, check every pair of eligible locals to see if they
     // conflict.
     for local_a in storage_conflicts.rows() {
-        let conflicts_a = storage_conflicts.count(local_a);
         if ineligible_locals.contains(local_a) {
             continue;
         }
+        let mut conflicts_a = None;
 
         for local_b in storage_conflicts.iter(local_a) {
             // local_a and local_b are storage live at the same time, therefore they
@@ -95,6 +95,7 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
             // If they conflict, we will choose one to make ineligible.
             // This is not always optimal; it's just a greedy heuristic that
             // seems to produce good results most of the time.
+            let conflicts_a = *conflicts_a.get_or_insert_with(|| storage_conflicts.count(local_a));
             let conflicts_b = storage_conflicts.count(local_b);
             let (remove, other) =
                 if conflicts_a > conflicts_b { (local_a, local_b) } else { (local_b, local_a) };
@@ -136,20 +137,20 @@ fn coroutine_saved_local_eligibility<VariantIdx: Idx, FieldIdx: Idx, LocalIdx: I
 }
 
 /// Compute the full coroutine layout.
-pub(super) fn layout<
-    'a,
-    F: core::ops::Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + core::fmt::Debug + Copy,
-    VariantIdx: Idx,
-    FieldIdx: Idx,
-    LocalIdx: Idx,
->(
+pub(super) fn layout<'a, F, VariantIdx, FieldIdx, LocalIdx>(
     calc: &super::LayoutCalculator<impl HasDataLayout>,
     local_layouts: &IndexSlice<LocalIdx, F>,
     mut prefix_layouts: IndexVec<FieldIdx, F>,
     variant_fields: &IndexSlice<VariantIdx, IndexVec<FieldIdx, LocalIdx>>,
     storage_conflicts: &BitMatrix<LocalIdx, LocalIdx>,
     tag_to_layout: impl Fn(Scalar) -> F,
-) -> super::LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+) -> super::LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+where
+    F: core::ops::Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + core::fmt::Debug + Copy,
+    VariantIdx: Idx,
+    FieldIdx: Idx,
+    LocalIdx: Idx,
+{
     use SavedLocalEligibility::*;
 
     let (ineligible_locals, assignments) =
@@ -171,8 +172,11 @@ pub(super) fn layout<
     let promoted_layouts = ineligible_locals.iter().map(|local| local_layouts[local]);
     prefix_layouts.push(tag_to_layout(tag));
     prefix_layouts.extend(promoted_layouts);
-    let prefix =
-        calc.univariant(&prefix_layouts, &ReprOptions::default(), StructKind::AlwaysSized)?;
+    let prefix = calc.layout_of_univariant(
+        &prefix_layouts,
+        &ReprOptions::default(),
+        StructKind::AlwaysSized,
+    )?;
 
     let (prefix_size, prefix_align) = (prefix.size, prefix.align);
 
@@ -192,8 +196,10 @@ pub(super) fn layout<
             // Disentangle the "a" and "b" components of `in_memory_order`
             // by preserving the order but keeping only one disjoint "half" each.
             // FIXME(eddyb) build a better abstraction for permutations, if possible.
-            let mut in_memory_order_a = IndexVec::<u32, FieldIdx>::new();
-            let mut in_memory_order_b = IndexVec::<u32, FieldIdx>::new();
+            let mut in_memory_order_a = IndexVec::<u32, FieldIdx>::with_capacity(b_start.index());
+            let mut in_memory_order_b = IndexVec::<u32, FieldIdx>::with_capacity(
+                in_memory_order.len().saturating_sub(b_start.index()),
+            );
             for i in in_memory_order {
                 if let Some(j) = i.index().checked_sub(b_start.index()) {
                     in_memory_order_b.push(FieldIdx::new(j));
@@ -211,24 +217,28 @@ pub(super) fn layout<
 
     let mut size = prefix.size;
     let mut align = prefix.align;
+    let mut variant_only_tys = IndexVec::<FieldIdx, F>::new();
     let variants = variant_fields
         .iter_enumerated()
         .map(|(index, variant_fields)| {
             // Only include overlap-eligible fields when we compute our variant layout.
-            let variant_only_tys = variant_fields
-                .iter()
-                .filter(|local| match assignments[**local] {
-                    Unassigned => unreachable!(),
-                    Assigned(v) if v == index => true,
-                    Assigned(_) => unreachable!("assignment does not match variant"),
-                    Ineligible(_) => false,
-                })
-                .map(|local| local_layouts[*local]);
+            variant_only_tys.raw.clear();
+            variant_only_tys.extend(
+                variant_fields
+                    .iter()
+                    .filter(|local| match assignments[**local] {
+                        Unassigned => unreachable!(),
+                        Assigned(v) if v == index => true,
+                        Assigned(_) => unreachable!("assignment does not match variant"),
+                        Ineligible(_) => false,
+                    })
+                    .map(|local| local_layouts[*local]),
+            );
 
-            let mut variant = calc.univariant(
-                &variant_only_tys.collect::<IndexVec<_, _>>(),
+            let mut variant = calc.layout_of_univariant(
+                &variant_only_tys,
                 &ReprOptions::default(),
-                StructKind::Prefixed(prefix_size, prefix_align.abi),
+                StructKind::Prefixed(prefix_size, prefix_align),
             )?;
 
             let FieldsShape::Arbitrary { offsets, in_memory_order } = variant.fields else {
@@ -284,7 +294,7 @@ pub(super) fn layout<
         })
         .collect::<Result<IndexVec<VariantIdx, _>, _>>()?;
 
-    size = size.align_to(align.abi);
+    size = size.align_to(align);
 
     let uninhabited = prefix.uninhabited || variants.iter().all(|v| v.is_uninhabited());
     let abi = BackendRepr::Memory { sized: true };
@@ -309,7 +319,8 @@ pub(super) fn layout<
         size,
         align,
         max_repr_align: None,
-        unadjusted_abi_align: align.abi,
+        unadjusted_abi_align: align,
+        repr_c: false,
         randomization_seed: Default::default(),
     })
 }

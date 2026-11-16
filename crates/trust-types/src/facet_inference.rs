@@ -37,10 +37,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::structural_determinism::is_structurally_deterministic;
-use crate::structural_panic_freedom::is_structurally_panic_free;
-use crate::structural_purity::is_structurally_pure;
-use crate::structural_termination::is_control_flow_loop_free;
+use crate::structural_determinism::{
+    statement_is_nondeterministic, terminator_is_nondeterministic,
+};
+use crate::structural_panic_freedom::is_own_panic_site;
+use crate::structural_purity::{statement_is_effectful, terminator_is_effectful};
+use crate::structural_termination::{for_each_terminator_successor, is_control_flow_loop_free};
 use crate::{
     BinOp, ConstValue, Operand, Place, Projection, Rvalue, Statement, Terminator, Ty,
     VerifiableFunction,
@@ -93,10 +95,20 @@ fn ty_in_closed_fragment(ty: &Ty) -> bool {
 ///   * **No destructor, no drop glue.** Every field is a scalar and the struct
 ///     has no enum variants, so `needs_drop` is false and rustc emits no `Drop`
 ///     terminator — which the validator refuses outright anyway.
-///   * **No hidden mutation channel.** A `u64` field IS the `u64`; there is no
-///     `UnsafeCell` on the path, so its value cannot change through a shared
-///     borrow. (An interior-mutable field would be an `Adt`, and a nested `Adt`
-///     is not in the closed fragment.)
+///   * **No hidden mutation channel — because the parameter is BY VALUE, not
+///     because this test excludes `UnsafeCell`.** The function owns its own
+///     copy of the struct, so no alias can change it during the call, and that
+///     is the whole argument. It is NOT the argument the parenthetical here
+///     used to make ("an interior-mutable field would be an `Adt`, and a nested
+///     `Adt` is not in the closed fragment"): that stopped being true when the
+///     recursion below admitted nested structs. `struct W { x: u32, c:
+///     Cell<u32> }` answers `true` here — `Cell<u32>` is `UnsafeCell<u32>` is
+///     `u32` all the way down — and it is admissible by value for the ownership
+///     reason, not for a `Freeze` reason this function never checks. **A
+///     `Freeze` claim needs `Ty::is_freeze`, and this is not it**, so do not
+///     reuse this predicate to justify reading a field through a SHARED BORROW:
+///     there the entry == exit property is exactly what an `UnsafeCell` on the
+///     path would break. See `docs/KNOWN_HAZARDS.md`.
 ///   * **Nothing else opens up.** A field READ is admitted by `place_ty`, but
 ///     comparison still requires a comparable scalar, `SwitchInt` still
 ///     requires a scalar discriminant, and a NON-parameter local of struct type
@@ -177,18 +189,6 @@ pub fn ty_is_std_option_of_signed(ty: &Ty) -> Option<u32> {
     }
 }
 
-/// Whether local `index` of a function with `arg_count` value parameters may
-/// carry type `ty` inside the closed fragment.
-///
-/// Identical to the scalar rule for every local EXCEPT a source parameter
-/// (`1..=arg_count`), which may additionally be an all-scalar struct
-/// ([`ty_is_scalar_struct`]), and the RETURN SLOT (`index == 0`), which may
-/// additionally be the std `Option<iN>` shape
-/// ([`ty_is_std_option_of_signed`], checked-arithmetic widening). Restricting
-/// the Option widening to the return slot is what keeps it to CONSTRUCTION:
-/// no temporary and no parameter carries an `Option`, so one can be built and
-/// returned but never read back, projected, or matched in this fragment.
-#[must_use]
 /// Whether `ty` is a local the CONTRACT lowering injected rather than a step of
 /// the body's own computation.
 ///
@@ -224,6 +224,18 @@ pub fn is_contract_injected_ty(ty: &Ty, def_path: &str) -> bool {
     }
 }
 
+/// Whether local `index` of a function with `arg_count` value parameters may
+/// carry type `ty` inside the closed fragment.
+///
+/// Identical to the scalar rule for every local EXCEPT a source parameter
+/// (`1..=arg_count`), which may additionally be an all-scalar struct
+/// ([`ty_is_scalar_struct`]), and the RETURN SLOT (`index == 0`), which may
+/// additionally be the std `Option<iN>` shape
+/// ([`ty_is_std_option_of_signed`], checked-arithmetic widening). Restricting
+/// the Option widening to the return slot is what keeps it to CONSTRUCTION:
+/// no temporary and no parameter carries an `Option`, so one can be built and
+/// returned but never read back, projected, or matched in this fragment.
+#[must_use]
 pub fn local_ty_in_closed_fragment(ty: &Ty, index: usize, arg_count: usize) -> bool {
     ty_in_closed_fragment(ty)
         || ((1..=arg_count).contains(&index) && ty_is_scalar_struct(ty))
@@ -234,6 +246,7 @@ pub fn local_ty_in_closed_fragment(ty: &Ty, index: usize, arg_count: usize) -> b
         // constructed value could never be returned, so that admission was
         // unreachable for its motivating case (`sat_term`).
         || (index == 0 && ty_is_scalar_struct(ty))
+        || (index > arg_count && crate::e6_expr::tree::option_payload(ty).is_some())
 }
 
 /// The bit width of an integer type, `None` for anything else (including
@@ -255,6 +268,9 @@ fn ty_is_comparable_scalar(ty: &Ty) -> bool {
 }
 
 fn place_ty<'a>(func: &'a VerifiableFunction, place: &Place) -> Option<&'a Ty> {
+    if matches!(place.projections.as_slice(), [Projection::Downcast(1), Projection::Field(0)]) {
+        return crate::e6_expr::tree::option_payload(&func.body.locals.get(place.local)?.ty);
+    }
     let mut ty = &func.body.locals.get(place.local)?.ty;
     for projection in &place.projections {
         match (projection, ty) {
@@ -262,9 +278,7 @@ fn place_ty<'a>(func: &'a VerifiableFunction, place: &Place) -> Option<&'a Ty> {
             // One declared field of an all-scalar STRUCT. `variants.is_empty()`
             // is the struct test: an enum's field is variant-relative and is
             // reached through a `Downcast`, which this loop refuses.
-            (Projection::Field(field), Ty::Adt { fields, variants, .. })
-                if variants.is_empty() =>
-            {
+            (Projection::Field(field), Ty::Adt { fields, variants, .. }) if variants.is_empty() => {
                 ty = &fields.get(*field)?.1;
             }
             _ => return None,
@@ -351,6 +365,16 @@ fn rvalue_matches_ty(func: &VerifiableFunction, rvalue: &Rvalue, destination: &T
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 *destination == Ty::Bool && operands_have_same_comparable_ty(func, lhs, rhs)
             }
+            // Trust (E6 expansion I3′): the non-short-circuit connectives over
+            // `bool` — `s & i & n`, `acc ^ c`. Over `bool` they are the total,
+            // effect-free `Bool.and`/`Bool.or`/`Bool.xor` (they cannot panic,
+            // and none is in `has_undischarged_panic_operation`'s list), so
+            // they close exactly when both operands and the destination are
+            // `bool`. A MIXED `bool`/integer operand pair falls through to
+            // the integer arm below, which the `bool` destination refuses.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor if *destination == Ty::Bool => {
+                operand_matches_ty(func, lhs, &Ty::Bool) && operand_matches_ty(func, rhs, &Ty::Bool)
+            }
             BinOp::Add
             | BinOp::Sub
             | BinOp::Mul
@@ -384,8 +408,7 @@ fn rvalue_matches_ty(func: &VerifiableFunction, rvalue: &Rvalue, destination: &T
         Rvalue::Cast(operand, cast_ty) => {
             let dest_w = int_bit_width(destination);
             let src_w = operand_place_ty(func, operand).and_then(|t| int_bit_width(&t));
-            cast_ty == destination
-                && matches!((dest_w, src_w), (Some(d), Some(s)) if d != s)
+            cast_ty == destination && matches!((dest_w, src_w), (Some(d), Some(s)) if d != s)
         }
         Rvalue::CheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) => {
             let Ty::Tuple(fields) = destination else { return false };
@@ -443,6 +466,10 @@ fn rvalue_matches_ty(func: &VerifiableFunction, rvalue: &Rvalue, destination: &T
             ops.iter()
                 .zip(fields.iter())
                 .all(|(op, (_, field_ty))| operand_matches_ty(func, op, field_ty))
+        }
+        Rvalue::Discriminant(place) => {
+            ty_is_integer(destination)
+                && place_ty(func, place).and_then(crate::e6_expr::tree::option_payload).is_some()
         }
         _ => false,
     }
@@ -518,17 +545,28 @@ fn total_primitive_call_is_valid(
 fn terminator_is_valid(
     func: &VerifiableFunction,
     terminator: &Terminator,
-    certified_callees: &std::collections::BTreeSet<String>,
+    certified_callees: &crate::fx::FxHashSet<&str>,
 ) -> bool {
     match terminator {
         Terminator::Goto(target) => target_exists(func, *target),
         Terminator::SwitchInt { discr, targets, otherwise, .. } => {
-            let mut values = HashSet::new();
-            switch_operand_is_valid(func, discr)
-                && targets
+            if !switch_operand_is_valid(func, discr) || !target_exists(func, *otherwise) {
+                return false;
+            }
+            if targets.len() <= 16 {
+                targets.iter().enumerate().all(|(idx, (value, target))| {
+                    !targets[..idx].iter().any(|(prev, _)| prev == value)
+                        && target_exists(func, *target)
+                })
+            } else {
+                let mut values = crate::fx::FxHashSet::with_capacity_and_hasher(
+                    targets.len(),
+                    Default::default(),
+                );
+                targets
                     .iter()
                     .all(|(value, target)| values.insert(*value) && target_exists(func, *target))
-                && target_exists(func, *otherwise)
+            }
         }
         Terminator::Return => true,
         Terminator::Assert { cond, target, .. } => {
@@ -582,6 +620,18 @@ fn terminator_is_valid(
                     *is_unsafe_sig,
                 );
             }
+            // TG14: signed wrapping primitives are total at their exact
+            // compiler-authenticated scalar signature. Frozen E6 recognition
+            // remains unsigned; only the separate tree reader consumes these.
+            if let Some((_, expected)) = crate::e6_expr::tree::wrapping_primitive(callee) {
+                return atomic.is_none()
+                    && !is_foreign
+                    && !is_unsafe_sig
+                    && args.len() == 2
+                    && args.iter().all(|arg| operand_matches_ty(func, arg, &expected))
+                    && place_ty(func, dest) == Some(&expected)
+                    && (*target).is_some_and(|normal| target_exists(func, normal));
+            }
             // An overflow-CHECKED signed primitive method (Shape A of the
             // checked-arithmetic lane): compiler-marked identity, exactly two
             // operands of the SIGNED width, destination typed at the pinned
@@ -600,12 +650,31 @@ fn terminator_is_valid(
                         .is_some_and(|w| w == method.width())
                     && (*target).is_some_and(|normal| target_exists(func, normal));
             }
+            if let Some((_, expected)) = crate::e6_expr::tree::checked_primitive(callee) {
+                return atomic.is_none()
+                    && !is_foreign
+                    && !is_unsafe_sig
+                    && args.len() == 2
+                    && args.iter().all(|arg| operand_matches_ty(func, arg, &expected))
+                    && place_ty(func, dest).and_then(crate::e6_expr::tree::option_payload)
+                        == Some(&expected)
+                    && (*target).is_some_and(|normal| target_exists(func, normal));
+            }
             // This namespace is closed: a malformed or excluded marker must
             // not fall through to same-unit call authority even if a hostile
             // serialized bundle also supplies the same impossible def-path.
+            // The `ToString::to_string` totality stamp belongs here too: it is
+            // a panic-freedom fact about ONE std call, not an E6 facet grammar
+            // (the call allocates), so it grants no facet at all.
             if callee.starts_with(crate::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX)
                 || callee.starts_with(crate::TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX)
                 || callee.starts_with(crate::TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX)
+                || callee.starts_with(crate::TRUST_TOTAL_TO_STRING_PATH_PREFIX)
+                // Trust (std-call-summaries P2): the panic-freedom-only intrinsic
+                // stamp grants NO facet. Its callees (the transcendentals, the
+                // `nsz` selections) are nondeterministic, so a Deterministic facet
+                // read off it would be false; it is closed here like the others.
+                || callee.starts_with(crate::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX)
             {
                 return false;
             }
@@ -620,6 +689,9 @@ fn terminator_is_valid(
             atomic.is_none()
                 && !is_foreign
                 && !is_unsafe_sig
+                // Trust (std-call-summaries P2): never via the panic-freedom-only
+                // stamp, even if a hostile unit supplies its spelling as a path.
+                && !callee.starts_with(crate::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX)
                 && (certified_callees.contains(callee.as_str())
                     || callee.starts_with(crate::TRUST_RUSTC_INTRINSIC_PATH_PREFIX))
         }
@@ -630,10 +702,9 @@ fn terminator_is_valid(
     }
 }
 
-fn is_valid_closed_leaf(
+fn is_valid_closed_leaf_intrinsic(
     func: &VerifiableFunction,
-    certified_callees: &std::collections::BTreeSet<String>,
-) -> bool {
+) -> Option<HashSet<crate::BlockId>> {
     if func.def_path.trim().is_empty()
         || func.body.blocks.is_empty()
         || func.body.locals.is_empty()
@@ -651,7 +722,7 @@ fn is_valid_closed_leaf(
             || ty_is_scalar_struct(&func.body.return_ty))
         || func.body.locals[0].ty != func.body.return_ty
     {
-        return false;
+        return None;
     }
 
     // Require the serialized identities to agree with their canonical vector
@@ -663,12 +734,30 @@ fn is_valid_closed_leaf(
                 || is_contract_injected_ty(&local.ty, &func.def_path))
     }) || func.body.blocks.iter().enumerate().any(|(index, block)| block.id.0 != index)
     {
-        return false;
+        return None;
     }
 
+    if !func
+        .body
+        .blocks
+        .iter()
+        .all(|block| block.stmts.iter().all(|statement| statement_is_valid(func, statement)))
+    {
+        return None;
+    }
+
+    Some(crate::e6_expr::tree::checked_option_impossible_defaults(func))
+}
+
+fn terminators_are_valid(
+    func: &VerifiableFunction,
+    impossible: &HashSet<crate::BlockId>,
+    certified_callees: &crate::fx::FxHashSet<&str>,
+) -> bool {
     func.body.blocks.iter().all(|block| {
-        block.stmts.iter().all(|statement| statement_is_valid(func, statement))
-            && terminator_is_valid(func, &block.terminator, certified_callees)
+        terminator_is_valid(func, &block.terminator, certified_callees)
+            || (matches!(block.terminator, Terminator::Unreachable)
+                && impossible.contains(&block.id))
     })
 }
 
@@ -696,6 +785,59 @@ fn has_undischarged_panic_operation(func: &VerifiableFunction) -> bool {
     })
 }
 
+/// Single-pass reachability evaluation of `(no_panic, pure, deterministic)` over
+/// a canonical block slice (`block.id.0 == index`), reusing caller-supplied
+/// `seen` and `stack` buffers across functions.
+fn reachable_structural_facets(
+    blocks: &[crate::BasicBlock],
+    seen: &mut Vec<bool>,
+    stack: &mut Vec<usize>,
+) -> (bool, bool, bool) {
+    if blocks.is_empty() {
+        return (false, false, false);
+    }
+    seen.clear();
+    seen.resize(blocks.len(), false);
+    seen[0] = true;
+    stack.clear();
+    stack.push(0);
+    let mut no_panic = true;
+    let mut pure = true;
+    let mut deterministic = true;
+    while let Some(idx) = stack.pop() {
+        let Some(block) = blocks.get(idx) else {
+            continue;
+        };
+        if no_panic && is_own_panic_site(&block.terminator) {
+            no_panic = false;
+        }
+        if pure
+            && (terminator_is_effectful(&block.terminator)
+                || block.stmts.iter().any(statement_is_effectful))
+        {
+            pure = false;
+        }
+        if deterministic
+            && (terminator_is_nondeterministic(&block.terminator)
+                || block.stmts.iter().any(statement_is_nondeterministic))
+        {
+            deterministic = false;
+        }
+        if !no_panic && !pure && !deterministic {
+            break;
+        }
+        for_each_terminator_successor(&block.terminator, |s| {
+            if let Some(slot) = seen.get_mut(s.0)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(s.0);
+            }
+        });
+    }
+    (no_panic, pure, deterministic)
+}
+
 /// Infer the conservative E6 structural facets for every function.
 ///
 /// Duplicate def-paths are rejected as a group: the result contains the path
@@ -703,56 +845,106 @@ fn has_undischarged_panic_operation(func: &VerifiableFunction) -> bool {
 /// good and bad body onto one apparently certified identity.
 #[must_use]
 pub fn infer_facets(functions: &[VerifiableFunction]) -> HashMap<String, FacetSet> {
-    let mut occurrences: HashMap<&str, usize> = HashMap::new();
+    let mut occurrences: crate::fx::FxHashMap<&str, usize> =
+        crate::fx::FxHashMap::with_capacity_and_hasher(functions.len(), Default::default());
     for func in functions {
         *occurrences.entry(func.def_path.as_str()).or_default() += 1;
     }
 
-    // Facets are closed over callees by LEAST FIXPOINT. Round 0 certifies
-    // nothing, so only call-free bodies qualify; each round then admits callers
-    // whose callees are all already certified. The predicate is monotone in the
-    // certified set and the set is bounded by the function count, so this
-    // terminates — and a recursive cycle NEVER certifies, because no member can
-    // enter the set before the others. Refusing recursion here is the correct
-    // direction: `Total` must not be assumed of a body that may not terminate.
-    //
-    // A callee must satisfy ALL FOUR facets to be usable, not merely be
-    // "valid": a caller inherits its callee's behaviour, so a callee that can
-    // panic makes the caller panicking too.
-    let facets_of =
-        |func: &VerifiableFunction, certified: &std::collections::BTreeSet<String>| -> FacetSet {
-            let unique = occurrences.get(func.def_path.as_str()) == Some(&1);
-            if unique && is_valid_closed_leaf(func, certified) {
-                FacetSet {
-                    total: is_control_flow_loop_free(func),
-                    no_panic: !has_undischarged_panic_operation(func)
-                        && is_structurally_panic_free(func),
-                    pure: is_structurally_pure(func),
-                    deterministic: is_structurally_deterministic(func),
-                }
-            } else {
-                FacetSet::default()
-            }
-        };
-
-    let mut certified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    loop {
-        let mut next: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for func in functions {
-            let f = facets_of(func, &certified);
-            if f.total && f.no_panic && f.pure && f.deterministic {
-                next.insert(func.def_path.clone());
-            }
-        }
-        if next == certified {
-            break;
-        }
-        certified = next;
+    enum FuncCandidate<'a> {
+        Invalid,
+        CertifiedOdt,
+        ClosedLeaf {
+            func: &'a VerifiableFunction,
+            impossible: HashSet<crate::BlockId>,
+            intrinsic_facets: FacetSet,
+        },
     }
 
-    let mut inferred = HashMap::new();
-    for func in functions {
-        inferred.insert(func.def_path.clone(), facets_of(func, &certified));
+    // Precompute all call-independent structural checks and intrinsic facets once
+    // per function before the fixpoint loop.
+    let mut candidates = Vec::with_capacity(functions.len());
+    let mut certified: crate::fx::FxHashSet<&str> =
+        crate::fx::FxHashSet::with_capacity_and_hasher(functions.len(), Default::default());
+    let mut pending: Vec<usize> = Vec::with_capacity(functions.len());
+    let mut reach_seen: Vec<bool> = Vec::new();
+    let mut reach_stack: Vec<usize> = Vec::new();
+
+    for (idx, func) in functions.iter().enumerate() {
+        let unique = occurrences.get(func.def_path.as_str()) == Some(&1);
+        if !unique {
+            candidates.push(FuncCandidate::Invalid);
+            continue;
+        }
+        // TG11: a separate closed reader checks every constructor path,
+        // including that the default Unreachable is impossible. This is
+        // not a general enum/Unreachable addition to the v1 whitelist.
+        if crate::e6_odt::read(func).is_some() {
+            certified.insert(func.def_path.as_str());
+            candidates.push(FuncCandidate::CertifiedOdt);
+            continue;
+        }
+        let Some(impossible) = is_valid_closed_leaf_intrinsic(func) else {
+            candidates.push(FuncCandidate::Invalid);
+            continue;
+        };
+        let (reach_no_panic, reach_pure, reach_deterministic) =
+            reachable_structural_facets(&func.body.blocks, &mut reach_seen, &mut reach_stack);
+        let intrinsic_facets = FacetSet {
+            total: is_control_flow_loop_free(func),
+            no_panic: reach_no_panic && !has_undischarged_panic_operation(func),
+            pure: reach_pure,
+            deterministic: reach_deterministic,
+        };
+        if intrinsic_facets.all() {
+            pending.push(idx);
+        }
+        candidates.push(FuncCandidate::ClosedLeaf { func, impossible, intrinsic_facets });
+    }
+
+    // Facets are closed over callees by LEAST FIXPOINT. Round 0 certifies
+    // nothing (besides call-free ODT bodies), so only call-free bodies qualify;
+    // each round then admits callers whose callees are all already certified.
+    // The predicate is monotone in the certified set and the set is bounded by
+    // the function count, so this terminates — and a recursive cycle NEVER
+    // certifies, because no member can enter the set before the others.
+    let mut newly_certified: Vec<&str> = Vec::new();
+    loop {
+        pending.retain(|&idx| {
+            let FuncCandidate::ClosedLeaf { func, impossible, .. } = &candidates[idx] else {
+                return false;
+            };
+            if terminators_are_valid(func, impossible, &certified) {
+                newly_certified.push(func.def_path.as_str());
+                false
+            } else {
+                true
+            }
+        });
+        if newly_certified.is_empty() {
+            break;
+        }
+        certified.extend(newly_certified.drain(..));
+    }
+
+    let all_true = FacetSet { total: true, no_panic: true, pure: true, deterministic: true };
+    let mut inferred = HashMap::with_capacity(functions.len());
+    for (func, candidate) in functions.iter().zip(candidates.iter()) {
+        let facets = match candidate {
+            FuncCandidate::Invalid => FacetSet::default(),
+            FuncCandidate::CertifiedOdt => all_true,
+            FuncCandidate::ClosedLeaf { func, impossible, intrinsic_facets } => {
+                if certified.contains(func.def_path.as_str())
+                    || (*intrinsic_facets != FacetSet::default()
+                        && terminators_are_valid(func, impossible, &certified))
+                {
+                    *intrinsic_facets
+                } else {
+                    FacetSet::default()
+                }
+            }
+        };
+        inferred.insert(func.def_path.clone(), facets);
     }
     inferred
 }
@@ -786,6 +978,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -833,6 +1026,7 @@ mod tests {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         unwind: UnwindEdge::Unreachable,
                     },
                 },
@@ -918,6 +1112,29 @@ mod tests {
         );
     }
 
+    /// Trust (std-call-summaries P2): the panic-freedom-only intrinsic stamp is NOT
+    /// a facet marker. `maximum_number_nsz_f64` may return either signed zero and
+    /// `sinf64`'s precision varies by platform, so a caller must not be certified
+    /// Deterministic through it, not even when a hostile unit also supplies a
+    /// function whose path IS the stamped spelling.
+    #[test]
+    fn a_panic_free_only_intrinsic_stamp_grants_no_facet() {
+        for name in ["maximum_number_nsz_f64", "minimumf64", "sinf64"] {
+            let stamped = format!(
+                "{}core::intrinsics::{name}",
+                crate::TRUST_RUSTC_PANIC_FREE_INTRINSIC_PATH_PREFIX
+            );
+            let facets = infer_facets(&[caller_of("crate::uses", &stamped)]);
+            let f = facets.get("crate::uses").copied().unwrap_or_default();
+            assert!(!f.deterministic, "{name}: no Deterministic facet via the stamp: {f:?}");
+            assert!(!f.all(), "{name}: no facet set via the stamp: {f:?}");
+            let hostile =
+                infer_facets(&[identity_leaf(&stamped), caller_of("crate::uses", &stamped)]);
+            let g = hostile.get("crate::uses").copied().unwrap_or_default();
+            assert!(!g.deterministic && !g.all(), "{name}: hostile same-unit spelling: {g:?}");
+        }
+    }
+
     #[test]
     fn a_marked_total_primitive_method_is_usable_but_a_lookalike_is_not() {
         let marked = format!(
@@ -984,6 +1201,24 @@ mod tests {
         }
     }
 
+    /// The `@trust-total-to-string::` stamp says one std call cannot panic; it is
+    /// not an E6 facet grammar, so a stamped callee grants no facet — not even
+    /// when a hostile serialized bundle also supplies a same-unit function
+    /// carrying the stamped identity (which the ordinary fixpoint would certify).
+    #[test]
+    fn a_to_string_stamped_callee_is_a_closed_namespace() {
+        let stamped = format!(
+            "{}<str as alloc::string::ToString>::to_string",
+            crate::TRUST_TOTAL_TO_STRING_PATH_PREFIX
+        );
+        let facets =
+            infer_facets(&[identity_leaf(&stamped), caller_of("crate::stamped_caller", &stamped)]);
+        assert!(
+            !facets.get("crate::stamped_caller").copied().unwrap_or_default().all(),
+            "a to_string totality stamp must never inherit same-unit facet authority"
+        );
+    }
+
     /// An unknown callee still fails closed — the closure widens admission only
     /// to callees actually present and certified in this unit.
     #[test]
@@ -1043,6 +1278,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             unwind: UnwindEdge::Unreachable,
         }
     }
@@ -1250,6 +1486,49 @@ mod tests {
         assert!(inferred(f).all());
     }
 
+    /// E6 expansion I3′ (design note §6): `&`/`|`/`^` over `bool` are in the
+    /// closed fragment — ay's `self_ind & init_valid & entry_ind` and
+    /// `acc ^ contribution` get all four facets — and a bit operation whose
+    /// operand is an integer, or whose destination is not `bool`, gets none
+    /// from this arm.
+    #[test]
+    fn bool_bitwise_is_closed() {
+        let bool_fn = |path: &str, op: BinOp, operand_ty: Ty, dest: Ty| {
+            func_with(
+                path,
+                vec![
+                    LocalDecl { index: 0, ty: dest.clone(), name: None },
+                    LocalDecl { index: 1, ty: operand_ty.clone(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: operand_ty, name: Some("b".into()) },
+                ],
+                vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::BinaryOp(
+                            op,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                2,
+                dest,
+            )
+        };
+        for op in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+            let path = format!("crate::bool_{op:?}");
+            let facets = infer_facets(&[bool_fn(&path, op, Ty::Bool, Ty::Bool)]);
+            assert!(facets[&path].all(), "{op:?} over bool: {:?}", facets[&path]);
+            // An integer operand into a `bool` destination is not this arm.
+            let mixed = format!("crate::mixed_{op:?}");
+            let facets = infer_facets(&[bool_fn(&mixed, op, Ty::u64(), Ty::Bool)]);
+            assert!(!facets[&mixed].pure, "{op:?} over u64 into bool: {:?}", facets[&mixed]);
+        }
+    }
+
     /// The GUARDED-NARROW lane's one new statement form: an integer-to-integer
     /// cast is pure, total, deterministic and panic-free, so the whole
     /// `if fits { Some(x as i64) } else { None }` body stays certifiable. This
@@ -1324,10 +1603,7 @@ mod tests {
                         },
                         Statement::Assign {
                             place: Place::local(0),
-                            rvalue: Rvalue::Aggregate(
-                                agg(1),
-                                vec![Operand::Move(Place::local(4))],
-                            ),
+                            rvalue: Rvalue::Aggregate(agg(1), vec![Operand::Move(Place::local(4))]),
                             span: SourceSpan::default(),
                         },
                     ],
@@ -1468,7 +1744,13 @@ mod tests {
     }
 
     /// `Cst { degree, coeff }` built from two parameters, returned by value.
-    fn constructs(ret_ty: Ty, adt_name: &str, ops: Vec<Operand>, locals: Vec<LocalDecl>, argc: usize) -> VerifiableFunction {
+    fn constructs(
+        ret_ty: Ty,
+        adt_name: &str,
+        ops: Vec<Operand>,
+        locals: Vec<LocalDecl>,
+        argc: usize,
+    ) -> VerifiableFunction {
         func_with(
             "crate::mk",
             locals,
@@ -1520,10 +1802,8 @@ mod tests {
     #[test]
     fn a_constructed_nested_scalar_struct_return_certifies() {
         let lit = Ty::adt("crate::Lit", vec![("var".into(), Ty::u64()), ("neg".into(), Ty::Bool)]);
-        let term = Ty::adt(
-            "crate::Term",
-            vec![("coeff".into(), Ty::u64()), ("lit".into(), lit.clone())],
-        );
+        let term =
+            Ty::adt("crate::Term", vec![("coeff".into(), Ty::u64()), ("lit".into(), lit.clone())]);
         let f = constructs(
             term.clone(),
             "crate::Term",
@@ -1663,13 +1943,18 @@ mod tests {
         // A NON-SCALAR field takes the whole struct back out of the fragment.
         let with_slice = Ty::adt(
             "crate::Cst",
-            vec![("degree".into(), Ty::u64()), ("terms".into(), Ty::Slice { elem: Box::new(Ty::u64()) })],
+            vec![
+                ("degree".into(), Ty::u64()),
+                ("terms".into(), Ty::Slice { elem: Box::new(Ty::u64()) }),
+            ],
         );
-        assert!(!infer_facets(std::slice::from_ref(&field_leaf(
-            with_slice,
-            vec![Projection::Field(0)]
-        )))["crate::deg"]
-            .all());
+        assert!(
+            !infer_facets(std::slice::from_ref(&field_leaf(
+                with_slice,
+                vec![Projection::Field(0)]
+            )))["crate::deg"]
+                .all()
+        );
 
         // An ENUM is refused: `fields` is the union view, so field 0 is
         // variant-relative and does not name one value of the parameter.
@@ -1706,11 +1991,13 @@ mod tests {
 
         // A DEREF projection is still outside `place_ty`, so a `&Cst`-shaped
         // read never types.
-        assert!(!infer_facets(std::slice::from_ref(&field_leaf(
-            scalar_cst(),
-            vec![Projection::Deref, Projection::Field(0)]
-        )))["crate::deg"]
-            .all());
+        assert!(
+            !infer_facets(std::slice::from_ref(&field_leaf(
+                scalar_cst(),
+                vec![Projection::Deref, Projection::Field(0)]
+            )))["crate::deg"]
+                .all()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1793,6 +2080,7 @@ mod tests {
                     terminator: Terminator::Call {
                         func: cold_callee.to_string(),
                         callee_identity: None,
+                        callee_key: None,
                         args: vec![],
                         dest: Place::local(6),
                         target: Some(BlockId(3)),
@@ -1839,7 +2127,7 @@ mod tests {
         // Unsigned payload refuses.
         let mut unsigned = option_of_signed(64);
         let Ty::Adt { variants, .. } = &mut unsigned else { unreachable!() };
-        variants[1].fields[0].1 = Ty::Int { width: 64, signed: false };
+        variants.make_mut()[1].fields[0].1 = Ty::Int { width: 64, signed: false };
         assert_eq!(ty_is_std_option_of_signed(&unsigned), None, "unsigned payload");
         // A same-shape lookalike under a different name refuses.
         let mut lookalike = option_of_signed(64);
@@ -1850,7 +2138,7 @@ mod tests {
         // hostile bundle also claims disc_index_safe.
         let mut ref_payload = option_of_signed(64);
         let Ty::Adt { variants, .. } = &mut ref_payload else { unreachable!() };
-        variants[1].fields[0].1 =
+        variants.make_mut()[1].fields[0].1 =
             Ty::Ref { mutable: false, inner: Box::new(Ty::Int { width: 64, signed: true }) };
         assert_eq!(ty_is_std_option_of_signed(&ref_payload), None, "reference payload");
         // Scalars and structs refuse.
@@ -1907,10 +2195,37 @@ mod tests {
         }];
         assert!(!inferred(bad_none).all(), "None aggregate with a payload");
 
-        // An Option-typed TEMPORARY (not the return slot) refuses.
+        // An Option-typed TEMPORARY (not the return slot) is admitted only as
+        // the std `Option<iN>` TG14 reads (35b06b86eb: a `checked_*` result is
+        // stored in a temporary before its match, `local_ty_in_closed_fragment`
+        // via `e6_expr::tree::option_payload`). An unused one changes nothing
+        // about the body, so it keeps every facet.
         let mut opt_temp = base();
         opt_temp.body.locals.push(LocalDecl { index: 7, ty: option_of_signed(64), name: None });
-        assert!(!inferred(opt_temp).all(), "Option temporary outside the return slot");
+        assert!(inferred(opt_temp).all(), "a std Option<i64> temporary is in the fragment");
+        // Every other Option temporary refuses: a niche-encoded one, and one
+        // whose payload is not a fixed-width integer.
+        let mut niche_temp = base();
+        let mut niche_ty = option_of_signed(64);
+        let Ty::Adt { disc_index_safe, .. } = &mut niche_ty else { unreachable!() };
+        *disc_index_safe = false;
+        niche_temp.body.locals.push(LocalDecl { index: 7, ty: niche_ty, name: None });
+        assert!(!inferred(niche_temp).all(), "niche-encoded Option temporary");
+        let mut bool_temp = base();
+        let bool_ty = Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                crate::VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                crate::VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), Ty::Bool)],
+                },
+            ],
+            true,
+        );
+        bool_temp.body.locals.push(LocalDecl { index: 7, ty: bool_ty, name: None });
+        assert!(!inferred(bool_temp).all(), "Option<bool> temporary");
 
         // A wrong-typed payload operand (the Bool flag where the i64 result
         // belongs) refuses. (The generic-ARGS rendering of the aggregate is
@@ -1945,6 +2260,7 @@ mod tests {
                         terminator: Terminator::Call {
                             func: callee.to_string(),
                             callee_identity: None,
+                            callee_key: None,
                             args: vec![
                                 Operand::Copy(Place::local(1)),
                                 Operand::Copy(Place::local(2)),
@@ -1964,8 +2280,7 @@ mod tests {
                 option_of_signed(64),
             )
         };
-        let marked =
-            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add";
+        let marked = "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add";
         assert!(
             inferred(call_body(marked)).all(),
             "a TyCtxt-confirmed checked primitive method must be usable as a callee"
@@ -1987,8 +2302,7 @@ mod tests {
         }
         // A WIDTH-mismatched marked call (i32 method into an Option<i64>
         // destination) refuses.
-        let mismatch =
-            "@trust-rustc-checked-primitive-method::core::num::<impl i32>::checked_add";
+        let mismatch = "@trust-rustc-checked-primitive-method::core::num::<impl i32>::checked_add";
         assert!(!inferred(call_body(mismatch)).all(), "width mismatch must fail closed");
     }
 }

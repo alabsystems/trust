@@ -5,6 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
+// Trust: exercise the production frontend's explicit scheduling boundary.
+#[cfg(unix)]
+#[path = "boundary_args/jobserver.rs"]
+mod jobserver_boundary;
+
 // Trust: `CARGO_BIN_EXE_*` is defined only when cargo BUILDS an integration
 // test target. `cargo check` type-checks this file without linking the bins, so
 // a compile-time `env!` here made `x.py check` fail on a target it never runs.
@@ -518,12 +523,15 @@ fn tippy_driver_is_vanilla_and_has_no_trust_evidence_escape_route() {
         "unexpected direct-passthrough rejection: {rejected_stderr}"
     );
 
+    // Evidence routes whose effect does not depend on verification running. The
+    // verification-conditional selectors (`-Ztrust-ir-lower`, the proof-artifact
+    // root, the verifier output format, …) are accepted and NEUTRALIZED instead:
+    // `tippy_driver_decides_trust_posture_on_the_effective_configuration`.
     for forbidden_control in [
-        "-Ztrust-ir-lower",
         "-Ztrust-dump=ir:/tmp/tippy-must-not-publish-ir",
+        "-Ztrust-dump=native-bundle:/tmp/tippy-must-not-publish-bundle",
+        "-Ztrust-body-census=/tmp/tippy-must-not-publish-census",
         "-Ztrust-verify-session=tippy-must-not-prove",
-        "-Ztrust-proof-artifact-root=/tmp/tippy-must-not-publish-proof",
-        "-Ztrust-verify-output=json",
         "-Zcodegen-backend=trust-cg",
         "-Zllvm-plugins=/tmp/tippy-must-not-load-plugin",
         "-Cllvm-args=-load=/tmp/tippy-must-not-load-plugin",
@@ -735,4 +743,172 @@ fn tippy_driver_is_vanilla_and_has_no_trust_evidence_escape_route() {
     assert!(precedence_stderr.contains("unused variable"), "{precedence_stderr}");
 
     std::fs::remove_dir_all(root).expect("remove driver verification fixture");
+}
+
+/// ay's committed verification posture (its `.cargo/config.toml` rustflags), which
+/// Cargo hands the lint driver exactly as it hands `trustc`.
+const AY_POSTURE: [&str; 6] = [
+    "-Ztrust-verify=on",
+    "-Ztrust-policy=certify",
+    "-Ztrust-verify-level=2",
+    "-Ztrust-verify-profile=unix_hardened",
+    "-Ztrust-verify-include-dependencies=yes",
+    "-Ztrust-ir-lower=strict",
+];
+
+/// Tippy produces no verification evidence, so it judges Trust options on the
+/// EFFECTIVE (last-wins, fully parsed) configuration, not on each occurrence. A
+/// committed posture followed by the `-Ztrust-verify=off` Targo appends for the
+/// lint pass resolves to verification off: every selector in it is inert here and
+/// is accepted and neutralized, and the lint compilation is vanilla. Measured on
+/// seal 7d5533b2: every accepted shape below except the first was refused with
+/// "NoTrustEvidence compiler frontend rejects semantic, evidence, or backend
+/// control", which made `targo tippy` impossible in every repository whose
+/// config carries its posture.
+#[test]
+fn tippy_driver_decides_trust_posture_on_the_effective_configuration() {
+    let _fixture_parent_guard = lock_fixture_parent();
+    let root = unique_temp_dir("effective-trust-posture");
+    std::fs::create_dir_all(&root).expect("create effective-posture fixture directory");
+    let proof_root = root.join("must-not-publish-proofs");
+    let proof_root_flag = format!("-Ztrust-proof-artifact-root={}", proof_root.display());
+
+    let ay_then = |extra: &[&str]| -> Vec<String> {
+        AY_POSTURE
+            .iter()
+            .copied()
+            .chain(["-Ztrust-verify=off"])
+            .chain(extra.iter().copied())
+            .map(str::to_string)
+            .collect()
+    };
+    let owned = |args: &[&str]| -> Vec<String> { args.iter().map(|arg| arg.to_string()).collect() };
+
+    let accepted: Vec<(&str, Vec<String>)> = vec![
+        ("plain off-switch", owned(&["-Ztrust-verify=off"])),
+        ("verification on, then off", owned(&["-Ztrust-verify=on", "-Ztrust-verify=off"])),
+        ("certify policy, then off", owned(&["-Ztrust-policy=certify", "-Ztrust-verify=off"])),
+        ("proof level, then off", owned(&["-Ztrust-verify-level=2", "-Ztrust-verify=off"])),
+        ("strict lowering, then off", owned(&["-Ztrust-ir-lower=strict", "-Ztrust-verify=off"])),
+        ("ay's posture, then off", ay_then(&[])),
+        (
+            "every other verification selector, then off",
+            ay_then(&[
+                "-Ztrust-verify-output=json",
+                "-Ztrust-memory-notes",
+                proof_root_flag.as_str(),
+                "-Ztrust-verify-timeout-ms=1",
+                "-Ztrust-verify-worker-threads=1",
+                "-Ztrust-verify-function-budget-ms=1",
+                "-Ztrust-verify-function-budget-steps=1",
+                "-Ztrust-verify-effort=1",
+                "-Ztrust-no-adapter-yield",
+                "-Ztrust-no-r1",
+                "-Ztrust-bundle-foreign-crate=lint_subject",
+                "-Ztrust-ir-flip=no",
+                "-Ztrust-instance-flip=no",
+            ]),
+        ),
+    ];
+
+    // A real lint compilation reaches `ClippyCallbacks::config`; the neutralized
+    // posture must leave it vanilla (`cfg(trust_verify)` absent) and publish nothing.
+    let source = root.join("lint_subject.rs");
+    std::fs::write(
+        &source,
+        "#[cfg(trust_verify)] compile_error!(\"Tippy compilation retained verification semantics\");\n\
+         pub fn lint_subject() -> u32 { 1 }\n",
+    )
+    .expect("write effective-posture lint subject");
+
+    for (index, (label, shape)) in accepted.iter().enumerate() {
+        let cfg = Command::new(TIPPY_DRIVER_BIN)
+            .args(shape)
+            .arg("--print=cfg")
+            .env_remove("TRUST_NO_VERIFY")
+            .output()
+            .expect("run effective-posture cfg query");
+        let stdout = String::from_utf8_lossy(&cfg.stdout);
+        let stderr = String::from_utf8_lossy(&cfg.stderr);
+        assert!(cfg.status.success(), "{label}: Tippy refused {shape:?}:\n{stderr}");
+        assert!(
+            !stdout.lines().any(|line| line == "trust_verify"),
+            "{label}: Tippy reported verification on:\n{stdout}"
+        );
+
+        let metadata = root.join(format!("lint_subject_{index}.rmeta"));
+        let mut compile = Command::new(TIPPY_DRIVER_BIN);
+        compile.args(["--crate-name", "lint_subject", "--crate-type=lib", "--emit=metadata"]);
+        if let Some(sysroot) = option_env!("TEST_SYSROOT") {
+            compile.args(["--sysroot", sysroot]);
+        }
+        let compiled = compile
+            .args(shape)
+            .arg("-o")
+            .arg(&metadata)
+            .arg(&source)
+            .env_remove("TRUST_NO_VERIFY")
+            .env_remove("CLIPPY_ARGS")
+            .env_remove("TIPPY_ENCODED_ARGS")
+            .output()
+            .expect("run effective-posture lint compilation");
+        assert!(
+            compiled.status.success(),
+            "{label}: lint compilation under {shape:?} failed:\n{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        assert!(metadata.is_file(), "{label}: lint compilation emitted no metadata");
+    }
+    assert!(!proof_root.exists(), "a neutralized proof root received proof bytes");
+
+    let refused: Vec<(&str, Vec<String>, &str)> = vec![
+        ("ay's posture with verification left on", owned(&AY_POSTURE), "-Ztrust-verify"),
+        (
+            "an off-switch overridden by a later `on`",
+            owned(&["-Ztrust-verify=off", "-Ztrust-verify=on"]),
+            "-Ztrust-verify",
+        ),
+        ("a TrustIR artifact sink", ay_then(&["-Ztrust-dump=ir:/tmp/tippy-no-ir"]), "-Ztrust-dump"),
+        (
+            "an authenticated session identity",
+            ay_then(&["-Ztrust-verify-session=tippy-must-not-prove"]),
+            "-Ztrust-verify-session",
+        ),
+        (
+            "a certified-monitor selector",
+            ay_then(&["-Ztrust-targo-test-monitor"]),
+            "-Ztrust-targo-test-monitor",
+        ),
+        (
+            "a trust-cg codegen control",
+            ay_then(&["-Ztrust-cg-output-gate=off"]),
+            "-Ztrust-cg-output-gate",
+        ),
+        (
+            "an adversarial burn-in control",
+            ay_then(&["-Ztrust-sat-perturb=enum-reshape"]),
+            "-Ztrust-sat-perturb",
+        ),
+        ("the typeck-witness lane", ay_then(&["-Ztrust-witness=off"]), "-Ztrust-witness"),
+        ("a backend selection", ay_then(&["-Zcodegen-backend=llvm"]), "-Zcodegen-backend"),
+    ];
+    for (label, shape, option) in &refused {
+        for mode in ["--print=cfg", "-vV"] {
+            let rejected = Command::new(TIPPY_DRIVER_BIN)
+                .args(shape)
+                .arg(mode)
+                .env_remove("TRUST_NO_VERIFY")
+                .output()
+                .expect("run effective-posture rejection probe");
+            let stderr = String::from_utf8_lossy(&rejected.stderr);
+            assert!(!rejected.status.success(), "{label} ({mode}): Tippy accepted {shape:?}");
+            assert!(
+                stderr.contains("NoTrustEvidence compiler frontend rejects")
+                    && stderr.contains(&format!("`{option}`")),
+                "{label} ({mode}): unexpected rejection:\n{stderr}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(root).expect("remove effective-posture fixture");
 }

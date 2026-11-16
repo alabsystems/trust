@@ -1,0 +1,51 @@
+# trust-wp probe transcript, 2026-10-14 (r24-wpv-probes/zz_vfy_probe_b.rs). 'A' = trust-wp with aee6e8f2 (D-237).
+## with aee6e8f2
+    TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh4, cu1::{closure#2}, cu2::{closure#2}, cs1, cs1::{closure#3}, cs2::{closure#2}, mh5; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh4 (1 verified, 0 declared), creusot_test::mh5 (1 verified, 0 declared)
+trust-wp: verifying proof_assert in creusot_test::mh3 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh3 FAILED ✗
+trust-wp: mh3 FAILED ✗ (proof_assert)
+trust-wp: verifying proof_assert in creusot_test::mh4 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh4 verified ✓
+trust-wp: mh4 verified ✓
+trust-wp: cu1 FAILED ✗ (postcondition)
+trust-wp: cu1::{closure#2} verified ✓
+trust-wp: cu2 FAILED ✗
+trust-wp: cu2::{closure#2} verified ✓ (vacuous: explicit #[requires(false)])
+trust-wp: cs1 verified ✓
+trust-wp: cs1::{closure#3} verified ✓
+trust-wp: cs2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: verifying proof_assert in creusot_test::cs2 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::cs2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: cs2::{closure#2} verified ✓
+trust-wp: verifying proof_assert in creusot_test::mh5 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh5 verified ✓
+trust-wp: mh5 verified ✓
+trust-wp: 7 verified, 3 failed, 1 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+trust-wp: proof_assert: 2 verified, 1 failed, 1 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+TEETH LOST — rejected, but not for the declared reason:
+  zz_vfy_probe_b: TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh4, cu1::{closure#2}, cu2::{closure#2}, cs1, cs1::{closure#3}, cs2::{closure#2}, mh5; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh4 (1 verified, 0 declared), creusot_test::mh5 (1 verified, 0 declared)
+## without
+    TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh4, cu1::{closure#2}, cu2::{closure#2}, cs1, cs1::{closure#3}, cs2::{closure#2}, mh5; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh4 (1 verified, 0 declared), creusot_test::mh5 (1 verified, 0 declared)
+trust-wp: verifying proof_assert in creusot_test::mh3 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh3 FAILED ✗
+trust-wp: mh3 FAILED ✗ (proof_assert)
+trust-wp: verifying proof_assert in creusot_test::mh4 (0 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh4 verified ✓
+trust-wp: mh4 verified ✓
+trust-wp: cu1 FAILED ✗ (postcondition)
+trust-wp: cu1::{closure#2} verified ✓
+trust-wp: cu2 FAILED ✗
+trust-wp: cu2::{closure#2} verified ✓ (vacuous: explicit #[requires(false)])
+trust-wp: cs1 verified ✓
+trust-wp: cs1::{closure#3} verified ✓
+trust-wp: cs2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: verifying proof_assert in creusot_test::cs2 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::cs2 error: unsupported formula: final-collapse refused (fail-closed): `^Int(0)` applies a prophecy to a constant carrier, which records the borrowed place's CURRENT value and has no prophecy slot; folding the wrapper away would assert the false equality `^p == *p` (Final-collapse audit Fix A, constant-carrier arm)
+trust-wp: cs2::{closure#2} verified ✓
+trust-wp: verifying proof_assert in creusot_test::mh5 (1 contract preconditions)
+trust-wp: proof_assert in creusot_test::mh5 verified ✓
+trust-wp: mh5 verified ✓
+trust-wp: 7 verified, 3 failed, 1 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+trust-wp: proof_assert: 2 verified, 1 failed, 1 errors, encoding-errors unsupported=1 sort-inference=0 solver=0
+TEETH LOST — rejected, but not for the declared reason:
+  zz_vfy_probe_b: TEETH LOST — verified on a case whose contract is false, and not declared by `//@ also-verified:`: mh4, cu1::{closure#2}, cu2::{closure#2}, cs1, cs1::{closure#3}, cs2::{closure#2}, mh5; proof_assert verified on a case whose contract is false, and not declared by `//@ also-verified-assertion:`: creusot_test::mh4 (1 verified, 0 declared), creusot_test::mh5 (1 verified, 0 declared)

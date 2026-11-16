@@ -63,6 +63,7 @@ fn func_with_locals(name: &str, locals: Vec<LocalDecl>, return_ty: Ty) -> Verifi
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -323,14 +324,15 @@ fn extractor_shaped_enum(variants: Vec<VariantDef>, variants_serialized: bool) -
     };
     Ty::Adt {
         name,
-        fields,
-        variants: if variants_serialized { unreachable!() } else { Vec::new() },
+        fields: fields.into(),
+        variants: if variants_serialized { unreachable!() } else { Vec::new().into() },
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -457,14 +459,16 @@ fn flat_payload_slot_wins_over_a_disagreeing_variants_list() {
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v0_0".into(), Ty::Int { width: 64, signed: false }),
-        ],
-        variants: vec![variant("A", Some(Ty::Int { width: 8, signed: false }), 0)],
+        ]
+        .into(),
+        variants: vec![variant("A", Some(Ty::Int { width: 8, signed: false }), 0)].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     let place =
         Place { local: 1, projections: vec![Projection::Downcast(0), Projection::Field(0)] };
@@ -518,13 +522,14 @@ fn adt_kind_enum_alone_declines_a_bare_field() {
     let kinded = Ty::Adt {
         name,
         fields,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: Some(trust_types::AdtKind::Enum),
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     let place = Place { local: 1, projections: vec![Projection::Field(0)] };
     let func = reads("adt_kind_enum", kinded, place.clone());
@@ -610,20 +615,17 @@ fn a_plain_struct_still_resolves_through_the_flat_view() {
         let s = Ty::Adt {
             name,
             fields,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind,
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         let place = Place { local: 1, projections: vec![Projection::Field(0)] };
         let func = reads("plain_struct", s, place.clone());
-        assert_eq!(
-            resolved_int(&func, &place),
-            Some((8, false)),
-            "adt_kind = {adt_kind:?}"
-        );
+        assert_eq!(resolved_int(&func, &place), Some((8, false)), "adt_kind = {adt_kind:?}");
     }
 }

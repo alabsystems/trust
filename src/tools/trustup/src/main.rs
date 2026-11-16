@@ -29,6 +29,7 @@ const REQUIRED_TOOLS: &[&str] = &["trustc", "targo", "targo-trust"];
 const INHERITED_PUBLIC_NAMES: &[&str] = &[
     "rustc",
     "cargo",
+    "tcargo",
     "rustdoc",
     "rustfmt",
     "clippy",
@@ -47,25 +48,22 @@ const INHERITED_PUBLIC_NAMES: &[&str] = &[
 ///
 /// This mirrors `STOCK_ALIAS_TARGETS` in `scripts/off_stock_rust_audit.py` — the
 /// existing encoding of "a stock spelling is legitimate only when it is an alias
-/// of the corresponding Trust frontend in the same toolchain directory" — and is
-/// deliberately a strict *subset* of it on both axes, so nothing trustup admits
-/// could be rejected by that audit:
+/// of the corresponding Trust frontend in the same toolchain directory" — and
+/// matches the three compatibility names in bootstrap's complete-root surface:
 ///
-///  * Fewer names. The audit also maps `rustdoc`/`rustfmt`/`cargo-clippy`/
-///    `clippy-driver`, because it must grade arbitrary third-party trees. A
-///    Trust sysroot never materializes those: `tool::upstream_compat_bin_for_tool_source`
-///    emits `cargo` and nothing else, and `rustc` is materialized separately by
-///    `materialize_local_compiler_aliases`. Those two exist solely because
-///    rustup refuses to register a toolchain whose `bin/` lacks them. Any other
-///    inherited spelling in a Trust root is still an unconditional rejection.
+///  * Bootstrap materializes `rustc`, `cargo` and `rustdoc` beside their Trust
+///    frontends. The audit also maps formatter/linter aliases because it grades
+///    arbitrary third-party trees; those remain forbidden here. The retired
+///    `tcargo` name cannot authenticate `cargo`.
 ///  * A stricter identity test. The audit accepts same-inode **or** equal
 ///    size-and-SHA-256, since it audits paths it did not produce and that may
 ///    have been copied across filesystems. Here the aliases are produced by
 ///    bootstrap in one directory, so same-device/same-inode is both sufficient
-///    and the fail-closed choice: it cannot admit a distinct executable that
-///    merely happens to hash the same as a sibling at audit time.
-const INHERITED_ALIAS_TARGETS: &[(&str, &[&str])] =
-    &[("rustc", &["trustc"]), ("cargo", &["targo", "tcargo"])];
+///    and the fail-closed choice. Both paths must resolve directly within the
+///    selected bin directory; inode equality alone could also admit an escape
+///    through a symlink to an external hardlink of the same file.
+const INHERITED_ALIAS_TARGETS: &[(&str, &str)] =
+    &[("rustc", "trustc"), ("cargo", "targo"), ("rustdoc", "trustdoc")];
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -118,9 +116,10 @@ Usage:
   trustup run <trust-tool> [args...]
   trustup capability verify
   trustup doctor
+  trustup home
 
 Environment:
-  TRUSTUP_HOME       Trustup state root (default: ~/.trustup)
+  TRUSTUP_HOME       Trustup state root (default: ~/.trustup; `trustup home` prints it)
   TRUSTUP_TOOLCHAIN  Selected Trust toolchain name (default: default file)
 "
     );
@@ -314,21 +313,24 @@ fn selected_tool_path(tool: &str) -> Result<PathBuf, String> {
         return Err(format!("`{tool}` is not a canonical Trust tool name"));
     }
     let path = selected_root()?.join("bin").join(exe_name(tool));
-    if !path.is_file() {
-        return Err(format!("selected Trust root does not expose `{tool}`"));
+    if !canonical_tool_is_executable(&path) {
+        return Err(format!("selected Trust root does not expose an exact executable `{tool}`"));
     }
     Ok(path)
 }
 
 fn validate_toolchain_root(root: &Path) -> Result<(), String> {
     let bin = root.join("bin");
-    if !bin.is_dir() {
-        return Err(format!("Trust root has no bin directory: {}", root.display()));
+    if !fs::symlink_metadata(&bin).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!("Trust root has no exact bin directory: {}", root.display()));
     }
     for tool in REQUIRED_TOOLS {
         let path = bin.join(exe_name(tool));
-        if !path.is_file() {
-            return Err(format!("Trust root is missing canonical `{tool}` at {}", path.display()));
+        if !canonical_tool_is_executable(&path) {
+            return Err(format!(
+                "Trust root is missing exact executable canonical `{tool}` at {}",
+                path.display()
+            ));
         }
     }
     for inherited in INHERITED_PUBLIC_NAMES {
@@ -352,18 +354,49 @@ fn validate_toolchain_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// True when `path` is one of the two rustup-required inherited spellings *and*
+/// True when `path` is one of the three supported compatibility spellings *and*
 /// is the very same on-disk artifact as a canonical Trust binary sitting beside
 /// it in `bin`. See `INHERITED_ALIAS_TARGETS`.
 fn inherited_alias_is_authenticated(bin: &Path, inherited: &str, path: &Path) -> bool {
-    let Some(targets) = INHERITED_ALIAS_TARGETS
+    let Some(target) = INHERITED_ALIAS_TARGETS
         .iter()
         .find(|(name, _)| *name == inherited)
         .map(|(_, targets)| *targets)
     else {
         return false;
     };
-    targets.iter().any(|target| same_artifact(path, &bin.join(exe_name(target))))
+    let canonical = bin.join(exe_name(target));
+    if !canonical_tool_is_executable(&canonical) {
+        return false;
+    }
+    let (Ok(bin), Ok(alias), Ok(canonical_path)) =
+        (bin.canonicalize(), path.canonicalize(), canonical.canonicalize())
+    else {
+        return false;
+    };
+    alias.parent() == Some(bin.as_path())
+        && canonical_path.parent() == Some(bin.as_path())
+        && same_artifact(path, &canonical)
+}
+
+/// Canonical tools are regular leaves, never symlinks to a different root.
+/// Compatibility aliases have their separate confinement/identity check.
+fn canonical_tool_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Same regular file, reached by two names: a hardlink or a symlink within the

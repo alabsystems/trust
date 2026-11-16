@@ -94,9 +94,8 @@ impl SpecDatabase {
         self.memory
             .facts()
             .iter()
-            .filter(|fact| match &fact.source {
-                FactSource::ProvedPostcondition(post) => post.function == function,
-                _ => false,
+            .filter(|fact| {
+                matches!(&fact.source, FactSource::ProvedPostcondition(post) if post.function == function)
             })
             .collect()
     }
@@ -229,6 +228,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("parse"),
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -245,6 +245,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("parse"),
                             is_foreign: false,
                             func: "sqrt".to_string(),
                             args: vec![Operand::Copy(Place::local(2))],
@@ -272,6 +273,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -391,6 +393,7 @@ mod tests {
                             unwind: UnwindEdge::Unreachable,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: crate::sep_engine::tests::fixture_key("parse"),
                             is_foreign: false,
                             func: "parse".to_string(),
                             args: vec![Operand::Copy(Place::local(1))],
@@ -440,6 +443,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let mut specs = SpecDatabase::new();
@@ -700,6 +704,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         let specs = SpecDatabase::new();

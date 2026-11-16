@@ -96,6 +96,80 @@ fn place_names_overlap_prefix_semantics() {
     assert!(!ov("a[0][1]", "a[0][2]"), "all-literal nested indices stay precise");
 }
 
+/// Trust (2026-09-29): LITERAL index spellings are compared by the element they
+/// name. A constant pattern index carries the pattern's minimum length, a subslice
+/// rebases what follows it, and a from-end index counts from a length the name does
+/// not carry; an adversarial audit measured false proofs through each
+/// (`tests/ui/trust/slice_pattern_spellings_alias_refused.rs`).
+#[test]
+fn place_names_overlap_compares_literal_index_spellings_by_element() {
+    use super::place_names_overlap as ov;
+    // One element, two minimum lengths.
+    assert!(ov("v*[0;min=1]", "v*[0;min=2]"));
+    assert!(ov("v*[0;min=2]", "v*[0;slice]"));
+    // A subslice may name any element of its base.
+    assert!(ov("s*.0[1;min=4]", "s*.0[1..4][0;min=3]"));
+    assert!(ov("v*[1..-0][0;min=1]", "v*[1;min=2]"));
+    // From the end and from the start may meet.
+    assert!(ov("v*[-1;min=1]", "v*[0;min=1]"));
+    // Different elements counted from the same end stay independent.
+    assert!(!ov("v*[0;min=2]", "v*[1;min=2]"));
+    assert!(!ov("v*[0;min=1]", "v*[1;min=3]"));
+    assert!(!ov("v*[-1;min=2]", "v*[-2;min=2]"));
+    assert!(!ov("a[0;min=4]", "a[1;min=4]"));
+    // A field and an index never meet, and different bases never meet.
+    assert!(!ov("v*[0;min=1].0", "v*[1;min=1].0"));
+    assert!(!ov("v*[0;min=1]", "w*[0;min=2]"));
+}
+
+/// Trust: 2026-09-16 (round A9) — a write to an INDEX local rebinds every name that
+/// embeds it by number: `s*[_3]` denotes a different slot after `_3 = k`, and so does
+/// its `__slice_len` derivative. The fallback spelling `_3` is the one name that
+/// denotes local 3 and nothing else, so it is the written name the gen-sets carry.
+///
+/// Trust (round A10): the relation is DIRECTIONAL and lives in `write_rebinds`, never
+/// in the symmetric `place_names_overlap` — a store to `s*[_3]` is not a write of `_3`.
+/// With the symmetric clause, an element store `(*a)[_11] = 1` killed the entry defs
+/// of its own index local `_11` and refuted correct programs (`ctl_shadow_store_loop`).
+#[test]
+fn place_names_overlap_reaches_the_index_local_inside_a_projection() {
+    use super::{
+        dest_write_rebinds, place_names_overlap as ov, write_covers_index_segment as w,
+        write_rebinds,
+    };
+    assert!(w("_3", "s*[_3]"), "the element read embeds local 3 by number");
+    assert!(w("_3", "s*[_3]__slice_len"), "...and so does its length derivative");
+    assert!(w("_3", "a[0][_3].1"), "at any depth, with anything below");
+    assert!(!w("_3", "s*[_30]"), "the segment is matched whole");
+    assert!(!w("_3", "s*[_13]"));
+    assert!(!w("_3", "s*[3]"), "a literal index names no local");
+    assert!(!w("j", "s*[_3]"), "only the fallback spelling reaches the segment");
+    assert!(!w("_3", "_3"), "the bare fallback is the plain equality's job");
+    assert!(!w("_3", "_3.0"), "a projection of the local itself is the prefix rule's job");
+    // The symmetric overlap predicate does NOT carry the index-segment relation.
+    assert!(!ov("_3", "s*[_3]"));
+    assert!(!ov("s*[_3]", "_3"));
+    assert!(!ov("_3", "s*[_3]__slice_len"));
+    assert!(!ov("_3", "s*[_4]"), "a different index local is a different slot");
+    assert!(!ov("_3", "t"));
+    // The directional relation does, written-first only.
+    assert!(write_rebinds("_3", "s*[_3]"), "a write of local 3 rebinds the element read");
+    assert!(write_rebinds("_3", "s*[_3]__slice_len"), "...and its length derivative");
+    assert!(!write_rebinds("s*[_3]", "_3"), "a store INTO the element rebinds no index local");
+    assert!(!write_rebinds("a*[_11]", "_11"), "the ctl_shadow_store_loop shape");
+    assert!(write_rebinds("a*[_11]", "a*[_11]"), "...but does rebind the element itself");
+    assert!(write_rebinds("a", "a*[_11]"), "and a whole write of the base rebinds it too");
+    assert!(!write_rebinds("_3", "s*[_4]"));
+    // The derived-length channel belongs to a DESTINATION name only: a havoc of the
+    // base `s` (the opaque deref-store / call havoc list) must not reseat `s__slice_len`
+    // — `ctl_store_read_computed`'s live length tie across `s[i + 1] = 1`.
+    assert!(dest_write_rebinds("p", "p__slice_len"), "a destination reseats its own length");
+    assert!(!write_rebinds("p", "p__slice_len"), "a base-name havoc does not");
+    assert!(!dest_write_rebinds("p__slice_len", "p"));
+    assert!(!dest_write_rebinds("s*[_8]", "s__slice_len"), "an element store keeps the length");
+    assert!(dest_write_rebinds("_3", "s*[_3]__slice_len"), "the index channel rides along");
+}
+
 #[test]
 fn write_covers_derived_slice_len_semantics() {
     // Trust (P0 false-refutation, 2026-07-02): the version oracle must
@@ -152,6 +226,7 @@ fn mut_pointer_param_pointee_havoced_at_call() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("g"),
                         is_foreign: false,
                         func: "g".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -171,6 +246,7 @@ fn mut_pointer_param_pointee_havoced_at_call() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let kills = super::terminator_def_names(&func, &func.body.blocks[0]);
     assert!(
@@ -188,10 +264,14 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
     let rawmut = || Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) };
     assert!(c(&mref()));
     assert!(c(&rawmut()));
-    assert!(c(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    assert!(c(&Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "W".into(),
-        fields: vec![("p".into(), mref())],
+        fields: vec![("p".into(), mref())].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -200,10 +280,14 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
     assert!(c(&Ty::Array { elem: Box::new(mref()), len: 4 }));
     // No mutable pointer anywhere -> false.
     assert!(!c(&Ty::u32()));
-    assert!(!c(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    assert!(!c(&Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "P".into(),
-        fields: vec![("v".into(), Ty::u32())],
+        fields: vec![("v".into(), Ty::u32())].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -222,10 +306,14 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
     // non-reference Adt local: no syntactic `&mut x` statement and the local's
     // top-level type is not a pointer. The Call must still havoc `s` (whose
     // prefix-overlap kills the nested pointee fact `s.0*`). Round-13 fix.
-    let wrapper = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
-        variants: Vec::new(),
+    let wrapper = Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "Wrapper".into(),
-        fields: vec![("p".into(), Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) })],
+        fields: vec![("p".into(), Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) })].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -247,6 +335,7 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("g"),
                         is_foreign: false,
                         func: "g".into(),
                         args: vec![Operand::Move(Place::local(1))],
@@ -266,6 +355,7 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let kills = super::terminator_def_names(&func, &func.body.blocks[0]);
     assert!(
@@ -302,6 +392,7 @@ fn int_op_type_recovers_width_from_nonconst_operand() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let c = Operand::Constant(ConstValue::Int(100));
     let x = Operand::Copy(Place::local(1));
@@ -353,6 +444,7 @@ fn shift_overflow_uses_dest_width_for_constant_shifted_value() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = super::generate_vcs(&func);
     let shift_vc = vcs
@@ -406,6 +498,7 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
                         is_foreign,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("compute_hash"),
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -418,6 +511,7 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     // is_foreign=true -> conservative fail-closed FFI obligation present.
     let vcs = super::generate_vcs(&build(true));
@@ -435,6 +529,7 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
         is_foreign,
         is_unsafe_sig,
         callee_identity,
+        callee_key,
         ..
     } = tail.body.blocks[0].terminator.clone()
     else {
@@ -448,6 +543,7 @@ fn foreign_flagged_call_fails_closed_even_without_name_marker() {
         is_foreign,
         is_unsafe_sig,
         callee_identity,
+        callee_key,
     };
     tail.body.blocks.truncate(1);
     let tail_vcs = super::generate_vcs(&tail);

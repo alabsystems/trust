@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "trust.vanilla.targo-managed-witness-layout",
+  "owner": "@trust-release",
+  "status": "active",
+  "reviewed_on": "2026-10-24",
+  "expires_on": "2026-11-23",
+  "store_magic": "TWSTORE2",
+  "stem_hex_digits": 16,
+  "modules": [
+    "tests/testsuite/build_dir.rs",
+    "tests/testsuite/build_dir_fine_grain_locking.rs",
+    "tests/testsuite/build_dir_legacy.rs"
+  ],
+  "reason": "DQ WITNESS-STORE-FLAT-1 deliberately keeps the default-on typeck cache as one flat StableCrateId.twit per crate in the compiler out-dir, including an empty TWSTORE2 envelope when no root is eligible. These Cargo layout fixtures positively validate caller-declared witness locations/counts, regularity, names, framing and integrity before comparing every unchanged upstream non-witness snapshot. Stock compilers retain the no-witness layout. This adapter changes no witness mint/replay policy, verifier posture, original test annotation or non-witness expected path. Retire when upstream accounts for this deliberate additional output or the managed-store contract changes; expiry is enforced at test runtime. The dedicated Cargo fixture reader enforces this ledger; the Rust-tests-only patch porter is unchanged."
+}

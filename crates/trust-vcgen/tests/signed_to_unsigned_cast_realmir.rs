@@ -41,6 +41,9 @@
 // lowering under test is the one the compiler actually emits.
 use trust_types::{Formula, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 /// Stack for the solver thread: VC GENERATION and the solver search both recurse
 /// over the whole formula, and libtest's default test-thread stack is smaller
 /// than rustc's own verification thread. A harness allowance, not a production
@@ -58,7 +61,7 @@ fn verdicts(func: &VerifiableFunction) -> Vec<(String, VerificationResult)> {
         .stack_size(SOLVER_STACK_BYTES)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = test_router::deterministic_test_router();
             let results = router.verify_all(&vcs);
             vcs.iter()
                 .zip(results)

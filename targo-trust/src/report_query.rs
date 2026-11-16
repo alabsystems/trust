@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use serde::Serialize;
 use trust_types::{FunctionProofReport, JsonProofReport, ObligationOutcome, ObligationReport};
 
-use crate::diff::load_report;
 use crate::report::LiveCanonicalReport;
+use crate::saved_report::load_report;
 use crate::types::OutputFormat;
 
 #[derive(Debug, Clone)]
@@ -225,7 +225,7 @@ fn report_query_usage_text() -> String {
         "  targo trust report-query <report.json> [function]",
         "",
         "Options:",
-        "  --report <path>       Saved JsonProofReport or legacy report JSON",
+        "  --report <path>       A saved canonical JsonProofReport (report.json)",
         "  --function <name>     Function selector; exact, ::suffix, or bare final segment",
         "  --require proved      Require at least one selected obligation and all selected obligations to be proved",
         "  --format <fmt>        Output format: terminal (default), json, or repair",
@@ -257,7 +257,8 @@ fn parse_report_query_args(args: &[String]) -> Result<ReportQueryArgs, String> {
             }
             "--format" => {
                 i += 1;
-                let value = args.get(i).ok_or("--format requires a value (terminal or json)")?;
+                let value =
+                    args.get(i).ok_or("--format requires a value (terminal, json, or repair)")?;
                 format = parse_output_format(value)?;
             }
             value if value.starts_with("--format=") => {
@@ -648,6 +649,7 @@ mod tests {
                 unknown,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -661,6 +663,7 @@ mod tests {
 
     fn obligation(kind: &str, description: &str, outcome: ObligationOutcome) -> ObligationReport {
         ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: description.to_string(),
             kind: kind.to_string(),
@@ -682,8 +685,6 @@ mod tests {
                 trust_version: "test".into(),
                 timestamp: String::new(),
                 total_time_ms: 14,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "demo".into(),
             summary: CrateSummary {
@@ -699,6 +700,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -773,7 +775,10 @@ mod tests {
             obligation(
                 "division_by_zero",
                 "denominator may be zero",
-                ObligationOutcome::Failed { counterexample: None },
+                ObligationOutcome::Failed {
+                    counterexample: None,
+                    basis: trust_types::FailureBasis::Refuted,
+                },
             ),
             obligation(
                 "postcondition",
@@ -967,6 +972,7 @@ mod tests {
             function_with_counts("crate::math::slow", FunctionVerdict::Inconclusive, 2, 0, 0, 0, 2);
         timed_out.obligations = vec![
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "solver timed out".to_string(),
                 kind: "solver_timeout".to_string(),
@@ -980,6 +986,7 @@ mod tests {
                 transport_evidence: None,
             },
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "incomplete quantifier reasoning".to_string(),
                 kind: "postcondition".to_string(),
@@ -1107,6 +1114,7 @@ mod tests {
         partial.summary.timed_out = 2;
         partial.obligations = vec![
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "solver timed out".to_string(),
                 kind: "solver_timeout".to_string(),
@@ -1120,6 +1128,7 @@ mod tests {
                 transport_evidence: None,
             },
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "incomplete quantifier reasoning".to_string(),
                 kind: "postcondition".to_string(),

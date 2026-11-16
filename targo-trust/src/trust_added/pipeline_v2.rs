@@ -278,7 +278,7 @@ pub(super) fn run(root: &Path, policy: GatePolicy) -> Result<()> {
 
         section("Formula compatibility gate test");
         let (targo, _trustc) = standalone_targo(root)?;
-        let manifest = root.join("crates/Cargo.toml");
+        let manifest = root.join("Cargo.toml");
         let mut command = std::process::Command::new(&targo);
         let target = tempfile::Builder::new()
             .prefix("trust-formula-compat-target-")
@@ -353,7 +353,7 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
     command
         .arg("--unverified")
         .args(["test", "--manifest-path"])
-        .arg(root.join("crates/Cargo.toml"))
+        .arg(root.join("Cargo.toml"))
         .args([
             "--locked",
             "-p",
@@ -415,7 +415,7 @@ pub(super) fn run_three_suite_artifact_gate(root: &Path) -> Result<()> {
     command
         .arg("--unverified")
         .args(["test", "--manifest-path"])
-        .arg(root.join("crates/Cargo.toml"))
+        .arg(root.join("Cargo.toml"))
         .args([
             "--locked",
             "-p",
@@ -518,16 +518,9 @@ fn require_bootstrap_execution_policy(policy: GatePolicy) -> Result<()> {
 
 fn run_contract_source_recovery_tests(root: &Path, policy: GatePolicy) -> Result<()> {
     section("MIR-compatibility contract source-recovery behavioral tests");
-    // `trust-mir-extract` requires rustc_private, so it is deliberately
-    // EXCLUDED from the crates/ dev workspace (crates/Cargo.toml `exclude`)
-    // and is a member of the ROOT compiler workspace instead. A targo
-    // invocation against crates/Cargo.toml can never resolve it ("package ID
-    // specification did not match any packages"), and a direct manifest build
-    // fails on cross-workspace path deps. Route the behavioral tests through
-    // the Rust bootstrap binary's crate-test lane
-    // (`bootstrap test crates/trust-mir-extract`) — the same no-Python
-    // bootstrap resolution the trust-added compiletest gate uses — which
-    // builds against the cached stage2 compiler artifacts.
+    // `trust-mir-extract` is a root member outside developer defaults. It
+    // requires rustc_private, so use bootstrap's crate-test lane to supply
+    // the cached stage2 compiler sysroot and its private dependency artifacts.
     // `compat_source_recovery_must_be_explicitly_selected` was deleted with the
     // legacy compat/debug source-scraping contract lane it guarded
     // (R-U §1.2-5, d6cda3055b1) — the surface no longer exists, so the four
@@ -643,7 +636,7 @@ fn run_vcgen_guard_contract_tests(root: &Path) -> Result<()> {
         command
             .arg("--unverified")
             .args(["test", "--manifest-path"])
-            .arg(root.join("crates/Cargo.toml"))
+            .arg(root.join("Cargo.toml"))
             .args(["--locked", "-p", "trust-vcgen", "--lib"])
             .arg(&exact)
             .args(["--", "--exact"])
@@ -1177,6 +1170,12 @@ fn validate_contract_verification_gate(
         bail!(
             "native contract report gate carries a contradictory runtime-checked conditional flag"
         );
+    }
+    // Ramp (2026-09-07): only the advisory lane can pass conditionally on an
+    // unknown, and the contract corpus is graded in the strict lane, so this
+    // flag is a forgery here — exactly like the runtime-checked one above.
+    if gate.conditional_on_unknown_rows {
+        bail!("native contract report gate carries a contradictory unknown-row conditional flag");
     }
     let has_dependency_assumption =
         raw_report.assumptions.iter().any(|entry| entry.source == "dep-tcb-cargo-unit-inventory");
@@ -1769,6 +1768,7 @@ mod tests {
                 unknown: 0,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -1777,6 +1777,7 @@ mod tests {
                 verdict: FunctionVerdict::HasViolations,
             },
             obligations: vec![ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: Some(obligation_id.clone()),
                 description: VcKind::Postcondition.description(),
                 kind: "postcondition".into(),
@@ -1788,14 +1789,19 @@ mod tests {
                     line_end: clause_line,
                     col_end: 2,
                 }),
-                outcome: ObligationOutcome::Failed { counterexample: None },
+                outcome: ObligationOutcome::Failed {
+                    counterexample: None,
+                    basis: trust_types::FailureBasis::Refuted,
+                },
                 solver: "ay".into(),
                 time_ms: 1,
                 evidence: None,
                 proof_evidence: None,
                 transport_evidence: Some(ObligationTransportEvidenceReport {
+                    identity: None,
                     obligation_id: Some(obligation_id),
                     claim_digest_sha256: None,
+                    original_vc_snapshot: None,
                     typed_kind: Some(Box::new(VcKind::Postcondition)),
                     native_trust_ir: None,
                     proof_evidence: None,
@@ -1819,8 +1825,6 @@ mod tests {
                 trust_version: "test".into(),
                 timestamp: "2026-07-11T00:00:00Z".into(),
                 total_time_ms: 5,
-                timeout_ms: Some(5_000),
-                function_budget_ms: Some(10_000),
             },
             crate_name: report_subject.clone(),
             summary: CrateSummary {
@@ -1836,6 +1840,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -1877,6 +1882,7 @@ mod tests {
                 assumed: 0,
                 mandated: summary.total_design_requirements,
                 contract_panics: 0,
+                excluded: 0,
             },
             conditional_on_assumption_rows: false,
             conditional_on_dependency_entries: report
@@ -1884,12 +1890,17 @@ mod tests {
                 .iter()
                 .any(|entry| entry.source == "dep-tcb-cargo-unit-inventory"),
             conditional_on_runtime_checks: summary.total_runtime_checked > 0,
+            conditional_on_unknown_rows: false,
             conditional_on_visitation_entries: false,
             coverage: Some(VerificationCoverage::from_counts(
                 report.functions.len(),
                 report.functions.len(),
             )),
             test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
         });
         Captured {
             exit,
@@ -1909,10 +1920,12 @@ mod tests {
         obligation.description = kind.description();
         obligation.proof_level = kind.proof_level();
         let obligation_id = obligation.obligation_id.clone();
-        let evidence = obligation.transport_evidence.get_or_insert_with(|| {
+        let evidence = obligation.transport_evidence.get_or_insert({
             ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id,
                 claim_digest_sha256: None,
+                original_vc_snapshot: None,
                 typed_kind: None,
                 native_trust_ir: None,
                 proof_evidence: None,
@@ -1974,8 +1987,10 @@ mod tests {
             obligation.evidence = Some(evidence);
             obligation.proof_evidence = Some(proof_report);
             obligation.transport_evidence = Some(ObligationTransportEvidenceReport {
+                identity: None,
                 obligation_id: transport.obligation_id,
                 claim_digest_sha256: transport.claim_digest_sha256,
+                original_vc_snapshot: transport.original_vc_snapshot,
                 typed_kind: transport.typed_kind,
                 native_trust_ir: Some(native),
                 proof_evidence: Some(proof),
@@ -2116,6 +2131,55 @@ mod tests {
             stderr: String::new(),
         };
         assert!(assert_contracts_check_report(&invented).is_err());
+    }
+
+    /// The verdict-bearing consumer re-admits a proved row only through
+    /// `saved_obligation_structural_proof_defect`. A row in the shape the
+    /// producer now writes — the envelope minus its duplicate `proof_evidence`
+    /// copy — is admitted exactly like the legacy two-copy row, and neither the
+    /// row's own checks nor the legacy mismatch check got looser.
+    #[test]
+    fn typed_contract_report_admits_a_proved_row_whose_transport_proof_copy_is_elided() {
+        let mut valid = failed_report();
+        install_publishable_proof(&mut valid, 1, "11", "21");
+        let valid_result = assert_contracts_check_report(&captured_report(&valid, 1));
+        assert!(valid_result.is_ok(), "{valid_result:?}");
+
+        let mut elided = valid.clone();
+        let obligation = &mut elided.functions[1].obligations[0];
+        assert!(trust_types::elide_duplicate_transport_proof_evidence(obligation));
+        assert!(
+            obligation
+                .transport_evidence
+                .as_ref()
+                .is_some_and(|transport| transport.proof_evidence.is_none())
+        );
+        let elided_result = assert_contracts_check_report(&captured_report(&elided, 1));
+        assert!(elided_result.is_ok(), "{elided_result:?}");
+        assert_eq!(
+            serde_json::to_value(&elided).expect("elided report")["summary"],
+            serde_json::to_value(&valid).expect("valid report")["summary"],
+        );
+
+        let mut malformed = elided.clone();
+        malformed.functions[1].obligations[0]
+            .proof_evidence
+            .as_mut()
+            .expect("proof evidence")
+            .native_id = Some("trust_ir-native-trust-wp-request-11-proof-attacker".into());
+        let error = assert_contracts_check_report(&captured_report(&malformed, 1)).unwrap_err();
+        assert!(error.to_string().contains("malformed"), "{error}");
+
+        let mut mismatched_copy = valid.clone();
+        mismatched_copy.functions[1].obligations[0]
+            .transport_evidence
+            .as_mut()
+            .and_then(|transport| transport.proof_evidence.as_mut())
+            .expect("transport proof copy")
+            .proof_id = Some("999".into());
+        let error =
+            assert_contracts_check_report(&captured_report(&mismatched_copy, 1)).unwrap_err();
+        assert!(error.to_string().contains("malformed"), "{error}");
     }
 
     #[test]

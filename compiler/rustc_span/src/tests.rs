@@ -117,3 +117,43 @@ fn test_unnormalized_source_length() {
     assert_eq!(sf.unnormalized_source_len, 19);
     assert_eq!(sf.normalized_source_len.0, 14);
 }
+
+#[test]
+fn test_span_niche_and_four_encoding_formats_roundtrip() {
+    use crate::def_id::{DefIndex, LocalDefId};
+    use crate::edition::Edition;
+
+    assert_eq!(std::mem::size_of::<Span>(), 8);
+    assert_eq!(std::mem::size_of::<Option<Span>>(), 8);
+    assert!(DUMMY_SP.is_dummy());
+
+    create_session_globals_then(Edition::Edition2024, &[], None, || {
+        // 1. InlineCtxt (`0` prefix): parent = None, small len & ctxt
+        let s_ctxt = Span::new(BytePos(100), BytePos(120), SyntaxContext::from_u32(7), None);
+        assert!(!s_ctxt.is_dummy());
+        assert_eq!(s_ctxt.lo_hi(), (BytePos(100), BytePos(120)));
+        assert_eq!(s_ctxt.ctxt(), SyntaxContext::from_u32(7));
+        assert_eq!(s_ctxt.parent(), None);
+
+        // 2. InlineParent (`110` prefix): ctxt = root (0), parent = Some(small)
+        let p_small = LocalDefId { local_def_index: DefIndex::from_u32(42) };
+        let s_parent = Span::new(BytePos(500), BytePos(550), SyntaxContext::root(), Some(p_small));
+        assert_eq!(s_parent.lo_hi(), (BytePos(500), BytePos(550)));
+        assert_eq!(s_parent.ctxt(), SyntaxContext::root());
+        assert_eq!(s_parent.parent(), Some(p_small));
+
+        // 3. InlinePair (`10` prefix): non-root ctxt + parent within 16 bits, small lo & len
+        let s_pair =
+            Span::new(BytePos(200), BytePos(210), SyntaxContext::from_u32(3), Some(p_small));
+        assert_eq!(s_pair.lo_hi(), (BytePos(200), BytePos(210)));
+        assert_eq!(s_pair.ctxt(), SyntaxContext::from_u32(3));
+        assert_eq!(s_pair.parent(), Some(p_small));
+
+        // 4. Interned (`111` prefix, non-MAX): large length triggers interning
+        let s_interned =
+            Span::new(BytePos(1000), BytePos(100_000), SyntaxContext::from_u32(9), Some(p_small));
+        assert_eq!(s_interned.lo_hi(), (BytePos(1000), BytePos(100_000)));
+        assert_eq!(s_interned.ctxt(), SyntaxContext::from_u32(9));
+        assert_eq!(s_interned.parent(), Some(p_small));
+    });
+}

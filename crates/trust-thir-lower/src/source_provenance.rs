@@ -71,6 +71,13 @@ fn put_domain(bytes: &mut Vec<u8>, domain: TrustContractPropositionDomain) {
             put_u32(bytes, width);
             bytes.push(u8::from(signed));
         }
+        // Tag 4, appended rather than inserted: these bytes are a digest input,
+        // so renumbering an existing domain would change the provenance hash of
+        // every contract that does not involve a float.
+        TrustContractPropositionDomain::Float { width } => {
+            bytes.push(4);
+            put_u32(bytes, width);
+        }
     }
 }
 
@@ -88,6 +95,14 @@ fn put_proposition(bytes: &mut Vec<u8>, proposition: &TrustContractProposition) 
         P::UInt(value) => {
             bytes.push(2);
             put_u128(bytes, *value);
+        }
+        // Tag appended for the same digest-stability reason as the domain above.
+        // The BITS go in, not a rendered decimal: two spellings of one value
+        // must not hash apart, and the two zeroes must not hash together.
+        P::Float { bits, width } => {
+            bytes.push(20);
+            put_u32(bytes, *width);
+            put_u128(bytes, u128::from(*bits));
         }
         P::Var { name, domain } => {
             bytes.push(3);
@@ -687,8 +702,9 @@ mod tests {
 
     fn authenticated_fixture() -> (Module, Vec<SourceLoopPlan>, ProofDigest) {
         let mut module = Module::new("authenticated-source-loop");
-        let signature =
-            module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        let signature = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "f", signature, BlockId::new(0));
         let initial = ValueId::new(0);
         let carried = ValueId::new(1);
@@ -716,7 +732,7 @@ mod tests {
         let mut body = Block::new(BlockId::new(3));
         body.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![carried] }));
         function.blocks = vec![entry, header, exit, body];
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         let plans = vec![SourceLoopPlan {
             source_loop_id: 0,
@@ -735,8 +751,9 @@ mod tests {
 
     fn two_loop_fixture() -> Module {
         let mut module = Module::new("two-source-loops");
-        let signature =
-            module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        let signature = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "f", signature, BlockId::new(0));
         let first_condition = ValueId::new(0);
         let second_condition = ValueId::new(1);
@@ -778,15 +795,16 @@ mod tests {
         exit.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         function.blocks =
             vec![entry, first_header, first_body, between, second_header, second_body, exit];
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
     #[test]
     fn natural_header_reconstruction_does_not_mistake_backward_exit_edges() {
         let mut module = Module::new("source-loop-structure");
-        let signature =
-            module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        let signature = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), "f", signature, BlockId::new(0));
         let mut entry = Block::new(BlockId::new(0));
         entry.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
@@ -818,7 +836,7 @@ mod tests {
         let mut latch = Block::new(BlockId::new(4));
         latch.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
         function.blocks = vec![entry, header, exit, body, latch];
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         assert_eq!(structural_loop_headers(&module).unwrap(), vec![BlockId::new(1)]);
     }

@@ -190,8 +190,7 @@ impl<'a, 'tcx> LowerCx<'a, 'tcx> {
         &self,
         value: ValueId,
     ) -> Result<DirectFormulaOperand, &'static str> {
-        let Some(node) = self.cur.iter().rev().find(|node| node.results.contains(&value))
-        else {
+        let Some(node) = self.cur.iter().rev().find(|node| node.results.contains(&value)) else {
             return Err("unnamed-temp-operand");
         };
         let Inst::Overflow { op, ty, lhs, rhs } = &node.inst else {

@@ -67,6 +67,34 @@ fn dot_like(preconditions: Vec<Formula>, reassign_self: bool) -> VerifiableFunct
     }
     let local =
         |index: usize, name: &str| LocalDecl { index, ty: Ty::f64_ty(), name: Some(name.into()) };
+    // `self`/`o` are STRUCTS, not bare f64s. The fixture declared them as
+    // `f64` for years and the field places still "worked" because nothing
+    // asked them for a type — but `Place::field(1, 0)` on an `f64` cannot
+    // resolve, so the moment the overflow discharge started reading the
+    // operation's IEEE WIDTH from its operands (2026-09-17), the artificial
+    // typing made a REAL, production-shaped discharge look unavailable.
+    // Declare the real shape so these tests measure what production measures.
+    let param = |index: usize, name: &str| LocalDecl {
+        index,
+        ty: Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
+            adt_kind: None,
+            layout: None,
+            name: "Vec3".into(),
+            fields: vec![
+                ("x".into(), Ty::f64_ty()),
+                ("y".into(), Ty::f64_ty()),
+                ("z".into(), Ty::f64_ty()),
+            ]
+            .into(),
+            variants: Vec::new().into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+        },
+        name: Some(name.into()),
+    };
     VerifiableFunction {
         name: "dot".into(),
         def_path: "Vec3::dot".into(),
@@ -74,8 +102,8 @@ fn dot_like(preconditions: Vec<Formula>, reassign_self: bool) -> VerifiableFunct
         body: VerifiableBody {
             locals: vec![
                 local(0, "_0"),
-                local(1, "self"),
-                local(2, "o"),
+                param(1, "self"),
+                param(2, "o"),
                 local(3, "s"),
                 local(4, "_4"),
                 local(5, "_5"),
@@ -90,6 +118,7 @@ fn dot_like(preconditions: Vec<Formula>, reassign_self: bool) -> VerifiableFunct
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

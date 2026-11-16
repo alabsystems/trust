@@ -23,22 +23,27 @@ closes, from outside the compiler, over artifacts alone.
 
 It is deliberately a CONSUMER-side check written against the published bytes:
 the party that consumes the artifact must not have to trust the producer's log.
+A passing result is diagnostic artifact-lineage evidence, not proof of G7
+executable authority.
 
 WHAT IT PROVES
 
-  A. Set integrity      -- every artifact named in the publication manifest is
-                           present and hashes to the declared digest under the
-                           declared domain, recomputed here from first
-                           principles (`sha256-domain-v1`), not by calling the
-                           producer's own code.
+  A. Set integrity      -- the publication manifest names exactly the required
+                           binary module and canonical text for this crate;
+                           both are present and hash to their declared digests
+                           under the producer's domain, recomputed here from
+                           first principles (`sha256-domain-v1`), not by
+                           calling the producer's own code.
   B. Coverage           -- every flipped body's lineage digest appears in the
                            coverage rows, exactly once.
   C. Presence           -- that row is SPLICED (`func_id` is not null): the body
                            whose code shipped is actually in the artifact.
   D. Address fidelity   -- `func_id` addresses a function in the assembled
-                           module whose name is that row's `def_path` (with the
-                           `{const-init}`/`{static-init}` marker the assembler
-                           appends for initializer bodies).
+                           module whose DISPLAY PATH is that row's `def_path`
+                           (with the `{const-init}`/`{static-init}` marker the
+                           assembler appends for initializer bodies). Since
+                           WS5.2 the function's NAME is its link-time symbol,
+                           so the def path lives in `; #display-path: "..."`.
 
 WHAT IT DOES NOT PROVE (do not quote it as more than it is)
 
@@ -88,8 +93,15 @@ from pathlib import Path
 # (first-party/trust-ir/crates/trust-ir/src/proof/evidence.rs)
 SHA256_DOMAIN_PREFIX = b"trust-ir.sha256-domain.v1\x00"
 
+# `crate_module.rs::coverage_publication_manifest` emits this exact v1 shape;
+# dump mode names the two data files from the coverage crate.
 EXPECTED_PUBLICATION_SCHEMA = "trust.thir-lower.artifact-set.v1"
 EXPECTED_DIGEST_ALGORITHM = "sha256-domain-v1"
+EXPECTED_DIGEST_DOMAIN = "trust.thir-lower.artifact.v1"
+PUBLICATION_KEYS = {
+    "schema", "digest_algorithm", "digest_domain", "commit_marker", "artifacts"
+}
+ARTIFACT_KEYS = {"name", "bytes", "digest"}
 
 # `rustc_mir_transform::trust_ir_flip`'s two `info!` lines. Both seams count:
 # the codegen seam selects the body codegen consumes, the CTFE seam selects the
@@ -105,6 +117,43 @@ FLIP_LINE = re.compile(
 # `func_id` indexes (crate_module.rs: declarations are appended last so
 # `module.functions[i].id == i` holds end to end).
 TEXT_FN = re.compile(r"^(?:[a-z]+ )?fn @(?P<name>.+?)\(", re.MULTILINE)
+
+# WS5.2: the canonical text carries a function's def path as a quoted (Rust
+# `Debug`-escaped) `; #display-path:` directive right under its header.
+TEXT_DISPLAY_PATH = re.compile(r'^\s*; #display-path: (?P<quoted>".*")\s*$', re.MULTILINE)
+
+_RUST_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+
+
+def rust_debug_unquote(quoted: str) -> str | None:
+    """Invert Rust's `{:?}` string escaping (the `#display-path` spelling), or None."""
+    if len(quoted) < 2 or quoted[0] != '"' or quoted[-1] != '"':
+        return None
+    body, out, i = quoted[1:-1], [], 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(body):
+            return None
+        esc = body[i + 1]
+        if esc == "u":
+            close = body.find("}", i + 2)
+            if body[i + 2 : i + 3] != "{" or close < 0:
+                return None
+            try:
+                out.append(chr(int(body[i + 3 : close], 16)))
+            except ValueError:
+                return None
+            i = close + 1
+            continue
+        if esc not in _RUST_ESCAPES:
+            return None
+        out.append(_RUST_ESCAPES[esc])
+        i += 2
+    return "".join(out)
 
 
 def sha256_domain(domain: str, payload: bytes) -> str:
@@ -142,6 +191,11 @@ def check_publication(dump: Path, coverage: dict, out: Reconciliation) -> None:
             "marker, so a consumer cannot tell a current generation from a stale or partial one"
         )
         return
+    if not isinstance(publication, dict):
+        out.fail("coverage.json `publication` block is not an object")
+        return
+    if set(publication) != PUBLICATION_KEYS:
+        out.fail("publication block does not have the producer schema's exact fields")
     if publication.get("schema") != EXPECTED_PUBLICATION_SCHEMA:
         out.fail(
             f"publication schema is {publication.get('schema')!r}, expected "
@@ -158,23 +212,44 @@ def check_publication(dump: Path, coverage: dict, out: Reconciliation) -> None:
         out.fail("publication block is not a commit marker: the set is incomplete by its own claim")
         return
     domain = publication.get("digest_domain")
-    if not isinstance(domain, str) or not domain:
-        out.fail("publication block names no digest domain")
+    if domain != EXPECTED_DIGEST_DOMAIN:
+        out.fail(
+            f"publication digest domain is {domain!r}, expected "
+            f"{EXPECTED_DIGEST_DOMAIN!r} from the producer schema"
+        )
         return
 
-    artifacts = publication.get("artifacts") or []
-    if not artifacts:
-        out.fail("publication block names no artifacts")
+    artifacts = publication.get("artifacts")
+    if not isinstance(artifacts, list):
+        out.fail("publication artifacts is not a list")
         return
+
+    crate = coverage["crate"]
+    required = {f"{crate}.trust-ir.bin", f"{crate}.trust-ir.txt"}
+    seen: set[str] = set()
     for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            out.fail("publication artifact entry is not an object")
+            continue
+        if set(artifact) != ARTIFACT_KEYS:
+            out.fail("publication artifact entry does not have the producer schema's exact fields")
         name = artifact.get("name")
+        if not isinstance(name, str) or name not in required:
+            out.fail(f"unexpected publication artifact {name!r}; expected only {sorted(required)}")
+            continue
+        if name in seen:
+            out.fail(f"duplicate publication artifact {name!r}")
+            continue
+        seen.add(name)
         path = dump / name
-        if not path.is_file():
-            out.fail(f"artifact {name!r} is named by the commit marker but is not on disk")
+        if path.is_symlink() or not path.is_file():
+            out.fail(f"required artifact {name!r} is not a regular file in the dump directory")
             continue
         payload = path.read_bytes()
         declared_bytes = artifact.get("bytes")
-        if declared_bytes != len(payload):
+        if type(declared_bytes) is not int or declared_bytes < 0:
+            out.fail(f"artifact {name!r} has no valid byte count in the commit marker")
+        elif declared_bytes != len(payload):
             out.fail(
                 f"artifact {name!r} is {len(payload)} bytes on disk, "
                 f"{declared_bytes} in the commit marker"
@@ -186,6 +261,8 @@ def check_publication(dump: Path, coverage: dict, out: Reconciliation) -> None:
                 f"{artifact.get('digest')}, the bytes on disk digest to {recomputed}"
             )
         out.artifacts += 1
+    for name in sorted(required - seen):
+        out.fail(f"required publication artifact {name!r} is missing from the commit marker")
 
 
 def assembled_function_names(dump: Path, coverage: dict) -> list[str] | None:
@@ -197,8 +274,24 @@ def assembled_function_names(dump: Path, coverage: dict) -> list[str] | None:
     return TEXT_FN.findall(text.read_text(encoding="utf-8", errors="replace"))
 
 
+def assembled_display_paths(dump: Path, coverage: dict) -> list[str | None] | None:
+    """Each function's `#display-path` (None when absent), in `module.functions` order."""
+    crate = coverage.get("crate")
+    text_path = dump / f"{crate}.trust-ir.txt"
+    if not text_path.is_file():
+        return None
+    text = text_path.read_text(encoding="utf-8", errors="replace")
+    headers = list(TEXT_FN.finditer(text))
+    paths: list[str | None] = []
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        found = TEXT_DISPLAY_PATH.search(text, header.end(), end)
+        paths.append(rust_debug_unquote(found.group("quoted")) if found else None)
+    return paths
+
+
 def expected_assembled_name(row: dict) -> str:
-    """The name `assemble` gives a spliced body (crate_module.rs)."""
+    """The display path `assemble` gives a spliced body (crate_module.rs)."""
     kind = row.get("kind")
     if kind == "const-init":
         return f"{row['def_path']}::{{const-init}}"
@@ -218,6 +311,13 @@ def reconcile(dump: Path, flip_log: Path | None) -> Reconciliation:
         )
         return out
     coverage = json.loads(coverage_files[0].read_text(encoding="utf-8"))
+    if not isinstance(coverage, dict):
+        out.fail("coverage.json is not an object")
+        return out
+    crate = coverage.get("crate")
+    if not isinstance(crate, str) or not crate or coverage_files[0].name != f"{crate}.coverage.json":
+        out.fail("coverage crate does not match its <crate>.coverage.json commit marker path")
+        return out
 
     check_publication(dump, coverage, out)
 
@@ -240,7 +340,7 @@ def reconcile(dump: Path, flip_log: Path | None) -> Reconciliation:
                 "digest no longer names one object"
             )
 
-    names = assembled_function_names(dump, coverage)
+    names = assembled_display_paths(dump, coverage)
     if names is None:
         out.fail(
             f"no {coverage.get('crate')}.trust-ir.txt in {dump}: `func_id` cannot be resolved "
@@ -266,8 +366,8 @@ def reconcile(dump: Path, flip_log: Path | None) -> Reconciliation:
             if names[func_id] != expected:
                 out.fail(
                     f"row {row.get('def_path')!r} claims func_id {func_id}, but the assembled "
-                    f"module's function at that index is named {names[func_id]!r}, not "
-                    f"{expected!r}"
+                    f"module's function at that index has display path {names[func_id]!r}, "
+                    f"not {expected!r}"
                 )
 
     if flip_log is None:

@@ -26,3 +26,7 @@ trust-cg-codegen = { path = "../../first-party/trust-cg/crates/trust-cg-codegen"
 
 [dev-dependencies]
 trust-ir-build = { workspace = true }
+# The positive binary fixture earns its codegen license through Clean's real
+# pipeline and the independent kernel re-check; no test-only license policy.
+clean-compiler = { path = "../../first-party/clean/crates/clean-compiler", default-features = false, features = ["trust-ir-backend"] }
+clean-kernel = { workspace = true }

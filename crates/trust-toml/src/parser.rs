@@ -125,7 +125,11 @@ enum Slot {
     /// all land here and none of them may be extended afterwards.
     Value(Item),
     Table(TableBuilder),
-    ArrayOfTables { items: Vec<TableBuilder>, line: usize, column: usize },
+    ArrayOfTables {
+        items: Vec<TableBuilder>,
+        line: usize,
+        column: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -238,10 +242,7 @@ impl<'a> Parser<'a> {
     /// `a = [[[…]]]` a thousand deep is not. Matching the incumbent's
     /// enter/exit pair rather than a high-water mark is what makes the two
     /// agree on a document like `[[a], [[b]], [[[c]]]]`.
-    fn nested<T>(
-        &mut self,
-        body: impl FnOnce(&mut Self) -> Result<T, Error>,
-    ) -> Result<T, Error> {
+    fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
         self.depth += 1;
         if self.depth >= MAX_DEPTH {
             // Reported at the current position, not at the opening bracket:
@@ -344,7 +345,10 @@ impl<'a> Parser<'a> {
             // fine is the failure mode this crate exists to remove.
             if is_forbidden_control(next) {
                 return Err(Error::at(
-                    format!("control character U+{:04X} is not permitted in a comment", next as u32),
+                    format!(
+                        "control character U+{:04X} is not permitted in a comment",
+                        next as u32
+                    ),
                     line,
                     column,
                 ));
@@ -825,8 +829,10 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     return Err(Error::at(
-                        format!("a `\\{}` escape needs exactly {digits} hex digits",
-                            if digits == 4 { 'u' } else { 'U' }),
+                        format!(
+                            "a `\\{}` escape needs exactly {digits} hex digits",
+                            if digits == 4 { 'u' } else { 'U' }
+                        ),
                         line,
                         column,
                     ));
@@ -839,11 +845,7 @@ impl<'a> Parser<'a> {
             // Surrogates and values above U+10FFFF. TOML requires a scalar
             // value, and Rust's `char` cannot hold anything else, so this is
             // both a spec rule and a representability rule.
-            Error::at(
-                format!("`\\u{scalar:04X}` is not a Unicode scalar value"),
-                line,
-                column,
-            )
+            Error::at(format!("`\\u{scalar:04X}` is not a Unicode scalar value"), line, column)
         })
     }
 
@@ -960,9 +962,10 @@ fn open_table(
 ) -> Result<(), Error> {
     match cursor.entries.get_mut(&part.name) {
         None => {
-            cursor
-                .entries
-                .insert(part.name.clone(), Slot::Table(TableBuilder::new(TableKind::Explicit, line, column)));
+            cursor.entries.insert(
+                part.name.clone(),
+                Slot::Table(TableBuilder::new(TableKind::Explicit, line, column)),
+            );
             Ok(())
         }
         Some(Slot::Table(table)) if table.kind == TableKind::ImplicitHeader => {
@@ -1053,11 +1056,7 @@ fn open_array_of_tables(
 }
 
 /// Write `a.b.c = value` into `table`, creating dotted intermediates.
-fn insert_dotted(
-    table: &mut TableBuilder,
-    keys: &[KeyPart],
-    value: Item,
-) -> Result<(), Error> {
+fn insert_dotted(table: &mut TableBuilder, keys: &[KeyPart], value: Item) -> Result<(), Error> {
     let (last, ancestors) = keys.split_last().expect("a key path has at least one part");
     let mut cursor = table;
     for part in ancestors {
@@ -1282,9 +1281,7 @@ fn parse_float(
         text.push_str(&digits);
     }
 
-    let value = text
-        .parse::<f64>()
-        .map_err(|_| bad(format!("`{raw}` is not a valid float")))?;
+    let value = text.parse::<f64>().map_err(|_| bad(format!("`{raw}` is not a valid float")))?;
 
     // A decimal literal that overflows `f64` is REJECTED, not silently rounded
     // to infinity. `inf`/`-inf`/`nan` were returned above, so reaching here
@@ -1390,7 +1387,7 @@ mod tests {
         assert_eq!(kind("a = 0xdead_beef", "a"), Kind::Integer(0xdead_beef));
         assert_eq!(kind("a = 0o755", "a"), Kind::Integer(0o755));
         assert_eq!(kind("a = 0b1010", "a"), Kind::Integer(0b1010));
-        assert_eq!(kind("a = 3.14", "a"), Kind::Float(3.14));
+        assert_eq!(kind("a = 1.23", "a"), Kind::Float(1.23));
         assert_eq!(kind("a = 1e6", "a"), Kind::Float(1e6));
         assert_eq!(kind("a = -2.5E-3", "a"), Kind::Float(-2.5E-3));
         assert_eq!(kind("a = true", "a"), Kind::Boolean(true));
@@ -1449,7 +1446,9 @@ mod tests {
         // Nor is a header over a table a dotted key created.
         assert!(parse_document("a.b = 1\n[a]\n").is_err());
         // But a sub-table of a dotted-key table is fine (TOML v1.0.0 §Table).
-        assert!(parse_document("[f]\napple.color = 'red'\n[f.apple.texture]\nsmooth = true\n").is_ok());
+        assert!(
+            parse_document("[f]\napple.color = 'red'\n[f.apple.texture]\nsmooth = true\n").is_ok()
+        );
     }
 
     #[test]
@@ -1480,10 +1479,13 @@ mod tests {
 
     #[test]
     fn trailing_comma_in_an_array_is_allowed() {
-        assert_eq!(kind("a = [1, 2, ]", "a"), Kind::Array(vec![
-            Item { kind: Kind::Integer(1), line: 1, column: 6 },
-            Item { kind: Kind::Integer(2), line: 1, column: 9 },
-        ]));
+        assert_eq!(
+            kind("a = [1, 2, ]", "a"),
+            Kind::Array(vec![
+                Item { kind: Kind::Integer(1), line: 1, column: 6 },
+                Item { kind: Kind::Integer(2), line: 1, column: 9 },
+            ])
+        );
     }
 
     #[test]

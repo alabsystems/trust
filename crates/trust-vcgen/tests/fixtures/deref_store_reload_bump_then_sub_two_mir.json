@@ -1,0 +1,318 @@
+{
+ "name": "bump_then_sub_two",
+ "def_path": "deref_store_reload::bump_then_sub_two",
+ "span": {
+  "file": "tests/data/deref_store_reload.rs",
+  "line_start": 15,
+  "col_start": 0,
+  "line_end": 18,
+  "col_end": 1
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      }
+     }
+    },
+    "name": "count"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 64,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 2,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Add",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": [
+            "Deref"
+           ]
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 16,
+        "col_start": 4,
+        "line_end": 16,
+        "col_end": 15
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 2,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Add"
+      },
+      "target": 1,
+      "span": {
+       "file": "tests/data/deref_store_reload.rs",
+       "line_start": 16,
+       "col_start": 4,
+       "line_end": 16,
+       "col_end": 15
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 1,
+        "projections": [
+         "Deref"
+        ]
+       },
+       "rvalue": {
+        "Use": {
+         "Move": {
+          "local": 2,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 16,
+        "col_start": 4,
+        "line_end": 16,
+        "col_end": 15
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 1,
+          "projections": [
+           "Deref"
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 17,
+        "col_start": 4,
+        "line_end": 17,
+        "col_end": 10
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Sub",
+         {
+          "Copy": {
+           "local": 3,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            2,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 17,
+        "col_start": 4,
+        "line_end": 17,
+        "col_end": 14
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 4,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Sub"
+      },
+      "target": 2,
+      "span": {
+       "file": "tests/data/deref_store_reload.rs",
+       "line_start": 17,
+       "col_start": 4,
+       "line_end": 17,
+       "col_end": 14
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Move": {
+          "local": 4,
+          "projections": [
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "tests/data/deref_store_reload.rs",
+        "line_start": 17,
+        "col_start": 4,
+        "line_end": 17,
+        "col_end": 14
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": {
+   "Int": {
+    "width": 64,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

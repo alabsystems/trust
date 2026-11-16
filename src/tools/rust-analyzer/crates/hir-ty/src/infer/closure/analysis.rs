@@ -30,20 +30,21 @@
 //! then mean that all later passes would have to check for these figments
 //! and report an error, and it just seems like more mess in the end.)
 
-use std::{iter, mem};
+use std::{cmp, iter, mem};
 
 use hir_def::{
     expr_store::ExpressionStore,
     hir::{
-        BindingAnnotation, BindingId, CaptureBy, CoroutineSource, Expr, ExprId, ExprOrPatId, Pat,
-        PatId, Statement,
+        BindingAnnotation, BindingId, CaptureBy, CoroutineSource, Expr, ExprId, ExprOrPatIdPacked,
+        Pat, PatId, Statement,
     },
     resolver::ValueNs,
+    upvars::{Upvars, UpvarsRef},
 };
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     BoundVar, ClosureKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
@@ -53,7 +54,7 @@ use span::Edition;
 use tracing::{debug, instrument};
 
 use crate::{
-    Span,
+    Span, ThinFxHashMap,
     infer::{
         CaptureInfo, CaptureSourceStack, CapturedPlace, InferenceContext, UpvarCapture,
         closure::analysis::expr_use_visitor::{
@@ -65,7 +66,6 @@ use crate::{
         Binder, BoundRegion, BoundRegionKind, DbInterner, GenericArgs, Region, Ty, TyKind,
         abi::Safety, infer::traits::ObligationCause, normalize,
     },
-    upvars::{Upvars, UpvarsRef},
 };
 
 pub(crate) mod expr_use_visitor;
@@ -88,7 +88,7 @@ impl<'db> UpvarArgs<'db> {
     }
 }
 
-#[derive(Eq, Clone, PartialEq, Debug, Copy, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
     Immutable,
@@ -194,10 +194,9 @@ enum PlaceAncestryRelation {
 /// analysis pass.
 type InferredCaptureInformation = Vec<(Place, CaptureInfo)>;
 
-impl<'a, 'db> InferenceContext<'a, 'db> {
+impl<'db> InferenceContext<'db> {
     pub(crate) fn closure_analyze(&mut self) {
-        let upvars = crate::upvars::upvars_mentioned(self.db, self.store_owner)
-            .unwrap_or(const { &FxHashMap::with_hasher(FxBuildHasher) });
+        let upvars = hir_def::upvars::upvars_mentioned(self.db, self.store_owner);
         for root_expr in self.store.expr_roots() {
             self.analyze_closures_in_expr(root_expr, upvars);
         }
@@ -206,7 +205,11 @@ impl<'a, 'db> InferenceContext<'a, 'db> {
         assert!(self.deferred_call_resolutions.is_empty());
     }
 
-    fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db FxHashMap<ExprId, Upvars>) {
+    fn analyze_closures_in_expr(
+        &mut self,
+        expr: ExprId,
+        upvars: &'db ThinFxHashMap<ExprId, Upvars>,
+    ) {
         self.store.walk_child_exprs(expr, |expr| self.analyze_closures_in_expr(expr, upvars));
 
         match &self.store[expr] {
@@ -515,7 +518,7 @@ impl<'a, 'db> InferenceContext<'a, 'db> {
 
         let fake_reads = delegate.fake_reads;
 
-        self.result.closures_data.entry(closure_expr_id).or_default().fake_reads =
+        self.result.closures_data.get_mut(&closure_expr_id).unwrap().fake_reads =
             fake_reads.into_boxed_slice();
 
         // If we are also inferred the closure kind here,
@@ -730,8 +733,7 @@ impl<'a, 'db> InferenceContext<'a, 'db> {
             return;
         }
 
-        let mut closure_data =
-            self.result.closures_data.remove(&closure_def_id).unwrap_or_default();
+        let mut closure_data = self.result.closures_data.remove(&closure_def_id).unwrap();
         let root_var_min_capture_list = &mut closure_data.min_captures;
         let mut dedup_sources_scratch = FxHashMap::default();
 
@@ -1202,7 +1204,7 @@ impl<'db> euv::Delegate<'db> for InferBorrowKind {
         &mut self,
         place_with_id: PlaceWithOrigin,
         cause: FakeReadCause,
-        ctx: &mut InferenceContext<'_, 'db>,
+        ctx: &mut InferenceContext<'db>,
     ) {
         let PlaceBase::Upvar { .. } = place_with_id.place.base else { return };
 
@@ -1222,7 +1224,7 @@ impl<'db> euv::Delegate<'db> for InferBorrowKind {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn consume(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'_, 'db>) {
+    fn consume(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
         let PlaceBase::Upvar { closure: upvar_closure, .. } = place_with_id.place.base else {
             return;
         };
@@ -1237,7 +1239,7 @@ impl<'db> euv::Delegate<'db> for InferBorrowKind {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'_, 'db>) {
+    fn use_cloned(&mut self, place_with_id: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
         let PlaceBase::Upvar { closure: upvar_closure, .. } = place_with_id.place.base else {
             return;
         };
@@ -1256,7 +1258,7 @@ impl<'db> euv::Delegate<'db> for InferBorrowKind {
         &mut self,
         place_with_id: PlaceWithOrigin,
         bk: BorrowKind,
-        ctx: &mut InferenceContext<'_, 'db>,
+        ctx: &mut InferenceContext<'db>,
     ) {
         let PlaceBase::Upvar { closure: upvar_closure, .. } = place_with_id.place.base else {
             return;
@@ -1284,21 +1286,21 @@ impl<'db> euv::Delegate<'db> for InferBorrowKind {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn mutate(&mut self, assignee_place: PlaceWithOrigin, ctx: &mut InferenceContext<'_, 'db>) {
+    fn mutate(&mut self, assignee_place: PlaceWithOrigin, ctx: &mut InferenceContext<'db>) {
         self.borrow(assignee_place, BorrowKind::Mutable, ctx);
     }
 }
 
 /// Rust doesn't permit moving fields out of a type that implements drop
 #[instrument(skip(fcx), ret, level = "debug")]
-fn restrict_precision_for_drop_types<'a, 'db>(
-    fcx: &mut InferenceContext<'a, 'db>,
+fn restrict_precision_for_drop_types<'db>(
+    fcx: &mut InferenceContext<'db>,
     mut place: Place,
     capture_info: &mut CaptureInfo,
 ) -> Place {
-    let is_copy_type = fcx.infcx().type_is_copy_modulo_regions(fcx.table.param_env, place.ty());
-
-    if let (false, UpvarCapture::ByValue) = (is_copy_type, capture_info.capture_kind) {
+    if capture_info.capture_kind == UpvarCapture::ByValue
+        && !fcx.infcx().type_is_copy_modulo_regions(fcx.table.param_env, place.ty())
+    {
         for i in 0..place.projections.len() {
             match place.ty_before_projection(i).kind() {
                 TyKind::Adt(def, _) if def.destructor(fcx.interner()).is_some() => {
@@ -1408,60 +1410,19 @@ fn adjust_for_non_move_closure(mut place: Place, capture_info: &mut CaptureInfo)
 
 /// At the end, `capture_info_a` will contain the selected info.
 fn determine_capture_info(capture_info_a: &mut CaptureInfo, capture_info_b: &mut CaptureInfo) {
-    // If the capture kind is equivalent then, we don't need to escalate and can compare the
-    // expressions.
-    let eq_capture_kind = match (capture_info_a.capture_kind, capture_info_b.capture_kind) {
-        (UpvarCapture::ByValue, UpvarCapture::ByValue) => true,
-        (UpvarCapture::ByUse, UpvarCapture::ByUse) => true,
-        (UpvarCapture::ByRef(ref_a), UpvarCapture::ByRef(ref_b)) => ref_a == ref_b,
-        (UpvarCapture::ByValue, _) | (UpvarCapture::ByUse, _) | (UpvarCapture::ByRef(_), _) => {
-            false
-        }
-    };
-
-    let swap = if eq_capture_kind {
-        false
-    } else {
-        // We select the CaptureKind which ranks higher based the following priority order:
-        // (ByUse | ByValue) > MutBorrow > UniqueImmBorrow > ImmBorrow
-        match (capture_info_a.capture_kind, capture_info_b.capture_kind) {
-            (UpvarCapture::ByUse, UpvarCapture::ByValue)
-            | (UpvarCapture::ByValue, UpvarCapture::ByUse) => {
-                panic!("Same capture can't be ByUse and ByValue at the same time")
-            }
-            (UpvarCapture::ByValue, UpvarCapture::ByValue)
-            | (UpvarCapture::ByUse, UpvarCapture::ByUse)
-            | (UpvarCapture::ByValue | UpvarCapture::ByUse, UpvarCapture::ByRef(_)) => false,
-            (UpvarCapture::ByRef(_), UpvarCapture::ByValue | UpvarCapture::ByUse) => true,
-            (UpvarCapture::ByRef(ref_a), UpvarCapture::ByRef(ref_b)) => {
-                match (ref_a, ref_b) {
-                    // Take LHS:
-                    (BorrowKind::UniqueImmutable | BorrowKind::Mutable, BorrowKind::Immutable)
-                    | (BorrowKind::Mutable, BorrowKind::UniqueImmutable) => false,
-
-                    // Take RHS:
-                    (BorrowKind::Immutable, BorrowKind::UniqueImmutable | BorrowKind::Mutable)
-                    | (BorrowKind::UniqueImmutable, BorrowKind::Mutable) => true,
-
-                    (BorrowKind::Immutable, BorrowKind::Immutable)
-                    | (BorrowKind::UniqueImmutable, BorrowKind::UniqueImmutable)
-                    | (BorrowKind::Mutable, BorrowKind::Mutable) => {
-                        panic!("Expected unequal capture kinds");
-                    }
-                }
-            }
-        }
-    };
-
-    if swap {
-        mem::swap(capture_info_a, capture_info_b);
+    // We select the CaptureKind which ranks higher based the following priority order:
+    // (ByUse | ByValue) > MutBorrow > UniqueImmBorrow > ImmBorrow
+    match capture_info_a.capture_kind.partial_cmp(&capture_info_b.capture_kind) {
+        Some(cmp::Ordering::Equal) | Some(cmp::Ordering::Greater) => {}
+        Some(cmp::Ordering::Less) => mem::swap(capture_info_a, capture_info_b),
+        None => panic!("Same capture can't be ByUse and ByValue at the same time"),
     }
 }
 
 fn determine_capture_sources(
     capture_info_a: &mut CaptureInfo,
     capture_info_b: &mut CaptureInfo,
-    dedup_sources_scratch: &mut FxHashMap<ExprOrPatId, CaptureSourceStack>,
+    dedup_sources_scratch: &mut FxHashMap<ExprOrPatIdPacked, CaptureSourceStack>,
 ) -> SmallVec<[CaptureSourceStack; 2]> {
     dedup_sources_scratch.clear();
     dedup_sources_scratch.extend(

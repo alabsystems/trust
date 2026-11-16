@@ -612,9 +612,17 @@ impl X86_64Semantics {
     // JMP: unconditional branch
     // -----------------------------------------------------------------------
 
-    fn sem_jmp(&self, _state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
-        let target = branch_target(insn)?;
-        Ok(vec![Effect::Branch { target: target.clone() }, Effect::PcUpdate { value: target }])
+    fn sem_jmp(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
+        // A jump-table dispatch ends in `JMP r64` (`jmp rax`), so an indirect
+        // target resolves exactly as CALL's does.
+        let (target, target_read) =
+            direct_or_rm64_target(state, insn, "JMP requires direct or r/m64 target")?;
+        let mut effects: Vec<Effect> = target_read.into_iter().collect();
+        effects.extend([
+            Effect::Branch { target: target.clone() },
+            Effect::PcUpdate { value: target },
+        ]);
+        Ok(effects)
     }
 
     // -----------------------------------------------------------------------
@@ -668,7 +676,8 @@ impl X86_64Semantics {
     // -----------------------------------------------------------------------
 
     fn sem_call(&self, state: &MachineState, insn: &Instruction) -> Result<Vec<Effect>, SemError> {
-        let (target, target_read) = call_target(state, insn)?;
+        let (target, target_read) =
+            direct_or_rm64_target(state, insn, "CALL requires direct or r/m64 target")?;
         let return_addr = Formula::BvAdd(
             Box::new(state.pc.clone()),
             Box::new(Formula::BitVec { value: i128::from(insn.size), width: 64 }),
@@ -1497,22 +1506,12 @@ fn pc_advance(state: &MachineState, insn: &Instruction) -> Effect {
     }
 }
 
-/// Extract a branch target address as a Formula from the instruction.
+/// Extract a direct (PC-relative) branch target. Jcc has no indirect form;
+/// JMP and CALL resolve indirect targets through [`direct_or_rm64_target`].
 fn branch_target(insn: &Instruction) -> Result<Formula, SemError> {
     for op in insn.operands() {
         if let Operand::PcRelAddr(addr) = op {
             return Ok(Formula::BitVec { value: *addr as i128, width: 64 });
-        }
-    }
-    // For indirect branches (JMP r/m, CALL r/m), use the register/memory operand.
-    // Find a register or memory operand that could be the target.
-    for op in insn.operands() {
-        match op {
-            Operand::Reg(_) | Operand::Mem(_) => {
-                // Indirect branch — this needs operand resolution but we don't have
-                // state here. Return an error for now; indirect jumps need state.
-            }
-            _ => {}
         }
     }
     Err(SemError::InvalidOperand {
@@ -1522,11 +1521,13 @@ fn branch_target(insn: &Instruction) -> Result<Formula, SemError> {
     })
 }
 
-/// Extract a CALL target. Direct calls use the decoded PC-relative address;
-/// indirect calls use the 64-bit register or memory target operand.
-fn call_target(
+/// Extract a JMP or CALL target. A direct branch uses the decoded PC-relative
+/// address; an indirect one uses the 64-bit register or memory target operand
+/// (a memory target also yields the read that loads it).
+fn direct_or_rm64_target(
     state: &MachineState,
     insn: &Instruction,
+    refusal: &str,
 ) -> Result<(Formula, Option<Effect>), SemError> {
     for op in insn.operands() {
         if let Operand::PcRelAddr(addr) = op {
@@ -1549,11 +1550,9 @@ fn call_target(
             let target = load_le_bytes(state, &addr, 8, 64);
             Ok((target, Some(Effect::MemRead { address: addr, width_bytes: 8 })))
         }
-        _ => Err(SemError::InvalidOperand {
-            opcode: insn.opcode,
-            index: 0,
-            detail: "CALL requires direct or r/m64 target".into(),
-        }),
+        _ => {
+            Err(SemError::InvalidOperand { opcode: insn.opcode, index: 0, detail: refusal.into() })
+        }
     }
 }
 
@@ -2847,6 +2846,32 @@ mod tests {
 
         assert!(effects.iter().any(|e| matches!(e, Effect::MemRead { width_bytes: 8, .. })));
         assert!(effects.iter().any(|e| matches!(e, Effect::Call { .. })));
+    }
+
+    #[test]
+    fn test_jmp_indirect_reg64() {
+        // FF E0 = JMP RAX, the tail of a jump-table dispatch.
+        let insn = decode_x86_64(&[0xFF, 0xE0], 0x1000).expect("decode JMP RAX");
+        let effects = sem().effects(&state(), &insn).expect("effects");
+
+        let target = effects
+            .iter()
+            .find_map(|e| if let Effect::Branch { target } = e { Some(target) } else { None });
+        assert!(
+            matches!(target, Some(Formula::Var(name, Sort::BitVec(64))) if name == "X0"),
+            "JMP RAX should branch to the 64-bit symbolic RAX, got: {target:?}"
+        );
+        assert!(effects.iter().any(|e| matches!(e, Effect::PcUpdate { .. })));
+    }
+
+    #[test]
+    fn test_jmp_indirect_mem64_reads_target() {
+        // FF 20 = JMP QWORD PTR [RAX]
+        let insn = decode_x86_64(&[0xFF, 0x20], 0x1000).expect("decode JMP [RAX]");
+        let effects = sem().effects(&state(), &insn).expect("effects");
+
+        assert!(effects.iter().any(|e| matches!(e, Effect::MemRead { width_bytes: 8, .. })));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Branch { .. })));
     }
 
     #[test]

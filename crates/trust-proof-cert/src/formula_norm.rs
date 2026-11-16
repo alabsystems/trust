@@ -71,6 +71,7 @@ fn variant_tag(f: &Formula) -> u16 {
         Formula::Exists(..) => 91,
         Formula::Select(..) => 100,
         Formula::Store(..) => 101,
+        Formula::ConstArray { .. } => 102,
         // Catch-all for #[non_exhaustive] future variants
         _ => 999,
     }
@@ -97,7 +98,72 @@ pub(crate) fn formula_sort_key(a: &Formula, b: &Formula) -> Ordering {
             w1.cmp(w2).then_with(|| v1.cmp(v2))
         }
         (Formula::Var(n1, s1), Formula::Var(n2, s2)) => n1.cmp(n2).then_with(|| sort_cmp(s1, s2)),
-        // For compound formulas, compare children recursively
+        // The carried sorts are part of a constant array's identity: two with
+        // the same value but different sorts are different terms.
+        (
+            Formula::ConstArray { index_sort: i1, elem_sort: e1, value: v1 },
+            Formula::ConstArray { index_sort: i2, elem_sort: e2, value: v2 },
+        ) => sort_cmp(i1, i2).then_with(|| sort_cmp(e1, e2)).then_with(|| formula_sort_key(v1, v2)),
+        (Formula::And(ca), Formula::And(cb)) | (Formula::Or(ca), Formula::Or(cb)) => {
+            let len_cmp = ca.len().cmp(&cb.len());
+            if len_cmp != Ordering::Equal {
+                return len_cmp;
+            }
+            for (x, y) in ca.iter().zip(cb.iter()) {
+                let child_cmp = formula_sort_key(x, y);
+                if child_cmp != Ordering::Equal {
+                    return child_cmp;
+                }
+            }
+            Ordering::Equal
+        }
+        (Formula::Not(a1), Formula::Not(b1))
+        | (Formula::Neg(a1), Formula::Neg(b1))
+        | (Formula::BvNot(a1, _), Formula::BvNot(b1, _))
+        | (Formula::BvToInt(a1, ..), Formula::BvToInt(b1, ..))
+        | (Formula::IntToBv(a1, _), Formula::IntToBv(b1, _))
+        | (Formula::BvExtract { inner: a1, .. }, Formula::BvExtract { inner: b1, .. })
+        | (Formula::BvZeroExt(a1, _), Formula::BvZeroExt(b1, _))
+        | (Formula::BvSignExt(a1, _), Formula::BvSignExt(b1, _))
+        | (Formula::Forall(_, a1), Formula::Forall(_, b1))
+        | (Formula::Exists(_, a1), Formula::Exists(_, b1)) => formula_sort_key(a1, b1),
+        (Formula::Implies(a1, a2), Formula::Implies(b1, b2))
+        | (Formula::Eq(a1, a2), Formula::Eq(b1, b2))
+        | (Formula::Lt(a1, a2), Formula::Lt(b1, b2))
+        | (Formula::Le(a1, a2), Formula::Le(b1, b2))
+        | (Formula::Gt(a1, a2), Formula::Gt(b1, b2))
+        | (Formula::Ge(a1, a2), Formula::Ge(b1, b2))
+        | (Formula::Add(a1, a2), Formula::Add(b1, b2))
+        | (Formula::Sub(a1, a2), Formula::Sub(b1, b2))
+        | (Formula::Mul(a1, a2), Formula::Mul(b1, b2))
+        | (Formula::Div(a1, a2), Formula::Div(b1, b2))
+        | (Formula::Rem(a1, a2), Formula::Rem(b1, b2))
+        | (Formula::BvAdd(a1, a2, _), Formula::BvAdd(b1, b2, _))
+        | (Formula::BvSub(a1, a2, _), Formula::BvSub(b1, b2, _))
+        | (Formula::BvMul(a1, a2, _), Formula::BvMul(b1, b2, _))
+        | (Formula::BvUDiv(a1, a2, _), Formula::BvUDiv(b1, b2, _))
+        | (Formula::BvSDiv(a1, a2, _), Formula::BvSDiv(b1, b2, _))
+        | (Formula::BvURem(a1, a2, _), Formula::BvURem(b1, b2, _))
+        | (Formula::BvSRem(a1, a2, _), Formula::BvSRem(b1, b2, _))
+        | (Formula::BvAnd(a1, a2, _), Formula::BvAnd(b1, b2, _))
+        | (Formula::BvOr(a1, a2, _), Formula::BvOr(b1, b2, _))
+        | (Formula::BvXor(a1, a2, _), Formula::BvXor(b1, b2, _))
+        | (Formula::BvShl(a1, a2, _), Formula::BvShl(b1, b2, _))
+        | (Formula::BvLShr(a1, a2, _), Formula::BvLShr(b1, b2, _))
+        | (Formula::BvAShr(a1, a2, _), Formula::BvAShr(b1, b2, _))
+        | (Formula::BvULt(a1, a2, _), Formula::BvULt(b1, b2, _))
+        | (Formula::BvULe(a1, a2, _), Formula::BvULe(b1, b2, _))
+        | (Formula::BvSLt(a1, a2, _), Formula::BvSLt(b1, b2, _))
+        | (Formula::BvSLe(a1, a2, _), Formula::BvSLe(b1, b2, _))
+        | (Formula::BvConcat(a1, a2), Formula::BvConcat(b1, b2))
+        | (Formula::Select(a1, a2), Formula::Select(b1, b2)) => {
+            formula_sort_key(a1, b1).then_with(|| formula_sort_key(a2, b2))
+        }
+        (Formula::Ite(a1, a2, a3), Formula::Ite(b1, b2, b3))
+        | (Formula::Store(a1, a2, a3), Formula::Store(b1, b2, b3)) => formula_sort_key(a1, b1)
+            .then_with(|| formula_sort_key(a2, b2))
+            .then_with(|| formula_sort_key(a3, b3)),
+        // For remaining compound formulas, compare children recursively
         _ => {
             let ca = a.children();
             let cb = b.children();
@@ -318,18 +384,22 @@ fn simplify(f: Formula) -> Formula {
 
 /// Flatten and simplify And.
 fn simplify_and(terms: Vec<Formula>) -> Formula {
-    let mut flat = Vec::new();
+    let mut flat = Vec::with_capacity(terms.len());
     for t in terms {
         match t {
-            Formula::And(inner) => flat.extend(inner),
+            Formula::Bool(false) => return Formula::Bool(false),
             Formula::Bool(true) => {} // identity: skip
+            Formula::And(inner) => {
+                for sub in inner {
+                    match sub {
+                        Formula::Bool(false) => return Formula::Bool(false),
+                        Formula::Bool(true) => {}
+                        other => flat.push(other),
+                    }
+                }
+            }
             f => flat.push(f),
         }
-    }
-
-    // Short-circuit: if any is false, result is false
-    if flat.iter().any(|t| matches!(t, Formula::Bool(false))) {
-        return Formula::Bool(false);
     }
 
     match flat.len() {
@@ -344,18 +414,22 @@ fn simplify_and(terms: Vec<Formula>) -> Formula {
 
 /// Flatten and simplify Or.
 fn simplify_or(terms: Vec<Formula>) -> Formula {
-    let mut flat = Vec::new();
+    let mut flat = Vec::with_capacity(terms.len());
     for t in terms {
         match t {
-            Formula::Or(inner) => flat.extend(inner),
+            Formula::Bool(true) => return Formula::Bool(true),
             Formula::Bool(false) => {} // identity: skip
+            Formula::Or(inner) => {
+                for sub in inner {
+                    match sub {
+                        Formula::Bool(true) => return Formula::Bool(true),
+                        Formula::Bool(false) => {}
+                        other => flat.push(other),
+                    }
+                }
+            }
             f => flat.push(f),
         }
-    }
-
-    // Short-circuit: if any is true, result is true
-    if flat.iter().any(|t| matches!(t, Formula::Bool(true))) {
-        return Formula::Bool(true);
     }
 
     match flat.len() {
@@ -401,7 +475,15 @@ pub fn formula_subsumes(stronger: &Formula, weaker: &Formula) -> bool {
     formula_subsumes_normalized(&stronger, &weaker)
 }
 
-fn formula_subsumes_normalized(stronger: &Formula, weaker: &Formula) -> bool {
+pub(crate) fn negate_normalized(norm: &Formula) -> Formula {
+    if let Formula::Not(inner) = norm {
+        (**inner).clone()
+    } else {
+        Formula::Not(Box::new(norm.clone()))
+    }
+}
+
+pub(crate) fn formula_subsumes_normalized(stronger: &Formula, weaker: &Formula) -> bool {
     if stronger == weaker
         || matches!(stronger, Formula::Bool(true) | Formula::Bool(false))
         || matches!(weaker, Formula::Bool(true))

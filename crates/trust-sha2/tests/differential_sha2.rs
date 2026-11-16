@@ -55,10 +55,16 @@ fn hex(bytes: &[u8]) -> String {
 
 /// One-shot agreement for all four widths at a single input.
 fn assert_one_shot_agrees(data: &[u8], label: &str) {
+    let expected = sha2::Sha256::digest(data);
     assert_eq!(
         hex(trust_sha2::Sha256::digest(data).as_ref()),
-        hex(&sha2::Sha256::digest(data)),
+        hex(&expected),
         "SHA-256 differs from the incumbent ({label})"
+    );
+    assert_eq!(
+        hex(trust_sha2::NativeSha256::digest(data).as_ref()),
+        hex(&expected),
+        "native SHA-256 differs from the incumbent ({label})"
     );
     assert_eq!(
         hex(trust_sha2::Sha512::digest(data).as_ref()),
@@ -132,21 +138,30 @@ fn randomized_chunkings_agree() {
         splits.sort_unstable();
 
         let mut ours = trust_sha2::Sha256::new();
+        let mut native = trust_sha2::NativeSha256::new();
         let mut theirs = sha2::Sha256::new();
         let mut position = 0;
         for &split in &splits {
             if split > position {
                 ours.update(&data[position..split]);
+                native.update(&data[position..split]);
                 theirs.update(&data[position..split]);
                 position = split;
             }
         }
         ours.update(&data[position..]);
+        native.update(&data[position..]);
         theirs.update(&data[position..]);
+        let expected = theirs.finalize();
         assert_eq!(
             hex(ours.finalize().as_ref()),
-            hex(&theirs.finalize()),
+            hex(&expected),
             "SHA-256 incremental differs: length {length}, splits {splits:?}"
+        );
+        assert_eq!(
+            hex(native.finalize().as_ref()),
+            hex(&expected),
+            "native SHA-256 incremental differs: length {length}, splits {splits:?}"
         );
 
         let mut ours = trust_sha2::Sha512::new();
@@ -203,7 +218,8 @@ fn lower_hex_rendering_matches_the_incumbent() {
 /// implementations. Not a shape test — a *value* test on the shapes.
 #[test]
 fn measured_call_shapes_agree() {
-    // trust_buildcache::key::hash_bytes — 8-byte length framing, BY VALUE.
+    // trust_buildcache::key::hash_bytes (deleted by T11) — 8-byte length
+    // framing, BY VALUE.
     let label: &[u8] = b"rustc_version";
     let value: &[u8] = b"1.99.0-dev";
 
@@ -232,7 +248,8 @@ fn measured_call_shapes_agree() {
     }
     assert_eq!(hex(ours.finalize().as_ref()), hex(&theirs.finalize()));
 
-    // trust_cache::integrity::compute_cache_key — b"\x00" separators.
+    // trust_cache::integrity::compute_cache_key (deleted by T11) — b"\x00"
+    // separators.
     let mut ours = trust_sha2::Sha256::new();
     ours.update("exe-hash".as_bytes());
     ours.update(b"\x00");

@@ -37,7 +37,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-REP8_BYTES = [0x05, 0x18, 0x1B, 0x20, 0x30, 0x3B, 0x40, 0x9B]  # C0,CAN,ESC,inter,digit,semi,final,C1CSI
+# C0, CAN, ESC, intermediate, digit, semicolon, final, C1 CSI
+REP8_BYTES = [0x05, 0x18, 0x1B, 0x20, 0x30, 0x3B, 0x40, 0x9B]
 N_ACT = 17  # ActionType variant count (None=0..ApcEnd=16); pair encode = ns*17+act
 
 DUMP_TEST = r'''
@@ -48,8 +49,10 @@ use std::fs;
 fn _spec_drift_dump() {
     let (mut ns, mut act) = (String::new(), String::new());
     for s in 0..14usize {
-        let nr: Vec<String> = (0..256).map(|b| (TRANSITIONS[s][b].next_state as u8).to_string()).collect();
-        let ar: Vec<String> = (0..256).map(|b| (TRANSITIONS[s][b].action as u8).to_string()).collect();
+        let nr: Vec<String> =
+            (0..256).map(|b| (TRANSITIONS[s][b].next_state as u8).to_string()).collect();
+        let ar: Vec<String> =
+            (0..256).map(|b| (TRANSITIONS[s][b].action as u8).to_string()).collect();
         let _ = writeln!(ns, "{}", nr.join(" "));
         let _ = writeln!(act, "{}", ar.join(" "));
     }
@@ -68,7 +71,9 @@ def dump_live_table(aterm_dir: Path):
     try:
         env = dict(os.environ, SPEC_DRIFT_NS=str(ns_path), SPEC_DRIFT_ACT=str(act_path))
         subprocess.run(
-            ["cargo", "test", "-p", "aterm-parser", "--test", "_spec_drift_dump", "--", "--nocapture"],
+            # Trust toolchain, never stock cargo (CLAUDE.md "Build").
+            ["targo", "--unverified", "test", "-p", "aterm-parser", "--test", "_spec_drift_dump",
+             "--", "--nocapture"],
             cwd=aterm_dir, env=env, check=True, capture_output=True,
         )
     finally:
@@ -96,14 +101,14 @@ ORACLE_MODULES = [
 def run_oracle(aterm_dir: Path):
     """Run aterm's conformance suite. Returns (ok, summary_line)."""
     proc = subprocess.run(
-        ["cargo", "test", "-p", "aterm-parser", "--lib", "--"] + ORACLE_MODULES,
+        ["targo", "--unverified", "test", "-p", "aterm-parser", "--lib", "--"] + ORACLE_MODULES,
         cwd=aterm_dir, capture_output=True, text=True,
     )
     out = proc.stdout + proc.stderr
     m = re.search(r"test result:\s*(ok|FAILED)\.\s*(\d+)\s+passed;\s*(\d+)\s+failed", out)
     if proc.returncode == 0 and m and m.group(1) == "ok" and m.group(3) == "0":
         return True, f"{m.group(2)} passed; 0 failed"
-    return False, (m.group(0) if m else f"cargo exited {proc.returncode}")
+    return False, (m.group(0) if m else f"targo exited {proc.returncode}")
 
 
 def partition(columns):
@@ -122,13 +127,19 @@ def expected(ns, act):
     # 19-class next-state partition
     cols = [tuple(ns[s][b] for s in range(14)) for b in range(256)]
     distinct, classify = partition(cols)
-    out["full_aterm_class_matrix"] = [[distinct[k][s] for k in range(len(distinct))] for s in range(14)]
+    out["full_aterm_class_matrix"] = [
+        [distinct[k][s] for k in range(len(distinct))] for s in range(14)
+    ]
     out["aterm_byte_classifier_row"] = [classify]
     # 23-class (next_state,action) pair partition (encoded ns*17+act)
     pcols = [tuple(ns[s][b] * N_ACT + act[s][b] for s in range(14)) for b in range(256)]
     pdist, pclassify = partition(pcols)
-    out["pair_nextstate_matrix"] = [[pdist[k][s] // N_ACT for k in range(len(pdist))] for s in range(14)]
-    out["pair_action_matrix"] = [[pdist[k][s] % N_ACT for k in range(len(pdist))] for s in range(14)]
+    out["pair_nextstate_matrix"] = [
+        [pdist[k][s] // N_ACT for k in range(len(pdist))] for s in range(14)
+    ]
+    out["pair_action_matrix"] = [
+        [pdist[k][s] % N_ACT for k in range(len(pdist))] for s in range(14)
+    ]
     out["aterm_pair_classifier_row"] = [pclassify]
     return out
 
@@ -216,7 +227,8 @@ def main():
             print("OK: trust-cg-bridge `byte_classifier` matches the proven classifier")
 
     if ok:
-        print("\nRung 2 PASS: every committed spec literal matches the live aterm_parser::TRANSITIONS.")
+        print("\nRung 2 PASS: every committed spec literal matches the live "
+              "aterm_parser::TRANSITIONS.")
     else:
         print("\nRung 2 FAIL: spec drifted from the live artifact (see above).", file=sys.stderr)
 

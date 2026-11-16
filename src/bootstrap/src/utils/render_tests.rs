@@ -6,30 +6,48 @@
 //! and rustc) libtest doesn't include the rendered human-readable output as a JSON field. We had
 //! to reimplement all the rendering logic in this module because of that.
 
-use std::fs::File;
+use std::collections::HashSet;
+use std::env;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::ChildStdout;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use termcolor::{Color, ColorSpec, WriteColor};
 
 use crate::core::build_steps::test::failed_tests::RecordFailedTests;
 use crate::core::builder::Builder;
-use crate::utils::exec::BootstrapCommand;
+use crate::utils::exec::{BootstrapCommand, CommandReader};
+use crate::utils::helpers;
 
 const TERSE_TESTS_PER_LINE: usize = 88;
+// Trust: keep compiletest's structured case evidence separate from rendered output.
+const CASE_EVENT_SCHEMA: &str = "trust.compiletest.case-events/v1";
+static NEXT_CASE_STREAM: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn add_flags_and_try_run_tests(
     builder: &Builder<'_>,
     cmd: &mut BootstrapCommand,
     record_failed_tests: RecordFailedTests,
 ) -> bool {
+    add_flags_and_try_run_tests_with_postcheck(builder, cmd, record_failed_tests, || Ok(()))
+}
+
+// Trust: retained test inputs must be checked even when a test failed and the
+// ordinary failure policy will exit immediately afterward.
+pub(crate) fn add_flags_and_try_run_tests_with_postcheck(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+    record_failed_tests: RecordFailedTests,
+    postcheck: impl FnOnce() -> Result<(), String>,
+) -> bool {
     if !cmd.get_args().any(|arg| arg == "--") {
         cmd.arg("--");
     }
     cmd.args(["-Z", "unstable-options", "--format", "json"]);
 
-    try_run_tests(builder, cmd, false, record_failed_tests)
+    try_run_tests_with_postcheck(builder, cmd, false, record_failed_tests, postcheck)
 }
 
 pub(crate) fn try_run_tests(
@@ -38,15 +56,45 @@ pub(crate) fn try_run_tests(
     stream: bool,
     record_failed_tests: RecordFailedTests,
 ) -> bool {
-    if run_tests(builder, cmd, stream, record_failed_tests) {
+    try_run_tests_with_postcheck(builder, cmd, stream, record_failed_tests, || Ok(()))
+}
+
+fn completed_test_and_postcheck(
+    run: impl FnOnce() -> bool,
+    postcheck: impl FnOnce() -> Result<(), String>,
+) -> (bool, Option<String>) {
+    let tests_passed = run();
+    let input_error = postcheck().err();
+    (tests_passed && input_error.is_none(), input_error)
+}
+
+fn try_run_tests_with_postcheck(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+    stream: bool,
+    record_failed_tests: RecordFailedTests,
+    postcheck: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    let (passed, input_error) = completed_test_and_postcheck(
+        || run_tests(builder, cmd, stream, record_failed_tests),
+        postcheck,
+    );
+    if let Some(error) = &input_error {
+        eprintln!("test input validation failed: {error}");
+    }
+    if passed {
         return true;
     }
 
     if builder.fail_fast {
-        crate::exit!(1);
+        helpers::exit_process(1);
     }
 
-    builder.config.exec_ctx().add_to_delay_failure(format!("{cmd:?}"));
+    let message = match input_error {
+        Some(error) => format!("{cmd:?}; input error: {error}"),
+        None => format!("{cmd:?}"),
+    };
+    builder.config.exec_ctx().add_to_delay_failure(message);
 
     false
 }
@@ -63,15 +111,24 @@ fn run_tests(
         return true;
     };
 
+    let (case_events, sidecar_error) = match CaseEventForwarder::for_command(cmd) {
+        Ok(events) => (events, None),
+        Err(error) => (None, Some(error)),
+    };
     // This runs until the stdout of the child is closed, which means the child exited. We don't
     // run this on another thread since the builder is not Sync.
-    let renderer =
-        Renderer::new(streaming_command.stdout.take().unwrap(), builder, record_failed_tests);
-    if stream {
+    let renderer = Renderer::new(
+        streaming_command.stdout.take().unwrap(),
+        builder,
+        record_failed_tests,
+        case_events,
+    );
+    let render_result = if stream {
         renderer.stream_all();
+        validate_raw_stream_mode(cmd)
     } else {
-        renderer.render_all();
-    }
+        renderer.render_all()
+    };
 
     let status = streaming_command.wait(&builder.config.exec_ctx).unwrap();
     if !status.success() && builder.is_verbose() {
@@ -81,11 +138,225 @@ fn run_tests(
         );
     }
 
+    if let Some(error) = sidecar_error.or_else(|| render_result.err()) {
+        eprintln!("compiletest case event sidecar failed: {error}");
+        return false;
+    }
+
     status.success()
 }
 
+// Trust: raw streaming must not bypass compiletest's structured case-event checks.
+fn is_compiletest_command(cmd: &BootstrapCommand) -> bool {
+    cmd.get_args().any(|arg| arg == "--suite")
+}
+
+fn validate_raw_stream_mode(cmd: &BootstrapCommand) -> Result<(), String> {
+    if is_compiletest_command(cmd) {
+        Err("compiletest --suite cannot bypass structured case event validation".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+// Trust: the proof runner supplies this directory; each invocation gets its own JSONL stream.
+struct CaseEventForwarder<W: Write> {
+    writer: W,
+    selected: Option<usize>,
+    started: HashSet<String>,
+    terminal: HashSet<String>,
+    passed: usize,
+    failed: usize,
+    ignored: usize,
+    saw_suite_end: bool,
+    error: Option<String>,
+}
+
+impl CaseEventForwarder<File> {
+    fn for_command(cmd: &BootstrapCommand) -> Result<Option<Self>, String> {
+        let Some(proof_dir) = env::var_os("TRUST_UPSTREAM_RUST_PROOF_DIR") else {
+            return Ok(None);
+        };
+        if !is_compiletest_command(cmd) {
+            return Ok(None);
+        }
+
+        let args = cmd
+            .get_args()
+            .map(|arg| {
+                arg.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "non-UTF-8 compiletest argument".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let proof_dir = PathBuf::from(proof_dir);
+        Self::create(&proof_dir, args).map(Some)
+    }
+
+    fn create(proof_dir: &Path, args: Vec<String>) -> Result<Self, String> {
+        let mut file = loop {
+            let serial = NEXT_CASE_STREAM.fetch_add(1, Ordering::Relaxed);
+            let path =
+                proof_dir.join(format!("compiletest-events-{}-{serial}.jsonl", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
+            }
+        };
+        let header = serde_json::json!({
+            "schema": CASE_EVENT_SCHEMA,
+            "type": "invocation",
+            "argv": args,
+        });
+        writeln!(file, "{header}").map_err(|error| format!("cannot write sidecar: {error}"))?;
+        Ok(Self::new(file))
+    }
+}
+
+impl<W: Write> CaseEventForwarder<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            selected: None,
+            started: HashSet::new(),
+            terminal: HashSet::new(),
+            passed: 0,
+            failed: 0,
+            ignored: 0,
+            saw_suite_end: false,
+            error: None,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.selected.is_some()
+    }
+
+    fn reject(&mut self, reason: &str) {
+        if self.error.is_none() {
+            self.error = Some(reason.to_owned());
+        }
+    }
+
+    fn forward_parsed(&mut self, line: &[u8], is_case_event: bool, message: &Message) {
+        if is_case_event {
+            self.record(line, message);
+        } else {
+            self.reject("untagged or unknown compiletest event");
+        }
+    }
+
+    fn record(&mut self, line: &[u8], message: &Message) {
+        if let Err(error) = self.writer.write_all(line) {
+            self.reject(&format!("cannot write case event: {error}"));
+        }
+        match message {
+            Message::Suite(SuiteMessage::Started { test_count, selected_count }) => {
+                if self.selected.replace(*test_count).is_some() {
+                    self.reject("duplicate compiletest suite start");
+                }
+                if *test_count == 0 || *selected_count != Some(*test_count) {
+                    self.reject("empty or inconsistent compiletest selection");
+                }
+            }
+            Message::Test(TestMessage::Started { name }) => {
+                if let Some(name) = name {
+                    if self.selected.is_none() || self.saw_suite_end {
+                        self.reject("test start outside compiletest suite");
+                    }
+                    if !self.started.insert(name.clone()) {
+                        self.reject("duplicate selected test identity");
+                    }
+                } else {
+                    self.reject("test start missing identity");
+                }
+            }
+            Message::Test(TestMessage::Ok(outcome)) => {
+                self.passed += 1;
+                self.record_terminal(&outcome.name);
+            }
+            Message::Test(TestMessage::Failed(outcome)) => {
+                self.failed += 1;
+                self.record_terminal(&outcome.name);
+            }
+            Message::Test(TestMessage::Ignored(outcome)) => {
+                self.ignored += 1;
+                self.record_terminal(&outcome.name);
+            }
+            Message::Test(TestMessage::Timeout { name }) => {
+                if !self.started.contains(name) || self.saw_suite_end {
+                    self.reject("timeout outside started test");
+                }
+            }
+            Message::Suite(SuiteMessage::Ok(outcome)) => self.record_suite_end(outcome, true),
+            Message::Suite(SuiteMessage::Failed(outcome)) => {
+                self.record_suite_end(outcome, false);
+            }
+            Message::Bench(_) | Message::Report(_) => {
+                self.reject("unexpected compiletest case event");
+            }
+        }
+    }
+
+    fn record_terminal(&mut self, name: &str) {
+        if self.selected.is_none() || self.saw_suite_end || !self.started.contains(name) {
+            self.reject("terminal event outside started test");
+        }
+        if !self.terminal.insert(name.to_owned()) {
+            self.reject("duplicate terminal event");
+        }
+    }
+
+    fn record_suite_end(&mut self, outcome: &SuiteOutcome, event_ok: bool) {
+        if self.saw_suite_end || self.selected.is_none() {
+            self.reject("suite end without unique start");
+        }
+        self.saw_suite_end = true;
+        let selected = self.selected.unwrap_or(0);
+        let executed = self.passed + self.failed;
+        let terminal = executed + self.ignored;
+        if outcome.selected_count != Some(selected)
+            || outcome.executed_count != Some(executed)
+            || outcome.terminal_count != Some(terminal)
+            || outcome.passed != self.passed
+            || outcome.failed != self.failed
+            || outcome.ignored != self.ignored
+            || outcome.protocol_valid != Some(true)
+            || selected == 0
+            || self.started.len() != selected
+            || self.terminal.len() != selected
+            || terminal != selected
+            || event_ok != (self.failed == 0)
+        {
+            self.reject("inconsistent or incomplete compiletest suite");
+        }
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        if self.selected.is_none() || !self.saw_suite_end {
+            self.reject("missing complete compiletest case stream");
+        }
+        if let Err(error) = self.writer.flush() {
+            self.reject(&format!("cannot flush case events: {error}"));
+        }
+        self.error.map_or(Ok(()), Err)
+    }
+
+    // Trust: a reused native execution success requires real, successful cases.
+    // The ordinary sidecar still faithfully records failed and ignored suites.
+    fn finish_executed(self) -> Result<(), String> {
+        if self.passed == 0 || self.failed != 0 || self.ignored != 0 {
+            return Err(
+                "native repository UI selection did not execute every case successfully".into()
+            );
+        }
+        self.finish()
+    }
+}
+
 struct Renderer<'a> {
-    stdout: BufReader<ChildStdout>,
+    stdout: BufReader<CommandReader>,
     failures: Vec<TestOutcome>,
     benches: Vec<BenchOutcome>,
     builder: &'a Builder<'a>,
@@ -99,13 +370,17 @@ struct Renderer<'a> {
     ci_latest_logged_percentage: f64,
 
     failed_tests: Option<File>,
+    case_events: Option<CaseEventForwarder<File>>,
+    // Trust: validate native workflow cases in memory, without another report artifact.
+    native_cases: Option<CaseEventForwarder<std::io::Sink>>,
 }
 
 impl<'a> Renderer<'a> {
     fn new(
-        stdout: ChildStdout,
+        stdout: CommandReader,
         builder: &'a Builder<'a>,
         record_failed_tests: RecordFailedTests,
+        case_events: Option<CaseEventForwarder<File>>,
     ) -> Self {
         let failed_tests = record_failed_tests.path().and_then(|path| {
             // create the file (overwriting any previous) to get ready to record new failed tests
@@ -133,10 +408,16 @@ impl<'a> Renderer<'a> {
             terse_tests_in_line: 0,
             ci_latest_logged_percentage: 0.0,
             failed_tests,
+            case_events,
+            native_cases: builder
+                .config
+                .cmd
+                .trust_repo_check()
+                .then(|| CaseEventForwarder::new(std::io::sink())),
         }
     }
 
-    fn render_all(mut self) {
+    fn render_all(mut self) -> Result<(), String> {
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -149,10 +430,51 @@ impl<'a> Renderer<'a> {
                 break;
             }
 
-            match serde_json::from_slice(&line) {
-                Ok(parsed) => self.render_message(parsed),
+            match serde_json::from_slice::<serde_json::Value>(&line) {
+                Ok(value) => {
+                    let schema = value.get("schema").and_then(serde_json::Value::as_str);
+                    let is_case_event = schema == Some(CASE_EVENT_SCHEMA);
+                    let unknown_case_event =
+                        schema.is_some_and(|s| s.starts_with("trust.compiletest."));
+                    match serde_json::from_value::<Message>(value) {
+                        Ok(parsed) => {
+                            if let Some(events) = &mut self.case_events {
+                                events.forward_parsed(&line, is_case_event, &parsed);
+                            }
+                            if let Some(events) = &mut self.native_cases {
+                                events.forward_parsed(&line, is_case_event, &parsed);
+                            }
+                            self.render_message(parsed);
+                        }
+                        Err(_) => {
+                            if let Some(events) = &mut self.case_events
+                                && (unknown_case_event || events.active())
+                            {
+                                events.reject("invalid compiletest event JSON");
+                            }
+                            if let Some(events) = &mut self.native_cases
+                                && (unknown_case_event || events.active())
+                            {
+                                events.reject("invalid compiletest event JSON");
+                            }
+                            let mut stdout = std::io::stdout();
+                            stdout.write_all(&line).unwrap();
+                            let _ = stdout.flush();
+                        }
+                    }
+                }
                 Err(_err) => {
                     // Handle non-JSON output, for example when --nocapture is passed.
+                    if let Some(events) = &mut self.case_events
+                        && events.active()
+                    {
+                        events.reject("non-JSON output in compiletest event stream");
+                    }
+                    if let Some(events) = &mut self.native_cases
+                        && events.active()
+                    {
+                        events.reject("non-JSON output in compiletest event stream");
+                    }
                     let mut stdout = std::io::stdout();
                     stdout.write_all(&line).unwrap();
                     let _ = stdout.flush();
@@ -164,6 +486,14 @@ impl<'a> Renderer<'a> {
             let n = self.up_to_date_tests;
             let s = if n > 1 { "s" } else { "" };
             println!("help: ignored {n} up-to-date test{s}; use `--force-rerun` to prevent this\n");
+        }
+
+        if let Some(events) = self.native_cases {
+            events.finish_executed()?;
+        }
+        match self.case_events {
+            Some(events) => events.finish(),
+            None => Ok(()),
         }
     }
 
@@ -354,7 +684,7 @@ impl<'a> Renderer<'a> {
 
     fn render_message(&mut self, message: Message) {
         match message {
-            Message::Suite(SuiteMessage::Started { test_count }) => {
+            Message::Suite(SuiteMessage::Started { test_count, .. }) => {
                 println!("\nrunning {test_count} tests");
                 self.benches = vec![];
                 self.failures = vec![];
@@ -410,7 +740,7 @@ impl<'a> Renderer<'a> {
             Message::Test(TestMessage::Timeout { name }) => {
                 println!("test {name} has been running for a long time");
             }
-            Message::Test(TestMessage::Started) => {} // Not useful
+            Message::Test(TestMessage::Started { .. }) => {} // Not useful
         }
     }
 }
@@ -499,11 +829,15 @@ enum Message {
 enum SuiteMessage {
     Ok(SuiteOutcome),
     Failed(SuiteOutcome),
-    Started { test_count: usize },
+    Started { test_count: usize, selected_count: Option<usize> },
 }
 
 #[derive(serde_derive::Deserialize)]
 struct SuiteOutcome {
+    selected_count: Option<usize>,
+    executed_count: Option<usize>,
+    terminal_count: Option<usize>,
+    protocol_valid: Option<bool>,
     passed: usize,
     failed: usize,
     ignored: usize,
@@ -521,7 +855,7 @@ enum TestMessage {
     Failed(TestOutcome),
     Ignored(TestOutcome),
     Timeout { name: String },
-    Started,
+    Started { name: Option<String> },
 }
 
 #[derive(serde_derive::Deserialize)]
@@ -545,3 +879,6 @@ struct Report {
     total_time: f64,
     compilation_time: f64,
 }
+
+#[cfg(test)]
+mod tests;

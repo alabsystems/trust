@@ -6,6 +6,8 @@ use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
+use crate::PassPolicy;
+
 pub(super) struct PostAnalysisNormalize;
 
 impl<'tcx> crate::MirPass<'tcx> for PostAnalysisNormalize {
@@ -13,17 +15,21 @@ impl<'tcx> crate::MirPass<'tcx> for PostAnalysisNormalize {
         // FIXME(#132279): This is used during the phase transition from analysis
         // to runtime, so we have to manually specify the correct typing mode.
         let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
-        PostAnalysisNormalizeVisitor { tcx, typing_env }.visit_body_preserves_cfg(body);
+        let next_trait_solver_globally = tcx.next_trait_solver_globally();
+        PostAnalysisNormalizeVisitor { tcx, typing_env, next_trait_solver_globally }
+            .visit_body_preserves_cfg(body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Reveals opaque types and normalizes MIR while transitioning to the runtime dialect.
+        PassPolicy::Required
     }
 }
 
 struct PostAnalysisNormalizeVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
+    next_trait_solver_globally: bool,
 }
 
 impl<'tcx> MutVisitor<'tcx> for PostAnalysisNormalizeVisitor<'tcx> {
@@ -39,7 +45,7 @@ impl<'tcx> MutVisitor<'tcx> for PostAnalysisNormalizeVisitor<'tcx> {
         _context: PlaceContext,
         _location: Location,
     ) {
-        if !self.tcx.next_trait_solver_globally() {
+        if !self.next_trait_solver_globally {
             // `OpaqueCast` projections are only needed if there are opaque types on which projections
             // are performed. After the `PostAnalysisNormalize` pass, all opaque types are replaced with their
             // hidden types, so we don't need these projections anymore.
@@ -86,7 +92,7 @@ impl<'tcx> MutVisitor<'tcx> for PostAnalysisNormalizeVisitor<'tcx> {
     }
 
     #[inline]
-    fn visit_args(&mut self, args: &mut ty::GenericArgsRef<'tcx>, _: Location) {
+    fn visit_args(&mut self, args: &mut ty::GenericArgs<'tcx>, _: Location) {
         if let Ok(a) = self.tcx.try_normalize_erasing_regions(
             self.typing_env,
             ty::set_aliases_to_non_rigid(self.tcx, *args),

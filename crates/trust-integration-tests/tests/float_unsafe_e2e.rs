@@ -58,6 +58,7 @@ fn float_div_by_var_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -94,6 +95,7 @@ fn float_div_by_const_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -138,6 +140,7 @@ fn float_mul_overflow_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -175,6 +178,7 @@ fn int_mul_no_float_overflow_safe() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -253,6 +257,7 @@ fn ffi_malloc_call_buggy() -> VerifiableFunction {
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -265,6 +270,7 @@ fn ffi_malloc_call_buggy() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -295,6 +301,7 @@ fn safe_call_no_ffi() -> VerifiableFunction {
                         atomic: None,
                         unwind: trust_types::UnwindEdge::Unreachable,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -307,6 +314,7 @@ fn safe_call_no_ffi() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -318,7 +326,12 @@ fn safe_call_no_ffi() -> VerifiableFunction {
 
 #[test]
 fn test_detect_float_div_by_zero_variable() {
-    let ay = require_ay();
+    // STALE expectation retired by 9fac730af6f ("fix(vcgen): float division
+    // defined (§9, no obligation)"): IEEE-754 float division is total — `a / 0.0`
+    // yields ±inf or NaN and never traps or causes UB — so dividing by an
+    // unconstrained float variable mints NO FloatDivisionByZero obligation. The
+    // only row the fixture may carry is the advisory overflow-to-infinity kind,
+    // which lives at L1Functional, never at the L0 safety level.
     let func = float_div_by_var_buggy();
     let vcs = trust_vcgen::generate_vcs(&func);
 
@@ -327,26 +340,22 @@ fn test_detect_float_div_by_zero_variable() {
         eprintln!("  VC: {:?} — {}", vc.kind, vc.function);
     }
 
-    let float_divzero_vcs: Vec<_> =
-        vcs.iter().filter(|vc| matches!(vc.kind, VcKind::FloatDivisionByZero)).collect();
-
     assert!(
-        !float_divzero_vcs.is_empty(),
-        "vcgen must produce FloatDivisionByZero VC for float division by variable"
+        !vcs.iter().any(|vc| matches!(vc.kind, VcKind::FloatDivisionByZero)),
+        "float division is defined (9fac730af6f): no FloatDivisionByZero VC may be emitted: {vcs:#?}"
     );
 
-    for vc in &float_divzero_vcs {
-        let result = ay.verify(vc);
-        eprintln!("ay result for float div-by-zero: {:?}", result);
-
+    for vc in &vcs {
         assert!(
-            result.is_failed(),
-            "ay must find float variable divisor CAN be zero. Got: {result:?}"
+            matches!(vc.kind, VcKind::FloatOverflowToInfinity { op: BinOp::Div, .. }),
+            "the only row a float division may carry is FloatOverflowToInfinity(Div): {:?}",
+            vc.kind
         );
-
-        if let VerificationResult::Failed { counterexample: Some(cex), .. } = &result {
-            eprintln!("  Counterexample: {cex}");
-        }
+        assert_eq!(
+            vc.kind.proof_level(),
+            ProofLevel::L1Functional,
+            "the float overflow-to-infinity row is advisory L1Functional, not L0 safety"
+        );
     }
 }
 

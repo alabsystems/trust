@@ -1,0 +1,12 @@
+{
+  "function": "may_close_source_descriptions",
+  "fuel": 64,
+  "cases": [
+    { "arguments": [false, false], "expected": false, "permitted": false },
+    { "arguments": [false, true], "expected": true, "permitted": true },
+    { "arguments": [true, false], "expected": false, "permitted": false },
+    { "arguments": [true, true], "expected": false, "permitted": false }
+  ],
+  "mutation_from": "!handler_active && ",
+  "mutation_to": ""
+}

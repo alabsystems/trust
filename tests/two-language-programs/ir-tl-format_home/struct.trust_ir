@@ -1,0 +1,37 @@
+; TrustIr text format v1
+module "parta-lean-should-emit-data"
+
+struct @Pt { u64, u64 } id=0
+
+functy.0 = () -> ()
+
+functy.1 = (u64, u64) -> (u64)
+
+functy.2 = (struct.0, struct.0) -> (u64)
+
+functy.3 = (u64, u64, u64, u64) -> (u64)
+
+rustcc fn @dot(functy.2) {
+    ; #producer: clean
+bb0(%0: struct.0, %1: struct.0):
+    %2 = extractfield u64 %0, 0
+    %3 = extractfield u64 %1, 0
+    %4 = mul u64 %2, %3
+    %5 = extractfield u64 %0, 1
+    %6 = extractfield u64 %1, 1
+    %7 = mul u64 %5, %6
+    %8 = add u64 %4, %7
+    ret %8
+}
+
+rustcc fn @dotOf(functy.3) {
+    ; #producer: clean
+bb0(%0: u64, %1: u64, %2: u64, %3: u64):
+    %4 = const struct.0 { 0, 0 }
+    %5 = insertfield struct.0 %4, 0, %0
+    %6 = insertfield struct.0 %5, 1, %1
+    %7 = insertfield struct.0 %4, 0, %2
+    %8 = insertfield struct.0 %7, 1, %3
+    %9 = call @func.0(%6, %8)
+    ret %9
+}

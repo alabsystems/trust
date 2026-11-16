@@ -290,9 +290,9 @@ fn grounded_residual_certifies_through_the_vc_entry_point() {
 /// bytes, so this also pins the lane's determinism (the implication-pair
 /// orientation and the reading order of a var/var equality both feed it).
 ///
-/// Run with `TRUST_CERTIFY_MEMO=0` to make the regeneration a genuine second
-/// run of the derivation rather than a memo hit; the test is meaningful either
-/// way, so it is not gated on the variable.
+/// The regeneration may be a memo hit; a hit is byte-identical to a fresh run
+/// by construction (trust-certify's `memo_hit_is_byte_identical_to_fresh`), so
+/// the test is meaningful either way.
 #[test]
 fn certificates_replay_through_recheck() {
     for (name, violation) in [

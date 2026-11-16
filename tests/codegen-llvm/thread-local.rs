@@ -6,6 +6,7 @@
 //@ ignore-android does not use #[thread_local]
 //@ ignore-nto does not use #[thread_local]
 //@ ignore-qnx does not use #[thread_local]
+//@ ignore-ohos does not use #[thread_local]
 
 #![crate_type = "lib"]
 
@@ -15,8 +16,8 @@ use std::cell::Cell;
 
 thread_local!(static A: Cell<u32> = const { Cell::new(1) });
 
-// CHECK: [[TLS_AUX:@.+]] = external thread_local{{.*}} global i64
 // CHECK: [[TLS:@.+]] = internal thread_local{{.*}} global
+// CHECK: [[TLS_AUX:@.+]] = external thread_local{{.*}} global [8 x i8]
 
 // CHECK-LABEL: @get
 #[no_mangle]

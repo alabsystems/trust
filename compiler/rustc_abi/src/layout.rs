@@ -1,7 +1,7 @@
-use std::collections::BTreeSet;
 use std::fmt::{self, Write};
+use std::num::NonZero;
 use std::ops::Deref;
-use std::range::RangeInclusive;
+use std::range::{RangeFrom, RangeInclusive, RangeToInclusive};
 use std::{cmp, iter};
 
 use rustc_hashes::Hash64;
@@ -10,9 +10,10 @@ use rustc_index::bit_set::BitMatrix;
 use tracing::{debug, trace};
 
 use crate::{
-    AbiAlign, Align, BackendRepr, FieldsShape, HasDataLayout, IndexSlice, IndexVec, Integer,
-    LayoutData, Niche, NonZeroUsize, NumScalableVectors, Primitive, ReprOptions, Scalar, Size,
-    StructKind, TagEncoding, TargetDataLayout, VariantLayout, Variants, WrappingRange,
+    Align, BackendLaneCount, BackendRepr, FieldsShape, HasDataLayout, IndexSlice, IndexVec,
+    Integer, LayoutData, Niche, NicheOptimizations, NumScalableVectors, Primitive, ReprOptions,
+    Scalar, Size, StructKind, TagEncoding, TargetDataLayout, VariantLayout, Variants,
+    WrappingRange,
 };
 
 mod coroutine;
@@ -92,11 +93,22 @@ where
     VariantIdx: Idx,
     F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug,
 {
-    let uninhabited = fields.iter().any(|f| f.is_uninhabited());
     // We cannot ignore alignment; that might lead us to entirely discard a variant and
     // produce an enum that is less aligned than it should be!
-    let is_1zst = fields.iter().all(|f| f.is_1zst());
-    uninhabited && is_1zst
+    fields.iter().any(|f| f.is_uninhabited()) && fields.iter().all(|f| f.is_1zst())
+}
+
+#[inline]
+fn scalar_pair_layout(
+    dl: &TargetDataLayout,
+    a: Scalar,
+    b: Scalar,
+) -> (Align, Size, Size, BackendRepr) {
+    let b_align = b.default_align(dl);
+    let align = a.default_align(dl).max(b_align).max(dl.aggregate_align);
+    let b_offset = a.size(dl).align_to(b_align);
+    let size = (b_offset + b.size(dl)).align_to(align);
+    (align, size, b_offset, BackendRepr::ScalarPair { a, b, b_offset })
 }
 
 /// Determines towards which end of a struct layout optimizations will try to place the best niches.
@@ -128,7 +140,7 @@ pub enum LayoutCalculatorError<F> {
     ZeroLengthSimdType,
 
     /// The length of an SIMD type exceeds the maximum number of lanes
-    OversizedSimdType { max_lanes: u64 },
+    OversizedSimdType { max_lanes: usize },
 
     /// An element type of an SIMD type isn't a primitive
     NonPrimitiveSimdType(F),
@@ -178,7 +190,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         Self { cx }
     }
 
-    pub fn array_like<FieldIdx: Idx, VariantIdx: Idx, F>(
+    pub fn layout_of_array_like<FieldIdx: Idx, VariantIdx: Idx, F>(
         &self,
         element: &LayoutData<FieldIdx, VariantIdx>,
         count_if_sized: Option<u64>, // None for slices
@@ -196,12 +208,13 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             align: element.align,
             size,
             max_repr_align: None,
-            unadjusted_abi_align: element.align.abi,
+            unadjusted_abi_align: element.align,
+            repr_c: element.repr_c,
             randomization_seed: element.randomization_seed.wrapping_add(Hash64::new(count)),
         })
     }
 
-    pub fn scalable_vector_type<FieldIdx, VariantIdx, F>(
+    pub fn layout_of_scalable_vector_type<FieldIdx, VariantIdx, F>(
         &self,
         element: F,
         count: u64,
@@ -220,7 +233,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         )
     }
 
-    pub fn simd_type<FieldIdx, VariantIdx, F>(
+    pub fn layout_of_simd_type<FieldIdx, VariantIdx, F>(
         &self,
         element: F,
         count: u64,
@@ -239,20 +252,20 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
     ///
     /// This uses dedicated code instead of [`Self::layout_of_struct_or_enum`], as coroutine
     /// fields may be shared between multiple variants (see the [`coroutine`] module for details).
-    pub fn coroutine<
-        'a,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-        VariantIdx: Idx,
-        FieldIdx: Idx,
-        LocalIdx: Idx,
-    >(
+    pub fn layout_of_coroutine<'a, F, VariantIdx, FieldIdx, LocalIdx>(
         &self,
         local_layouts: &IndexSlice<LocalIdx, F>,
         prefix_layouts: IndexVec<FieldIdx, F>,
         variant_fields: &IndexSlice<VariantIdx, IndexVec<FieldIdx, LocalIdx>>,
         storage_conflicts: &BitMatrix<LocalIdx, LocalIdx>,
         tag_to_layout: impl Fn(Scalar) -> F,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+        VariantIdx: Idx,
+        FieldIdx: Idx,
+        LocalIdx: Idx,
+    {
         coroutine::layout(
             self,
             local_layouts,
@@ -263,96 +276,96 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         )
     }
 
-    pub fn univariant<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    /// Compute the layout for a univariant (see [`Variants::Single`]).
+    ///
+    /// As a consumer of `rustc_abi`, you should only use this method for non-ADTs.
+    /// For structs and univariant enums, use [`Self::layout_of_struct`] instead
+    /// (it uses this function internally).
+    pub fn layout_of_univariant<'a, FieldIdx, VariantIdx, F>(
         &self,
         fields: &IndexSlice<FieldIdx, F>,
         repr: &ReprOptions,
         kind: StructKind,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let dl = self.cx.data_layout();
-        let layout = self.univariant_biased(fields, repr, kind, NicheBias::Start);
+        let layout = self.layout_of_univariant_biased(fields, repr, kind, NicheBias::Start);
         // Enums prefer niches close to the beginning or the end of the variants so that other
         // (smaller) data-carrying variants can be packed into the space after/before the niche.
         // If the default field ordering does not give us a niche at the front then we do a second
         // run and bias niches to the right and then check which one is closer to one of the
         // struct's edges.
-        if let Ok(layout) = &layout {
+        if let Ok(layout) = &layout
             // Don't try to calculate an end-biased layout for unsizable structs,
             // otherwise we could end up with different layouts for
             // Foo<Type> and Foo<dyn Trait> which would break unsizing.
-            if !matches!(kind, StructKind::MaybeUnsized) {
-                if let Some(niche) = layout.largest_niche {
-                    let head_space = niche.offset.bytes();
-                    let niche_len = niche.value.size(dl).bytes();
-                    let tail_space = layout.size.bytes() - head_space - niche_len;
+            && !matches!(kind, StructKind::MaybeUnsized)
+            && let Some(niche) = layout.largest_niche
+            && let head_space = niche.offset.bytes()
+            && let niche_len = niche.value.size(dl).bytes()
+            && let tail_space = layout.size.bytes() - head_space - niche_len
+            // This may end up doing redundant work if the niche is already in the last
+            // field (e.g. a trailing bool) and there is tail padding. But it's non-trivial
+            // to get the unpadded size so we try anyway.
+            && (fields.len() > 1 && head_space != 0 && tail_space > 0)
+        {
+            let alt_layout = self
+                .layout_of_univariant_biased(fields, repr, kind, NicheBias::End)
+                .expect("alt layout should always work");
+            let alt_niche = alt_layout
+                .largest_niche
+                .expect("alt layout should have a niche like the regular one");
+            let alt_head_space = alt_niche.offset.bytes();
+            let alt_niche_len = alt_niche.value.size(dl).bytes();
+            let alt_tail_space = alt_layout.size.bytes() - alt_head_space - alt_niche_len;
 
-                    // This may end up doing redundant work if the niche is already in the last
-                    // field (e.g. a trailing bool) and there is tail padding. But it's non-trivial
-                    // to get the unpadded size so we try anyway.
-                    if fields.len() > 1 && head_space != 0 && tail_space > 0 {
-                        let alt_layout = self
-                            .univariant_biased(fields, repr, kind, NicheBias::End)
-                            .expect("alt layout should always work");
-                        let alt_niche = alt_layout
-                            .largest_niche
-                            .expect("alt layout should have a niche like the regular one");
-                        let alt_head_space = alt_niche.offset.bytes();
-                        let alt_niche_len = alt_niche.value.size(dl).bytes();
-                        let alt_tail_space =
-                            alt_layout.size.bytes() - alt_head_space - alt_niche_len;
+            debug_assert_eq!(layout.size.bytes(), alt_layout.size.bytes());
 
-                        debug_assert_eq!(layout.size.bytes(), alt_layout.size.bytes());
+            let prefer_alt_layout = alt_head_space > head_space && alt_head_space > tail_space;
 
-                        let prefer_alt_layout =
-                            alt_head_space > head_space && alt_head_space > tail_space;
+            debug!(
+                "sz: {}, default_niche_at: {}+{}, default_tail_space: {}, alt_niche_at/head_space: {}+{}, alt_tail: {}, num_fields: {}, better: {}\n\
+                layout: {}\n\
+                alt_layout: {}\n",
+                layout.size.bytes(),
+                head_space,
+                niche_len,
+                tail_space,
+                alt_head_space,
+                alt_niche_len,
+                alt_tail_space,
+                layout.fields.count(),
+                prefer_alt_layout,
+                self.format_field_niches(layout, fields),
+                self.format_field_niches(&alt_layout, fields),
+            );
 
-                        debug!(
-                            "sz: {}, default_niche_at: {}+{}, default_tail_space: {}, alt_niche_at/head_space: {}+{}, alt_tail: {}, num_fields: {}, better: {}\n\
-                            layout: {}\n\
-                            alt_layout: {}\n",
-                            layout.size.bytes(),
-                            head_space,
-                            niche_len,
-                            tail_space,
-                            alt_head_space,
-                            alt_niche_len,
-                            alt_tail_space,
-                            layout.fields.count(),
-                            prefer_alt_layout,
-                            self.format_field_niches(layout, fields),
-                            self.format_field_niches(&alt_layout, fields),
-                        );
-
-                        if prefer_alt_layout {
-                            return Ok(alt_layout);
-                        }
-                    }
-                }
+            if prefer_alt_layout {
+                return Ok(alt_layout);
             }
         }
         layout
     }
 
-    pub fn layout_of_struct_or_enum<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    pub fn layout_of_struct_or_enum<'a, FieldIdx, VariantIdx, F>(
         &self,
         repr: &ReprOptions,
         variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
         is_enum: bool,
-        is_special_no_niche: bool,
-        discr_range_of_repr: impl Fn(i128, i128) -> (Integer, bool),
-        discriminants: impl Iterator<Item = (VariantIdx, i128)>,
+        niche_optimizations: NicheOptimizations,
+        discr_range_of_repr: impl Fn(RangeFrom<i128>, RangeToInclusive<u128>) -> (Integer, bool),
+        discriminants: impl Iterator<Item = (VariantIdx, u128)>,
         always_sized: bool,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let (present_first, present_second) = {
             let mut present_variants = variants.iter_enumerated().filter_map(|(i, v)| {
                 if !repr.inhibit_enum_layout_opt() && absent(v) { None } else { Some(i) }
@@ -378,10 +391,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             self.layout_of_struct(
                 repr,
                 variants,
-                is_enum,
-                is_special_no_niche,
-                always_sized,
                 present_first,
+                is_enum,
+                niche_optimizations,
+                always_sized,
             )
         } else {
             // At this point, we have handled all unions and
@@ -392,16 +405,16 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         }
     }
 
-    pub fn layout_of_union<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    pub fn layout_of_union<'a, FieldIdx, VariantIdx, F>(
         &self,
         repr: &ReprOptions,
         variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let dl = self.cx.data_layout();
         let mut align = if repr.pack.is_some() { dl.i8_align } else { dl.aggregate_align };
         let mut max_repr_align = repr.align;
@@ -424,7 +437,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                 return Err(LayoutCalculatorError::UnexpectedUnsized(*field));
             }
 
-            align = align.max(field.align.abi);
+            align = align.max(field.align);
             max_repr_align = max_repr_align.max(field.max_repr_align);
             size = cmp::max(size, field.size);
 
@@ -446,14 +459,14 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                         // have the same alignment
                         if !matches!(common_abi, BackendRepr::Memory { .. }) {
                             assert_eq!(
-                                common_align, field.align.abi,
+                                common_align, field.align,
                                 "non-Aggregate field with matching ABI but differing alignment"
                             );
                         }
                     }
                 } else {
                     // First non-ZST field: record its ABI and alignment
-                    common_non_zst_repr_and_align = Ok(Some((field_abi, field.align.abi)));
+                    common_non_zst_repr_and_align = Ok(Some((field_abi, field.align)));
                 }
             }
         }
@@ -476,29 +489,33 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             Err(AbiMismatch) | Ok(None) => BackendRepr::Memory { sized: true },
             Ok(Some((repr, _))) => match repr {
                 // Mismatched alignment (e.g. union is #[repr(packed)]): disable opt
-                BackendRepr::Scalar(_) | BackendRepr::ScalarPair(_, _)
+                BackendRepr::Scalar(_) | BackendRepr::ScalarPair { .. }
                     if repr.scalar_platform_align(dl).unwrap() != align =>
                 {
                     BackendRepr::Memory { sized: true }
                 }
                 // Vectors require at least element alignment, else disable the opt
                 BackendRepr::SimdVector { element, count: _ }
-                    if element.default_align(dl).abi > align =>
+                    if element.default_align(dl) > align =>
                 {
                     BackendRepr::Memory { sized: true }
                 }
                 // the alignment tests passed and we can use this
                 BackendRepr::Scalar(..)
-                | BackendRepr::ScalarPair(..)
+                | BackendRepr::ScalarPair { .. }
                 | BackendRepr::SimdVector { .. }
                 | BackendRepr::SimdScalableVector { .. }
                 | BackendRepr::Memory { .. } => repr,
             },
         };
 
-        let Some(union_field_count) = NonZeroUsize::new(only_variant.len()) else {
+        let Some(union_field_count) = NonZero::new(only_variant.len()) else {
             return Err(LayoutCalculatorError::EmptyUnion);
         };
+
+        // We also need to check for a `repr(transparent)` wrapper around `repr(C)`
+        let repr_c =
+            repr.c() || (repr.transparent() && only_variant.iter().any(|field| field.repr_c));
 
         let combined_seed = only_variant
             .iter()
@@ -511,44 +528,45 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             backend_repr,
             largest_niche: None,
             uninhabited: false,
-            align: AbiAlign::new(align),
+            align,
             size: size.align_to(align),
             max_repr_align,
             unadjusted_abi_align,
+            repr_c,
             randomization_seed: combined_seed,
         })
     }
 
-    /// single-variant enums are just structs, if you think about it
-    fn layout_of_struct<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    /// Calculate the layout for a struct, or a single-variant enum.
+    ///
+    /// They are the same thing, if you think about it
+    /// (Typechecking will reject discriminant-sizing attrs.)
+    fn layout_of_struct<'a, FieldIdx, VariantIdx, F>(
         &self,
         repr: &ReprOptions,
         variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
+        variant_idx: VariantIdx,
         is_enum: bool,
-        is_special_no_niche: bool,
+        niche_optimizations: NicheOptimizations,
         always_sized: bool,
-        present_first: VariantIdx,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
-        // Struct, or univariant enum equivalent to a struct.
-        // (Typechecking will reject discriminant-sizing attrs.)
-
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let dl = self.cx.data_layout();
-        let v = present_first;
+        let v = variant_idx;
         let kind = if is_enum || variants[v].is_empty() || always_sized {
             StructKind::AlwaysSized
         } else {
             StructKind::MaybeUnsized
         };
 
-        let mut st = self.univariant(&variants[v], repr, kind)?;
+        let mut st = self.layout_of_univariant(&variants[v], repr, kind)?;
         st.variants = Variants::Single { index: v };
 
-        if is_special_no_niche {
+        if niche_optimizations == NicheOptimizations::Disabled {
             let hide_niches = |scalar: &mut _| match scalar {
                 Scalar::Initialized { value, valid_range } => {
                     *valid_range = WrappingRange::full(value.size(dl))
@@ -558,7 +576,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             };
             match &mut st.backend_repr {
                 BackendRepr::Scalar(scalar) => hide_niches(scalar),
-                BackendRepr::ScalarPair(a, b) => {
+                BackendRepr::ScalarPair { a, b, b_offset: _ } => {
                     hide_niches(a);
                     hide_niches(b);
                 }
@@ -573,18 +591,18 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         Ok(st)
     }
 
-    fn layout_of_enum<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    fn layout_of_enum<'a, FieldIdx, VariantIdx, F>(
         &self,
         repr: &ReprOptions,
         variants: &IndexSlice<VariantIdx, IndexVec<FieldIdx, F>>,
-        discr_range_of_repr: impl Fn(i128, i128) -> (Integer, bool),
-        discriminants: impl Iterator<Item = (VariantIdx, i128)>,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+        discr_range_of_repr: impl Fn(RangeFrom<i128>, RangeToInclusive<u128>) -> (Integer, bool),
+        discriminants: impl Iterator<Item = (VariantIdx, u128)>,
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let dl = self.cx.data_layout();
         // bail if the enum has an incoherent repr that cannot be computed
         if repr.packed() {
@@ -613,11 +631,11 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             let mut variant_layouts = variants
                 .iter()
                 .map(|v| {
-                    let st = self.univariant(v, repr, StructKind::AlwaysSized).ok()?;
+                    let st = self.layout_of_univariant(v, repr, StructKind::AlwaysSized).ok()?;
 
-                    variants_info.push(VariantLayoutInfo { align_abi: st.align.abi });
+                    variants_info.push(VariantLayoutInfo { align_abi: st.align });
 
-                    align = align.max(st.align.abi);
+                    align = align.max(st.align);
                     max_repr_align = max_repr_align.max(st.max_repr_align);
                     unadjusted_abi_align = unadjusted_abi_align.max(st.unadjusted_abi_align);
                     combined_seed = combined_seed.wrapping_add(st.randomization_seed);
@@ -701,13 +719,21 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                     // When the total alignment and size match, we can use the
                     // same ABI as the scalar variant with the reserved niche.
                     BackendRepr::Scalar(_) => BackendRepr::Scalar(niche_scalar),
-                    BackendRepr::ScalarPair(first, second) => {
+                    BackendRepr::ScalarPair { a: first, b: second, b_offset } => {
                         // Only the niche is guaranteed to be initialised,
                         // so use union layouts for the other primitive.
                         if niche_offset == Size::ZERO {
-                            BackendRepr::ScalarPair(niche_scalar, second.to_union())
+                            BackendRepr::ScalarPair {
+                                a: niche_scalar,
+                                b: second.to_union(),
+                                b_offset,
+                            }
                         } else {
-                            BackendRepr::ScalarPair(first.to_union(), niche_scalar)
+                            BackendRepr::ScalarPair {
+                                a: first.to_union(),
+                                b: niche_scalar,
+                                b_offset,
+                            }
                         }
                     }
                     _ => BackendRepr::Memory { sized: true },
@@ -735,9 +761,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                 largest_niche,
                 uninhabited,
                 size,
-                align: AbiAlign::new(align),
+                align,
                 max_repr_align,
                 unadjusted_abi_align,
+                repr_c: repr.c(),
                 randomization_seed: combined_seed,
             };
 
@@ -747,63 +774,36 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         let niche_filling_layout = calculate_niche_filling_layout();
 
         let discr_type = repr.discr_type();
-        let discr_int = Integer::from_attr(dl, discr_type);
-        // Because we can only represent one range of valid values, we'll look for the
-        // largest range of invalid values and pick everything else as the range of valid
-        // values.
+        let discr_size = Integer::from_attr(dl, discr_type).size();
 
-        // First we need to sort the possible discriminant values so that we can look for the largest gap:
-        let valid_discriminants: BTreeSet<i128> = discriminants
+        let necessary_discriminants: Vec<u128> = discriminants
             .filter(|&(i, _)| repr.c() || variants[i].iter().all(|f| !f.is_uninhabited()))
-            .map(|(_, val)| {
-                if discr_type.is_signed() {
-                    // sign extend the raw representation to be an i128
-                    // FIXME: do this at the discriminant iterator creation sites
-                    discr_int.size().sign_extend(val as u128)
-                } else {
-                    val
-                }
-            })
+            .map(|(_, val)| val)
             .collect();
-        trace!(?valid_discriminants);
-        let discriminants = valid_discriminants.iter().copied();
-        //let next_discriminants = discriminants.clone().cycle().skip(1);
-        let next_discriminants =
-            discriminants.clone().chain(valid_discriminants.first().copied()).skip(1);
-        // Iterate over pairs of each discriminant together with the next one.
-        // Since they were sorted, we can now compute the niche sizes and pick the largest.
-        let discriminants = discriminants.zip(next_discriminants);
-        let largest_niche = discriminants.max_by_key(|&(start, end)| {
-            trace!(?start, ?end);
-            // If this is a wraparound range, the niche size is `MAX - abs(diff)`, as the diff between
-            // the two end points is actually the size of the valid discriminants.
-            let dist = if start > end {
-                // Overflow can happen for 128 bit discriminants if `end` is negative.
-                // But in that case casting to `u128` still gets us the right value,
-                // as the distance must be positive if the lhs of the subtraction is larger than the rhs.
-                let dist = start.wrapping_sub(end);
-                if discr_type.is_signed() {
-                    discr_int.signed_max().wrapping_sub(dist) as u128
-                } else {
-                    discr_int.size().unsigned_int_max() - dist as u128
-                }
-            } else {
-                // Overflow can happen for 128 bit discriminants if `start` is negative.
-                // But in that case casting to `u128` still gets us the right value,
-                // as the distance must be positive if the lhs of the subtraction is larger than the rhs.
-                end.wrapping_sub(start) as u128
-            };
-            trace!(?dist);
-            dist
-        });
-        trace!(?largest_niche);
 
-        // `max` is the last valid discriminant before the largest niche
-        // `min` is the first valid discriminant after the largest niche
-        let (max, min) = largest_niche
+        // When picking the integer to use, we respect how the discriminants were written
+        // in the original rust code, rather than looking only at the bit pattern.
+        let (min_negative, max_positive): (i128, u128) = if discr_type.is_signed() {
+            necessary_discriminants.iter().copied().map(|val| discr_size.sign_extend(val)).fold(
+                (0_i128, 0_u128),
+                |(min, max), val| {
+                    if let Ok(val) = u128::try_from(val) {
+                        (min, max.max(val))
+                    } else {
+                        (min.min(val), max)
+                    }
+                },
+            )
+        } else {
             // We might have no inhabited variants, so pretend there's at least one.
-            .unwrap_or((0, 0));
-        let (min_ity, signed) = discr_range_of_repr(min, max); //Integer::discr_range_of_repr(tcx, ty, &repr, min, max);
+            (0, necessary_discriminants.iter().copied().max().unwrap_or(0))
+        };
+        trace!(?min_negative, ?max_positive);
+
+        let (min_ity, signed) = discr_range_of_repr(
+            RangeFrom { start: min_negative },
+            RangeToInclusive { last: max_positive },
+        ); //Integer::discr_range_of_repr(tcx, ty, &repr, min, max);
 
         let mut align = dl.aggregate_align;
         let mut max_repr_align = repr.align;
@@ -821,11 +821,11 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         // the alignment of the union. (This value is used both for
         // determining the alignment of the overall enum, and the
         // determining the alignment of the payload after the tag.)
-        let mut prefix_align = min_ity.align(dl).abi;
+        let mut prefix_align = min_ity.align(dl);
         if repr.c() {
             for fields in variants {
                 for field in fields {
-                    prefix_align = prefix_align.max(field.align.abi);
+                    prefix_align = prefix_align.max(field.align);
                 }
             }
         }
@@ -834,7 +834,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         let mut layout_variants = variants
             .iter()
             .map(|field_layouts| {
-                let st = self.univariant(
+                let st = self.layout_of_univariant(
                     field_layouts,
                     repr,
                     StructKind::Prefixed(min_ity.size(), prefix_align),
@@ -844,12 +844,12 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                 for field_idx in st.fields.index_by_increasing_offset() {
                     let field = &field_layouts[FieldIdx::new(field_idx)];
                     if !field.is_1zst() {
-                        start_align = start_align.min(field.align.abi);
+                        start_align = start_align.min(field.align);
                         break;
                     }
                 }
                 size = cmp::max(size, st.size);
-                align = align.max(st.align.abi);
+                align = align.max(st.align);
                 max_repr_align = max_repr_align.max(st.max_repr_align);
                 unadjusted_abi_align = unadjusted_abi_align.max(st.unadjusted_abi_align);
                 combined_seed = combined_seed.wrapping_add(st.randomization_seed);
@@ -921,13 +921,16 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             }
         }
 
-        let tag_mask = ity.size().unsigned_int_max();
+        let tag_valid_range = {
+            let tag_size = ity.size();
+            let tags = necessary_discriminants.into_iter().map(|d| tag_size.truncate(d));
+            WrappingRange::smallest_range_containing(tags, tag_size)
+                // We might have no inhabited variants, so pretend there's at least one.
+                .unwrap_or(WrappingRange { start: 0, end: 0 })
+        };
         let tag = Scalar::Initialized {
             value: Primitive::Int(ity, signed),
-            valid_range: WrappingRange {
-                start: (min as u128 & tag_mask),
-                end: (max as u128 & tag_mask),
-            },
+            valid_range: tag_valid_range,
         };
         let mut abi = BackendRepr::Memory { sized: true };
 
@@ -1013,23 +1016,12 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                     // Common prim might be uninit.
                     Scalar::Union { value: prim }
                 };
-                let pair =
-                    LayoutData::<FieldIdx, VariantIdx>::scalar_pair(&self.cx, tag, prim_scalar);
-                let pair_offsets = match pair.fields {
-                    FieldsShape::Arbitrary { ref offsets, ref in_memory_order } => {
-                        assert_eq!(in_memory_order.raw, [FieldIdx::new(0), FieldIdx::new(1)]);
-                        offsets
-                    }
-                    _ => panic!("encountered a non-arbitrary layout during enum layout"),
-                };
-                if pair_offsets[FieldIdx::new(0)] == Size::ZERO
-                    && pair_offsets[FieldIdx::new(1)] == *offset
-                    && align == pair.align.abi
-                    && size == pair.size
-                {
+                let (pair_align, pair_size, b_offset, pair_repr) =
+                    scalar_pair_layout(dl, tag, prim_scalar);
+                if *offset == b_offset && align == pair_align && size == pair_size {
                     // We can use `ScalarPair` only when it matches our
                     // already computed layout (including `#[repr(C)]`).
-                    abi = pair.backend_repr;
+                    abi = pair_repr;
                 }
             }
         }
@@ -1037,7 +1029,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         // If we pick a "clever" (by-value) ABI, we might have to adjust the ABI of the
         // variants to ensure they are consistent. This is because a downcast is
         // semantically a NOP, and thus should not affect layout.
-        if matches!(abi, BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..)) {
+        if matches!(abi, BackendRepr::Scalar(..) | BackendRepr::ScalarPair { .. }) {
             for variant in &mut layout_variants {
                 // We only do this for variants with fields; the others are not accessed anyway.
                 // Also do not overwrite any already existing "clever" ABIs.
@@ -1066,10 +1058,11 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             largest_niche,
             uninhabited,
             backend_repr: abi,
-            align: AbiAlign::new(align),
+            align,
             size,
             max_repr_align,
             unadjusted_abi_align,
+            repr_c: repr.c(),
             randomization_seed: combined_seed,
         };
 
@@ -1094,18 +1087,18 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         Ok(best_layout)
     }
 
-    fn univariant_biased<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
-    >(
+    fn layout_of_univariant_biased<'a, FieldIdx, VariantIdx, F>(
         &self,
         fields: &IndexSlice<FieldIdx, F>,
         repr: &ReprOptions,
         kind: StructKind,
         niche_bias: NicheBias,
-    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F> {
+    ) -> LayoutCalculatorResult<FieldIdx, VariantIdx, F>
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug + Copy,
+    {
         let dl = self.cx.data_layout();
         let pack = repr.pack;
         let mut align = if pack.is_some() { dl.i8_align } else { dl.aggregate_align };
@@ -1124,6 +1117,11 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             // If `-Z randomize-layout` was enabled for the type definition we can shuffle
             // the field ordering to try and catch some code making assumptions about layouts
             // we don't guarantee.
+            // In the future, we might do more than shuffle field order (e.g. introduce extra padding),
+            // but never for `repr(Rust)` structs with only zero-sized fields, single-variant
+            // `repr(Rust)` enums with only zero-sized fields, or zero-variant `repr(Rust)` enums,
+            // which must remain zero-sized as per T-lang decisions in
+            // https://github.com/rust-lang/reference/pull/2262 and https://github.com/rust-lang/reference/pull/2293
             if repr.can_randomize_type_layout() && cfg!(feature = "randomize") {
                 #[cfg(feature = "randomize")]
                 {
@@ -1159,7 +1157,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                     // `alignment_group_key`, one or the other branch will be taken, so this is okay.
                     if let Some(pack) = pack {
                         // Return the packed alignment in bytes.
-                        layout.align.abi.min(pack).bytes()
+                        layout.align.min(pack).bytes()
                     } else {
                         // Returns `log2(effective-align)`. The calculation assumes that size is an
                         // integer multiple of align, except for ZSTs.
@@ -1278,13 +1276,10 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             }
 
             // Invariant: offset < dl.obj_size_bound() <= 1<<61
-            let field_align = if let Some(pack) = pack {
-                field.align.min(AbiAlign::new(pack))
-            } else {
-                field.align
-            };
-            offset = offset.align_to(field_align.abi);
-            align = align.max(field_align.abi);
+            let field_align =
+                if let Some(pack) = pack { field.align.min(pack) } else { field.align };
+            offset = offset.align_to(field_align);
+            align = align.max(field_align);
             max_repr_align = max_repr_align.max(field.max_repr_align);
 
             debug!("univariant offset: {:?} field: {:#?}", offset, field);
@@ -1343,7 +1338,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                     layout_of_single_non_zst_field = Some(field);
 
                     // Field fills the struct and it has a scalar or scalar pair ABI.
-                    if offsets[i].bytes() == 0 && align == field.align.abi && size == field.size {
+                    if offsets[i].bytes() == 0 && align == field.align && size == field.size {
                         match field.backend_repr {
                             // For plain scalars, or vectors of them, we can't unpack
                             // newtypes for `#[repr(C)]`, as that affects C ABIs.
@@ -1354,7 +1349,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                             }
                             // But scalar pairs are Rust-specific and get
                             // treated as aggregates by C ABIs anyway.
-                            BackendRepr::ScalarPair(..) => {
+                            BackendRepr::ScalarPair { .. } => {
                                 abi = field.backend_repr;
                             }
                             _ => {}
@@ -1372,30 +1367,16 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                             } else {
                                 ((j, b), (i, a))
                             };
-                            let pair =
-                                LayoutData::<FieldIdx, VariantIdx>::scalar_pair(&self.cx, a, b);
-                            let pair_offsets = match pair.fields {
-                                FieldsShape::Arbitrary { ref offsets, ref in_memory_order } => {
-                                    assert_eq!(
-                                        in_memory_order.raw,
-                                        [FieldIdx::new(0), FieldIdx::new(1)]
-                                    );
-                                    offsets
-                                }
-                                FieldsShape::Primitive
-                                | FieldsShape::Array { .. }
-                                | FieldsShape::Union(..) => {
-                                    panic!("encountered a non-arbitrary layout during enum layout")
-                                }
-                            };
-                            if offsets[i] == pair_offsets[FieldIdx::new(0)]
-                                && offsets[j] == pair_offsets[FieldIdx::new(1)]
-                                && align == pair.align.abi
-                                && size == pair.size
+                            let (pair_align, pair_size, b_offset, pair_repr) =
+                                scalar_pair_layout(dl, a, b);
+                            if offsets[i] == Size::ZERO
+                                && offsets[j] == b_offset
+                                && align == pair_align
+                                && size == pair_size
                             {
                                 // We can use `ScalarPair` only when it matches our
                                 // already computed layout (including `#[repr(C)]`).
-                                abi = pair.backend_repr;
+                                abi = pair_repr;
                             }
                         }
                         _ => {}
@@ -1419,6 +1400,9 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             unadjusted_abi_align
         };
 
+        // We also need to check for a `repr(transparent)` wrapper around `repr(C)`
+        let repr_c = repr.c() || (repr.transparent() && fields.iter().any(|field| field.repr_c));
+
         let seed = field_seed.wrapping_add(repr.field_shuffle_seed);
 
         Ok(LayoutData {
@@ -1427,24 +1411,25 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
             backend_repr: abi,
             largest_niche,
             uninhabited,
-            align: AbiAlign::new(align),
+            align,
             size,
             max_repr_align,
             unadjusted_abi_align,
+            repr_c,
             randomization_seed: seed,
         })
     }
 
-    fn format_field_niches<
-        'a,
-        FieldIdx: Idx,
-        VariantIdx: Idx,
-        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug,
-    >(
+    fn format_field_niches<'a, FieldIdx, VariantIdx, F>(
         &self,
         layout: &LayoutData<FieldIdx, VariantIdx>,
         fields: &IndexSlice<FieldIdx, F>,
-    ) -> String {
+    ) -> String
+    where
+        FieldIdx: Idx,
+        VariantIdx: Idx,
+        F: Deref<Target = &'a LayoutData<FieldIdx, VariantIdx>> + fmt::Debug,
+    {
         let dl = self.cx.data_layout();
         let mut s = String::new();
         for i in layout.fields.index_by_increasing_offset() {
@@ -1488,11 +1473,7 @@ where
     F: AsRef<LayoutData<FieldIdx, VariantIdx>> + fmt::Debug,
 {
     let elt = element.as_ref();
-    if count == 0 {
-        return Err(LayoutCalculatorError::ZeroLengthSimdType);
-    } else if count > crate::MAX_SIMD_LANES {
-        return Err(LayoutCalculatorError::OversizedSimdType { max_lanes: crate::MAX_SIMD_LANES });
-    }
+    let count = BackendLaneCount::new(count)?;
 
     let BackendRepr::Scalar(element) = elt.backend_repr else {
         return Err(LayoutCalculatorError::NonPrimitiveSimdType(element));
@@ -1500,13 +1481,13 @@ where
 
     // Compute the size and alignment of the vector
     let size =
-        elt.size.checked_mul(count, dl).ok_or_else(|| LayoutCalculatorError::SizeOverflow)?;
+        elt.size.checked_mul(count.as_u64(), dl).ok_or(LayoutCalculatorError::SizeOverflow)?;
     let (repr, size, align) = match kind {
         SimdVectorKind::Scalable(number_of_vectors) => (
             BackendRepr::SimdScalableVector { element, count, number_of_vectors },
             size.checked_mul(number_of_vectors.0 as u64, dl)
-                .ok_or_else(|| LayoutCalculatorError::SizeOverflow)?,
-            dl.llvmlike_vector_align(size),
+                .ok_or(LayoutCalculatorError::SizeOverflow)?,
+            dl.rust_vector_align(size),
         ),
         // Non-power-of-two vectors have padding up to the next power-of-two.
         // If we're a packed repr, remove the padding while keeping the alignment as close
@@ -1515,7 +1496,7 @@ where
             (BackendRepr::Memory { sized: true }, size, Align::max_aligned_factor(size))
         }
         SimdVectorKind::PackedFixed | SimdVectorKind::Fixed => {
-            (BackendRepr::SimdVector { element, count }, size, dl.llvmlike_vector_align(size))
+            (BackendRepr::SimdVector { element, count }, size, dl.rust_vector_align(size))
         }
     };
     let size = size.align_to(align);
@@ -1530,9 +1511,10 @@ where
         largest_niche: elt.largest_niche,
         uninhabited: false,
         size,
-        align: AbiAlign::new(align),
+        align,
         max_repr_align: None,
-        unadjusted_abi_align: elt.align.abi,
-        randomization_seed: elt.randomization_seed.wrapping_add(Hash64::new(count)),
+        unadjusted_abi_align: elt.align,
+        repr_c: false,
+        randomization_seed: elt.randomization_seed.wrapping_add(Hash64::new(count.as_u64())),
     })
 }

@@ -1,0 +1,250 @@
+{
+ "name": "shl_assign_u32",
+ "def_path": "nm::shl_assign_u32",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 12,
+  "col_start": 0,
+  "line_end": 12,
+  "col_end": 71
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "b"
+   },
+   {
+    "index": 3,
+    "ty": "Unit",
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Int": {
+        "width": 32,
+        "signed": false
+       }
+      }
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "Ref": {
+         "mutable": true,
+         "place": {
+          "local": 1,
+          "projections": []
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 12,
+        "col_start": 51,
+        "line_end": 12,
+        "col_end": 52
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Call": {
+      "func": "<u32 as core::ops::bit::ShlAssign>::shl_assign",
+      "args": [
+       {
+        "Move": {
+         "local": 4,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 3,
+       "projections": []
+      },
+      "target": 1,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 12,
+       "col_start": 51,
+       "line_end": 12,
+       "col_end": 66
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16997581370999730295,
+       "def_index": 37868,
+       "substs_digest": [
+        11031654923400625744,
+        7746132838901858938
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16997581370999730295,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 1,
+          "projections": []
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 12,
+        "col_start": 68,
+        "line_end": 12,
+        "col_end": 69
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

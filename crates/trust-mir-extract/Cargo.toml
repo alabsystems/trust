@@ -8,7 +8,7 @@
 
 [package]
 name = "trust-mir-extract"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -20,18 +20,42 @@ workspace = true
 serde_json = "1"
 trust-types = { path = "../trust-types" }
 trust-verifier-api = { path = "../trust-verifier-api" }
+trust-source-contract = { path = "../trust-source-contract" }
 trust-vcgen = { path = "../trust-vcgen" }
+# The spawn census's reachability engine (design 2026-09-29 §5.1): this crate's
+# `concurrency_effects` is its MIR adapter.
+trust-ir = { workspace = true }
 # trust: rustc crates needed for MIR extraction (resolved by bootstrap build)
 rustc_abi = { path = "../../compiler/rustc_abi" }
+rustc_ast = { path = "../../compiler/rustc_ast" }
 rustc_ast_ir = { path = "../../compiler/rustc_ast_ir" }
+rustc_attr_ir = { path = "../../compiler/rustc_attr_ir" }
 rustc_data_structures = { path = "../../compiler/rustc_data_structures" }
 rustc_hir = { path = "../../compiler/rustc_hir" }
+# Trust (OPAQUE-IMPL-WHERE-LEAK-1): the leak-free normalizer and trait check of
+# `ctfe_reentrancy` run the selected compiler solver on an `InferCtxt` they own, so ambiguity is a
+# decline rather than the query normalizer's "unexpected ambiguity" delayed bug.
+# OpaqueAnalysis protects analysis; OpaqueBoundsOnly protects the complete-probe
+# codegen-selection guard. Neither mode shares an ordinary/erased cache key.
+rustc_infer = { path = "../../compiler/rustc_infer" }
 rustc_middle = { path = "../../compiler/rustc_middle" }
 rustc_span = { path = "../../compiler/rustc_span" }
+rustc_trait_selection = { path = "../../compiler/rustc_trait_selection" }
+rustc_type_ir = { path = "../../compiler/rustc_type_ir" }
 
 [dev-dependencies]
 rustc_driver = { path = "../../compiler/rustc_driver" }
 rustc_interface = { path = "../../compiler/rustc_interface" }
+# Integration-only compiler-owner -> actual atomic IR lowering controls. The
+# reverse bridge edge selects this library, not this integration test target.
+trust-ir-bridge = { path = "../trust-ir-bridge", features = ["compiler-context"] }
+trust-ir-build = { workspace = true }
+# Test-only: the derived-MIR storage rule run in process on compiler-built bodies
+# (tests/derived_assert_msg_storage_rule.rs). trust-thir-lower depends on this crate,
+# so this is a dev-dependency cycle, as rustc_driver above already is.
+trust-thir-lower = { path = "../trust-thir-lower" }
+clean-kernel = { workspace = true }
+clean-verify = { workspace = true }
 # Test-only producer/consumer parity pin for the exact direct MIR-memory JSON
 # schema consumed by trust-vc-bridge. Production extraction remains decoupled
 # from the TrustVC engine implementation.

@@ -149,6 +149,40 @@ class Findings:
         return 1 if self.errors or self.omitted_errors else 0
 
 
+# The one symlink `build` may be: a link to the sibling REAL directory
+# `build.noindex`, whose name keeps Spotlight from indexing hundreds of GiB of
+# build output (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight out of build/").
+# Inlined rather than imported because this helper runs under `python -I -S`
+# and authenticates only itself; scripts/tests/build_dir_symlink_test.py drives
+# this copy and its siblings (mint_seed_support.py) over one fixture matrix.
+BUILD_NOINDEX = "build.noindex"
+
+
+def is_sanctioned_build_link(root: Path) -> bool:
+    """True iff `root/build` is a symlink resolving to the real `root/build.noindex`."""
+    lexical = root / "build"
+    try:
+        if not stat.S_ISLNK(os.lstat(lexical).st_mode):
+            return False
+        physical = root.resolve(strict=True) / BUILD_NOINDEX
+        if not stat.S_ISDIR(os.lstat(physical).st_mode):
+            return False
+        return lexical.resolve(strict=True) == physical
+    except (OSError, RuntimeError):
+        return False
+
+
+def physical_build_directory(root: Path) -> Path:
+    """`root/build`, or the `build.noindex` it links to under the sanctioned layout.
+
+    A containment test against a RESOLVED path must use this: `root / "build"`
+    is lexical, so a build root resolved through the link is never inside it.
+    """
+    if is_sanctioned_build_link(root):
+        return root.resolve(strict=True) / BUILD_NOINDEX
+    return root / "build"
+
+
 def inside(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -783,7 +817,7 @@ def trace_audit(root_arg: str, build_root_arg: str, trace_arg: str) -> int:
     root = Path(root_arg).resolve()
     build_root = Path(build_root_arg).resolve()
     trace = Path(trace_arg)
-    if not inside(build_root, root / "build"):
+    if not inside(build_root, physical_build_directory(root)):
         findings.error("audited build root is outside the checkout build directory")
         return findings.emit()
     if trace.is_symlink() or not trace.is_file():
@@ -895,7 +929,7 @@ def stage2_output(root_arg: str, build_root_arg: str) -> int:
     root = Path(root_arg).resolve()
     build_root = Path(build_root_arg).resolve()
     candidates = []
-    if build_root.is_dir() and inside(build_root, root / "build"):
+    if build_root.is_dir() and inside(build_root, physical_build_directory(root)):
         candidates = list(build_root.glob("*/stage2/bin/trustc")) + list(
             build_root.glob("*/stage2/bin/trustc.exe")
         )
@@ -923,7 +957,9 @@ def stage2_output(root_arg: str, build_root_arg: str) -> int:
 
 def make_audit_dir(parent_arg: str) -> int:
     lexical_parent = Path(parent_arg)
-    if lexical_parent.is_symlink():
+    if lexical_parent.is_symlink() and not (
+        lexical_parent.name == "build" and is_sanctioned_build_link(lexical_parent.parent)
+    ):
         print("ERROR: audit parent must not be a symlink", file=sys.stderr)
         return 1
     lexical_parent.mkdir(mode=0o700, parents=True, exist_ok=True)

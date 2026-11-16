@@ -1,0 +1,7 @@
+# Identities for adv4.trust_ir: the review of census/c0's real stage1 dump
+# of adv4.rs. Conventions: census_shapes.identities.
+body adv_step2_bounded pub
+spawners
+product-census
+effects adv_step2_bounded 6:23=fork 9:37=fcntl 10:17=execv 10:42=_exit
+drops adv_step2_bounded

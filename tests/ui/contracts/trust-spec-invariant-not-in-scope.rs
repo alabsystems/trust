@@ -1,3 +1,4 @@
+//@ normalize-stderr: "elapsed_ms=\d+" -> "elapsed_ms=$$TIME"
 //! Trust: with no `trust` crate linked, the `trust::invariant` path must still
 //! be REFUSED — the refusal must not become a quieter way to accept it.
 //!

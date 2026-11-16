@@ -1,0 +1,549 @@
+{
+  "name": "drop_in_option",
+  "def_path": "drop1::drop_in_option",
+  "span": {
+    "file": "drop1.rs",
+    "line_start": 28,
+    "col_start": 0,
+    "line_end": 28,
+    "col_end": 118
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "m"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "drop1::G",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Ref": {
+                            "mutable": true,
+                            "inner": {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            }
+                          }
+                        }
+                      ],
+                      [
+                        "1",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "drop1::G",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Ref": {
+                                "mutable": true,
+                                "inner": {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": false
+                                  }
+                                }
+                              }
+                            }
+                          ],
+                          [
+                            "1",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "_o"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Adt": {
+            "name": "drop1::G",
+            "fields": [
+              [
+                "0",
+                {
+                  "Ref": {
+                    "mutable": true,
+                    "inner": {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ],
+              [
+                "1",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": "t"
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Uint": [
+                      7,
+                      64
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 62,
+                "line_end": 28,
+                "col_end": 63
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 83,
+                "line_end": 28,
+                "col_end": 89
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "drop1::G",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "drop1::G<'_>"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 5,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 1,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 81,
+                "line_end": 28,
+                "col_end": 93
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::option::Option<drop1::G<'_>>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 76,
+                "line_end": 28,
+                "col_end": 94
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 3,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "drop1.rs",
+              "line_start": 28,
+              "col_start": 96,
+              "line_end": 28,
+              "col_end": 97
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 106,
+                "line_end": 28,
+                "col_end": 107
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 109,
+                "line_end": 28,
+                "col_end": 116
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 2,
+            "span": {
+              "file": "drop1.rs",
+              "line_start": 28,
+              "col_start": 109,
+              "line_end": 28,
+              "col_end": 116
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        100,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "drop1.rs",
+                "line_start": 28,
+                "col_start": 109,
+                "line_end": 28,
+                "col_end": 116
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 64,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "v",
+                "Int"
+              ]
+            },
+            {
+              "Int": 18446744073709551615
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

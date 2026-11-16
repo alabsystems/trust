@@ -68,11 +68,11 @@ pub fn coeff_of(c: Cst) -> u64
 // has to name `trust_import_*`. That is exactly how the client's nine existing
 // citations discharge, and all that changed is that `c.degree` is now sayable.
 //
-// The clause must NOT call an island definition here: only the UNCITED defeq
-// lane installs island-definition facets, so `ident_isl(c.degree) <= c.degree
-// by …` is refused with "no diagnostic E6 facet record exists". That is a
-// property of the cited lane, unrelated to fields, and it is why (1) and (3)
-// are spelled differently.
+// The clause deliberately calls NO island definition: when this was written
+// only the UNCITED defeq lane installed island-definition facets, which is why
+// (1) and (3) are spelled differently. The cited lanes admit them now too
+// (`e9_cited_island_def_discharge`); that is unrelated to fields, and an island
+// definition applied to a FIELD in a cited clause is not measured by this pin.
 pub fn degree_bound(c: Cst) -> u64
     ensures result <= c.degree by degree_le_self
 {

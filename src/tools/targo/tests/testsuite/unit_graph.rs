@@ -7,13 +7,14 @@ use cargo_test_support::str;
 
 #[cargo_test]
 fn gated() {
+    // Trust: retain the channel refusal and exact current Trust guidance.
     let p = project().file("src/lib.rs", "").build();
     p.cargo("build --unit-graph")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[ERROR] the `--unit-graph` flag is unstable, and only available on the nightly channel of Cargo, but this is the `stable` channel
-See https://doc.rust-lang.org/book/[..].html for more information about Rust release channels.
-See https://github.com/rust-lang/cargo/issues/8002 for more information about the `--unit-graph` flag.
+[ERROR] the `--unit-graph` flag is unstable, and only available on Trust/nightly-capable Cargo channels, but this is the `stable` channel
+Use the Trust `trust` channel, or another Cargo channel with explicit unstable-feature support, for these flags.
+See https://github.com/alabsystems/Trust/issues for more information about the `--unit-graph` flag.
 
 "#]])
         .run();
@@ -46,7 +47,8 @@ fn simple() {
         .file("src/lib.rs", "")
         .build();
 
-    p.cargo("build --features a/feata --unit-graph -Zunstable-options")
+    p.cargo("build --features a/feata --unit-graph")
+        .arg("-Zunstable-options")
         .masquerade_as_nightly_cargo(&["unit-graph"])
         .with_stdout_data(
             str![[r#"
@@ -84,7 +86,8 @@ fn simple() {
         "panic": "unwind",
         "rpath": false,
         "split_debuginfo": "{...}",
-        "strip": "{...}"
+        "strip": "{...}",
+        "trim_paths": "none"
       },
       "target": {
         "crate_types": [
@@ -130,7 +133,8 @@ fn simple() {
         "panic": "unwind",
         "rpath": false,
         "split_debuginfo": "{...}",
-        "strip": "{...}"
+        "strip": "{...}",
+        "trim_paths": "none"
       },
       "target": {
         "crate_types": [
@@ -168,7 +172,8 @@ fn simple() {
         "panic": "unwind",
         "rpath": false,
         "split_debuginfo": "{...}",
-        "strip": "{...}"
+        "strip": "{...}",
+        "trim_paths": "none"
       },
       "target": {
         "crate_types": [
@@ -212,7 +217,8 @@ fn simple() {
         "panic": "unwind",
         "rpath": false,
         "split_debuginfo": "{...}",
-        "strip": "{...}"
+        "strip": "{...}",
+        "trim_paths": "none"
       },
       "target": {
         "crate_types": [

@@ -303,12 +303,46 @@ fn test_pipeline_frontier_from_verification_result() {
 // Uses trust-types + trust-strengthen + trust-convergence
 // ---------------------------------------------------------------------------
 
+/// A source file defining `midpoint`, removed on drop.
+struct MidpointSource(std::path::PathBuf);
+
+impl MidpointSource {
+    fn new() -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("trust_convergence_midpoint_{}.rs", std::process::id()));
+        std::fs::write(
+            &path,
+            "pub fn midpoint(lo: u64, hi: u64) -> u64 {\n    (lo + hi) / hi\n}\n",
+        )
+        .expect("write temp source");
+        Self(path)
+    }
+
+    /// Point every function of `cr` at this file.
+    fn attach(&self, mut cr: CrateVerificationResult) -> CrateVerificationResult {
+        for func in &mut cr.functions {
+            func.function_path = self.0.display().to_string();
+        }
+        cr
+    }
+}
+
+impl Drop for MidpointSource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[test]
 fn test_pipeline_strengthen_improves_convergence() {
     let mut tracker = VerificationConvergenceTracker::new(3, 10);
+    // strengthen names real operands for an overflow fix, so it reads the
+    // function's source from `function_path`; a module path has none, and
+    // then no overflow proposal is made (no invented operand names).
+    let source = MidpointSource::new();
 
     // Iteration 0: 2 failures that strengthen can propose specs for
-    let iter0_result = crate_result(
+    let iter0_result = source.attach(crate_result(
         "midpoint",
         vec![
             (
@@ -323,7 +357,7 @@ fn test_pipeline_strengthen_improves_convergence() {
             ),
             (VcKind::DivisionByZero, failed()),
         ],
-    );
+    ));
     tracker.observe(&iter0_result);
 
     // Run strengthen on the failures
@@ -337,7 +371,7 @@ fn test_pipeline_strengthen_improves_convergence() {
 
     // Simulate: strengthen proposals accepted, re-verify with better specs.
     // Iteration 1: 1 proved (div-by-zero fixed), 1 still failing
-    let iter1_result = crate_result(
+    let iter1_result = source.attach(crate_result(
         "midpoint",
         vec![
             (
@@ -352,7 +386,7 @@ fn test_pipeline_strengthen_improves_convergence() {
             ),
             (VcKind::DivisionByZero, proved()),
         ],
-    );
+    ));
     let changes1 = tracker.observe(&iter1_result);
     let improvements: Vec<_> = changes1.iter().filter(|c| c.is_improvement()).collect();
     assert!(!improvements.is_empty());
@@ -363,7 +397,7 @@ fn test_pipeline_strengthen_improves_convergence() {
     assert_eq!(strengthen_output2.failures_analyzed, 1);
 
     // Iteration 2: all proved
-    let iter2_result = crate_result(
+    let iter2_result = source.attach(crate_result(
         "midpoint",
         vec![
             (
@@ -378,7 +412,7 @@ fn test_pipeline_strengthen_improves_convergence() {
             ),
             (VcKind::DivisionByZero, proved()),
         ],
-    );
+    ));
     tracker.observe(&iter2_result);
 
     let score = tracker.convergence_score().expect("has VCs");

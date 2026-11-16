@@ -26,17 +26,22 @@ from urllib.parse import unquote
 
 UTC = timezone.utc
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    try:
-        import tomli as tomllib  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
-        print(
-            "error: Python 3.11+ or the 'tomli' package is required to parse TOML",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+
+def _require_python_311() -> None:
+    if sys.version_info >= (3, 11):
+        return
+    for minor in (14, 13, 12, 11):
+        candidate = shutil.which(f"python3.{minor}")
+        if candidate:
+            os.execv(candidate, [candidate, *sys.argv])
+    raise SystemExit(
+        "discover_trust_stage0_seed.py requires Python >=3.11 (tomllib); "
+        f"found {sys.version.split()[0]}"
+    )
+
+
+_require_python_311()
+import tomllib  # noqa: E402  (loaded only after the version gate/re-exec)
 
 
 # Trust: produced-toolchain bin surface. These are matched against an
@@ -1483,7 +1488,7 @@ def markdown_report(data: dict[str, object]) -> str:
                 "",
                 "```bash",
                 "TRUST_DIST_SERVER=file:///ABS/PATH/TO/TRUST-STAGE0 python3 scripts/discover_trust_stage0_seed.py --repo-root . --candidate-root /ABS/PATH/TO/TRUST-STAGE0 --json",
-                "TRUST_DIST_SERVER=file:///ABS/PATH/TO/TRUST-STAGE0 bash tests/e2e_trust_stage0_lineage.sh --dist-server file:///ABS/PATH/TO/TRUST-STAGE0",
+                "TRUST_DIST_SERVER=file:///ABS/PATH/TO/TRUST-STAGE0 targo trust domination trust-added --release stage0-lineage",
                 "TRUST_DIST_SERVER=file:///ABS/PATH/TO/TRUST-STAGE0 ./x.py build --stage 1 compiler/rustc library/std",
                 "```",
             ]

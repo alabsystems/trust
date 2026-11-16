@@ -84,17 +84,16 @@
 /// The hypothesis lift: reading an erased proof binder as a caller obligation.
 pub mod hypothesis;
 
-pub use hypothesis::Hypothesis;
-pub use trust_types::clean_origin_precondition::{
-    CleanOriginPrecondition, PreconditionOperand, PreconditionRelation,
-};
-
 use clean_kernel::{BigNat, Expr, ExprKind, Literal};
+pub use hypothesis::Hypothesis;
 use trust_symbols::{
     CarrierEvidence, CarrierExtent, CarrierWitness, ObligationNotDischarged, OperationAgreement,
     RepresentationObligation, SymbolHeader,
 };
 use trust_types::Ty;
+pub use trust_types::clean_origin_precondition::{
+    CleanOriginPrecondition, PreconditionOperand, PreconditionRelation,
+};
 
 // ---------------------------------------------------------------------------
 // The modeled Clean types
@@ -204,7 +203,7 @@ pub fn recognize(ty: &Expr) -> Option<CleanType> {
     match ty.kind() {
         // A `Sort` is `Prop`/`Type`. Not a value.
         ExprKind::Sort(_) | ExprKind::SProp => Some(CleanType::Sort),
-        ExprKind::Const(name, _) => match name.to_string().as_str() {
+        ExprKind::Const(name, _) => match name_str1(name)? {
             "Bool" => Some(CleanType::Bool),
             "UInt8" => Some(CleanType::UInt(8)),
             "UInt16" => Some(CleanType::UInt(16)),
@@ -218,16 +217,62 @@ pub fn recognize(ty: &Expr) -> Option<CleanType> {
             _ => None,
         },
         // `BitVec w`, with `w` a literal. A symbolic width is NOT recognized:
-        // "some width" is not a width.
+        // "some width" is not a width. Both literal SPELLINGS the elaborator
+        // produces are accepted; see [`nat_width_literal`].
         ExprKind::App(head, arg) => {
             let ExprKind::Const(name, _) = strip_mdata(head).kind() else { return None };
-            if name.to_string() != "BitVec" {
+            if name_str1(name) != Some("BitVec") {
                 return None;
             }
-            let width = nat_literal(strip_mdata(arg))?.to_u64()?;
+            let width = nat_width_literal(strip_mdata(arg))?.to_u64()?;
             Some(CleanType::BitVec(u32::try_from(width).ok()?))
         }
         _ => None,
+    }
+}
+
+/// Borrow a single-component string `Name` without heap allocation.
+///
+/// Since `Name`'s `Display` implementation joins multiple components with `.`
+/// and formats `Anon` as `[anonymous]`, a dot-free non-numeric target string
+/// matches `name.to_string()` if and only if `name` is a single `Str` component
+/// directly under `Anon`.
+#[inline]
+pub(crate) fn name_str1(name: &clean_kernel::Name) -> Option<&str> {
+    match name.inner() {
+        clean_kernel::name::NameInner::Str(parent, s) if parent.is_anon() => Some(s.as_ref()),
+        _ => None,
+    }
+}
+
+/// Check whether `name` equals the two-component name `s0.s1` (i.e.
+/// `Name::from_string("s0.s1")`) without allocating.
+#[inline]
+pub(crate) fn name_is_str2(name: &clean_kernel::Name, s0: &str, s1: &str) -> bool {
+    matches!(
+        name.inner(),
+        clean_kernel::name::NameInner::Str(parent, last)
+            if last.as_ref() == s1 && name_str1(parent) == Some(s0)
+    )
+}
+
+/// Check whether `name.to_string()` equals the single-dot string `dotted`
+/// (`"{s0}.{s1}"`) without allocating.
+#[inline]
+pub(crate) fn name_is_str2_or_dotted(
+    name: &clean_kernel::Name,
+    s0: &str,
+    s1: &str,
+    dotted: &str,
+) -> bool {
+    match name.inner() {
+        clean_kernel::name::NameInner::Str(parent, last) if parent.is_anon() => {
+            last.as_ref() == dotted
+        }
+        clean_kernel::name::NameInner::Str(parent, last) if last.as_ref() == s1 => {
+            name_str1(parent) == Some(s0)
+        }
+        _ => false,
     }
 }
 
@@ -244,6 +289,89 @@ pub(crate) fn nat_literal(e: &Expr) -> Option<&BigNat> {
         ExprKind::Lit(Literal::Nat(n)) => Some(n),
         _ => None,
     }
+}
+
+/// The `Nat` a **width position** denotes, in either spelling the elaborator
+/// produces: a bare `Lit(Nat)`, or the numeral wrapper
+/// `@OfNat.ofNat Nat n (instOfNatNat n)`.
+///
+/// # Why the second spelling has to be here
+///
+/// No island author writes the wrapper — they write `BitVec 64`. The
+/// elaborator, not the author, decides which form the recorded type carries,
+/// and measured on this tree it carries the wrapper for **every** island-
+/// authored `BitVec n` signature (`def f (x : BitVec 64) : BitVec 64 := x`
+/// records
+/// `App(Const BitVec, App(App(App(Const OfNat.ofNat.{0}, Const Nat), Lit(Nat 64)), App(Const instOfNatNat, Lit(Nat 64))))`).
+/// A raw-literal-only reader therefore refused the whole modeled family while
+/// the refusal it printed went on listing `BitVec 8/16/32/64` among "the
+/// modeled value types" — the compiler telling the user to use a spelling it
+/// then refuses. `trust-certify`'s clause-side width reader
+/// (`clean_island::nat_literal_of`) already accepted both for this reason; the
+/// carrier did not, and the carrier is the side that mints `Capability::Call`.
+///
+/// # Why this is still not a reduction
+///
+/// [`recognize`]'s contract is syntactic and shallow: it does not reduce, it
+/// does not unfold, and it does not consult a kernel. This is an **affirmative
+/// allow-list of one closed shape**, not a WHNF — exactly the peel
+/// `clean_kernel`'s own `peel_ofnat_nat_lit`
+/// (`env/native_reducers_bitvec.rs`) performs, and checked the same way:
+///
+/// * the head is `OfNat.ofNat` applied to exactly **three** arguments, so a
+///   partial application or an over-application is refused rather than having
+///   its spine truncated;
+/// * the class carrier is the constant `Nat` itself, un-applied — no other
+///   `OfNat` instance is peeled, and the field of `@OfNat.ofNat α n inst` for
+///   some other `α`/`inst` need not equal `n` at all;
+/// * the instance is `instOfNatNat` applied to exactly one argument, and that
+///   argument is a literal. `instOfNatNat n = ⟨n⟩`, so this stored field is
+///   the value the genuine projection chain
+///   `OfNat.ofNat → proj(OfNat, 0, instOfNatNat K) → K` produces;
+/// * **that field is what is returned** — the width the kernel elaborated,
+///   read off the term, never re-derived from the surface text or from the
+///   class index;
+/// * the class index (`args[1]`) must be the syntactically identical literal.
+///   On a well-typed term the two always agree, so the check is free; on an
+///   internally inconsistent one it refuses instead of choosing a half. A
+///   wrong choice here is not a missed proof, it is a `BitVec 64` value
+///   emitted through a `u8` carrier.
+///
+/// Anything else — a bound variable, an arithmetic expression, a different
+/// `OfNat` instance, a non-literal instance field — is `None`, and `BitVec`
+/// at such a width keeps refusing by name exactly as before.
+fn nat_width_literal(e: &Expr) -> Option<&BigNat> {
+    let e = strip_mdata(e);
+    if let Some(n) = nat_literal(e) {
+        return Some(n);
+    }
+    // `@OfNat.ofNat α n inst` — three arguments, spelled out rather than
+    // uncurried so the arity is enforced by the shape itself.
+    let ExprKind::App(f2, instance) = e.kind() else { return None };
+    let ExprKind::App(f1, index) = strip_mdata(f2).kind() else { return None };
+    let ExprKind::App(head, carrier) = strip_mdata(f1).kind() else { return None };
+    let ExprKind::Const(head_name, _) = strip_mdata(head).kind() else { return None };
+    if !name_is_str2_or_dotted(head_name, "OfNat", "ofNat", "OfNat.ofNat") {
+        return None;
+    }
+    // α must be the constant `Nat`, un-applied.
+    let ExprKind::Const(carrier_name, _) = strip_mdata(carrier).kind() else { return None };
+    if name_str1(carrier_name) != Some("Nat") {
+        return None;
+    }
+    // inst must be `instOfNatNat <lit>`, applied to exactly one argument.
+    let ExprKind::App(inst_head, inst_arg) = strip_mdata(instance).kind() else { return None };
+    let ExprKind::Const(inst_name, _) = strip_mdata(inst_head).kind() else { return None };
+    if name_str1(inst_name) != Some("instOfNatNat") {
+        return None;
+    }
+    let stored = nat_literal(strip_mdata(inst_arg))?;
+    // The class index must be the same literal, or the wrapper is not the
+    // numeral it looks like.
+    if nat_literal(strip_mdata(index))? != stored {
+        return None;
+    }
+    Some(stored)
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +523,10 @@ impl SignaturePosition {
 
 impl core::fmt::Display for SignaturePosition {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.describe())
+        match self {
+            Self::Argument(i) => write!(f, "argument {i}"),
+            Self::Result => f.write_str("the result"),
+        }
     }
 }
 
@@ -625,12 +756,12 @@ pub fn carrier_signature_with_hypotheses_for(
     // Pass 1 — peel the telescope, classifying each binder, WITHOUT deciding
     // any dependency yet. The dependency rules differ per class, so they cannot
     // be applied while the class is still unknown.
-    enum Binder<'a> {
-        Value(&'a Expr),
+    enum Binder {
+        Value(Carrier),
         Hypothesis(CleanOriginPrecondition),
     }
 
-    let mut binders: Vec<Binder<'_>> = Vec::new();
+    let mut binders: Vec<Binder> = Vec::new();
     // `carried_index_of_binder[b]` — the carried-argument index of telescope
     // binder `b`, or `None` when `b` is an erased hypothesis. Built as we go so
     // a hypothesis can only ever name binders to its LEFT.
@@ -643,7 +774,7 @@ pub fn carrier_signature_with_hypotheses_for(
         let domain = strip_mdata(domain);
 
         match carrier_for(domain) {
-            Ok(_) => {
+            Ok(carrier) => {
                 // A VALUE binder. Its domain must be closed — a value type that
                 // depends on an earlier argument has no Rust spelling, which is
                 // the refusal this lift does NOT touch.
@@ -653,18 +784,16 @@ pub fn carrier_signature_with_hypotheses_for(
                         signature: render_signature(ty),
                     });
                 }
-                binders.push(Binder::Value(domain));
+                binders.push(Binder::Value(carrier));
                 carried_index_of_binder.push(Some(carried));
                 carried += 1;
             }
             Err(cause) => {
                 // Not a carried value. It is a hypothesis binder if — and only
                 // if — this crate can restate it.
-                if let Some(precondition) = hypothesis::recognise_hypothesis(
-                    domain,
-                    binder_index,
-                    &carried_index_of_binder,
-                ) {
+                if let Some(precondition) =
+                    hypothesis::recognise_hypothesis(domain, binder_index, &carried_index_of_binder)
+                {
                     // Nothing downstream may depend on the PROOF. `body` is the
                     // whole remainder, and a loose bvar in it at this depth
                     // means the proof itself is used later — no Rust type for
@@ -710,23 +839,14 @@ pub fn carrier_signature_with_hypotheses_for(
         });
     }
 
-    // Pass 2 — mint the carriers. `carrier_for` is called a SECOND time per
-    // value position rather than reusing pass 1's, so the granted carrier and
-    // the classification come from the same function with no shortcut between
-    // them, and the positional refusal keeps the base cause verbatim.
-    let mut arguments: Vec<Carrier> = Vec::new();
+    // Pass 2 — partition the classified binders into value carriers and sealed
+    // hypotheses, reusing the `Carrier` already granted by `carrier_for` in
+    // pass 1.
+    let mut arguments: Vec<Carrier> = Vec::with_capacity(carried);
     let mut hypotheses: Vec<Hypothesis> = Vec::new();
     for (binder_index, binder) in binders.into_iter().enumerate() {
         match binder {
-            Binder::Value(domain) => {
-                let index = arguments.len();
-                let carrier =
-                    carrier_for(domain).map_err(|cause| CarrierRefused::SignatureComponent {
-                        position: SignaturePosition::Argument(index),
-                        arity: count_arrows(ty),
-                        signature: render_signature(ty),
-                        cause: Box::new(cause),
-                    })?;
+            Binder::Value(carrier) => {
                 arguments.push(carrier);
             }
             Binder::Hypothesis(precondition) => {
@@ -1115,22 +1235,21 @@ impl core::fmt::Display for CarrierRefused {
                  and discharge it — `UInt{width}.ofNatLT` takes exactly that proof"
             ),
             Self::SignatureComponent { position, arity, signature, cause } => {
-                let where_ = position.describe();
                 let plural = if *arity == 1 { "argument" } else { "arguments" };
                 write!(
                     f,
                     "the Clean signature `{signature}` ({arity} {plural}) has no Rust \
-                     carrier, because {where_} has none. The WHOLE signature is refused, \
+                     carrier, because {position} has none. The WHOLE signature is refused, \
                      not just that position: a carrier for a signature is total in every \
                      position or it does not exist, since a call that carries the other \
                      values faithfully still emits a wrong value for this one.\n\
-                     options: (1) change {where_} to a carried type — the refusal for \
+                     options: (1) change {position} to a carried type — the refusal for \
                      that position, quoted below, lists the specific fixes; (2) keep the \
                      whole declaration PROOF-only, where no position needs a carrier at \
                      all; (3) split it — the carryable part becomes a `def` Rust calls, \
-                     and the part that needs {where_} stays PROOF-only and is cited from \
+                     and the part that needs {position} stays PROOF-only and is cited from \
                      `requires`/`ensures`\n\
-                     the refusal at {where_} is:\n{cause}"
+                     the refusal at {position} is:\n{cause}"
                 )
             }
             Self::DependentFunctionType { binder_index, signature } => write!(
@@ -1520,9 +1639,14 @@ fn decimal_of_limbs(limbs: &[u64]) -> String {
         }
     }
 
-    let mut out = chunks.pop().expect("at least one chunk").to_string();
+    let Some(first) = chunks.pop() else {
+        return "0".to_string();
+    };
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(chunks.len() * 19 + 20);
+    let _ = write!(out, "{first}");
     while let Some(chunk) = chunks.pop() {
-        out.push_str(&format!("{chunk:019}"));
+        let _ = write!(out, "{chunk:019}");
     }
     out
 }
@@ -1543,6 +1667,36 @@ mod tests {
 
     fn bitvec(w: u64) -> Expr {
         Expr::app(c("BitVec"), Expr::nat_lit(w))
+    }
+
+    /// `@OfNat.ofNat.{0} Nat (nat_lit n) (instOfNatNat (nat_lit n))` — the
+    /// numeral wrapper the elaborator records for a `Nat` written in source.
+    /// Measured on this tree, this is the ONLY spelling an island-authored
+    /// `BitVec n` signature carries.
+    fn ofnat_nat(n: u64) -> Expr {
+        ofnat_nat_parts(c("Nat"), Expr::nat_lit(n), Expr::app(c("instOfNatNat"), Expr::nat_lit(n)))
+    }
+
+    /// The same wrapper with each of its three arguments open, so a test can
+    /// mutate exactly one of them.
+    fn ofnat_nat_parts(carrier: Expr, index: Expr, instance: Expr) -> Expr {
+        Expr::app(
+            Expr::app(
+                Expr::app(
+                    Expr::const_(
+                        Name::from_string("OfNat.ofNat"),
+                        vec![clean_kernel::Level::zero()],
+                    ),
+                    carrier,
+                ),
+                index,
+            ),
+            instance,
+        )
+    }
+
+    fn bitvec_ofnat(w: u64) -> Expr {
+        Expr::app(c("BitVec"), ofnat_nat(w))
     }
 
     // -- Recognition ------------------------------------------------------
@@ -1566,6 +1720,83 @@ mod tests {
         // A `BitVec` with a symbolic width is "some width", which is not a
         // width.
         assert_eq!(recognize(&Expr::app(c("BitVec"), c("w"))), None);
+    }
+
+    /// The regression this lane exists for: an island-authored `BitVec n`
+    /// records its width as `@OfNat.ofNat Nat n (instOfNatNat n)`, never as a
+    /// bare literal, so a raw-literal-only reader refused the entire modeled
+    /// `BitVec` family while the refusal text kept offering it.
+    #[test]
+    fn the_elaborated_numeral_spelling_of_a_width_is_the_same_width() {
+        for w in [8u64, 16, 32, 64] {
+            assert_eq!(
+                recognize(&bitvec_ofnat(w)),
+                Some(CleanType::BitVec(u32::try_from(w).unwrap())),
+                "`BitVec {w}` as the elaborator spells it must recognize at width {w}"
+            );
+            // And it must agree with the bare-literal spelling, which is the
+            // whole point: an author never chooses between the two.
+            assert_eq!(recognize(&bitvec_ofnat(w)), recognize(&bitvec(w)));
+        }
+    }
+
+    /// MUTATION CONTROL for the arm above. Each case mutates exactly ONE part
+    /// of the accepted wrapper; every one of them must refuse. A reader that
+    /// accepted any of these would be reading a width the kernel did not
+    /// elaborate, which is a wrong carrier — not a missed proof.
+    #[test]
+    fn only_the_exact_numeral_wrapper_is_peeled() {
+        let lit = |n: u64| Expr::nat_lit(n);
+        let inst = |n: u64| Expr::app(c("instOfNatNat"), lit(n));
+        let cases: Vec<(&str, Expr)> = vec![
+            // A different head constant, every other part identical.
+            (
+                "other head",
+                Expr::app(Expr::app(Expr::app(c("OfNat.evil"), c("Nat")), lit(64)), inst(64)),
+            ),
+            // A different class carrier: the field of `@OfNat.ofNat α n inst`
+            // for another `α` need not be `n` at all.
+            ("carrier is not Nat", ofnat_nat_parts(c("UInt64"), lit(64), inst(64))),
+            // The carrier applied to something, i.e. not the constant `Nat`.
+            ("carrier applied", ofnat_nat_parts(Expr::app(c("Nat"), lit(0)), lit(64), inst(64))),
+            // A different `OfNat` instance: its stored field is not `n`.
+            (
+                "other instance",
+                ofnat_nat_parts(c("Nat"), lit(64), Expr::app(c("instEvil"), lit(64))),
+            ),
+            // The instance un-applied — no stored field to read.
+            ("instance not applied", ofnat_nat_parts(c("Nat"), lit(64), c("instOfNatNat"))),
+            // The instance over-applied.
+            (
+                "instance over-applied",
+                ofnat_nat_parts(
+                    c("Nat"),
+                    lit(64),
+                    Expr::app(Expr::app(c("instOfNatNat"), lit(64)), lit(64)),
+                ),
+            ),
+            // The instance field is not a literal.
+            (
+                "instance field symbolic",
+                ofnat_nat_parts(c("Nat"), lit(64), Expr::app(c("instOfNatNat"), c("w"))),
+            ),
+            // The class index is not a literal.
+            ("index symbolic", ofnat_nat_parts(c("Nat"), c("w"), inst(64))),
+            // Index and stored field DISAGREE: this term is not the numeral it
+            // looks like, and neither half may be chosen.
+            ("index disagrees with field", ofnat_nat_parts(c("Nat"), lit(8), inst(64))),
+            // Partially applied: only two arguments.
+            ("partial application", Expr::app(Expr::app(c("OfNat.ofNat"), c("Nat")), lit(64))),
+            // Over-applied: four arguments.
+            ("over-application", Expr::app(ofnat_nat(64), lit(64))),
+        ];
+        for (why, width) in cases {
+            assert_eq!(
+                recognize(&Expr::app(c("BitVec"), width)),
+                None,
+                "`BitVec <{why}>` must NOT be recognized as a width"
+            );
+        }
     }
 
     #[test]

@@ -3,13 +3,12 @@ use std::ops::ControlFlow;
 
 use rustc_hir::def_id::DefId;
 use rustc_infer::traits::util::PredicateSet;
-use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
     self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
     VtblEntry,
 };
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, bug};
 use smallvec::{SmallVec, smallvec};
 use tracing::debug;
 
@@ -122,11 +121,12 @@ fn prepare_vtable_segments_inner<'tcx, T>(
             let &(inner_most_trait_ref, _, _) = stack.last().unwrap();
 
             let mut direct_super_traits_iter = tcx
-                .explicit_super_predicates_of(inner_most_trait_ref.def_id)
+                .explicit_super_clauses_of(inner_most_trait_ref.def_id)
                 .iter_identity_copied()
                 .map(Unnormalized::skip_norm_wip)
-                .filter_map(move |(pred, _)| {
-                    pred.instantiate_supertrait(tcx, ty::Binder::dummy(inner_most_trait_ref))
+                .filter_map(move |(clause, _)| {
+                    clause
+                        .instantiate_supertrait(tcx, ty::Binder::dummy(inner_most_trait_ref))
                         .as_trait_clause()
                 })
                 .map(move |pred| {
@@ -275,8 +275,8 @@ fn vtable_entries<'tcx>(
                     // do not hold for this particular set of type parameters.
                     // Note that this method could then never be called, so we
                     // do not want to try and codegen it, in that case (see #23435).
-                    if tcx.instantiate_and_check_impossible_predicates((def_id, args)) {
-                        debug!("vtable_entries: predicates do not hold");
+                    if tcx.instantiate_and_check_impossible_clauses((def_id, args)) {
+                        debug!("vtable_entries: clauses do not hold");
                         return VtblEntry::Vacant;
                     }
 
@@ -309,9 +309,14 @@ fn vtable_entries<'tcx>(
 
 // Given a `dyn Subtrait: Supertrait` trait ref, find corresponding first slot
 // for `Supertrait`'s methods in the vtable of `Subtrait`.
-pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRef<'tcx>) -> usize {
+//
+// Returns `None` if and only if an error was already reported elsewhere.
+pub(crate) fn first_method_vtable_slot<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    key: ty::TraitRef<'tcx>,
+) -> Option<usize> {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
+    tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
     let ty::Dynamic(source, _) = *key.self_ty().kind() else {
         bug!();
@@ -321,11 +326,10 @@ pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRe
     );
 
     // We're monomorphizing a call to a dyn trait object that can never be constructed.
-    if tcx.instantiate_and_check_impossible_predicates((
-        source_principal.def_id,
-        source_principal.args,
-    )) {
-        return 0;
+    if tcx
+        .instantiate_and_check_impossible_clauses((source_principal.def_id, source_principal.args))
+    {
+        return Some(0);
     }
 
     let target_principal = ty::ExistentialTraitRef::erase_self_ty(tcx, key);
@@ -356,7 +360,19 @@ pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRe
         }
     };
 
-    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap()
+    let index = prepare_vtable_segments(tcx, source_principal, vtable_segment_callback);
+
+    if index.is_none() {
+        // This can happen if the trait hierarchy is malformed (e.g., due to
+        // missing generics on a supertrait bound). There should already be an error
+        // emitted for this, so we just delay the ICE.
+        tcx.dcx().delayed_bug(format!(
+            "could not find the supertrait vtable slot for `{}` -> `{}`",
+            source, target_principal
+        ));
+    }
+
+    index
 }
 
 /// Given a `dyn Subtrait` and `dyn Supertrait` trait object, find the slot of
@@ -390,10 +406,9 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
     );
 
     // We're monomorphizing a dyn trait object upcast that can never be constructed.
-    if tcx.instantiate_and_check_impossible_predicates((
-        source_principal.def_id,
-        source_principal.args,
-    )) {
+    if tcx
+        .instantiate_and_check_impossible_clauses((source_principal.def_id, source_principal.args))
+    {
         return None;
     }
 

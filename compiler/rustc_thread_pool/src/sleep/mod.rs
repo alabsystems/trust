@@ -251,12 +251,20 @@ impl Sleep {
             // Drop `is_blocked` now in case `acquire_thread` blocks
             drop(is_blocked);
 
-            thread.registry.acquire_thread();
+            // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): a wake for termination takes
+            // no thread slot; the worker keeps the pairing.
+            thread.acquire_thread_after_sleep(latch);
         }
 
         // Update other state:
         idle_state.wake_fully();
         latch.wake_up();
+    }
+
+    /// Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): see `Registry::sleeping_threads`.
+    #[cfg(test)]
+    pub(super) fn sleeping_threads(&self) -> usize {
+        self.counters.load(Ordering::SeqCst).sleeping_threads()
     }
 
     /// Notify the given thread that it should wake up (if it is

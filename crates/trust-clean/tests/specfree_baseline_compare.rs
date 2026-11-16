@@ -11,11 +11,12 @@ use trust_clean::prove_dump_dir;
 
 fn report(label: &str, rel: &str) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(rel);
-    if !dir.exists() {
-        println!("[{label}] MISSING: {}", dir.display());
-        return;
-    }
-    let sc = prove_dump_dir(&dir).expect("read dumps");
+    // NO-VACUOUS-CORPUS-TEST: every corpus compared here is checked in, so a
+    // missing or undecodable one FAILS naming the path, never prints MISSING.
+    assert!(dir.is_dir(), "required fixture corpus {} is missing", dir.display());
+    let sc = prove_dump_dir(&dir)
+        .unwrap_or_else(|error| panic!("prove required fixture corpus {}: {error}", dir.display()));
+    assert!(sc.total > 0, "required fixture corpus {} holds no dumps", dir.display());
     let spec_free = sc.total.saturating_sub(sc.postcondition_obligations);
     println!(
         "[{label}] total={} inhabited={} | postcond_obls={} safety_obls={} safety_kernel_discharged={} safety_smt_only={} | fully_faithful={} | spec_free>={} kernel_rejected={}",

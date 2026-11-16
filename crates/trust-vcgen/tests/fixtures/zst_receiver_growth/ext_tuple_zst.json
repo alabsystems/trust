@@ -1,0 +1,273 @@
+{
+  "name": "ext_tuple_zst",
+  "def_path": "zst_receiver_growth::ext_tuple_zst",
+  "span": {
+    "file": "zst_receiver_growth.rs",
+    "line_start": 51,
+    "col_start": 0,
+    "line_end": 53,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Tuple": [
+                {
+                  "Seq": {
+                    "elem": "Unit"
+                  }
+                },
+                {
+                  "Seq": {
+                    "elem": {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "name": "v"
+      },
+      {
+        "index": 2,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Tuple": [
+                    "Unit",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Tuple": [
+                        "Unit",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Tuple": [
+            "Unit",
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Constant": "Unit"
+                    },
+                    {
+                      "Constant": {
+                        "Uint": [
+                          1,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "zst_receiver_growth.rs",
+                "line_start": 52,
+                "col_start": 18,
+                "line_end": 52,
+                "col_end": 27
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::option::Option<((), u8)>"
+                    }
+                  },
+                  [
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "zst_receiver_growth.rs",
+                "line_start": 52,
+                "col_start": 13,
+                "line_end": 52,
+                "col_end": 28
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<(alloc::vec::Vec<()>, alloc::vec::Vec<u8>) as core::iter::traits::collect::Extend<((), u8)>>::extend::<core::option::Option<((), u8)>>::<__trust_elem_bytes@1>",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "zst_receiver_growth.rs",
+              "line_start": 52,
+              "col_start": 4,
+              "line_end": 52,
+              "col_end": 29
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 10357,
+              "substs_digest": [
+                5493255763653064984,
+                10267413671055306401
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

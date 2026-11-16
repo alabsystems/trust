@@ -1,0 +1,37 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-tl-general",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "GENERAL.consumer.accepts_head_invalid_modules": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "GENERAL.interpret": {
+   "verdict": "GAP",
+   "class": "consumer-gap",
+   "signature": "non-executable vararg signature",
+   "audit": null,
+   "moved": "not measured by the audit: its interpreter target was set only from a module the rewrite had repaired, and for `areaOfRect` the repaired copy did not validate, so no row was written. Judged as emitted, the valid module links and the refusal is the interpreter's own: `non-executable vararg signature` — it has no host-call hook for the Clean runtime, which is a consumer gap, not a producer one."
+  },
+  "GENERAL.link.no_shims": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "no sumTo.o",
+   "audit": null,
+   "moved": "not measured by the audit: the negative control links `sumTo.o`, and the audit's run never reached the point of recording its absence. The ported judge records it either way (F-120 (3): the controls run whether or not the declaration links), here as the named absence `no sumTo.o` — clean --emit obj produced no object for that declaration (GENERAL.p04_nat_structural_rec.sumTo.obj is the ungated-license refusal above)."
+  },
+  "GENERAL.representation": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "EnumDef=0:StructDef=0:ClosureTy=0:obligations=0:body_gates=['\"Ungated\"']",
+   "audit": "FAIL",
+   "moved": "the audit computed this census over the TWO repaired modules its rewrite left standing ('across 2 repaired general modules') and recorded FAIL; the ported judge computes it over all 20 modules AS EMITTED and pins the same absence — EnumDef=0, StructDef=0, ClosureTy=0, obligations=0, every body gate `\"Ungated\"` — as a named producer GAP. Same fact, now a signature a fix must flip."
+  }
+ }
+}

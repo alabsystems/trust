@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use cargo_test_support::basic_manifest;
+use cargo_test_support::paths;
 use cargo_test_support::registry::Package;
 use cargo_test_support::str;
 
@@ -613,6 +614,7 @@ args: []
         .with_stderr_data(str![[r#"
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/s-h.w§c!.rs`
+...
 [COMPILING] s-h-w-c- v0.0.0 ([ROOT]/foo/s-h.w§c!.rs)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `[ROOT]/home/.cargo/build/[HASH]/target/debug/s-h-w-c-[EXE]`
@@ -927,6 +929,9 @@ fn test_name_same_as_dependency() {
 ---
 [dependencies]
 script = "1.0.0"
+
+[lints.cargo]
+default = "allow"
 ---
 
 fn main() {
@@ -946,7 +951,7 @@ Hello world!
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/script.rs`
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest Rust [..] compatible version
+[LOCKING] 1 package to highest Rust [..] compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] script v1.0.0 (registry `dummy-registry`)
 [COMPILING] script v1.0.0
@@ -964,6 +969,9 @@ fn test_path_dep() {
 ---
 [dependencies]
 bar.path = "./bar"
+
+[lints.cargo]
+default = "allow"
 ---
 
 fn main() {
@@ -985,7 +993,7 @@ Hello world!
         .with_stderr_data(str![[r#"
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/script.rs`
-[LOCKING] 1 package to latest Rust [..] compatible version
+[LOCKING] 1 package to highest Rust [..] compatible version
 [COMPILING] bar v0.0.1 ([ROOT]/foo/bar)
 [COMPILING] script v0.0.0 ([ROOT]/foo/script.rs)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1609,6 +1617,17 @@ args: []
 
 "#]])
         .run();
+
+    paths::cargo_home().join("build").assert_dir_layout(
+        str![[r#"
+[ROOT]/home/.cargo/build/[HASH]/CACHEDIR.TAG
+[ROOT]/home/.cargo/build/[HASH]/[HASH]/Cargo.lock
+[ROOT]/home/.cargo/build/[HASH]/target/CACHEDIR.TAG
+
+"#]]
+        .unordered(),
+        &["[..]/debug/[..]".into(), "[..]/.rustc_info.json".into()],
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zscript is unstable")]
@@ -1770,7 +1789,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/script.rs`
 [COMPILING] script v0.0.0 ([ROOT]/foo/script.rs)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests script.rs ([ROOT]/home/.cargo/build/[HASH]/debug/deps/script-[HASH][EXE])
+[RUNNING] unittests script.rs ([ROOT]/home/.cargo/build/[HASH]/debug/build/script/[HASH]/out/script-[HASH][EXE])
 
 "#]])
         .run();
@@ -1791,6 +1810,28 @@ fn cmd_clean_with_embedded() {
     p.cargo("-Zscript clean --manifest-path script.rs")
         .masquerade_as_nightly_cargo(&["script"])
         .with_stdout_data("")
+        .with_stderr_data(str![[r#"
+[WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
+[HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/script.rs`
+[REMOVED] [FILE_NUM] files, [FILE_SIZE]B total
+
+"#]])
+        .run();
+}
+
+#[cargo_test(nightly, reason = "-Zscript is unstable")]
+fn cmd_clean_with_embedded_and_target_dir() {
+    let script = ECHO_SCRIPT;
+    let p = cargo_test_support::project()
+        .file("script.rs", script)
+        .build();
+
+    p.cargo("-Zscript check --manifest-path script.rs --target-dir script-target")
+        .masquerade_as_nightly_cargo(&["script"])
+        .run();
+
+    p.cargo("-Zscript clean --manifest-path script.rs --target-dir script-target")
+        .masquerade_as_nightly_cargo(&["script"])
         .with_stderr_data(str![[r#"
 [WARNING] `package.edition` is unspecified, defaulting to the latest edition (currently `[..]`)
 [HELP] to pin the edition, run `cargo fix --manifest-path [ROOT]/foo/script.rs`

@@ -42,7 +42,8 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn tick(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `async_fn_records_assumption::tick::{closure#0}`: 1 obligation(s) were not proved
+    // RE-PINNED 2026-09-14: advisory accounts the stamped conditional rows in a NOTE
+    // ("conditionally discharged (NOT proved) … skipped"), not the Level-0 incomplete WARN.
     x
 }
 fn main() {}

@@ -1,15 +1,16 @@
 //! Performs various peephole optimizations.
 
 use rustc_abi::{ExternAbi, Integer};
-use rustc_hir::{LangItem, find_attr};
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::{IntegerExt, ValidityRequirement};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, layout};
-use rustc_span::{Symbol, sym};
+use rustc_middle::ty::{self, GenericArgs, Ty, TyCtxt, layout};
+use rustc_span::{Symbol, bug, sym};
 
+use crate::PassPolicy;
 use crate::simplify::simplify_duplicate_switch_targets;
 
 pub(super) enum InstSimplify {
@@ -25,21 +26,22 @@ impl<'tcx> crate::MirPass<'tcx> for InstSimplify {
         }
     }
 
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let preserve_ub_checks = find_attr!(tcx.hir_krate_attrs(), RustcPreserveUbChecks);
         if !preserve_ub_checks {
-            SimplifyUbCheck { tcx }.visit_body(body);
+            SimplifyUbCheck { tcx }.visit_body_preserves_cfg(body);
         }
         let mut ctx = InstSimplifyContext {
             tcx,
             typing_env: body.typing_env(tcx),
             local_decls: &mut body.local_decls,
         };
-        for block in body.basic_blocks.as_mut() {
+        let mut cfg_changed = false;
+        for block in body.basic_blocks.as_mut_preserves_cfg() {
             for statement in block.statements.iter_mut() {
                 let StatementKind::Assign((.., rvalue)) = &mut statement.kind else {
                     continue;
@@ -54,17 +56,16 @@ impl<'tcx> crate::MirPass<'tcx> for InstSimplify {
             }
 
             let terminator = block.terminator.as_mut().unwrap();
-            ctx.simplify_primitive_clone(terminator, &mut block.statements);
-            ctx.simplify_size_or_align_of_val(terminator, &mut block.statements);
-            ctx.simplify_raw_eq(terminator, &mut block.statements);
-            ctx.simplify_intrinsic_assert(terminator);
-            ctx.simplify_nounwind_call(terminator);
-            simplify_duplicate_switch_targets(terminator);
+            cfg_changed |= ctx.simplify_primitive_clone(terminator, &mut block.statements);
+            cfg_changed |= ctx.simplify_size_or_align_of_val(terminator, &mut block.statements);
+            cfg_changed |= ctx.simplify_raw_eq(terminator, &mut block.statements);
+            cfg_changed |= ctx.simplify_intrinsic_assert(terminator, &mut block.statements);
+            cfg_changed |= ctx.simplify_nounwind_call(terminator);
+            cfg_changed |= simplify_duplicate_switch_targets(terminator);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
+        if cfg_changed {
+            body.basic_blocks.invalidate_cfg_cache();
+        }
     }
 }
 
@@ -220,33 +221,33 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         &self,
         terminator: &mut Terminator<'tcx>,
         statements: &mut Vec<Statement<'tcx>>,
-    ) {
+    ) -> bool {
         let TerminatorKind::Call {
             func, args, destination, target: Some(destination_block), ..
         } = &terminator.kind
         else {
-            return;
+            return false;
         };
 
         // It's definitely not a clone if there are multiple arguments
-        let [arg] = &args[..] else { return };
+        let [arg] = &args[..] else { return false };
 
         // Only bother looking more if it's easy to know what we're calling
-        let Some((fn_def_id, ..)) = func.const_fn_def() else { return };
+        let Some((fn_def_id, ..)) = func.const_fn_def() else { return false };
 
         // These types are easily available from locals, so check that before
         // doing DefId lookups to figure out what we're actually calling.
         let arg_ty = arg.node.ty(self.local_decls, self.tcx);
 
-        let ty::Ref(_region, inner_ty, Mutability::Not) = *arg_ty.kind() else { return };
+        let ty::Ref(_region, inner_ty, Mutability::Not) = *arg_ty.kind() else { return false };
 
         if !self.tcx.is_lang_item(fn_def_id, LangItem::CloneFn)
             || !inner_ty.is_trivially_pure_clone_copy()
         {
-            return;
+            return false;
         }
 
-        let Some(arg_place) = arg.node.place() else { return };
+        let Some(arg_place) = arg.node.place() else { return false };
 
         statements.push(Statement::new(
             terminator.source_info,
@@ -258,7 +259,8 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                 ),
             ))),
         ));
-        terminator.kind = TerminatorKind::Goto { target: *destination_block };
+        terminator.kind = TerminatorKind::goto(*destination_block);
+        true
     }
 
     /// Simplify `size_of_val` and `align_of_val` if we don't actually need
@@ -276,7 +278,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         &self,
         terminator: &mut Terminator<'tcx>,
         statements: &mut Vec<Statement<'tcx>>,
-    ) {
+    ) -> bool {
         let source_info = terminator.source_info;
         if let TerminatorKind::Call {
             func, args, destination, target: Some(destination_block), ..
@@ -289,7 +291,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             } else if self.tcx.is_intrinsic(fn_def_id, sym::align_of_val) {
                 LangItem::AlignOf
             } else {
-                return;
+                return false;
             };
             let generic_ty = generics.type_at(0);
             let ty = if generic_ty.is_sized(self.tcx, self.typing_env) {
@@ -299,14 +301,14 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             {
                 elem_ty
             } else {
-                return;
+                return false;
             };
 
             let const_def_id = self.tcx.require_lang_item(lang_item, source_info.span);
             let const_op = Operand::unevaluated_constant(
                 self.tcx,
                 const_def_id,
-                &[ty.into()],
+                self.tcx.mk_args(&[ty.into()]),
                 source_info.span,
             );
             statements.push(Statement::new(
@@ -316,8 +318,10 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                     Rvalue::Use(const_op, WithRetag::Yes),
                 ))),
             ));
-            terminator.kind = TerminatorKind::Goto { target: *destination_block };
+            terminator.kind = TerminatorKind::goto(*destination_block);
+            return true;
         }
+        false
     }
 
     /// Simplify `raw_eq` intrinsic calls to `Eq` when the type has the size of a primitive.
@@ -327,7 +331,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
         &mut self,
         terminator: &mut Terminator<'tcx>,
         statements: &mut Vec<Statement<'tcx>>,
-    ) {
+    ) -> bool {
         let tcx = self.tcx;
         let source_info = terminator.source_info;
         let span = source_info.span;
@@ -373,17 +377,23 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                     Rvalue::BinaryOp(BinOp::Eq, Box::new((lhs_op, rhs_op))),
                 ))),
             ));
-            terminator.kind = TerminatorKind::Goto { target: *destination_block };
+            terminator.kind = TerminatorKind::goto(*destination_block);
+            return true;
         }
+        false
     }
 
-    fn simplify_nounwind_call(&self, terminator: &mut Terminator<'tcx>) {
+    fn simplify_nounwind_call(&self, terminator: &mut Terminator<'tcx>) -> bool {
         let TerminatorKind::Call { ref func, ref mut unwind, .. } = terminator.kind else {
-            return;
+            return false;
         };
 
+        if matches!(*unwind, UnwindAction::Unreachable) {
+            return false;
+        }
+
         let Some((def_id, _)) = func.const_fn_def() else {
-            return;
+            return false;
         };
 
         let body_ty = self.tcx.type_of(def_id).skip_binder();
@@ -396,34 +406,60 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
 
         if !layout::fn_can_unwind(self.tcx, Some(def_id), body_abi) {
             *unwind = UnwindAction::Unreachable;
+            return true;
         }
+        false
     }
 
-    fn simplify_intrinsic_assert(&self, terminator: &mut Terminator<'tcx>) {
-        let TerminatorKind::Call { ref func, target: ref mut target @ Some(target_block), .. } =
-            terminator.kind
+    fn simplify_intrinsic_assert(
+        &self,
+        terminator: &mut Terminator<'tcx>,
+        statements: &mut Vec<Statement<'tcx>>,
+    ) -> bool {
+        let TerminatorKind::Call {
+            ref func,
+            destination,
+            target: ref mut target @ Some(target_block),
+            ..
+        } = terminator.kind
         else {
-            return;
+            return false;
         };
         let func_ty = func.ty(self.local_decls, self.tcx);
         let Some((intrinsic_name, args)) = resolve_rust_intrinsic(self.tcx, func_ty) else {
-            return;
+            return false;
         };
         // The intrinsics we are interested in have one generic parameter
-        let [arg, ..] = args[..] else { return };
+        let [arg, ..] = *args.as_slice() else { return false };
 
         let known_is_valid =
             intrinsic_assert_panics(self.tcx, self.typing_env, arg, intrinsic_name);
         match known_is_valid {
             // We don't know the layout or it's not validity assertion at all, don't touch it
-            None => {}
+            None => false,
             Some(true) => {
                 // If we know the assert panics, indicate to later opts that the call diverges
                 *target = None;
+                true
             }
             Some(false) => {
-                // If we know the assert does not panic, turn the call into a Goto
-                terminator.kind = TerminatorKind::Goto { target: target_block };
+                // If we know the assert does not panic, turn the call into a Goto. We still need to
+                // initialize its unit result.
+                statements.push(Statement::new(
+                    terminator.source_info,
+                    StatementKind::Assign(Box::new((
+                        destination,
+                        Rvalue::Use(
+                            Operand::zero_sized_constant(
+                                self.tcx.types.unit,
+                                terminator.source_info.span,
+                            ),
+                            WithRetag::Yes,
+                        ),
+                    ))),
+                ));
+                terminator.kind = TerminatorKind::goto(target_block);
+                true
             }
         }
     }
@@ -443,10 +479,10 @@ fn intrinsic_assert_panics<'tcx>(
 fn resolve_rust_intrinsic<'tcx>(
     tcx: TyCtxt<'tcx>,
     func_ty: Ty<'tcx>,
-) -> Option<(Symbol, GenericArgsRef<'tcx>)> {
+) -> Option<(Symbol, GenericArgs<'tcx>)> {
     let ty::FnDef(def_id, args) = *func_ty.kind() else { return None };
     let intrinsic = tcx.intrinsic(def_id)?;
-    Some((intrinsic.name, args))
+    Some((intrinsic.name, args.no_bound_vars().unwrap()))
 }
 
 struct SimplifyUbCheck<'tcx> {

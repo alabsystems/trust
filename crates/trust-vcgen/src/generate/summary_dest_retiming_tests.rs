@@ -148,6 +148,7 @@ fn caller(dest_local: usize) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&CALLEE.to_string()),
                         is_foreign: false,
                         func: CALLEE.to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -189,6 +190,7 @@ fn caller(dest_local: usize) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -580,6 +582,9 @@ fn wrapping_neg_caller(dest_local: usize) -> VerifiableFunction {
                         atomic: None,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::num::<impl i64>::wrapping_neg",
+                        ),
                         is_foreign: false,
                     },
                 },
@@ -593,6 +598,7 @@ fn wrapping_neg_caller(dest_local: usize) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -493,16 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verifying_key_from_bad_bytes() {
-        let bad_bytes = [0u8; 32]; // all zeros is not a valid Ed25519 point
-        // Note: all-zeros may or may not be a valid point depending on impl.
-        // Use a clearly invalid approach:
-        let result = CertVerifyingKey::from_bytes(&bad_bytes, TrustLevel::Solver);
-        // Either succeeds or fails; just ensuring no panic
-        let _ = result;
-    }
-
-    #[test]
     fn test_canonical_bytes_deterministic() {
         let cert = make_test_cert();
         let b1 = canonical_bytes(&cert, TrustLevel::Solver);

@@ -18,7 +18,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+trust-bridge-closure = { workspace = true }
 trust-types = { workspace = true }
+# Preserve actual kernel-registered ADT types at the contract elaboration boundary.
+# This validates carrier identity only; it grants no source-refinement authority.
+trust-spec-elab = { workspace = true }
 # Trust (perf): parallelize the edge-free corpus proof loop in `prove_dump_dir`.
 rayon = { workspace = true }
 # §6 driver: count the FULL obligation set (safety VCs + postconditions) per
@@ -47,14 +51,7 @@ clean-kernel = { workspace = true }
 # clean-elab elaborate the agreement theorems against the imported constants
 # (the thin check seam is ported from first-party/clean/crates/clean/src/check.rs
 # — depending on the `clean` facade crate would drag in clean-cli/tokio/server).
-# Trust: explicit path (not `{ workspace = true }`) is REQUIRED for `x.py dist`
-# generate-copyright. clean-olean is the one clean crate reached ONLY through the
-# single cross-workspace path targo-trust -> trust-clean, and `cargo vendor`
-# cannot resolve a `workspace = true` inheritance across that boundary (it fails
-# with "dependency.clean-olean was not found in workspace.dependencies", even
-# though it is in crates/Cargo.toml [workspace.dependencies]). The other clean
-# deps resolve via additional in-graph paths, so only this one needs pinning.
-clean-olean = { path = "../../first-party/clean/crates/clean-olean" }
+clean-olean = { workspace = true }
 clean-parser = { workspace = true }
 clean-elab = { workspace = true }
 # MANIFEST.toml parsing for the vendored-olean provenance gate (fail-closed on
@@ -62,7 +59,11 @@ clean-elab = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 
-[features]
-clean-integration = []
-
 [dev-dependencies]
+# The pinned ay, for the live ay-proof -> replay harness (`src/live_ay_replay_tests.rs`).
+# Already in this crate's NORMAL graph through clean-elab -> clean-auto (which takes it
+# with `default-features = false`; `targo tree -p trust-clean -i ay -e normal`), so naming
+# it here with the same features adds no crate and no feature. An explicit path rather
+# than `{ workspace = true }`, like clean-olean above, whose note records that `cargo
+# vendor` run from targo-trust cannot resolve that inheritance across the boundary.
+ay = { path = "../../first-party/ay/crates/ay", default-features = false }

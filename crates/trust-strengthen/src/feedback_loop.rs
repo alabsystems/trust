@@ -180,7 +180,7 @@ impl FeedbackLoop {
         // Step 3: Generate proposals from failures
         let mut all_proposals: Vec<Proposal> = Vec::new();
         for entry in &entries {
-            let proposals = crate::proposer::strengthen(
+            let proposals = crate::proposer::strengthen_for_function(
                 &entry.function_path,
                 &entry.function_name,
                 std::slice::from_ref(&entry.analysis),
@@ -237,7 +237,7 @@ impl FeedbackLoop {
             self.collector.record(
                 proposal,
                 ProposalSource::Heuristic,
-                &pattern_name_for_kind(&proposal.kind),
+                pattern_name_for_kind(&proposal.kind),
                 true,
                 VerificationOutcome::Proved,
                 0,
@@ -249,7 +249,7 @@ impl FeedbackLoop {
             self.collector.record(
                 proposal,
                 ProposalSource::Heuristic,
-                &pattern_name_for_kind(&proposal.kind),
+                pattern_name_for_kind(&proposal.kind),
                 false,
                 VerificationOutcome::Error,
                 0,
@@ -308,7 +308,7 @@ impl FeedbackLoop {
 
         // Generate proposals from each entry
         for entry in entries {
-            let proposals = crate::proposer::strengthen(
+            let proposals = crate::proposer::strengthen_for_function(
                 &entry.function_path,
                 &entry.function_name,
                 std::slice::from_ref(&entry.analysis),
@@ -408,14 +408,14 @@ pub fn classify_failures(entries: &[FeedbackEntry]) -> FxHashMap<FailureClass, u
 }
 
 /// Get a pattern name string from a proposal kind (for feedback tracking).
-fn pattern_name_for_kind(kind: &ProposalKind) -> String {
+fn pattern_name_for_kind(kind: &ProposalKind) -> &'static str {
     match kind {
-        ProposalKind::AddPrecondition { .. } => "precondition".to_string(),
-        ProposalKind::AddPostcondition { .. } => "postcondition".to_string(),
-        ProposalKind::AddInvariant { .. } => "invariant".to_string(),
-        ProposalKind::SafeArithmetic { .. } => "safe_arithmetic".to_string(),
-        ProposalKind::AddBoundsCheck { .. } => "bounds_check".to_string(),
-        ProposalKind::AddNonZeroCheck { .. } => "nonzero_check".to_string(),
+        ProposalKind::AddPrecondition { .. } => "precondition",
+        ProposalKind::AddPostcondition { .. } => "postcondition",
+        ProposalKind::AddInvariant { .. } => "invariant",
+        ProposalKind::SafeArithmetic { .. } => "safe_arithmetic",
+        ProposalKind::AddBoundsCheck { .. } => "bounds_check",
+        ProposalKind::AddNonZeroCheck { .. } => "nonzero_check",
     }
 }
 
@@ -507,6 +507,26 @@ mod tests {
             total_from_notes: 0,
             total_with_assumptions: 0,
         }
+    }
+
+    /// A real source file defining `func`, removed on drop. Overflow proposals
+    /// name the function's operands, so they need its source.
+    struct FuncSource(std::path::PathBuf);
+
+    impl Drop for FuncSource {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn make_overflow_result_with_source(tag: &str) -> (FuncSource, CrateVerificationResult) {
+        let path = std::env::temp_dir()
+            .join(format!("trust_strengthen_feedback_{tag}_{}.rs", std::process::id()));
+        std::fs::write(&path, "pub fn func(a: u64, b: u64) -> u64 {\n    a + b\n}\n")
+            .expect("write temp source");
+        let mut results = make_crate_result(vec![(make_overflow_vc(), failed_result())]);
+        results.functions[0].function_path = path.display().to_string();
+        (FuncSource(path), results)
     }
 
     fn make_multi_function_result() -> CrateVerificationResult {
@@ -651,7 +671,7 @@ mod tests {
     #[test]
     fn test_feedback_loop_single_failure() {
         let mut fl = FeedbackLoop::new();
-        let results = make_crate_result(vec![(make_overflow_vc(), failed_result())]);
+        let (_source, results) = make_overflow_result_with_source("single");
         let result = fl.run_iteration(&results);
         assert_eq!(result.total_failures, 1);
         assert!(!result.accepted_proposals.is_empty());
@@ -678,7 +698,7 @@ mod tests {
     #[test]
     fn test_feedback_loop_tracks_prior_proposals() {
         let mut fl = FeedbackLoop::new();
-        let results = make_crate_result(vec![(make_overflow_vc(), failed_result())]);
+        let (_source, results) = make_overflow_result_with_source("tracks");
         let _ = fl.run_iteration(&results);
         assert!(fl.prior_proposal_count() > 0);
     }
@@ -688,7 +708,7 @@ mod tests {
         let mut fl = FeedbackLoop::new();
 
         // First iteration: generates proposals and stores them as prior
-        let results = make_crate_result(vec![(make_overflow_vc(), failed_result())]);
+        let (_source, results) = make_overflow_result_with_source("learns");
         let _ = fl.run_iteration(&results);
 
         // Second iteration: should have improved proposals from learning
@@ -715,7 +735,7 @@ mod tests {
     fn test_feedback_loop_no_gate() {
         let config = FeedbackLoopConfig { use_structural_gate: false, ..Default::default() };
         let mut fl = FeedbackLoop::with_config(config);
-        let results = make_crate_result(vec![(make_overflow_vc(), failed_result())]);
+        let (_source, results) = make_overflow_result_with_source("nogate");
         let result = fl.run_iteration(&results);
         assert!(result.rejected_proposals.is_empty(), "no gate means no rejections");
         assert!(!result.accepted_proposals.is_empty());

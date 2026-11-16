@@ -17,10 +17,27 @@ authors.workspace = true
 workspace = true
 
 [features]
-# Enable Mach-O binary loading via trust-binary-parse.
-# Disabled by default because trust-binary-parse has pre-existing compile issues.
+# ELF and Mach-O loading are ON by default. With neither, `lift_binary_to_trust_ir`
+# returns `LiftError::BinaryParserUnavailable`, which also silently disables
+# trust-vcgen's `analyze_compiled_binary` and trust-backprop's compiled-binary
+# plan for every consumer that does not happen to enable a parser itself.
+#
+# They were off from the initial commit (06efaa37ef, 2026-05-24) on a note that
+# trust-binary-parse "has pre-existing compile issues". Re-measured false
+# 2026-09-27 (`targo --unverified test -p <crate> --lib`, all EXIT=0): trust-lift
+# with no parser 196 passed, `macho` 208, `elf` 214, `elf,macho` 215;
+# trust-binary-parse 357.
+#
+# What default-on costs, measured the same day. trust-lift sits under the
+# compiler (rustc_mir_transform -> trust-vcgen -> trust-lift), so
+# trust-binary-parse (~15.8k lines, first-party, no dependency outside that
+# graph) now builds there too: 3.6 s in a cold release build at load ~28, in
+# parallel with trust-machine-sem. It adds no package to any Cargo.lock. `--no-default-features` still builds
+# the parser-free lifter; `no_parser_feature_returns_clear_error` covers it.
+default = ["elf", "macho"]
+# Mach-O loading via trust-binary-parse.
 macho = ["dep:trust-binary-parse"]
-# Enable ELF binary loading via trust-binary-parse.
+# ELF loading via trust-binary-parse.
 elf = ["dep:trust-binary-parse"]
 # Enable ay solver integration for verification of lifted code.
 ay-verify = ["dep:ay"]
@@ -30,11 +47,18 @@ trust-binary-parse = { workspace = true, optional = true }
 trust-disasm = { workspace = true }
 trust-machine-sem = { workspace = true }
 # Pure data layer over trust-types (LiftedFunction -> VerifiableFunction);
-# trust-lift never uses the `Discharge` `?`-sugar, so it must not transitively
-# re-enable trust-types' nightly `try-sugar` feature. Depend with
-# default-features = false (instead of `{ workspace = true }`) so trust-lift
-# and its production consumers (trust-vcgen, hence the `clean` workspace) build
-# on the stable release channel. See trust-vcgen/Cargo.toml for the rationale.
+# trust-lift never uses the `Discharge` `?`-sugar, so its own edge does not ask
+# for trust-types' nightly `try-sugar` feature (default-features = false,
+# instead of `{ workspace = true }`). trust-binary-parse (pulled in by the default
+# `elf`/`macho`) drops the default the same way, so `try-sugar` is off in this
+# crate's whole graph — measured 2026-09-27 with
+# `targo tree -p trust-lift -e features -i trust-types`, which showed that edge
+# had been the ONLY thing turning it on. That still does NOT make trust-lift
+# stable-buildable: trust-machine-sem, a non-optional dependency, declares
+# `#![feature(register_tool)]` (since the initial commit).
+# No manifest under first-party/clean references trust-lift or trust-vcgen
+# (checked 2026-09-27), and trust-vcgen is Trust-toolchain-only through
+# trust-widthconv (see trust-vcgen/Cargo.toml).
 trust-types = { path = "../trust-types", default-features = false }
 thiserror = { workspace = true }
 ay = { workspace = true, optional = true }

@@ -8,9 +8,9 @@
 #
 # WHY each guard exists (a verifier must never hang on one obligation):
 #   - Per-function and per-obligation bounds are rustc tracked options. Targo
-#       supplies the compiler defaults plus `trust.toml`'s public timeout policy.
-#   - AY executable selection comes from Targo's public solver configuration and
-#       is translated to a tracked compiler option by `targo trust check`.
+#       derives them from the workspace root's `[trust]` `effort` and `backstop`
+#       (the builtin budget profile when unset); `trust.toml` sets no budget.
+#   - There is no AY executable to select: the solver is linked into trustc.
 #   - perl alarm backstop        process-level wall clock; kills the whole compile
 #       if an uncovered engine path still spins. macOS has no `timeout(1)`.
 #
@@ -61,16 +61,16 @@ if [ -n "${TRUST_VERIFY_FN_BUDGET_MS+x}" ]; then
   exit 2
 fi
 if [ -n "${TRUST_TIMEOUT_MS+x}" ]; then
-  echo "TRUST_TIMEOUT_MS has been removed; set timeout_ms in trust.toml so Targo can track it" >&2
+  echo "TRUST_TIMEOUT_MS has been removed; set backstop in the workspace root's [trust] table so Targo can track it" >&2
   exit 2
 fi
 if [ -n "${SURVEY_NO_AY_TIMEOUT+x}" ]; then
-  echo "SURVEY_NO_AY_TIMEOUT has been removed; solver bounds and AY selection are tracked by Targo" >&2
+  echo "SURVEY_NO_AY_TIMEOUT has been removed; solver bounds are tracked by Targo and the AY solver is linked into trustc" >&2
   exit 2
 fi
 
 # Do not forward any retired compiler controls. `targo trust check` owns the
-# tracked survey, timeout, scope, and AY options for every Cargo unit.
+# tracked survey, timeout and scope options for every Cargo unit.
 unset TRUST_VERIFY_FN_BUDGET_MS TRUST_VERIFY_POLICY TRUST_VERIFY_PRIMARY_ONLY
 unset TRUST_TIMEOUT_MS AY_DIRECT_SOLVE_TIMEOUT_MS TRUST_VERIFY_SURVEY TRUST_SKIP_FUNCTIONS
 
@@ -81,9 +81,11 @@ echo "contracts replay: $CONTRACTS"                          | tee -a "$LOG"
 echo "bounds       : compiler/AY tracked by Targo; run=${RUN_TIMEOUT_S}s" | tee -a "$LOG"
 echo "json         : $JSON"                                  | tee -a "$LOG"
 
-# Verification runs DURING compilation, so a cached crate makes trustc skip
-# re-verifying and targo emits a degraded probe. Clean just this package to
-# force a recompile + re-verify (generic; no crate-layout assumptions).
+# Verification runs DURING compilation. Targo keys every verified unit on a
+# per-run session nonce, so the surveyed package recompiles and re-verifies on
+# every run, and a proof unit Cargo still reports as fresh is refused, not
+# counted. Cleaning just this package first is redundant with that and harmless
+# (generic; no crate-layout assumptions).
 "$TARGO" clean -p "$CRATE" --manifest-path "$WS/Cargo.toml" >/dev/null 2>&1 || true
 
 # perl alarm = process-level backstop (no timeout(1) on macOS). Run from the

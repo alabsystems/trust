@@ -32,6 +32,7 @@
         * [Features Examples](reference/features-examples.md)
     * [Profiles](reference/profiles.md)
     * [Configuration](reference/config.md)
+        * [Test Plans (Trust)](reference/test-plan.md)
     * [Environment Variables](reference/environment-variables.md)
     * [Build Scripts](reference/build-scripts.md)
         * [Build Script Examples](reference/build-script-examples.md)

@@ -1,0 +1,1 @@
+fn addition(x:u64)->u64{x.wrapping_add(18446744073709551615u64)}

@@ -250,18 +250,9 @@ impl HeuristicStrategy {
 impl SearchStrategy for HeuristicStrategy {
     fn next(&mut self, forks: Vec<ExecutionFork>) -> Option<ExecutionFork> {
         self.pool.extend(forks);
-        if self.pool.is_empty() {
-            return None;
-        }
         // Find the best-scoring fork.
-        let best_idx = self
-            .pool
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, f)| self.score(f))
-            .map(|(i, _)| i)
-            // SAFETY: We checked pool.is_empty() above and returned None.
-            .unwrap_or_else(|| unreachable!("pool empty after non-empty check"));
+        let best_idx =
+            self.pool.iter().enumerate().max_by_key(|(_, f)| self.score(f)).map(|(i, _)| i)?;
         Some(self.pool.swap_remove(best_idx))
     }
 

@@ -136,7 +136,10 @@ fn prelude() -> Environment {
         .copied()
         .filter(|name| env.get_const(&Name::from_string(name)).is_none())
         .collect();
-    assert!(missing.is_empty(), "the builtin prelude must provide the encoding; missing {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "the builtin prelude must provide the encoding; missing {missing:?}"
+    );
     env
 }
 
@@ -237,10 +240,8 @@ fn build_probe_sum(broken: Break) -> (Expr, Expr) {
     let n = f.next();
     let rec_ty = {
         let k = f.next();
-        let inner = Expr::arrow(
-            lt(Expr::fvar(k), Expr::fvar(n)),
-            Expr::app(motive.clone(), Expr::fvar(k)),
-        );
+        let inner =
+            Expr::arrow(lt(Expr::fvar(k), Expr::fvar(n)), Expr::app(motive.clone(), Expr::fvar(k)));
         Expr::pi(BinderInfo::Default, nat(), inner.abstract_fvar(k))
     };
     let rec = f.next();
@@ -253,12 +254,7 @@ fn build_probe_sum(broken: Break) -> (Expr, Expr) {
     // `Nat.sub_lt b 1 h (Nat.zero_lt_succ Nat.zero) : Nat.lt (Nat.sub b 1) b`
     let sub_lt = Expr::apps(
         c("Nat.sub_lt"),
-        [
-            Expr::fvar(b),
-            one.clone(),
-            Expr::fvar(h),
-            Expr::app(c("Nat.zero_lt_succ"), zero.clone()),
-        ],
+        [Expr::fvar(b), one.clone(), Expr::fvar(h), Expr::app(c("Nat.zero_lt_succ"), zero.clone())],
     );
     // `Nat.add_lt_add_left (b-1) b sub_lt a : Nat.lt (a + (b-1)) (a + b)` — the
     // real obligation: the SUM decreases although neither summand is inspected
@@ -325,10 +321,7 @@ fn build_probe_sum(broken: Break) -> (Expr, Expr) {
         c_at("WellFounded.fix", vec![l1.clone(), l1]),
         [nat(), motive, relation, hwf, fix_body, succ_m.clone()],
     );
-    let seed_proof = Expr::app(
-        c("Nat.le.refl"),
-        if broken == Break::Seed { m_o } else { succ_m },
-    );
+    let seed_proof = Expr::app(c("Nat.le.refl"), if broken == Break::Seed { m_o } else { succ_m });
     let applied = Expr::apps(fix, [Expr::fvar(a_o), Expr::fvar(b_o), seed_proof]);
     let value = {
         let t = Expr::lam(BinderInfo::Default, nat(), applied.abstract_fvar(b_o));
@@ -581,8 +574,9 @@ fn q3_the_reader_reads_the_elaborated_phase3_body() {
          termination_by a + b",
     )
     .expect("the `+ 1` spelling elaborates");
-    let plan = plan_clean_origin_body(&plus_one, "probeSumPlus")
-        .unwrap_or_else(|refusal| panic!("the phase-3 lane must PLAN this body: {}", refusal.note()));
+    let plan = plan_clean_origin_body(&plus_one, "probeSumPlus").unwrap_or_else(|refusal| {
+        panic!("the phase-3 lane must PLAN this body: {}", refusal.note())
+    });
     assert_eq!(
         format!("{:?}", plan.shape()),
         "WellFoundedNatRec { zero_value: Param(0), nonzero_value: Add(Rec, NatConst(1)), \
@@ -710,9 +704,8 @@ fn blank_measure_binders(functional: &Expr, arity: usize) -> Expr {
 fn q4_the_gate_parses_a_phase3_side_a_and_borrows_its_decrease_slots() {
     let env = island(PROBE_SUM_SOURCE).expect("the elaborated fixture is this probe's side A");
     let anatomy = read_wf_sum_measure_anatomy(&body_of(&env, "probeSum")).expect("reads");
-    let reflected = ReflectedWfFunctional {
-        functional: honest_side_b(anatomy.functional(), anatomy.arity()),
-    };
+    let reflected =
+        ReflectedWfFunctional { functional: honest_side_b(anatomy.functional(), anatomy.arity()) };
 
     // Non-vacuity first: side B really is DIFFERENT from side A before the
     // borrow — it holds a constant the environment does not even declare.
@@ -814,13 +807,12 @@ fn c2_a_side_b_at_the_wrong_phase3_layout_is_refused() {
     // The measure plumbing is blanked honestly; ONLY the decrease slot sits at
     // phase 2's position (the second argument, which phase 3 uses for the
     // course-of-values hypothesis).
-    let wrong_slot = side_b_from(anatomy.functional(), arity, &move |position, argument| {
-        match position {
+    let wrong_slot =
+        side_b_from(anatomy.functional(), arity, &move |position, argument| match position {
             0 => measure_sentinel(),
             _ if position == phase2_slot => sentinel(),
             _ => argument.clone(),
-        }
-    });
+        });
     let wrong_slot = blank_measure_binders(&wrong_slot, arity);
     let refusal = check_faithful_wf_functional(
         &env,
@@ -846,8 +838,10 @@ fn c2_a_side_b_at_the_wrong_phase3_layout_is_refused() {
     .err()
     .expect("a self-call one argument short must be REFUSED");
     assert!(
-        format!("{refusal:?}").contains("argument(s) where a self-call at this arity and \
-                                         lowering carries 5"),
+        format!("{refusal:?}").contains(
+            "argument(s) where a self-call at this arity and \
+                                         lowering carries 5"
+        ),
         "the refusal must name the lowering's own call arity: {refusal:?}"
     );
 
@@ -976,8 +970,9 @@ const ADD_ACC_SOURCE: &str = "def addAcc (n acc : Nat) : Nat := \
 fn p2_a_phase2_body_still_plans_byte_identically() {
     let env = island(ADD_ACC_SOURCE)
         .unwrap_or_else(|why| panic!("the phase-2 fixture must still elaborate: {why}"));
-    let plan = plan_clean_origin_body(&env, "addAcc")
-        .unwrap_or_else(|refusal| panic!("the phase-2 fixture must still PLAN: {}", refusal.note()));
+    let plan = plan_clean_origin_body(&env, "addAcc").unwrap_or_else(|refusal| {
+        panic!("the phase-2 fixture must still PLAN: {}", refusal.note())
+    });
 
     assert_eq!(
         format!("{:?}", plan.shape()),

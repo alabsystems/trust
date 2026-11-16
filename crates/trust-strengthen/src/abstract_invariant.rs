@@ -365,10 +365,9 @@ impl InvariantInferrer {
     /// Checks: applying the loop body to the invariant domain yields a state
     /// contained in (or equal to) the invariant domain.
     pub fn validate_invariant(&self, candidate: &InvariantCandidate, loop_body: &str) -> bool {
-        let statements: Vec<&str> = loop_body.lines().filter(|l| !l.trim().is_empty()).collect();
         let mut state = candidate.domain.clone();
 
-        for stmt in &statements {
+        for stmt in loop_body.lines().filter(|l| !l.trim().is_empty()) {
             state = self.abstract_transfer(&state, stmt);
         }
 
@@ -586,12 +585,9 @@ impl InvariantInferrer {
 fn parse_increment(stmt: &str) -> Option<i64> {
     let stmt = stmt.trim();
     // Match "VAR = VAR + N" or "VAR = VAR - N"
-    let parts: Vec<&str> = stmt.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let lhs = parts[0].trim();
-    let rhs = parts[1].trim();
+    let (lhs, rhs) = stmt.split_once('=')?;
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
 
     // Try "VAR + N"
     if let Some(rest) = rhs.strip_prefix(lhs) {
@@ -610,11 +606,8 @@ fn parse_increment(stmt: &str) -> Option<i64> {
 /// Parse "x = N" where N is a constant integer.
 fn parse_const_assign(stmt: &str) -> Option<i64> {
     let stmt = stmt.trim();
-    let parts: Vec<&str> = stmt.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let rhs = parts[1].trim();
+    let (_, rhs) = stmt.split_once('=')?;
+    let rhs = rhs.trim();
     // Only match if RHS is a plain integer (not an expression)
     if rhs.contains('+') || rhs.contains('-') && !rhs.starts_with('-') {
         return None;
@@ -624,14 +617,14 @@ fn parse_const_assign(stmt: &str) -> Option<i64> {
 
 /// Extract variable names from the loop body and init state.
 fn extract_variables(loop_body: &str, init_state: &str) -> Vec<String> {
-    let mut vars = Vec::new();
+    let mut vars: Vec<String> = Vec::new();
     for line in init_state.lines().chain(loop_body.lines()) {
         let line = line.trim();
         if let Some(eq_pos) = line.find('=') {
             let lhs = line[..eq_pos].trim();
             if !lhs.is_empty()
                 && lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
-                && !vars.contains(&lhs.to_string())
+                && !vars.iter().any(|v| v == lhs)
             {
                 vars.push(lhs.to_string());
             }

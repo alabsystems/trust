@@ -1,7 +1,6 @@
 //! Tests for profiles defined in config files.
 
 use crate::prelude::*;
-use cargo_test_support::registry::Package;
 use cargo_test_support::{basic_lib_manifest, paths, project, str};
 use cargo_util_schemas::manifest::TomlDebugInfo;
 
@@ -40,7 +39,8 @@ Caused by:
 "#]])
         .run();
 
-    p.cargo("check -v -Zprofile-rustflags")
+    p.cargo("check -v")
+        .arg("-Zprofile-rustflags")
         .masquerade_as_nightly_cargo(&["profile-rustflags"])
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.0.1 ([ROOT]/foo)
@@ -228,7 +228,7 @@ fn profile_config_override_spec_multiple() {
     p.cargo("build -v")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] multiple package overrides in profile `dev` match package `bar v0.5.0 ([ROOT]/foo/bar)`
 found package specs: bar, bar@0.5.0
 
@@ -262,7 +262,7 @@ fn profile_config_all_options() {
         .env_remove("CARGO_INCREMENTAL")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..] -C opt-level=1 -C panic=abort -C lto[..]-C codegen-units=2 -C debuginfo=2 [..]-C debug-assertions=on -C overflow-checks=off [..]-C rpath --out-dir [ROOT]/foo/target/release/deps -C incremental=[ROOT]/foo/target/release/incremental[..]`
+[RUNNING] `rustc --crate-name foo [..] -C opt-level=1 -C panic=abort -C lto[..]-C codegen-units=2 -C debuginfo=2 [..]-C debug-assertions=on -C overflow-checks=off [..]-C rpath --out-dir [ROOT]/foo/target/release/build/foo/[HASH]/out -C incremental=[ROOT]/foo/target/release/incremental[..]`
 [FINISHED] `release` profile [optimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -289,6 +289,9 @@ fn profile_config_override_precedence() {
 
                 [profile.dev.package.bar]
                 opt-level = 3
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -305,7 +308,7 @@ fn profile_config_override_precedence() {
 
     p.cargo("build -v")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
 [RUNNING] `rustc --crate-name bar [..] -C opt-level=2[..]-C codegen-units=2 [..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
@@ -372,10 +375,10 @@ fn named_config_profile() {
     // foo -> middle -> bar -> dev
     // middle exists in Cargo.toml, the others in .cargo/config.toml
     use super::config::GlobalContextBuilder;
-    use cargo::core::compiler::CompileKind;
-    use cargo::core::profiles::{Profiles, UnitFor};
-    use cargo::core::{PackageId, Workspace};
     use std::fs;
+    use targo::compiler::CompileKind;
+    use targo::workspace::profiles::{Profiles, UnitFor};
+    use targo::workspace::{PackageId, Workspace};
     paths::root().join(".cargo").mkdir_p();
     fs::write(
         paths::root().join(".cargo/config.toml"),
@@ -424,13 +427,13 @@ fn named_config_profile() {
     let ws = Workspace::new(&paths::root().join("Cargo.toml"), &gctx).unwrap();
     let profiles = Profiles::new(&ws, profile_name).unwrap();
 
-    let crates_io = cargo::core::SourceId::crates_io(&gctx).unwrap();
+    let crates_io = targo::workspace::SourceId::crates_io(&gctx).unwrap();
     let a_pkg = PackageId::try_new("a", "0.1.0", crates_io).unwrap();
     let dep_pkg = PackageId::try_new("dep", "0.1.0", crates_io).unwrap();
 
     // normal package
     let kind = CompileKind::Host;
-    let p = profiles.get_profile(a_pkg, true, true, UnitFor::new_normal(kind), kind);
+    let p = profiles.get_profile(a_pkg, None, true, true, UnitFor::new_normal(kind), kind);
     assert_eq!(p.name, "foo");
     assert_eq!(p.codegen_units, Some(2)); // "foo" from config
     assert_eq!(p.opt_level, "1"); // "middle" from manifest
@@ -439,7 +442,14 @@ fn named_config_profile() {
     assert_eq!(p.overflow_checks, true); // "dev" built-in (ignore package override)
 
     // build-override
-    let bo = profiles.get_profile(a_pkg, true, true, UnitFor::new_host(false, kind), kind);
+    let bo = profiles.get_profile(
+        a_pkg,
+        None,
+        true,
+        true,
+        UnitFor::new_host(false, kind),
+        kind,
+    );
     assert_eq!(bo.name, "foo");
     assert_eq!(bo.codegen_units, Some(6)); // "foo" build override from config
     assert_eq!(bo.opt_level, "0"); // default to zero
@@ -448,7 +458,7 @@ fn named_config_profile() {
     assert_eq!(bo.overflow_checks, true); // SAME as normal
 
     // package overrides
-    let po = profiles.get_profile(dep_pkg, false, true, UnitFor::new_normal(kind), kind);
+    let po = profiles.get_profile(dep_pkg, None, false, true, UnitFor::new_normal(kind), kind);
     assert_eq!(po.name, "foo");
     assert_eq!(po.codegen_units, Some(7)); // "foo" package override from config
     assert_eq!(po.opt_level, "1"); // SAME as normal
@@ -486,10 +496,7 @@ fn named_env_profile() {
 }
 
 #[cargo_test]
-fn test_with_dev_profile() {
-    // The `test` profile inherits from `dev` for both local crates and
-    // dependencies.
-    Package::new("somedep", "1.0.0").publish();
+fn check_uses_build_profile() {
     let p = project()
         .file(
             "Cargo.toml",
@@ -498,28 +505,148 @@ fn test_with_dev_profile() {
             name = "foo"
             version = "0.1.0"
             edition = "2015"
-
-            [dependencies]
-            somedep = "1.0"
             "#,
         )
-        .file("src/lib.rs", "")
+        .file("src/main.rs", "fn main() {}")
         .build();
-    p.cargo("test --lib --no-run -v")
-        .env("CARGO_PROFILE_DEV_DEBUG", "0")
+    p.cargo("check")
+        .env("CARGO_BUILD_PROFILE", "release")
         .with_stderr_data(str![[r#"
-[UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
-[DOWNLOADING] crates ...
-[DOWNLOADED] somedep v1.0.0 (registry `dummy-registry`)
-[COMPILING] somedep v1.0.0
-[RUNNING] `rustc --crate-name somedep [..]`
-[COMPILING] foo v0.1.0 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name foo [..]`
-[FINISHED] `test` profile [unoptimized] target(s) in [ELAPSED]s
-[EXECUTABLE] `[ROOT]/foo/target/debug/deps/foo-[HASH][EXE]`
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
 
 "#]])
-        .with_stdout_does_not_contain("[..] -C debuginfo=0[..]")
+        .run();
+}
+
+#[cargo_test]
+fn check_ignores_install_profile() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    p.cargo("check")
+        .env("CARGO_INSTALL_PROFILE", "release")
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn test_uses_build_profile() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    p.cargo("test --no-run")
+        .env("CARGO_BUILD_PROFILE", "release")
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
+[EXECUTABLE] unittests src/main.rs (target/release/build/foo/[HASH]/out/foo-[HASH][EXE])
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn test_ignores_install_profile() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    p.cargo("test --no-run")
+        .env("CARGO_INSTALL_PROFILE", "release")
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[EXECUTABLE] unittests src/main.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn install_uses_install_profile() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    p.cargo("install")
+        .env("CARGO_INSTALL_PROFILE", "debug")
+        .with_stderr_data(str![[r#"
+[WARNING] using `cargo install` to install the binaries from the package in current working directory is deprecated, use `cargo install --path .` instead. [NOTE] use `cargo build` if you want to simply build the package.
+[INSTALLING] foo v0.1.0 ([ROOT]/foo)
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `debug` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[INSTALLING] [ROOT]/home/.cargo/bin/foo[EXE]
+[INSTALLED] package `foo v0.1.0 ([ROOT]/foo)` (executable `foo[EXE]`)
+[WARNING] be sure to add `[ROOT]/home/.cargo/bin` to your PATH to be able to run the installed binaries
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn install_ignores_build_profile() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    p.cargo("install")
+        .env("CARGO_BUILD_PROFILE", "dev")
+        .with_stderr_data(str![[r#"
+[WARNING] using `cargo install` to install the binaries from the package in current working directory is deprecated, use `cargo install --path .` instead. [NOTE] use `cargo build` if you want to simply build the package.
+[INSTALLING] foo v0.1.0 ([ROOT]/foo)
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
+[INSTALLING] [ROOT]/home/.cargo/bin/foo[EXE]
+[INSTALLED] package `foo v0.1.0 ([ROOT]/foo)` (executable `foo[EXE]`)
+[WARNING] be sure to add `[ROOT]/home/.cargo/bin` to your PATH to be able to run the installed binaries
+
+"#]])
         .run();
 }

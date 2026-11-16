@@ -1,0 +1,15 @@
+[package]
+name = "trust-determinism-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The determinism instrument (`targo trust stability`, run from this directory)
+# verifies this crate on several axes and requires the SAME verdict vector
+# every time.
+# No dependencies: the verdicts must be a function of this source alone.
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

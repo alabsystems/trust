@@ -149,7 +149,8 @@ pub fn modular_composition_with_deps(
         }
 
         let mut path = Vec::new();
-        for &node in color.clone().keys() {
+        let nodes: Vec<&str> = color.keys().copied().collect();
+        for node in nodes {
             if color[node] == 0
                 && let Some(cycle) = dfs_find_cycle(node, &adj, &mut color, &mut path)
             {

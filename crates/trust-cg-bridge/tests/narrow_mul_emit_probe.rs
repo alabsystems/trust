@@ -1,20 +1,39 @@
-// narrow_mul_emit_probe.rs — SCRATCH DIAGNOSTIC (session 2026-08-31): the
-// stage1 F1 lane refuses `fn pack(a: u8, b: u8) -> u16 { (b as u16) * 256 +
-// (a as u16) }` with "verification emission produced no shippable object
-// bytes" — the gate's early Unknown swallows emit_object's real error. This
-// probe lowers the same narrow checked-mul shape and calls emit_object
-// directly so the error is readable. Keep or fold into a real pin once the
-// root cause lands.
+// narrow_mul_emit_probe.rs — regression pin for the narrow checked-mul emit
+// path. Before b47640f463 (2026-08-31, "bridge(module-to-lir): narrow checked
+// ADD/SUB widen too") the stage1 F1 lane refused
+// `fn pack(a: u8, b: u8) -> u16 { (b as u16) * 256 + (a as u16) }` with
+// "verification emission produced no shippable object bytes" — the gate's
+// early Unknown swallowed emit_object's real error. This test lowers the same
+// narrow checked-mul shape and calls emit_object directly, so a regression
+// surfaces as the real emit error rather than the swallowed Unknown.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-#![cfg(feature = "ay-proofs")]
+// Trust (2026-09-30, plan §5 fail-open item 1): every shipping `module_to_lir`
+// entry point now refuses an `Assert`-bearing body as
+// `ModuleLirError::ImplicitPanicUnfaithful` — the `Brif`/`Trap` lowering this
+// file proves is a bare `brk`, not Rust's panic. The proofs stay under test
+// for plan §5 item P through the trap oracle, which exists only under the
+// non-default `test-hooks` feature (never enabled by the compiler); this file
+// moved from the `ay-proofs` lane to `test-hooks` with it (`test-hooks`
+// implies `ay-proofs`).
+#![cfg(feature = "test-hooks")]
 
 use trust_cg_bridge::codegen_backend::{
     BridgeOptimizationLevel, TrustCgCodegenBackend, TrustCgTargetArch,
 };
-use trust_cg_bridge::module_to_lir::lower_module_to_lir;
+use trust_cg_bridge::module_to_lir::lower_trust_ir_function_to_lir_trap_assert_oracle;
+
+/// The trap oracle under the name this file always used (see the note at the
+/// top): `Assert` lowers to `Brif`/`Trap` here and is refused everywhere else.
+fn lower_module_to_lir(
+    module: &trust_ir::Module,
+    func_id: trust_ir::value::FuncId,
+) -> Result<trust_cg_lower::function::Function, trust_cg_bridge::ModuleLirError> {
+    let function = module.function_by_id(func_id).expect("function id present in the module");
+    lower_trust_ir_function_to_lir_trap_assert_oracle(module, function, false)
+}
 use trust_ir::inst::{Inst, OverflowOp};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::FuncTy;
@@ -31,6 +50,7 @@ fn narrow_u16_checked_mul_emits_object_bytes() {
         params: vec![Ty::U16, Ty::U16],
         returns: vec![Ty::U16],
         is_vararg: false,
+        abi: None,
     });
     let mut f = IrFunction::new(FuncId::new(0), "pack", FuncTyId::new(0), BlockId::new(0));
     let mut b0 = Block::new(BlockId::new(0));
@@ -57,7 +77,11 @@ fn narrow_u16_checked_mul_emits_object_bytes() {
             else_val: ValueId::new(6),
         })
         .with_result(ValueId::new(7)),
-        InstrNode::new(Inst::Assert { cond: ValueId::new(7) }),
+        InstrNode::new(Inst::Assert {
+            cond: ValueId::new(7),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        }),
         InstrNode::new(Inst::Return { values: vec![ValueId::new(3)] }),
     ];
     f.blocks.push(b0);
@@ -78,12 +102,13 @@ fn narrow_u16_checked_mul_emits_object_bytes() {
 /// before the widened mul and the add.
 #[test]
 fn u8_to_u16_zext_mul_add_emits_object_bytes() {
-    use trust_ir::inst::{BinOp, CastOp};
+    use trust_ir::inst::CastOp;
     let mut module = Module::new("t");
     module.func_types.push(FuncTy {
         params: vec![Ty::U8, Ty::U8],
         returns: vec![Ty::U16],
         is_vararg: false,
+        abi: None,
     });
     let mut f = IrFunction::new(FuncId::new(0), "pack8", FuncTyId::new(0), BlockId::new(0));
     let mut b0 = Block::new(BlockId::new(0));
@@ -117,7 +142,11 @@ fn u8_to_u16_zext_mul_add_emits_object_bytes() {
             else_val: ValueId::new(7),
         })
         .with_result(ValueId::new(8)),
-        InstrNode::new(Inst::Assert { cond: ValueId::new(8) }),
+        InstrNode::new(Inst::Assert {
+            cond: ValueId::new(8),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        }),
         InstrNode::new(Inst::Cast {
             op: CastOp::ZExt,
             src_ty: Ty::U8,
@@ -139,7 +168,11 @@ fn u8_to_u16_zext_mul_add_emits_object_bytes() {
             else_val: ValueId::new(7),
         })
         .with_result(ValueId::new(12)),
-        InstrNode::new(Inst::Assert { cond: ValueId::new(12) }),
+        InstrNode::new(Inst::Assert {
+            cond: ValueId::new(12),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        }),
         InstrNode::new(Inst::Return { values: vec![ValueId::new(10)] }),
     ];
     f.blocks.push(b0);

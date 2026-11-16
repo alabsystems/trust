@@ -12,7 +12,7 @@
 
 [package]
 name = "trust-spec-elab"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 publish = false
 description = "L1→L2 spec elaborator: surface contract clauses → clean_kernel::Expr goals (total over the supported fragment, fail-closed outside it), with prove+certify plumbing through clean-auto and the honesty meter."
@@ -35,5 +35,9 @@ cert-meter = { package = "trust-cert-meter", path = "../trust-cert-meter" }
 # `trust-symbols`' sealed `KernelAuthority` seam and this crate never holds the
 # token. Every admission it mints is `Reflected`.
 trust-symbols = { path = "../trust-symbols" }
+# The canonical E6 bridge consumes the actual typed body. This data crate is
+# already in the normal graph through trust-symbols; no solver or certificate
+# manager is needed to call the existing importer. Keep its optional bridges off.
+trust-types = { path = "../trust-types", default-features = false }
 syn = { workspace = true }
 quote = { workspace = true }

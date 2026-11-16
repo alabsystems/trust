@@ -1,0 +1,274 @@
+{
+  "name": "ok_cd32",
+  "def_path": "literal_pair_width_arms::ok_cd32",
+  "span": {
+    "file": "literal_pair_width_arms.rs",
+    "line_start": 85,
+    "col_start": 0,
+    "line_end": 87,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 1,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 7
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 86,
+                "col_start": 4,
+                "line_end": 86,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 1,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 1,
+            "span": {
+              "file": "literal_pair_width_arms.rs",
+              "line_start": 86,
+              "col_start": 4,
+              "line_end": 86,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 7
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 86,
+                "col_start": 4,
+                "line_end": 86,
+                "col_end": 4
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 100
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -2147483648
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 86,
+                "col_start": 4,
+                "line_end": 86,
+                "col_end": 4
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 86,
+                "col_start": 4,
+                "line_end": 86,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Div"
+            },
+            "target": 2,
+            "span": {
+              "file": "literal_pair_width_arms.rs",
+              "line_start": 86,
+              "col_start": 4,
+              "line_end": 86,
+              "col_end": 4
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Constant": {
+                      "Int": 100
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 7
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "literal_pair_width_arms.rs",
+                "line_start": 86,
+                "col_start": 4,
+                "line_end": 86,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 0,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

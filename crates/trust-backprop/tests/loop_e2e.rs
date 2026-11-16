@@ -80,12 +80,31 @@ fn div_zero_iteration_proposes_a_native_requires_clause_and_never_auto_writes_it
     let clause = rendered
         .find("requires y != 0")
         .unwrap_or_else(|| panic!("the queued rewrite must render a native clause:\n{rendered}"));
-    let body_brace = rendered
-        .find(&format!("fn {FUNCTION}"))
-        .and_then(|start| rendered[start..].find('{').map(|offset| start + offset))
+    let fn_start =
+        rendered.find(&format!("fn {FUNCTION}")).expect("the rewritten fn must keep its signature");
+    let body_brace = rendered[fn_start..]
+        .find('{')
+        .map(|offset| fn_start + offset)
         .expect("the rewritten fn must keep a body");
-    assert!(clause < body_brace, "the clause must sit in the signature, not the body:\n{rendered}");
-    assert!(!rendered.contains("#["), "spec text must be a native clause:\n{rendered}");
+    assert!(
+        fn_start < clause && clause < body_brace,
+        "the clause must sit in the signature, not above it or in the body:\n{rendered}"
+    );
+    // Scoped to the signature the clause is rendered into, not the whole file:
+    // the fixture carries attributes of its own (`#[unsafe(no_mangle)]` since
+    // ff8e582284), and those are not the proposal's spelling. The count check
+    // covers the other place an attribute-form spec would land — above `fn` —
+    // without tripping on the fixture's own.
+    let signature = &rendered[fn_start..body_brace];
+    assert!(
+        !signature.contains("#["),
+        "spec text must be a native clause, not an attribute:\n{signature}"
+    );
+    assert_eq!(
+        rendered.matches("#[").count(),
+        workspace.original.matches("#[").count(),
+        "the review rewrite must not add an attribute anywhere in the file:\n{rendered}"
+    );
 }
 
 #[test]

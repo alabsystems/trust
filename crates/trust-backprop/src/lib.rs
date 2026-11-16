@@ -2540,4 +2540,211 @@ mod tests {
             Err(RewriteError::InvalidSpec { .. })
         ));
     }
+
+    /// `apply_binary_derived_plan_from_compiled_binary` on REAL bytes. Live by
+    /// default since trust-lift's `elf`/`macho` features were turned on
+    /// (cdcc3bee15); before that its relift always failed with
+    /// `BinaryParserUnavailable`.
+    mod compiled_binary {
+        use trust_types::{SolverDispatchStatus, stable_sha256_hex};
+
+        use super::{
+            accepted_source_backpropagation_gate, exact_source_provenance,
+            make_precondition_proposal_at, proof_grade_binary_verification, temp_source_file,
+            validated_reconstruction,
+        };
+        use crate::{
+            BinaryBackpropEvidence, BinaryReliftBackpropError, BinaryReliftError,
+            BinaryReliftOptions, GovernancePolicy, RewriteError, analyze_compiled_binary,
+            apply_binary_derived_plan, apply_binary_derived_plan_from_compiled_binary, apply_plan,
+        };
+
+        /// x86-64 ELF, 576 bytes: `trust_fixture_x86_load` = `mov rax, [rdi]; ret`
+        /// at the entry point. Shared with trust-vcgen's relift tests,
+        /// trust-integration-tests, trust-symex and trust-decompile. It carries no
+        /// DWARF, so its relift has no exact source provenance.
+        const X86_64_LOAD_ELF_HEX: &str =
+            include_str!("../../../tests/fixtures/binary_decomp/x86_64-load-elf.hex");
+        const X86_64_LOAD_ELF_SHA256: &str =
+            "251757e36749c41d81a42feb4764e9ed80c354990f9de66858a498e549524000";
+
+        /// The source a binary-derived proposal targets. The proposal is valid for
+        /// it (see the `apply_plan` controls), so any refusal below is the binary
+        /// gate's, and the file must read back unchanged.
+        const RECOVERED_SOURCE: &str = "fn recovered(x: u64) -> u64 { x }\n";
+
+        fn elf_bytes() -> Vec<u8> {
+            let hex =
+                X86_64_LOAD_ELF_HEX.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex byte"))
+                .collect::<Vec<_>>();
+            assert_eq!(stable_sha256_hex(&bytes), X86_64_LOAD_ELF_SHA256, "fixture drifted");
+            bytes
+        }
+
+        fn assert_source_untouched(path: &str) {
+            let now = std::fs::read_to_string(path).expect("read proposal target");
+            assert_eq!(now, RECOVERED_SOURCE, "backprop wrote to the source it only proposes for");
+        }
+
+        /// Backprop PROPOSES; a compiled binary's relift can never be what opens
+        /// source rewriting. Its summaries are the only evidence available without
+        /// a solver and a checked certificate (every VC `NotDispatched`, no exact
+        /// provenance). Supplied as evidence they pass the same-binary consistency
+        /// check and are then refused by the rewrite gate: an error, no plan, and
+        /// the target file byte-identical.
+        #[test]
+        fn compiled_binary_backprop_refuses_rewrites_backed_only_by_its_own_relift() {
+            let bytes = elf_bytes();
+            let (_dir, path) = temp_source_file(RECOVERED_SOURCE);
+            let proposal = make_precondition_proposal_at(&path, "recovered", "x > 0");
+            let policy = GovernancePolicy::default();
+            let control = apply_plan(std::slice::from_ref(&proposal), &policy)
+                .expect("control: the proposal is plannable without the binary gate");
+            assert_eq!(control.len(), 1);
+
+            let relift = analyze_compiled_binary(&bytes, BinaryReliftOptions::default())
+                .expect("real ELF relifts");
+            assert!(!relift.vcs.is_empty(), "relift generated no VC; the refusal would be vacuous");
+            assert_eq!(relift.verification.proved, 0);
+            let evidence =
+                BinaryBackpropEvidence::new(&relift.source_provenance, &relift.verification);
+            let codes = evidence.rejection_diagnostics().iter().map(|d| d.code).collect::<Vec<_>>();
+            assert!(codes.contains(&"proof-grade-binary-verification-missing"), "{codes:?}");
+            assert!(codes.contains(&"exact-source-provenance-missing"), "{codes:?}");
+
+            let error = apply_binary_derived_plan_from_compiled_binary(
+                &bytes,
+                BinaryReliftOptions::default(),
+                &[proposal],
+                &policy,
+                evidence,
+            )
+            .expect_err("relift output alone must never open source rewriting");
+
+            match error {
+                BinaryReliftBackpropError::Rewrite(RewriteError::UnsafeProvenance {
+                    function,
+                    reason,
+                }) => {
+                    assert_eq!(function, "recovered");
+                    assert!(reason.contains("proof-grade-binary-verification-missing"), "{reason}");
+                }
+                other => panic!("expected the rewrite gate to refuse the relift, got: {other}"),
+            }
+            assert_source_untouched(&path);
+        }
+
+        /// Evidence must be about THIS binary. A bundle that opens the gate on its
+        /// own (exact provenance, a checked proof-grade VC, accepted
+        /// reconstruction and source gate — the control plans one rewrite with it)
+        /// but that the relift of these bytes does not reproduce is refused as a
+        /// mismatch before any planning, and the source is untouched.
+        #[test]
+        fn compiled_binary_backprop_rejects_proof_grade_evidence_the_relift_does_not_match() {
+            let bytes = elf_bytes();
+            let (_dir, path) = temp_source_file(RECOVERED_SOURCE);
+            let proposal = make_precondition_proposal_at(&path, "recovered", "x > 0");
+            let policy = GovernancePolicy::default();
+            let source_provenance = exact_source_provenance();
+            let verification = proof_grade_binary_verification();
+            let reconstruction = validated_reconstruction();
+            let source_gate = accepted_source_backpropagation_gate();
+            let evidence = BinaryBackpropEvidence::new(&source_provenance, &verification)
+                .with_reconstruction(&reconstruction)
+                .with_certificate_source_backpropagation_gate(&source_gate);
+            let control =
+                apply_binary_derived_plan(std::slice::from_ref(&proposal), &policy, evidence)
+                    .expect("control: this evidence opens the gate when no relift is checked");
+            assert_eq!(control.len(), 1);
+
+            let error = apply_binary_derived_plan_from_compiled_binary(
+                &bytes,
+                BinaryReliftOptions::default(),
+                &[proposal],
+                &policy,
+                evidence,
+            )
+            .expect_err("evidence that is not about these bytes must be refused");
+
+            assert!(
+                matches!(
+                    &error,
+                    BinaryReliftBackpropError::EvidenceMismatch { function, .. }
+                        if function == "recovered"
+                ),
+                "expected an evidence/relift mismatch, got: {error}"
+            );
+            assert_source_untouched(&path);
+        }
+
+        /// No relift, no plan: bytes that do not relift fail the whole call with
+        /// the relift error, even when the supplied evidence would open the gate
+        /// by itself. It never degrades into an empty plan that reads as success.
+        #[test]
+        fn compiled_binary_backprop_fails_closed_when_the_bytes_do_not_relift() {
+            let bytes = elf_bytes();
+            let (_dir, path) = temp_source_file(RECOVERED_SOURCE);
+            let proposal = make_precondition_proposal_at(&path, "recovered", "x > 0");
+            let source_provenance = exact_source_provenance();
+            let verification = proof_grade_binary_verification();
+            let reconstruction = validated_reconstruction();
+            let source_gate = accepted_source_backpropagation_gate();
+            let evidence = BinaryBackpropEvidence::new(&source_provenance, &verification)
+                .with_reconstruction(&reconstruction)
+                .with_certificate_source_backpropagation_gate(&source_gate);
+
+            let error = apply_binary_derived_plan_from_compiled_binary(
+                &bytes[..24],
+                BinaryReliftOptions::all_functions_best_effort(),
+                &[proposal],
+                &GovernancePolicy::default(),
+                evidence,
+            )
+            .expect_err("a truncated binary must not produce a plan");
+
+            assert!(
+                matches!(error, BinaryReliftBackpropError::Relift(BinaryReliftError::Lift(_))),
+                "expected the relift failure, got: {error}"
+            );
+            assert_source_untouched(&path);
+        }
+
+        /// With nothing proposed there is nothing to gate: the call succeeds on
+        /// real bytes, plans nothing, and returns the relift unchanged in
+        /// posture — VCs generated, none dispatched, none proved, provenance
+        /// gate closed.
+        #[test]
+        fn compiled_binary_backprop_without_proposals_plans_nothing_and_proves_nothing() {
+            let bytes = elf_bytes();
+            let relift = analyze_compiled_binary(&bytes, BinaryReliftOptions::default())
+                .expect("real ELF relifts");
+            let evidence =
+                BinaryBackpropEvidence::new(&relift.source_provenance, &relift.verification);
+
+            let result = apply_binary_derived_plan_from_compiled_binary(
+                &bytes,
+                BinaryReliftOptions::default(),
+                &[],
+                &GovernancePolicy::default(),
+                evidence,
+            )
+            .expect("an empty proposal set needs no evidence");
+
+            assert!(result.plan.is_empty());
+            let analysis = &result.analysis;
+            assert!(!analysis.vcs.is_empty());
+            assert_eq!(analysis.verification.proved, 0);
+            assert!(
+                analysis
+                    .verification
+                    .solver_dispatch
+                    .iter()
+                    .all(|record| record.status == SolverDispatchStatus::NotDispatched)
+            );
+            assert!(!analysis.source_provenance_allows_backpropagation());
+        }
+    }
 }

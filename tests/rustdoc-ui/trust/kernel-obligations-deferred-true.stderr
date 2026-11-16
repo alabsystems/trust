@@ -1,0 +1,6 @@
+note: Clean island kernel-checked after program admission: 1 declaration(s) registered (ident_same)
+  --> $DIR/kernel-obligations-deferred-true.rs:14:5
+   |
+LL |     theorem ident_same (x : UInt64) : trust_import_kernel_obligations_deferred_true__ident x = x := rfl
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

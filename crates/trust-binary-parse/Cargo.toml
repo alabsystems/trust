@@ -17,7 +17,12 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-trust-types = { path = "../trust-types" }
+# Default features OFF: trust-types' only default is the nightly `try-sugar`
+# feature (the `?`-sugar on `Discharge`), and this crate uses none of it — only
+# `trust_types::fx` maps and `BinarySegmentPermissions`. With the default on,
+# this edge was the ONLY thing enabling `try-sugar` in trust-lift's graph
+# (measured 2026-09-27 with `targo tree -p trust-lift -e features -i trust-types`).
+trust-types = { path = "../trust-types", default-features = false }
 thiserror = { workspace = true }
 
 [dev-dependencies]

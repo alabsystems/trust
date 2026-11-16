@@ -105,6 +105,18 @@ where
         .map_err(|_| RecheckThreadError::Panicked)
 }
 
+/// Run `route` on a fresh [`RECHECK_STACK_BYTES`] stack on the calling thread.
+///
+/// The routes reflect a Formula by recursion, one frame per node, and build
+/// and drop kernel terms as deep, before any kernel check reaches the pool. On
+/// the caller's own stack a deep Formula overflowed it and aborted the process
+/// instead of declining (a 2 MiB thread, a 16-deep left-nested `^` chain, in a
+/// debug build). The stack is switched, not the thread, so thread-locals (the
+/// test hooks among them) and panics behave as they did on the caller's stack.
+fn on_route_stack<T>(route: impl FnOnce() -> T) -> T {
+    stacker::grow(RECHECK_STACK_BYTES, route)
+}
+
 /// The slow bit-blast certificate lane shares the same stack permits as the
 /// O(1) instantiation lane. Calling clean-auto's convenience wrapper directly
 /// would create an uncoordinated 256 MiB stack and reintroduce the resource
@@ -141,6 +153,12 @@ pub(crate) mod kx {
     }
     pub fn bool_ty() -> Expr {
         Expr::const_str("Bool")
+    }
+    /// The raw Formula variable identity is one string component. Parsing it
+    /// as a dotted declaration name would identify numeric components such
+    /// as `01` and `1`, so a kernel goal could mention a different variable.
+    pub fn leaf_name(name: &str, width: u32) -> Name {
+        Name::anon().str(format!("BVC_LEAF_{name}_{width}"))
     }
     pub fn list_bool() -> Expr {
         Expr::app(Expr::const_(Name::from_string("List"), vec![Level::zero()]), bool_ty())
@@ -370,16 +388,6 @@ pub(crate) mod kx {
     pub fn select_store_same(m: Expr, a: Expr, v: Expr) -> Expr {
         Expr::apps(Expr::const_str("Clean.BVC.selectStoreSame"), [m, a, v])
     }
-    /// The abstracted underlying memory: the CLOSED array `fun (_ : List Bool) => List.nil`
-    /// of type `List Bool → List Bool`. `selectStoreSame` is parametric over `m` and never
-    /// inspects it, so abstracting the ~28-store frame stack as this one closed term is sound
-    /// (the load short-circuits at the pointer store, above the frame). No axiom needed.
-    ///
-    /// NOT usable for a BARE read: `bvSelect (fun _ => nil) a` REDUCES to `nil` for every
-    /// address, which would equate every bare read with every other. Use [`mem_const`].
-    pub fn opaque_mem() -> Expr {
-        Expr::lam(clean_kernel::expr::BinderInfo::Default, list_bool(), nil())
-    }
     /// The CALLER-PROVIDED memory `BVC_MEM_{key}` — an OPAQUE axiom of type
     /// `List Bool → List Bool` (registered by `discharge_env`). Opaque is the whole
     /// point: a read from it is stuck, so the only way two reads discharge against
@@ -487,6 +495,50 @@ pub(crate) struct ReflectCtx {
     pub(crate) mems: Vec<String>,
     /// May a bare `Select(MEM, a)` be admitted? See [`ReflectCtx::for_obligation`].
     caller_memory_readable: bool,
+    /// The add-commutation retry ([`ReflectCtx::commuting`]): variables are
+    /// rendered at their width and `Add` operands are put in one order, each
+    /// reordering justified by a kernel theorem. Off everywhere else.
+    commuting: bool,
+    /// How many `Add` nodes the commuting reflection reordered.
+    add_swaps: usize,
+    /// The strength-reduction retry ([`ReflectCtx::strength`]): a standalone
+    /// `ZeroExt` is in the fragment, every wrapper tag of the GOAL (`bvf`) is
+    /// built from the Formula's own reflection rather than from a rewritten
+    /// core, and (with `strength_steps`) the `strength` rewrite steps are
+    /// spliced into the cores. Off everywhere else.
+    strength: bool,
+    /// Whether the `strength` step builders run. Always set with `strength`
+    /// outside tests; a test turns it off to show the goal does not depend on
+    /// them (`strength_dry`).
+    strength_steps: bool,
+    /// The strength theorem each spliced step instantiates, in order.
+    strength_used: Vec<&'static str>,
+    /// How many strength steps were spliced (at most `strength::MAX_REWRITES`).
+    strength_rewrites: usize,
+    /// BRANCH-SPLIT-1: the `branch_reflect` arms (bit-vector `Ite`, the
+    /// faithful `BvUDiv`) are active. Off in every legacy context.
+    branching: bool,
+    /// Whether the `branch_reflect` step builders run (ground selection, the
+    /// division guard, `mul_add_self`, `sub_zero`). Off when the goal is built
+    /// ([`ReflectCtx::branching_goal`]).
+    branching_steps: bool,
+    /// How many branch steps were spliced (at most
+    /// `branch_reflect::BRANCH_MAX_REWRITES`), on their own counter.
+    branch_rewrites: usize,
+    /// A branch step was refused because the counter was full.
+    branch_cap_hit: bool,
+    /// CANCEL-1: whether the `cancel` step builder runs at a `Sub` node. Set
+    /// only by [`ReflectCtx::cancel`], and effective only together with
+    /// `strength_steps` (the hook tests both), so every other context,
+    /// strength and branching included, reflects exactly as before.
+    cancel_steps: bool,
+    /// CONSTDIV-1: the `const_div::umulh` goal arm (the 128-bit
+    /// multiply-high) is active. Set only by the `const_div` contexts (the
+    /// step-(4) rewrite and the step-(5) route); off in every other context.
+    const_div: bool,
+    /// Whether the `const_div` step builders run (multiplier fold, magic
+    /// quotient, remainder tail). Off when the goal is built.
+    const_div_steps: bool,
 }
 
 impl ReflectCtx {
@@ -494,7 +546,120 @@ impl ReflectCtx {
     /// has not proved the read-only side condition gets this, and a bare read is
     /// refused exactly as it was before this fragment was widened.
     pub(crate) fn closed() -> Self {
-        Self { leaves: Vec::new(), mems: Vec::new(), caller_memory_readable: false }
+        Self {
+            leaves: Vec::new(),
+            mems: Vec::new(),
+            caller_memory_readable: false,
+            commuting: false,
+            add_swaps: 0,
+            strength: false,
+            strength_steps: false,
+            strength_used: Vec::new(),
+            strength_rewrites: 0,
+            branching: false,
+            branching_steps: false,
+            branch_rewrites: 0,
+            branch_cap_hit: false,
+            cancel_steps: false,
+            const_div: false,
+            const_div_steps: false,
+        }
+    }
+
+    /// The reflection the branch split states its goal with: the strength
+    /// reflection with every step builder off, plus the `branch_reflect`
+    /// arms. Nothing in it depends on a rewrite step.
+    fn branching_goal() -> Self {
+        let mut ctx = Self::strength();
+        ctx.strength_steps = false;
+        ctx.branching = true;
+        ctx
+    }
+
+    /// The reflection the branch split proves with: [`ReflectCtx::strength`]
+    /// plus the `branch_reflect` arms and their steps. Its `bvf` is the goal's
+    /// (`branching_bvf_matches_the_goal`).
+    fn branching() -> Self {
+        let mut ctx = Self::strength();
+        ctx.branching = true;
+        ctx.branching_steps = true;
+        ctx
+    }
+
+    /// The reflection of the strength-reduction retry: the commuting
+    /// reflection plus the standalone `ZeroExt` arm, Formula-only goal tags
+    /// and the rewrite steps of `strength`. Caller memory stays unreadable.
+    fn strength() -> Self {
+        let mut ctx = Self::commuting();
+        ctx.strength = true;
+        ctx.strength_steps = true;
+        ctx
+    }
+
+    /// The reflection of the additive-cancellation retry (CANCEL-1):
+    /// [`ReflectCtx::strength`] plus the `cancel` step at `Sub` nodes.
+    /// [`ReflectCtx::strength`] keeps `cancel_steps` off, so the strength route
+    /// is unchanged by it.
+    fn cancel() -> Self {
+        let mut ctx = Self::strength();
+        ctx.cancel_steps = true;
+        ctx
+    }
+
+    /// [`ReflectCtx::cancel`] with every step builder off (strength's and the
+    /// cancel step): the goal it reflects must be byte-identical.
+    #[cfg(test)]
+    fn cancel_dry() -> Self {
+        let mut ctx = Self::cancel();
+        ctx.strength_steps = false;
+        ctx.cancel_steps = false;
+        ctx
+    }
+
+    /// [`ReflectCtx::strength`] with the step builders off: the goal it
+    /// reflects must be byte-identical (T-U10).
+    #[cfg(test)]
+    fn strength_dry() -> Self {
+        let mut ctx = Self::strength();
+        ctx.strength_steps = false;
+        ctx
+    }
+
+    /// Splice `steps` (each `before` the current core) into a node whose goal
+    /// is `bvf`, whose core is `core` and whose proof is
+    /// `bvfEval bvf = bvfEval core`. A step whose `before` is not the current
+    /// core, or one past `strength::MAX_REWRITES`, is not spliced: the core
+    /// then stays where it is, and the cores of the two sides fail to meet.
+    fn splice(
+        &mut self,
+        bvf: &Expr,
+        steps: Vec<strength::Step>,
+        core: &mut Expr,
+        proof: &mut Expr,
+    ) {
+        for step in steps {
+            if step.before != *core || self.strength_rewrites >= strength::MAX_REWRITES {
+                return;
+            }
+            *proof = step.chain(bvf, proof.clone());
+            *core = step.core;
+            self.strength_used.push(step.theorem);
+            self.strength_rewrites += 1;
+        }
+    }
+
+    /// Do the strength step builders run at this node?
+    fn strength_steps(&self) -> bool {
+        self.strength && self.strength_steps
+    }
+
+    /// The reflection of the add-commutation retry. Caller memory stays
+    /// unreadable (the retry covers scalar obligations only), so a memory read
+    /// is refused exactly as under [`ReflectCtx::closed`].
+    fn commuting() -> Self {
+        let mut ctx = Self::closed();
+        ctx.commuting = true;
+        ctx
     }
 
     /// Admit bare reads for THIS obligation iff NEITHER side writes memory.
@@ -533,10 +698,40 @@ fn memory_key(f: &Formula) -> Option<String> {
 /// Also records, in `ctx`, the symbolic leaves and caller memories that need an
 /// axiom to state the obligation.
 pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> {
+    let out = reflect_node(f, ctx)?;
+    // BRANCH-SPLIT-1: the `mul_add_self` / `sub_zero` steps run after a node is
+    // reflected, under `branching_steps` only; every legacy context returns
+    // the node as reflected.
+    let out = if ctx.branching_steps { branch_reflect::post_step(f, out, ctx) } else { out };
+    // CONSTDIV (stage A): the magic-quotient and remainder-tail steps, under
+    // `const_div_steps` only.
+    if ctx.const_div_steps { Ok(const_div::post_step(f, out, ctx)) } else { Ok(out) }
+}
+
+/// One node of [`reflect_formula`] (children go back through it).
+fn reflect_node(f: &Formula, ctx: &mut ReflectCtx) -> Result<Reflected, String> {
     match f {
+        // CONSTDIV (stage A): exactly the 64-bit multiply-high shape, under
+        // `ctx.const_div` only (`const_div::umulh`).
+        Formula::BvExtract { high: 127, low: 64, .. } if ctx.const_div => const_div::umulh(f, ctx),
+        // BRANCH-SPLIT-1: the bit-vector `Ite` and the faithful unsigned
+        // division, active only under `ctx.branching` (`branch_reflect`).
+        Formula::Ite(c, a, e) if ctx.branching => branch_reflect::ite(c, a, e, ctx),
+        Formula::BvUDiv(l, r, _w) if ctx.branching => branch_reflect::udiv(l, r, ctx),
+        Formula::BvExtract { inner, high, low } if *low != 0 && ctx.branching => {
+            branch_reflect::high_extract(inner, *high, *low, ctx)
+        }
+        Formula::BvSignExt(x, k) if ctx.branching => branch_reflect::sign_ext(x, *k, ctx),
         Formula::Var(name, Sort::BitVec(w)) => {
             ctx.leaves.push((name.clone(), *w));
-            let leaf_list = Expr::const_str(&format!("BVC_LEAF_{name}_{w}"));
+            // The commuting retry needs the variable's width in the term: the
+            // length premise of `addRecM_comm` is unprovable for an opaque
+            // `List Bool` (see `add_comm`). Everything else keeps the opaque leaf.
+            let leaf_list = if ctx.commuting {
+                add_comm::bit_leaf(name, *w)
+            } else {
+                Expr::const_(kx::leaf_name(name, *w), vec![])
+            };
             let l = kx::leaf(leaf_list);
             Ok(Reflected { bvf: l.clone(), core: l.clone(), proof: kx::eq_refl_list(kx::evalf(l)) })
         }
@@ -551,6 +746,9 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
         // BvMul core (which doesn't). Mirrors the BvOr(0,·) arm exactly.
         Formula::BvAdd(l, r, _w) if matches!(&**l, Formula::BitVec { value: 0, .. }) => {
             let rx = reflect_formula(r, ctx)?;
+            if ctx.strength {
+                return Ok(strength_zero_wrapper(rx, kx::add, kx::add_cong, kx::add_zero_id));
+            }
             let const_af = kx::const_(kx::all_false(kx::evalf(rx.core.clone())));
             let bvf = kx::add(const_af.clone(), rx.bvf.clone());
             let core = rx.core.clone();
@@ -579,8 +777,58 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             let rl = reflect_formula(l, ctx)?;
             let rr = reflect_formula(r, ctx)?;
             let bvf = kx::add(rl.bvf.clone(), rr.bvf.clone());
-            let core = kx::add(rl.core.clone(), rr.core.clone());
-            let proof = kx::add_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+            let mut core = kx::add(rl.core.clone(), rr.core.clone());
+            let mut proof =
+                kx::add_cong(rl.bvf, rl.core.clone(), rr.bvf, rr.core.clone(), rl.proof, rr.proof);
+            // THE STRENGTH RETRY: `(x + y) + x * c1` becomes `x * (c1 + 1) + y`
+            // (`Trust.BVS.collect_add`) before the operands are ordered.
+            // The operands the ordering below looks at are those of the core as
+            // it now stands.
+            let (mut op_l, mut op_r) = (rl.core, rr.core);
+            if ctx.strength_steps()
+                && let Some(step) = strength::add_step(&op_l, &op_r)
+            {
+                ctx.splice(&bvf, vec![step], &mut core, &mut proof);
+                let Some(operands) = add_operands(&core) else {
+                    return Ok(Reflected { bvf, core, proof });
+                };
+                (op_l, op_r) = operands;
+            }
+            // THE COMMUTED RETRY (PKG-C5c). `bvf` above is the Formula's own
+            // operand order and is what the goal is stated over; only the CORE,
+            // the waypoint the two sides meet at, takes the canonical order, and
+            // the step from one order to the other is an instance of the kernel
+            // theorem `Trust.BVC.addRecM_comm` under a proved equal-length
+            // premise. No step is available (`None`) for an Add neither of whose
+            // operands is a multiply, or for an operand whose length `add_comm`
+            // cannot prove; the Add then stays in source order.
+            if ctx.commuting
+                && let Some(step) = add_comm::canonical_step(&op_l, &op_r)
+            {
+                let swapped = kx::add(op_r, op_l);
+                let proof = kx::eq_trans_list(
+                    kx::evalf(bvf.clone()),
+                    kx::evalf(core),
+                    kx::evalf(swapped.clone()),
+                    proof,
+                    step,
+                );
+                ctx.add_swaps += 1;
+                return Ok(Reflected { bvf, core: swapped, proof });
+            }
+            Ok(Reflected { bvf, core, proof })
+        }
+        Formula::BvConcat(high, low) => {
+            memory_reflection::width(f).ok_or("reflect: malformed concatenation widths")?;
+            let high = reflect_formula(high, ctx)?;
+            let low = reflect_formula(low, ctx)?;
+            let make = |h, l| Expr::apps(Expr::const_str("Clean.BVC.BvF.Concat"), [h, l]);
+            let bvf = make(high.bvf.clone(), low.bvf.clone());
+            let core = make(high.core.clone(), low.core.clone());
+            let proof = Expr::apps(
+                Expr::const_str("Clean.BVC.bvf_concat_cong"),
+                [high.bvf, high.core, low.bvf, low.core, high.proof, low.proof],
+            );
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvSub(l, r, _w) => {
@@ -590,6 +838,43 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             let rr = reflect_formula(r, ctx)?;
             let bvf = kx::sub(rl.bvf.clone(), rr.bvf.clone());
             let core = kx::sub(rl.core.clone(), rr.core.clone());
+            if ctx.strength_steps()
+                && let Some(step) = strength::sub_step(&rl.core, &rr.core)
+            {
+                // THE STRENGTH RETRY: `(x * c1 + y) - x` becomes
+                // `x * (c1 - 1) + y` (`Trust.BVS.collect_sub`), an `Add`
+                // whose operands are then ordered as at an `Add` node.
+                let mut core = core;
+                let mut proof = kx::sub_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+                ctx.splice(&bvf, vec![step], &mut core, &mut proof);
+                if let Some((op_l, op_r)) = add_operands(&core)
+                    && let Some(swap) = add_comm::canonical_step(&op_l, &op_r)
+                {
+                    let swapped = kx::add(op_r, op_l);
+                    proof = kx::eq_trans_list(
+                        kx::evalf(bvf.clone()),
+                        kx::evalf(core),
+                        kx::evalf(swapped.clone()),
+                        proof,
+                        swap,
+                    );
+                    core = swapped;
+                    ctx.add_swaps += 1;
+                }
+                return Ok(Reflected { bvf, core, proof });
+            }
+            if ctx.strength_steps()
+                && ctx.cancel_steps
+                && let Some(step) = cancel::sub_cancel_step(&rl.core, &rr.core)
+            {
+                // THE CANCEL RETRY (CANCEL-1): `(c + x) - c` becomes `x`
+                // (`Trust.BVA.add_sub_cancel`). `x` is a core this reflection
+                // already built, its own `Add` operands already ordered.
+                let mut core = core;
+                let mut proof = kx::sub_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+                ctx.splice(&bvf, vec![step], &mut core, &mut proof);
+                return Ok(Reflected { bvf, core, proof });
+            }
             let proof = kx::sub_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
             Ok(Reflected { bvf, core, proof })
         }
@@ -625,6 +910,10 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvUDiv(l, r, _w) => {
+            // NOT FAITHFUL AT /0: `BvF.Div` is `bvDiv`, whose value at a zero
+            // divisor is not SMT `bvudiv`'s all-ones. This arm is sound only
+            // under congruence (both sides carry the same `Div`, whatever it
+            // computes). `branch_reflect::udiv` is the faithful reflection.
             // UNSIGNED DIV — the exact mul analogue: the LIR `udiv` reflects to `BvF.Div`
             // over the SAME operand wrappers the IR `BvUDiv` carries; `bvf_div_cong` cancels
             // the shared `BvF.Div` by congruence (the quotient VALUE is not load-bearing —
@@ -647,8 +936,18 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             let rl = reflect_formula(l, ctx)?;
             let rr = reflect_formula(r, ctx)?;
             let bvf = kx::shl(rl.bvf.clone(), rr.bvf.clone());
-            let core = kx::shl(rl.core.clone(), rr.core.clone());
-            let proof = kx::shl_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+            let mut core = kx::shl(rl.core.clone(), rr.core.clone());
+            // THE STRENGTH RETRY: a shift by a constant is a multiply by a
+            // power of two (`Trust.BVS.shl_mul`), after the AArch64 `lsl #k`
+            // alias of UBFM has dropped its zero-extension
+            // (`Trust.BVS.shl_hi_out`).
+            let steps = if ctx.strength_steps() {
+                strength::shl_steps(&rl.core, &rr.core)
+            } else {
+                Vec::new()
+            };
+            let mut proof = kx::shl_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
+            ctx.splice(&bvf, steps, &mut core, &mut proof);
             Ok(Reflected { bvf, core, proof })
         }
         Formula::BvLShr(l, r, _w) => {
@@ -670,6 +969,9 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
         Formula::BvOr(lhs, rhs, _w) => {
             if let Formula::BitVec { value: 0, .. } = &**lhs {
                 let rx = reflect_formula(rhs, ctx)?;
+                if ctx.strength {
+                    return Ok(strength_zero_wrapper(rx, kx::or, kx::or_cong, kx::or_zero_id));
+                }
                 let const_af = kx::const_(kx::all_false(kx::evalf(rx.core.clone())));
                 let bvf = kx::or(const_af.clone(), rx.bvf.clone());
                 let core = rx.core.clone();
@@ -714,37 +1016,11 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
                 Ok(Reflected { bvf, core, proof })
             }
         }
-        // MEMORY STORE-LOAD ROUNDTRIP: `Select(Store(M, a, v), a)` — a load at the SAME
-        // address as the immediately-covering store returns the stored value `v`, THROUGH
-        // any underlying memory. Reflect it as `BvF.Leaf (bvSelect (bvStore M' a' v') a')`
-        // whose `bvfEval` (≡ the bvSelect term, since bvfEval(Leaf l) ⟶ l) is bridged to the
-        // stored value's core by `selectStoreSame`. M' is the closed `opaque_mem` (the ~28
-        // frame stores under the pointer store are never analyzed — selectStoreSame short-
-        // circuits). a' / v' are the (bvfEval of the) reflected address / value cores, so the
-        // enclosing readout wrappers reflect over this Leaf and the o1 coercion path proves
-        // machine == auto once both loads reduce to the shared stored-byte core.
+        // The scalar reflector retains its old store-free policy. Production
+        // memory obligations instead use the original-term memory reflector.
         Formula::Select(mem, load_addr) => {
-            if let Formula::Store(_under, store_addr, val) = &**mem {
-                if **store_addr == **load_addr {
-                    let ra = reflect_formula(load_addr, ctx)?;
-                    let rv = reflect_formula(val, ctx)?;
-                    let a_list = kx::evalf(ra.core);
-                    let v_list = kx::evalf(rv.core.clone());
-                    let m = kx::opaque_mem();
-                    let sel_term = kx::bv_select(
-                        kx::bv_store(m.clone(), a_list.clone(), v_list.clone()),
-                        a_list.clone(),
-                    );
-                    // bvf: Leaf(sel_term); evalf(bvf) ≡ sel_term. core: the stored value's core.
-                    // proof: selectStoreSame m a' v' : sel_term = v_list = evalf(core).
-                    let bvf = kx::leaf(sel_term);
-                    let core = rv.core;
-                    let proof = kx::select_store_same(m, a_list, v_list);
-                    return Ok(Reflected { bvf, core, proof });
-                }
-                return Err(
-                    "reflect: Select store/load address mismatch (aliasing not in fragment)".into(),
-                );
+            if matches!(&**mem, Formula::Store(..)) {
+                return Err("reflect: storing memory requires the original-term memory path".into());
             }
             // ── BARE MEMORY READ — a load through a CALLER-PROVIDED pointer ────
             //
@@ -798,9 +1074,16 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             if *low != 0 {
                 return Err("reflect: BvExtract low != 0 (outside fragment)".into());
             }
+            memory_reflection::width(f).ok_or("reflect: invalid extract bounds or widths")?;
             if let Formula::BvZeroExt(z, k) = &**inner {
+                if high.checked_add(1) != memory_reflection::width(z) {
+                    return Err("reflect: extract width differs from zero-extension input".into());
+                }
                 let rz = reflect_formula(z, ctx)?;
                 let kn = kx::nat_lit(*k);
+                if ctx.strength {
+                    return Ok(strength_extract_zext(rz, kn));
+                }
                 let tag = rz.core.clone();
                 let zext_bvf = kx::zext(rz.bvf.clone(), kn.clone());
                 let zext_core = kx::zext(rz.core.clone(), kn.clone());
@@ -822,7 +1105,13 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
             } else {
                 // Bare extract of a leaf (operand wn = Extract[w-1:0](Var X)): part
                 // of the SHARED core, identical on both sides — core = bvf, refl.
+                let branch_steps_before = ctx.branch_rewrites;
                 let ri = reflect_formula(inner, ctx)?;
+                // This arm drops the child's core, so a branch step under it
+                // would be counted without appearing in the proof.
+                if ctx.branching_steps && ctx.branch_rewrites != branch_steps_before {
+                    return Err("reflect: extract over a branch step (outside fragment)".into());
+                }
                 let w = high - low + 1;
                 let tag = kx::const_(kx::bits(0, w));
                 let bvf = kx::extract(ri.bvf.clone(), tag);
@@ -833,8 +1122,117 @@ pub(crate) fn reflect_formula(f: &Formula, ctx: &mut ReflectCtx) -> Result<Refle
                 })
             }
         }
+        // A STANDALONE zero-extension, under strength only (the s09 `rung`
+        // return `ZeroExt(h(x), 32)` and the UBFM operand
+        // `ZeroExt(Extract(x, 62, 0), 1)`): a congruence, with the extension
+        // amount a `succ` chain of at most 63. Outside strength it stays out of
+        // the fragment, as before.
+        Formula::BvZeroExt(z, k) if ctx.strength => {
+            if !(1..=63).contains(k) || !memory_reflection::width(f).is_some_and(|w| w <= 64) {
+                return Err("reflect: zero-extension outside the strength fragment".into());
+            }
+            let rz = reflect_formula(z, ctx)?;
+            let kn = kx::nat_lit(*k);
+            Ok(Reflected {
+                bvf: kx::zext(rz.bvf.clone(), kn.clone()),
+                core: kx::zext(rz.core.clone(), kn.clone()),
+                proof: kx::zext_cong(rz.bvf, rz.core, kn, rz.proof),
+            })
+        }
         other => Err(format!("reflect: Formula outside add@N reflection fragment: {other:?}")),
     }
+}
+
+/// The operands of a `BvF.Add` core.
+fn add_operands(core: &Expr) -> Option<(Expr, Expr)> {
+    let is_add = matches!(core.get_app_fn().kind(),
+        clean_kernel::ExprKind::Const(name, _) if *name == Name::from_string("Clean.BVC.BvF.Add"));
+    match core.get_app_args().as_slice() {
+        [l, r] if is_add => Some(((*l).clone(), (*r).clone())),
+        _ => None,
+    }
+}
+
+/// A zero wrapper `op (Const (allFalse ·)) x` (`Or` or `Add` with a zero
+/// left operand) under strength. The GOAL side takes its zero from the
+/// Formula's own reflection, `allFalse (bvfEval x.bvf)`, never from the
+/// rewritten core, so what is proved does not depend on the step builders
+/// (T-U10). The proof bridges that zero to `allFalse (bvfEval x.core)` by
+/// `congrArg bvAllFalse x.proof` inside the two-sided congruence `cong`, then
+/// drops the wrapper with `zero_id` at the core.
+fn strength_zero_wrapper(
+    rx: Reflected,
+    op: fn(Expr, Expr) -> Expr,
+    cong: fn(Expr, Expr, Expr, Expr, Expr, Expr) -> Expr,
+    zero_id: fn(Expr) -> Expr,
+) -> Reflected {
+    let (eval_bvf, eval_core) = (kx::evalf(rx.bvf.clone()), kx::evalf(rx.core.clone()));
+    let zero_bvf = kx::const_(kx::all_false(eval_bvf.clone()));
+    let zero_core = kx::const_(kx::all_false(eval_core.clone()));
+    // `allFalse (eval bvf) = allFalse (eval core)`, which is
+    // `bvfEval zero_bvf = bvfEval zero_core` by computation of `bvfEval (Const l)`.
+    let zeros = kterm::congr_arg(
+        kx::list_bool(),
+        kx::list_bool(),
+        eval_bvf,
+        eval_core,
+        Expr::const_str("Clean.BVC.bvAllFalse"),
+        rx.proof.clone(),
+    );
+    let bvf = op(zero_bvf.clone(), rx.bvf.clone());
+    let mid = op(zero_core.clone(), rx.core.clone());
+    let step_a = cong(zero_bvf, zero_core, rx.bvf, rx.core.clone(), zeros, rx.proof);
+    let step_b = zero_id(rx.core.clone());
+    let proof = kx::eq_trans_list(
+        kx::evalf(bvf.clone()),
+        kx::evalf(mid),
+        kx::evalf(rx.core.clone()),
+        step_a,
+        step_b,
+    );
+    Reflected { bvf, core: rx.core, proof }
+}
+
+/// `ExtractLow (ZeroExt z k) tag` (the 32-bit return readout) under strength.
+/// The GOAL's length tag is the Formula's own reflection `z.bvf`, never the
+/// rewritten core. The proof: congruence through the zero-extension, then
+/// `congrArg (λ t. bvTakeLen t (bvfEval (ZeroExt z.core k))) z.proof` to move
+/// the tag to `z.core` (`bvfEval (ExtractLow e tag)` computes to
+/// `bvTakeLen (bvfEval tag) (bvfEval e)`), then `bvf_extract_zeroext_id`.
+fn strength_extract_zext(rz: Reflected, kn: Expr) -> Reflected {
+    let zext_bvf = kx::zext(rz.bvf.clone(), kn.clone());
+    let zext_core = kx::zext(rz.core.clone(), kn.clone());
+    let bvf = kx::extract(zext_bvf.clone(), rz.bvf.clone());
+    let inner_eq = kx::zext_cong(rz.bvf.clone(), rz.core.clone(), kn.clone(), rz.proof.clone());
+    let step_a = kx::extract_cong1(zext_bvf, zext_core.clone(), rz.bvf.clone(), inner_eq);
+    let take_from = {
+        let mut fr = kterm::Fresh::new();
+        let (t_id, t) = fr.local();
+        let body =
+            Expr::apps(Expr::const_str("Clean.BVC.bvTakeLen"), [t, kx::evalf(zext_core.clone())]);
+        kterm::lams(vec![(t_id, kx::list_bool())], body)
+    };
+    let step_m = kterm::congr_arg(
+        kx::list_bool(),
+        kx::list_bool(),
+        kx::evalf(rz.bvf.clone()),
+        kx::evalf(rz.core.clone()),
+        take_from,
+        rz.proof,
+    );
+    let step_b = kx::extract_zeroext_id(rz.core.clone(), kn);
+    let at_tag_bvf = kx::evalf(kx::extract(zext_core.clone(), rz.bvf.clone()));
+    let at_tag_core = kx::evalf(kx::extract(zext_core, rz.core.clone()));
+    let to_core_tag =
+        kx::eq_trans_list(kx::evalf(bvf.clone()), at_tag_bvf, at_tag_core.clone(), step_a, step_m);
+    let proof = kx::eq_trans_list(
+        kx::evalf(bvf.clone()),
+        at_tag_core,
+        kx::evalf(rz.core.clone()),
+        to_core_tag,
+        step_b,
+    );
+    Reflected { bvf, core: rz.core, proof }
 }
 
 /// True iff `e`'s Debug still carries the wrapper ctors (non-folding check — the
@@ -882,7 +1280,7 @@ pub(crate) fn discharge_env(
         // idempotent: a repeated (name,w) is fine (add_decl of an existing axiom
         // with the same type is a no-op-or-error we tolerate).
         let _ = env.add_decl(clean_kernel::Declaration::Axiom {
-            name: Name::from_string(&format!("BVC_LEAF_{name}_{w}")),
+            name: kx::leaf_name(name, *w),
             level_params: vec![],
             type_: kx::list_bool(),
         });
@@ -1678,6 +2076,69 @@ fn div_peel_to_ite(f: &Formula) -> Option<&Formula> {
     }
 }
 
+/// An exact 32-bit operand and identity wrappers around that SAME value. Unlike
+/// `operand_key`, this must not erase nested truncation: low16(X) widened back
+/// to 32 bits is not W(X), and W(X) != 0 cannot justify dividing by low16(X).
+/// The tracked width is the actual intermediate Formula width; the value always
+/// fits in 32 bits. This deliberately accepts no arithmetic or sign extension.
+fn div_operand_identity(f: &Formula) -> Option<(String, u32)> {
+    match f {
+        Formula::Var(_, Sort::BitVec(32)) => Some((operand_key(f)?, 32)),
+        Formula::BvExtract { inner, high: 31, low: 0 } => {
+            if matches!(&**inner, Formula::Var(_, Sort::BitVec(64))) {
+                return Some((operand_key(f)?, 32));
+            }
+            let (key, width) = div_operand_identity(inner)?;
+            (width >= 32).then_some((key, 32))
+        }
+        Formula::BvZeroExt(inner, extra) => {
+            let (key, width) = div_operand_identity(inner)?;
+            let width = width.checked_add(*extra)?;
+            (width <= 128).then_some((key, width))
+        }
+        Formula::BvOr(left, right, width) => {
+            let other = match (&**left, &**right) {
+                (Formula::BitVec { value: 0, width: zero_width }, other) if zero_width == width => {
+                    other
+                }
+                (other, Formula::BitVec { value: 0, width: zero_width }) if zero_width == width => {
+                    other
+                }
+                _ => return None,
+            };
+            let (key, actual_width) = div_operand_identity(other)?;
+            (actual_width == *width).then_some((key, actual_width))
+        }
+        _ => None,
+    }
+}
+
+fn div_operand_key(f: &Formula) -> Option<String> {
+    let (key, width) = div_operand_identity(f)?;
+    if width != 32 {
+        return None;
+    }
+    // Kernel Name::from_string normalizes numeric dotted components: raw
+    // Formula variables X.1.tail and X.01.tail must not become the same opaque
+    // bit constants. Fixed two-digit UTF-8 byte encoding is injective and has
+    // no dots, so the kernel goal retains exact Formula variable identity.
+    let encoded: String = key.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("DIV32_{encoded}"))
+}
+
+/// Reflect exactly the supplied nonzero predicate. Do not invent a premise,
+/// simplify an unrelated Boolean expression, or drop a stronger/weaker clause.
+fn div_precondition_key(pre: &Formula) -> Option<String> {
+    let Formula::Not(inner) = pre else { return None };
+    let Formula::Eq(left, right) = &**inner else { return None };
+    let operand = match (&**left, &**right) {
+        (Formula::BitVec { value: 0, width: 32 }, operand)
+        | (operand, Formula::BitVec { value: 0, width: 32 }) => operand,
+        _ => return None,
+    };
+    div_operand_key(operand)
+}
+
 /// THE UNSIGNED-DIV CONDITIONAL O(1) DISCHARGE. Recognizes the gate's REAL udiv obligation:
 ///   auto    = BvUDiv(Wa, Wb)
 ///   machine = W_zext( Ite(Eq(Wb', 0@w), 0@w, BvUDiv(Wa', Wb')) )   (the architectural ÷0=0 guard)
@@ -1685,7 +2146,10 @@ fn div_peel_to_ite(f: &Formula) -> Option<&Formula> {
 /// collapses the machine `Ite` to its `BvUDiv` else-branch = auto. THE PROOF is `divGuardBridge`
 /// PARTIALLY applied at the MACHINE operand bit-lists, leaving the `b != 0` hypothesis OPEN — so
 /// the discharge term has the CONDITIONAL type `(bvIsZero <b2> = false) -> (mach_val = bvDiv <a2><b2>)`,
-/// exactly the gate's conditional obligation. OPERAND-IDENTITY KERNEL-TIED (eq/ult discipline): the
+/// The goal hypothesis is reflected independently from the ACTUAL supplied
+/// precondition. Kernel checking must unify it with that open hypothesis; the
+/// machine's divisor cannot supply an assumption absent from the input claim.
+/// OPERAND-IDENTITY KERNEL-TIED (eq/ult discipline): the
 /// kernel `check_type` against the conditional goal must defeq the conclusion RHS `bvDiv <a2><b2>` to
 /// the goal's auto_val `bvDiv <a><b>`, FORCING <a2>≡<a>, <b2>≡<b>; divergent operands key to distinct
 /// bit-lists -> REJECT (no false [PROVED]). Handles BOTH unsigned (auto `BvUDiv` -> `bvDiv`) and
@@ -1697,17 +2161,20 @@ fn div_peel_to_ite(f: &Formula) -> Option<&Formula> {
 /// DIVISION-SEMANTICS CORE — the ÷0-guard collapse (`divGuardBridge`) and operand identity
 /// (<a2>≡<a>, <b2>≡<b>). It does NOT re-check the readout-WRAPPER faithfulness: those layers are
 /// stripped by the matcher (`div_peel_to_ite`, in the TCB) and their value-preservation is backed by
-/// ay's prior width-matched UNSAT over the unstripped formulas — so a strip bug can only MIS-GRADE an
-/// already-ay-proven obligation, never fabricate a [PROVED]. (This readout-strip residual is shared
+/// ay's prior width-matched UNSAT over the unstripped formulas. That is a remaining
+/// kernel-grade limitation, not independent proof of the whole wrapped formula.
+/// (This readout-strip residual is shared
 /// with the eq/ult/… value discharges; it is matcher-trusted, not ay-free.)
 pub(crate) fn try_div_conditional_discharge(
     machine_out: &Formula,
     auto: &Formula,
+    pre: &Formula,
 ) -> Option<String> {
+    let key_pre = div_precondition_key(pre)?;
     // auto = BvUDiv(a, b) [unsigned] OR BvSDiv(a, b) [signed]
     let (a, b, signed) = match auto {
-        Formula::BvUDiv(l, r, _) => (&**l, &**r, false),
-        Formula::BvSDiv(l, r, _) => (&**l, &**r, true),
+        Formula::BvUDiv(l, r, 32) => (&**l, &**r, false),
+        Formula::BvSDiv(l, r, 32) => (&**l, &**r, true),
         _ => return None,
     };
     // machine = W( Ite(Eq(b2, 0), 0, BvU/SDiv(a2, b2)) ), W = nested Extract/ZeroExt/Or(0,·)
@@ -1716,30 +2183,30 @@ pub(crate) fn try_div_conditional_discharge(
         Formula::Ite(p, t, e) => (&**p, &**t, &**e),
         _ => return None,
     };
-    if eq_const_bv_value(then_b) != Some(0) {
+    if !matches!(then_b, Formula::BitVec { value: 0, width: 32 }) {
         return None; // then-branch must be the ÷0 result 0
     }
     // predicate is `Eq(b2, 0)` (zero on either side)
     let b_pred = match pred {
-        Formula::Eq(l, r) if eq_const_bv_value(r) == Some(0) => &**l,
-        Formula::Eq(l, r) if eq_const_bv_value(l) == Some(0) => &**r,
+        Formula::Eq(l, r) if matches!(&**r, Formula::BitVec { value: 0, width: 32 }) => &**l,
+        Formula::Eq(l, r) if matches!(&**l, Formula::BitVec { value: 0, width: 32 }) => &**r,
         _ => return None,
     };
     let (a2, b2) = match (else_b, signed) {
-        (Formula::BvUDiv(l, r, _), false) => (&**l, &**r),
-        (Formula::BvSDiv(l, r, _), true) => (&**l, &**r),
+        (Formula::BvUDiv(l, r, 32), false) => (&**l, &**r),
+        (Formula::BvSDiv(l, r, 32), true) => (&**l, &**r),
         _ => return None, // machine div op must match auto's signedness
     };
 
-    let key_a = operand_key(a)?;
-    let key_b = operand_key(b)?;
-    let key_a2 = operand_key(a2)?;
-    let key_b2 = operand_key(b2)?;
+    let key_a = div_operand_key(a)?;
+    let key_b = div_operand_key(b)?;
+    let key_a2 = div_operand_key(a2)?;
+    let key_b2 = div_operand_key(b2)?;
     // SOUNDNESS: the ÷0-guard predicate divisor (b_pred) must key-match the udiv divisor (b2), so the
     // hypothesis `bvIsZero <b2> = false` collapses the SAME guard the value is divided under. This Rust
     // check is LOAD-BEARING: the kernel ties b2≡b to the auto side, but the guard predicate operand is
     // not otherwise kernel-constrained to equal b2, so a mismatched guard register must be refused here.
-    if operand_key(b_pred)? != key_b2 {
+    if div_operand_key(b_pred)? != key_b2 {
         return None;
     }
 
@@ -1749,6 +2216,7 @@ pub(crate) fn try_div_conditional_discharge(
     let bits_b = kx::opaque_bit_list(&key_b, w, &mut bit_axioms);
     let bits_a2 = kx::opaque_bit_list(&key_a2, w, &mut bit_axioms);
     let bits_b2 = kx::opaque_bit_list(&key_b2, w, &mut bit_axioms);
+    let bits_pre = kx::opaque_bit_list(&key_pre, w, &mut bit_axioms);
     let zero_v = kx::evalf(kx::const_(kx::bits(0, w)));
 
     // value fn: unsigned -> bvDiv ; signed -> bvSDiv (the quotient divGuardBridge collapses to).
@@ -1760,8 +2228,9 @@ pub(crate) fn try_div_conditional_discharge(
         valfn(bits_a2.clone(), bits_b2.clone()),
     );
     let auto_val = valfn(bits_a, bits_b);
-    // CONDITIONAL goal: (bvIsZero <b2> = false) -> (mach_val = auto_val).
-    let h_type = kx::eq_bool(kx::bv_is_zero(bits_b2.clone()), kx::bfalse());
+    // The goal uses the supplied precondition, NOT the machine divisor. A
+    // theorem instantiated at b2 only checks when these are the same predicate.
+    let h_type = kx::eq_bool(kx::bv_is_zero(bits_pre), kx::bfalse());
     let goal = Expr::arrow(h_type, kx::eq_list(mach_val, auto_val));
     // discharge = divGuardBridge <b2> zero (val <a2> <b2>)  [h LEFT OPEN] : the conditional proof.
     let discharge = Expr::apps(
@@ -1785,8 +2254,9 @@ pub(crate) fn try_div_conditional_discharge(
 pub(crate) fn try_div_conditional_discharge_for_test(
     machine_out: &Formula,
     auto: &Formula,
+    pre: &Formula,
 ) -> Option<String> {
-    try_div_conditional_discharge(machine_out, auto)
+    try_div_conditional_discharge(machine_out, auto, pre)
 }
 
 /// Reconstruct the eval-level (List Bool) VALUE of an unsigned-rem composite Formula:
@@ -1900,6 +2370,20 @@ pub(crate) fn try_o1_instantiation_discharge(
     machine_out: &Formula,
     auto: &Formula,
 ) -> Option<String> {
+    on_route_stack(|| o1_routes(machine_out, auto))
+}
+
+/// The routes of [`try_o1_instantiation_discharge`], in order.
+fn o1_routes(machine_out: &Formula, auto: &Formula) -> Option<String> {
+    // Memory and concatenation must check both original terms, including every
+    // array identity/store/query. Never fall back to the stripped scalar goal.
+    if formula_contains_select(machine_out)
+        || formula_contains_select(auto)
+        || memory_reflection::contains_concat(machine_out)
+        || memory_reflection::contains_concat(auto)
+    {
+        return memory_reflection::discharge(machine_out, auto);
+    }
     // EQ-compare value discharge FIRST (strictly additive; falls through on
     // any non-match to the bitvector-core path below).
     if let Some(t) = try_eq_value_discharge(machine_out, auto) {
@@ -1918,6 +2402,32 @@ pub(crate) fn try_o1_instantiation_discharge(
         return Some(t);
     }
 
+    // The shared-core discharge is tried first and is unchanged. Only when it
+    // declines is the same equation retried with `Add` operands commuted into
+    // one order (PKG-C5c: `madd` renders its addend first, source `x * 3 + 7`
+    // renders it second). A declined retry is `None`, as before it existed.
+    //
+    // Only when both decline is it retried once more with the strength-reduction
+    // rewrites (`strength`): trust-cg emits `x * 3 + 7` as
+    // `(x + 7) + (x << 1)`, which no wrapper strip or operand order joins to
+    // the source. A declined retry is `None`, as before it existed.
+    //
+    // Only when all three decline is it retried with additive cancellation as
+    // well (`cancel`, CANCEL-1): trust-cg folds `(c + x) - c + 1` to `x + 1`.
+    // This chain runs per item inside `try_kernel_recheckable_proof`, so it
+    // precedes everything step (5) of `call_event.rs` tries after a declined
+    // conjunction: `closed_branch::retry`, then the branch routes
+    // (`try_branch_split_conjunction`: BRANCH-SPLIT-1, then DIV-SPLIT-1, then
+    // CONSTDIV-1), which are not in this chain. A declined retry is `None`, as before it existed.
+    try_shared_core_discharge(machine_out, auto)
+        .or_else(|| try_add_comm_discharge(machine_out, auto, AddCommFilter::On))
+        .or_else(|| try_strength_discharge(machine_out, auto, StrengthFilter::On))
+        .or_else(|| try_cancel_discharge(machine_out, auto, CancelFilter::On))
+}
+
+/// The two sides reflect to cores the kernel finds definitionally equal; the
+/// discharge chains each side's congruence proof through that shared core.
+fn try_shared_core_discharge(machine_out: &Formula, auto: &Formula) -> Option<String> {
     // The read-only side condition is decided ONCE, over BOTH whole formulas,
     // before any reflection runs — it is a property of the obligation, not of an
     // individual read. `for_obligation` is the only constructor that can turn the
@@ -1968,139 +2478,57 @@ pub(crate) fn try_o1_instantiation_discharge(
     })
 }
 
-/// Does the formula contain a `Select` node (a memory read)? Cheap guard so the
-/// memory discharge only fires on store-load obligations.
-fn formula_contains_select(f: &Formula) -> bool {
-    match f {
-        Formula::Select(..) => true,
-        Formula::Store(a, b, c) => {
-            formula_contains_select(a) || formula_contains_select(b) || formula_contains_select(c)
-        }
-        Formula::BvExtract { inner, .. } => formula_contains_select(inner),
-        Formula::BvZeroExt(x, _) | Formula::Not(x) => formula_contains_select(x),
-        Formula::BvAdd(l, r, _)
-        | Formula::BvSub(l, r, _)
-        | Formula::BvOr(l, r, _)
-        | Formula::BvAnd(l, r, _)
-        | Formula::BvXor(l, r, _) => formula_contains_select(l) || formula_contains_select(r),
-        _ => false,
-    }
+/// Whether [`try_add_comm_discharge`] declines before the kernel runs when no
+/// `Add` was reordered or the two cores are still different terms. `Off`
+/// exists for the tests that hand the kernel a false equation and assert that
+/// the KERNEL, not this filter, rejects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddCommFilter {
+    On,
+    #[cfg(test)]
+    Off,
 }
 
-/// MEMORY-PATH reflection — the CONCRETE-CONS, FAITHFUL (non-stripping) variant that
-/// makes sub-register (u8/u16) readout coercions REDUCE. Differs from `reflect_formula`:
-///   (1) register leaves reflect as a CONCRETE `opaque_bit_list` (a cons of `w` fresh
-///       per-bit `Bool` axioms), NOT a single opaque `List Bool` leaf — so `bvfEval`
-///       of every `ZeroExt`/`ExtractLow`/`Or`/`Add` over them REDUCES computationally
-///       (append/take/zipOr on a concrete cons), collapsing the whole readout to the
-///       byte's bits with NO width-matched coercion-identity lemma required;
-///   (2) wrappers are NON-STRIPPING: `core = W(inner.core)` (the wrapper is kept in
-///       BOTH bvf and core, proof by the plain congruence lemma), so equality is
-///       discharged by defeq REDUCTION of both cores to the same concrete byte;
-///   (3) the store-load `Select(Store(M,a,v),a)` bridges via `selectStoreSame` (the ONE
-///       non-reducing point — `bvSelect` is stuck on `bvBeq a a`), abstracting the
-///       underlying memory (frame stack) as the closed `opaque_mem`.
-/// Returns `None` for any node outside this fragment (→ caller falls through, [VALIDATED]).
-fn reflect_mem(f: &Formula, bit_axioms: &mut Vec<String>) -> Option<Reflected> {
-    match f {
-        Formula::Var(name, Sort::BitVec(w)) => {
-            let key = operand_key(f).unwrap_or_else(|| name.clone());
-            let bits = kx::opaque_bit_list(&key, *w, bit_axioms);
-            let bvf = kx::leaf(bits);
-            Some(Reflected {
-                bvf: bvf.clone(),
-                core: bvf.clone(),
-                proof: kx::eq_refl_list(kx::evalf(bvf)),
-            })
-        }
-        Formula::BitVec { value, width } => {
-            let bvf = kx::const_(kx::bits(*value, *width));
-            Some(Reflected {
-                bvf: bvf.clone(),
-                core: bvf.clone(),
-                proof: kx::eq_refl_list(kx::evalf(bvf)),
-            })
-        }
-        Formula::BvZeroExt(inner, k) => {
-            let ri = reflect_mem(inner, bit_axioms)?;
-            let kn = kx::nat_lit(*k);
-            let bvf = kx::zext(ri.bvf.clone(), kn.clone());
-            let core = kx::zext(ri.core.clone(), kn.clone());
-            let proof = kx::zext_cong(ri.bvf, ri.core, kn, ri.proof);
-            Some(Reflected { bvf, core, proof })
-        }
-        Formula::BvExtract { inner, high, low } if *low == 0 => {
-            let ri = reflect_mem(inner, bit_axioms)?;
-            let w = high + 1;
-            let tag = kx::const_(kx::bits(0, w));
-            let bvf = kx::extract(ri.bvf.clone(), tag.clone());
-            let core = kx::extract(ri.core.clone(), tag.clone());
-            let proof = kx::extract_cong1(ri.bvf, ri.core, tag, ri.proof);
-            Some(Reflected { bvf, core, proof })
-        }
-        Formula::BvOr(l, r, _) if matches!(&**l, Formula::BitVec { value: 0, .. }) => {
-            let ri = reflect_mem(r, bit_axioms)?;
-            let const_af = kx::const_(kx::all_false(kx::evalf(ri.core.clone())));
-            let bvf = kx::or(const_af.clone(), ri.bvf.clone());
-            let core = kx::or(const_af.clone(), ri.core.clone());
-            let proof = kx::or_cong2(const_af, ri.bvf, ri.core, ri.proof);
-            Some(Reflected { bvf, core, proof })
-        }
-        Formula::BvAdd(l, r, _) => {
-            let rl = reflect_mem(l, bit_axioms)?;
-            let rr = reflect_mem(r, bit_axioms)?;
-            let bvf = kx::add(rl.bvf.clone(), rr.bvf.clone());
-            let core = kx::add(rl.core.clone(), rr.core.clone());
-            let proof = kx::add_cong(rl.bvf, rl.core, rr.bvf, rr.core, rl.proof, rr.proof);
-            Some(Reflected { bvf, core, proof })
-        }
-        Formula::Select(mem, load_addr) => {
-            let Formula::Store(_under, store_addr, val) = &**mem else { return None };
-            // Reflect the store and load addresses SEPARATELY (they may be value-equal but
-            // structurally different wrappings of the pointer). The load is built FAITHFULLY
-            // at `a_load`, but proved by `selectStoreSame` instantiated at `a_store`: the
-            // kernel accepts it iff `a_load ≡ a_store` by DEFEQ (both concrete-cons addresses
-            // reduce to the same pointer bits) — so a genuine store/load ALIAS mismatch is
-            // KERNEL-REJECTED, never a false [PROVED].
-            let ra_store = reflect_mem(store_addr, bit_axioms)?;
-            let ra_load = reflect_mem(load_addr, bit_axioms)?;
-            let rv = reflect_mem(val, bit_axioms)?;
-            let a_store = kx::evalf(ra_store.core);
-            let a_load = kx::evalf(ra_load.core);
-            let v_list = kx::evalf(rv.core.clone());
-            let m = kx::opaque_mem();
-            // Faithful value: read at a_load from a store at a_store.
-            let sel_term =
-                kx::bv_select(kx::bv_store(m.clone(), a_store.clone(), v_list.clone()), a_load);
-            let bvf = kx::leaf(sel_term);
-            let core = rv.core;
-            // selectStoreSame m a_store v : bvSelect (bvStore m a_store v) a_store = v ;
-            // typechecks against `sel_term = v` iff a_load ≡ a_store.
-            let proof = kx::select_store_same(m, a_store, v_list);
-            Some(Reflected { bvf, core, proof })
-        }
-        _ => None,
-    }
-}
-
-/// THE MEMORY STORE-LOAD [PROVED] DISCHARGE. `machine_out == auto` where auto is a
-/// store-load roundtrip `Select(Store(MEM, a, v), a)` (possibly under readout wrappers).
-/// Reflects BOTH sides via `reflect_mem` (concrete-cons leaves + faithful wrappers +
-/// the `selectStoreSame` bridge) and discharges `evalf(machine.bvf) = evalf(auto.bvf)`
-/// through the shared core by `Eq.trans` — the kernel's defeq REDUCES both cores to the
-/// SAME concrete byte-cons (keyed by the shared operand, so a divergent-operand read is
-/// KERNEL-REJECTED). Returns `Some(label)` iff the kernel `check_type` SUCCEEDS; `None`
-/// on any non-match / reduction failure / rejection (→ [VALIDATED], never a false [PROVED]).
-pub(crate) fn try_mem_store_load_discharge(
+/// THE COMMUTED RETRY (PKG-C5c). Reflect both sides again with the operands of
+/// every `Add` that has a multiply operand in one canonical order, and check
+/// the resulting term in the kernel.
+///
+/// What is proved, and by what. The goal is
+/// `bvfEval (reflect machine_out) = bvfEval (reflect auto)`, where `reflect`
+/// keeps each Formula's own operand order and renders a `w`-bit variable as `w`
+/// opaque `Bool` constants. The proof is each side's congruence proof to its
+/// core, as in [`try_shared_core_discharge`], except that at an `Add` node whose
+/// operands are out of order the core takes the other order and the proof
+/// gains one step, an instance of
+/// `Trust.BVC.addRecM_comm : ∀ xs ys c, bvLen xs = bvLen ys → addRecM xs ys c = addRecM ys xs c`
+/// with its length premise proved from `Trust.BVC.len_addRecM` /
+/// `Trust.BVC.len_bvMul` and computation on the concrete leaves. Those are
+/// kernel-checked theorems with an empty axiom closure (`add_comm`).
+///
+/// The kernel's `check_type` of the whole term against that goal is the only
+/// authority. The operand order, the swap decisions and the length proofs are
+/// all inside the checked term; if any is wrong the check fails and this
+/// returns `None`. `Sub` is never reordered, an `Add` without a multiply
+/// operand is never reordered (`add_comm`, "Scope"), and an `Add` whose operand
+/// lengths are not proved equal is never reordered.
+fn try_add_comm_discharge(
     machine_out: &Formula,
     auto: &Formula,
+    filter: AddCommFilter,
 ) -> Option<String> {
-    if !formula_contains_select(auto) {
+    let mut ctx = ReflectCtx::commuting();
+    let rm = reflect_formula(machine_out, &mut ctx).ok()?;
+    let ra = reflect_formula(auto, &mut ctx).ok()?;
+    // Decline without the kernel when it could not help. With no `Add`
+    // reordered this is the first attempt over again; with two cores that are
+    // still different terms the kernel would have to decide two bit-level
+    // adders equal by unfolding them, which is not this route's job and has no
+    // useful time bound. Both tests only ever decline; they accept nothing.
+    if filter == AddCommFilter::On && (ctx.add_swaps == 0 || rm.core != ra.core) {
         return None;
     }
-    let mut bit_axioms: Vec<String> = Vec::new();
-    let rm = reflect_mem(machine_out, &mut bit_axioms)?;
-    let ra = reflect_mem(auto, &mut bit_axioms)?;
+    let ReflectCtx { leaves, .. } = ctx;
+
     let goal = kx::eq_list(kx::evalf(rm.bvf.clone()), kx::evalf(ra.bvf.clone()));
     let sym_ra = Expr::apps(
         Expr::const_(Name::from_string("Eq.symm"), vec![Level::succ(Level::zero())]),
@@ -2113,14 +2541,467 @@ pub(crate) fn try_mem_store_load_discharge(
         rm.proof,
         sym_ra,
     );
-    let result = run_recheck_thread("trust-mem-store-load", move || {
-        let env = eq_discharge_env(&bit_axioms).ok()?;
+    run_recheck_thread("trust-mpos-o1-add-comm", move || {
+        let env = add_comm::commuting_env(&leaves).ok()?;
         let tc = TypeChecker::with_mode(&env, env.mode());
-        tc.check_type(&discharge, &goal).ok().map(|()| ())
+        tc.check_type(&discharge, &goal).ok()
     })
     .ok()
-    .flatten();
-    result.map(|()| "Clean.BVC.selectStoreSame+readout-reduction (memory store-load)".to_string())
+    .flatten()
+    .map(|()| add_comm::THEOREM_LABEL.to_string())
+}
+
+/// Whether [`try_strength_discharge`] declines before the kernel runs when no
+/// strength step was spliced or the two cores are still different terms.
+/// `Off` exists for the tests that hand the kernel a false equation and assert
+/// that the KERNEL, not this filter, rejects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StrengthFilter {
+    On,
+    #[cfg(test)]
+    Off,
+}
+
+/// No side of a strength obligation has more Formula nodes than this.
+const STRENGTH_MAX_NODES: usize = 256;
+
+/// The pre-filter of the strength route, run on each side before anything is
+/// reflected: every node is a variable, a constant, `+`, `-`, `*`, `|`, `^`,
+/// `<<`, a zero-extension or a low extract (`low == 0`), the only kinds the
+/// measured strength-reduced shapes and their register-move and zero-extension
+/// wrappers use; every width (each variable, constant, operation, extract and
+/// zero-extension result) is in `1..=64` and consistent with its operands';
+/// every zero-extension amount is in `1..=63`; and there are at most
+/// [`STRENGTH_MAX_NODES`] nodes. So nothing downstream (`kx::bits`,
+/// `kx::nat_lit`, `add_comm::bit_leaf`, the step builders) is ever handed an
+/// unbounded width, amount or list, and no node whose reflection this route
+/// does not need (division, right shifts, `&`) widens the reflection residual
+/// it trusts.
+fn strength_fragment(f: &Formula) -> bool {
+    /// The width of `f`, or `None` outside the fragment.
+    fn walk(f: &Formula, nodes: &mut usize) -> Option<u32> {
+        *nodes += 1;
+        if *nodes > STRENGTH_MAX_NODES {
+            return None;
+        }
+        let width = match f {
+            Formula::Var(_, Sort::BitVec(w)) | Formula::BitVec { width: w, .. } => *w,
+            Formula::BvZeroExt(x, k) => {
+                if !(1..=63).contains(k) {
+                    return None;
+                }
+                walk(x, nodes)?.checked_add(*k)?
+            }
+            Formula::BvExtract { inner, high, low: 0 } => {
+                let inner_width = walk(inner, nodes)?;
+                if *high >= inner_width {
+                    return None;
+                }
+                high + 1
+            }
+            Formula::BvAdd(l, r, w)
+            | Formula::BvSub(l, r, w)
+            | Formula::BvMul(l, r, w)
+            | Formula::BvOr(l, r, w)
+            | Formula::BvXor(l, r, w)
+            | Formula::BvShl(l, r, w) => {
+                if walk(l, nodes)? != *w || walk(r, nodes)? != *w {
+                    return None;
+                }
+                *w
+            }
+            _ => return None,
+        };
+        (1..=64).contains(&width).then_some(width)
+    }
+    walk(f, &mut 0).is_some()
+}
+
+/// A strength obligation as the kernel will see it: the goal
+/// `bvfEval (reflect machine) = bvfEval (reflect auto)`, the discharge term,
+/// the variables it states, and the label a success carries.
+struct StrengthObligation {
+    goal: Expr,
+    discharge: Expr,
+    leaves: Vec<(String, u32)>,
+    label: String,
+}
+
+/// Reflect both sides under [`ReflectCtx::strength`] and build the discharge:
+/// each side's proof to its core, chained through the shared core. `None`
+/// when a side is outside [`strength_fragment`] or the reflection, and, with
+/// [`StrengthFilter::On`], when no strength step was spliced (the older routes
+/// already had this obligation) or the cores are still different terms (the
+/// kernel would have to decide two bit-level circuits equal by unfolding them).
+fn strength_obligation(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: StrengthFilter,
+) -> Option<StrengthObligation> {
+    if !strength_fragment(machine_out) || !strength_fragment(auto) {
+        return None;
+    }
+    let mut ctx = ReflectCtx::strength();
+    let rm = reflect_formula(machine_out, &mut ctx).ok()?;
+    let ra = reflect_formula(auto, &mut ctx).ok()?;
+    if filter == StrengthFilter::On && (ctx.strength_rewrites == 0 || rm.core != ra.core) {
+        return None;
+    }
+    let label = strength::label(&ctx.strength_used, ctx.add_swaps);
+    let (goal, discharge) = meet(rm, ra);
+    Some(StrengthObligation { goal, discharge, leaves: ctx.leaves, label })
+}
+
+/// The goal `bvfEval rm.bvf = bvfEval ra.bvf` and its discharge: each side's
+/// proof to its core, chained through the shared core.
+fn meet(rm: Reflected, ra: Reflected) -> (Expr, Expr) {
+    let goal = kx::eq_list(kx::evalf(rm.bvf.clone()), kx::evalf(ra.bvf.clone()));
+    let sym_ra = kterm::symm(
+        kx::list_bool(),
+        kx::evalf(ra.bvf.clone()),
+        kx::evalf(ra.core.clone()),
+        ra.proof,
+    );
+    let discharge = kx::eq_trans_list(
+        kx::evalf(rm.bvf),
+        kx::evalf(rm.core),
+        kx::evalf(ra.bvf),
+        rm.proof,
+        sym_ra,
+    );
+    (goal, discharge)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many strength kernel checks this thread started (T-U7).
+    static STRENGTH_KERNEL_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// THE STRENGTH-REDUCTION RETRY. Reflect both sides with the rewrite steps of
+/// `strength` spliced into the cores (a shift by a constant becomes a
+/// multiply; a multiply absorbs an added or subtracted multiplicand), and
+/// check the resulting term in the kernel.
+///
+/// What is proved, and by what. The goal is
+/// `bvfEval (reflect machine_out) = bvfEval (reflect auto)`, built from the two
+/// Formulas alone: under strength every node's `bvf`, including the zero and
+/// length tags of the wrappers, is the Formula's own reflection, independent
+/// of the step builders. The proof is each side's congruence proof to its
+/// core, where a rewritten node's proof gains one step per rewrite, an
+/// instance of a `Trust.BVS.*` theorem whose closed premises (lengths and
+/// values of constants of at most 64 bits) the kernel computes. Those
+/// theorems, the value theory under them and every lemma the reflection
+/// splices are audited in `strength::strength_base` (proved, empty domain and
+/// foundational axiom closure). The term is declared as a theorem of the goal
+/// in the per-obligation environment (`strength::admit_obligation`), so the
+/// kernel's type-check of the whole term against the goal is the only
+/// authority: a wrong match, constant or length proof makes it fail, and this
+/// returns `None`. That declaration's transitive axiom closure must then hold
+/// only the per-bit `BVC_LEAFBIT_*` `Bool` constants that state the
+/// obligation, so nothing the term reaches, directly or through a citation,
+/// may rest on another axiom.
+///
+/// Trusted, as for every route here: that the reflection is faithful to the
+/// Formula (the F1 residual), which now includes the standalone `ZeroExt` arm.
+fn try_strength_discharge(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: StrengthFilter,
+) -> Option<String> {
+    strength_discharge_in(machine_out, auto, filter, strength::strength_env)
+}
+
+/// [`try_strength_discharge`] in the environment `env_of` builds (a test
+/// hands it a doctored one).
+fn strength_discharge_in(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: StrengthFilter,
+    env_of: fn(&[(String, u32)]) -> Result<Environment, String>,
+) -> Option<String> {
+    let StrengthObligation { goal, discharge, leaves, label } =
+        strength_obligation(machine_out, auto, filter)?;
+    #[cfg(test)]
+    STRENGTH_KERNEL_RUNS.with(|runs| runs.set(runs.get() + 1));
+    run_recheck_thread("trust-mpos-o1-strength", move || {
+        let mut env = env_of(&leaves).ok()?;
+        strength::admit_obligation(&mut env, goal, discharge).ok()
+    })
+    .ok()
+    .flatten()
+    .map(|()| label)
+}
+
+/// Whether [`try_cancel_discharge`] declines before the kernel runs when no
+/// cancellation was spliced or the two cores are still different terms. `Off`
+/// exists for the tests that hand the kernel a false equation and assert that
+/// the KERNEL, not this filter, rejects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CancelFilter {
+    On,
+    #[cfg(test)]
+    Off,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many cancel kernel checks this thread started.
+    static CANCEL_KERNEL_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A cancel obligation as the kernel will see it. `None` when a side is outside
+/// [`strength_fragment`] or the reflection, and, with [`CancelFilter::On`],
+/// when the discharge term cites no `add_sub_cancel` (the older routes already
+/// had this obligation) or the cores are still different terms. The label
+/// names only theorems the term cites.
+fn cancel_obligation(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: CancelFilter,
+) -> Option<StrengthObligation> {
+    if !strength_fragment(machine_out) || !strength_fragment(auto) {
+        return None;
+    }
+    let mut ctx = ReflectCtx::cancel();
+    let rm = reflect_formula(machine_out, &mut ctx).ok()?;
+    let ra = reflect_formula(auto, &mut ctx).ok()?;
+    let cores_meet = rm.core == ra.core;
+    // A cheap first filter on the context's record of the steps.
+    let recorded = ctx.strength_used.contains(&cancel::names::ADD_SUB_CANCEL);
+    if filter == CancelFilter::On && (!recorded || !cores_meet) {
+        return None;
+    }
+    let (goal, discharge) = meet(rm, ra);
+    // The filter and the label then read the theorems the discharge term
+    // itself cites, not the context's record: an arm that drops its child's
+    // core (the bare `BvExtract`) drops a step spliced beneath it from the
+    // proof while the record still counts it.
+    let mut cited = std::collections::HashSet::new();
+    discharge.used_constants_dag(clean_kernel::expr::UsedConstants::ConstantsOnly, &mut cited);
+    let cites = |n: &str| cited.contains(&Name::from_string(n));
+    if filter == CancelFilter::On && !cites(cancel::names::ADD_SUB_CANCEL) {
+        return None;
+    }
+    let used: Vec<&'static str> = ctx.strength_used.iter().copied().filter(|n| cites(n)).collect();
+    let label = cancel::label(&used, usize::from(cites(add_comm::names::ADD_REC_M_COMM)));
+    Some(StrengthObligation { goal, discharge, leaves: ctx.leaves, label })
+}
+
+/// THE ADDITIVE-CANCELLATION RETRY (CANCEL-1). Reflect both sides under
+/// [`ReflectCtx::cancel`] (the strength reflection with
+/// `Trust.BVA.add_sub_cancel` spliced at every `Sub` whose cores are
+/// `(c + x) - c`, at 32 or 64 bits), and check the resulting term in the
+/// kernel.
+///
+/// What is proved, and by what: as for [`try_strength_discharge`]. The goal is
+/// `bvfEval (reflect machine_out) = bvfEval (reflect auto)`, built from the two
+/// Formulas alone (the `Sub` node's `bvf` is the Formula's own, whatever the
+/// step does to its core). The theorem is checked by `add_decl` and audited in
+/// `cancel::cancel_base` (empty domain and foundational axiom closure, through
+/// everything it cites); the term is admitted only through
+/// `strength::admit_obligation`, whose transitive axiom closure may hold only
+/// the per-bit `BVC_LEAFBIT_*` leaves. A wrong match or length proof makes
+/// the kernel check fail, and this returns `None`.
+///
+/// Trusted, as for every route here: that the reflection is faithful to the
+/// Formula (the F1 residual). This route adds no reflection arm.
+fn try_cancel_discharge(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: CancelFilter,
+) -> Option<String> {
+    cancel_discharge_in(machine_out, auto, filter, cancel::cancel_env)
+}
+
+/// [`try_cancel_discharge`] in the environment `env_of` builds (a test hands
+/// it a doctored one).
+fn cancel_discharge_in(
+    machine_out: &Formula,
+    auto: &Formula,
+    filter: CancelFilter,
+    env_of: fn(&[(String, u32)]) -> Result<Environment, String>,
+) -> Option<String> {
+    let StrengthObligation { goal, discharge, leaves, label } =
+        cancel_obligation(machine_out, auto, filter)?;
+    #[cfg(test)]
+    CANCEL_KERNEL_RUNS.with(|runs| runs.set(runs.get() + 1));
+    run_recheck_thread("trust-mpos-o1-cancel", move || {
+        let mut env = env_of(&leaves).ok()?;
+        strength::admit_obligation(&mut env, goal, discharge).ok()
+    })
+    .ok()
+    .flatten()
+    .map(|()| label)
+}
+
+/// Does the formula contain a `Select` node (a memory read)? Cheap guard so the
+/// memory discharge only fires on store-load obligations.
+pub(crate) fn formula_contains_select(f: &Formula) -> bool {
+    match f {
+        Formula::Select(..) => true,
+        Formula::Store(a, b, c) => {
+            formula_contains_select(a) || formula_contains_select(b) || formula_contains_select(c)
+        }
+        Formula::BvExtract { inner, .. } => formula_contains_select(inner),
+        Formula::BvZeroExt(x, _) | Formula::Not(x) => formula_contains_select(x),
+        Formula::BvAdd(l, r, _)
+        | Formula::BvSub(l, r, _)
+        | Formula::BvOr(l, r, _)
+        | Formula::BvAnd(l, r, _)
+        | Formula::BvXor(l, r, _)
+        | Formula::BvMul(l, r, _)
+        | Formula::BvUDiv(l, r, _)
+        | Formula::BvSDiv(l, r, _)
+        | Formula::BvShl(l, r, _)
+        | Formula::BvLShr(l, r, _)
+        | Formula::BvAShr(l, r, _)
+        | Formula::BvConcat(l, r) => formula_contains_select(l) || formula_contains_select(r),
+        _ => false,
+    }
+}
+
+// Memory obligations use a separate original-term reflector. The previous
+// concrete-cons shortcut erased the underlying memory and substituted stripped
+// children into its goal; that is insufficient for a kernel-instantiated grade.
+#[path = "verify_output_instantiate/memory_reflection.rs"]
+mod memory_reflection;
+
+// Kernel term builders for the bridge-side theorems (`add_comm`).
+#[path = "verify_output_instantiate/kterm.rs"]
+mod kterm;
+
+// Add commutation for the multiply-then-add (MADD) shape: the kernel theorems
+// and the per-obligation proof steps of `try_add_comm_discharge`.
+#[path = "verify_output_instantiate/add_comm.rs"]
+mod add_comm;
+
+// An untrusted `+`/`*` normaliser over `Nat` that emits kernel proof terms,
+// and the value theory (`Trust.BVV.*`: order, `/` and `%`, powers of two,
+// bits and lists) whose proofs use it. Every term is checked by `add_decl`.
+#[path = "verify_output_instantiate/nat_ring.rs"]
+mod nat_ring;
+
+#[path = "verify_output_instantiate/bv_value.rs"]
+mod bv_value;
+
+// The strength-reduction theorems (`Trust.BVS.*`: a shift by a constant is a
+// multiply, a multiply absorbs an added or subtracted multiplicand), their
+// audited environment, and the guarded per-obligation rewrite steps that
+// `try_strength_discharge` splices into the reflection.
+#[path = "verify_output_instantiate/strength.rs"]
+mod strength;
+
+// Additive cancellation (CANCEL-1, `Trust.BVA.add_sub_cancel`): the theorem,
+// its audited environment, and the guarded step `try_cancel_discharge`
+// splices into the reflection.
+#[path = "verify_output_instantiate/cancel.rs"]
+mod cancel;
+
+// The route's unit tests (T-U4, T-U5, T-U7 to T-U12).
+#[cfg(test)]
+#[path = "verify_output_instantiate/strength_route_tests.rs"]
+mod strength_route_tests;
+
+// The branch split (BRANCH-SPLIT-1): the kernel theory of `bvIteVal` and the
+// comparison bridges (`Trust.BVB.*`, `Trust.BVS.mul_add_self`), and the route
+// that proves a conjunction of branching obligations by an atom case split.
+#[path = "verify_output_instantiate/branch_theory.rs"]
+mod branch_theory;
+
+#[path = "verify_output_instantiate/branch_reflect.rs"]
+mod branch_reflect;
+
+#[path = "verify_output_instantiate/branch_split.rs"]
+mod branch_split;
+
+// The guarded symbolic division split (DIV-SPLIT-1), tried only where the branch split declined,
+// and the dispatch that orders the two (the step-(5) branch routes).
+#[path = "verify_output_instantiate/div_split.rs"]
+mod div_split;
+
+#[path = "verify_output_instantiate/branch_dispatch.rs"]
+mod branch_dispatch;
+
+// CONSTDIV: the constant-division theory and route. Stage B1 (DECISION_QUEUE
+// CONSTDIV-1) wires the step-(4) rewrite: call_event.rs hands each item's
+// machine side to `const_div_step4`. Stage B2 wires the conjunction route
+// (`const_div::try_conjunction`) as the third step-(5) branch route
+// (`branch_dispatch.rs`), tried only after the branch and division splits
+// decline and only on a conj with a multiply-high.
+#[path = "verify_output_instantiate/const_div.rs"]
+mod const_div;
+#[path = "verify_output_instantiate/const_div_theory.rs"]
+mod const_div_theory;
+#[cfg(feature = "test-hooks")]
+pub use branch_dispatch::without_const_div_conjunction;
+pub(crate) use const_div::step4_rewrite as const_div_step4;
+#[cfg(feature = "test-hooks")]
+pub use const_div::{HookCall, record_const_div_rewrites, without_const_div_rewrite};
+
+// Loop L1 spike (unwired, test-only): `Trust.Loop.sim` and the cut-point lockstep route.
+#[cfg(test)]
+#[path = "verify_output_instantiate/loop_sim.rs"]
+mod loop_sim;
+
+/// The step-(5) branch routes as the call-event gate calls them (call_event.rs and
+/// call_event/closed_branch.rs, DECISION_QUEUE BRANCH-SPLIT-1, DIV-SPLIT-1 and CONSTDIV-1): the
+/// branch split, then, on its decline, the guarded symbolic division split, then, on its decline
+/// and only with a multiply-high in the conj, the constant division route (`branch_dispatch.rs`,
+/// which this returns unchanged). `Some(KernelInstantiated)` when the kernel accepts a split, `None`
+/// otherwise. Under `test-hooks` each call's outcome is also recorded for
+/// [`record_branch_split_calls`]; the recording changes no result.
+pub(crate) fn try_branch_split_conjunction(
+    items: &[(Formula, Formula)],
+) -> Option<crate::verify_output::ProvenEvidence> {
+    let evidence = branch_dispatch::try_conjunction(items);
+    #[cfg(feature = "test-hooks")]
+    BRANCH_SPLIT_CALLS.with(|calls| {
+        if let Some(calls) = calls.borrow_mut().as_mut() {
+            calls.push(evidence.is_some());
+        }
+    });
+    evidence
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static BRANCH_SPLIT_CALLS: std::cell::RefCell<Option<Vec<bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TEST HOOK (`test-hooks` only): run `body` and return, with its result, one entry per call
+/// the call-event gate made to the branch split on THIS thread while it ran (`true` when the
+/// route returned kernel evidence, `false` when it declined). It observes the route; it grants
+/// nothing and changes no verdict. It lets a gate test pin WHERE step (5) calls the route (only
+/// inside `kernel_eligible`, after `closed_branch::retry`, never over kernel evidence), which the
+/// evidence alone cannot show when the route would decline anyway.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn record_branch_split_calls<R>(body: impl FnOnce() -> R) -> (R, Vec<bool>) {
+    let outer = BRANCH_SPLIT_CALLS.with(|calls| calls.borrow_mut().replace(Vec::new()));
+    let result = body();
+    let calls = BRANCH_SPLIT_CALLS.with(|calls| std::mem::replace(&mut *calls.borrow_mut(), outer));
+    (result, calls.unwrap_or_default())
+}
+
+/// The original typed mixed goal is checked as one CIC conjunction.
+pub(crate) fn try_original_conjunction_discharge(
+    items: &[(Formula, Formula)],
+) -> Option<crate::original_conjunction_certificate::CheckedOriginalConjunction> {
+    on_route_stack(|| memory_reflection::discharge_conjunction(items))
+}
+
+pub(crate) fn try_mem_store_load_discharge(
+    machine_out: &Formula,
+    auto: &Formula,
+) -> Option<String> {
+    on_route_stack(|| {
+        if !formula_contains_select(machine_out) && !formula_contains_select(auto) {
+            return None;
+        }
+        memory_reflection::discharge(machine_out, auto)
+    })
 }
 
 // ── Test-support surface (used by verify_output's B2b/B4 tests) ────────────────
@@ -2150,8 +3031,7 @@ pub(crate) mod test_support {
     }
     /// Does `reflect_mem` accept this formula? (true iff Some).
     pub(crate) fn reflect_mem_ok(f: &Formula) -> bool {
-        let mut ax = Vec::new();
-        super::reflect_mem(f, &mut ax).is_some()
+        super::memory_reflection::accepts(f)
     }
     pub(crate) fn mem_discharge(m: &Formula, a: &Formula) -> Option<String> {
         super::try_mem_store_load_discharge(m, a)
@@ -2166,3 +3046,9 @@ pub(crate) mod test_support {
         super::reflection_contains_wrapper(e)
     }
 }
+
+pub(crate) use memory_reflection::{
+    OriginalParameterRole, install_original_frame_bank, original_conjunction_goal,
+    original_conjunction_goal_version, original_conjunction_model, original_parameter_roles,
+    original_reflexive_equation,
+};

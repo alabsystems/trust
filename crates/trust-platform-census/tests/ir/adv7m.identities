@@ -1,0 +1,7 @@
+# Identities for the HAND-EDITED adv7m.trust_ir (see its header): the
+# edited body's calls (the transmute is now an alloca, a store, a load).
+body adv_transmute_guard pub
+spawners
+product-census
+effects adv_transmute_guard 40:23=fork 44:21=execv 44:46=_exit 47:39=fcntl 48:17=execv 48:42=_exit
+drops adv_transmute_guard

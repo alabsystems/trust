@@ -53,7 +53,10 @@ enum State<T, F> {
 #[stable(feature = "lazy_cell", since = "1.80.0")]
 // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
 #[rustc_diagnostic_item = "LazyCell"]
-pub struct LazyCell<T, F = fn() -> T> {
+pub struct LazyCell<
+    #[rustc_assert_variance(invariant)] T,
+    #[rustc_assert_variance(invariant)] F = fn() -> T,
+> {
     state: UnsafeCell<State<T, F>>,
 }
 
@@ -138,7 +141,7 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
-    #[rustc_should_not_be_called_on_const_items]
+    #[lint::should_not_be_called_on_const_items]
     // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
     #[rustc_diagnostic_item = "lazy_cell_force"]
     pub fn force(this: &LazyCell<T, F>) -> &T {

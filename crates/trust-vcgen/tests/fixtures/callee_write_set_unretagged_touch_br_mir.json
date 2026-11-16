@@ -1,0 +1,205 @@
+{
+  "name": "touch_br",
+  "def_path": "callee_write_set_unretagged::touch_br",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/callee_write_set_unretagged.rs",
+    "line_start": 104,
+    "col_start": 0,
+    "line_end": 106,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "callee_write_set_unretagged::BR",
+                "fields": [
+                  [
+                    "n",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "b",
+                    {
+                      "Ref": {
+                        "mutable": false,
+                        "inner": {
+                          "Adt": {
+                            "name": "alloc::boxed::Box",
+                            "fields": [
+                              [
+                                "0",
+                                {
+                                  "Adt": {
+                                    "name": "core::ptr::unique::Unique",
+                                    "fields": [
+                                      [
+                                        "pointer",
+                                        {
+                                          "Adt": {
+                                            "name": "core::ptr::non_null::NonNull",
+                                            "fields": [
+                                              [
+                                                "pointer",
+                                                {
+                                                  "RawPtr": {
+                                                    "mutable": false,
+                                                    "pointee": {
+                                                      "Int": {
+                                                        "width": 64,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "_marker",
+                                        {
+                                          "Adt": {
+                                            "name": "core::marker::PhantomData",
+                                            "fields": [],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ],
+                              [
+                                "1",
+                                {
+                                  "Adt": {
+                                    "name": "alloc::alloc::Global",
+                                    "fields": [],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "_x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "callee_write_set_unretagged::poke_global",
+            "args": [],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/callee_write_set_unretagged.rs",
+              "line_start": 105,
+              "col_start": 4,
+              "line_end": 105,
+              "col_end": 4
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 11682421472045932417,
+              "def_index": 4,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 11682421472045932417,
+              "krate_name": "callee_write_set_unretagged"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

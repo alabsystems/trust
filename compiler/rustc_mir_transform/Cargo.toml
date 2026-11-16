@@ -8,47 +8,54 @@ edition = "2024"
 
 [dependencies]
 # tidy-alphabetical-start
+clean-auto = { workspace = true }
+# Trust (totality campaign): the GENERAL Clean -> trust-ir compiler for the
+# general recording lane (every computational island def, not only the 13
+# planned shapes). Scope this backend requirement to the compiler consumer;
+# developer-only products need not compile it.
+clean-compiler = { workspace = true, features = ["trust-ir-backend"] }
 clean-kernel = { workspace = true }
 # Trust (kernel-tv): the producing denotation map; the independent re-check is
 # trust-ir-build's clean_backend_tv mirror, driven via validate_module.
 clean-reflect = { workspace = true }
-# Trust (totality campaign): the GENERAL Clean -> trust-ir compiler for the
-# general recording lane (every computational island def, not only the 13
-# planned shapes). Feature trust-ir-backend comes from the workspace entry.
-clean-compiler = { workspace = true }
-# Trust (totality campaign): in-tree re-check of the general lane's mint-time
-# TV certificates (the clean_backend_tv mirror) before the strip.
-trust-ir-build = { workspace = true }
 either = "1"
 itertools = "0.15"
 libc = "0.2"
 rustc_abi = { path = "../rustc_abi" }
 rustc_arena = { path = "../rustc_arena" }
 rustc_ast = { path = "../rustc_ast" }
+rustc_attr_ir = { path = "../rustc_attr_ir" }
 rustc_const_eval = { path = "../rustc_const_eval" }
+rustc_crate_store = { path = "../rustc_crate_store" }
 rustc_data_structures = { path = "../rustc_data_structures" }
 rustc_errors = { path = "../rustc_errors" }
 rustc_hir = { path = "../rustc_hir" }
 rustc_index = { path = "../rustc_index" }
 rustc_infer = { path = "../rustc_infer" }
 rustc_lexer = { path = "../rustc_lexer" }
+rustc_lint_defs = { path = "../rustc_lint_defs" }
 rustc_macros = { path = "../rustc_macros" }
 rustc_middle = { path = "../rustc_middle" }
+rustc_mir_build = { path = "../rustc_mir_build" }
 rustc_mir_dataflow = { path = "../rustc_mir_dataflow" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
+rustc_structures = { path = "../rustc_structures" }
 rustc_target = { path = "../rustc_target" }
 rustc_trait_selection = { path = "../rustc_trait_selection" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 smallvec = { version = "1.8.1", features = ["union", "may_dangle"] }
 tracing = "0.1"
 trust-cache = { workspace = true }
 trust-certify = { workspace = true }
-# Trust (I5): the gate's admitted statement is at the CARRIER type, and the
-# emitter's local types are the carrier decision rather than a convenience
-# mapping. Named directly so `clean_origin_mir.rs` cannot silently acquire a
-# second, looser type mapping through a re-export.
-trust-clean-carrier = { workspace = true }
+# Trust: the Clean -> TrustIR producer. Consumes the SAME sealed CleanOriginPlan
+# `clean_origin_mir` emits MIR from, so the two languages meet in TrustIR.
+trust-clean-ir = { workspace = true }
+# Trust: independent reflector/gate over the actual emitted TrustIR Function.
+# A targeted WrappingBinOp disagreement is fatal before the record can escape.
+trust-clean-ir-gate = { workspace = true }
 # Trust (I5): the Clean-origin CALL lane's two decisions. This crate is a
 # DEPENDENCY of `rustc_mir_transform`, not a provider installer above
 # `rustc_interface` — §7's "installs the provider overrides" is not
@@ -58,20 +65,27 @@ trust-clean-carrier = { workspace = true }
 # functions, which is strictly better: both call sites are inside the crate that
 # owns MIR construction, so there is no override to audit.
 trust-clean-origin = { workspace = true }
-# Trust: the Clean -> TrustIR producer. Consumes the SAME sealed CleanOriginPlan
-# `clean_origin_mir` emits MIR from, so the two languages meet in TrustIR.
-trust-clean-ir = { workspace = true }
-# Trust: independent reflector/gate over the actual emitted TrustIR Function.
-# A targeted WrappingBinOp disagreement is fatal before the record can escape.
-trust-clean-ir-gate = { workspace = true }
-trust-ir = { workspace = true, features = ["serde"] }
+trust-ir = { workspace = true, features = ["serde", "binary"] }
 trust-ir-bridge = { workspace = true, features = ["compiler-context"] }
+# Trust (totality campaign): in-tree re-check of the general lane's mint-time
+# TV certificates (the clean_backend_tv mirror) before the strip.
+trust-ir-build = { workspace = true }
 trust-mir-extract = { workspace = true }
+# Trust: D-2 C1/C2 data, shared with the rmeta kernel adapter.
+trust-odt = { workspace = true }
+# Trust (platform protocols, plan L1a = design PR 8): the platform-protocol pass (plan L1d)
+# runs the census over the published crate module, derives each root's model from the one
+# Darwin definition and replays every refutation on it. Linked now so L1d adds code, not a
+# dependency edge; nothing in this crate calls them yet.
+trust-platform = { workspace = true }
+trust-platform-census = { workspace = true }
+trust-platform-derive = { workspace = true }
 # Trust: enable the in-process ay SMT backend inside rustc so the verifier has
 # an artifact-backed (replayable unsat-proof) arithmetic prover. The historical
 # stacker/cc dep conflict that gated this off appears resolved (stacker aligned
 # at 0.1.24 across workspaces). Revert if the bootstrap dep graph conflicts.
 trust-router = { workspace = true, features = ["ay-backend", "ay-certify", "trust-build", "trust-cg-output-gate", "trust-vc-native"] }
+trust-source-contract = { workspace = true }
 trust-spec-elab = { workspace = true }
 trust-strengthen = { workspace = true }
 # Trust: P1 item 5 — the trust-ir flip (trust_ir_flip.rs) re-derives codegen MIR from the green
@@ -82,3 +96,17 @@ trust-vc-bridge = { workspace = true }
 trust-vcgen = { workspace = true }
 trust-verifier-api = { workspace = true }
 # tidy-alphabetical-end
+
+[dev-dependencies]
+# Replay regressions exercise the canonical Clean elaborator and producer
+# without needing to run a complete compiler bootstrap for each mutation.
+clean-elab = { workspace = true }
+clean-parser = { workspace = true }
+# Same pinned packages/features already reached via trust-router -> trust-bmc.
+# Tests inspect typed counterexamples without granting public failure authority.
+trust-mc-core = { workspace = true }
+trust-mc-driver = { path = "../../first-party/trust-mc/trust-mc-driver", default-features = false, features = ["native-typed-chc-pdr", "native-trust-ir-bundle"] }
+# VF5: the calculus-mint tests take a certificate from the reference entry over
+# trust-certify's stand-in VF5 family (`calculus_row::test_support`). A
+# dev-dependency feature, so test builds only (resolver 2).
+trust-certify = { workspace = true, features = ["calculus-row-test-support"] }

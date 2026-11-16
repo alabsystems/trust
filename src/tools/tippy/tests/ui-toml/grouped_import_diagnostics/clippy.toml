@@ -1,0 +1,7 @@
+disallowed-macros = [
+    "grouped_import_diagnostics::exports::wrong_kind",
+    "grouped_import_diagnostics::single::wrong_kind",
+]
+enforced-import-renames = [
+    { path = "grouped_import_diagnostics::exports::policy", rename = "approved" },
+]

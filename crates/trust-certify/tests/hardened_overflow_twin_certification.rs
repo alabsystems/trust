@@ -48,6 +48,44 @@
 // This test pins that asymmetry so it cannot move unobserved. It is a COVERAGE
 // record, not a soundness bug: declining to certify is fail-closed.
 //
+// ===========================================================================
+// AMENDMENT 2026-09-20 — THE ASYMMETRY IS GONE. IT MOVED, AND IT WAS OBSERVED.
+//
+// `trust_certify::certify_singleton_disjunction_retry` (the a7 per-path
+// postcondition lane, `docs/STRICT_VERIFICATION_FRAGMENT.md` §19.3) added a
+// LAST rung to `certify_with_identity_uncached`: a flat, disjunction-free
+// violation carrying a top-level negated conjunction is re-presented to
+// `certify_disjunctive_contradiction` as a ONE-ARM disjunction. `Or([F])` is
+// `F`, and `build_or_prop` emits a one-element list as the arm's own
+// proposition, so no wrapper reaches the kernel term.
+//
+// That is exactly the recognizer this file's located cause said the negated
+// conjunction "never reaches". It reaches it now, so the TWIN CERTIFIES — the
+// same change the `de_morgan_alone_recovers_the_twin` control predicted would
+// recover it, reached without rewriting the formula.
+//
+// THE BAR THIS FILE SET WAS CLEARED, and that is the only reason the flips
+// below are recorded rather than reverted:
+// `a_genuinely_overflowing_twin_certifies_nothing_before_or_after_de_morgan`
+// still PASSES. The SAT mutation (guards at 2_000_000_000, z3 witness
+// `a = 147483648, b = 2000000000`) certifies nothing, before or after the
+// rewrite, with the rung in place. What stops it is the engine's ay-UNSAT gate
+// and kernel re-check, not any entry test.
+//
+// THE FRONTIER SCRIPT IS NOT TOUCHED BY THIS AMENDMENT, deliberately, and for
+// the same reason CORRECTION 1 in `scripts/trust_strict_pass_frontier.sh` gives:
+// nobody has RUN `blocked.rs` since. Two things must also be kept apart before
+// anyone reads this as "the frontier moved":
+//   * The formulas in this file are the PRE-#222 capture from stage1
+//     `31ccf1b56`. Producer fix #222 already makes
+//     `guards::checked_binop_out_of_range_violation` emit the canonical
+//     disjunction, so on current `main` the live twin carries an `Or` and this
+//     rung DECLINES it at its first gate. This file is a historical shape.
+//   * Certifying that historical shape therefore changes nothing about what
+//     `trustc` emits today. Flip `run blocked expect-fail` only on a measured
+//     passing run, exactly as CORRECTION 1 says.
+// ===========================================================================
+//
 // Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0 OR MIT.
 
 use trust_types::{
@@ -66,12 +104,359 @@ fn span() -> SourceSpan {
 
 /// `[arithmetic_overflow_add]` — the per-statement arithmetic-safety row.
 fn primary_violation() -> Formula {
-    Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_3".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_4".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::Eq(Box::new(Formula::Var("_5".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_6".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::And(vec![Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_3".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_4".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::Eq(Box::new(Formula::Var("_5".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_6".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::Or(vec![Formula::Lt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(-2147483648))), Formula::Gt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(2147483647)))])])])])])])])
+    Formula::And(vec![
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Eq(
+                Box::new(Formula::Var("_3".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_4".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_5".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_6".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                )),
+            ),
+            Formula::And(vec![
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                ))),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Eq(
+                        Box::new(Formula::Var("_3".to_string(), Sort::Bool)),
+                        Box::new(Formula::Gt(
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(1000000)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_4".to_string(), Sort::Bool)),
+                        Box::new(Formula::Lt(
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(-1000000)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_5".to_string(), Sort::Bool)),
+                        Box::new(Formula::Gt(
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(1000000)),
+                        )),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_6".to_string(), Sort::Bool)),
+                        Box::new(Formula::Lt(
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(-1000000)),
+                        )),
+                    ),
+                    Formula::And(vec![
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                        Formula::And(vec![
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(-2147483648)),
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(2147483647)),
+                                ),
+                            ]),
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(-2147483648)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(2147483647)),
+                                ),
+                            ]),
+                            Formula::Or(vec![
+                                Formula::Lt(
+                                    Box::new(Formula::Add(
+                                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                    )),
+                                    Box::new(Formula::Int(-2147483648)),
+                                ),
+                                Formula::Gt(
+                                    Box::new(Formula::Add(
+                                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                    )),
+                                    Box::new(Formula::Int(2147483647)),
+                                ),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
 }
 
 /// `[hardened_panic_boundary] mir_assert::Overflow(Add)` — the `unix_hardened` twin.
 fn twin_violation() -> Formula {
-    Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_3".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_4".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::Eq(Box::new(Formula::Var("_5".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Eq(Box::new(Formula::Var("_6".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::And(vec![Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(1000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-1000000))))), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_7.1".to_string(), Sort::Bool)), Box::new(Formula::Or(vec![Formula::Lt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(-2147483648))), Formula::Gt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(2147483647)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Not(Box::new(Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int))))), Formula::Le(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(2147483647)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))])])])])])])
+    Formula::And(vec![
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Eq(
+                Box::new(Formula::Var("_3".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_4".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_5".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_6".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                )),
+            ),
+            Formula::And(vec![
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(1000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-1000000)),
+                ))),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Eq(
+                        Box::new(Formula::Var("_7.1".to_string(), Sort::Bool)),
+                        Box::new(Formula::Or(vec![
+                            Formula::Lt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(-2147483648)),
+                            ),
+                            Formula::Gt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ])),
+                    ),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(-2147483648)),
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(2147483647)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(-2147483648)),
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(2147483647)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Not(Box::new(Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]))),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
 }
 
 fn primary_vc() -> VerificationCondition {
@@ -111,19 +496,29 @@ fn primary_arithmetic_overflow_row_is_kernel_certified() {
     );
 }
 
-/// The twin does not — TODAY. Both formulas are UNSAT (z3-confirmed), so this
-/// is a certifier COVERAGE boundary, not a refutation and not a soundness bug.
+/// AND SO DOES THE TWIN, since 2026-09-20. Both formulas were always UNSAT
+/// (z3-confirmed); what changed is that the certifier can now reach the second
+/// spelling, through `certify_singleton_disjunction_retry`. This assertion is
+/// INVERTED from its original direction — see the file header amendment for why
+/// that is a coverage gain and not a relaxation, and note that the bar the
+/// header set (the SAT control below) still holds.
 ///
-/// WHEN THIS FLIPS: `blocked.rs` starts passing `targo trust check`, and
-/// `scripts/trust_strict_pass_frontier.sh`'s `run blocked expect-fail` must be
-/// updated deliberately, with the measurement that justified it.
+/// It stays in the file, inverted rather than deleted, because a regression
+/// would otherwise be silent: the rung is a last resort, and anything that
+/// reorders or narrows the lanes above it could take this shape back out of
+/// reach without failing anything else.
+///
+/// It is NOT evidence that `blocked.rs` passes. These formulas predate producer
+/// fix #222; the live twin now carries an `Or` and this rung declines it. Flip
+/// `scripts/trust_strict_pass_frontier.sh`'s `run blocked expect-fail` only on a
+/// measured passing run.
 #[test]
-fn hardened_overflow_twin_is_not_kernel_certified_today() {
+fn hardened_overflow_twin_is_kernel_certified_through_the_singleton_retry() {
     assert!(
-        trust_certify::certify_vc(&twin_vc()).is_none(),
-        "the hardened Overflow(Add) twin now certifies — if this is the intended \
-         improvement, flip blocked.rs to expect-pass in \
-         scripts/trust_strict_pass_frontier.sh and update this test"
+        trust_certify::certify_vc(&twin_vc()).is_some(),
+        "the hardened Overflow(Add) twin stopped certifying — the singleton \
+         disjunction retry no longer reaches the negated-conjunction spelling; \
+         re-run the isolation below before trusting any plan built on it"
     );
 }
 
@@ -131,6 +526,15 @@ fn hardened_overflow_twin_is_not_kernel_certified_today() {
 /// formulas: certification follows the formula in both directions.
 ///
 /// This is what rules out "the certifier refuses hardened rows on principle".
+///
+/// AMENDED 2026-09-20. The declining half used to be the UNSAT twin formula
+/// under an `ArithmeticOverflow` kind, and the singleton-disjunction retry now
+/// certifies that formula — which makes both halves certify and leaves the test
+/// measuring nothing. The declining half is therefore the SATISFIABLE
+/// `overflowing_twin_violation` instead, which keeps the ORIGINAL claim intact
+/// and sharpens it: the outcome tracks the formula's mathematics under either
+/// kind, both when the kind says "hardened" over a certifiable formula and when
+/// it says "arithmetic overflow" over an uncertifiable one.
 #[test]
 fn certification_follows_the_formula_not_the_vc_kind() {
     let mut hardened_kind_primary_formula = twin_vc();
@@ -141,12 +545,12 @@ fn certification_follows_the_formula_not_the_vc_kind() {
          certifier does not discriminate on VcKind"
     );
 
-    let mut primary_kind_twin_formula = primary_vc();
-    primary_kind_twin_formula.formula = twin_violation();
+    let mut primary_kind_satisfiable_formula = primary_vc();
+    primary_kind_satisfiable_formula.formula = overflowing_twin_violation();
     assert!(
-        trust_certify::certify_vc(&primary_kind_twin_formula).is_none(),
-        "an ArithmeticOverflow row carrying the TWIN formula must still decline: \
-         the gap is the formula shape"
+        trust_certify::certify_vc(&primary_kind_satisfiable_formula).is_none(),
+        "an ArithmeticOverflow row carrying a SATISFIABLE violation must decline: \
+         the kind cannot buy a certificate the mathematics does not support"
     );
 }
 
@@ -232,16 +636,30 @@ fn de_morgan_alone_recovers_the_twin() {
     );
 }
 
-/// The overflow-flag definition is NOT the blocker: dropping it changes nothing.
+/// The overflow-flag definition is NOT the blocker.
+///
+/// AMENDED 2026-09-20, and the amendment is why the isolation above is kept as
+/// history rather than re-run. Since `certify_singleton_disjunction_retry`
+/// landed the twin certifies with the flag definition PRESENT, so "dropping it
+/// alone does not recover the twin" is no longer a statement the outcome can
+/// distinguish: there is nothing left to recover. The 2026-08-27 measurement
+/// stands as recorded — De Morgan was the sole blocker, the flag definition was
+/// inert — and this test now pins the same fact in the only form still
+/// observable: the rewrite is INERT, so its outcome must equal the untouched
+/// twin's rather than differ from it.
+///
+/// A future change that made the flag definition matter in either direction
+/// breaks this, which is the property the original test existed to protect.
 #[test]
-fn dropping_the_overflow_flag_definition_alone_does_not_recover_the_twin() {
+fn dropping_the_overflow_flag_definition_alone_is_inert() {
     let mut vc = twin_vc();
     vc.formula = drop_overflow_flag_defs(&twin_violation());
     assert_ne!(vc.formula, twin_violation(), "the rewrite must actually change the formula");
-    assert!(
-        trust_certify::certify_vc(&vc).is_none(),
-        "dropping the flag definition now recovers the twin — the cause is no \
-         longer the De Morgan spelling alone"
+    assert_eq!(
+        trust_certify::certify_vc(&vc).is_some(),
+        trust_certify::certify_vc(&twin_vc()).is_some(),
+        "dropping the definition of a Bool flag that occurs in no other conjunct \
+         constrains nothing, so it must not move the certifier's answer"
     );
 }
 
@@ -262,7 +680,175 @@ fn dropping_the_overflow_flag_definition_alone_does_not_recover_the_twin() {
 
 /// The genuinely-overflowing twin, exactly as `trustc` emits it.
 fn overflowing_twin_violation() -> Formula {
-    Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_3".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2000000000))))), Formula::Eq(Box::new(Formula::Var("_4".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-2000000000))))), Formula::Eq(Box::new(Formula::Var("_5".to_string(), Sort::Bool)), Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2000000000))))), Formula::Eq(Box::new(Formula::Var("_6".to_string(), Sort::Bool)), Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-2000000000))))), Formula::And(vec![Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2000000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-2000000000))))), Formula::Not(Box::new(Formula::Gt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2000000000))))), Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-2000000000))))), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(-2147483648))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_7.1".to_string(), Sort::Bool)), Box::new(Formula::Or(vec![Formula::Lt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(-2147483648))), Formula::Gt(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(2147483647)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Not(Box::new(Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int))))), Formula::Le(Box::new(Formula::Add(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int)))), Box::new(Formula::Int(2147483647)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(-2147483648)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(2147483647)))])])])])])])
+    Formula::And(vec![
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(-2147483648)),
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                Box::new(Formula::Int(2147483647)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Eq(
+                Box::new(Formula::Var("_3".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(2000000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_4".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-2000000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_5".to_string(), Sort::Bool)),
+                Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(2000000000)),
+                )),
+            ),
+            Formula::Eq(
+                Box::new(Formula::Var("_6".to_string(), Sort::Bool)),
+                Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-2000000000)),
+                )),
+            ),
+            Formula::And(vec![
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(2000000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-2000000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Gt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(2000000000)),
+                ))),
+                Formula::Not(Box::new(Formula::Lt(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(-2000000000)),
+                ))),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Ge(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(-2147483648)),
+                    ),
+                    Formula::Le(
+                        Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        Box::new(Formula::Int(2147483647)),
+                    ),
+                ]),
+                Formula::And(vec![
+                    Formula::Eq(
+                        Box::new(Formula::Var("_7.1".to_string(), Sort::Bool)),
+                        Box::new(Formula::Or(vec![
+                            Formula::Lt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(-2147483648)),
+                            ),
+                            Formula::Gt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ])),
+                    ),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(-2147483648)),
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(2147483647)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(-2147483648)),
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(2147483647)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Not(Box::new(Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]))),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(-2147483648)),
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(2147483647)),
+                            ),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
 }
 
 #[test]
@@ -310,7 +896,209 @@ fn a_genuinely_overflowing_twin_certifies_nothing_before_or_after_de_morgan() {
 /// `[hardened_panic_boundary] mir_assert::Overflow(Add)` for `widen_add.rs`'s
 /// `(a as u16) + (b as u16)`, in the PRE-#222 negated-conjunction spelling.
 fn widen_add_twin_violation_pre_222() -> Formula {
-    Formula::And(vec![Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::And(vec![Formula::Ge(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(0))), Formula::Le(Box::new(Formula::Var("a".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::Ge(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(0))), Formula::Le(Box::new(Formula::Var("b".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::Or(vec![Formula::Gt(Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int)))), Box::new(Formula::Int(65535))), Formula::Eq(Box::new(Formula::Var("_0".to_string(), Sort::Int)), Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int)))))]), Formula::Le(Box::new(Formula::Var("_0".to_string(), Sort::Int)), Box::new(Formula::Int(510))), Formula::Le(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Int(255))), Formula::Le(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Int(255))), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_5.1".to_string(), Sort::Bool)), Box::new(Formula::Or(vec![Formula::Lt(Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int)))), Box::new(Formula::Int(0))), Formula::Gt(Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int)))), Box::new(Formula::Int(65535)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_3".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Int(65535)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_4".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Int(65535)))]), Formula::And(vec![Formula::Eq(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("a".to_string(), Sort::Int))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_3".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::Eq(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Var("b".to_string(), Sort::Int))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_4".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::Not(Box::new(Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int))))), Formula::Le(Box::new(Formula::Add(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Var("_4".to_string(), Sort::Int)))), Box::new(Formula::Int(65535)))]))), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_3".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Int(65535)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_4".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Int(65535)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_3".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_3".to_string(), Sort::Int)), Box::new(Formula::Int(255)))]), Formula::And(vec![Formula::Le(Box::new(Formula::Int(0)), Box::new(Formula::Var("_4".to_string(), Sort::Int))), Formula::Le(Box::new(Formula::Var("_4".to_string(), Sort::Int)), Box::new(Formula::Int(255)))])])])])])])])
+    Formula::And(vec![
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(0)),
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                Box::new(Formula::Int(255)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::Le(
+                Box::new(Formula::Int(0)),
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+            ),
+            Formula::Le(
+                Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                Box::new(Formula::Int(255)),
+            ),
+        ]),
+        Formula::And(vec![
+            Formula::And(vec![
+                Formula::Ge(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(255)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::Ge(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(0)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(255)),
+                ),
+            ]),
+            Formula::And(vec![
+                Formula::Or(vec![
+                    Formula::Gt(
+                        Box::new(Formula::Add(
+                            Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                            Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                        )),
+                        Box::new(Formula::Int(65535)),
+                    ),
+                    Formula::Eq(
+                        Box::new(Formula::Var("_0".to_string(), Sort::Int)),
+                        Box::new(Formula::Add(
+                            Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                            Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                        )),
+                    ),
+                ]),
+                Formula::Le(
+                    Box::new(Formula::Var("_0".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(510)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(255)),
+                ),
+                Formula::Le(
+                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                    Box::new(Formula::Int(255)),
+                ),
+                Formula::And(vec![
+                    Formula::Eq(
+                        Box::new(Formula::Var("_5.1".to_string(), Sort::Bool)),
+                        Box::new(Formula::Or(vec![
+                            Formula::Lt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(0)),
+                            ),
+                            Formula::Gt(
+                                Box::new(Formula::Add(
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                )),
+                                Box::new(Formula::Int(65535)),
+                            ),
+                        ])),
+                    ),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(0)),
+                            Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(65535)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Le(
+                            Box::new(Formula::Int(0)),
+                            Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                        ),
+                        Formula::Le(
+                            Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                            Box::new(Formula::Int(65535)),
+                        ),
+                    ]),
+                    Formula::And(vec![
+                        Formula::Eq(
+                            Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                            Box::new(Formula::Var("a".to_string(), Sort::Int)),
+                        ),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(0)),
+                                Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(255)),
+                            ),
+                        ]),
+                        Formula::Eq(
+                            Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                            Box::new(Formula::Var("b".to_string(), Sort::Int)),
+                        ),
+                        Formula::And(vec![
+                            Formula::Le(
+                                Box::new(Formula::Int(0)),
+                                Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                            ),
+                            Formula::Le(
+                                Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                Box::new(Formula::Int(255)),
+                            ),
+                        ]),
+                        Formula::And(vec![
+                            Formula::Not(Box::new(Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(0)),
+                                    Box::new(Formula::Add(
+                                        Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                        Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                    )),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Add(
+                                        Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                        Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                    )),
+                                    Box::new(Formula::Int(65535)),
+                                ),
+                            ]))),
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(0)),
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(65535)),
+                                ),
+                            ]),
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(0)),
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(65535)),
+                                ),
+                            ]),
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(0)),
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("_3".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(255)),
+                                ),
+                            ]),
+                            Formula::And(vec![
+                                Formula::Le(
+                                    Box::new(Formula::Int(0)),
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                ),
+                                Formula::Le(
+                                    Box::new(Formula::Var("_4".to_string(), Sort::Int)),
+                                    Box::new(Formula::Int(255)),
+                                ),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
 }
 
 fn widen_add_twin_vc(formula: Formula) -> VerificationCondition {
@@ -339,8 +1127,7 @@ fn the_cast_range_recognizer_survives_the_canonical_respelling() {
     // CONTROL: the pre-#222 spelling really does certify here. Without this the
     // assertion below would pass even if the recognizer had died entirely.
     assert!(
-        trust_certify::certify_vc(&widen_add_twin_vc(widen_add_twin_violation_pre_222()))
-            .is_some(),
+        trust_certify::certify_vc(&widen_add_twin_vc(widen_add_twin_violation_pre_222())).is_some(),
         "control lost: `widen_add`'s twin no longer certifies in its ORIGINAL \
          negated-conjunction spelling, so the comparison below proves nothing"
     );

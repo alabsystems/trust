@@ -111,6 +111,10 @@
 //! on `render` below pins the census line, so a dropped obligation now reads
 //! `out of 1 obligation(s)` and fails this test instead of passing it.
 //!
+//! (2026-09-30: the census line counts the rows the function PUBLISHES, so the
+//! `assumption:assumed-total-callee` row is "1 skipped" there, as it is in the JSON
+//! above; the line used to call it "1 runtime-checked", its VC-level category.)
+//!
 //! (The annotation sigil is deliberately not spelled anywhere in this prose:
 //! compiletest's expectation regex matches it ANYWHERE on a line, comment or
 //! not, so quoting it in a doc comment mints a phantom expectation that can
@@ -123,7 +127,7 @@
 use core::fmt::{self, Write as _};
 
 pub fn render() -> fmt::Result {
-    //~^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 1 runtime-checked out of 2 obligation(s)
+    //~^ NOTE Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked, 1 skipped out of 2 obligation(s)
     {
         struct S {
             n: u32,

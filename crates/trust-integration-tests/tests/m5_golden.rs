@@ -49,6 +49,25 @@ use trust_types::{
 ///   _0 = _7
 ///   return
 /// ```
+/// The source the binary_search fixtures are written to disk as.
+const BINARY_SEARCH_SOURCE: &str = "\
+pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {
+    let mut low = 0usize;
+    let mut high = arr.len();
+    while low < high {
+        let mid = (low + high) / 2;
+        if arr[mid] == target {
+            return Some(mid);
+        } else if arr[mid] < target {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    None
+}
+";
+
 fn binary_search_function() -> VerifiableFunction {
     VerifiableFunction {
         name: "binary_search".to_string(),
@@ -177,6 +196,7 @@ fn binary_search_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -213,23 +233,7 @@ fn test_m5_golden_binary_search_prove_strengthen_backprop() {
     // a report-only pseudo path.
     let _source_dir = tempfile::tempdir().expect("create temp dir");
     let source_path = _source_dir.path().join("search.rs");
-    let source = "\
-pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {
-    let mut low = 0usize;
-    let mut high = arr.len();
-    while low < high {
-        let mid = (low + high) / 2;
-        if arr[mid] == target {
-            return Some(mid);
-        } else if arr[mid] < target {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    None
-}
-";
+    let source = BINARY_SEARCH_SOURCE;
     std::fs::write(&source_path, source).expect("write temp source");
     let path_str = source_path.display().to_string();
 
@@ -325,13 +329,12 @@ pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {
     }
 
     // Check that we get the right kinds of rewrites
-    let has_spec_attribute = plan.rewrites.iter().any(|r| {
-        matches!(
-            &r.kind,
-            trust_backprop::RewriteKind::InsertAttribute { attribute }
-                if attribute.contains("requires") || attribute.contains("ensures")
-        )
-    });
+    // Backprop emits native contract clauses, not `#[trust::...]` attributes,
+    // since ec00579e8de (contracts are grammar; the attribute is a compat spelling).
+    let has_spec_attribute = plan
+        .rewrites
+        .iter()
+        .any(|r| matches!(&r.kind, trust_backprop::RewriteKind::InsertContractClause { .. }));
     let has_safe_arithmetic = plan.rewrites.iter().any(|r| {
         matches!(
             &r.kind,
@@ -400,10 +403,16 @@ fn test_m5_strengthen_overflow_proposal_quality() {
     let overflow_vcs: Vec<_> =
         vcs.into_iter().filter(|vc| matches!(vc.kind, VcKind::ArithmeticOverflow { .. })).collect();
 
+    // strengthen reads the function's source from `function_path` to name real
+    // operands, so point it at a real file.
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let source_path = dir.path().join("search.rs");
+    std::fs::write(&source_path, BINARY_SEARCH_SOURCE).expect("write temp source");
+
     let crate_results = CrateVerificationResult {
         crate_name: "search".into(),
         functions: vec![FunctionVerificationResult {
-            function_path: "search::binary_search".into(),
+            function_path: source_path.display().to_string(),
             function_name: "binary_search".into(),
             results: overflow_vcs
                 .into_iter()
@@ -428,12 +437,35 @@ fn test_m5_strengthen_overflow_proposal_quality() {
     let output =
         trust_strengthen::run(&crate_results, &trust_strengthen::StrengthenConfig::default());
 
-    // Proposals should include a precondition about overflow
-    let has_precondition = output
+    // The overflowing `low + high` is over body locals. A `requires` clause
+    // cannot name them (backprop refuses out-of-scope contract variables since
+    // 476a4e2a890), so the proposal is the checked rewrite of the real
+    // expression, and no precondition over invented names (previously the
+    // placeholder `a + b >= a`).
+    let safe_arithmetic: Vec<_> = output
         .proposals
         .iter()
-        .any(|p| matches!(p.kind, trust_strengthen::ProposalKind::AddPrecondition { .. }));
-    assert!(has_precondition, "strengthen should propose a precondition for the overflow");
+        .filter_map(|p| match &p.kind {
+            trust_strengthen::ProposalKind::SafeArithmetic { original, replacement } => {
+                Some((original.as_str(), replacement.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        safe_arithmetic
+            .contains(&("low + high", "low.checked_add(high).expect(\"addition overflow\")")),
+        "strengthen should propose checked_add for the real `low + high`: {:?}",
+        output.proposals
+    );
+    assert!(
+        !output
+            .proposals
+            .iter()
+            .any(|p| matches!(p.kind, trust_strengthen::ProposalKind::AddPrecondition { .. })),
+        "no precondition can name the body locals: {:?}",
+        output.proposals
+    );
 
     // All proposals should have meaningful confidence
     for p in &output.proposals {
@@ -450,33 +482,21 @@ fn test_m5_backprop_produces_valid_plan() {
     // proposal's function_path.
     let dir = tempfile::tempdir().expect("create temp dir");
     let source_path = dir.path().join("search.rs");
-    let source = "\
-pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {
-    let mut low = 0usize;
-    let mut high = arr.len();
-    while low < high {
-        let mid = (low + high) / 2;
-        if arr[mid] == target {
-            return Some(mid);
-        } else if arr[mid] < target {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    None
-}
-";
+    let source = BINARY_SEARCH_SOURCE;
     std::fs::write(&source_path, source).expect("write temp source");
     let path_str = source_path.display().to_string();
 
-    // Create a proposal manually (simulating strengthen output)
+    // Create a proposal manually (simulating strengthen output). The
+    // precondition names only the parameter `arr`: `low`/`high` are body locals
+    // a `requires` clause cannot name (scope check, 476a4e2a890), and `as`
+    // casts are refused in first-class clauses (1b576fa4a03). Bounding the
+    // length by usize::MAX / 2 (64-bit) keeps `low + high <= 2 * len` in range.
     let proposals = vec![
         trust_strengthen::Proposal {
             function_path: path_str.clone(),
             function_name: "binary_search".into(),
             kind: trust_strengthen::ProposalKind::AddPrecondition {
-                spec_body: "low as u128 + high as u128 <= usize::MAX as u128".into(),
+                spec_body: "arr.len() <= 9223372036854775807".into(),
             },
             confidence: 0.85,
             rationale: "Prevent addition overflow in midpoint calculation".into(),
@@ -499,13 +519,22 @@ pub fn binary_search(arr: &[i32], target: i32) -> Option<usize> {
 
     assert_eq!(plan.len(), 2, "plan should have 2 rewrites");
 
-    // First rewrite: InsertAttribute with requires
-    let attr_rewrites: Vec<_> = plan
+    // First rewrite: a native `requires` clause. Backprop emits
+    // InsertContractClause instead of InsertAttribute since ec00579e8de.
+    let clause_rewrites: Vec<_> = plan
         .rewrites
         .iter()
-        .filter(|r| matches!(&r.kind, trust_backprop::RewriteKind::InsertAttribute { .. }))
+        .filter(|r| {
+            matches!(
+                &r.kind,
+                trust_backprop::RewriteKind::InsertContractClause {
+                    clause: trust_backprop::ContractClauseKind::Requires,
+                    ..
+                }
+            )
+        })
         .collect();
-    assert_eq!(attr_rewrites.len(), 1, "should have 1 attribute insertion");
+    assert_eq!(clause_rewrites.len(), 1, "should have 1 requires clause insertion");
 
     // Second rewrite: ReplaceExpression with checked_add
     let expr_rewrites: Vec<_> = plan

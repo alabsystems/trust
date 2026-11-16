@@ -6,6 +6,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 use trust_types::{CrateVerdict, FunctionVerdict, JsonProofReport, ObligationOutcome};
 
 use crate::{
@@ -93,10 +96,13 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
             ansi(
                 DIM,
                 &format!(
-                    "{} proved, {} runtime-checked, {} failed, {} | {} obligations | max level: {} | {}ms{}",
+                    "{} proved, {} runtime-checked, {}, {} | {} obligations | max level: {} | {}ms{}",
                     func.summary.proved,
                     func.summary.runtime_checked,
-                    func.summary.failed,
+                    trust_types::failed_count_phrase(
+                        func.summary.failed,
+                        func.summary.failed_unproved
+                    ),
                     pending_summary(func.summary.unknown, func.summary.timed_out),
                     func.summary.total_obligations,
                     proof_level_label(func.summary.max_proof_level),
@@ -119,6 +125,11 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
                     ansi(GREEN, &format!("PROVED [{}]", proof_strength_label(strength)), color)
                 }
                 ObligationOutcome::RuntimeChecked { .. } => ansi(BLUE, "RUNTIME-CHECKED", color),
+                // A row nothing refuted still FAILS (red), but must not read as
+                // a found violation: name its basis.
+                ObligationOutcome::Failed { basis, .. } if !basis.is_refuted() => {
+                    ansi(RED, &format!("FAILED ({})", basis.human_label()), color)
+                }
                 ObligationOutcome::Failed { .. } => ansi(RED, "FAILED", color),
                 ObligationOutcome::Unknown { .. } => ansi(YELLOW, "UNKNOWN", color),
                 ObligationOutcome::Timeout { .. } => ansi(YELLOW, "TIMEOUT", color),
@@ -140,6 +151,10 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
             );
 
             lines.push(format!("    {} [{}] {} {}", status_colored, ob.kind, ob.description, meta));
+            // Trust (TINV step 10.7): every premise the row rests on, whatever the outcome.
+            for premise in &ob.assumes {
+                lines.push(format!("      {}", ansi(YELLOW, premise, color)));
+            }
 
             // The legacy strength remains in the compact status token for CLI
             // compatibility; the next line is the authoritative multi-axis
@@ -188,13 +203,18 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
             }
 
             // Extra detail for failures with counterexamples
-            if let ObligationOutcome::Failed { counterexample: Some(cex) } = &ob.outcome {
-                let vars: Vec<String> =
-                    cex.variables.iter().map(|v| format!("{} = {}", v.name, v.display)).collect();
+            if let ObligationOutcome::Failed { counterexample: Some(cex), .. } = &ob.outcome {
+                let mut vars = String::new();
+                for (i, v) in cex.variables.iter().enumerate() {
+                    if i > 0 {
+                        vars.push_str(", ");
+                    }
+                    let _ = write!(vars, "{} = {}", v.name, v.display);
+                }
                 lines.push(format!(
                     "      {} {}",
                     ansi(RED, "counterexample:", color),
-                    vars.join(", "),
+                    vars,
                 ));
             }
 
@@ -232,11 +252,9 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
     } else {
         format!("{} runtime-checked", s.total_runtime_checked)
     };
-    let failed_str = if s.total_failed > 0 {
-        ansi(RED, &format!("{} failed", s.total_failed), color)
-    } else {
-        format!("{} failed", s.total_failed)
-    };
+    let failed_phrase = trust_types::failed_count_phrase(s.total_failed, s.total_failed_unproved);
+    let failed_str =
+        if s.total_failed > 0 { ansi(RED, &failed_phrase, color) } else { failed_phrase };
     let pending_label = pending_summary(s.total_unknown, s.total_timed_out);
     let pending_str =
         if s.total_unknown > 0 { ansi(YELLOW, &pending_label, color) } else { pending_label };
@@ -271,9 +289,8 @@ pub(crate) fn format_terminal_report_impl(report: &JsonProofReport, color: bool)
         lines.push(ansi(DIM, &line, color));
     }
 
-    // Trust: session-end Trust Surface — vanilla rustc accepts this crate
-    // unchanged; this section states, split by strength of basis, exactly what
-    // Trust additionally proved (certified/smt-backed), runtime-checked, left
+    // Trust: session-end Trust Surface states, split by strength of basis, what
+    // Trust reported as proved (certified/smt-backed), runtime-checked, left
     // unknown, or rested on an assumed/trusted dependency. Bolds the header and
     // dims the detail to match the surrounding summary style.
     let surface_lines = crate::formatting::trust_surface_lines(&report.functions);
@@ -321,15 +338,15 @@ fn unattributed_suffix(proved: usize, failed: usize, unknown: usize) -> String {
 
 fn evidence_provenance_label(
     provenance: &trust_types::ObligationEvidenceProvenanceReport,
-) -> String {
+) -> Cow<'static, str> {
     match provenance {
         trust_types::ObligationEvidenceProvenanceReport::RouterAttributed => {
-            "router_attributed".to_string()
+            Cow::Borrowed("router_attributed")
         }
         trust_types::ObligationEvidenceProvenanceReport::NativeBackend { verifier } => {
-            format!("native_backend:{verifier}")
+            Cow::Owned(format!("native_backend:{verifier}"))
         }
-        _ => "unknown".to_string(),
+        _ => Cow::Borrowed("unknown"),
     }
 }
 
@@ -420,8 +437,6 @@ mod tests {
                 trust_version: TRUST_VERSION.to_string(),
                 timestamp: "0".to_string(),
                 total_time_ms: 11,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "runtime_checked".to_string(),
             summary: CrateSummary {
@@ -438,6 +453,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,
@@ -453,6 +469,7 @@ mod tests {
                     unknown: 0,
                     timed_out: 0,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 0,
@@ -461,6 +478,7 @@ mod tests {
                     verdict: FunctionVerdict::RuntimeChecked,
                 },
                 obligations: vec![ObligationReport {
+                    assumes: Vec::new(),
                     obligation_id: None,
                     description: "runtime safety check".to_string(),
                     kind: "postcondition".to_string(),
@@ -487,6 +505,102 @@ mod tests {
             verification_gate: None,
             cargo_proof_inventory: None,
         }
+    }
+
+    // Ramp (2026-09-07): a pass that stands on unproved obligations gets its
+    // own line under the Gate line — and only when the flag says so.
+    #[test]
+    fn gate_note_names_unproved_conditions_only_when_the_flag_is_set() {
+        let mut report = runtime_checked_report();
+        let mut gate = trust_types::VerificationGateReport {
+            lane: "advisory".to_string(),
+            verification_level: Some("L0".to_string()),
+            decision: "conditional-pass".to_string(),
+            exit_code: 0,
+            counts: trust_types::VerificationGateCounts {
+                total: 3,
+                proved: 2,
+                failed: 0,
+                unknown: 1,
+                runtime_checked: 0,
+                assumed: 0,
+                mandated: 0,
+                contract_panics: 0,
+                excluded: 0,
+            },
+            conditional_on_assumption_rows: false,
+            conditional_on_dependency_entries: false,
+            conditional_on_runtime_checks: false,
+            conditional_on_unknown_rows: true,
+            conditional_on_visitation_entries: false,
+            coverage: None,
+            test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
+        };
+        report.verification_gate = Some(gate.clone());
+        let rendered = crate::formatting::format_json_summary(&report);
+        assert!(rendered.contains("Gate: CONDITIONAL-PASS [advisory lane, exit 0]"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "Gate note: 1 obligation(s) UNPROVED and carried as conditions of the pass"
+            ),
+            "{rendered}"
+        );
+
+        gate.conditional_on_unknown_rows = false;
+        report.verification_gate = Some(gate);
+        let rendered = crate::formatting::format_json_summary(&report);
+        assert!(!rendered.contains("Gate note:"), "{rendered}");
+    }
+
+    // Trust (CB4): excluded libtest harness bodies are named on the Gate line,
+    // outside `total`, and only when there are any.
+    #[test]
+    fn gate_line_names_excluded_harness_bodies_only_when_present() {
+        let mut report = runtime_checked_report();
+        let mut gate = trust_types::VerificationGateReport {
+            lane: "strict".to_string(),
+            verification_level: Some("L0".to_string()),
+            decision: "pass".to_string(),
+            exit_code: 0,
+            counts: trust_types::VerificationGateCounts {
+                total: 2,
+                proved: 2,
+                failed: 0,
+                unknown: 0,
+                runtime_checked: 0,
+                assumed: 0,
+                mandated: 0,
+                contract_panics: 0,
+                excluded: 4,
+            },
+            conditional_on_assumption_rows: false,
+            conditional_on_dependency_entries: false,
+            conditional_on_runtime_checks: false,
+            conditional_on_unknown_rows: false,
+            conditional_on_visitation_entries: false,
+            coverage: None,
+            test_execution: None,
+            exclusions: Vec::new(),
+            determinism: None,
+            failure_sites: None,
+            project_requirements: None,
+        };
+        report.verification_gate = Some(gate.clone());
+        let rendered = crate::formatting::format_json_summary(&report);
+        assert!(
+            rendered.contains("0 unknown / 2 total; 4 excluded: test-harness-synthesized)"),
+            "{rendered}"
+        );
+
+        gate.counts.excluded = 0;
+        report.verification_gate = Some(gate);
+        let rendered = crate::formatting::format_json_summary(&report);
+        assert!(rendered.contains("0 unknown / 2 total)"), "{rendered}");
+        assert!(!rendered.contains("excluded: test-harness"), "{rendered}");
     }
 
     #[test]
@@ -549,29 +663,43 @@ mod tests {
         assert!(output.contains("max level: L0 safety"));
     }
 
-    // Trust: the session-end Trust Surface section renders the deviation from
-    // vanilla rustc, split by strength of basis, and reconciles with the report.
+    // Trust: the session-end Trust Surface classifies reported outcomes without
+    // claiming that another compiler accepts source it has not checked.
     #[test]
-    fn test_terminal_trust_surface_section() {
+    fn test_trust_surface_reports_outcomes_without_upstream_acceptance_claim() {
         let report = mixed_report(); // 1 raw proof status, 1 failed, 1 unknown
-        let output = format_terminal_report_impl(&report, false);
-
-        assert!(
-            output.contains("Trust Surface (deviation from vanilla rustc)"),
-            "missing Trust Surface header:\n{output}"
-        );
-        assert!(
-            output.contains("vanilla rustc accepts this unchanged"),
-            "missing vanilla framing:\n{output}"
-        );
-        // The raw proof status has no structured publication evidence.
-        assert!(
-            output.contains("additionally proved=0 (certified=0, smt-backed=0)"),
-            "surface must split proved by assurance:\n{output}"
-        );
-        // Both the original Unknown and downgraded raw status are surfaced.
-        assert!(output.contains("left unknown=2"), "surface must report unknowns:\n{output}");
-        assert!(output.contains("refuted=1"), "surface must report refutations:\n{output}");
+        for (renderer, output) in [
+            ("terminal", format_terminal_report_impl(&report, false)),
+            ("terminal with color", format_terminal_report_impl(&report, true)),
+            ("text", crate::formatting::format_json_summary(&report)),
+        ] {
+            assert!(
+                output.contains("Trust Surface (reported verification obligations)"),
+                "{renderer}: missing Trust Surface header:\n{output}"
+            );
+            assert!(
+                output.contains("Trust reported 3 obligations"),
+                "{renderer}: surface must count the reported obligations:\n{output}"
+            );
+            assert!(
+                !output.contains("vanilla rustc") && !output.contains("accepts this unchanged"),
+                "{renderer}: report has no evidence of upstream source acceptance:\n{output}"
+            );
+            // The raw proof status has no structured publication evidence.
+            assert!(
+                output.contains("additionally proved=0 (certified=0, smt-backed=0)"),
+                "{renderer}: surface must split proved by assurance:\n{output}"
+            );
+            // Both the original Unknown and downgraded raw status are surfaced.
+            assert!(
+                output.contains("left unknown=2"),
+                "{renderer}: surface must report unknowns:\n{output}"
+            );
+            assert!(
+                output.contains("refuted=1"),
+                "{renderer}: surface must report refutations:\n{output}"
+            );
+        }
     }
 
     #[test]
@@ -678,8 +806,10 @@ mod tests {
         obligation.description = "prove loop invariant".into();
         obligation.outcome = ObligationOutcome::Unknown { reason: "static proof open".into() };
         obligation.transport_evidence = Some(ObligationTransportEvidenceReport {
+            identity: None,
             obligation_id: Some("obligation:loop_invariant:0".into()),
             claim_digest_sha256: None,
+            original_vc_snapshot: None,
             typed_kind: Some(Box::new(VcKind::LoopInvariantInitiation {
                 invariant: "i <= n".into(),
                 header_block: 1,
@@ -707,8 +837,6 @@ mod tests {
                 trust_version: TRUST_VERSION.to_string(),
                 timestamp: "0".to_string(),
                 total_time_ms: 9,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "native".to_string(),
             summary: CrateSummary {
@@ -725,6 +853,7 @@ mod tests {
                 total_unknown: 0,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 1,
@@ -740,6 +869,7 @@ mod tests {
                     unknown: 0,
                     timed_out: 0,
                     design_requirements: 0,
+                    failed_unproved: 0,
                     unattributed_failed: 0,
                     unattributed_unknown: 0,
                     unattributed_proved: 1,
@@ -748,6 +878,7 @@ mod tests {
                     verdict: FunctionVerdict::Inconclusive,
                 },
                 obligations: vec![ObligationReport {
+                    assumes: Vec::new(),
                     obligation_id: Some("abc:0".to_string()),
                     description: "postcondition".to_string(),
                     kind: "postcondition".to_string(),

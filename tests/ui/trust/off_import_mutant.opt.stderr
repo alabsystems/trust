@@ -1,0 +1,20 @@
+error: `member_approval_is_exact` did not elaborate: Tactic failed: unsolved goals: tactic block has 1 unsolved goal(s)
+       authority : Bool
+       eligible : Bool
+       writer : Bool
+       ⊢ Bool.or fvar#1 (Bool.and fvar#2 fvar#3) = and fvar#1 (and fvar#2 fvar#3) [raised under tactic `simp` at source bytes 212..216]
+  --> $DIR/off_import_mutant.rs:25:5
+   |
+LL |     theorem member_approval_is_exact (authority eligible writer : Bool) :
+   |     ^^^^^^^
+   |
+   = note: this island names the kernel-import namespace, so it was checked after program admissions were minted (two-language design item 10)
+
+error: cited theorem `member_approval_is_exact` is not registered in any Clean island or the prelude
+  --> $DIR/off_import_mutant.rs:18:62
+   |
+LL |     ensures result == (authority && (eligible && writer)) by member_approval_is_exact
+   |                                                              ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

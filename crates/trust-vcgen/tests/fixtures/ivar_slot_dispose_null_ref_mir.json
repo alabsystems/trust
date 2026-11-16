@@ -1,0 +1,1838 @@
+{
+ "name": "dispose",
+ "def_path": "repro::IvarSlot::<T>::dispose",
+ "span": {
+  "file": "src/lib.rs",
+  "line_start": 17,
+  "col_start": 4,
+  "line_end": 28,
+  "col_end": 5
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": "Unit",
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "RawPtr": {
+      "mutable": true,
+      "pointee": {
+       "Adt": {
+        "name": "repro::IvarSlot",
+        "fields": [
+         [
+          "initialized",
+          "Bool"
+         ],
+         [
+          "value",
+          {
+           "Adt": {
+            "name": "core::mem::maybe_uninit::MaybeUninit",
+            "fields": [
+             [
+              "uninit",
+              "Unit"
+             ],
+             [
+              "value",
+              {
+               "Adt": {
+                "name": "core::mem::manually_drop::ManuallyDrop",
+                "fields": [
+                 [
+                  "value",
+                  {
+                   "Adt": {
+                    "name": "core::mem::maybe_dangling::MaybeDangling",
+                    "fields": [
+                     [
+                      "0",
+                      {
+                       "Unsupported": {
+                        "kind": "TyKind::Param",
+                        "detail": "generic parameter T/#0 needs monomorphization"
+                       }
+                      }
+                     ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                   }
+                  }
+                 ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Union"
+           }
+          }
+         ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Struct"
+       }
+      }
+     }
+    },
+    "name": "slot"
+   },
+   {
+    "index": 2,
+    "ty": "Bool",
+    "name": "initialized"
+   },
+   {
+    "index": 3,
+    "ty": "Unit",
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "RawPtr": {
+      "mutable": true,
+      "pointee": {
+       "Unsupported": {
+        "kind": "TyKind::Param",
+        "detail": "generic parameter T/#0 needs monomorphization"
+       }
+      }
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 5,
+    "ty": {
+     "Ref": {
+      "mutable": true,
+      "inner": {
+       "Adt": {
+        "name": "core::mem::maybe_uninit::MaybeUninit",
+        "fields": [
+         [
+          "uninit",
+          "Unit"
+         ],
+         [
+          "value",
+          {
+           "Adt": {
+            "name": "core::mem::manually_drop::ManuallyDrop",
+            "fields": [
+             [
+              "value",
+              {
+               "Adt": {
+                "name": "core::mem::maybe_dangling::MaybeDangling",
+                "fields": [
+                 [
+                  "0",
+                  {
+                   "Unsupported": {
+                    "kind": "TyKind::Param",
+                    "detail": "generic parameter T/#0 needs monomorphization"
+                   }
+                  }
+                 ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+               }
+              }
+             ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+           }
+          }
+         ]
+        ],
+        "variants": [],
+        "disc_index_safe": false,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Union"
+       }
+      }
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 6,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 7,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 8,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 9,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 10,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 11,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 12,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 13,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 14,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 15,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 16,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 17,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 18,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 19,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 20,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 21,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 22,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 23,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 24,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 25,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 26,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 27,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 28,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 29,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 30,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 31,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 32,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 33,
+    "ty": {
+     "RawPtr": {
+      "mutable": false,
+      "pointee": "Unit"
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 34,
+    "ty": {
+     "Int": {
+      "width": 64,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 35,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 36,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 37,
+    "ty": "Bool",
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 16,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 17,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 16,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 18,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Sub",
+         {
+          "Constant": {
+           "OpaqueScalar": {
+            "width": 64,
+            "signed": false
+           }
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 19,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 17,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 18,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 20,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 19,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 20,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": "MisalignedPointerDereference",
+      "target": 6,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 19,
+       "col_start": 35,
+       "line_end": 19,
+       "col_end": 54
+      }
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 11,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 12,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 11,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 13,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Sub",
+         {
+          "Constant": {
+           "OpaqueScalar": {
+            "width": 64,
+            "signed": false
+           }
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 14,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 12,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 13,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 15,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 14,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 15,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": "MisalignedPointerDereference",
+      "target": 5,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 25,
+       "col_start": 12,
+       "line_end": 25,
+       "col_end": 39
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::ptr::drop_in_place::<T>",
+      "args": [
+       {
+        "Move": {
+         "local": 4,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 3,
+       "projections": []
+      },
+      "target": 3,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 26,
+       "col_start": 12,
+       "line_end": 26,
+       "col_end": 64
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": true,
+      "unwind": "Continue",
+      "callee_key": {
+       "sysroot_item": "PtrDropInPlace",
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 6692626837626329215,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 3,
+    "stmts": [],
+    "terminator": "Return"
+   },
+   {
+    "id": 4,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 33,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 34,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 33,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 35,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 34,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 36,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 35,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Bool": true
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 37,
+        "projections": []
+       },
+       "rvalue": {
+        "UnaryOp": [
+         "Not",
+         {
+          "Copy": {
+           "local": 36,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 37,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": {
+       "Custom": "null reference constructed"
+      },
+      "target": 9,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 26,
+       "col_start": 37,
+       "line_end": 26,
+       "col_end": 50
+      }
+     }
+    }
+   },
+   {
+    "id": 5,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 27,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 28,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 27,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 29,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Ne",
+         {
+          "Constant": {
+           "OpaqueScalar": {
+            "width": 64,
+            "signed": false
+           }
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 30,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 28,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 31,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 30,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 29,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 32,
+        "projections": []
+       },
+       "rvalue": {
+        "UnaryOp": [
+         "Not",
+         {
+          "Copy": {
+           "local": 31,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 32,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": "NullPointerDereference",
+      "target": 8,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 25,
+       "col_start": 12,
+       "line_end": 25,
+       "col_end": 39
+      }
+     }
+    }
+   },
+   {
+    "id": 6,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 21,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 22,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 21,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 23,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Ne",
+         {
+          "Constant": {
+           "OpaqueScalar": {
+            "width": 64,
+            "signed": false
+           }
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 24,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 22,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 25,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 24,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 23,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 26,
+        "projections": []
+       },
+       "rvalue": {
+        "UnaryOp": [
+         "Not",
+         {
+          "Copy": {
+           "local": 25,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 26,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": "NullPointerDereference",
+      "target": 7,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 19,
+       "col_start": 35,
+       "line_end": 19,
+       "col_end": 54
+      }
+     }
+    }
+   },
+   {
+    "id": 7,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 2,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 1,
+          "projections": [
+           "Deref",
+           {
+            "Field": 0
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 19,
+        "col_start": 35,
+        "line_end": 19,
+        "col_end": 54
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Copy": {
+        "local": 2,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        3
+       ]
+      ],
+      "otherwise": 1,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 20,
+       "col_start": 12,
+       "line_end": 20,
+       "col_end": 23
+      }
+     }
+    }
+   },
+   {
+    "id": 8,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 1,
+        "projections": [
+         "Deref",
+         {
+          "Field": 0
+         }
+        ]
+       },
+       "rvalue": {
+        "Use": {
+         "Constant": {
+          "Bool": false
+         }
+        }
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 25,
+        "col_start": 12,
+        "line_end": 25,
+        "col_end": 39
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 6,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "RawPtr": {
+           "mutable": false,
+           "pointee": "Unit"
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 7,
+        "projections": []
+       },
+       "rvalue": {
+        "Cast": [
+         {
+          "Copy": {
+           "local": 6,
+           "projections": []
+          }
+         },
+         {
+          "Int": {
+           "width": 64,
+           "signed": false
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 8,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Sub",
+         {
+          "Constant": {
+           "OpaqueScalar": {
+            "width": 64,
+            "signed": false
+           }
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            1,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 9,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "BitAnd",
+         {
+          "Copy": {
+           "local": 7,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 8,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     },
+     {
+      "Assign": {
+       "place": {
+        "local": 10,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Eq",
+         {
+          "Copy": {
+           "local": 9,
+           "projections": []
+          }
+         },
+         {
+          "Constant": {
+           "Uint": [
+            0,
+            64
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Copy": {
+        "local": 10,
+        "projections": []
+       }
+      },
+      "expected": true,
+      "msg": "MisalignedPointerDereference",
+      "target": 4,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 26,
+       "col_start": 37,
+       "line_end": 26,
+       "col_end": 50
+      }
+     }
+    }
+   },
+   {
+    "id": 9,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 5,
+        "projections": []
+       },
+       "rvalue": {
+        "Ref": {
+         "mutable": true,
+         "place": {
+          "local": 1,
+          "projections": [
+           "Deref",
+           {
+            "Field": 1
+           }
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "src/lib.rs",
+        "line_start": 26,
+        "col_start": 37,
+        "line_end": 26,
+        "col_end": 50
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Call": {
+      "func": "core::mem::maybe_uninit::MaybeUninit::<T>::as_mut_ptr",
+      "args": [
+       {
+        "Move": {
+         "local": 5,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 4,
+       "projections": []
+      },
+      "target": 2,
+      "span": {
+       "file": "src/lib.rs",
+       "line_start": 26,
+       "col_start": 37,
+       "line_end": 26,
+       "col_end": 63
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_key": {
+       "sysroot_item": "MaybeUninitAsMutPtr",
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 6692626837626329215,
+       "krate_name": "core"
+      }
+     }
+    }
+   }
+  ],
+  "arg_count": 1,
+  "return_ty": "Unit"
+ },
+ "contracts": [],
+ "preconditions": [],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

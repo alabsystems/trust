@@ -1,0 +1,441 @@
+{
+ "name": "strict_add_g",
+ "def_path": "nm::strict_add_g",
+ "span": {
+  "file": "nm.rs",
+  "line_start": 32,
+  "col_start": 0,
+  "line_end": 32,
+  "col_end": 98
+ },
+ "body": {
+  "locals": [
+   {
+    "index": 0,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 1,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "a"
+   },
+   {
+    "index": 2,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": "b"
+   },
+   {
+    "index": 3,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   },
+   {
+    "index": 4,
+    "ty": {
+     "Tuple": [
+      {
+       "Int": {
+        "width": 32,
+        "signed": false
+       }
+      },
+      "Bool"
+     ]
+    },
+    "name": null
+   },
+   {
+    "index": 5,
+    "ty": "Bool",
+    "name": null
+   },
+   {
+    "index": 6,
+    "ty": {
+     "Int": {
+      "width": 32,
+      "signed": false
+     }
+    },
+    "name": null
+   }
+  ],
+  "blocks": [
+   {
+    "id": 0,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 4,
+        "projections": []
+       },
+       "rvalue": {
+        "CheckedBinaryOp": [
+         "Sub",
+         {
+          "Constant": {
+           "Uint": [
+            4294967295,
+            32
+           ]
+          }
+         },
+         {
+          "Copy": {
+           "local": 2,
+           "projections": []
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 32,
+        "col_start": 53,
+        "line_end": 32,
+        "col_end": 53
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Assert": {
+      "cond": {
+       "Move": {
+        "local": 4,
+        "projections": [
+         {
+          "Field": 1
+         }
+        ]
+       }
+      },
+      "expected": false,
+      "msg": {
+       "Overflow": "Sub"
+      },
+      "target": 4,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 32,
+       "col_start": 53,
+       "line_end": 32,
+       "col_end": 53
+      },
+      "unwind": "Continue"
+     }
+    }
+   },
+   {
+    "id": 1,
+    "stmts": [],
+    "terminator": {
+     "Call": {
+      "func": "core::num::<impl u32>::strict_add",
+      "args": [
+       {
+        "Copy": {
+         "local": 1,
+         "projections": []
+        }
+       },
+       {
+        "Copy": {
+         "local": 2,
+         "projections": []
+        }
+       }
+      ],
+      "dest": {
+       "local": 6,
+       "projections": []
+      },
+      "target": 5,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 32,
+       "col_start": 70,
+       "line_end": 32,
+       "col_end": 70
+      },
+      "atomic": null,
+      "is_foreign": false,
+      "is_unsafe_sig": false,
+      "unwind": "Continue",
+      "callee_identity": {
+       "stable_crate_id": 16308397492346268927,
+       "def_index": 27624,
+       "substs_digest": [
+        14241860155052752853,
+        2268345107747320411
+       ]
+      },
+      "callee_key": {
+       "krate_is_real_sysroot": true,
+       "krate_name_is_ambiguous": false,
+       "stable_crate_id": 16308397492346268927,
+       "krate_name": "core"
+      }
+     }
+    }
+   },
+   {
+    "id": 2,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Constant": {
+          "Uint": [
+           0,
+           32
+          ]
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 32,
+        "col_start": 45,
+        "line_end": 32,
+        "col_end": 45
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Goto": 3
+    }
+   },
+   {
+    "id": 3,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 0,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 3,
+          "projections": []
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 32,
+        "col_start": 98,
+        "line_end": 32,
+        "col_end": 98
+       }
+      }
+     }
+    ],
+    "terminator": "Return"
+   },
+   {
+    "id": 4,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 5,
+        "projections": []
+       },
+       "rvalue": {
+        "BinaryOp": [
+         "Le",
+         {
+          "Copy": {
+           "local": 1,
+           "projections": []
+          }
+         },
+         {
+          "Copy": {
+           "local": 4,
+           "projections": [
+            {
+             "Field": 0
+            }
+           ]
+          }
+         }
+        ]
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 32,
+        "col_start": 48,
+        "line_end": 32,
+        "col_end": 48
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "SwitchInt": {
+      "discr": {
+       "Copy": {
+        "local": 5,
+        "projections": []
+       }
+      },
+      "targets": [
+       [
+        0,
+        2
+       ]
+      ],
+      "otherwise": 1,
+      "exhaustive_enum_unreachable": false,
+      "span": {
+       "file": "nm.rs",
+       "line_start": 32,
+       "col_start": 45,
+       "line_end": 32,
+       "col_end": 45
+      }
+     }
+    }
+   },
+   {
+    "id": 5,
+    "stmts": [
+     {
+      "Assign": {
+       "place": {
+        "local": 3,
+        "projections": []
+       },
+       "rvalue": {
+        "Use": {
+         "Copy": {
+          "local": 6,
+          "projections": []
+         }
+        }
+       },
+       "span": {
+        "file": "nm.rs",
+        "line_start": 32,
+        "col_start": 45,
+        "line_end": 32,
+        "col_end": 45
+       }
+      }
+     }
+    ],
+    "terminator": {
+     "Goto": 3
+    }
+   }
+  ],
+  "arg_count": 2,
+  "return_ty": {
+   "Int": {
+    "width": 32,
+    "signed": false
+   }
+  }
+ },
+ "contracts": [],
+ "preconditions": [
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "a",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "And": [
+    {
+     "Ge": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 0
+      }
+     ]
+    },
+    {
+     "Le": [
+      {
+       "Var": [
+        "b",
+        "Int"
+       ]
+      },
+      {
+       "Int": 4294967295
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "postconditions": [],
+ "spec": {
+  "requires": [],
+  "ensures": [],
+  "invariants": []
+ }
+}

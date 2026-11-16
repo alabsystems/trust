@@ -1,5 +1,5 @@
 use crate::command_prelude::*;
-use cargo::ops::{self, TestOptions};
+use targo::ops::{self, TestOptions};
 
 pub fn cli() -> Command {
     subcommand("bench")
@@ -45,7 +45,7 @@ pub fn cli() -> Command {
         .arg_jobs()
         .arg_unsupported_keep_going()
         .arg_profile("Build artifacts with the specified profile")
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_unit_graph()
         .arg_timings()
@@ -68,6 +68,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
     let ops = TestOptions {
         no_run: args.flag("no-run"),
         no_fail_fast: args.flag("no-fail-fast"),
+        required_test_bins: Vec::new(),
         compile_opts,
     };
 

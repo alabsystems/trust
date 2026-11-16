@@ -15,9 +15,7 @@ use std::time::Duration;
 use crate::oscillation::{
     DampingStrategy, OscillationConfig, OscillationPattern, apply_damping, detect_oscillation,
 };
-use crate::{
-    ConvergenceDecision, ConvergenceTracker, IterationSnapshot, ProofFrontier, StepVerdict,
-};
+use crate::{ConvergenceDecision, ConvergenceTracker, IterationSnapshot, StepVerdict};
 
 // ---------------------------------------------------------------------------
 // LoopDecision — the single enum trust-loop uses
@@ -253,35 +251,34 @@ impl LoopConvergence {
         self.cex_fingerprints.push(observation.cex_fingerprint);
         self.solver_confidences.push(observation.solver_confidence);
 
-        // Observe frontier via inner tracker.
-        let decision = self.tracker.observe(observation.snapshot.clone());
-
         // Track convergence score for oscillation detection.
-        let score = observation.snapshot.frontier.convergence_score().unwrap_or(0.0);
+        let frontier = observation.snapshot.frontier.clone();
+        let score = frontier.convergence_score().unwrap_or(0.0);
         self.score_history.push(score);
+
+        // Observe frontier via inner tracker.
+        let decision = self.tracker.observe(observation.snapshot);
 
         // Detect oscillation on the score history.
         let oscillation = detect_oscillation(&self.score_history, &self.policy.oscillation_config);
 
         // Build multi-dimensional convergence snapshot.
-        let dimensions = self.compute_dimensions(&observation.snapshot.frontier);
+        let dimensions = self.compute_dimensions_with_score(score);
 
         // Check budget exhaustion.
         if let Some(resource) = self.check_budget() {
-            let proved_ratio = observation.snapshot.frontier.convergence_score().unwrap_or(0.0);
             return LoopDecision::Terminate {
-                outcome: TerminationOutcome::BudgetExhausted { resource, proved_ratio },
+                outcome: TerminationOutcome::BudgetExhausted { resource, proved_ratio: score },
                 dimensions,
             };
         }
 
         // Check for divergence via oscillation.
         if let Some(OscillationPattern::Divergent) = &oscillation {
-            let proved_ratio = observation.snapshot.frontier.convergence_score().unwrap_or(0.0);
             return LoopDecision::Terminate {
                 outcome: TerminationOutcome::Diverging {
                     pattern: OscillationPattern::Divergent,
-                    proved_ratio,
+                    proved_ratio: score,
                 },
                 dimensions,
             };
@@ -290,17 +287,15 @@ impl LoopConvergence {
         // Map inner ConvergenceDecision to LoopDecision.
         match decision {
             ConvergenceDecision::Converged { stable_rounds, .. } => {
-                let frontier = &observation.snapshot.frontier;
                 if frontier.failed == 0 && frontier.unknown == 0 {
                     LoopDecision::Terminate {
                         outcome: TerminationOutcome::FullyVerified { stable_rounds },
                         dimensions,
                     }
                 } else {
-                    let proved_ratio = frontier.convergence_score().unwrap_or(0.0);
                     LoopDecision::Terminate {
                         outcome: TerminationOutcome::PartiallyVerified {
-                            proved_ratio,
+                            proved_ratio: score,
                             stable_rounds,
                         },
                         dimensions,
@@ -308,11 +303,10 @@ impl LoopConvergence {
                 }
             }
             ConvergenceDecision::IterationLimitReached { .. } => {
-                let proved_ratio = observation.snapshot.frontier.convergence_score().unwrap_or(0.0);
                 LoopDecision::Terminate {
                     outcome: TerminationOutcome::BudgetExhausted {
                         resource: BudgetResource::Iterations,
-                        proved_ratio,
+                        proved_ratio: score,
                     },
                     dimensions,
                 }
@@ -394,8 +388,7 @@ impl LoopConvergence {
         None
     }
 
-    fn compute_dimensions(&self, frontier: &ProofFrontier) -> ConvergenceDimensions {
-        let frontier_score = frontier.convergence_score().unwrap_or(0.0);
+    fn compute_dimensions_with_score(&self, frontier_score: f64) -> ConvergenceDimensions {
         let spec_stability = self.fingerprint_stability(&self.spec_fingerprints);
         let cex_stability = self.fingerprint_stability(&self.cex_fingerprints);
         let solver_confidence = self.mean_recent_confidence();
@@ -549,6 +542,7 @@ pub fn compute_fingerprint<T: Hash>(items: &[T]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProofFrontier;
 
     fn frontier(
         trusted: u32,

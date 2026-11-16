@@ -1,0 +1,45 @@
+{
+ "schema": "trust-land-gate/2",
+ "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+ "changed": 1,
+ "profile": "development",
+ "legs": {
+  "push-rows": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 183.0,
+   "log": "/dev/null"
+  },
+  "ir-cohort": {
+   "selected": true,
+   "reasons": [
+    "fixture"
+   ],
+   "command": [
+    "true"
+   ],
+   "targets": null,
+   "outcome": "PASS",
+   "rc": 0,
+   "seconds": 38.9,
+   "log": "/dev/null"
+  }
+ },
+ "seconds": 400.0,
+ "checkout_checks": [],
+ "split_keys": {},
+ "ordinary_push": {
+  "rc": 0,
+  "log": "/dev/null",
+  "mode": "ordinary push"
+ }
+}

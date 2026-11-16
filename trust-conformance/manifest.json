@@ -113,52 +113,52 @@
       "checks": [
         {
           "kind": "file_exists",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json"
         },
         {
-          "expected": "targo-trust-publication-json/v1",
+          "expected": 1,
           "kind": "json_pointer_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/format"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/schema_version"
         },
         {
-          "expected": "targo trust --publication-json",
+          "expected": "Trust",
           "kind": "json_pointer_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/producer/command"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/metadata/trust.producer"
+        },
+        {
+          "expected": "compiler-trust-contract-bundle+trust_ir",
+          "kind": "json_pointer_equals",
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/metadata/trust.pipeline"
         },
         {
           "expected": "trust.verifier-api.v1",
           "kind": "json_pointer_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/bundle/schema_version"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/metadata/trust.verifier_api.schema_version"
         },
         {
-          "expected": "publication-v3-seed",
+          "expected": "evidence_only",
           "kind": "json_pointer_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/bundle/publication/candidate_id"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/proof_policy"
         },
         {
-          "expected": "Proved",
+          "expected": "translation_validation",
           "kind": "json_pointer_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/evidence/0/status"
-        },
-        {
-          "kind": "json_pointer_file_sha256_equals",
-          "path": "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-          "pointer": "/evidence/0/artifacts/0/hash/value",
-          "target_path": "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+          "path": "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+          "pointer": "/units/0/obligations/2/kind"
         }
       ],
-      "description": "Fixture-backed targo-trust publication JSON seed covering the public verifier API envelope, publication hashes, and proof-certificate artifact binding.",
+      "description": "The trust_vc adapter request Trust emits from a compiler contract bundle. trust-vc-bridge's golden test asserts the emitter still produces it exactly and verifies it through the trust_vc engine.",
       "evidence": [
-        "trust-conformance/cases/trust-integration/targo_trust_publication_json/publication.json",
-        "trust-conformance/cases/proof-calculus/minimal_certificate/certificate.json"
+        "crates/trust-vc-bridge/fixtures/trust_ir_adapter/trust_increment_contract_cfg_trust_ir_adapter_golden.json",
+        "crates/trust-vc-bridge/src/trust_ir_adapter_request.rs"
       ],
-      "id": "trust_integration.targo_trust_publication_json",
-      "title": "targo-trust publication JSON contract"
+      "id": "trust_integration.trust_vc_adapter_request",
+      "title": "Compiler contract bundle to trust_vc adapter request"
     },
     {
       "category": "proof-calculus",

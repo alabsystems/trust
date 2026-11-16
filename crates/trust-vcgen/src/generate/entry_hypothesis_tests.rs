@@ -123,6 +123,7 @@ fn identity_fn(
         preconditions: assumed,
         postconditions: vec![ensures],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

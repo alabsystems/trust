@@ -21,7 +21,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> 
 
     #[cfg(unix)]
     {
-        return atomic_write_private_unix(parent, path, bytes);
+        atomic_write_private_unix(parent, path, bytes, true)
     }
 
     #[cfg(not(unix))]
@@ -68,7 +68,19 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> 
 }
 
 #[cfg(unix)]
-fn atomic_write_private_unix(parent: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_new_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent =
+        path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    atomic_write_private_unix(parent, path, bytes, false)
+}
+
+#[cfg(unix)]
+fn atomic_write_private_unix(
+    parent: &Path,
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> io::Result<()> {
     let destination = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -79,7 +91,11 @@ fn atomic_write_private_unix(parent: &Path, path: &Path, bytes: &[u8]) -> io::Re
         io::Error::new(io::ErrorKind::InvalidInput, "evidence output name contains NUL")
     })?;
     let directory = open_directory_no_follow(parent)?;
-    validate_replaceable_leaf(directory.as_raw_fd(), &destination, path)?;
+    if replace {
+        validate_replaceable_leaf(directory.as_raw_fd(), &destination, path)?;
+    } else if component_stat(directory.as_raw_fd(), &destination)?.is_some() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "evidence output already exists"));
+    }
 
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
@@ -122,17 +138,38 @@ fn atomic_write_private_unix(parent: &Path, path: &Path, bytes: &[u8]) -> io::Re
         // Recheck immediately before publication. A later leaf substitution is
         // still safe: renameat replaces the directory entry and never follows
         // its target.
-        validate_replaceable_leaf(directory.as_raw_fd(), &destination, path)?;
-        let result = unsafe {
-            libc::renameat(
-                directory.as_raw_fd(),
-                staged_name.as_ptr(),
-                directory.as_raw_fd(),
-                destination.as_ptr(),
-            )
+        let result = if replace {
+            validate_replaceable_leaf(directory.as_raw_fd(), &destination, path)?;
+            unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    staged_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    destination.as_ptr(),
+                )
+            }
+        } else {
+            // linkat is atomic and refuses any existing destination, including
+            // a leaf introduced after the first absence check. Both names are
+            // relative to the same held directory; no pathname is followed.
+            unsafe {
+                libc::linkat(
+                    directory.as_raw_fd(),
+                    staged_name.as_ptr(),
+                    directory.as_raw_fd(),
+                    destination.as_ptr(),
+                    0,
+                )
+            }
         };
         if result != 0 {
             return Err(io::Error::last_os_error());
+        }
+        if !replace {
+            let result = unsafe { libc::unlinkat(directory.as_raw_fd(), staged_name.as_ptr(), 0) };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         directory.sync_all()
     })();
@@ -334,6 +371,51 @@ mod tests {
         atomic_write_private(&output, b"two").expect("atomic replacement");
         #[cfg(unix)]
         assert_eq!(fs::read(&output).expect("read output"), b"two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_evidence_is_private_and_never_replaces_an_existing_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("new evidence fixture");
+        let path = root.path().join("new/nested/report.json");
+        atomic_write_new_private(&path, b"first").expect("publish new evidence");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            atomic_write_new_private(&path, b"second").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_new_publishers_have_one_winner_and_no_staging_leaks() {
+        let root = tempfile::tempdir().expect("new publisher race fixture");
+        let root = fs::canonicalize(root.path()).unwrap();
+        let path = root.join("report.json");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_new_private(&path, b"first")
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                atomic_write_new_private(&path, b"second")
+            });
+            let outcomes = [first.join().unwrap(), second.join().unwrap()];
+            assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+            assert!(
+                outcomes
+                    .into_iter()
+                    .filter_map(std::result::Result::err)
+                    .all(|error| error.kind() == io::ErrorKind::AlreadyExists)
+            );
+        });
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes == b"first" || bytes == b"second");
+        assert_eq!(fs::read_dir(root).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

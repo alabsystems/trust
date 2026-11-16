@@ -126,7 +126,7 @@ pub fn certify_paired_condvars(
     functions: &[VerifiableFunction],
     candidates: &[PairedCondvarCandidate],
 ) -> Vec<CertifiedCondvarPair> {
-    if candidates.is_empty() {
+    if candidates.is_empty() || functions.is_empty() {
         return Vec::new();
     }
 
@@ -162,10 +162,9 @@ pub fn certify_paired_condvars(
             };
             // Mixed evidence decertifies; a single, unpoisoned sibling mutex
             // certifies the pair.
-            if ms.len() != 1 {
+            let (Some(&m), 1) = (ms.iter().next(), ms.len()) else {
                 continue;
-            }
-            let m = *ms.iter().next().expect("len checked above");
+            };
             if !cand.mutex_fields.contains(&m) || poisoned.contains(&(ci, m)) {
                 continue;
             }
@@ -229,14 +228,21 @@ fn kill_local(state: &mut State, local: usize) {
     state.retain(|l, fact| *l != local && fact.base().local != local);
 }
 
-fn join(a: &State, b: &State) -> State {
-    let mut out = State::default();
-    for (l, fa) in a {
-        if b.get(l) == Some(fa) {
-            out.insert(*l, fa.clone());
-        }
-    }
-    out
+fn join_in_place(acc: &mut State, incoming: &State) -> bool {
+    let prev_len = acc.len();
+    acc.retain(|l, fa| incoming.get(l) == Some(fa));
+    acc.len() != prev_len
+}
+
+fn is_wait_call_terminator(term: &Terminator) -> bool {
+    matches!(
+        term,
+        Terminator::Call { func: callee, .. }
+            if std_anchored(callee)
+                && callee.contains("Condvar")
+                && callee.contains("wait")
+                && recognized_wait_family(&normalize_callee(callee)).is_some()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +253,25 @@ fn join(a: &State, b: &State) -> State {
 /// generic/turbofish group, then any residue `::` a TRAILING turbofish leaves
 /// behind (`Condvar::wait::<Vec<u8>>` strips to `…::wait::`, cf. vcgen's
 /// `method_tail` on the same hazard).
-fn normalize_callee(callee: &str) -> String {
-    let stripped = strip_generics(callee);
-    stripped.trim_end_matches(':').to_string()
+fn normalize_callee(callee: &str) -> std::borrow::Cow<'_, str> {
+    if !std_anchored(callee) {
+        return std::borrow::Cow::Borrowed("");
+    }
+    if !callee.contains('<') {
+        return std::borrow::Cow::Borrowed(callee.trim_end_matches(':'));
+    }
+    let mut stripped = strip_generics(callee);
+    let trimmed_len = stripped.trim_end_matches(':').len();
+    stripped.truncate(trimmed_len);
+    std::borrow::Cow::Owned(stripped)
+}
+
+fn may_be_dataflow_callee(callee: &str) -> bool {
+    std_anchored(callee)
+        && ((callee.contains("Mutex") && callee.contains("lock"))
+            || (callee.contains("Result")
+                && (callee.contains("unwrap") || callee.contains("expect")))
+            || (callee.contains("Condvar") && callee.contains("wait")))
 }
 
 /// `std::`-anchored suffix match after [`normalize_callee`], the same
@@ -357,34 +379,33 @@ fn candidate_field_borrow(
     Some((cand, Base { local: place.local, projections: prefix.to_vec() }, *fidx))
 }
 
-/// Detection walk for the crate-wide whitelist: every position in `place`'s
-/// projection list where a candidate-struct field `Field(k)` (k a paired
+/// Detection walk for the crate-wide whitelist: visits every position in `place`'s
+/// projection list where a candidate-struct field `Field(k)` (`k` a paired
 /// condvar/mutex field) is projected. Unlike [`candidate_field_borrow`] this
 /// walks through raw pointers, enums (flattened `__v{v}_` fields), tuples,
 /// closures and slices so a use CANNOT hide behind them. If the walk gets stuck
-/// on an unmodeled type while `Field` projections remain, it reports
-/// `WalkOutcome::Opaque` and the caller poisons EVERYTHING (a candidate field
-/// could be below the unmodeled node).
-enum WalkOutcome {
-    /// `(position, candidate index, field)` for every paired-field projection.
-    Mentions(Vec<(usize, usize, usize)>),
-    Opaque,
+/// on an unmodeled type while `Field` projections remain, it returns `false`
+/// (opaque) and the caller poisons EVERYTHING (a candidate field could be below
+/// the unmodeled node).
+fn has_variant_field_prefix(name: &str, variant: usize) -> bool {
+    name.strip_prefix("__v")
+        .and_then(|rest| rest.split_once('_'))
+        .is_some_and(|(digits, _)| !digits.is_empty() && digits.parse::<usize>().ok() == Some(variant))
 }
 
-fn candidate_field_mentions(
+fn visit_candidate_field_mentions(
     func: &VerifiableFunction,
     place: &Place,
     candidates: &[PairedCondvarCandidate],
-) -> WalkOutcome {
-    let mut out = Vec::new();
+    mut on_mention: impl FnMut(usize, usize, usize),
+) -> bool {
+    if !place.projections.iter().any(|p| matches!(p, Projection::Field(_))) {
+        return true;
+    }
     let Some(mut ty) = local_ty(func, place.local) else {
         // An out-of-range local cannot be typed; if it projects any field we
         // cannot rule a paired field out.
-        return if place.projections.iter().any(|p| matches!(p, Projection::Field(_))) {
-            WalkOutcome::Opaque
-        } else {
-            WalkOutcome::Mentions(out)
-        };
+        return false;
     };
     let mut pending_variant: Option<usize> = None;
     for (pos, proj) in place.projections.iter().enumerate() {
@@ -401,16 +422,15 @@ fn candidate_field_mentions(
                             let cand = &candidates[ci];
                             if cand.condvar_fields.contains(idx) || cand.mutex_fields.contains(idx)
                             {
-                                out.push((pos, ci, *idx));
+                                on_mention(pos, ci, *idx);
                             }
                         }
                         fields.get(*idx).map(|(_, t)| t)
                     } else if let Some(v) = pending_variant.take() {
                         // Enum variant field via the flattened `__v{v}_` shape.
-                        let prefix = format!("__v{v}_");
                         fields
                             .iter()
-                            .filter(|(n, _)| n.starts_with(&prefix))
+                            .filter(|(n, _)| has_variant_field_prefix(n, v))
                             .nth(*idx)
                             .map(|(_, t)| t)
                     } else {
@@ -444,14 +464,11 @@ fn candidate_field_mentions(
             None => {
                 // Stuck. If any `Field` remains (including this one), a paired
                 // field might be below the unmodeled node — fail closed.
-                if place.projections[pos..].iter().any(|p| matches!(p, Projection::Field(_))) {
-                    return WalkOutcome::Opaque;
-                }
-                return WalkOutcome::Mentions(out);
+                return !place.projections[pos..].iter().any(|p| matches!(p, Projection::Field(_)));
             }
         }
     }
-    WalkOutcome::Mentions(out)
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -642,24 +659,31 @@ fn apply_statement(
     }
 }
 
-fn for_each_rvalue_operand(rvalue: &Rvalue, f: &mut impl FnMut(&Operand)) {
+fn try_for_each_rvalue_operand(
+    rvalue: &Rvalue,
+    f: &mut impl FnMut(&Operand) -> bool,
+) -> bool {
     match rvalue {
         Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) | Rvalue::Repeat(op, _) => {
             f(op)
         }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
-            f(a);
-            f(b);
-        }
-        Rvalue::Aggregate(_, ops) => ops.iter().for_each(f),
-        Rvalue::Unsupported { operands, .. } => operands.iter().for_each(f),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => f(a) && f(b),
+        Rvalue::Aggregate(_, ops) => ops.iter().all(&mut *f),
+        Rvalue::Unsupported { operands, .. } => operands.iter().all(&mut *f),
         Rvalue::Ref { .. }
         | Rvalue::Discriminant(_)
         | Rvalue::Len(_)
         | Rvalue::AddressOf(..)
-        | Rvalue::CopyForDeref(_) => {}
-        _ => {}
+        | Rvalue::CopyForDeref(_) => true,
+        _ => true,
     }
+}
+
+fn for_each_rvalue_operand(rvalue: &Rvalue, f: &mut impl FnMut(&Operand)) {
+    let _ = try_for_each_rvalue_operand(rvalue, &mut |op| {
+        f(op);
+        true
+    });
 }
 
 /// The wait-site outcome computed by the terminator transfer: `Some` iff the
@@ -680,54 +704,57 @@ fn apply_terminator(
 ) -> Option<WaitSite> {
     match term {
         Terminator::Call { func: callee, args, dest, .. } => {
-            let name = normalize_callee(callee);
             let mut wait_site = None;
             // Recognition against the PRE state.
-            let generated: Option<Fact> = if is_lock_callee(&name) && args.len() == 1 {
-                match operand_whole_local(&args[0]).and_then(|l| state.get(&l)) {
-                    Some(Fact::MutexRef { cand, base, field }) => {
-                        Some(Fact::GuardRes { cand: *cand, base: base.clone(), field: *field })
+            let generated: Option<Fact> = if may_be_dataflow_callee(callee) {
+                let name = normalize_callee(callee);
+                if is_lock_callee(&name) && args.len() == 1 {
+                    match operand_whole_local(&args[0]).and_then(|l| state.get(&l)) {
+                        Some(Fact::MutexRef { cand, base, field }) => {
+                            Some(Fact::GuardRes { cand: *cand, base: base.clone(), field: *field })
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            } else if is_result_unwrap_callee(&name) && !args.is_empty() {
-                match operand_whole_local(&args[0]).and_then(|l| state.get(&l)) {
-                    Some(Fact::GuardRes { cand, base, field }) => {
-                        Some(Fact::Guard { cand: *cand, base: base.clone(), field: *field })
+                } else if is_result_unwrap_callee(&name) && !args.is_empty() {
+                    match operand_whole_local(&args[0]).and_then(|l| state.get(&l)) {
+                        Some(Fact::GuardRes { cand, base, field }) => {
+                            Some(Fact::Guard { cand: *cand, base: base.clone(), field: *field })
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            } else if is_result_unwrap_or_else_callee(&name) && args.len() == 2 {
-                let res = operand_whole_local(&args[0]).and_then(|l| state.get(&l)).cloned();
-                match res {
-                    Some(Fact::GuardRes { cand, base, field })
-                        if closure_is_poison_into_inner(func, &args[1], closures) =>
-                    {
-                        Some(Fact::Guard { cand, base, field })
+                } else if is_result_unwrap_or_else_callee(&name) && args.len() == 2 {
+                    match operand_whole_local(&args[0]).and_then(|l| state.get(&l)) {
+                        Some(Fact::GuardRes { cand, base, field })
+                            if closure_is_poison_into_inner(func, &args[1], closures) =>
+                        {
+                            Some(Fact::Guard { cand: *cand, base: base.clone(), field: *field })
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            } else if let Some(family) = recognized_wait_family(&name) {
-                let recv =
-                    args.first().and_then(operand_whole_local).and_then(|l| state.get(&l)).cloned();
-                let guard =
-                    args.get(1).and_then(operand_whole_local).and_then(|l| state.get(&l)).cloned();
-                let validated = match (&recv, &guard) {
-                    (
-                        Some(Fact::CvRef { cand: rc, base: rb, field: c }),
-                        Some(Fact::Guard { cand: gc, base: gb, field: m }),
-                    ) if rc == gc && rb == gb => Some((*rc, *c, *m)),
-                    _ => None,
-                };
-                wait_site = Some(WaitSite { validated });
-                match (family, validated, guard) {
-                    // std's `wait` returns the SAME guard (poison wraps the same
-                    // guard, `poison/condvar.rs:125-132`) — the fact is invariant
-                    // across a VALIDATED wait, so the wait's Result inherits it.
-                    (WaitFamily::Wait, Some((cand, _c, m)), Some(Fact::Guard { base, .. })) => {
-                        Some(Fact::GuardRes { cand, base, field: m })
+                } else if let Some(family) = recognized_wait_family(&name) {
+                    let recv =
+                        args.first().and_then(operand_whole_local).and_then(|l| state.get(&l));
+                    let guard =
+                        args.get(1).and_then(operand_whole_local).and_then(|l| state.get(&l));
+                    let validated = match (recv, guard) {
+                        (
+                            Some(Fact::CvRef { cand: rc, base: rb, field: c }),
+                            Some(Fact::Guard { cand: gc, base: gb, field: m }),
+                        ) if rc == gc && rb == gb => Some((*rc, *c, *m)),
+                        _ => None,
+                    };
+                    wait_site = Some(WaitSite { validated });
+                    match (family, validated, guard) {
+                        // std's `wait` returns the SAME guard (poison wraps the same
+                        // guard, `poison/condvar.rs:125-132`) — the fact is invariant
+                        // across a VALIDATED wait, so the wait's Result inherits it.
+                        (WaitFamily::Wait, Some((cand, _c, m)), Some(Fact::Guard { base, .. })) => {
+                            Some(Fact::GuardRes { cand, base: base.clone(), field: m })
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                } else {
+                    None
                 }
             } else {
                 None
@@ -788,22 +815,29 @@ fn closure_is_poison_into_inner(
     };
     // Unique whole-local def of the closure local, no projected writes.
     let mut def: Option<&Rvalue> = None;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt {
-                if place.local == cl_local {
+    let invalid = crate::any_local_write_candidate(
+        func,
+        &func.body.blocks,
+        cl_local,
+        |block, item| match item {
+            Some(stmt) => {
+                if let Statement::Assign { place, rvalue, .. } = stmt
+                    && place.local == cl_local
+                {
                     if !place.projections.is_empty() || def.is_some() {
-                        return false;
+                        return true;
                     }
                     def = Some(rvalue);
                 }
+                false
             }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator {
-            if dest.local == cl_local {
-                return false;
+            None => {
+                matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == cl_local)
             }
-        }
+        },
+    );
+    if invalid {
+        return false;
     }
     let Some(Rvalue::Aggregate(AggregateKind::Closure { name, captures, .. }, ops)) = def else {
         return false;
@@ -898,27 +932,32 @@ fn chases_to_param(f: &VerifiableFunction, mut local: usize) -> bool {
         }
         fuel -= 1;
         let mut def: Option<usize> = None;
-        for block in &f.body.blocks {
-            for stmt in &block.stmts {
-                if let Statement::Assign { place, rvalue, .. } = stmt {
-                    if place.local == local {
+        let invalid =
+            crate::any_local_write_candidate(f, &f.body.blocks, local, |block, item| match item {
+                Some(stmt) => {
+                    if let Statement::Assign { place, rvalue, .. } = stmt
+                        && place.local == local
+                    {
                         if !place.projections.is_empty() || def.is_some() {
-                            return false;
+                            return true;
                         }
                         match rvalue {
                             Rvalue::Use(Operand::Move(src)) if src.projections.is_empty() => {
                                 def = Some(src.local);
                             }
-                            _ => return false,
+                            _ => {
+                                return true;
+                            }
                         }
                     }
+                    false
                 }
-            }
-            if let Terminator::Call { dest, .. } = &block.terminator {
-                if dest.local == local {
-                    return false;
+                None => {
+                    matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local)
                 }
-            }
+            });
+        if invalid {
+            return false;
         }
         match def {
             Some(src) => local = src,
@@ -929,12 +968,9 @@ fn chases_to_param(f: &VerifiableFunction, mut local: usize) -> bool {
 
 /// Any def (whole or projected, assign or call destination) of `local`?
 fn local_has_any_def(f: &VerifiableFunction, local: usize) -> bool {
-    f.body.blocks.iter().any(|block| {
-        block
-            .stmts
-            .iter()
-            .any(|stmt| matches!(stmt, Statement::Assign { place, .. } if place.local == local))
-            || matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local)
+    crate::any_local_write_candidate(f, &f.body.blocks, local, |block, item| match item {
+        Some(stmt) => matches!(stmt, Statement::Assign { place, .. } if place.local == local),
+        None => matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local),
     })
 }
 
@@ -942,19 +978,28 @@ fn local_has_any_def(f: &VerifiableFunction, local: usize) -> bool {
 // Per-function analysis: fixpoint + whitelist accounting + constructor scan
 // ---------------------------------------------------------------------------
 
-fn terminator_successors(term: &Terminator) -> Vec<usize> {
+fn for_each_terminator_successor(term: &Terminator, mut f: impl FnMut(usize)) {
     match term {
-        Terminator::Goto(b) => vec![b.0],
+        Terminator::Goto(b) => f(b.0),
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut out: Vec<usize> = targets.iter().map(|(_, b)| b.0).collect();
-            out.push(otherwise.0);
-            out
+            for (_, b) in targets {
+                f(b.0);
+            }
+            f(otherwise.0);
         }
-        Terminator::Call { target, .. } => target.iter().map(|b| b.0).collect(),
-        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => vec![target.0],
-        Terminator::Opaque { targets, .. } => targets.iter().map(|b| b.0).collect(),
-        Terminator::Return | Terminator::Unreachable | Terminator::Resume => Vec::new(),
-        _ => Vec::new(),
+        Terminator::Call { target, .. } => {
+            if let Some(b) = target {
+                f(b.0);
+            }
+        }
+        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => f(target.0),
+        Terminator::Opaque { targets, .. } => {
+            for b in targets {
+                f(b.0);
+            }
+        }
+        Terminator::Return | Terminator::Unreachable | Terminator::Resume => {}
+        _ => {}
     }
 }
 
@@ -978,45 +1023,61 @@ fn analyze_function(
     };
 
     // ---- 1. Fixpoint of the instance-pinned dataflow. ------------------
-    let raw_exposed = raw_exposed_locals(func);
-    let mut entry: Vec<Option<State>> = vec![None; nblocks];
-    entry[0] = Some(State::default());
-    let mut work: Vec<usize> = vec![0];
-    while let Some(b) = work.pop() {
-        let Some(block) = func.body.blocks.get(b) else { continue };
-        let mut state = entry[b].clone().unwrap_or_default();
-        for stmt in &block.stmts {
-            apply_statement(&mut state, stmt, func, candidates, &raw_exposed);
-        }
-        let _ = apply_terminator(&mut state, &block.terminator, func, closures, &raw_exposed);
-        for succ in terminator_successors(&block.terminator) {
-            if succ >= nblocks {
-                continue;
-            }
-            let merged = match &entry[succ] {
-                None => state.clone(),
-                Some(old) => join(old, &state),
-            };
-            if entry[succ].as_ref() != Some(&merged) {
-                entry[succ] = Some(merged);
-                work.push(succ);
-            }
-        }
-    }
-
     // ---- 2. Final pass: wait-site validation results per block. --------
     // Unvisited blocks are processed with the EMPTY state (fail closed: any
-    // wait site there is unvalidated).
+    // wait site there is unvalidated). When the function has no recognized
+    // `Condvar::wait*` call terminator, `wait_sites` is guaranteed to be empty.
     let mut wait_sites: FxHashMap<usize, Option<(usize, usize, usize)>> = FxHashMap::default();
+    let mut wait_blocks: Vec<usize> = Vec::new();
     for (b, block) in func.body.blocks.iter().enumerate() {
-        let mut state = entry[b].clone().unwrap_or_default();
-        for stmt in &block.stmts {
-            apply_statement(&mut state, stmt, func, candidates, &raw_exposed);
+        if is_wait_call_terminator(&block.terminator) {
+            wait_blocks.push(b);
         }
-        if let Some(site) =
-            apply_terminator(&mut state, &block.terminator, func, closures, &raw_exposed)
-        {
-            wait_sites.insert(b, site.validated);
+    }
+    if !wait_blocks.is_empty() {
+        let raw_exposed = raw_exposed_locals(func);
+        let mut entry: Vec<Option<State>> = vec![None; nblocks];
+        entry[0] = Some(State::default());
+        let mut work: Vec<usize> = vec![0];
+        let mut in_work: Vec<bool> = vec![false; nblocks];
+        in_work[0] = true;
+        while let Some(b) = work.pop() {
+            in_work[b] = false;
+            let Some(block) = func.body.blocks.get(b) else { continue };
+            let mut state = entry[b].clone().unwrap_or_default();
+            for stmt in &block.stmts {
+                apply_statement(&mut state, stmt, func, candidates, &raw_exposed);
+            }
+            let _ = apply_terminator(&mut state, &block.terminator, func, closures, &raw_exposed);
+            for_each_terminator_successor(&block.terminator, |succ| {
+                if succ >= nblocks {
+                    return;
+                }
+                let changed = match &mut entry[succ] {
+                    None => {
+                        entry[succ] = Some(state.clone());
+                        true
+                    }
+                    Some(old) => join_in_place(old, &state),
+                };
+                if changed && !in_work[succ] {
+                    in_work[succ] = true;
+                    work.push(succ);
+                }
+            });
+        }
+
+        for &b in &wait_blocks {
+            let Some(block) = func.body.blocks.get(b) else { continue };
+            let mut state = entry[b].clone().unwrap_or_default();
+            for stmt in &block.stmts {
+                apply_statement(&mut state, stmt, func, candidates, &raw_exposed);
+            }
+            if let Some(site) =
+                apply_terminator(&mut state, &block.terminator, func, closures, &raw_exposed)
+            {
+                wait_sites.insert(b, site.validated);
+            }
         }
     }
 
@@ -1025,75 +1086,79 @@ fn analyze_function(
     // shared-borrow rvalue (vetted by consumer accounting in pass B). Every
     // other mention — write, read, move-out, `&mut`, raw borrow, drop, deeper
     // projection INTO the field — poisons the field.
-    let mut opaque = false;
-    for_each_place(func, &mut |place, ctx, loc| match candidate_field_mentions(
-        func, place, candidates,
-    ) {
-        WalkOutcome::Opaque => opaque = true,
-        WalkOutcome::Mentions(mentions) => {
-            for (pos, ci, k) in mentions {
-                let terminal = pos + 1 == place.projections.len();
-                let allowed =
-                    terminal && ctx == PlaceCtx::RefShared && matches!(loc, Loc::Stmt(..));
-                if !allowed {
-                    poisoned.insert((ci, k));
+    let mut ref_shared_stmt_locs: Vec<(usize, usize)> = Vec::new();
+    let pass_a_ok = try_for_each_place(func, &mut |place, ctx, loc| {
+        visit_candidate_field_mentions(func, place, candidates, |pos, ci, k| {
+            let terminal = pos + 1 == place.projections.len();
+            if terminal
+                && ctx == PlaceCtx::RefShared
+                && let Loc::Stmt(b, s) = loc
+            {
+                if ref_shared_stmt_locs.last() != Some(&(b, s)) {
+                    ref_shared_stmt_locs.push((b, s));
                 }
+            } else {
+                poisoned.insert((ci, k));
             }
-        }
+        })
     });
-    if opaque {
+    if !pass_a_ok {
         poison_all(poisoned);
         return;
     }
 
     // ---- 4. Pass B: shared-borrow consumer accounting. -----------------
-    for (b, block) in func.body.blocks.iter().enumerate() {
-        for (s, stmt) in block.stmts.iter().enumerate() {
-            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
-            let Rvalue::Ref { mutable: false, place: borrowed } = rvalue else { continue };
-            let Some((ci, _base, k)) = candidate_field_borrow(func, borrowed, candidates) else {
-                // A terminal shared borrow is provisionally allowed by pass A
-                // so the precise consumer accounting can run here. If its
-                // projection reaches a paired field but the STRICT instance
-                // parser rejects its base (raw-pointer deref, enum/index path,
-                // unsupported type, ...), it is not an accountable safe borrow:
-                // poison every paired field the detection walk found.
-                match candidate_field_mentions(func, borrowed, candidates) {
-                    WalkOutcome::Mentions(mentions) => {
-                        for (_, mention_ci, mention_k) in mentions {
-                            poisoned.insert((mention_ci, mention_k));
-                        }
-                    }
-                    WalkOutcome::Opaque => poison_all(poisoned),
-                }
-                continue;
-            };
-            let cand = &candidates[ci];
-            let is_c = cand.condvar_fields.contains(&k);
-            let is_m = cand.mutex_fields.contains(&k);
-            if !is_c && !is_m {
-                continue;
+    for &(b, s) in &ref_shared_stmt_locs {
+        let Some(stmt) = func.body.blocks.get(b).and_then(|block| block.stmts.get(s)) else {
+            continue;
+        };
+        let Statement::Assign { place, rvalue, .. } = stmt else { continue };
+        let Rvalue::Ref { mutable: false, place: borrowed } = rvalue else { continue };
+        let Some((ci, _base, k)) = candidate_field_borrow(func, borrowed, candidates) else {
+            // A terminal shared borrow is provisionally allowed by pass A
+            // so the precise consumer accounting can run here. If its
+            // projection reaches a paired field but the STRICT instance
+            // parser rejects its base (raw-pointer deref, enum/index path,
+            // unsupported type, ...), it is not an accountable safe borrow:
+            // poison every paired field the detection walk found.
+            if !visit_candidate_field_mentions(
+                func,
+                borrowed,
+                candidates,
+                |_, mention_ci, mention_k| {
+                    poisoned.insert((mention_ci, mention_k));
+                },
+            ) {
+                poison_all(poisoned);
             }
-            if !place.projections.is_empty() {
-                poisoned.insert((ci, k));
-                continue;
-            }
-            let x = place.local;
-            // The borrow local must have EXACTLY this one def and no aliasing.
-            if !single_def_unaliased(func, x, b, s) {
-                poisoned.insert((ci, k));
-                continue;
-            }
-            // Every other mention must be an allowed consumer.
-            let allowed = consumers_allowed(func, x, (b, s), is_c, ci, k, &wait_sites, evidence);
-            if !allowed {
-                poisoned.insert((ci, k));
-            }
+            continue;
+        };
+        let cand = &candidates[ci];
+        let is_c = cand.condvar_fields.contains(&k);
+        let is_m = cand.mutex_fields.contains(&k);
+        if !is_c && !is_m {
+            continue;
+        }
+        if !place.projections.is_empty() {
+            poisoned.insert((ci, k));
+            continue;
+        }
+        let x = place.local;
+        // The borrow local must have EXACTLY this one def and no aliasing.
+        if !single_def_unaliased(func, x, b, s) {
+            poisoned.insert((ci, k));
+            continue;
+        }
+        // Every other mention must be an allowed consumer.
+        let allowed =
+            consumers_allowed(func, x, (b, s), is_c, ci, k, &wait_sites, evidence);
+        if !allowed {
+            poisoned.insert((ci, k));
         }
     }
 
     // ---- 5. Constructor scan: every `S { … }` must build `c` fresh. -----
-    let aliased = mut_aliased_locals(func);
+    let mut aliased: Option<FxHashSet<usize>> = None;
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             let Statement::Assign { rvalue, .. } = stmt else { continue };
@@ -1112,8 +1177,9 @@ fn analyze_function(
                 }
                 continue;
             }
+            let aliased = aliased.get_or_insert_with(|| mut_aliased_locals(func));
             for &c in &cand.condvar_fields {
-                if !ops.get(c).is_some_and(|op| operand_is_fresh_condvar(func, op, &aliased)) {
+                if !ops.get(c).is_some_and(|op| operand_is_fresh_condvar(func, op, aliased)) {
                     poisoned.insert((ci, c));
                 }
             }
@@ -1126,36 +1192,40 @@ fn analyze_function(
 /// `local_defs::has_one_explicit_def`, so a PARAMETER (defined at ENTRY, invisibly to
 /// the scan below) whose entry value is still live does not pass on one store.
 fn single_def_unaliased(func: &VerifiableFunction, local: usize, db: usize, ds: usize) -> bool {
+    let Some(expected_stmt) = func.body.blocks.get(db).and_then(|b| b.stmts.get(ds)) else {
+        return false;
+    };
+    // PERF-COMPILER-VCGEN-587: `has_one_explicit_def` always returns false for
+    // parameters (their entry value is an implicit def, plus any explicit def ≥ 2).
+    if crate::local_defs::is_parameter(func, local)
+        || !crate::local_defs::has_one_explicit_def(func, local)
+    {
+        return false;
+    }
     let mut defs = 0usize;
-    for (b, block) in func.body.blocks.iter().enumerate() {
-        for (s, stmt) in block.stmts.iter().enumerate() {
-            match stmt {
+    let invalid =
+        crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place, rvalue, .. } => {
                     if place.local == local {
-                        if !place.projections.is_empty() || (b, s) != (db, ds) {
-                            return false;
+                        if !place.projections.is_empty() || !std::ptr::eq(stmt, expected_stmt) {
+                            return true;
                         }
                         defs += 1;
                     }
-                    match rvalue {
+                    matches!(
+                        rvalue,
                         Rvalue::Ref { mutable: true, place: p } | Rvalue::AddressOf(_, p)
-                            if p.local == local =>
-                        {
-                            return false;
-                        }
-                        _ => {}
-                    }
+                            if p.local == local
+                    )
                 }
-                _ => {}
+                _ => false,
+            },
+            None => {
+                matches!(&block.terminator, Terminator::Call { dest, .. } if dest.local == local)
             }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator {
-            if dest.local == local {
-                return false;
-            }
-        }
-    }
-    defs == 1 && crate::local_defs::has_one_explicit_def(func, local)
+        });
+    !invalid && defs == 1
 }
 
 /// Locations where `local` is mentioned (any place occurrence, statement or
@@ -1167,20 +1237,53 @@ enum Loc {
     Term(usize),
 }
 
-fn local_mention_sites(func: &VerifiableFunction, local: usize) -> Vec<(Loc, usize)> {
-    let mut out: Vec<(Loc, usize)> = Vec::new();
-    let mut push = |loc: Loc| match out.iter_mut().find(|(l, _)| *l == loc) {
-        Some((_, n)) => *n += 1,
-        None => out.push((loc, 1)),
-    };
-    for_each_place(func, &mut |place, _ctx, loc| {
-        if place.local == local
-            || place.projections.iter().any(|p| matches!(p, Projection::Index(i) if *i == local))
-        {
-            push(loc);
+fn place_mentions_local(place: &Place, local: usize) -> bool {
+    place.local == local
+        || place.projections.iter().any(|p| matches!(p, Projection::Index(i) if *i == local))
+}
+
+fn visit_local_mention_sites(
+    func: &VerifiableFunction,
+    local: usize,
+    mut on_site: impl FnMut(Loc, usize) -> bool,
+) -> bool {
+    let mut current: Option<(Loc, usize)> = None;
+    let ok = try_for_each_place(func, &mut |place, _ctx, loc| {
+        if !place_mentions_local(place, local) {
+            return true;
         }
+        match &mut current {
+            Some((prev_loc, count)) if *prev_loc == loc => *count += 1,
+            Some((prev_loc, count)) => {
+                if !on_site(*prev_loc, *count) {
+                    return false;
+                }
+                current = Some((loc, 1));
+            }
+            None => current = Some((loc, 1)),
+        }
+        true
     });
-    out
+    if ok
+        && let Some((loc, count)) = current
+    {
+        return on_site(loc, count);
+    }
+    ok
+}
+
+fn local_has_exactly_two_mentions(func: &VerifiableFunction, local: usize) -> bool {
+    let mut count = 0usize;
+    let within_limit = try_for_each_place(func, &mut |place, _ctx, _loc| {
+        if place_mentions_local(place, local) {
+            count += 1;
+            if count > 2 {
+                return false;
+            }
+        }
+        true
+    });
+    within_limit && count == 2
 }
 
 /// Every mention of borrow local `x` (other than its def) must be a recognized
@@ -1206,12 +1309,9 @@ fn consumers_allowed(
     if x == 0 {
         return false;
     }
-    for (loc, count) in local_mention_sites(func, x) {
+    visit_local_mention_sites(func, x, |loc, count| {
         if loc == Loc::Stmt(def.0, def.1) {
-            if count != 1 {
-                return false; // the def statement mentions x more than once
-            }
-            continue;
+            return count == 1; // the def statement mentions x at most once
         }
         let Loc::Term(tb) = loc else {
             return false; // any statement-level consumer is unrecognized
@@ -1240,8 +1340,8 @@ fn consumers_allowed(
         } else if !is_lock_callee(&name) {
             return false;
         }
-    }
-    true
+        true
+    })
 }
 
 /// The constructor-freshness chase: `op` must be a whole-local move whose value
@@ -1265,35 +1365,49 @@ fn operand_is_fresh_condvar(
         }
         fuel -= 1;
         // Mentions: exactly 2 (one def + one consumption).
-        let mentions: usize = local_mention_sites(func, local).iter().map(|(_, n)| n).sum();
-        if mentions != 2 {
+        if !local_has_exactly_two_mentions(func, local) {
             return false;
         }
         // Unique def.
         let mut assign_def: Option<&Rvalue> = None;
         let mut call_def: Option<&Terminator> = None;
-        for block in &func.body.blocks {
-            for stmt in &block.stmts {
-                if let Statement::Assign { place, rvalue, .. } = stmt {
-                    if place.local == local {
+        let multi_or_projected = crate::any_local_write_candidate(
+            func,
+            &func.body.blocks,
+            local,
+            |block, item| match item {
+                Some(stmt) => {
+                    if let Statement::Assign { place, rvalue, .. } = stmt
+                        && place.local == local
+                    {
                         if !place.projections.is_empty()
                             || assign_def.is_some()
                             || call_def.is_some()
                         {
-                            return false;
+                            return true;
                         }
                         assign_def = Some(rvalue);
                     }
+                    false
                 }
-            }
-            if let Terminator::Call { dest, .. } = &block.terminator {
-                if dest.local == local {
-                    if !dest.projections.is_empty() || assign_def.is_some() || call_def.is_some() {
-                        return false;
+                None => {
+                    if let Terminator::Call { dest, .. } = &block.terminator
+                        && dest.local == local
+                    {
+                        if !dest.projections.is_empty()
+                            || assign_def.is_some()
+                            || call_def.is_some()
+                        {
+                            return true;
+                        }
+                        call_def = Some(&block.terminator);
                     }
-                    call_def = Some(&block.terminator);
+                    false
                 }
-            }
+            },
+        );
+        if multi_or_projected {
+            return false;
         }
         match (assign_def, call_def) {
             (None, Some(Terminator::Call { func: callee, args, .. })) => {
@@ -1340,44 +1454,62 @@ enum PlaceCtx {
 /// Visit EVERY place occurring in the function — assign destinations, all
 /// rvalue operands and borrow/inspect places, call args + destinations, drop /
 /// switch / assert / intrinsic operands, and `Unsupported` payload operands —
-/// so no paired-field use can hide from the whitelist scan.
-fn for_each_place(func: &VerifiableFunction, f: &mut impl FnMut(&Place, PlaceCtx, Loc)) {
+/// so no paired-field use can hide from the whitelist scan. Stops early and
+/// returns `false` when `f` returns `false`.
+fn try_for_each_place(
+    func: &VerifiableFunction,
+    f: &mut impl FnMut(&Place, PlaceCtx, Loc) -> bool,
+) -> bool {
     for (b, block) in func.body.blocks.iter().enumerate() {
         for (s, stmt) in block.stmts.iter().enumerate() {
             let loc = Loc::Stmt(b, s);
             match stmt {
                 Statement::Assign { place, rvalue, .. } => {
-                    f(place, PlaceCtx::Other, loc);
-                    match rvalue {
-                        Rvalue::Ref { mutable: false, place: p } => f(p, PlaceCtx::RefShared, loc),
+                    if !f(place, PlaceCtx::Other, loc) {
+                        return false;
+                    }
+                    let rvalue_place_ok = match rvalue {
+                        Rvalue::Ref { mutable: false, place: p } => {
+                            f(p, PlaceCtx::RefShared, loc)
+                        }
                         Rvalue::Ref { mutable: true, place: p }
                         | Rvalue::AddressOf(_, p)
                         | Rvalue::Discriminant(p)
                         | Rvalue::Len(p)
                         | Rvalue::CopyForDeref(p) => f(p, PlaceCtx::Other, loc),
-                        _ => {}
+                        _ => true,
+                    };
+                    if !rvalue_place_ok
+                        || !try_for_each_rvalue_operand(rvalue, &mut |op| {
+                            operand_place(op).is_none_or(|p| f(p, PlaceCtx::Other, loc))
+                        })
+                    {
+                        return false;
                     }
-                    for_each_rvalue_operand(rvalue, &mut |op| {
-                        if let Some(p) = operand_place(op) {
-                            f(p, PlaceCtx::Other, loc);
-                        }
-                    });
                 }
                 Statement::SetDiscriminant { place, .. }
                 | Statement::Deinit { place }
                 | Statement::Retag { place }
-                | Statement::PlaceMention(place) => f(place, PlaceCtx::Other, loc),
+                | Statement::PlaceMention(place) => {
+                    if !f(place, PlaceCtx::Other, loc) {
+                        return false;
+                    }
+                }
                 Statement::Intrinsic { args, .. } => {
                     for op in args {
-                        if let Some(p) = operand_place(op) {
-                            f(p, PlaceCtx::Other, loc);
+                        if let Some(p) = operand_place(op)
+                            && !f(p, PlaceCtx::Other, loc)
+                        {
+                            return false;
                         }
                     }
                 }
                 Statement::Unsupported { operands, .. } => {
                     for op in operands {
-                        if let Some(p) = operand_place(op) {
-                            f(p, PlaceCtx::Other, loc);
+                        if let Some(p) = operand_place(op)
+                            && !f(p, PlaceCtx::Other, loc)
+                        {
+                            return false;
                         }
                     }
                 }
@@ -1389,26 +1521,39 @@ fn for_each_place(func: &VerifiableFunction, f: &mut impl FnMut(&Place, PlaceCtx
         match &block.terminator {
             Terminator::Call { args, dest, .. } => {
                 for op in args {
-                    if let Some(p) = operand_place(op) {
-                        f(p, PlaceCtx::Other, loc);
+                    if let Some(p) = operand_place(op)
+                        && !f(p, PlaceCtx::Other, loc)
+                    {
+                        return false;
                     }
                 }
-                f(dest, PlaceCtx::Other, loc);
+                if !f(dest, PlaceCtx::Other, loc) {
+                    return false;
+                }
             }
             Terminator::SwitchInt { discr, .. } => {
-                if let Some(p) = operand_place(discr) {
-                    f(p, PlaceCtx::Other, loc);
+                if let Some(p) = operand_place(discr)
+                    && !f(p, PlaceCtx::Other, loc)
+                {
+                    return false;
                 }
             }
             Terminator::Assert { cond, .. } => {
-                if let Some(p) = operand_place(cond) {
-                    f(p, PlaceCtx::Other, loc);
+                if let Some(p) = operand_place(cond)
+                    && !f(p, PlaceCtx::Other, loc)
+                {
+                    return false;
                 }
             }
-            Terminator::Drop { place, .. } => f(place, PlaceCtx::Other, loc),
+            Terminator::Drop { place, .. } => {
+                if !f(place, PlaceCtx::Other, loc) {
+                    return false;
+                }
+            }
             _ => {}
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,11 +1577,15 @@ mod tests {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: name.into(),
             fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        }
     }
 
     fn condvar_ty() -> Ty {
@@ -1512,6 +1661,7 @@ mod tests {
             preconditions: Vec::new(),
             postconditions: Vec::new(),
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -1553,6 +1703,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         }
     }
 

@@ -232,9 +232,9 @@ impl FeedbackCollector {
     /// Compute success rate grouped by pattern name.
     #[must_use]
     pub fn success_rate_by_pattern(&self) -> BTreeMap<String, f64> {
-        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
         for outcome in &self.outcomes {
-            let entry = counts.entry(outcome.pattern_name.clone()).or_insert((0, 0));
+            let entry = counts.entry(outcome.pattern_name.as_str()).or_insert((0, 0));
             entry.1 += 1;
             if outcome.was_accepted {
                 entry.0 += 1;
@@ -243,7 +243,7 @@ impl FeedbackCollector {
         counts
             .into_iter()
             .map(|(pattern, (accepted, total))| {
-                (pattern, if total > 0 { accepted as f64 / total as f64 } else { 0.0 })
+                (pattern.to_string(), if total > 0 { accepted as f64 / total as f64 } else { 0.0 })
             })
             .collect()
     }
@@ -392,7 +392,7 @@ impl FeedbackCollector {
     #[must_use]
     pub fn report(&self) -> FeedbackReport {
         let mut by_source: BTreeMap<ProposalSource, (usize, usize, u64)> = BTreeMap::new();
-        let mut by_pattern: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut by_pattern: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
 
         for outcome in &self.outcomes {
             let source_entry = by_source.entry(outcome.source).or_insert((0, 0, 0));
@@ -402,7 +402,8 @@ impl FeedbackCollector {
                 source_entry.0 += 1;
             }
 
-            let pattern_entry = by_pattern.entry(outcome.pattern_name.clone()).or_insert((0, 0));
+            let pattern_entry =
+                by_pattern.entry(outcome.pattern_name.as_str()).or_insert((0, 0));
             pattern_entry.1 += 1;
             if outcome.was_accepted {
                 pattern_entry.0 += 1;
@@ -432,7 +433,7 @@ impl FeedbackCollector {
             .into_iter()
             .map(|(pattern, (accepted, total))| {
                 (
-                    pattern,
+                    pattern.to_string(),
                     PatternStats {
                         total,
                         accepted,
@@ -845,7 +846,10 @@ mod tests {
         collector.record_outcome(make_outcome(ProposalSource::Heuristic, "overflow", true, 10));
         collector.record_outcome(make_outcome(ProposalSource::Llm, "div_zero", false, 100));
 
-        let dir = std::env::temp_dir().join("trust_feedback_test");
+        // Per process: the lib is compiled into two test binaries (default
+        // features and `--features trust-wp`), which the crates-tests lane runs
+        // side by side, and a shared directory let one delete the other's file.
+        let dir = std::env::temp_dir().join(format!("trust_feedback_test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("feedback.json");
 
@@ -858,8 +862,7 @@ mod tests {
         assert!(rates[&ProposalSource::Llm].abs() < 1e-10);
 
         // Cleanup
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

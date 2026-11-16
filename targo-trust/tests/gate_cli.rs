@@ -141,6 +141,90 @@ fn gate_examples_alias_is_removed() {
     );
 }
 
+// check-all binds the stage2 `trustc`/`targo` it gates with by their version
+// answers. Those are files a build has just written, so on a loaded host their
+// first exec waits behind macOS's machine-wide syspolicyd scan
+// (docs/KNOWN_HAZARDS.md EXEC-ASSESS-STALL-1). Each stand-in answers after 15 s,
+// past the old 10 s bound on any host, so the result does not depend on load; it
+// is far inside the hang guard the probe now has.
+#[cfg(unix)]
+#[test]
+fn check_all_binds_stage2_tools_whose_version_answer_comes_after_ten_seconds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_test_dir("targo-trust-check-all-late-version-answer");
+    let targo_trust = root.join("targo-trust");
+    fs::create_dir_all(&targo_trust).expect("create targo-trust dir");
+    fs::write(targo_trust.join("Cargo.toml"), "[package]\nname='fixture'\n")
+        .expect("write fake targo-trust manifest");
+    fs::write(root.join(".gitignore"), "build/\n").expect("write fixture gitignore");
+    initialize_clean_git_repo(&root);
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .expect("read fixture HEAD");
+    assert!(head.status.success(), "fixture git rev-parse failed");
+    let head = String::from_utf8(head.stdout).expect("utf-8 HEAD").trim().to_string();
+
+    let bin = root.join("build/host/stage2/bin");
+    fs::create_dir_all(&bin).expect("create stage2 bin");
+    let stand_ins = [
+        (
+            "targo",
+            "#!/bin/sh\n[ \"${1:-}\" = \"-Vv\" ] || exit 2\n/bin/sleep 15\nprintf 'targo 1.99.0-dev\\nrelease: 1.99.0-dev\\nhost: test-host\\n'\n".to_string(),
+        ),
+        (
+            "trustc",
+            format!(
+                "#!/bin/sh\n[ \"${{1:-}}\" = \"-vV\" ] || exit 2\n/bin/sleep 15\nprintf 'trustc 1.99.0-dev\\ncommit-hash: {head}\\nhost: test-host\\n'\n"
+            ),
+        ),
+    ];
+    for (name, script) in &stand_ins {
+        let path = bin.join(name);
+        fs::write(&path, script).expect("write stage2 stand-in");
+        let mut permissions = fs::metadata(&path).expect("stand-in metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod stage2 stand-in");
+    }
+
+    let started = std::time::Instant::now();
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "gate",
+            "check-all",
+            "--repo-root",
+            root.to_str().expect("utf-8 temp path"),
+            "--targo",
+            bin.join("targo").to_str().expect("utf-8 stage2 path"),
+        ])
+        .env("TRUST_SCRIPT_PYTHON", "python3")
+        .output()
+        .expect("run check-all with late stage2 stand-ins");
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The fixture has none of the scripts check-all runs next, so it ends red;
+    // what this pins is that the stage2 identity was bound and the gate went on.
+    assert!(
+        !stderr.contains("identity probe"),
+        "a late version answer must not fail the stage2 identity probe\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("=== Script syntax and verifier examples ==="),
+        "check-all must reach its first step past the stage2 identity\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(30),
+        "both late stand-ins were probed ({elapsed:?})"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 fn initialize_clean_git_repo(repo_root: &std::path::Path) {
     for args in [
         &["init"][..],

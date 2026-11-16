@@ -66,9 +66,10 @@ pub(crate) enum Subcommand {
     Diff,
     /// Solvers: detect and report status of solver binaries.
     Solvers,
-    /// Init: scaffold verification annotations for a crate.
-    #[allow(dead_code)]
-    Init,
+    // `targo trust init` is not a pipeline subcommand: `main.rs` dispatches it
+    // straight to `run_init_subcommand`, which never builds a `Subcommand`.
+    // An `Init` variant here was constructed only by a test (TRUST-35), so it
+    // was removed rather than kept alive under `#[allow(dead_code)]`.
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +816,8 @@ pub(crate) struct StructuredTransportEvidence {
     /// parameterized temporal/deep kinds that the legacy compact tag cannot
     /// reconstruct. It is diagnostic metadata, never proof authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) original_vc_snapshot: Option<Box<trust_types::OriginalVcSnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) typed_kind: Option<Box<trust_types::VcKind>>,
     /// Compiler-provided design-mandate bit carried verbatim from the
     /// transport row (`TransportObligationResult::design_mandate`): the
@@ -824,36 +827,162 @@ pub(crate) struct StructuredTransportEvidence {
     /// from the hardened proof-evidence denominator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) design_mandate: bool,
+    /// The compiler's own `Session::overflow_checks()` / `Session::ub_checks()`
+    /// for the compilation unit that minted this row, carried verbatim from the
+    /// unit's transport envelope (`FunctionTransportResult::runtime_checks`).
+    ///
+    /// It arrives on the ENVELOPE because it is a per-unit fact (see that
+    /// field's own note), and it is bound HERE, per row, because every consumer
+    /// decision is per row and because this is the payload the private live
+    /// transport receipt covers: `live_transport_row_receipt` digests the whole
+    /// serialized `VerificationResult`, `raw_line` included, so a row's check
+    /// environment cannot be edited, donated from a neighbouring row, or
+    /// reordered without invalidating that row's receipt. It is evidence, never
+    /// proof authority — like `design_mandate`, only the compiler may set it and
+    /// targo must never infer it from row text or from the flags targo appended.
+    ///
+    /// `None` means the producer did not state it. It is NOT "checks are off"
+    /// and it is NOT "checks are on": it is the absence of a measurement, and a
+    /// consumer must fall back to the most conservative value it can establish
+    /// on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_checks: Option<trust_types::RuntimeCheckEnv>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) native_trust_ir: Option<trust_types::TransportNativeTrustIrEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proof_evidence: Option<trust_types::TransportProofEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) monitor: Option<trust_types::TransportMonitorEvidence>,
+    /// Trust (TINV step 10.7): the transport row's `assumes` disclosure, carried
+    /// verbatim so every report surface can copy it onto the row. Disclosure only,
+    /// never proof authority (and bound into the row's live receipt like every field
+    /// here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) assumes: Vec<String>,
+    /// Trust (T9): the row's stable key, package and function source digest,
+    /// built from the compiler's envelope (`FunctionTransportResult::stable_ids`
+    /// and `source_sha256`) by [`envelope_identities`]. Like `runtime_checks` it
+    /// arrives on the envelope and is bound HERE, per row, inside the payload
+    /// the live transport receipt covers. Identity, never authority: the
+    /// verdict vector, the committed baseline and `targo trust diff` key on it,
+    /// and nothing grants credit by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<trust_types::obligation_identity::ObligationIdentity>,
+    /// Trust (VF1): the transport row's three-axis grade (encoding, discharge,
+    /// premises), carried verbatim for the `trust.obligations.v1` record.
+    /// Disclosure only, never proof authority (and bound into the row's live
+    /// receipt like every field here). `None` from a compiler that states none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grade: Option<trust_types::authority_grade::ObligationGrade>,
+}
+
+/// Trust (T9): each row's [`ObligationIdentity`] for one function envelope, in
+/// `results` order — or none at all.
+///
+/// A key is `<function>#<stable id>` with the envelope's own (unscoped)
+/// function path; the package is the envelope's Cargo package, or, outside
+/// Cargo, its crate. The envelope's ids are minted for the whole row set at
+/// once, so a defect anywhere — a count other than one id per row, a malformed
+/// or repeated id, no package or crate — leaves EVERY row without a key, which
+/// the determinism accounting reads as could-not-run: a partial key set would
+/// compare a subset as if it were the whole.
+///
+/// [`ObligationIdentity`]: trust_types::obligation_identity::ObligationIdentity
+pub(crate) fn envelope_identities(
+    envelope: &trust_types::FunctionTransportResult,
+) -> Vec<Option<trust_types::obligation_identity::ObligationIdentity>> {
+    use trust_types::obligation_identity::{
+        ObligationIdentity, is_function_source_digest, is_local_id, obligation_key,
+    };
+    let none = || vec![None; envelope.results.len()];
+    let Some(package) = envelope
+        .package_name
+        .as_deref()
+        .or(envelope.crate_name.as_deref())
+        .filter(|package| !package.trim().is_empty())
+    else {
+        return none();
+    };
+    let ids = &envelope.stable_ids;
+    let mut distinct: Vec<&str> = ids.iter().map(String::as_str).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if ids.len() != envelope.results.len()
+        || distinct.len() != ids.len()
+        || !ids.iter().all(|id| is_local_id(id))
+        || envelope.function.trim().is_empty()
+    {
+        return none();
+    }
+    let source = envelope.source_sha256.clone().filter(|digest| is_function_source_digest(digest));
+    ids.iter()
+        .map(|id| {
+            Some(ObligationIdentity {
+                key: obligation_key(&envelope.function, id),
+                package: package.to_string(),
+                function_source_sha256: source.clone(),
+                expanded_function_identity: envelope.expanded_function_identity.clone(),
+            })
+        })
+        .collect()
 }
 
 impl StructuredTransportEvidence {
-    fn from_transport(r: &trust_types::TransportObligationResult) -> Option<Self> {
+    fn from_transport(
+        r: &trust_types::TransportObligationResult,
+        runtime_checks: Option<trust_types::RuntimeCheckEnv>,
+        identity: Option<trust_types::obligation_identity::ObligationIdentity>,
+    ) -> Option<Self> {
         let evidence = Self {
             obligation_id: r.obligation_id.clone(),
             claim_digest_sha256: r.claim_digest_sha256.clone(),
+            original_vc_snapshot: r.original_vc_snapshot.clone(),
             typed_kind: r.typed_kind.clone(),
             design_mandate: r.design_mandate,
+            runtime_checks,
             native_trust_ir: r.native_trust_ir.clone(),
             proof_evidence: r.proof_evidence.clone(),
             monitor: r.monitor.clone(),
+            assumes: r.assumes.clone(),
+            identity,
+            grade: r.grade.clone(),
         };
         evidence.has_structured_fields().then_some(evidence)
     }
 
+    /// Whether this evidence carries envelope facts and NOTHING else — the
+    /// per-unit runtime-check environment and the row's stable identity (T9),
+    /// neither of which speaks to a row's own claim: the identity is derived
+    /// from the row's kind and source position, not from what it asserts. Used
+    /// only to recognise the zero-obligation inventory row and the
+    /// test-harness exclusion row, which the compiler emits with every claim
+    /// field empty; see `is_exact_zero_obligation_inventory_row`.
+    fn carries_only_envelope_facts(&self) -> bool {
+        self.obligation_id.is_none()
+            && self.claim_digest_sha256.is_none()
+            && self.original_vc_snapshot.is_none()
+            && self.typed_kind.is_none()
+            && !self.design_mandate
+            && self.native_trust_ir.is_none()
+            && self.proof_evidence.is_none()
+            && self.monitor.is_none()
+            && self.assumes.is_empty()
+            && self.grade.is_none()
+    }
+
     fn has_structured_fields(&self) -> bool {
-        self.obligation_id.is_some()
+        self.identity.is_some()
+            || self.obligation_id.is_some()
             || self.claim_digest_sha256.is_some()
+            || self.original_vc_snapshot.is_some()
             || self.typed_kind.is_some()
             || self.design_mandate
+            || self.runtime_checks.is_some()
             || self.native_trust_ir.is_some()
             || self.proof_evidence.is_some()
             || self.monitor.is_some()
+            || !self.assumes.is_empty()
+            || self.grade.is_some()
     }
 }
 
@@ -862,6 +991,20 @@ pub(crate) fn structured_transport_evidence(
 ) -> Option<StructuredTransportEvidence> {
     let payload = result.raw_line.strip_prefix(STRUCTURED_TRANSPORT_EVIDENCE_PREFIX)?;
     serde_json::from_str(payload).ok()
+}
+
+/// The compiler-stated runtime-check environment of the compilation unit that
+/// minted this row, or `None` when the row does not carry one.
+///
+/// `None` is the honest answer for an older compiler, a producer that does not
+/// mint the field, a row that reached targo without structured evidence, and a
+/// malformed payload alike. Callers must treat it as "no measurement", never as
+/// a value: reading absence as `overflow_checks = true` would manufacture the
+/// POSITIVE SAFETY CLAIM that `VcKind::has_runtime_fallback_in` exists to gate.
+pub(crate) fn transport_runtime_check_env(
+    result: &VerificationResult,
+) -> Option<trust_types::RuntimeCheckEnv> {
+    structured_transport_evidence(result).and_then(|evidence| evidence.runtime_checks)
 }
 
 /// Recover the exact typed VC kind only when it agrees with both adjacent
@@ -887,51 +1030,54 @@ pub(crate) fn exact_structured_transport_vc_kind(
 /// These rows need the additive typed payload before they may carry proof or
 /// runtime-check credit.
 pub(crate) fn compact_vc_tag_requires_typed_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "unknown"
-            | "overflow"
-            | "overflow:add"
-            | "overflow:sub"
-            | "overflow:mul"
-            | "overflow:div"
-            | "overflow:rem"
-            | "arithmetic_overflow"
-            | "arithmetic_overflow:add"
-            | "arithmetic_overflow:sub"
-            | "arithmetic_overflow:mul"
-            | "arithmetic_overflow:div"
-            | "arithmetic_overflow:rem"
-            | "arithmetic_overflow_add"
-            | "arithmetic_overflow_sub"
-            | "arithmetic_overflow_mul"
-            | "arithmetic_overflow_div"
-            | "arithmetic_overflow_rem"
-            | "shift"
-            | "shift:left"
-            | "shift:right"
-            | "shift_overflow_shl"
-            | "shift_overflow_shr"
-            | "cast"
-            | "cast_overflow"
-            | "negation"
-            | "negation_overflow"
-            | "temporal"
-            | "liveness"
-            | "fairness"
-            | "taint"
-            | "taint_violation"
-            | "refinement"
-            | "refinement_violation"
-            | "resilience"
-            | "resilience_violation"
-            | "protocol"
-            | "protocol_violation"
-            | "termination"
-            | "non_termination"
-            | "float_overflow_to_infinity"
-            | "unbounded_allocation"
-    )
+    // TINV: both the transport spelling `type_invariant:<point>` and the report spelling
+    // `type_invariant_<point>` drop `ty` and `site`, so the row must carry its typed kind.
+    kind.starts_with("type_invariant")
+        || matches!(
+            kind,
+            "unknown"
+                | "overflow"
+                | "overflow:add"
+                | "overflow:sub"
+                | "overflow:mul"
+                | "overflow:div"
+                | "overflow:rem"
+                | "arithmetic_overflow"
+                | "arithmetic_overflow:add"
+                | "arithmetic_overflow:sub"
+                | "arithmetic_overflow:mul"
+                | "arithmetic_overflow:div"
+                | "arithmetic_overflow:rem"
+                | "arithmetic_overflow_add"
+                | "arithmetic_overflow_sub"
+                | "arithmetic_overflow_mul"
+                | "arithmetic_overflow_div"
+                | "arithmetic_overflow_rem"
+                | "shift"
+                | "shift:left"
+                | "shift:right"
+                | "shift_overflow_shl"
+                | "shift_overflow_shr"
+                | "cast"
+                | "cast_overflow"
+                | "negation"
+                | "negation_overflow"
+                | "temporal"
+                | "liveness"
+                | "fairness"
+                | "taint"
+                | "taint_violation"
+                | "refinement"
+                | "refinement_violation"
+                | "resilience"
+                | "resilience_violation"
+                | "protocol"
+                | "protocol_violation"
+                | "termination"
+                | "non_termination"
+                | "float_overflow_to_infinity"
+                | "unbounded_allocation"
+        )
 }
 
 fn structured_transport_vc_kind_defect(result: &VerificationResult) -> Option<&'static str> {
@@ -963,142 +1109,13 @@ pub(crate) fn replace_structured_transport_evidence(
     Ok(())
 }
 
-/// The obligation-id of a `#[trust::ensures]` postcondition row, if this result
-/// carries one. A postcondition produces TWO obligations: the authoritative
-/// BODY-AWARE VC (`vc:<fn>:postcondition:<n>`, whose formula pins the return slot
-/// to its computed value — a closed query the backends prove) and a redundant
-/// DEF-SITE contract MARKER (`obligation:<fn>:postcondition:<n>`, the bare
-/// contract predicate with a havoc'd return slot, which the in-compiler pure
-/// replay cannot discharge and so leaves `unknown`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostconditionRowKind {
-    BodyVc,
-    DefinitionMarker,
-}
-
-/// Return the exact binding key shared by a body VC and its definition-site
-/// marker. The key retains the complete function fragment and everything after
-/// `:postcondition:`; in particular, two `#[ensures]` rows with different
-/// indices/suffixes never alias merely because they belong to the same function.
-fn postcondition_binding(result: &VerificationResult) -> Option<(PostconditionRowKind, String)> {
-    if !structured_transport_vc_kind_is_authority_safe(result) {
-        return None;
-    }
-    let postcondition_classification = match exact_structured_transport_vc_kind(result) {
-        Ok(Some(trust_types::VcKind::Postcondition)) => true,
-        Ok(Some(_)) | Err(()) => false,
-        Ok(None) => {
-            matches!(result.kind.as_str(), "postcond" | "postcondition")
-                && result.message == "postcondition"
-                || matches!(result.kind.as_str(), "assert" | "assertion")
-                    && result.message == "assertion: postcondition"
-        }
-    };
-    if !postcondition_classification {
-        return None;
-    }
-    let oid = structured_transport_evidence(result)?.obligation_id?;
-    let (kind, binding) = if let Some(binding) = oid.strip_prefix("vc:") {
-        (PostconditionRowKind::BodyVc, binding)
-    } else if let Some(binding) = oid.strip_prefix("obligation:") {
-        (PostconditionRowKind::DefinitionMarker, binding)
-    } else {
-        return None;
-    };
-    let (function_fragment, suffix) = binding.rsplit_once(":postcondition:")?;
-    if function_fragment.is_empty() || suffix.is_empty() {
-        return None;
-    }
-    Some((kind, binding.to_string()))
-}
-
-/// Discharge a redundant def-site `#[trust::ensures]` MARKER by SUBSUMPTION onto
-/// the function's body-aware postcondition VC(s).
-///
-/// A valid `#[ensures]` produces a proved body-aware VC PLUS a def-site marker
-/// the pure-replay lane leaves `unknown`; that lone `unknown` keeps an otherwise
-/// VERIFIED function at `Inconclusive`. When the one body-aware
-/// `vc:<fn>:postcondition:<suffix>` paired with a marker is genuinely `Proved`,
-/// the redundant `obligation:<fn>:postcondition:<suffix>` marker is flipped to
-/// `Proved`.
-///
-/// SOUND + fail-closed, mirroring the compiler's own postcondition re-keying
-/// (`full_verification_legacy_results`): binding uses the complete stable
-/// obligation-id suffix, and requires exactly one VC plus exactly one marker for
-/// that key. A missing, duplicated, failed, or inconclusive body-aware VC leaves
-/// the marker `unknown` (so a genuinely-violated or unproven postcondition never
-/// reads Verified). Only the def-site marker (`obligation:` prefix) is ever
-/// flipped — a body-aware VC's own verdict is never altered.
-pub(crate) fn subsume_redundant_postcondition_markers(results: &mut [VerificationResult]) {
-    use std::collections::{HashMap, HashSet};
-
-    #[derive(Default)]
-    struct PostconditionBinding {
-        body_vc_count: usize,
-        marker_count: usize,
-        body_vc_proved: bool,
-    }
-
-    // Count both sides of each exact binding. Include the display function in
-    // the key as a second independent boundary: malformed transport cannot
-    // correlate rows attributed to different functions even if their embedded
-    // obligation-id fragments collide.
-    let mut bindings: HashMap<(String, String), PostconditionBinding> = HashMap::new();
-    for result in results.iter() {
-        let Some((kind, binding)) = postcondition_binding(result) else {
-            continue;
-        };
-        let entry = bindings.entry((result.function.clone(), binding)).or_default();
-        match kind {
-            PostconditionRowKind::BodyVc => {
-                entry.body_vc_count += 1;
-                entry.body_vc_proved = result.outcome.is_proved();
-            }
-            PostconditionRowKind::DefinitionMarker => entry.marker_count += 1,
-        }
-    }
-
-    // Only an unambiguous one-to-one pair can establish a marker. Counting rows
-    // instead of collapsing them in a set makes duplicate transport fail closed.
-    let established: HashSet<(String, String)> = bindings
-        .into_iter()
-        .filter(|(_, binding)| {
-            binding.body_vc_count == 1 && binding.marker_count == 1 && binding.body_vc_proved
-        })
-        .map(|(key, _)| key)
-        .collect();
-    if established.is_empty() {
-        return;
-    }
-
-    for result in results.iter_mut() {
-        if !matches!(result.outcome, VerificationOutcome::Unknown) {
-            continue;
-        }
-        let Some((kind, binding)) = postcondition_binding(result) else {
-            continue;
-        };
-        if kind != PostconditionRowKind::DefinitionMarker
-            || !established.contains(&(result.function.clone(), binding))
-        {
-            continue;
-        }
-        result.outcome = VerificationOutcome::Proved;
-        result.backend = if result.backend.trim().is_empty() {
-            "subsumed:postcondition-vc".to_string()
-        } else {
-            format!("subsumed:{}", result.backend)
-        };
-        result.reason = Some(
-            "discharged by SUBSUMPTION: the def-site #[ensures] contract marker is paired \
-             one-to-one with its exact body-aware postcondition VC, which is genuinely proved"
-                .to_string(),
-        );
-    }
-}
-
-fn structured_transport_evidence_raw_line(r: &trust_types::TransportObligationResult) -> String {
-    let Some(evidence) = StructuredTransportEvidence::from_transport(r) else {
+fn structured_transport_evidence_raw_line(
+    r: &trust_types::TransportObligationResult,
+    runtime_checks: Option<trust_types::RuntimeCheckEnv>,
+    identity: Option<trust_types::obligation_identity::ObligationIdentity>,
+) -> String {
+    let Some(evidence) = StructuredTransportEvidence::from_transport(r, runtime_checks, identity)
+    else {
         return String::new();
     };
     serde_json::to_string(&evidence)
@@ -1131,12 +1148,11 @@ pub(crate) fn parse_trust_note(line: &str) -> Option<VerificationResult> {
     // Find outcome separator: " -- " (ASCII) or " — " (em-dash, encoded as \u{2014})
     let (message_part, outcome_part) = if let Some(sep_pos) = after_colon.find(" -- ") {
         (&after_colon[..sep_pos], &after_colon[sep_pos + 4..])
-    } else if let Some(sep_pos) = after_colon.find(" \u{2014} ") {
+    } else {
+        let sep_pos = after_colon.find(" \u{2014} ")?;
         // em-dash is 3 bytes in UTF-8
         let em_dash_len = '\u{2014}'.len_utf8();
         (&after_colon[..sep_pos], &after_colon[sep_pos + 2 + em_dash_len..])
-    } else {
-        return None;
     };
 
     let message = message_part.trim().to_string();
@@ -1188,6 +1204,8 @@ pub(crate) fn parse_trust_note(line: &str) -> Option<VerificationResult> {
 pub(crate) fn transport_to_verification_result(
     function: &str,
     r: &trust_types::TransportObligationResult,
+    runtime_checks: Option<trust_types::RuntimeCheckEnv>,
+    identity: Option<trust_types::obligation_identity::ObligationIdentity>,
 ) -> VerificationResult {
     let parsed_outcome = VerificationOutcome::from(r.outcome);
     let typed_kind_defect = match r.typed_kind.as_deref() {
@@ -1227,11 +1245,17 @@ pub(crate) fn transport_to_verification_result(
         reason: if let Some(defect) = typed_kind_defect.filter(|_| {
             matches!(normalized, VerificationOutcome::Proved | VerificationOutcome::RuntimeChecked)
         }) {
-            Some(format!("{defect}; favorable outcome downgraded before publication"))
+            Some(publication_demotion_reason(
+                r.outcome,
+                r.reason.as_deref(),
+                r.typed_kind.as_deref(),
+                false,
+                &format!("{defect}; favorable outcome downgraded before publication"),
+            ))
         } else {
             normalized_transport_reason(r, outcome)
         },
-        raw_line: structured_transport_evidence_raw_line(r),
+        raw_line: structured_transport_evidence_raw_line(r, runtime_checks, identity),
     }
 }
 
@@ -1279,6 +1303,17 @@ fn normalize_overflow_op(op: &str) -> String {
 }
 
 impl VerificationResult {
+    /// Why a `failed` row fails ([`trust_types::FailureBasis`]); `None` unless
+    /// the outcome is `failed`. Read off the compiler-stamped solver label and
+    /// the counterexample, exactly as the canonical report builder reads it, so
+    /// the terminal and `report.json` cannot disagree. Display only: the
+    /// outcome, the partition and the gate never consult it.
+    pub(crate) fn failure_basis(&self) -> Option<trust_types::FailureBasis> {
+        matches!(self.outcome, VerificationOutcome::Failed).then(|| {
+            trust_types::FailureBasis::for_failed_row(&self.backend, self.counterexample.is_some())
+        })
+    }
+
     /// Classify this result as a hardened `PanicBoundary` `mir_assert` TWIN and
     /// return which direct per-statement family it corresponds to.
     ///
@@ -1404,6 +1439,24 @@ impl VerificationResult {
     }
 }
 
+/// The MIR-assert pairing role and family key of `result`, from the SAME
+/// classifier and the same authority filter `subsume_hardened_panic_twins` keys
+/// on. The report's failure-site accounting (`trust_types::failure_sites`) uses
+/// this, so the two cannot drift about which rows are twins of which; there is
+/// no second assert-family mapping. `None` for every other row.
+pub(crate) fn panic_twin_pairing(
+    result: &VerificationResult,
+) -> Option<(trust_types::failure_sites::TwinRole, String)> {
+    use trust_types::failure_sites::TwinRole;
+    if !structured_transport_vc_kind_is_authority_safe(result) {
+        return None;
+    }
+    if let Some(family) = result.hardened_panic_twin_family() {
+        return Some((TwinRole::HardenedTwin, format!("{family:?}")));
+    }
+    result.direct_panic_sibling_family().map(|family| (TwinRole::L0Primary, format!("{family:?}")))
+}
+
 /// Discharge hardened `PanicBoundary` `mir_assert` twins by SUBSUMPTION.
 ///
 /// A hardened twin `VerificationResult` whose outcome is `Unknown` is flipped to
@@ -1415,17 +1468,18 @@ impl VerificationResult {
 /// discharges the twin.
 ///
 /// SOUNDNESS — we subsume ONLY when ALL of:
-///   * same function (`function` equal),
-///   * byte-identical source span (`SourceSpan` derives `Eq`),
-///   * corresponding family (Overflow(Add|Sub|Mul|..)<->ArithmeticOverflow,
-///     Overflow(Shl|Shr)<->ShiftOverflow, BoundsCheck<->Index/Slice,
-///     DivisionByZero<->DivisionByZero, RemainderByZero<->RemainderByZero) AND
-///     SAME op — a Shr twin is discharged ONLY by a proved Shr ShiftOverflow
-///     sibling, never by an Shl shift sibling and never by any arithmetic sibling,
-///   * one-to-one cardinality (multiple direct siblings or multiple hardened
-///     twins at the same key are ambiguous and NONE are subsumed),
-///   * the sibling is a genuine `Proved` at/above the reported-proof floor (a
-///     `RuntimeChecked`/`Unknown`/`Failed`/`Timeout` sibling does NOT subsume).
+/// - same function (`function` equal),
+/// - byte-identical source span (`SourceSpan` derives `Eq`),
+/// - corresponding family (Overflow(Add|Sub|Mul|..)<->ArithmeticOverflow,
+///   Overflow(Shl|Shr)<->ShiftOverflow, BoundsCheck<->Index/Slice,
+///   DivisionByZero<->DivisionByZero, RemainderByZero<->RemainderByZero) AND
+///   SAME op — a Shr twin is discharged ONLY by a proved Shr ShiftOverflow
+///   sibling, never by an Shl shift sibling and never by any arithmetic sibling,
+/// - one-to-one cardinality (multiple direct siblings or multiple hardened
+///   twins at the same key are ambiguous and NONE are subsumed),
+/// - the sibling is a genuine `Proved` at/above the reported-proof floor (a
+///   `RuntimeChecked`/`Unknown`/`Failed`/`Timeout` sibling does NOT subsume).
+///
 /// A twin with no such proved sibling (e.g. a loop-body Add twin whose
 /// per-statement Add is itself only `RuntimeChecked`/`Unknown`) stays `Unknown`.
 /// Only `mir_assert` `PanicBoundary` twins are eligible; `unwrap`/`expect` and
@@ -1588,18 +1642,25 @@ pub(crate) fn subsume_hardened_panic_twins(results: &mut [VerificationResult]) {
 /// `Unknown` and leaves it in place carrying the verbatim reason (`--json`
 /// shows it; `grep` counts it). But demotion runs BEFORE
 /// `elide_rows_proved_only_by`, which DELETES rows: a demoted hardened-panic
-/// twin whose direct sibling at the same span did publish is removed outright,
-/// leaving no row, no id and no reason. Counting the marker text alone would
+/// twin whose direct sibling at the same span did publish is removed from the
+/// proof vector. Its diagnostic identity is retained separately below.
+/// Counting the marker text in the proof vector alone would
 /// therefore silently UNDER-report, which is worse than not reporting at all —
 /// it reads as complete.
 ///
 /// Conservation, held by construction and asserted in
 /// `publication_boundary_conservation_holds_across_both_fates`:
 /// `compiler_favorable == published_favorable + withheld_relabelled + withheld_elided`.
+/// `published_favorable` counts only rows this pass did NOT demote: a policy-B
+/// `RuntimeChecked` relabel (2026-09-16) is still a favorable outcome in the
+/// published vector, but it is the compiler's PROOF claim withheld and a weaker
+/// claim published, so it belongs to `withheld_relabelled` (and its
+/// `withheld_relabelled_runtime_checked` sub-count), never to the published side.
 ///
-/// This is a DISCLOSURE record. Nothing here changes what a row claims, which
-/// rows are demoted, or which rows are elided.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Counts and diagnostics disclose the unchanged publication decisions. Typed
+/// elided stops additionally preserve unit determinism accounting; they change
+/// no row claim, demotion, elision, obligation count or proof authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PublicationBoundary {
     /// Favorable (`Proved`/`RuntimeChecked`) rows in the authenticated compiler
     /// vector, EXCLUDING the exact zero-obligation inventory rows — those are
@@ -1608,12 +1669,20 @@ pub(crate) struct PublicationBoundary {
     pub(crate) compiler_favorable: usize,
     /// Favorable rows that survived to publication.
     pub(crate) published_favorable: usize,
-    /// Favorable compiler rows rewritten to `Unknown` and STILL PRESENT in the
-    /// published vector, carrying the verbatim demotion reason.
+    /// Favorable compiler rows rewritten to `Unknown` — or, under policy B, to
+    /// `RuntimeChecked` — and STILL PRESENT in the published vector, carrying
+    /// the verbatim demotion reason. The compiler's PROOF claim was withheld
+    /// either way; the policy-B fate publishes the weaker, entailed claim.
     pub(crate) withheld_relabelled: usize,
-    /// Favorable compiler rows that were demoted and then DELETED outright by
-    /// the alias-elision passes. No row, no id, no reason survives — this is
-    /// the population a `--json` reader cannot recover.
+    /// The policy-B subset of `withheld_relabelled`: rows rewritten to
+    /// `RuntimeChecked` rather than `Unknown` because their exact typed kind
+    /// keeps a runtime fallback rustc emits at every setting
+    /// (`transport_row_keeps_an_unconditional_runtime_check`). The gate counts
+    /// them CONDITIONAL, never proved.
+    pub(crate) withheld_relabelled_runtime_checked: usize,
+    /// Favorable compiler rows that were demoted and then removed by the
+    /// alias-elision passes. Their identities survive in diagnostic disclosure,
+    /// not in the canonical proof vector.
     pub(crate) withheld_elided: usize,
     /// Rows the compiler did NOT report favorably that were elided as redundant
     /// aliases. Pre-existing intended behaviour, disclosed for completeness.
@@ -1621,6 +1690,75 @@ pub(crate) struct PublicationBoundary {
     /// Exact zero-obligation inventory rows removed (already disclosed through
     /// `zero_obligation_functions`).
     pub(crate) inventory_elided: usize,
+    /// Trust (CB4): exact test-harness exclusion rows removed (already disclosed
+    /// through `test_harness_exclusions` and the gate's `exclusions`). Like the
+    /// zero-obligation rows they are inventory, not obligations.
+    pub(crate) harness_exclusions_elided: usize,
+    /// Diagnostic identities retained before alias elision. These are not
+    /// additional obligations, discharged goals, or proof authority.
+    pub(crate) elided_diagnostics: Vec<ElidedPublicationDiagnostic>,
+    /// Stops removed from the row vector by alias elision. These remain unit
+    /// accounting, never additional obligations or proof authority.
+    pub(crate) elided_stops: Vec<PublicationStop>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicationStop {
+    /// Exact transported package identity; absent means no package can safely
+    /// exclude this stop from its accounting.
+    pub(crate) package: Option<String>,
+    pub(crate) stop: trust_types::determinism::NotedStop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElidedPublicationDiagnostic {
+    pub(crate) function: String,
+    pub(crate) kind: String,
+    pub(crate) message: String,
+    pub(crate) outcome: VerificationOutcome,
+    pub(crate) source_location: Option<String>,
+    pub(crate) reason: Option<String>,
+    pub(crate) obligation_id: Option<String>,
+    pub(crate) claim_digest_sha256: Option<String>,
+    pub(crate) native_request_id: Option<String>,
+    pub(crate) native_id: Option<String>,
+    pub(crate) native_suite: Option<String>,
+    pub(crate) backend: String,
+    pub(crate) withheld: bool,
+}
+
+impl ElidedPublicationDiagnostic {
+    fn from_result(result: &VerificationResult, withheld: bool) -> Self {
+        let evidence = structured_transport_evidence(result);
+        let native = evidence.as_ref().and_then(|evidence| evidence.native_trust_ir.as_ref());
+        let proof = evidence.as_ref().and_then(|evidence| evidence.proof_evidence.as_ref());
+        Self {
+            function: result.function.clone(),
+            kind: result.kind.clone(),
+            message: result.message.clone(),
+            outcome: result.outcome,
+            source_location: result
+                .location
+                .as_ref()
+                .map(|span| format!("{}:{}:{}", span.file, span.line_start, span.col_start)),
+            reason: result.reason.clone(),
+            obligation_id: evidence.as_ref().and_then(|evidence| evidence.obligation_id.clone()),
+            claim_digest_sha256: evidence
+                .as_ref()
+                .and_then(|evidence| evidence.claim_digest_sha256.clone()),
+            native_request_id: native
+                .and_then(|native| native.request_id.clone())
+                .or_else(|| proof.and_then(|proof| proof.request_id.clone())),
+            native_id: native
+                .and_then(|native| native.native_id.clone())
+                .or_else(|| proof.and_then(|proof| proof.native_id.clone())),
+            native_suite: native
+                .map(|native| native.suite.clone())
+                .or_else(|| proof.map(|proof| proof.suite.clone())),
+            backend: result.backend.clone(),
+            withheld,
+        }
+    }
 }
 
 impl PublicationBoundary {
@@ -1628,20 +1766,134 @@ impl PublicationBoundary {
     /// DIFFERENCE of two independently counted populations rather than as a sum
     /// of the attributed parts. A bookkeeping slip in the split can then show
     /// up as unattributed residue instead of quietly shrinking the total.
-    pub(crate) fn withheld(self) -> usize {
+    pub(crate) fn withheld(&self) -> usize {
         self.compiler_favorable.saturating_sub(self.published_favorable)
     }
 
     /// Withheld rows the split failed to account for. Zero whenever the
     /// conservation law above holds; rendered explicitly when it does not, so a
     /// future edit that breaks the accounting is visible instead of silent.
-    pub(crate) fn unattributed_withheld(self) -> usize {
+    pub(crate) fn unattributed_withheld(&self) -> usize {
         self.withheld().saturating_sub(self.withheld_relabelled + self.withheld_elided)
     }
 }
 
+/// Preserve the producer's typed stop while adding a structural refusal.
+/// No validator verdict is proof authority here. In particular, a failed
+/// path-backed check conflates structural defects with IO/races, so it cannot
+/// acquire a deterministic attribution from an earlier favorable label.
+fn publication_demotion_reason(
+    outcome: trust_types::Outcome,
+    prior_reason: Option<&str>,
+    typed_kind: Option<&trust_types::VcKind>,
+    may_have_failed_io: bool,
+    refusal: &str,
+) -> String {
+    use trust_types::determinism::StopCause;
+    let unsupported_detail = match typed_kind {
+        Some(trust_types::VcKind::UnsupportedMir { detail, .. }) => Some(detail.as_str()),
+        _ => None,
+    };
+    let typed_outcome =
+        if unsupported_detail.is_some() { trust_types::Outcome::Unsupported } else { outcome };
+    let mut cause = StopCause::of_outcome(typed_outcome, prior_reason);
+    // An explicitly unsupported source kind remains unsupported even if a
+    // malformed favorable carrier also says `solved`.
+    if unsupported_detail.is_some() && cause == StopCause::Solved {
+        cause = StopCause::Unsupported;
+    }
+    if let Some(detail_cause) = unsupported_detail.and_then(StopCause::from_reason) {
+        cause = StopCause::combine(cause, detail_cause);
+    }
+    if may_have_failed_io {
+        cause = StopCause::combine(cause, StopCause::Unclassified);
+    }
+    let mut detail = format!(
+        "{refusal}; prior compiler outcome `{outcome:?}`: ({})",
+        prior_reason.unwrap_or("no reason supplied")
+    );
+    if let Some(typed_detail) = unsupported_detail {
+        detail.push_str("; original typed-kind detail: (");
+        detail.push_str(typed_detail);
+        detail.push(')');
+    }
+    cause.stamp(&detail)
+}
+
+/// Missing proof envelopes and inline structural refusals do not open files.
+/// Any path in a supplied proof/native envelope is conservatively enough to
+/// withhold a deterministic attribution; the Boolean validators do not expose
+/// whether their refusal came from structure or IO.
+fn publication_evidence_may_have_failed_io(result: &VerificationResult) -> bool {
+    let Some(evidence) = structured_transport_evidence(result) else { return false };
+    let Some(proof) = evidence.proof_evidence.as_ref() else { return false };
+    proof
+        .artifacts
+        .iter()
+        .chain(evidence.native_trust_ir.iter().flat_map(|native| &native.artifacts))
+        .any(|artifact| {
+            artifact
+                .materialization
+                .as_ref()
+                .is_some_and(|materialization| materialization.materialized_path.is_some())
+        })
+}
+
 fn is_favorable_publication_row(result: &VerificationResult) -> bool {
     matches!(result.outcome, VerificationOutcome::Proved | VerificationOutcome::RuntimeChecked)
+}
+
+/// The one publication defect policy B may soften (see
+/// `normalize_authenticated_results_for_publication`): the row is exact and
+/// typed but carries no attachable proof evidence.
+const PUBLICATION_EVIDENCE_DEFECT: &str =
+    "without attachable native or clean-kernel proof evidence";
+
+/// Whether a row's EXACT typed kind keeps a runtime fallback under the
+/// fail-closed check environment (`overflow_checks = false`, `ub_checks =
+/// false`) — a fallback rustc emits at EVERY setting: `Assertion` (a panic; the
+/// lane-tagged UB families — every `[unsafe…]` assertion and `[provenance]` —
+/// answer `false` inside the predicate itself), bounds and slice checks,
+/// division and remainder by zero. Targo does not know the
+/// unit's real check environment, so the `overflow_checks`-gated kinds answer
+/// `false` here and stay `Unknown`; the compiler, which does know it, labels
+/// those itself (`build_transport_results_with_runtime_checks_bound`).
+///
+/// The typed kind must agree with the adjacent legacy tag/description
+/// (`exact_structured_transport_vc_kind`); a mismatch is a transport defect and
+/// answers `false`, as does an untyped row. `UnsupportedMir` answers `false`
+/// outright, on the rule of [`transport_row_can_carry_runtime_check`]: the
+/// compiler could not lower it, so no fallback can be vouched for — even where
+/// the predicate would recover a fallback-bearing tag from its text.
+///
+/// Two more refusals, both from the 2026-09-16 refutation of this relabel:
+///
+/// * the row must be EVIDENCE-FREE — policy B softens the "no attachable
+///   evidence" defect only. A `proved` row that DOES carry evidence which fails
+///   publication (a `failed`/`unsupported` status behind a `proved` label, a
+///   torn artifact) is a laundering attempt, not a gap; the parse-time
+///   `normalize_transport_outcome` re-derives that only for full-verifier
+///   solver names, so it is refused here for every solver;
+/// * a hardened-category `Assertion` (`hardened_category()` is `Some` for the
+///   whole `[unsafe…]` family — UB and FFI claims rustc never checks) answers
+///   `false` even though `has_runtime_fallback_in` now says the same: the
+///   boundary keeps its own belt.
+fn transport_row_keeps_an_unconditional_runtime_check(result: &VerificationResult) -> bool {
+    let Some(structured) = structured_transport_evidence(result) else {
+        return false;
+    };
+    if structured.proof_evidence.is_some() || structured.native_trust_ir.is_some() {
+        return false;
+    }
+    let Ok(Some(kind)) = exact_structured_transport_vc_kind(result) else {
+        return false;
+    };
+    if matches!(kind, trust_types::VcKind::UnsupportedMir { .. })
+        || kind.hardened_category().is_some()
+    {
+        return false;
+    }
+    kind.has_runtime_fallback_in(trust_types::RuntimeCheckEnv::overflow_checks_only(false))
 }
 
 /// Normalize rows from an authenticated compiler channel for publication.
@@ -1658,7 +1910,33 @@ fn is_favorable_publication_row(result: &VerificationResult) -> bool {
 /// Trust (#220): returns the `PublicationBoundary` describing what it withheld,
 /// so the human report can disclose a boundary that used to be visible only in
 /// `--json` (and, for elided rows, not at all). The returned value is
-/// observational; ignoring it leaves behaviour exactly as before.
+/// observational for proof decisions. Its typed elided stops must also reach
+/// the unit ledger, so an alias removal cannot hide stopped work.
+///
+/// Trust (2026-09-16, policy B at the publication boundary — blocker T4 of
+/// `reports/2026-09-13-w1-alignment-obligation-sizing.md`): a `Proved` row that
+/// fails ONLY the evidence criterion — exact claim identity present, typed kind
+/// authority-safe, but no attachable native or clean-kernel proof evidence — is
+/// rewritten to `RuntimeChecked` instead of `Unknown` WHEN its exact typed kind
+/// keeps a runtime fallback under the fail-closed check environment
+/// (`transport_row_keeps_an_unconditional_runtime_check`). The premise is the
+/// compiler's `Proved` label on a real typed obligation whose failure mode is a
+/// Rust panic (a panic-class `Assertion` — never a lane-tagged UB claim —,
+/// bounds/slice checks, div/rem by zero): the compiler
+/// asserted no runtime failure at all, so the strictly weaker claim "rustc's
+/// runtime check for this obligation stays in the binary" is entailed by it,
+/// and the gate counts the row CONDITIONAL (`conditional-pass`), never proved.
+/// Measured case (`trust-acb74dd5`, `p7_helper_print`): a whole-function
+/// panic-freedom row discharged by the compiler's `InterproceduralCalleeClosure`
+/// (`trust-assert-refute`, TCB class `Trusted`, premises not attachable) —
+/// `targo trust build` graded the crate INCONCLUSIVE on a body raw `trustc` had
+/// proved, exit 1, no binary. This is NOT the `RuntimeCheckPolicy::Auto`
+/// re-inference `report.rs` forbids: that laundered solver `Unknown`s (nothing
+/// established) into "covered"; here the label starts from a compiler proof
+/// claim and only moves DOWN. A row failing the identity or kind criterion, or
+/// whose kind's fallback is conditional (`overflow_checks`-gated) or absent,
+/// still fails closed to `Unknown`; the relabel is still counted as a withheld
+/// proof claim in the boundary disclosure.
 pub(crate) fn normalize_authenticated_results_for_publication(
     results: &mut Vec<VerificationResult>,
     materialization_root: Option<&std::path::Path>,
@@ -1670,9 +1948,17 @@ pub(crate) fn normalize_authenticated_results_for_publication(
     // fail closed below.
     let before_inventory = results.len();
     results.retain(|result| !is_exact_zero_obligation_inventory_row(result));
+    let inventory_elided = before_inventory - results.len();
+    // Trust (CB4): an excluded libtest harness body is inventory in exactly the
+    // same sense — it names a function, it claims nothing — so its EXACT row
+    // is elided too and disclosed through `authenticated_test_harness_exclusions`.
+    // A lookalike is not elided: it stays and fails closed in the partition.
+    let before_exclusions = results.len();
+    results.retain(|result| test_harness_exclusion_of(result).is_none());
 
     let mut boundary = PublicationBoundary {
-        inventory_elided: before_inventory - results.len(),
+        inventory_elided,
+        harness_exclusions_elided: before_exclusions - results.len(),
         compiler_favorable: results.iter().filter(|r| is_favorable_publication_row(r)).count(),
         ..PublicationBoundary::default()
     };
@@ -1688,6 +1974,17 @@ pub(crate) fn normalize_authenticated_results_for_publication(
         ) {
             continue;
         }
+        // Trust (OD-1 phase 1): the compiler's exact instance-discharge row claims no
+        // proof of its own — it reports the resolved callee's verdict, and the gate's
+        // partition counts a `proved` one as conditional evidence (`assumed`), never as
+        // proof. It carries no claim digest by construction, so the proof-claim checks
+        // below do not apply to it.
+        if trust_types::assumption::is_instance_hypothesis_discharge_row(
+            &result.kind,
+            &result.backend,
+        ) {
+            continue;
+        }
         let defect = if let Some(defect) = structured_transport_vc_kind_defect(result) {
             Some(defect)
         } else if result.outcome.is_proved() && !has_exact_compiler_claim_identity(result) {
@@ -1698,43 +1995,88 @@ pub(crate) fn normalize_authenticated_results_for_publication(
                 materialization_root,
             )
         {
-            Some("without attachable native or clean-kernel proof evidence")
+            Some(PUBLICATION_EVIDENCE_DEFECT)
         } else {
             None
         };
         if let Some(defect) = defect {
-            result.outcome = VerificationOutcome::Unknown;
-            result.reason = Some(format!(
-                "compiler transport claimed a favorable outcome {defect}; downgraded before publication"
+            let policy_b_runtime_checked = result.outcome.is_proved()
+                && defect == PUBLICATION_EVIDENCE_DEFECT
+                && transport_row_keeps_an_unconditional_runtime_check(result);
+            let original_outcome = crate::determinism_report::row_status(result);
+            let prior_reason = result.reason.clone();
+            let typed_kind = structured_transport_evidence(result).and_then(|e| e.typed_kind);
+            let may_have_failed_io = defect == PUBLICATION_EVIDENCE_DEFECT
+                && publication_evidence_may_have_failed_io(result);
+            if policy_b_runtime_checked {
+                result.outcome = VerificationOutcome::RuntimeChecked;
+                result.reason = Some(format!(
+                    "compiler transport claimed a favorable outcome {defect}; published as \
+                     runtime-checked under policy B (the compiler's `{}` claim is not \
+                     publication-grade proof; rustc's runtime check for this obligation stays \
+                     in the binary and the gate counts it conditional, never proved); \
+                     downgraded before publication",
+                    result.backend
+                ));
+            } else {
+                result.outcome = VerificationOutcome::Unknown;
+                result.reason = Some(format!(
+                    "compiler transport claimed a favorable outcome {defect}; downgraded before publication"
+                ));
+            }
+            result.reason = Some(publication_demotion_reason(
+                original_outcome,
+                prior_reason.as_deref(),
+                typed_kind.as_deref(),
+                may_have_failed_io,
+                result.reason.as_deref().expect("demotion supplies a reason"),
             ));
             demoted[index] = true;
         }
     }
 
-    let panic_twins = elide_rows_proved_only_by(results, &mut demoted, subsume_hardened_panic_twins);
-    let postcondition_markers =
-        elide_rows_proved_only_by(results, &mut demoted, subsume_redundant_postcondition_markers);
-
-    boundary.withheld_elided = panic_twins.demoted + postcondition_markers.demoted;
-    boundary.alias_elided = panic_twins.other + postcondition_markers.other;
+    let panic_twins =
+        elide_rows_proved_only_by(results, &mut demoted, subsume_hardened_panic_twins);
+    // An authored postcondition is its own source claim. A matching body-VC
+    // ID suffix is not evidence that it is a redundant diagnostic alias.
+    // Keep every withheld source row visible until its own proof can publish.
+    boundary.withheld_elided = panic_twins.demoted;
+    boundary.alias_elided = panic_twins.other;
+    boundary.elided_stops = panic_twins.stops;
+    boundary.elided_diagnostics = panic_twins.diagnostics;
     // A demoted row that survived elision is still visible (as `Unknown`, with
     // the reason); one that did not is gone. Only the first is reconstructible
     // from the published vector, which is exactly why both are counted here.
     boundary.withheld_relabelled = demoted.iter().filter(|was_demoted| **was_demoted).count();
-    boundary.published_favorable =
-        results.iter().filter(|r| is_favorable_publication_row(r)).count();
+    boundary.withheld_relabelled_runtime_checked = results
+        .iter()
+        .zip(demoted.iter())
+        .filter(|(result, was_demoted)| {
+            **was_demoted && result.outcome == VerificationOutcome::RuntimeChecked
+        })
+        .count();
+    // A demoted row is never "published favorable", even when policy B left a
+    // favorable `RuntimeChecked` outcome in the vector: the compiler's proof
+    // claim was withheld. Conservation needs the two sides disjoint.
+    boundary.published_favorable = results
+        .iter()
+        .zip(demoted.iter())
+        .filter(|(result, was_demoted)| !**was_demoted && is_favorable_publication_row(result))
+        .count();
     boundary
 }
 
 /// How many rows one `elide_rows_proved_only_by` pass removed, split by whether
 /// this run's publication demotion had already rewritten them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ElidedRowCounts {
     /// Removed rows that THIS run demoted from a favorable compiler outcome.
     demoted: usize,
     /// Removed rows the compiler had not reported favorably — ordinary
     /// redundant aliases.
     other: usize,
+    diagnostics: Vec<ElidedPublicationDiagnostic>,
+    stops: Vec<PublicationStop>,
 }
 
 pub(crate) fn authenticated_zero_obligation_inventory(
@@ -1751,6 +2093,84 @@ pub(crate) fn authenticated_zero_obligation_inventory(
     functions
 }
 
+/// Trust (CB4): the authenticated inventory of bodies the compiler EXCLUDED
+/// from the proof inventory because rustc's libtest harness synthesized them
+/// (`trust_types::exclusion`), one entry per exact exclusion row, sorted by
+/// function and deduplicated.
+///
+/// Like [`authenticated_zero_obligation_inventory`], this is function/coverage
+/// inventory, never a logical obligation: the rows it reads are elided from the
+/// publication vector by [`normalize_authenticated_results_for_publication`],
+/// so they cannot enter `total`, and a run whose only rows are exclusions is
+/// not a proof. Only an EXACT row is read ([`test_harness_exclusion_of`]); a
+/// lookalike stays in the vector and the gate's partition counts it as a
+/// genuine unknown with a transport defect.
+pub(crate) fn authenticated_test_harness_exclusions(
+    results: &[VerificationResult],
+) -> Vec<trust_types::GateExclusionReport> {
+    let mut exclusions = results.iter().filter_map(test_harness_exclusion_of).collect::<Vec<_>>();
+    exclusions.sort_by(|left, right| left.function.cmp(&right.function));
+    exclusions.dedup_by(|left, right| left.function == right.function);
+    exclusions
+}
+
+/// Trust (CB4): the exclusion a row stands for, when — and only when — it is
+/// the compiler's exact test-harness exclusion row, bound to a Cargo proof unit
+/// that builds a libtest harness.
+///
+/// Every condition is load-bearing and fails closed to `None` (the caller then
+/// counts the row as a genuine unknown):
+///
+/// * kind, solver, description and reason are exactly what the compiler mints
+///   (`trust_types::exclusion::is_exact_test_harness_exclusion_row`);
+/// * the outcome is the `skipped` wire value (read here as `Unknown`) — a row
+///   of this kind claiming proved, runtime-checked, failed or timed out is a
+///   defect;
+/// * it carries no counterexample, no time, and no claim evidence (the unit's
+///   runtime-check environment is tolerated: the compiler states it for every
+///   row alike and it says nothing about this row's claim);
+/// * `main` carries no location (it has none: rustc builds it at `DUMMY_SP`);
+/// * the row's Cargo proof unit compiles in a test-harness mode (`test`,
+///   `check-test`), read from the unit identity the transport stamped on it —
+///   so a `build`/`check` unit, a doctest, a build script or an unscoped raw
+///   compile cannot mint an exclusion.
+pub(crate) fn test_harness_exclusion_of(
+    result: &VerificationResult,
+) -> Option<trust_types::GateExclusionReport> {
+    use trust_types::exclusion::{
+        TEST_HARNESS_EXCLUSION_TAG, TestHarnessExclusionItem, is_exact_test_harness_exclusion_row,
+        parse_test_harness_exclusion_reason, test_harness_exclusion_admits_unit_mode,
+    };
+    if !is_exact_test_harness_exclusion_row(
+        &result.kind,
+        &result.backend,
+        &result.message,
+        result.reason.as_deref(),
+    ) || result.outcome != VerificationOutcome::Unknown
+        || result.counterexample.is_some()
+        || result.time_ms != Some(0)
+        || result.function.trim().is_empty()
+        || !structured_transport_evidence(result)
+            .is_none_or(|evidence| evidence.carries_only_envelope_facts())
+    {
+        return None;
+    }
+    let parsed = parse_test_harness_exclusion_reason(result.reason.as_deref()?)?;
+    if parsed.item == TestHarnessExclusionItem::HarnessMain && result.location.is_some() {
+        return None;
+    }
+    let mode = crate::test_target_panics::cargo_target_unit_mode(&result.function)?;
+    if !test_harness_exclusion_admits_unit_mode(&mode) {
+        return None;
+    }
+    Some(trust_types::GateExclusionReport {
+        function: result.function.clone(),
+        reason: TEST_HARNESS_EXCLUSION_TAG.to_string(),
+        item: parsed.item.tag().to_string(),
+        test_function: parsed.test_function,
+    })
+}
+
 fn is_exact_zero_obligation_inventory_row(result: &VerificationResult) -> bool {
     result.kind == "no_obligations"
         && result.message == "function has no panic obligations (trivially panic-free)"
@@ -1760,7 +2180,27 @@ fn is_exact_zero_obligation_inventory_row(result: &VerificationResult) -> bool {
         && result.location.is_none()
         && result.counterexample.is_none()
         && result.reason.as_deref() == Some("verified: zero panic obligations")
-        && structured_transport_evidence(result).is_none()
+        // NOT `is_none()`. The compiler stamps its runtime-check environment on
+        // the UNIT envelope and `transport_to_verification_result` binds it to
+        // every row, inventory rows included, so since that landed this row has
+        // always carried structured evidence and `is_none()` matched nothing.
+        // The consequence was not a lost elision but a failed gate: an unelided
+        // inventory row is a malformed lookalike, gets downgraded for want of a
+        // claim digest, and takes `Gate: PASS` with it — measured 2026-09-26,
+        // `targo trust check` on any program containing one trivially
+        // panic-free function returned `INCONCLUSIVE [strict lane, exit 1]`.
+        // See `zero_obligation_inventory_survives_a_stated_runtime_check_env`.
+        //
+        // What may be tolerated here is exactly what says NOTHING about this
+        // row's claim. `runtime_checks` is a per-unit environment fact the
+        // compiler states for every row alike, and the T9 `identity` is derived
+        // from the row's kind and position, not its claim. Every other
+        // structured field is
+        // claim evidence — an id, a digest, a typed kind, a mandate bit, native
+        // IR, proof evidence, a monitor — and a row bearing any of them is not
+        // inventory, whatever it calls itself. Those still fail closed.
+        && structured_transport_evidence(result)
+            .is_none_or(|evidence| evidence.carries_only_envelope_facts())
 }
 
 fn has_exact_compiler_claim_identity(result: &VerificationResult) -> bool {
@@ -1806,7 +2246,31 @@ fn elide_rows_proved_only_by(
     let mut counts = ElidedRowCounts::default();
     for (index, kept) in keep.iter().enumerate() {
         if !kept {
-            if demoted.get(index).copied().unwrap_or(false) {
+            use trust_types::determinism::{NotedStop, Reproducibility};
+            let row = &results[index];
+            let cause = crate::determinism_report::row_stop_cause(row);
+            let item = crate::determinism_report::row_stop_item(row);
+            if cause.reproducibility() != Reproducibility::Deterministic
+                || cause.is_solver_count()
+                || item.is_some()
+            {
+                counts.stops.push(PublicationStop {
+                    package: structured_transport_evidence(row)
+                        .and_then(|e| e.identity)
+                        .map(|identity| identity.package),
+                    stop: NotedStop {
+                        lane: "publication-alias-elision".into(),
+                        cause,
+                        item,
+                        count: 1,
+                    },
+                });
+            }
+            let withheld = demoted.get(index).copied().unwrap_or(false);
+            counts
+                .diagnostics
+                .push(ElidedPublicationDiagnostic::from_result(&results[index], withheld));
+            if withheld {
                 counts.demoted += 1;
             } else {
                 counts.other += 1;
@@ -1830,6 +2294,55 @@ fn elide_rows_proved_only_by(
     counts
 }
 
+/// Re-derive a full-verifier row's outcome from its native proof evidence, so a
+/// favorable label can never outrun the evidence behind it.
+///
+/// `Proved` is proof credit and is accepted ONLY when the native status is
+/// `Proved` — anything else is a laundered false PROVE and fails closed to
+/// `Unknown`. `Failed`/`Timeout` evidence statuses are preserved as the
+/// compiler stated them, with two exceptions: a row the compiler published
+/// `Timeout` stays a timeout over any status but `Failed` (a clock stop; see the
+/// arm), and a `Failed` status on a row the compiler reported `Unknown` stays
+/// `Unknown`.
+///
+/// Trust (2026-09-28): that last pair is the compiler WITHHOLDING a refutation.
+/// The native engine's status is its verdict on its own encoding, and the
+/// compiler decides whether that verdict is a refutation of the program. It
+/// withholds a solver model that chooses a value no execution produces, such as
+/// the unmodeled return of a same-crate callee (DQ D5-A) or a loop-carried state
+/// with no invariant (`trust_vcgen::GENERIC_REFUTATION_HELD_PREFIX`). Measured:
+/// `fn lower(x, y) -> u64 ensures result <= x { min2(x, y) }` is TRUE, and raw
+/// `trustc` reports its row `unknown` with "generic solver counterexample
+/// withheld". This function used to map every `Failed` status to `Failed`, so
+/// `targo trust check` printed `[FAILED]` and `Verdict: HAS VIOLATIONS` for a
+/// contract that holds. The row now stays `Unknown`. That is not proof credit:
+/// the gate still refuses an unknown row.
+///
+/// `RuntimeChecked` is NOT proof credit. It is the compiler's policy-B
+/// disposition (`docs/design/2026-07-25-completeness-gap-policy-ruling.md`):
+/// the solver could not decide, the runtime check rustc already emits stays in
+/// the binary, and the gate counts the row as CONDITIONAL — `conditional-pass`,
+/// never `pass`. It therefore cannot launder anything, and the compiler is the
+/// sole authority on which runtime checks the emitted binary carries. So a
+/// `RuntimeChecked` label is preserved across the "solver could not decide"
+/// statuses (`Unknown`/`Unsupported`/`Rejected`) and across a row with no
+/// evidence attached — PROVIDED the row is a real typed obligation
+/// ([`transport_row_can_carry_runtime_check`]); an untyped or
+/// `UnsupportedMir` row cannot say what is runtime-checked and stays `Unknown`.
+///
+/// Trust (2026-09-14): this function used to demote EVERY `RuntimeChecked`
+/// full-verifier row to `Unknown` — via the `Unsupported` arm when evidence was
+/// attached, and unconditionally when it was not. Measured on the ruling's own
+/// example, `fn main() { println!("hello"); }`: the compiler shipped
+/// `outcome=runtime_checked, proof_evidence.status=unsupported` for the
+/// `std::io::_print` absent-callee row (a runtime-checked gap with vanilla
+/// broken-pipe semantics, per the ruling's 2026-09-10 amendment), bare `trustc`
+/// built and ran it with exit 0, and `targo trust build` failed the SAME
+/// compile with `1 inconclusive` and no binary — because this demotion turned
+/// the row into `unknown` and the gate at `report.rs` requires
+/// `counts.unknown == 0`. targo's own `--help` states the intended rule ("on the
+/// default lane every obligation is proved or runtime-checked"); the code now
+/// matches it. `Proved`-without-evidence stays fail-closed exactly as before.
 fn normalize_transport_outcome(
     result: &trust_types::TransportObligationResult,
     parsed: VerificationOutcome,
@@ -1843,9 +2356,37 @@ fn normalize_transport_outcome(
             trust_types::TransportProofStatus::Proved if parsed == VerificationOutcome::Proved => {
                 VerificationOutcome::Proved
             }
+            // Determinism plan §3.7 (2026-10-01): a row the compiler published
+            // `timeout` is a CLOCK STOP — a later lane gave up on the function
+            // deadline before it decided the row or minted its authority — and
+            // it keeps that outcome over whatever its native evidence says: the
+            // `unsupported` of a bundle the deadline declined, the `unknown` of
+            // a row the bridge never reached, the `proved` of a row whose live
+            // mint the deadline refused. A timeout grants nothing, so it can
+            // launder nothing; re-deriving it from the evidence turned it back
+            // into the unexplained `unknown` the stamp exists to end, and kept
+            // it out of the function's `timed_out`. Only a refutation outranks
+            // it.
+            status
+                if parsed == VerificationOutcome::Timeout
+                    && status != trust_types::TransportProofStatus::Failed =>
+            {
+                VerificationOutcome::Timeout
+            }
             trust_types::TransportProofStatus::Proved => VerificationOutcome::Unknown,
+            trust_types::TransportProofStatus::Failed if parsed == VerificationOutcome::Unknown => {
+                VerificationOutcome::Unknown
+            }
             trust_types::TransportProofStatus::Failed => VerificationOutcome::Failed,
             trust_types::TransportProofStatus::Timeout => VerificationOutcome::Timeout,
+            trust_types::TransportProofStatus::Unknown
+            | trust_types::TransportProofStatus::Unsupported
+            | trust_types::TransportProofStatus::Rejected
+                if parsed == VerificationOutcome::RuntimeChecked
+                    && transport_row_can_carry_runtime_check(result) =>
+            {
+                VerificationOutcome::RuntimeChecked
+            }
             trust_types::TransportProofStatus::Unknown
             | trust_types::TransportProofStatus::Unsupported
             | trust_types::TransportProofStatus::Rejected => VerificationOutcome::Unknown,
@@ -1853,10 +2394,33 @@ fn normalize_transport_outcome(
         };
     }
 
+    // No evidence attached: `RuntimeChecked` is preserved on the same condition
+    // as above; an untyped or unsupported-MIR row still fails closed.
     match parsed {
+        VerificationOutcome::RuntimeChecked if transport_row_can_carry_runtime_check(result) => {
+            VerificationOutcome::RuntimeChecked
+        }
         VerificationOutcome::RuntimeChecked => VerificationOutcome::Unknown,
         other => other,
     }
+}
+
+/// Whether a full-verifier row is a real, typed obligation — the precondition for
+/// its `RuntimeChecked` label to survive [`normalize_transport_outcome`].
+///
+/// A runtime check is a claim about WHAT rustc left in the binary, so the row
+/// must say what that is: a transport that omitted the typed VC kind, or one
+/// classified `UnsupportedMir` (the compiler could not lower it, so no fallback
+/// can be vouched for), cannot carry runtime-check authority and stays
+/// `Unknown` — exactly the rule `report.rs`'s `unsupported_favorable` and
+/// `pipeline::tests::parse_compiler_stderr_keeps_unsupported_full_verifier_
+/// inconclusive` pin. The `std::io::_print` absent-callee row that motivated
+/// this passes: `typed_kind = Assertion`.
+fn transport_row_can_carry_runtime_check(result: &trust_types::TransportObligationResult) -> bool {
+    result
+        .typed_kind
+        .as_deref()
+        .is_some_and(|kind| !matches!(kind, trust_types::VcKind::UnsupportedMir { .. }))
 }
 
 fn normalized_transport_reason(
@@ -1880,6 +2444,11 @@ fn normalized_transport_reason(
     })
 }
 
+fn is_full_verifier_solver(solver: &str) -> bool {
+    let solver = solver.trim();
+    solver == "trust-full-verifier" || solver.contains("full-verifier")
+}
+
 #[cfg(test)]
 mod subsumption_tests {
     use trust_types::{BinOp, HardenedVcCategory, SourceSpan, Ty, VcKind};
@@ -1889,8 +2458,117 @@ mod subsumption_tests {
         VerificationResult, authenticated_zero_obligation_inventory,
         exact_structured_transport_vc_kind, normalize_authenticated_results_for_publication,
         structured_transport_evidence, structured_transport_vc_kind_is_authority_safe,
-        subsume_hardened_panic_twins, subsume_redundant_postcondition_markers,
+        subsume_hardened_panic_twins,
     };
+
+    #[test]
+    fn actual_selfuse_preserves_all_authored_source_rows() {
+        let frames: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/native_wp_selfuse_transport.json"))
+                .unwrap();
+        let mut rows = Vec::new();
+        for frame in frames {
+            let function = frame["function"].as_str().unwrap();
+            let package = frame["package_name"].as_str().unwrap();
+            let runtime_checks = serde_json::from_value(frame["runtime_checks"].clone()).unwrap();
+            let source = frame["source_sha256"].as_str().unwrap();
+            let ids = frame["stable_ids"].as_array().unwrap();
+            let transport: Vec<trust_types::TransportObligationResult> =
+                serde_json::from_value(frame["results"].clone()).unwrap();
+            assert_eq!(transport.len(), ids.len());
+            for (row, id) in transport.iter().zip(ids) {
+                let identity = trust_types::obligation_identity::ObligationIdentity {
+                    key: format!("{function}#{}", id.as_str().unwrap()),
+                    package: package.into(),
+                    function_source_sha256: Some(source.into()),
+                    expanded_function_identity: None,
+                };
+                rows.push(super::transport_to_verification_result(
+                    function,
+                    row,
+                    Some(runtime_checks),
+                    Some(identity),
+                ));
+            }
+        }
+        let ids = |rows: &[VerificationResult]| {
+            rows.iter()
+                .map(|row| structured_transport_evidence(row).unwrap().obligation_id.unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let original_ids = ids(&rows);
+        assert_eq!(rows.len(), 13);
+        let boundary = normalize_authenticated_results_for_publication(&mut rows, None);
+        assert_eq!(rows.len(), 13, "authored source claims are not diagnostic aliases");
+        assert_eq!(ids(&rows), original_ids);
+        assert_eq!(rows.iter().filter(|row| row.outcome == VerificationOutcome::Proved).count(), 3);
+        assert_eq!(
+            rows.iter().filter(|row| row.outcome == VerificationOutcome::RuntimeChecked).count(),
+            5
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.outcome == VerificationOutcome::Unknown).count(),
+            5
+        );
+        for row in &rows {
+            let evidence = structured_transport_evidence(row).unwrap();
+            let id = evidence.obligation_id.as_deref().unwrap();
+            if id.starts_with("obligation:") || id.contains("__wrong:postcondition:") {
+                assert_eq!(row.outcome, VerificationOutcome::Unknown, "{id}");
+            }
+            if row.outcome == VerificationOutcome::Proved {
+                assert!(id.starts_with("vc:"));
+                assert_eq!(
+                    evidence.proof_evidence.as_ref().unwrap().strength.as_ref().unwrap().assurance,
+                    trust_types::AssuranceLevel::Certified
+                );
+            }
+        }
+        assert_eq!(boundary.withheld_elided, 0);
+        assert_eq!(boundary.alias_elided, 0);
+        assert_eq!(boundary.withheld_relabelled, 3);
+        assert_eq!(boundary.published_favorable, 8);
+    }
+
+    #[test]
+    fn malformed_typed_source_row_survives_elision_and_future_relabel() {
+        let body = with_obligation_id(
+            result("identity", "postcond", "postcondition", VerificationOutcome::Proved, None),
+            "vc:identity:postcondition:0",
+        );
+        let malformed = with_obligation_id_and_typed_kind(
+            result(
+                "identity",
+                "assertion",
+                "assertion: postcondition",
+                VerificationOutcome::Unknown,
+                None,
+            ),
+            "obligation:identity:postcondition:0",
+            Some(VcKind::DivisionByZero),
+        );
+        assert!(exact_structured_transport_vc_kind(&malformed).is_err());
+
+        fn propose_second_row_as_proved(rows: &mut [VerificationResult]) {
+            rows[1].outcome = VerificationOutcome::Proved;
+        }
+        let mut rows = vec![body, malformed];
+        elide_rows_proved_only_by(&mut rows, propose_second_row_as_proved);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].outcome, VerificationOutcome::Unknown);
+
+        let mut future_internal_rewrite = vec![rows[1].clone()];
+        future_internal_rewrite[0].outcome = VerificationOutcome::Proved;
+        normalize_authenticated_results_for_publication(&mut future_internal_rewrite, None);
+        assert_eq!(future_internal_rewrite.len(), 1);
+        assert_eq!(future_internal_rewrite[0].outcome, VerificationOutcome::Unknown);
+        assert!(
+            future_internal_rewrite[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("inconsistent exact typed VC"))
+        );
+    }
 
     /// Trust (#220): the pre-#220 two-argument shape, so the existing elision
     /// tests below still read as assertions about the retain predicate and not
@@ -1993,6 +2671,153 @@ mod subsumption_tests {
         assert!(results.is_empty(), "inventory must not inflate logical proof totals");
     }
 
+    /// TINV step 2 (2026-10-05): both compact spellings of a type-invariant row drop
+    /// `ty` and `site`, so an untyped row must lose any favourable outcome.
+    #[test]
+    fn untyped_type_invariant_rows_are_downgraded() {
+        let tinv = trust_types::VcKind::TypeInvariant {
+            ty: "c::S".to_string(),
+            point: trust_types::TypeInvariantPoint::Call,
+            site: trust_types::TypeInvariantSite { block: 1, statement_index: 0 },
+            conjunct: 0,
+            ordinal: 0,
+            edge: None,
+        };
+        for kind in ["type_invariant:call", "type_invariant_call"] {
+            assert!(super::compact_vc_tag_requires_typed_kind(kind), "{kind}");
+            let transport = trust_types::TransportObligationResult {
+                assumes: Vec::new(),
+                obligation_id: None,
+                claim_digest_sha256: None,
+                original_vc_snapshot: None,
+                typed_kind: None,
+                kind: kind.to_string(),
+                description: tinv.description(),
+                location: None,
+                outcome: trust_types::Outcome::Proved,
+                solver: "ay".to_string(),
+                time_ms: 0,
+                counterexample: None,
+                counterexample_model: None,
+                reason: None,
+                design_mandate: false,
+                gap_class: None,
+                native_trust_ir: None,
+                proof_evidence: None,
+                monitor: None,
+                grade: None,
+            };
+            let row = super::transport_to_verification_result("c::f", &transport, None, None);
+            assert!(
+                matches!(row.outcome, VerificationOutcome::Unknown),
+                "{kind}: {:?}",
+                row.outcome
+            );
+            assert!(
+                row.reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("omitted the exact typed VC kind"),
+                "{kind}: {:?}",
+                row.reason
+            );
+        }
+        // With the exact typed kind, the compact tag is no defect.
+        let typed = trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            obligation_id: None,
+            claim_digest_sha256: None,
+            original_vc_snapshot: None,
+            typed_kind: Some(Box::new(tinv.clone())),
+            kind: tinv.transport_tag(),
+            description: tinv.description(),
+            location: None,
+            outcome: trust_types::Outcome::Proved,
+            solver: "ay".to_string(),
+            time_ms: 0,
+            counterexample: None,
+            counterexample_model: None,
+            reason: None,
+            design_mandate: false,
+            gap_class: None,
+            native_trust_ir: None,
+            proof_evidence: None,
+            monitor: None,
+            grade: None,
+        };
+        let row = super::transport_to_verification_result("c::f", &typed, None, None);
+        assert!(
+            !row.reason.as_deref().unwrap_or_default().contains("typed VC kind"),
+            "{:?}",
+            row.reason
+        );
+    }
+
+    /// REGRESSION (2026-09-26). The inventory row must still be elided once the
+    /// compiler states its runtime-check environment — the field is stamped on
+    /// the UNIT envelope and bound to every row, so after `f888a642ae6` the
+    /// `is_none()` test this replaced matched no real row at all. The visible
+    /// failure was not a miscount: the unelided row was downgraded for want of a
+    /// claim digest and `targo trust check` returned
+    /// `Gate: INCONCLUSIVE [strict lane, exit 1]` on any program with one
+    /// trivially panic-free function. Built through the real producers so the
+    /// writer and this reader cannot drift apart on the payload shape.
+    #[test]
+    fn zero_obligation_inventory_survives_a_stated_runtime_check_env() {
+        let transport = trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            obligation_id: None,
+            claim_digest_sha256: None,
+            original_vc_snapshot: None,
+            typed_kind: None,
+            kind: "no_obligations".to_string(),
+            description: "function has no panic obligations (trivially panic-free)".to_string(),
+            location: None,
+            outcome: trust_types::Outcome::Proved,
+            solver: "trust-structural".to_string(),
+            time_ms: 0,
+            counterexample: None,
+            counterexample_model: None,
+            reason: Some("verified: zero panic obligations".to_string()),
+            design_mandate: false,
+            gap_class: None,
+            native_trust_ir: None,
+            proof_evidence: None,
+            monitor: None,
+            grade: None,
+        };
+        let env = trust_types::RuntimeCheckEnv::new(true, true);
+        let mut results = vec![super::transport_to_verification_result(
+            "crate::empty",
+            &transport,
+            Some(env),
+            None,
+        )];
+        assert!(
+            !results[0].raw_line.is_empty(),
+            "the stated environment must actually reach the row, or this test proves nothing"
+        );
+
+        let boundary = normalize_authenticated_results_for_publication(&mut results, None);
+        assert!(results.is_empty(), "inventory must be elided, not downgraded into the gate");
+        assert_eq!(boundary.inventory_elided, 1);
+
+        // NEGATIVE CONTROL: the same row plus ONE claim field is not inventory.
+        let mut claimed = transport.clone();
+        claimed.claim_digest_sha256 = Some("c".repeat(64));
+        let mut results = vec![super::transport_to_verification_result(
+            "crate::empty",
+            &claimed,
+            Some(env),
+            None,
+        )];
+        let boundary = normalize_authenticated_results_for_publication(&mut results, None);
+        assert_eq!(
+            boundary.inventory_elided, 0,
+            "a row carrying claim evidence must not be elided as inventory"
+        );
+    }
+
     #[test]
     fn malformed_zero_obligation_lookalike_fails_closed() {
         let mut results = vec![VerificationResult {
@@ -2036,13 +2861,18 @@ mod subsumption_tests {
 
     fn with_typed_kind(mut result: VerificationResult, typed_kind: VcKind) -> VerificationResult {
         let evidence = StructuredTransportEvidence {
+            assumes: Vec::new(),
             obligation_id: None,
             claim_digest_sha256: None,
+            original_vc_snapshot: None,
             typed_kind: Some(Box::new(typed_kind)),
             design_mandate: false,
+            runtime_checks: None,
             native_trust_ir: None,
             proof_evidence: None,
             monitor: None,
+            identity: None,
+            grade: None,
         };
         result.raw_line = format!(
             "{STRUCTURED_TRANSPORT_EVIDENCE_PREFIX}{}",
@@ -2064,216 +2894,24 @@ mod subsumption_tests {
         typed_kind: Option<VcKind>,
     ) -> VerificationResult {
         let evidence = StructuredTransportEvidence {
+            assumes: Vec::new(),
             obligation_id: Some(obligation_id.to_string()),
             claim_digest_sha256: None,
+            original_vc_snapshot: None,
             typed_kind: typed_kind.map(Box::new),
             design_mandate: false,
+            runtime_checks: None,
             native_trust_ir: None,
             proof_evidence: None,
             monitor: None,
+            identity: None,
+            grade: None,
         };
         result.raw_line = format!(
             "{STRUCTURED_TRANSPORT_EVIDENCE_PREFIX}{}",
             serde_json::to_string(&evidence).unwrap()
         );
         result
-    }
-
-    // Build a postcondition row whose `raw_line` embeds the given obligation-id,
-    // mirroring how the transport parser stamps structured evidence onto a
-    // `VerificationResult` (`transport_to_verification_result`). The subsumption
-    // pass recovers the `obligation:`/`vc:` prefix from exactly this encoding.
-    fn postcondition_row(
-        function: &str,
-        obligation_id: &str,
-        outcome: VerificationOutcome,
-    ) -> VerificationResult {
-        with_obligation_id(
-            VerificationResult {
-                function: function.to_string(),
-                kind: "assertion".to_string(),
-                message: "assertion: postcondition".to_string(),
-                outcome,
-                backend: "trust-full-verifier".to_string(),
-                time_ms: Some(0),
-                location: None,
-                counterexample: None,
-                reason: None,
-                raw_line: String::new(),
-            },
-            obligation_id,
-        )
-    }
-
-    #[test]
-    fn ensures_marker_subsumed_when_body_vc_is_proved() {
-        let mut results = vec![
-            postcondition_row(
-                "identity",
-                "vc:identity:postcondition:0",
-                VerificationOutcome::Proved,
-            ),
-            postcondition_row(
-                "identity",
-                "obligation:identity:postcondition:0",
-                VerificationOutcome::Unknown,
-            ),
-        ];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(
-            matches!(results[1].outcome, VerificationOutcome::Proved),
-            "a valid #[ensures]'s def-site marker must be subsumed to Proved by its proved body-aware VC"
-        );
-        assert!(results[1].backend.starts_with("subsumed:"));
-        assert!(results[1].reason.as_deref().unwrap_or_default().contains("SUBSUMPTION"));
-        // The body-aware VC's own verdict is never altered.
-        assert!(matches!(results[0].outcome, VerificationOutcome::Proved));
-    }
-
-    #[test]
-    fn split_brain_typed_postcondition_marker_stays_visible_and_unknown() {
-        let body = postcondition_row(
-            "identity",
-            "vc:identity:postcondition:0",
-            VerificationOutcome::Proved,
-        );
-        let malformed_marker = with_obligation_id_and_typed_kind(
-            result(
-                "identity",
-                "assertion",
-                "assertion: postcondition",
-                VerificationOutcome::Unknown,
-                None,
-            ),
-            "obligation:identity:postcondition:0",
-            Some(VcKind::DivisionByZero),
-        );
-        assert!(exact_structured_transport_vc_kind(&malformed_marker).is_err());
-
-        let mut derived = vec![body.clone(), malformed_marker.clone()];
-        subsume_redundant_postcondition_markers(&mut derived);
-        assert!(matches!(derived[1].outcome, VerificationOutcome::Unknown));
-
-        // Even if a future alias derivation accidentally proposes Proved, the
-        // generic elision boundary must retain a malformed typed source row.
-        fn propose_second_row_as_proved(rows: &mut [VerificationResult]) {
-            rows[1].outcome = VerificationOutcome::Proved;
-        }
-        let mut publication = vec![body, malformed_marker];
-        elide_rows_proved_only_by(&mut publication, propose_second_row_as_proved);
-        assert_eq!(publication.len(), 2);
-        assert!(matches!(publication[1].outcome, VerificationOutcome::Unknown));
-
-        let mut future_internal_rewrite = vec![publication[1].clone()];
-        future_internal_rewrite[0].outcome = VerificationOutcome::Proved;
-        normalize_authenticated_results_for_publication(&mut future_internal_rewrite, None);
-        assert_eq!(future_internal_rewrite.len(), 1);
-        assert!(matches!(future_internal_rewrite[0].outcome, VerificationOutcome::Unknown));
-        assert!(
-            future_internal_rewrite[0]
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("inconsistent exact typed VC"))
-        );
-    }
-
-    #[test]
-    fn exact_wrong_kind_cannot_claim_a_postcondition_binding() {
-        let body = postcondition_row(
-            "identity",
-            "vc:identity:postcondition:0",
-            VerificationOutcome::Proved,
-        );
-        let wrong_marker = with_obligation_id_and_typed_kind(
-            result("identity", "divzero", "division by zero", VerificationOutcome::Unknown, None),
-            "obligation:identity:postcondition:0",
-            Some(VcKind::DivisionByZero),
-        );
-        assert_eq!(
-            exact_structured_transport_vc_kind(&wrong_marker),
-            Ok(Some(VcKind::DivisionByZero))
-        );
-
-        let mut results = vec![body, wrong_marker];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(matches!(results[1].outcome, VerificationOutcome::Unknown));
-        elide_rows_proved_only_by(&mut results, subsume_redundant_postcondition_markers);
-        assert_eq!(results.len(), 2);
-        assert!(matches!(results[1].outcome, VerificationOutcome::Unknown));
-    }
-
-    #[test]
-    fn ensures_marker_stays_unknown_when_a_body_vc_failed() {
-        // The decisive soundness case (the `nondecreasing` reproduction): a
-        // function with a FAILED body-aware postcondition VC must never have its
-        // marker flipped — a genuinely-violated #[ensures] never reads Verified.
-        let mut results = vec![
-            postcondition_row("f", "vc:f:postcondition:0", VerificationOutcome::Failed),
-            postcondition_row("f", "obligation:f:postcondition:0", VerificationOutcome::Unknown),
-        ];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(
-            matches!(results[1].outcome, VerificationOutcome::Unknown),
-            "the marker must stay Unknown when any body-aware postcondition VC failed"
-        );
-    }
-
-    #[test]
-    fn proved_postcondition_vc_subsumes_only_its_exact_index_marker() {
-        // Two #[ensures] markers belong to the same function, but only #0 has a
-        // body-aware proof. Function-level aggregation would incorrectly flip
-        // both markers; exact suffix binding must leave #1 Unknown.
-        let mut results = vec![
-            postcondition_row("f", "vc:f:postcondition:0", VerificationOutcome::Proved),
-            postcondition_row("f", "obligation:f:postcondition:0", VerificationOutcome::Unknown),
-            postcondition_row("f", "obligation:f:postcondition:1", VerificationOutcome::Unknown),
-        ];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(matches!(results[1].outcome, VerificationOutcome::Proved));
-        assert!(
-            matches!(results[2].outcome, VerificationOutcome::Unknown),
-            "a proof for postcondition #0 must never discharge marker #1"
-        );
-    }
-
-    #[test]
-    fn duplicate_postcondition_marker_is_ambiguous_and_not_subsumed() {
-        let mut results = vec![
-            postcondition_row("f", "vc:f:postcondition:0", VerificationOutcome::Proved),
-            postcondition_row("f", "obligation:f:postcondition:0", VerificationOutcome::Unknown),
-            postcondition_row("f", "obligation:f:postcondition:0", VerificationOutcome::Unknown),
-        ];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(
-            results[1..]
-                .iter()
-                .all(|result| matches!(result.outcome, VerificationOutcome::Unknown))
-        );
-    }
-
-    #[test]
-    fn ensures_marker_stays_unknown_when_a_body_vc_is_inconclusive() {
-        // An UNKNOWN (not failed) body-aware VC also blocks subsumption — the
-        // postcondition is not fully established, so the marker stays honest.
-        let mut results = vec![
-            postcondition_row("g", "vc:g:postcondition:1", VerificationOutcome::Unknown),
-            postcondition_row("g", "obligation:g:postcondition:0", VerificationOutcome::Unknown),
-        ];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(matches!(results[1].outcome, VerificationOutcome::Unknown));
-    }
-
-    #[test]
-    fn ensures_marker_not_touched_without_any_body_vc() {
-        // A marker with no body-aware postcondition VC at all is never flipped
-        // (nothing established it) — it cannot be conjured Proved out of thin air.
-        let mut results = vec![postcondition_row(
-            "h",
-            "obligation:h:postcondition:0",
-            VerificationOutcome::Unknown,
-        )];
-        subsume_redundant_postcondition_markers(&mut results);
-        assert!(matches!(results[0].outcome, VerificationOutcome::Unknown));
     }
 
     #[test]
@@ -2909,9 +3547,4 @@ mod subsumption_tests {
         subsume_hardened_panic_twins(&mut results);
         assert!(matches!(results[1].outcome, VerificationOutcome::Unknown));
     }
-}
-
-fn is_full_verifier_solver(solver: &str) -> bool {
-    let solver = solver.trim();
-    solver == "trust-full-verifier" || solver.contains("full-verifier")
 }

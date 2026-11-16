@@ -4,7 +4,6 @@ use std::process::Command;
 use std::sync::Arc;
 
 use build_helper::npm;
-use build_helper::util::try_run;
 use compiletest::rustdoc_gui_test::RustdocGuiTestProps;
 use config::Config;
 
@@ -41,6 +40,8 @@ fn main() -> Result<(), ()> {
                 .env("RUSTDOC", &config.rustdoc)
                 .env("RUSTC", &config.rustc)
                 .current_dir(path);
+            // Trust: document the upstream fixtures without verifying them.
+            compiletest::rustdoc_gui_test::isolate_fixture_build(&mut cargo);
 
             if let Some(librs) = find_librs(entry.path()) {
                 let test_props = RustdocGuiTestProps::from_file(&librs);
@@ -92,4 +93,27 @@ fn main() -> Result<(), ()> {
     command.args(&config.test_args);
 
     try_run(&mut command, config.verbose)
+}
+
+fn fail(s: &str) -> ! {
+    eprintln!("\n\n{s}\n\n");
+    std::process::exit(1);
+}
+
+fn try_run(cmd: &mut Command, print_cmd_on_fail: bool) -> Result<(), ()> {
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(e) => fail(&format!("failed to execute command: {cmd:?}\nerror: {e}")),
+    };
+    if !status.success() {
+        if print_cmd_on_fail {
+            println!(
+                "\n\ncommand did not execute successfully: {cmd:?}\n\
+                 expected success, got: {status}\n\n"
+            );
+        }
+        Err(())
+    } else {
+        Ok(())
+    }
 }

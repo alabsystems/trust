@@ -4,4 +4,4 @@ expression: test src/tools/targo
 ---
 [Test] test::Cargo
     targets: [x86_64-unknown-linux-gnu]
-    - Set({test::src/tools/targo})
+    - Set({src/tools/targo})

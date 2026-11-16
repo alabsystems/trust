@@ -1,0 +1,42 @@
+{
+  "id": "instance-walk-generic-edge",
+  "class": "INSTANCE-WALK-1",
+  "title": "an #[trust::assume_total] skip was kept although a local generic instance calls a verify-off dependency's impl",
+  "origin": [
+    "trust da8ff46046 (INSTANCE-WALK-1, landed on origin/main 2026-10-14)",
+    "tests/ui/trust/unverified_edge_generic_instance.rs revision u32impl, unverified_edge_generic_instance_controls.rs t_generic",
+    "FIXED on trust origin/main by da8ff46046, after the store 9192 seal; the known-open marker is retired, so the store toolchain's proof is a FALSE-PROVED like every other store-era false proof that main has fixed"
+  ],
+  "lang": "rust",
+  "edition": "2024",
+  "source": "src.rs",
+  "aux": [
+    {
+      "crate": "unverified_edge_instance_dep",
+      "file": "dep.rs"
+    }
+  ],
+  "reproducer": {
+    "function": "t",
+    "mode": "assumption-kept",
+    "claim": "t's #[trust::assume_total] skip is kept (its rows are the assumption alone) and no revocation is emitted"
+  },
+  "twin": {
+    "function": "t_generic",
+    "mode": "assumption-kept",
+    "source": "twin.rs"
+  },
+  "witness": {
+    "main": "witness.rs",
+    "input": "(none)",
+    "observed": "calling t()",
+    "exit": -11,
+    "note": "exit -11 is SIGSEGV: the dependency's impl writes through null"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "reproducer": "not-proved",
+      "twin": "not-in-fragment"
+    }
+  }
+}

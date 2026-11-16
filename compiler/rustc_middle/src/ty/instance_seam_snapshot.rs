@@ -1,0 +1,54 @@
+//! Trust: independent raw built-MIR snapshot custody for the explicit D17 TEST-ORACLE.
+//! No ordinary production snapshot, flip candidate, codegen body or proof authority.
+
+use rustc_data_structures::fx::FxHashMap;
+use rustc_span::def_id::LocalDefId;
+
+use crate::ty::TyCtxt;
+
+#[derive(Default)]
+pub(super) struct InstanceSeamSnapshots<'tcx> {
+    siblings: FxHashMap<LocalDefId, Option<&'tcx crate::mir::Body<'tcx>>>,
+}
+
+impl<'tcx> TyCtxt<'tcx> {
+    /// Trust: diagnostic snapshot, never a codegen or flip authority. The flag-off path does
+    /// not clone or allocate a body. Retention precedes any lowering/comparison eligibility.
+    pub fn trust_instance_seam_retain(self, def: LocalDefId, built: &crate::mir::Body<'tcx>) {
+        if !self.sess.opts.unstable_opts.trust_ir_instance_seam_test {
+            return;
+        }
+        let mut table = self.trust_instance_seam_siblings.lock();
+        trust_record_instance_seam_snapshot(&mut table.siblings, def, || {
+            self.arena.alloc(built.clone())
+        });
+    }
+
+    /// Trust: missing and duplicate-poisoned entries both refuse the test oracle.
+    pub fn trust_instance_seam_sibling(
+        self,
+        def: LocalDefId,
+    ) -> Option<&'tcx crate::mir::Body<'tcx>> {
+        self.trust_instance_seam_siblings.lock().siblings.get(&def).copied().flatten()
+    }
+}
+
+// Trust: insertion shared by the real snapshot table and its duplicate-poison regression.
+fn trust_record_instance_seam_snapshot<K: std::hash::Hash + Eq, V>(
+    table: &mut FxHashMap<K, Option<V>>,
+    key: K,
+    snapshot: impl FnOnce() -> V,
+) {
+    match table.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(snapshot()));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "instance_seam_snapshot/tests.rs"]
+mod trust_instance_seam_tests;

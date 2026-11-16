@@ -23,25 +23,69 @@ records, per function, whether E6 **admitted** it (and as which shape) and
 whether an `ensures` **discharged** by uncited definitional equality or a cited
 theorem.
 
-## The matrix, as of 2026-08-26
+## The matrix, as of 2026-09-18
 
-**44 of 82 probes discharge.** The checked-in `probe-expect` headers are the
+**52 of 114 probes discharge.** The checked-in `probe-expect` headers are the
 ratchet; `run.py` must report zero deviations for the compiler being measured.
 
 | verdict | n | meaning |
 |---|---|---|
-| `discharged` | 44 | the kernel closed the clause by defeq or a cited theorem |
-| `clause-outside-fragment` | 21 | the clause never reached the kernel |
-| `unproved` | 8 | no defeq attempt reached; obligations left unproved |
-| `defeq-rejected` | 6 | the kernel checked a constructed `Eq.refl` and refused it |
+| `discharged` | 52 | the kernel closed the clause by defeq or a cited theorem |
+| `clause-outside-fragment` | 42 | the clause never reached the kernel |
+| `unproved` | 9 | no defeq attempt reached; obligations left unproved |
+| `defeq-rejected` | 8 | the kernel checked a constructed `Eq.refl` and refused it |
 | `island-only` | 2 | the island kernel-checked; the probe has no clause to discharge |
 | `other` | 1 | a native refutation; see `f53` |
 
 The counts above are the CHECKED-IN EXPECTATIONS, and the table had drifted from
 them badly before 2026-08-26 (it read "25 of 57" while the corpus held 73 probes
-of which 35 discharged). It is now re-derived from `matrix.json` rather than
-edited by hand, and the `d*` probes — 16 of the 82 — are counted, which the old
-number did not do.
+of which 35 discharged). It is re-derived from `matrix.json` rather than edited
+by hand, and the `d*` probes — 16 of the 114 — are counted, which the old number
+did not do. The 2026-09-18 revision is the ref-self I1 block `f68`–`f88`: three
+positives (`f68`, `f85`, `f88`) plus the by-value control `f69`, and eighteen
+negatives.
+
+**ONE DEVIATION IS LIVE AND IS NOT THIS BLOCK'S:** `g03_compare_to_bool.rs`
+expects `clause-outside-fragment` and reports `defeq-rejected`. It reproduces on
+a compiler built from the branch base, so it predates the ref-self work and
+wants its own lane.
+
+**SIX MORE DEVIATE AS OF 2026-11-05, AND NONE OF THEM IS E9-RESULT-CARRIER-1's:**
+`f54`, `f57`, `f60` and `f65` expect `discharged`, and `g01` and `g02` expect
+`unproved`; all six report `clause-outside-fragment`. They deviate the same way
+on a stage-1 compiler from `6c60b1c822` (before that fix) and on one built with
+it. Each is refused at `elaborate_ensures`' self-admission gate ("requires the
+specified function ... to be E6-admitted ...; it is not") before any clause
+atom is typed, and each body holds a cast, an `i128::from` call or a shift that
+E6 admission does not take. They want their own lane.
+
+**The 2026-09-20 block is `f95`–`f97`, and it is the first block here whose
+interesting variable is the ABSENCE of `probe-flags: -O`.** `TrustVerify` is the
+last pass of the optimization pipeline, so `mir-opt-level` (1 without `-O`, 2
+with it) decides which MIR the E6 recognizers read. `f95`/`f96` are `f45`/`f46`'s
+`&&`/`||` lane with the flag removed, and `f97` is their close negative (the
+second leaf's operands swapped in the island model). Until `bool_binary_arm`
+admitted the un-coalesced arm these three reported `clause-outside-fragment`,
+which is exactly the bug: the shape was unreachable through `targo trust check
+FILE.rs`, the single-file lane, which reaches the recognizer at `mir-opt-level
+1` (measured on `379912412`: `Gate: FAIL [strict lane, exit 1]`). **Run this
+matrix on a compiler built from the change** — on an older `trustc` `f95`/`f96`
+deviate to `clause-outside-fragment` and `f97` deviates there too (it is red
+either way, but for the wrong reason).
+
+**The 2026-11-05 block is `f98`–`f100`: a cited `ensures result == spec(..)`
+whose result carrier is not the carrier its parameters share.** `f98` is aterm's
+`relay_live::cursor` (four `bool`s in, a `u8` out) and `f100` the same bug at two
+machine widths (`u8` in, `u16` out); both measure `unproved` on Trust build 16387,
+whose goal builder typed the relation by the clause's variables and built `Eq Bool`
+(or `Eq UInt8`) over the result-carrier calls, a goal the kernel refuses
+(E9-RESULT-CARRIER-1 in `docs/DECISION_QUEUE.md`). `f99` is `f98`'s close
+negative: the body's codes swapped and a true theorem about something else cited.
+It is red on 16387 because the goal does not typecheck, and must stay red with
+the goal well-typed, because the cited statement is not the goal. On a stage-1
+compiler built from the fix, `f98` and `f100` discharge and `f99` stays
+`unproved`: its goal is `@Eq UInt8 (trust_import_probe__cursor ..) (spec_cursor ..)`
+and the citation is refused because the theorem states something else.
 
 ## Both surfaces, or half a measurement
 
@@ -234,14 +278,41 @@ compiler speaks.
 as if it were a proposition, and stays refused; only an admission that recorded
 `Domain::Bool` reads as `f(a, b) = true`. The island lane records a domain only
 for a literal `Bool` codomain, because the Clean-type-to-`Domain` map is not
-injective — `BitVec 64` is the carrier of both `i64` and `usize`. `f30` is the
+injective — `BitVec 64` is the carrier of both `i64` and `Domain::USize`. (That
+`Domain` is the STATEMENT-ONLY spelling, used by runtime monitors and the
+zero-authority denotation rows. A Rust `usize` clause binder in the E9 DISCHARGE
+lanes is resolved to the target's fixed-width name first, so on a 64-bit target
+it binds at `UInt64`, the carrier its E6 import carries — see `f15` and its
+close negative twin `f67`.) `f30` is the
 matching net on the other side: `bool` has no ORDER, so a decided bool-valued
 operand under `<=` stays outside the fragment.
 
 **6. A dotted path may name a PARAMETER's field and nothing else.** Four
-negatives hold the line, and each names a different reason. `f39` is a `&Cst`
-parameter: the MIR read carries a `Deref`, and the pointee is not provably
-unchanged between entry and exit, so `ensures` has no reading for it. `f40` is
+negatives held the line, and each names a different reason. **`f39` no longer
+does, and what replaced it is the ref-self I1 increment (2026-09-18).** It was a
+`&Cst` parameter, refused because the MIR read carries a `Deref` and the pointee
+is not provably unchanged between entry and exit. The E6 PARAMETER VIEW
+(`trust_types::e6_param_view`) supplies that entry == exit premise — as an
+ASSUMPTION, owner ruling R1, not as a proof — and presents the recognizer a
+borrow-erased copy in which the pointee's scalar fields are by-value parameters,
+so no `Deref` reaches it. `f39` therefore flips to `discharged`, at a grade BELOW
+`Certified`: `Trusted`/`Constructive` with the marker `frozen-shared-erased`
+disclosed on the spec-clean row, the JSON wire row and the human note, and
+withheld by the authenticated `targo trust` lane. `docs/TCB.md` carries the
+assumption as its own row and
+`docs/design-notes/2026-09-18-e6-parameter-view-ruling.md` records the ruling.
+The flip is MEASURED on a stage-1 compiler carrying the increment. Reversing a
+recorded deliberate negative is listed as owner ruling R3 in the rulings note,
+separate from accepting R1; the capability and the flip are the same fact, and
+what licenses it is R1's own second half — below-`Certified` with a disclosed
+marker — given with the acceptance. The sibling record that flipped with it is
+`tests/ui/trust/e9_field_projection_fail_closed.rs`'s `via_reference`. The line
+`f39` used to hold is now held by `f70` (`&mut self`), `f71` (a `Cell` field),
+`f72` (an atomic field), `f74`–`f79`, `f81`–`f84` and `f86`, and `f73` pins the
+kernel-level half: the clause names `self.y`, the body reads `self.x`, and the
+row must be `defeq-rejected`, never `discharged`. `f84`/`f85` are the `Freeze`
+differential: `&UnsafeCell<u32>` and `&Boxed` declare the identical field
+`value: u32`, and only the first is refused. `f40` is
 ALL-OR-NOTHING per struct — one non-scalar field refuses the whole parameter,
 because the clause-side flattening (HIR types) and the mint-side flattening
 (extracted-IR types) are two independent computations of one list, and a
@@ -271,12 +342,106 @@ so the veripb kernel can cite the lower bound of its `i64` guard (`i64::MIN` at
 128 bits is `2^128 - 2^63`) and cannot cite the upper one (`i64::MAX` is
 `9223372036854775807`).
 
+**6a (correction, 2026-09-17 — the original text above is left as written).**
+Finding 6's account of `f40` is WRONG about which side filters, and the error
+matters because it was the argument for a soundness property. Measured at
+source: the clause side, `trust_param_scalar_rows`, **SKIPS** a field it cannot
+type and keeps the scalar siblings' rows (its `continue`, landed because one
+non-scalar field — `Term`'s `lit: Lit` — was suppressing `result.coeff <=
+degree`). Only the mint side, `clean_island::param_flat_rows`, is still
+all-or-nothing (`collect::<Option<Vec<_>>>()`). So `f40` is red because the MINT
+refuses the parameter, not because both sides do, and "with no filter there is
+nothing to disagree about" is not the invariant that holds. The invariant that
+does hold is weaker and still sufficient: a residual disagreement changes the
+ARITY (ill-typed goal, `reject_untyped_goal` refuses it) or the NAMES
+(`Admission::param_names` compares by exact list equality in
+`elaborate_ensures`, which is what catches a same-length REORDERING). Both
+source comments that made the original claim are corrected in place.
+
+**6b (2026-09-17, I0 — a different way a dotted path's absence bites).** Because
+a by-value struct parameter contributes `c.degree`/`c.coeff` and **no bare
+`c`**, the bare name was free for a same-named ADMITTED ITEM to answer, and the
+clause then said "the parameter" while the certified goal was about the item.
+Measured certifying on a compiler built from this tree, for a program function
+(`fn limit() -> u64 { 80 }` beside `fn cap(limit: C) -> u64 ensures limit ==
+eighty`) and for a const generic (`fn pick<const N: usize>() ensures result == N`
+beside `clean { def N … }`). Both are refused now; see
+`tests/ui/trust/e9_signature_name_never_binds_an_admitted_item.rs` and
+`docs/design-notes/2026-09-17-clause-name-capture-and-ref-self-rulings.md`.
+
+**6c (2026-09-19, I2 — the all-or-nothing rule for FROZEN SHARED POINTEES is
+reversed; the text above and 6a are left as written).** Disposition R4 —
+IMPLEMENTER-PROPOSED, not an owner ruling (there is no R4 ruling text in the
+tree; `docs/design-notes/2026-09-18-e6-parameter-view-ruling.md` §9 records the
+proposal and `…2026-09-17-…` §3 still correctly lists R4 undecided).
+*(2026-09-27: R4 has since been RATIFIED, owner-delegated, with its price
+accepted; the ruling is in that note's §9a. The sentence above is the
+2026-09-19 record.)* A
+declared field outside the view vocabulary is now SKIPPED and its scalar
+siblings still get rows, so `f80` (`Cursor { row, limit, cells: Vec<u8> }`) and
+`f86` (`Ratio { num, scale: f64 }`) flip from `clause-outside-fragment` to
+`discharged`. **By-value struct parameters are untouched and `f40` stays red** —
+the mint's own flattening really is all-or-nothing, and I2 does not go near it.
+(Finding 6's own sentence listing the probes that hold `f39`'s line is therefore
+stale in one entry: `f86` is no longer among them. `f70`, `f71`, `f72`,
+`f74`–`f79`, `f81`–`f84` still are, joined by `f89`–`f92`.)
+
+Why the reversal is not a weakening, given 6a already corrected what the
+invariant is. The mint-side all-or-nothing that D-REF-8 was written for,
+`clean_island::param_flat_rows`, NEVER SEES A BORROW on this lane: the mint runs
+on the VIEW's body, whose parameters are already by-value scalars, so it takes
+its per-local `ty_to_domain` arm. There is ONE filter — the compiler's
+`trust_frozen_shared_param_scan` — and `trust_types::e6_param_view` does not
+filter at all: it VERIFIES each listed row against the extracted IR (declared
+index, field name, carrier) and refuses the WHOLE view on any disagreement. A
+field the table did not list is never inspected, so however the extractor
+lowered it — opaquely, compacted, by name — is irrelevant.
+
+**That per-row check is the ONLY net, and the count is worth getting right**
+because an earlier draft of this finding claimed two. `Admission::param_names`'
+exact-list comparison in `elaborate_ensures` does not stand behind it here:
+both of its lists descend from this same signature table (the clause side via
+`trust_fn_param_type_names`, the minted side via `e6_param_view`'s
+`param_names`, built from `pointee.rows` rather than from the extracted field
+names), so sorting this scan's rows by name instead of declared order would
+move both together and only the per-row name check would notice. That
+comparison is real defence on the BY-VALUE lane, where `param_flat_rows`
+re-derives the list from the extracted IR.
+
+A skipped field is UNNAMEABLE, not defaulted, and that is the half worth
+probing: `f90` pins that a clause naming one is an unbound variable, and `f89`
+that a body READING one loses the whole view (`read_place` admits
+`[Deref, Field(k)]` only for a listed `k`). `f93` pins the index mapping across a
+skip in the MIDDLE of the declaration order, where an off-by-one would mint a
+well-typed FALSE equation the kernel would re-check happily.
+
+**What the reversal costs, and it is the thing to remember about this finding:**
+`Cell<u32>` and `AtomicU32` are ADTs outside the vocabulary, so D-REF-8 was a
+SECOND net refusing a pointee with interior mutability in a sibling field. From
+I2 that net is gone by construction, and `Ty::is_freeze` (C2) with the
+structural walk K2 behind it is the only thing holding `f71`, `f91` and `f84`.
+Neither is kernel-checked. `docs/TCB.md`'s `EnsuresCitationViewDischarge` row
+says so, and the mutation control WAS RUN on 2026-09-19 in both directions: with
+`is_freeze` and K2 both stubbed out of `trust_frozen_shared_param_scan` and
+stage 1 rebuilt, `f71`, `f91` AND `f84` all go `discharged` while the `Freeze`
+twin `f85` is unchanged; restoring both guards returns all three to
+`clause-outside-fragment`. So nothing stands behind C2/K2 for these shapes. The same is true of C2's generic arm: `f92` is refused
+only because `Freeze` for an uninstantiated `T` is undecidable here, with `f88`
+as the instantiated positive control.
+
 One authoring fact, measured while writing `f38` and worth stating out loud
 because it is not about fields at all: the CITED lane installs no
 island-definition facets (only the uncited defeq lane does), so
 `isl(c.degree) <= c.degree by thm` is refused with "no diagnostic E6 facet
 record exists". The citation spelling that works is the client's own — mention
 `result`, and state the theorem over the value the E6 import unfolds to.
+
+**Correction to that authoring fact (2026-09-17).** It is no longer true:
+commit `5fe27c790df` gave the CITED lane the same island admission as the
+uncited one, through the shared seam `admit_clause_island_definitions`, so
+`isl(c.degree) <= c.degree by thm` is admitted and judged rather than refused
+for want of a facet record. The `result`-mentioning spelling still works; it is
+no longer the only one.
 
 `d12` separately pins item 10 phase 1: a stateful island suffix may name the
 compiler-minted `trust_import_*` function and is checked after the matching

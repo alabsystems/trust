@@ -1,6 +1,6 @@
 //@ run-pass
 //@ dont-check-compiler-stderr
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off -Astatic_mut_refs
 //! Trust (wave-ARF): a THIN RAW-POINTER field of a struct literal is admissible
 //! when its pointer STRICTLY OUTLIVES the call — and only then.
 //!

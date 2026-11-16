@@ -1,0 +1,6 @@
+{
+  "type": "alethe_certificate",
+  "version": "1.0",
+  "problem": "(set-logic ALL)\n(declare-fun and (Bool Int) Bool)\n(assert (and false 0))\n(check-sat)\n",
+  "proof": "(assume a0 (and false 0))\n(step t1 (cl false) :rule and :premises (a0) :args (0))\n(step t2 (cl (not false)) :rule false)\n(step t3 (cl) :rule resolution :premises (t1 t2))\n"
+}

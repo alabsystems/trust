@@ -5,12 +5,11 @@ use rustc_ast::{AttrVec, Attribute, CleanIslandDecl, Inline, Item, ModSpans};
 use rustc_attr_parsing::template;
 use rustc_attr_parsing::validate_attr::emit_malformed_attribute;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Diag, ErrorGuaranteed};
+use rustc_errors::{Diag, ErrorGuaranteed, FatalError};
 use rustc_parse::lexer::StripTokens;
 use rustc_parse::{exp, new_parser_from_file, trust_parse_clean_unit_decls, unwrap_or_emit_fatal};
 use rustc_session::Session;
 use rustc_session::parse::ParseSess;
-use rustc_span::fatal_error::FatalError;
 use rustc_span::{Ident, Span, Symbol, sym};
 use thin_vec::ThinVec;
 
@@ -337,7 +336,44 @@ pub(crate) fn load_clean_unit(
                     Some(relative) => format!("{}{}", relative.name, path::MAIN_SEPARATOR),
                     None => String::new(),
                 };
-                module.dir_path.join(format!("{}{}.clean", relative_prefix, ident.name))
+                // Trust (G2, 2026-09-13): a unit is Lean source, and Lean source
+                // is spelled `.lean`. Both `name.lean` and `name.clean` name the
+                // same unit; exactly one may exist. Ambiguity is refused with
+                // options (ruling v7/D3) rather than resolved by a preference
+                // order that would let a stale twin shadow the edited file.
+                let lean = module.dir_path.join(format!("{}{}.lean", relative_prefix, ident.name));
+                let clean =
+                    module.dir_path.join(format!("{}{}.clean", relative_prefix, ident.name));
+                let source_map = sess.psess.source_map();
+                match (source_map.file_exists(&lean), source_map.file_exists(&clean)) {
+                    (true, true) => {
+                        sess.dcx()
+                            .struct_span_err(
+                                span,
+                                format!(
+                                    "the out-of-line Clean unit `{ident}` is spelled twice on \
+                                     disk: both `{}` and `{}` exist",
+                                    lean.display(),
+                                    clean.display()
+                                ),
+                            )
+                            .with_note(
+                                "`clean mod …;` accepts either spelling for ONE unit; with both \
+                                 present, no preference order could say which text is the \
+                                 authored one",
+                            )
+                            .with_help(
+                                "options: delete one of the two files; or name the intended one \
+                                 explicitly with `#[path = \"…\"]` on this item",
+                            )
+                            .emit();
+                        return empty();
+                    }
+                    (true, false) => lean,
+                    // `.clean` when it exists, and also when NEITHER exists: the
+                    // not-found refusal below then names both candidates.
+                    (false, _) => clean,
+                }
             }
             DirOwnership::UnownedViaBlock => {
                 // The mod-in-block rule, applied unchanged (ruling v7/D3:
@@ -385,7 +421,8 @@ pub(crate) fn load_clean_unit(
         sess.dcx()
             .struct_span_err(span, format!("file not found for out-of-line Clean unit `{ident}`"))
             .with_note(format!(
-                "`clean mod {ident};` loads Clean (Lean) source from `{}`, which does not exist",
+                "`clean mod {ident};` loads Clean (Lean) source from `{}` (or the same path \
+                 spelled `.lean`), which does not exist",
                 file_path.display()
             ))
             .with_help(
@@ -463,7 +500,7 @@ impl ModError<'_> {
                     secondary_path: secondary_path.display().to_string(),
                 })
             }
-            ModError::ParserError(err) => err.emit(),
+            ModError::ParserError(err) => err.emit_err(),
         }
     }
 }

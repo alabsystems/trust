@@ -13,7 +13,9 @@
 //
 // Requirements: ay binary discoverable by the integration-test ay helper
 //               (tests skip gracefully if absent).
-//               MIR fixtures in fixtures/real_mir/ (tests skip if absent).
+//               checked-in MIR fixtures in fixtures/real_mir/ (REQUIRED: a
+//               missing or unparseable fixture fails the test, and fixtures
+//               load BEFORE the ay skip — NO-VACUOUS-CORPUS-TEST).
 //
 // Issue: #937 | Epic: #935
 //
@@ -24,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use trust_integration_tests::ay_test_support::{ay_available, require_ay};
+use trust_integration_tests::ay_test_support::require_ay;
 use trust_router::{MirRouter, MirRouterConfig, Router, VerificationBackend, build_v1_vcs};
 use trust_types::*;
 
@@ -37,43 +39,86 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures").join("real_mir")
 }
 
-/// Load a single VerifiableFunction from a JSON fixture file.
-///
-/// Returns None if the fixture does not exist (tests skip gracefully).
-fn load_fixture(name: &str) -> Option<VerifiableFunction> {
+/// Load a REQUIRED VerifiableFunction from a checked-in JSON fixture file.
+/// Panics, naming the path, on a missing, unreadable or unparseable file.
+fn load_fixture(name: &str) -> VerifiableFunction {
     let path = fixtures_dir().join(format!("{name}.json"));
-    if !path.exists() {
-        return None;
-    }
     let json = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
-    let func: VerifiableFunction = serde_json::from_str(&json)
-        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e}", path.display()));
-    Some(func)
+    serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e}", path.display()))
 }
 
-/// Load all JSON fixtures from the fixtures directory.
+/// Load every checked-in `test_functions__*.json` fixture (this excludes
+/// `coverage_manifest.json`). Panics on an unreadable directory or entry, on an
+/// unparseable fixture, and on an empty result.
 fn load_all_fixtures() -> Vec<(String, VerifiableFunction)> {
     let dir = fixtures_dir();
-    if !dir.exists() {
-        return vec![];
-    }
     let mut fixtures = Vec::new();
-    for entry in std::fs::read_dir(&dir).unwrap() {
-        let entry = entry.unwrap();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|error| {
+        panic!("failed to read fixture directory {}: {error}", dir.display())
+    }) {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("failed to read entry in fixture directory {}: {error}", dir.display())
+        });
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        if !name.starts_with("test_functions__") {
+            continue;
+        }
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-        match serde_json::from_str::<VerifiableFunction>(&json) {
-            Ok(func) => fixtures.push((name, func)),
-            Err(e) => eprintln!("WARNING: skipping invalid fixture {}: {e}", path.display()),
-        }
+        let func = serde_json::from_str::<VerifiableFunction>(&json)
+            .unwrap_or_else(|error| panic!("failed to parse fixture {}: {error}", path.display()));
+        fixtures.push((name, func));
     }
+    assert!(!fixtures.is_empty(), "no required real MIR fixtures found in {}", dir.display());
     fixtures
+}
+
+/// Assert how the report publishes checked_add's overflow obligation.
+///
+/// ay proves it as `Proved { Smt, Unchecked }`, conditional on the fixture's
+/// `a + b <= u32::MAX` precondition. `build_json_report` then applies two
+/// steps. First, the `Auto` runtime-check disposition (report_builder.rs
+/// `result_to_outcome`) moves the below-floor proof into the tentative
+/// runtime-checked lane. Second, the publication gate
+/// (`gate_report_for_publication` -> `JsonProofReport::sanitize_deserialized`)
+/// turns that tentative `RuntimeChecked` row into `Unknown`: a raw
+/// `VerificationResult` carries no live authenticated compiler/monitor
+/// capability.
+///
+/// Behaviour since 72ada1163c6 (gate added to `build_json_report`) and
+/// 6476f7a0038 (every `RuntimeChecked` row downgraded). The gate is a
+/// deliberate false-PROVE guard. The raw ay verdict is asserted separately.
+fn assert_checked_add_row_fails_closed(report: &JsonProofReport) {
+    let func = report
+        .functions
+        .iter()
+        .find(|f| f.function == "checked_add")
+        .expect("report should contain checked_add");
+    let overflow = func
+        .obligations
+        .iter()
+        .find(|ob| ob.kind == "arithmetic_overflow_add")
+        .expect("checked_add should report its overflow obligation");
+    match &overflow.outcome {
+        ObligationOutcome::Unknown { reason } => assert!(
+            reason.contains("no live authenticated compiler/monitor capability"),
+            "unexpected downgrade reason for checked_add: {reason}"
+        ),
+        other => panic!("checked_add overflow row must publish as Unknown, got {other:?}"),
+    }
+    assert_eq!(func.summary.verdict, FunctionVerdict::Inconclusive);
+    // No raw row may be published as proved or runtime-checked.
+    assert_eq!(report.summary.total_proved, 0, "raw Proved rows must not be published");
+    assert_eq!(
+        report.summary.total_runtime_checked, 0,
+        "tentative RuntimeChecked rows must not be published"
+    );
 }
 
 /// Create a MirRouter backed by real ay.
@@ -94,18 +139,7 @@ fn create_real_mir_router() -> MirRouter {
 
 #[test]
 fn test_e2e_real_mir_division_counterexample() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
-    let func = match load_fixture("test_functions__safe_divide") {
-        Some(f) => f,
-        None => {
-            eprintln!("SKIP: fixture test_functions__safe_divide.json not found");
-            return;
-        }
-    };
-
+    let func = load_fixture("test_functions__safe_divide");
     eprintln!("Source: fn safe_divide(x: u32, y: u32) -> u32 {{ x / y }}");
     eprintln!("Fixture: real compiler-extracted MIR from test_functions.rs");
 
@@ -160,23 +194,13 @@ fn test_e2e_real_mir_division_counterexample() {
 // Fixture: test_functions__checked_add.json (real compiler MIR)
 //
 // Expected: ArithmeticOverflow(Add) VC from Assert terminator, ay proves
-// the assertion condition (Formula::Bool(false) -> UNSAT -> Proved).
+// the assertion condition (UNSAT -> Proved). The report does not publish that
+// raw proof (see `assert_checked_add_row_fails_closed`).
 // ===========================================================================
 
 #[test]
 fn test_e2e_real_mir_overflow_proved() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
-    let func = match load_fixture("test_functions__checked_add") {
-        Some(f) => f,
-        None => {
-            eprintln!("SKIP: fixture test_functions__checked_add.json not found");
-            return;
-        }
-    };
-
+    let func = load_fixture("test_functions__checked_add");
     eprintln!("Source: fn checked_add(a: u32, b: u32) -> u32 {{ a + b }}");
     eprintln!("Fixture: real compiler-extracted MIR from test_functions.rs");
 
@@ -219,34 +243,22 @@ fn test_e2e_real_mir_overflow_proved() {
     eprintln!("Certificate record: digest={}", cert.record_digest);
     assert!(!cert.record_digest.is_empty(), "record digest should be non-empty");
 
-    // Step 5: Generate verification report
-    //
-    // ay reports this overflow obligation as `Proved{assurance: Unchecked}`
-    // (smt_unsat_unvalidated -- the Alethe cert is captured but not independently
-    // validated on the subprocess path). `build_json_report` applies the
-    // `SmtBacked` assurance floor (report_builder.rs:318), which downgrades an
-    // Unchecked proof into the runtime-checked lane. So at the report level the
-    // obligation is RUNTIME CHECKED, not PROVED. This is the intentional assurance
-    // floor, not a lost proof.
+    // Step 5: Generate verification report. The report lane publishes the raw
+    // proof as Unknown (see `assert_checked_add_row_fails_closed`).
     let report = trust_report::build_json_report("e2e_smoke_real", &results);
-    assert!(
-        report.summary.total_runtime_checked >= 1,
-        "report should show at least 1 runtime-checked (overflow obligation downgraded \
-         from Proved{{Unchecked}} by the SmtBacked assurance floor)"
-    );
-    assert_eq!(
-        report.summary.total_proved, 0,
-        "no obligation clears the SmtBacked floor, so report shows 0 proved"
-    );
-
     let text = trust_report::format_json_summary(&report);
     eprintln!("\n{text}");
-    assert!(
-        text.contains("RUNTIME CHECKED"),
-        "text report should contain RUNTIME CHECKED for the floor-downgraded overflow obligation"
-    );
+    assert_checked_add_row_fails_closed(&report);
+    assert_eq!(report.summary.total_obligations, 1);
+    assert_eq!(report.summary.total_unknown, 1);
+    assert_eq!(report.summary.verdict, CrateVerdict::Inconclusive);
+    assert!(text.contains("Verdict: INCONCLUSIVE"), "text: {text}");
+    assert!(!text.contains("RUNTIME CHECKED"), "text: {text}");
+    assert!(!text.contains("PROVED"), "text: {text}");
 
-    eprintln!("\n=== E2E REAL MIR: checked_add overflow RUNTIME CHECKED by real ay ===");
+    eprintln!(
+        "\n=== E2E REAL MIR: checked_add overflow PROVED by real ay (report: fail-closed UNKNOWN) ==="
+    );
 }
 
 // ===========================================================================
@@ -255,21 +267,13 @@ fn test_e2e_real_mir_overflow_proved() {
 // Source: all functions in fixtures/real_mir/src/test_functions.rs
 // Fixtures: all *.json files in fixtures/real_mir/
 //
-// Expected: at least 1 proved (checked_add), at least 1 failed (safe_divide).
+// Expected: ay proves checked_add (raw result), at least 1 failed row
+// (safe_divide), and the report publishes checked_add as fail-closed Unknown.
 // ===========================================================================
 
 #[test]
 fn test_e2e_real_mir_full_pipeline() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let fixtures = load_all_fixtures();
-    if fixtures.is_empty() {
-        eprintln!("SKIP: no real MIR fixtures found. Run: ./scripts/generate_mir_fixtures.sh");
-        return;
-    }
-
     eprintln!("Loaded {} real MIR fixtures", fixtures.len());
 
     let mut all_results: Vec<(VerificationCondition, VerificationResult)> = Vec::new();
@@ -303,21 +307,22 @@ fn test_e2e_real_mir_full_pipeline() {
         report.summary.total_obligations > 0,
         "real MIR fixtures should produce at least some VCs"
     );
-    // checked_add's overflow obligation is reported `Proved{Unchecked}` by ay and
-    // downgraded to the runtime-checked lane by the `SmtBacked` assurance floor
-    // (report_builder.rs:318), so it lands in `total_runtime_checked`, not
-    // `total_proved`. This is the intentional assurance floor.
-    assert!(
-        report.summary.total_runtime_checked >= 1,
-        "at least one VC should be runtime-checked (checked_add overflow obligation, \
-         downgraded from Proved{{Unchecked}} by the SmtBacked floor). Got {} runtime-checked",
-        report.summary.total_runtime_checked
-    );
+    // Raw lane: ay proves checked_add's overflow obligation.
+    let raw_proved = all_results
+        .iter()
+        .filter(|(vc, r)| vc.function.as_str().ends_with("checked_add") && r.is_proved())
+        .count();
+    assert!(raw_proved >= 1, "ay should prove checked_add's overflow obligation");
+    // Report lane: the raw proof is published as fail-closed Unknown.
+    assert_checked_add_row_fails_closed(&report);
     assert!(
         report.summary.total_failed >= 1,
         "at least one VC should be failed (safe_divide div-by-zero). Got {} failed",
         report.summary.total_failed
     );
+    // A counterexample is not downgraded by the publication gate.
+    assert_eq!(report.summary.verdict, CrateVerdict::HasViolations);
+    assert!(text.contains("Verdict: HAS VIOLATIONS"), "text: {text}");
 
     eprintln!(
         "\n=== E2E REAL MIR FULL PIPELINE: {} proved, {} failed, {} unknown ===",
@@ -334,16 +339,7 @@ fn test_e2e_real_mir_full_pipeline() {
 
 #[test]
 fn test_e2e_real_mir_pipeline_v2_router() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let fixtures = load_all_fixtures();
-    if fixtures.is_empty() {
-        eprintln!("SKIP: no real MIR fixtures found. Run: ./scripts/generate_mir_fixtures.sh");
-        return;
-    }
-
     let mir_router = create_real_mir_router();
 
     eprintln!("\n=== E2E REAL MIR: MirRouter pipeline-v2 dispatch ===");
@@ -381,15 +377,9 @@ fn test_e2e_real_mir_pipeline_v2_router() {
 
     // Acceptance criteria
     //
-    // The checked_add overflow obligation is reported `Proved{Unchecked}` by ay and
-    // downgraded into the runtime-checked lane by the `SmtBacked` assurance floor
-    // (report_builder.rs:318), so the report shows it as runtime-checked, not proved.
-    assert!(
-        report.summary.total_runtime_checked >= 1,
-        "at least one VC should be runtime-checked (overflow obligation downgraded from \
-         Proved{{Unchecked}} by the SmtBacked floor). Got {} runtime-checked",
-        report.summary.total_runtime_checked
-    );
+    // The v1 ay results are published through the report publication gate, so
+    // checked_add's raw proof is published as fail-closed Unknown.
+    assert_checked_add_row_fails_closed(&report);
     assert!(
         report.summary.total_failed >= 1,
         "at least one VC should be failed. Got {} failed",
@@ -426,18 +416,7 @@ fn test_e2e_real_mir_pipeline_v2_router() {
 
 #[test]
 fn test_e2e_real_mir_m2_demonstration() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
-    let func = match load_fixture("test_functions__checked_add") {
-        Some(f) => f,
-        None => {
-            eprintln!("SKIP: fixture test_functions__checked_add.json not found");
-            return;
-        }
-    };
-
+    let func = load_fixture("test_functions__checked_add");
     eprintln!("\n=== E2E REAL MIR: Full pipeline M2 demonstration ===\n");
     eprintln!("Source: fn checked_add(a: u32, b: u32) -> u32 {{ a + b }}");
     eprintln!(
@@ -496,23 +475,22 @@ fn test_e2e_real_mir_m2_demonstration() {
 
     // Final assertions: M2 acceptance check with REAL compiler MIR.
     //
-    // ay proves the checked_add overflow obligation but reports it as
-    // `Proved{assurance: Unchecked}` (the Alethe cert is captured but not
-    // independently validated on the subprocess path). `build_json_report`
-    // applies the `SmtBacked` assurance floor (report_builder.rs:318), which
-    // downgrades the Unchecked proof into the runtime-checked lane. So the M2
-    // report surfaces the obligation as RUNTIME CHECKED, not PROVED -- this is
-    // the intentional assurance floor, the obligation is still discharged.
+    // Raw lane: ay proves the checked_add overflow obligation, and the
+    // certificate record lists that raw proof.
     assert!(
-        report.summary.total_runtime_checked >= 1,
-        "M2: at least one function has at least one runtime-checked VC (overflow \
-         obligation downgraded from Proved{{Unchecked}} by the SmtBacked floor)"
+        results.iter().any(|(_, r)| r.is_proved()),
+        "M2: ay proves the checked_add overflow obligation"
     );
     assert!(!cert.record_digest.is_empty(), "M2: certificate record was generated");
     assert!(
-        text.contains("RUNTIME CHECKED"),
-        "M2: verification report shows RUNTIME CHECKED status for the floor-downgraded obligation"
+        cert.vc_entries.iter().any(|entry| entry.reported_proved),
+        "M2: certificate record carries the raw ay proof"
     );
+    // Report lane: the raw proof is published as fail-closed Unknown.
+    assert_checked_add_row_fails_closed(&report);
+    assert_eq!(report.summary.verdict, CrateVerdict::Inconclusive);
+    assert!(text.contains("Verdict: INCONCLUSIVE"), "M2 report text: {text}");
+    assert!(!text.contains("RUNTIME CHECKED"), "M2 report text: {text}");
 
     // Verify JSON serialization roundtrip
     let json = serde_json::to_string_pretty(&report).unwrap();

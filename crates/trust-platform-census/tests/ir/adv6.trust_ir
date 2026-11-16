@@ -1,0 +1,76 @@
+; TrustIr text format v1
+; trustc c054d5b16f0689fc92ce4d9a4c2b6decfb881e07 2026-10-08
+module "adv6"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "adv6.rs"
+
+functy.0 = (ptr, ptr) -> (i32)
+
+functy.1 = () -> (i32)
+
+functy.2 = (...) -> (i32)
+
+functy.3 = (i32) -> ()
+
+rustcc fn @adv_strip_to_this_hosts_limit(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 6 4
+    ; #scope: 2 parent=1 at 0 8 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.1()  ; #loc: 0 6 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 7 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 7 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 7 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 8 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 9 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 7 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 13 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 92160  ; #loc: 0 9 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 9 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 9 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = call @func.3(%0, %1)  ; #loc: 0 10 17  ; #scope: 2
+    %12 = const i32 127  ; #loc: 0 10 54  ; #scope: 2
+    call @func.4(%12)  ; #loc: 0 10 42  ; #scope: 2
+    unreachable  ; #loc: 0 10 42  ; #scope: 2
+bb6:
+    %13 = const i32 2  ; #loc: 0 9 53  ; #scope: 2
+    %14 = const i32 1  ; #loc: 0 9 68  ; #scope: 2
+    %15 = call @func.2(%2, %13, %14)  ; #loc: 0 9 37  ; #scope: 2
+    %16 = const i32 1  ; #loc: 0 9 95  ; #scope: 2
+    %17, %18 = add.overflow i32 %2, %16  ; #loc: 0 9 89  ; #scope: 2
+    %19 = const bool false  ; #loc: 0 9 89  ; #scope: 2
+    %20 = const bool true  ; #loc: 0 9 89  ; #scope: 2
+    %21 = select bool %18, %19, %20  ; #loc: 0 9 89  ; #scope: 2
+    assert %21, overflow add  ; #proof: no_overflow  ; #loc: 0 9 89  ; #scope: 2
+    br bb8(%17)  ; #loc: 0 9 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 9 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 9 8  ; #scope: 2
+}
+
+fn @"libc::fork"(functy.1) {
+    ; #producer: trust
+}
+
+fn @"libc::fcntl"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::execv"(functy.2) {
+    ; #producer: trust
+}
+
+fn @"libc::_exit"(functy.3) {
+    ; #producer: trust
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L9C89 of `adv6::adv_strip_to_this_hosts_limit`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "adv6::adv_strip_to_this_hosts_limit#L9C89#overflow#o0" range 0 9 89 9 96 site f0/bb6#8

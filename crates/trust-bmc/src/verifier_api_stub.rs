@@ -51,6 +51,13 @@ impl TrustMcVerifierApiAdapter {
         &self.config
     }
 
+    /// The real adapter's solve cutoff (2026-10-17); this stub never solves, so it has
+    /// nothing to bound.
+    #[must_use]
+    pub fn with_solve_cutoff(self, _cutoff: Option<std::time::Instant>) -> Self {
+        self
+    }
+
     fn unsupported_evidence(&self, obligation: &TrustObligation) -> ObligationEvidence {
         ObligationEvidence {
             evidence_id: format!("{}:{}:unsupported", ENGINE_NAME, obligation.obligation_id),
@@ -301,12 +308,46 @@ mod tests {
         ]);
     }
 
+    fn bundle_with(obligations: Vec<TrustObligation>) -> trust_verifier_api::TrustContractBundle {
+        let mut bundle = trust_verifier_api::TrustContractBundle::empty(
+            "bundle-trust-mc-stub",
+            trust_verifier_api::BundleSubject::Function {
+                crate_name: "demo".to_string(),
+                path: "demo::f".to_string(),
+            },
+        );
+        bundle.publication.dpub_plan_hash = Some("sha256:plan".to_string());
+        bundle.publication.trust_engines_lock_hash = Some("sha256:lock".to_string());
+        bundle.obligations = obligations;
+        bundle
+    }
+
+    /// Every E4/E5 row (LoopInvariant / Termination) is TrustMC-owned by KIND
+    /// since 79558a8f2e6 ("retire TrustWP verdict authority"): ownership no
+    /// longer depends on the typed payload, and a row whose payload is missing,
+    /// too deep, wrongly attributed or invalid is declined at verification time
+    /// instead. That commit re-pinned the native adapter's twin of this test
+    /// (verifier_api.rs) and left this feature-off copy asserting the retired
+    /// payload-gated ownership. The property that matters for the feature-off
+    /// build is unchanged and pinned here for every such row: the stub reports
+    /// the owned lane as supported and NEVER mints a verdict — its evidence is
+    /// Unsupported, with no proof strength, no decline claim and no model.
+    ///
+    /// What the typed envelope still decides is ADMISSION to the typed E4/E5
+    /// formula lane: `is_typed_body_aware_e4_e5_obligation` accepts exactly one
+    /// current, unique, compiler-authenticated VC origin carrying a validated
+    /// typed predicate, and refuses everything else — including a predicate
+    /// nested past the bound its readers decode
+    /// (`trust_types::json_depth::MAX_DEEP_NESTING`; T3 L4 C09d deleted the
+    /// public validator's 128-level semantic-depth limit, so a predicate past
+    /// that and within the readers' bound is admitted). Ownership and admission
+    /// are pinned separately below so a refused envelope can never be laundered
+    /// into proof authority here.
     #[test]
-    fn dynamic_e4_e5_ownership_requires_unique_compiler_vc_origin() {
+    fn dynamic_e4_e5_rows_are_owned_by_kind_and_never_verified_by_the_stub() {
         let adapter = TrustMcVerifierApiAdapter::default();
         let mut valid = obligation(ObligationKind::LoopInvariant);
         add_valid_compiler_vc_metadata(&mut valid);
-        assert!(adapter.supports(&valid).is_supported());
 
         let mut root = TrustSpecExpr::bool_literal(false);
         // Each typed expression node contributes multiple JSON object levels,
@@ -324,31 +365,52 @@ mod tests {
         );
         let mut deep = obligation(ObligationKind::Termination);
         add_valid_compiler_vc_metadata(&mut deep);
-        deep.metadata
-            .iter_mut()
-            .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-            .expect("payload metadata")
-            .value = encoded;
-        assert!(adapter.supports(&deep).is_supported());
-
-        let mut over_limit = TrustSpecExpr::bool_literal(false);
-        for _ in 0..=trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH {
-            over_limit =
-                TrustSpecExpr::unary(trust_verifier_api::TrustSpecUnaryOp::Not, over_limit);
-        }
-        let mut over_limit_obligation = obligation(ObligationKind::LoopInvariant);
-        add_valid_compiler_vc_metadata(&mut over_limit_obligation);
-        over_limit_obligation
-            .metadata
-            .iter_mut()
-            .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-            .expect("payload metadata")
-            .value = serde_json::to_string(&TrustSpecPredicate::new(over_limit, Vec::new()))
-            .expect("over-limit fixture serializes");
+        set_payload(&mut deep, encoded);
         assert!(
-            !adapter.supports(&over_limit_obligation).is_supported(),
-            "deep parsing must not widen the public semantic-depth limit"
+            is_typed_body_aware_e4_e5_obligation(&deep),
+            "a predicate below the public semantic-depth limit is admitted through deep parsing"
         );
+
+        // Trust (T3 L4, C09d): a chain of `links` Not nodes nests two JSON levels a link.
+        // Built, serialized, parsed and dropped on a deep stack: each recurses per level,
+        // and a test thread has 2 MiB.
+        let admitted = |links: usize| {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024 * 1024)
+                    .spawn_scoped(scope, move || {
+                        let mut chain = TrustSpecExpr::bool_literal(false);
+                        for _ in 0..links {
+                            chain = TrustSpecExpr::unary(
+                                trust_verifier_api::TrustSpecUnaryOp::Not,
+                                chain,
+                            );
+                        }
+                        let encoded =
+                            serde_json::to_string(&TrustSpecPredicate::new(chain, Vec::new()))
+                                .expect("the chain serializes");
+                        let depth = trust_types::json_depth::json_nesting_depth(&encoded);
+                        let mut row = obligation(ObligationKind::LoopInvariant);
+                        add_valid_compiler_vc_metadata(&mut row);
+                        set_payload(&mut row, encoded);
+                        let admitted = is_typed_body_aware_e4_e5_obligation(&row);
+                        (depth, admitted, row)
+                    })
+                    .expect("the deep-fixture thread starts")
+                    .join()
+                    .expect("the deep fixture runs")
+            })
+        };
+        // Past the deleted 128-level semantic bound, within the readers' bound: admitted.
+        let (depth, past_the_old_bound, _) = admitted(129);
+        assert!(depth <= trust_types::json_depth::MAX_DEEP_NESTING, "{depth}");
+        assert!(past_the_old_bound, "a predicate the readers decode is admitted, however deep");
+        // Past the readers' bound: no reader decodes it, and the row is refused.
+        // The row comes back for the stub's own run below.
+        let (depth, past_the_bound, over_limit_obligation) =
+            admitted(trust_types::json_depth::MAX_DEEP_NESTING / 2 + 1);
+        assert!(depth > trust_types::json_depth::MAX_DEEP_NESTING, "{depth}");
+        assert!(!past_the_bound, "a predicate nested past the readers' bound is refused");
 
         let mut wrong_origin = obligation(ObligationKind::Termination);
         add_valid_compiler_vc_metadata(&mut wrong_origin);
@@ -367,7 +429,7 @@ mod tests {
         )
         .to_metadata_entry()
         .expect("wrong-origin context serializes");
-        assert!(!adapter.supports(&wrong_origin).is_supported());
+        assert!(!is_typed_body_aware_e4_e5_obligation(&wrong_origin));
 
         let mut invalid_predicate = obligation(ObligationKind::LoopInvariant);
         add_valid_compiler_vc_metadata(&mut invalid_predicate);
@@ -375,15 +437,13 @@ mod tests {
             TrustSpecExpr::variable("missing", trust_verifier_api::TrustSpecSort::Bool),
             Vec::new(),
         );
-        invalid_predicate
-            .metadata
-            .iter_mut()
-            .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-            .expect("payload metadata")
-            .value = serde_json::to_string(&undeclared).expect("invalid fixture serializes");
+        set_payload(
+            &mut invalid_predicate,
+            serde_json::to_string(&undeclared).expect("invalid fixture serializes"),
+        );
         assert!(
-            !adapter.supports(&invalid_predicate).is_supported(),
-            "feature-off ownership must apply the same complete typed-predicate validator"
+            !is_typed_body_aware_e4_e5_obligation(&invalid_predicate),
+            "the complete typed-predicate validator still rejects an undeclared name"
         );
 
         let mut duplicate_context = valid.clone();
@@ -394,16 +454,63 @@ mod tests {
             .expect("context metadata")
             .clone();
         duplicate_context.metadata.push(duplicate);
-        assert!(!adapter.supports(&duplicate_context).is_supported());
+        assert!(!is_typed_body_aware_e4_e5_obligation(&duplicate_context));
 
-        let mut malformed_context = valid;
+        let mut malformed_context = valid.clone();
         malformed_context
             .metadata
             .iter_mut()
             .find(|entry| entry.key == trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
             .expect("context metadata")
             .value = "{}".to_string();
-        assert!(!adapter.supports(&malformed_context).is_supported());
+        assert!(!is_typed_body_aware_e4_e5_obligation(&malformed_context));
+
+        assert!(is_typed_body_aware_e4_e5_obligation(&valid), "the control row is well formed");
+        // A payload-free row of EITHER owned kind is still owned, and still
+        // outside the typed lane: ownership must not depend on payload
+        // presence, and admission must not be granted by its absence.
+        let bare = obligation(ObligationKind::Termination);
+        let bare_loop = obligation(ObligationKind::LoopInvariant);
+        assert!(!is_typed_body_aware_e4_e5_obligation(&bare));
+        assert!(!is_typed_body_aware_e4_e5_obligation(&bare_loop));
+        for (label, row) in [
+            ("valid", valid),
+            ("bare", bare),
+            ("bare_loop", bare_loop),
+            ("deep", deep),
+            ("over_limit", over_limit_obligation),
+            ("wrong_origin", wrong_origin),
+            ("invalid_predicate", invalid_predicate),
+            ("duplicate_context", duplicate_context),
+            ("malformed_context", malformed_context),
+        ] {
+            let mut row = row;
+            row.obligation_id = format!("dynamic-loop-vc-{label}");
+            assert!(adapter.supports(&row).is_supported(), "{label}: E4/E5 rows are owned by kind");
+            let bundle = bundle_with(vec![row]);
+            let evidence = adapter.verify(&bundle, &bundle.obligations);
+            // The public boundary may refuse a malformed bundle outright (no
+            // evidence at all, e.g. a duplicated context entry); anything that
+            // reaches the stub comes back as exactly one Unsupported row.
+            assert!(evidence.len() <= 1, "{label}: at most one evidence row, got {evidence:?}");
+            if label == "valid" {
+                assert_eq!(evidence.len(), 1, "valid: the boundary admits a well-formed row");
+            }
+            for row in &evidence {
+                assert_eq!(row.status, EvidenceStatus::Unsupported, "{label}");
+                assert!(row.proof_strength.is_none(), "{label}: the stub mints no proof");
+                assert!(row.counterexample.is_none(), "{label}: the stub mints no model");
+            }
+        }
+    }
+
+    fn set_payload(obligation: &mut TrustObligation, payload: String) {
+        obligation
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
+            .expect("payload metadata")
+            .value = payload;
     }
 
     #[test]

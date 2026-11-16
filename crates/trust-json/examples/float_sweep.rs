@@ -13,8 +13,8 @@
 //   float_sweep f32-exhaustive [threads]
 //   float_sweep f64-ties <count>
 
-use incumbent_serde_json as inc;
 use inc::ser::Formatter as _;
+use incumbent_serde_json as inc;
 use trust_json as tj;
 use trust_json::ser::float::FloatBuffer;
 
@@ -28,10 +28,7 @@ fn cmp_f32(v: f32, scratch: &mut Vec<u8>) -> Option<(String, String)> {
     if mine.as_bytes() == scratch.as_slice() {
         None
     } else {
-        Some((
-            mine.to_owned(),
-            String::from_utf8_lossy(scratch).into_owned(),
-        ))
+        Some((mine.to_owned(), String::from_utf8_lossy(scratch).into_owned()))
     }
 }
 
@@ -44,10 +41,7 @@ fn cmp_f64(v: f64, scratch: &mut Vec<u8>) -> Option<(String, String)> {
     if mine.as_bytes() == scratch.as_slice() {
         None
     } else {
-        Some((
-            mine.to_owned(),
-            String::from_utf8_lossy(scratch).into_owned(),
-        ))
+        Some((mine.to_owned(), String::from_utf8_lossy(scratch).into_owned()))
     }
 }
 
@@ -100,9 +94,7 @@ fn f64_ties(count: u64) {
     let mut scratch = Vec::with_capacity(32);
     let mut rng: u64 = 0x9E3779B97F4A7C15;
     let mut next = || {
-        rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         rng ^ (rng >> 31)
     };
     let mut checked = 0u64;
@@ -133,13 +125,8 @@ fn f64_ties(count: u64) {
                 // Is it an exact tie? The shortest rendering has n digits; the
                 // exact value needs n+1 and the last is a 5.
                 let sci = format!("{signed:e}");
-                let ndig = sci
-                    .split('e')
-                    .next()
-                    .unwrap()
-                    .chars()
-                    .filter(char::is_ascii_digit)
-                    .count();
+                let ndig =
+                    sci.split('e').next().unwrap().chars().filter(char::is_ascii_digit).count();
                 let exact = format!("{signed:.*}", 40usize);
                 if exact.trim_end_matches('0').ends_with('5') && ndig <= 17 {
                     ties += 1;

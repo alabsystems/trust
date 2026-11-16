@@ -90,8 +90,11 @@ mod m {
 }
 
 fn main() {
-    //~^ WARN Trust Level 0 safety verification incomplete
-    //~| WARN Trust verification advisory
+    // RE-PINNED 2026-09-14 (measured on the 4d972edcfd stage1): every obligation of `main`
+    // now PROVES — the Clean-origin wrapping call is grounded (25c1492ec3) and the W2
+    // wrapping carrier gate admits `a + b` on UInt64 — so the two advisory WARNs this file
+    // pinned for the retained runtime check no longer fire. The paragraph below describes
+    // the pre-widening state and is kept for the record.
     // (the retained runtime check on the third obligation surfaces as two
     // advisory WARNs under JSON diagnostics; strict does not fire because the
     // two value asserts are PROVED and the retained check is the assert

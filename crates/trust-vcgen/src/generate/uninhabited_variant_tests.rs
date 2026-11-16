@@ -46,42 +46,45 @@ use trust_types::{
 fn void_enum(name: &str) -> Ty {
     Ty::Adt {
         name: name.into(),
-        fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
-        variants: vec![],
+        fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Enum),
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
 fn struct_of(name: &str, fields: Vec<(String, Ty)>) -> Ty {
     Ty::Adt {
         name: name.into(),
-        fields,
-        variants: vec![],
+        fields: fields.into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Struct),
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
 fn enum_of(name: &str, variants: Vec<VariantDef>) -> Ty {
     Ty::Adt {
         name: name.into(),
-        fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
-        variants,
+        fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })].into(),
+        variants: variants.into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Enum),
         arbitrary_precision: None,
+        validity_wrapper: None,
     }
 }
 
@@ -136,6 +139,7 @@ fn func_matching_result(err_payload: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: trust_types::FunctionSpec::default(),
+        tuple_layouts: Default::default(),
     };
     func.body.blocks[0].stmts.push(Statement::Assign {
         place: Place::local(2),
@@ -349,14 +353,15 @@ fn unresolvable_and_indirect_payloads_decline() {
 fn union_payload_declines() {
     let u = Ty::Adt {
         name: "t::U".into(),
-        fields: vec![("a".into(), void_enum("core::convert::Infallible"))],
-        variants: vec![],
+        fields: vec![("a".into(), void_enum("core::convert::Infallible"))].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Union),
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     assert_eq!(result_tags(u), vec![0, 1], "a union is always inhabited");
 }
@@ -370,31 +375,34 @@ fn union_payload_declines() {
 fn un_migrated_adt_kind_declines() {
     let unkinded_void = Ty::Adt {
         name: "t::Void".into(),
-        fields: vec![],
-        variants: vec![],
+        fields: vec![].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     assert_eq!(result_tags(unkinded_void), vec![0, 1]);
     // A hand-built enum (the pre-existing unit fixtures' spelling) is unaffected:
     // filtering reads the VARIANTS' field types, never the outer ADT's own kind.
     let hand_built = Ty::Adt {
         name: "t::E".into(),
-        fields: vec![],
+        fields: vec![].into(),
         variants: vec![
             VariantDef { name: "A".into(), discriminant: 5, fields: vec![] },
             VariantDef { name: "B".into(), discriminant: 10, fields: vec![] },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
         adt_kind: None,
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     assert_eq!(
         super::inhabited_enum_variant_tag_set(&hand_built),
@@ -459,4 +467,226 @@ fn deep_nesting_fails_closed_to_inhabited() {
         vec![0, 1],
         "exhausting the depth budget must answer INHABITED, the fail-closed direction"
     );
+}
+
+// ── RECURSIVE ENUMS: the source place is a bare by-name marker ───────────────
+
+/// `T<NoExt>` with `enum T<X> { A, B(..), Ext(X) }` and `enum NoExt {}`, as
+/// `lower_enum_adt` records a RECURSIVE enum's definition in the body's table.
+fn recursive_t_definition(name: &str) -> Ty {
+    enum_of(
+        name,
+        vec![
+            VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
+            VariantDef {
+                name: "B".into(),
+                discriminant: 1,
+                fields: vec![(
+                    "0".into(),
+                    Ty::RawPtr {
+                        mutable: false,
+                        pointee: Box::new(Ty::Datatype { name: name.into(), variants: vec![] }),
+                    },
+                )],
+            },
+            VariantDef {
+                name: "Ext".into(),
+                discriminant: 2,
+                fields: vec![("0".into(), void_enum("t::NoExt"))],
+            },
+        ],
+    )
+}
+
+/// `fn f(t: &T<NoExt>) { _2 = Discriminant(*_1) }`, the scrutinee spelled as the
+/// bare marker `name` and the table carrying `defs`.
+fn func_matching_recursive_ref(name: &str, defs: Vec<Ty>) -> VerifiableFunction {
+    let mut func = func_matching_result(Ty::Int { width: 8, signed: false });
+    func.body.locals[1].ty = Ty::Ref {
+        mutable: false,
+        inner: Box::new(Ty::Datatype { name: name.into(), variants: vec![] }),
+    };
+    for def in defs {
+        assert!(trust_types::insert_datatype_def(&mut func.body.datatype_defs, def));
+    }
+    func.body.blocks[0].stmts.clear();
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Discriminant(Place {
+            local: 1,
+            projections: vec![trust_types::Projection::Deref],
+        }),
+        span: SourceSpan::default(),
+    });
+    func
+}
+
+/// THE RECURSIVE FIXTURE. The scrutinee is a bare marker the body's table defines:
+/// the fact must be read off the DEFINITION, so the dead `Ext` tag is dropped and the
+/// published membership is `{0, 1}`. Before `place_ty_resolved_cow`, NOTHING was
+/// published (the marker has no variants), and `_2 = 2` refuted the dead arm.
+#[test]
+fn recursive_marker_scrutinee_reads_its_table_definition() {
+    let name = "t::T<t::NoExt>";
+    let func = func_matching_recursive_ref(name, vec![recursive_t_definition(name)]);
+    let published = published_tags(&func);
+    assert!(!published.is_empty(), "the discriminant read of a defined marker must publish");
+    for tags in &published {
+        assert_eq!(tags, &vec![0, 1], "the dead `Ext` tag must be dropped: {published:?}");
+    }
+}
+
+/// FAIL CLOSED: a marker the table does NOT define — including one whose table entry
+/// is for a DIFFERENT instantiation (`T<u8>` vs the scrutinee's `T<t::NoExt>`) —
+/// publishes nothing, exactly as before the resolution existed. Binding a marker to a
+/// same-family definition of another instantiation would type the body into the
+/// wrong structure.
+#[test]
+fn undefined_or_other_instantiation_marker_publishes_no_fact() {
+    let undefined = func_matching_recursive_ref("t::T<t::NoExt>", vec![]);
+    assert!(super::build_discriminant_variant_range_facts(&undefined).is_empty());
+    let other =
+        func_matching_recursive_ref("t::T<t::NoExt>", vec![recursive_t_definition("t::T<u8>")]);
+    assert!(
+        super::build_discriminant_variant_range_facts(&other).is_empty(),
+        "a table entry for another instantiation must not resolve this marker"
+    );
+}
+
+// ── REPR-U128-HIGH-TAG-1: a lossy tag under an UNSIGNED read is no fact ──────
+
+/// `#[repr(u128)] enum E { A = 0, B = u128::MAX, C = 5 }` exactly as the extractor
+/// spelled it before REPR-U128-HIGH-TAG-1: `B`'s tag stored as the lossy
+/// `u128::MAX as i128 == -1`. The extractor now lowers this enum to `Unsupported`;
+/// a SERIALIZED body (an older dump) or a hand-built one can still carry it.
+fn lossy_repr_u128_enum() -> Ty {
+    enum_of(
+        "t::E",
+        vec![
+            VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
+            VariantDef { name: "B".into(), discriminant: -1, fields: vec![] },
+            VariantDef { name: "C".into(), discriminant: 5, fields: vec![] },
+        ],
+    )
+}
+
+/// `fn p(e: E) { _2 = Discriminant(e) }` with `_2` declared `dest_ty`.
+fn func_reading_lossy_tags_into(dest_ty: Ty) -> VerifiableFunction {
+    let mut func = func_matching_result(Ty::Int { width: 8, signed: false });
+    func.body.locals[1].ty = lossy_repr_u128_enum();
+    func.body.locals[2].ty = dest_ty;
+    func
+}
+
+/// Every name the published facts mention.
+fn fact_names(facts: &[Formula]) -> Vec<String> {
+    let mut names: Vec<String> =
+        facts.iter().flat_map(|f| f.free_variables().into_iter()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// THE FIX (defense in depth). A `u128` read cannot produce `-1`; the SwitchInt label
+/// for `B` renders the true `u128::MAX`, so `_2 ∈ {0, -1, 5}` deleted the real tag and
+/// made the `B` arm vacuous. No membership may be published — not over the dest, not
+/// over the canonical `__trust_mir__discr_*` carrier (the same read) — and the same
+/// for a `usize` (pointer-sized unsigned) read.
+#[test]
+fn negative_tag_read_into_an_unsigned_dest_publishes_no_fact() {
+    for dest_ty in [Ty::Int { width: 128, signed: false }, Ty::PtrSizedInt { signed: false }] {
+        let func = func_reading_lossy_tags_into(dest_ty.clone());
+        let facts = super::build_discriminant_variant_range_facts(&func);
+        assert!(
+            facts.is_empty(),
+            "{dest_ty:?}: a negative tag under an unsigned read is a FALSE membership; \
+             published {facts:?} over {:?}",
+            fact_names(&facts)
+        );
+        assert!(!super::discriminant_tags_denote_dest_values(&func, &Place::local(2), &[0, -1, 5]));
+    }
+}
+
+/// CONTROL: the same tags read into a SIGNED dest are genuine (a `#[repr(i128)]` or
+/// `repr(isize)` enum with a negative tag) and keep their fact, over the dest and
+/// the canonical carrier, with `-1` in the set.
+#[test]
+fn negative_tag_read_into_a_signed_dest_keeps_its_fact() {
+    for dest_ty in [Ty::Int { width: 128, signed: true }, Ty::PtrSizedInt { signed: true }] {
+        let func = func_reading_lossy_tags_into(dest_ty.clone());
+        let published = published_tags(&func);
+        assert_eq!(published.len(), 2, "{dest_ty:?}: dest and carrier: {published:?}");
+        for tags in &published {
+            assert_eq!(tags, &vec![0, -1, 5], "{dest_ty:?}");
+        }
+        let names = fact_names(&super::build_discriminant_variant_range_facts(&func));
+        assert!(
+            names.iter().any(|n| n.starts_with("__trust_mir__discr_")),
+            "{dest_ty:?}: the canonical carrier must be bound: {names:?}"
+        );
+    }
+}
+
+/// CONTROL (no capability loss): NON-negative tags mean the same number under every
+/// integer type, so an unsigned read keeps its fact — `#[repr(u128)] { 0, 7, 5 }`.
+#[test]
+fn non_negative_tags_read_into_an_unsigned_dest_keep_their_fact() {
+    let mut func = func_reading_lossy_tags_into(Ty::Int { width: 128, signed: false });
+    func.body.locals[1].ty = enum_of(
+        "t::E",
+        vec![
+            VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
+            VariantDef { name: "B".into(), discriminant: 7, fields: vec![] },
+            VariantDef { name: "C".into(), discriminant: 5, fields: vec![] },
+        ],
+    );
+    let published = published_tags(&func);
+    assert_eq!(published.len(), 2, "dest and carrier: {published:?}");
+    for tags in &published {
+        assert_eq!(tags, &vec![0, 7, 5]);
+    }
+}
+
+/// FAIL CLOSED: a dest whose type does not resolve gives a negative tag no
+/// denotation either.
+#[test]
+fn negative_tag_read_into_an_unresolvable_dest_publishes_no_fact() {
+    let mut func = func_reading_lossy_tags_into(Ty::Int { width: 128, signed: true });
+    func.body.blocks[0].stmts.clear();
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(9),
+        rvalue: Rvalue::Discriminant(Place::local(1)),
+        span: SourceSpan::default(),
+    });
+    assert!(super::build_discriminant_variant_range_facts(&func).is_empty());
+}
+
+/// The refutation lane's exact pin (`dest == __trust_mir__discr_<src>` plus the
+/// carrier's membership) applies the same gate: no pin for the unsigned read, one pin
+/// carrying `-1` for the signed control.
+#[test]
+fn discriminant_pin_declines_a_negative_tag_under_an_unsigned_dest() {
+    let input_free: trust_types::fx::FxHashSet<usize> = [1].into_iter().collect();
+    let stable: trust_types::fx::FxHashSet<String> = ["_2".to_string()].into_iter().collect();
+    let unsigned = func_reading_lossy_tags_into(Ty::Int { width: 128, signed: false });
+    assert_eq!(crate::place_to_var_name(&unsigned, &Place::local(2)), "_2");
+    assert!(
+        super::discriminant_pin_defs(&unsigned, &input_free, &stable).is_empty(),
+        "no pin may carry the false membership onto a u128 dest"
+    );
+    let signed = func_reading_lossy_tags_into(Ty::Int { width: 128, signed: true });
+    let pins = super::discriminant_pin_defs(&signed, &input_free, &stable);
+    assert_eq!(pins.len(), 1, "the signed control keeps its pin");
+    let mut tags = Vec::new();
+    for range in &pins[0].1 {
+        let Formula::Or(cases) = range else { panic!("membership over three tags: {range:?}") };
+        for case in cases {
+            if let Formula::Eq(_, rhs) = case
+                && let Formula::Int(t) = rhs.as_ref()
+            {
+                tags.push(*t);
+            }
+        }
+    }
+    assert_eq!(tags, vec![0, -1, 5]);
 }

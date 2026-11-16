@@ -17,7 +17,7 @@ use trust_convergence::{
     ConvergenceDecision, ConvergenceTracker, ConvergenceVerdict, IterationSnapshot, ProofFrontier,
     VerdictConfig,
 };
-use trust_types::{SourceSpan, VerificationCondition, VerificationResult};
+use trust_types::{VerificationCondition, VerificationResult};
 
 use crate::futility::FutilityDetector;
 pub use crate::futility::{FutilityConfig, FutilityReason};
@@ -213,10 +213,10 @@ pub fn run_iterative_verification(
     loop {
         let mut results = ctx.verify_vcs(&active_vcs);
 
-        let mut statuses = update_statuses(&carried_statuses, &results);
+        let (mut statuses, relies_on_carried) = update_statuses(&carried_statuses, &results);
         let mut counts = count_statuses(&statuses);
 
-        if counts.all_proved() {
+        if counts.all_proved() && relies_on_carried {
             // a sound AllProved requires every counted VC to
             // have been verified in the CURRENT iteration. `counts` can include a
             // status CARRIED FORWARD by `update_statuses` -- a VC proved earlier,
@@ -225,22 +225,19 @@ pub fn run_iterative_verification(
             // must be confirmed by re-verifying the FULL VC set (with
             // strengthenings) in the current context; only the full re-verification
             // result is trusted from this point on.
-            let relies_on_carried =
-                statuses.keys().any(|k| !results.iter().any(|(vc, _)| &vc_slot_key(vc) == k));
-            if relies_on_carried {
-                let revalidation = ctx.verify_vcs(&all_vcs);
-                let revalidation_statuses = update_statuses(&BTreeMap::new(), &revalidation);
-                counts = count_statuses(&revalidation_statuses);
-                statuses = revalidation_statuses;
-                results = revalidation;
-            }
+            let revalidation = ctx.verify_vcs(&all_vcs);
+            let (revalidation_statuses, _) = update_statuses(&BTreeMap::new(), &revalidation);
+            counts = count_statuses(&revalidation_statuses);
+            statuses = revalidation_statuses;
+            results = revalidation;
         }
 
         // Track per-VC statuses for regression detection and delta computation.
         vc_tracker.record_results(iteration, &results);
         let vc_delta = vc_tracker.compute_delta(iteration);
-        let iter_regressions = vc_tracker.detect_regressions(iteration);
-        all_regression_events.extend(iter_regressions);
+        if vc_delta.regressions > 0 {
+            all_regression_events.extend(vc_tracker.detect_regressions(iteration));
+        }
 
         let frontier = counts.frontier();
         let snapshot = IterationSnapshot::new(iteration, frontier)
@@ -248,7 +245,6 @@ pub fn run_iterative_verification(
         let decision = tracker.observe(snapshot);
         carried_statuses = statuses;
 
-        let failed = failed_results(&results);
         let mut record = IterationRecord {
             iteration,
             proved: counts.proved,
@@ -317,12 +313,23 @@ pub fn run_iterative_verification(
             finish!(TerminationReason::Futility { reason });
         }
 
-        if !config.enable_strengthen || failed.is_empty() {
+        if !config.enable_strengthen || counts.failed == 0 {
+            finish!(TerminationReason::NoProgress);
+        }
+
+        let failed = failed_results(&results);
+        if failed.is_empty() {
             finish!(TerminationReason::NoProgress);
         }
 
         let strengthened = ctx.strengthen_specs(&failed);
+        if strengthened.is_empty() {
+            finish!(TerminationReason::NoProgress);
+        }
         let merge = merge_unproved_vcs(unproved_vcs(&results), strengthened.clone());
+        if merge.applied == 0 {
+            finish!(TerminationReason::NoProgress);
+        }
         // Keep the full VC set in sync with the strengthenings so the AllProved
         // re-verification above checks the current (strengthened) formulas.
         all_vcs = merge_unproved_vcs(all_vcs, strengthened).vcs;
@@ -336,21 +343,6 @@ pub fn run_iterative_verification(
 
         history.push(record);
 
-        if merge.applied == 0 {
-            return LoopResult {
-                iterations: iteration,
-                reason: TerminationReason::NoProgress,
-                final_proved: counts.proved,
-                final_failed: counts.failed,
-                final_unknown: counts.unknown,
-                history,
-                final_results: results,
-                metrics_history,
-                regression_events: all_regression_events,
-                verdict: tracker.verdict(),
-            };
-        }
-
         active_vcs = merge.vcs;
         prev_counts = Some(counts);
         iteration += 1;
@@ -360,17 +352,21 @@ pub fn run_iterative_verification(
 fn update_statuses(
     previous: &BTreeMap<String, ObligationStatus>,
     results: &[(VerificationCondition, VerificationResult)],
-) -> BTreeMap<String, ObligationStatus> {
-    let mut statuses = previous
-        .iter()
-        .filter_map(|(key, status)| status.is_proved().then_some((key.clone(), *status)))
-        .collect::<BTreeMap<_, _>>();
-
+) -> (BTreeMap<String, ObligationStatus>, bool) {
+    let mut statuses = BTreeMap::new();
     for (vc, result) in results {
         statuses.insert(vc_slot_key(vc), ObligationStatus::from_result(result));
     }
 
-    statuses
+    let mut relies_on_carried = false;
+    for (key, status) in previous {
+        if status.is_proved() && !statuses.contains_key(key.as_str()) {
+            statuses.insert(key.clone(), *status);
+            relies_on_carried = true;
+        }
+    }
+
+    (statuses, relies_on_carried)
 }
 
 fn count_statuses(statuses: &BTreeMap<String, ObligationStatus>) -> StatusCounts {
@@ -423,10 +419,9 @@ fn merge_unproved_vcs(
     let mut applied = 0;
     for vc in strengthened {
         let key = vc_slot_key(&vc);
-        let value_fingerprint = vc_value_fingerprint(&vc);
 
         if let Some(index) = positions.get(&key).copied() {
-            if vc_value_fingerprint(&merged[index]) != value_fingerprint {
+            if merged[index].formula != vc.formula {
                 merged[index] = vc;
                 applied += 1;
             }
@@ -441,7 +436,7 @@ fn merge_unproved_vcs(
 }
 
 fn status_fingerprint(statuses: &BTreeMap<String, ObligationStatus>) -> String {
-    let mut fingerprint = String::new();
+    let mut fingerprint = String::with_capacity(statuses.len() * 32);
 
     for (key, status) in statuses {
         fingerprint.push_str(key);
@@ -453,18 +448,17 @@ fn status_fingerprint(statuses: &BTreeMap<String, ObligationStatus>) -> String {
     fingerprint
 }
 
-fn vc_slot_key(vc: &VerificationCondition) -> String {
-    format!("{}|{}|{}", vc.function, span_key(&vc.location), vc.kind.description())
-}
-
-fn vc_value_fingerprint(vc: &VerificationCondition) -> String {
-    format!("{}|{:?}", vc_slot_key(vc), vc.formula)
-}
-
-fn span_key(span: &SourceSpan) -> String {
+pub(crate) fn vc_slot_key(vc: &VerificationCondition) -> String {
+    let span = &vc.location;
     format!(
-        "{}:{}:{}:{}:{}",
-        span.file, span.line_start, span.col_start, span.line_end, span.col_end
+        "{}|{}:{}:{}:{}:{}|{}",
+        vc.function,
+        span.file,
+        span.line_start,
+        span.col_start,
+        span.line_end,
+        span.col_end,
+        vc.kind.description()
     )
 }
 
@@ -472,7 +466,7 @@ fn span_key(span: &SourceSpan) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use trust_types::{Formula, ProofStrength, Sort, VcKind};
+    use trust_types::{Formula, ProofStrength, Sort, SourceSpan, VcKind};
 
     use super::*;
 

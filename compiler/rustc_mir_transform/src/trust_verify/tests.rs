@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 #![allow(rustc::symbol_intern_string_literal)]
 
 use rustc_index::IndexVec;
@@ -13,6 +13,450 @@ use trust_router::full_verification::{
 };
 
 use super::*;
+
+#[path = "tests/replay_audit_tests.rs"]
+mod replay_audit_tests;
+
+#[path = "tests/bridge_interval_disagreement.rs"]
+mod bridge_interval_disagreement;
+
+// Existing bridge controls have no unresolved loop dependency. Production has
+// no scope-free entry point; tests retain the old convenience signature only.
+fn bridge_v1_ay_proofs_into_native_results(
+    timeout: u64,
+    deadline: Option<std::time::Instant>,
+    solver_vcs: &[VerificationCondition],
+    bindings: &mut [Option<ResultObligationBinding>],
+    stamp: bool,
+    results: Vec<(VerificationCondition, VerificationResult)>,
+) -> (
+    Vec<(VerificationCondition, VerificationResult)>,
+    u32,
+    u32,
+    Vec<Option<SolverRevalidationEligibility>>,
+) {
+    bridge_v1_ay_proofs_into_native_results_recording_clock_stops(
+        timeout,
+        deadline,
+        solver_vcs,
+        bindings,
+        &mut ClockStops::default(),
+        stamp,
+        results,
+    )
+}
+
+// The same, keeping the rows a clock cut (determinism plan §3.7).
+fn bridge_v1_ay_proofs_into_native_results_recording_clock_stops(
+    timeout: u64,
+    deadline: Option<std::time::Instant>,
+    solver_vcs: &[VerificationCondition],
+    bindings: &mut [Option<ResultObligationBinding>],
+    clock_stops: &mut ClockStops,
+    stamp: bool,
+    results: Vec<(VerificationCondition, VerificationResult)>,
+) -> (
+    Vec<(VerificationCondition, VerificationResult)>,
+    u32,
+    u32,
+    Vec<Option<SolverRevalidationEligibility>>,
+) {
+    let function = bridge_test_function();
+    let scope = trust_vcgen::GenericRefutationScope::for_function(&function, &[], &[]);
+    super::bridge_v1_ay_proofs_into_native_results_with_scope(
+        &scope,
+        timeout,
+        trust_types::determinism::EffortScale::BUILTIN,
+        deadline,
+        solver_vcs,
+        bindings,
+        clock_stops,
+        stamp,
+        results,
+        None,
+    )
+}
+
+// The empty function the bridge controls are scoped to.
+fn bridge_test_function() -> trust_types::VerifiableFunction {
+    trust_types::VerifiableFunction {
+        name: "bridge-test".into(),
+        def_path: "bridge-test".into(),
+        span: SourceSpan::default(),
+        body: trust_types::VerifiableBody {
+            locals: vec![],
+            blocks: vec![],
+            arg_count: 0,
+            return_ty: trust_types::Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+fn bridge_replay_test_vc() -> VerificationCondition {
+    let mut vc = test_vc(446);
+    vc.function = "bridge-test".into();
+    vc.kind = VcKind::SliceBoundsCheck;
+    let x = || Formula::Var("bridge_replay_x".into(), Sort::Int);
+    vc.formula = Formula::And(vec![
+        Formula::Lt(Box::new(x()), Box::new(Formula::Int(0))),
+        Formula::Lt(Box::new(Formula::Int(0)), Box::new(x())),
+    ]);
+    vc
+}
+
+#[test]
+fn v1_bridge_replay_child() {
+    let Some(mode) = std::env::var_os("TRUST_TEST_BRIDGE_REPLAY_MODE") else { return };
+    let root = std::path::PathBuf::from(std::env::var_os("TRUST_TEST_BRIDGE_REPLAY_ROOT").unwrap());
+    let mut vc = bridge_replay_test_vc();
+    if mode == "changed" {
+        vc.formula = Formula::Lt(
+            Box::new(Formula::Var("bridge_replay_x".into(), Sort::Int)),
+            Box::new(Formula::Int(0)),
+        );
+    }
+    let function = bridge_test_function();
+    let scope = trust_vcgen::GenericRefutationScope::for_function(&function, &[], &[]);
+    let obligation = authority_test_native_obligation("bridge:replay", 446, 446);
+    let mut bindings = vec![test_binding_for_obligation(0, &vc, &obligation)];
+    assert!(bindings[0].is_some());
+    let (results, proved, failed, eligibility) = bridge_v1_ay_proofs_into_native_results_with_scope(
+        &scope,
+        5000,
+        trust_types::determinism::EffortScale::BUILTIN,
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(15)),
+        std::slice::from_ref(&vc),
+        &mut bindings,
+        &mut ClockStops::default(),
+        true,
+        vec![(vc.clone(), bridge_test_unknown())],
+        (mode != "cold").then_some(root.as_path()),
+    );
+    assert_eq!(results.len(), 1);
+    if mode == "changed" {
+        assert_eq!((proved, failed), (0, 1));
+    } else {
+        assert_eq!((proved, failed), (1, 0));
+        if mode == "warm" {
+            assert!(eligibility[0].is_none(), "a replay must not claim an AY producer receipt");
+            assert!(matches!(&results[0].1, VerificationResult::Proved { solver, .. }
+                if solver.as_str() == "clean-kernel-certified"));
+        }
+    }
+}
+
+#[test]
+fn v1_bridge_replays_before_ay_dispatch() {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let requested = std::env::temp_dir().join(format!(
+        "trust-bridge-replay-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    ));
+    std::fs::create_dir(&requested).unwrap();
+    // Trust: the session root is the canonical spelling, as targo's
+    // `VerificationSession::create` passes it. macOS `temp_dir()` sits under
+    // the `/var` -> `/private/var` alias, and the lazy import's work lock
+    // refuses a non-canonical token parent, so the warm child silently missed
+    // the published proof and dispatched AY (BRIDGE-REPLAY-CANONICAL-ROOT-1).
+    let root = Scratch(requested.canonicalize().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let store = trust_certify::proof_artifacts::ProofArtifactStore::open(&root.0).unwrap();
+    assert!(
+        trust_certify::proof_artifacts::certify_vc_with_artifacts(
+            &bridge_replay_test_vc(),
+            &root.0,
+        )
+        .is_some()
+    );
+    assert_eq!(store.publish_session(&root.0).unwrap(), 1);
+    // Trust: preparation configures exact-key lazy import, without eagerly
+    // copying the pool. The warm child below must actually replay the proof
+    // in the current kernel while dispatching no AY query.
+    store.prepare_session(&root.0).unwrap();
+    let mut counts = Vec::new();
+    for mode in ["cold", "warm", "changed"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "trust_verify::tests::v1_bridge_replay_child", "--nocapture"])
+            .env("TRUST_TEST_BRIDGE_REPLAY_MODE", mode)
+            .env("TRUST_TEST_BRIDGE_REPLAY_ROOT", &root.0)
+            .env("TRUST_AY_SMT_TRACE", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let count = stderr.matches("[aysmt] ---- program handed to ay ----").count();
+        if mode == "warm" {
+            assert_eq!(count, 0, "{stderr}");
+        } else {
+            assert!(count > 0, "{mode} must actually reach AY: {stderr}");
+        }
+        counts.push((mode, count));
+    }
+    eprintln!("native bridge AY dispatches: {counts:?}");
+}
+
+fn unresolved_loop_bridge_fixture() -> (trust_types::VerifiableFunction, VerificationCondition) {
+    use trust_types::{
+        BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, Statement, Terminator, Ty,
+    };
+    let assign = |destination, source| Statement::Assign {
+        place: Place::local(destination),
+        rvalue: Rvalue::Use(Operand::Copy(Place::local(source))),
+        span: SourceSpan::default(),
+    };
+    let function = trust_types::VerifiableFunction {
+        name: "test::f".into(),
+        def_path: "test::f".into(),
+        span: SourceSpan::default(),
+        body: trust_types::VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: Ty::usize(), name: Some("len".into()) },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("hi".into()) },
+                LocalDecl { index: 3, ty: Ty::usize(), name: Some("index".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![assign(2, 1)],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![assign(3, 2)],
+                    terminator: Terminator::Goto(BlockId(2)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![assign(2, 2)],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+            ],
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    let mut gap = test_vc(440);
+    gap.kind = VcKind::UnsupportedMir {
+        kind: "UserLoopContractUnsupported".into(),
+        detail: "e4.machine.mixed-domain".into(),
+    };
+    (function, gap)
+}
+
+fn loop_bridge_query(raw: Formula, facts: Vec<Formula>) -> VerificationCondition {
+    let mut vc = test_vc(441);
+    vc.kind = VcKind::SliceBoundsCheck;
+    vc.formula = Formula::And(facts.iter().cloned().chain(std::iter::once(raw.clone())).collect());
+    vc.obligation = Some(trust_types::ObligationRecord {
+        body: raw,
+        wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }],
+        subject: None,
+        width: None,
+    });
+    vc
+}
+
+#[test]
+fn v1_bridge_unresolved_loop_sat_is_held_before_substitution_and_stays_strict() {
+    let (function, gap) = unresolved_loop_bridge_fixture();
+    let var = |name: &str| Formula::Var(name.into(), Sort::Int);
+    let vc = loop_bridge_query(
+        Formula::Ge(Box::new(var("index")), Box::new(var("len"))),
+        vec![
+            Formula::Eq(Box::new(var("index")), Box::new(var("hi#s0_0_s2_0"))),
+            Formula::Eq(Box::new(var("hi#s0_0_s2_0")), Box::new(Formula::Int(1))),
+            Formula::Eq(Box::new(var("len")), Box::new(Formula::Int(0))),
+        ],
+    );
+    let obligation = authority_test_native_obligation("bridge:loop-gap", 441, 441);
+    let mut baseline_bindings = vec![test_binding_for_obligation(0, &vc, &obligation)];
+    let (_, _, baseline_failed, _) = bridge_v1_ay_proofs_into_native_results(
+        5000,
+        None,
+        std::slice::from_ref(&vc),
+        &mut baseline_bindings,
+        true,
+        vec![(vc.clone(), bridge_test_unknown())],
+    );
+    assert_eq!(baseline_failed, 1, "the unprotected generic bridge really credits this SAT query");
+    // Production preclassifies UnsupportedMir as Unknown in the second
+    // carrier. The solver slice has no gap row; both carriers are required.
+    let inventory = vec![vc.clone()];
+    let classified = vec![(gap.clone(), bridge_test_unknown())];
+    let scope =
+        trust_vcgen::GenericRefutationScope::for_function(&function, &inventory, &classified);
+    let mut bindings = vec![test_binding_for_obligation(0, &vc, &obligation), None];
+    let original = serde_json::to_value(&vc).unwrap();
+    let original_gap = serde_json::to_value(&classified[0]).unwrap();
+    let (results, proved, failed, eligible) =
+        super::bridge_v1_ay_proofs_into_native_results_with_scope(
+            &scope,
+            5000,
+            trust_types::determinism::EffortScale::BUILTIN,
+            None,
+            &inventory,
+            &mut bindings,
+            &mut ClockStops::default(),
+            true,
+            vec![(vc.clone(), bridge_test_unknown()), classified[0].clone()],
+            None,
+        );
+    assert_eq!((proved, failed, results.len()), (0, 0, 2));
+    assert_eq!(serde_json::to_value(&results[0].0).unwrap(), original);
+    assert_eq!(serde_json::to_value(&results[1]).unwrap(), original_gap);
+    assert!(matches!(&results[0].1, VerificationResult::Unknown { reason, .. }
+        if reason.starts_with(trust_vcgen::GENERIC_REFUTATION_HELD_PREFIX)));
+    assert!(eligible.iter().all(Option::is_none));
+    assert!(result_is_held_assert_refutation(&results[0].1), "no runtime-check tolerance");
+    assert!(
+        strict_l0_verification_failure(
+            true,
+            &results,
+            &bindings,
+            &[],
+            None,
+            &OpenDispatchRefutationWitnesses::default()
+        )
+        .is_some(),
+        "original strict refusal remains"
+    );
+}
+
+#[test]
+fn v1_bridge_generic_hold_preserves_native_stops_and_strict_refusal() {
+    use trust_types::determinism::StopCause;
+    let (function, gap) = unresolved_loop_bridge_fixture();
+    let var = |name: &str| Formula::Var(name.into(), Sort::Int);
+    let vc = loop_bridge_query(
+        Formula::Ge(Box::new(var("index")), Box::new(var("len"))),
+        vec![
+            Formula::Eq(Box::new(var("index")), Box::new(var("hi#s0_0_s2_0"))),
+            Formula::Eq(Box::new(var("hi#s0_0_s2_0")), Box::new(Formula::Int(1))),
+            Formula::Eq(Box::new(var("len")), Box::new(Formula::Int(0))),
+        ],
+    );
+    let inventory = vec![vc.clone()];
+    let classified = vec![(gap, bridge_test_unknown())];
+    let scope =
+        trust_vcgen::GenericRefutationScope::for_function(&function, &inventory, &classified);
+    let obligation = authority_test_native_obligation("bridge:held-stop", 441, 441);
+    let mut previous = StopCause::ALL
+        .into_iter()
+        .map(|cause| cause.unknown_result("native-held-stop", 17, "native search retained"))
+        .collect::<Vec<_>>();
+    previous.push(VerificationResult::Unknown {
+        solver: "native-bare".into(),
+        time_ms: 19,
+        reason: "native cause unavailable".into(),
+    });
+    previous.push(VerificationResult::Timeout { solver: "native-timeout".into(), timeout_ms: 77 });
+    for prior in previous {
+        let cause = StopCause::of_result(&prior);
+        let mut bindings = vec![test_binding_for_obligation(0, &vc, &obligation), None];
+        let before = serde_json::to_value(&vc).unwrap();
+        let (results, proved, failed, eligible) =
+            bridge_v1_ay_proofs_into_native_results_with_scope(
+                &scope,
+                5000,
+                trust_types::determinism::EffortScale::BUILTIN,
+                None,
+                &inventory,
+                &mut bindings,
+                &mut ClockStops::default(),
+                true,
+                vec![(vc.clone(), prior), classified[0].clone()],
+                None,
+            );
+        assert_eq!((proved, failed), (0, 0));
+        assert_eq!(serde_json::to_value(&results[0].0).unwrap(), before);
+        assert_eq!(StopCause::of_result(&results[0].1), cause);
+        assert!(result_is_held_assert_refutation(&results[0].1));
+        assert!(result_is_held_generic_refutation(&results[0].1));
+        assert!(eligible.iter().all(Option::is_none));
+        assert!(
+            strict_l0_verification_failure(
+                true,
+                &results,
+                &bindings,
+                &[],
+                None,
+                &OpenDispatchRefutationWitnesses::default()
+            )
+            .is_some()
+        );
+    }
+}
+
+#[test]
+fn v1_bridge_unresolved_loop_scope_preserves_independent_sat_and_unsat() {
+    let (function, gap) = unresolved_loop_bridge_fixture();
+    let var = |name: &str| Formula::Var(name.into(), Sort::Int);
+    for (query, expected_failed, expected_proved) in [
+        (loop_bridge_query(Formula::Ge(Box::new(var("len")), Box::new(var("len"))), vec![]), 1, 0),
+        (
+            loop_bridge_query(
+                Formula::Ge(Box::new(var("index")), Box::new(var("len"))),
+                vec![
+                    Formula::Eq(Box::new(var("index")), Box::new(Formula::Int(0))),
+                    Formula::Eq(Box::new(var("len")), Box::new(Formula::Int(1))),
+                ],
+            ),
+            0,
+            1,
+        ),
+    ] {
+        let inventory = vec![query.clone()];
+        let classified = vec![(gap.clone(), bridge_test_unknown())];
+        let scope =
+            trust_vcgen::GenericRefutationScope::for_function(&function, &inventory, &classified);
+        let obligation = authority_test_native_obligation("bridge:loop-control", 441, 441);
+        let mut bindings = vec![test_binding_for_obligation(0, &query, &obligation), None];
+        let original_gap = serde_json::to_value(&classified[0]).unwrap();
+        let (results, proved, failed, _) =
+            super::bridge_v1_ay_proofs_into_native_results_with_scope(
+                &scope,
+                5000,
+                trust_types::determinism::EffortScale::BUILTIN,
+                None,
+                &inventory,
+                &mut bindings,
+                &mut ClockStops::default(),
+                true,
+                vec![(query.clone(), bridge_test_unknown()), classified[0].clone()],
+                None,
+            );
+        assert_eq!((failed, proved), (expected_failed, expected_proved));
+        assert_eq!(results.len(), 2);
+        assert_eq!(serde_json::to_value(&results[1]).unwrap(), original_gap);
+        assert_eq!(
+            serde_json::to_value(&results[0].0).unwrap(),
+            serde_json::to_value(&query).unwrap()
+        );
+    }
+}
 
 /// Trust: the value a DEFAULT session would hand
 /// `verify_full_bundle_with_live_receipts` — `-Ztrust-verify-timeout-ms`'s
@@ -39,6 +483,45 @@ fn native_proved_authority_validation_failures(
         proof_authorities,
         |_| None,
     )
+}
+
+#[test]
+fn native_authority_integrity_refusal_preserves_the_validator_defect() {
+    let obligation = authority_test_native_obligation("authority:integrity-diagnostic", 64, 64);
+    let mut run = authority_test_strict_native_run(obligation);
+    run.validate_derived_state().expect("the unmodified fixture is canonical");
+    run.summary.proved += 1;
+    let defect = run.validate_derived_state().expect_err("the forged count must be rejected");
+    assert!(defect.contains("summary"));
+
+    let failures = native_proved_authority_validation_failures(Some(&run), &[], &[], &[]);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].starts_with("native run derived state is invalid: "));
+    assert!(failures[0].contains(&defect), "the compiler must preserve the validator's reason");
+}
+
+#[test]
+fn native_authority_carrier_refusal_identifies_the_skewed_inventory() {
+    let obligation = authority_test_native_obligation("authority:carrier-diagnostic", 65, 65);
+    let run = authority_test_strict_native_run(obligation);
+    run.validate_derived_state().expect("the native run is canonical");
+    let results = vec![(test_vc(65), authority_test_proved())];
+
+    for (binding_count, authority_count) in [(0, 1), (1, 0), (2, 1)] {
+        let bindings = std::iter::repeat_with(|| None).take(binding_count).collect::<Vec<_>>();
+        let authorities = std::iter::repeat_with(|| None).take(authority_count).collect::<Vec<_>>();
+        let failures = native_proved_authority_validation_failures(
+            Some(&run),
+            &results,
+            &bindings,
+            &authorities,
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("not row-aligned"));
+        assert!(failures[0].contains("results=1"));
+        assert!(failures[0].contains(&format!("bindings={binding_count}")));
+        assert!(failures[0].contains(&format!("authorities={authority_count}")));
+    }
 }
 
 #[test]
@@ -204,7 +687,7 @@ fn r1_synthetic_substitution_honors_and_restores_ambient_deadline() {
     {
         let _budget = trust_types::verify_budget::VerifyBudgetGuard::install(
             Some(std::time::Instant::now()),
-            0,
+            u64::MAX,
         );
         assert_eq!(
             resolve_r1_synthetic_substitution_batch(
@@ -685,6 +1168,19 @@ fn unsafe_demand_refutation_spares_genuinely_discharged_separation_obligations()
         "failed:structural-unsafe-demand-finding",
         "an undischarged solvable unsafe obligation still fails closed"
     );
+    // Trust (honest label): every row the pass forced is a fail-closed
+    // failure with NO counterexample, and every report surface reads it as
+    // such; the two proofs it spared have no failure basis at all.
+    for index in [0, 1, 4] {
+        assert_eq!(
+            trust_types::FailureBasis::of_result(&results[index].1),
+            Some(trust_types::FailureBasis::UnprovedFailClosed),
+            "row {index} was forced Failed without a refutation"
+        );
+    }
+    for index in [2, 3] {
+        assert_eq!(trust_types::FailureBasis::of_result(&results[index].1), None);
+    }
 }
 
 /// Trust (vacuous-placeholder-proof arm): `Bool(false)` — the full-lane
@@ -737,6 +1233,111 @@ fn unsafe_demand_refutation_refutes_placeholder_proofs_for_vacuity() {
         }
         other => panic!("a `Proved` placeholder row must be forced Failed, got {other:?}"),
     }
+    // Trust (honest label): refused for vacuity, not refuted.
+    assert_eq!(
+        trust_types::FailureBasis::of_result(&results[0].1),
+        Some(trust_types::FailureBasis::UnprovedFailClosed)
+    );
+    assert_eq!(
+        verification_result_state_label(&results[0].1),
+        "FAILED (unproved, no counterexample; failed closed)"
+    );
+}
+
+/// Trust (honest label, 2026-10-02): the per-row state word never calls a
+/// fail-closed unsafe-demand row "refuted", while a backend refutation keeps
+/// its word. The outcome is `Failed` in both — only the description differs.
+#[test]
+fn unsafe_demand_fail_closed_rows_are_not_labelled_refuted() {
+    let mut vc = test_vc(17);
+    vc.kind = VcKind::Assertion {
+        message: "[unsafe:unmodeled-call] call to `c` (unsafe fn) is not covered".to_string(),
+    };
+    vc.formula = Formula::Bool(true);
+    let mut results = vec![(
+        vc,
+        VerificationResult::Unknown {
+            solver: "trust-full-verifier".into(),
+            time_ms: 0,
+            reason: "native typed-TrustIr lowering did not complete".to_string(),
+        },
+    )];
+    refute_unsafe_demand_findings(&mut results);
+    assert!(results[0].1.is_failed(), "the row must still FAIL the gate");
+    assert_eq!(
+        verification_result_state_label(&results[0].1),
+        "FAILED (unproved, no counterexample; failed closed)"
+    );
+    // CONTROL: a backend refutation keeps the historical word.
+    let refuted =
+        VerificationResult::Failed { solver: "ay".into(), time_ms: 0, counterexample: None };
+    assert_eq!(verification_result_state_label(&refuted), "FAILED (refuted)");
+}
+
+#[test]
+fn unsafe_demand_definite_violations_keep_reading_as_refuted() {
+    // A double free / use-after-free the separation model established on every
+    // reaching execution is a FOUND violation: when the native lane returns
+    // Unknown (or an unwitnessed Proved) and this pass forces it Failed, it
+    // must not read "unproved, no counterexample" like an unmodelled call.
+    let definite = |message: &str| {
+        let mut vc = test_vc(18);
+        vc.kind = VcKind::Assertion { message: message.to_string() };
+        vc.formula = Formula::Bool(true);
+        vc
+    };
+    let unknown = || VerificationResult::Unknown {
+        solver: "trust-full-verifier".into(),
+        time_ms: 0,
+        reason: "native typed-TrustIr lowering did not complete".to_string(),
+    };
+    let mut reconstructed = test_vc(19);
+    reconstructed.kind = VcKind::HardenedBoundary {
+        category: trust_types::HardenedVcCategory::UnsafeOperation,
+        callee: String::new(),
+        detail: "[unsafe:sep:heap] use-after-free: write through freed pointer `p`".to_string(),
+    };
+    reconstructed.formula = Formula::Bool(false);
+    let mut results = vec![
+        (definite("[unsafe:sep:free] double-free of `arg_1` (prov#1) in append"), unknown()),
+        (definite("[unsafe:sep:heap] use-after-free: read through freed pointer `p`"), unknown()),
+        (
+            reconstructed,
+            VerificationResult::Proved {
+                solver: "ay-in-process".into(),
+                time_ms: 0,
+                strength: trust_types::ProofStrength::smt_unsat(),
+                proof_certificate: None,
+                solver_warnings: None,
+                native_proof_envelope: None,
+            },
+        ),
+        // CONTROL: a non-definite constant row in the same family stays fail-closed.
+        (definite("[unsafe] missing SAFETY comment on unsafe block"), unknown()),
+    ];
+    refute_unsafe_demand_findings(&mut results);
+    for (_, result) in &results {
+        assert!(result.is_failed(), "every row must still FAIL the gate: {result:?}");
+    }
+    for (_, result) in &results[..3] {
+        let VerificationResult::Failed { solver, counterexample, .. } = result else {
+            unreachable!()
+        };
+        assert!(
+            solver.as_str().starts_with(trust_types::UNSAFE_DEMAND_DEFINITE_SOLVER),
+            "{solver}"
+        );
+        assert!(counterexample.is_none());
+        assert_eq!(
+            trust_types::FailureBasis::of_result(result),
+            Some(trust_types::FailureBasis::Refuted)
+        );
+        assert_eq!(verification_result_state_label(result), "FAILED (refuted)");
+    }
+    assert_eq!(
+        trust_types::FailureBasis::of_result(&results[3].1),
+        Some(trust_types::FailureBasis::UnprovedFailClosed)
+    );
 }
 
 #[test]
@@ -783,15 +1384,132 @@ fn forced_allocation_after_backend_decline_is_an_explicit_structural_refutation(
     assert!(counterexample.is_none());
 }
 
+/// An origin-inventory row an overflow `Assert` in `block` minted: its block, its site and
+/// the row's tree.
+fn assert_row(
+    block: usize,
+    vc: VerificationCondition,
+) -> (usize, trust_vcgen::OriginSite, VerificationCondition) {
+    (block, trust_vcgen::OriginSite::Assert, vc)
+}
+
+/// The origin table of `listed`. T3 L4 (C07): an inventory names each row by its id in
+/// the body's context, so the rows are interned into a fresh context first, as the
+/// consumed generation interns its own, and the table reads each one back for its key,
+/// beside its eager row (`eager_rows_by_id`), as the consumed path does.
+fn origins_of(
+    listed: &[(usize, trust_vcgen::OriginSite, VerificationCondition)],
+) -> OverflowCheckOrigins {
+    let mut context = trust_types::vc_context::VcContext::new();
+    let rows: Vec<trust_vcgen::OriginRow> = listed
+        .iter()
+        .map(|(block, site, vc)| trust_vcgen::OriginRow {
+            block: trust_types::BlockId(*block),
+            site: *site,
+            vc: context.push_checked_row(vc).expect("a test context has room"),
+        })
+        .collect();
+    let eager = eager_rows_by_id(&rows, listed.iter().map(|(_, _, vc)| vc));
+    OverflowCheckOrigins::from_rows(&context, &eager, &rows)
+        .expect("every listed row is a generated row")
+}
+
+/// Each origin's eager row by the id the origin names it by.
+fn eager_rows_by_id<'vc>(
+    rows: &[trust_vcgen::OriginRow],
+    vcs: impl IntoIterator<Item = &'vc VerificationCondition>,
+) -> FxHashMap<trust_types::vc_context::RowId, &'vc VerificationCondition> {
+    rows.iter().map(|row| row.vc).zip(vcs).collect()
+}
+
+/// T3 L4 (C07): an origin that names a row the generation did not return (here, a row of
+/// another context) means the inventory no longer lines up with the generation: no table,
+/// so every check is kept.
+#[test]
+fn an_origin_naming_another_contexts_row_gives_no_table() {
+    let vc = test_vc(15);
+    let mut other = trust_types::vc_context::VcContext::new();
+    let foreign = trust_vcgen::OriginRow {
+        block: trust_types::BlockId(1),
+        site: trust_vcgen::OriginSite::Assert,
+        vc: other.push_checked_row(&vc).expect("a test context has room"),
+    };
+    let mut context = trust_types::vc_context::VcContext::new();
+    let own = trust_vcgen::OriginRow {
+        vc: context.push_checked_row(&vc).expect("a test context has room"),
+        ..foreign
+    };
+    let eager = eager_rows_by_id(&[own], [&vc]);
+    assert!(OverflowCheckOrigins::from_rows(&context, &eager, &[own]).is_some(), "control");
+    assert!(OverflowCheckOrigins::from_rows(&context, &eager, &[own, foreign]).is_none());
+}
+
+/// T3 L4 (C07; L4-ORACLE-1): the eager row decides an origin's key. A row whose read-back
+/// disagrees with its eager row (here, an id that names a different row of the context)
+/// is keyed by its eager row, so the table is the one the eager rows give.
+#[test]
+fn an_origin_is_keyed_by_its_eager_row_when_the_read_back_disagrees() {
+    let (named, read) = (test_vc(16), test_vc(17));
+    let (named_key, read_key) = (
+        RowKey::of(&named).expect("canonical payload"),
+        RowKey::of(&read).expect("canonical payload"),
+    );
+    assert_ne!(named_key, read_key);
+    let mut context = trust_types::vc_context::VcContext::new();
+    let row = trust_vcgen::OriginRow {
+        block: trust_types::BlockId(3),
+        site: trust_vcgen::OriginSite::Assert,
+        vc: context.push_checked_row(&read).expect("a test context has room"),
+    };
+    // The origin's id reads back as `read`, but the generation returned `named` under it.
+    let eager = eager_rows_by_id(&[row], [&named]);
+    let origins = OverflowCheckOrigins::from_rows(&context, &eager, &[row]).expect("a table");
+    assert_eq!(origins.resolve(&named_key), Some(BasicBlock::from_usize(3)));
+    assert_eq!(origins.resolve(&read_key), None, "the read-back never spells the key");
+}
+
+/// T3 C05: a key only an arithmetic STATEMENT produced never resolves, alone or beside
+/// the same block's statement again; beside an Assert's row (in the same block or
+/// another) it makes the key ambiguous. So a block that ends in `Assert(Overflow(Add))`
+/// and also holds a plain integer `Add` cannot lose its Assert on the plain operation's
+/// proof, which gate (5)'s op-only re-confirm would otherwise accept.
+#[test]
+fn overflow_check_origins_never_resolve_a_statement_row() {
+    let statement =
+        |block: usize, vc: VerificationCondition| (block, trust_vcgen::OriginSite::Statement, vc);
+    let plain = test_vc(13);
+    let checked = test_vc(14);
+    let plain_key = RowKey::of(&plain).expect("canonical payload");
+    let checked_key = RowKey::of(&checked).expect("canonical payload");
+    assert_ne!(plain_key, checked_key);
+
+    // One block, its statement's row and its Assert's row: only the Assert resolves.
+    let origins = origins_of(&[
+        statement(2, plain.clone()),
+        statement(2, plain.clone()),
+        assert_row(2, checked.clone()),
+    ]);
+    assert_eq!(origins.resolve(&plain_key), None);
+    assert_eq!(
+        origins.0.get(&plain_key),
+        Some(&OverflowOrigin::Statement(BasicBlock::from_usize(2)))
+    );
+    assert_eq!(origins.audit_miss(&plain_key), "statement");
+    assert_eq!(origins.resolve(&checked_key), Some(BasicBlock::from_usize(2)), "control");
+
+    // A statement row with the Assert row's own key, in the same block or another.
+    for block in [2, 5] {
+        let origins =
+            origins_of(&[assert_row(2, checked.clone()), statement(block, checked.clone())]);
+        assert_eq!(origins.0.get(&checked_key), Some(&OverflowOrigin::Ambiguous), "bb{block}");
+    }
+}
+
 #[test]
 fn overflow_check_origins_preserve_repeated_rows_from_one_block() {
     let vc = test_vc(7);
-    let canonical_vc =
-        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
-    let origins = OverflowCheckOrigins::from_pairs(&[
-        (trust_types::BlockId(3), vc.clone()),
-        (trust_types::BlockId(3), vc),
-    ]);
+    let canonical_vc = RowKey::of(&vc).expect("test VC must have a canonical payload");
+    let origins = origins_of(&[assert_row(3, vc.clone()), assert_row(3, vc)]);
 
     assert_eq!(
         origins.resolve(&canonical_vc),
@@ -803,12 +1521,8 @@ fn overflow_check_origins_preserve_repeated_rows_from_one_block() {
 #[test]
 fn overflow_check_origins_fail_closed_for_identical_vcs_from_distinct_blocks() {
     let vc = test_vc(8);
-    let canonical_vc =
-        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
-    let origins = OverflowCheckOrigins::from_pairs(&[
-        (trust_types::BlockId(4), vc.clone()),
-        (trust_types::BlockId(9), vc),
-    ]);
+    let canonical_vc = RowKey::of(&vc).expect("test VC must have a canonical payload");
+    let origins = origins_of(&[assert_row(4, vc.clone()), assert_row(9, vc)]);
 
     assert_eq!(
         origins.resolve(&canonical_vc),
@@ -818,7 +1532,7 @@ fn overflow_check_origins_fail_closed_for_identical_vcs_from_distinct_blocks() {
     assert_eq!(origins.0.get(&canonical_vc), Some(&OverflowOrigin::Ambiguous));
 }
 
-/// WHY `trust_vcgen::overflow_vc_block_origins` RETURNS AN `Option` AND WHY A REFUSAL
+/// WHY `trust_vcgen::OverflowOrigins::complete` RETURNS AN `Option` AND WHY A REFUSAL
 /// MUST NOT DEGRADE TO "the rows I did manage to build".
 ///
 /// `Ambiguous` is not a property of a row — it is a property of the ENUMERATION. The
@@ -827,24 +1541,23 @@ fn overflow_check_origins_fail_closed_for_identical_vcs_from_distinct_blocks() {
 /// mints `Unique` and licenses a rewrite. Nothing downstream can detect the difference,
 /// because a short table and a complete one have the same type and the same shape.
 ///
-/// So completeness has to be decided where it is known — inside the replay, which is the
-/// only code that can tell "the walk ended" from "the walk was cut off" — and a refusal
-/// has to arrive as `None`, never as a partial `Vec`.
+/// So completeness has to be decided where it is known — inside the generation, which
+/// is the only code that can tell "the walk ended" from "the walk was cut off" (T3 C05:
+/// the consumed generation's own walk, no longer a replay) — and a refusal has to
+/// arrive as `None`, never as a partial `Vec`.
 #[test]
 fn a_truncated_origin_enumeration_forges_a_unique_origin() {
     let vc = test_vc(11);
-    let canonical_vc =
-        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
-    let complete =
-        [(trust_types::BlockId(4), vc.clone()), (trust_types::BlockId(9), vc.clone())];
+    let canonical_vc = RowKey::of(&vc).expect("test VC must have a canonical payload");
+    let complete = [assert_row(4, vc.clone()), assert_row(9, vc.clone())];
 
     assert_eq!(
-        OverflowCheckOrigins::from_pairs(&complete).resolve(&canonical_vc),
+        origins_of(&complete).resolve(&canonical_vc),
         None,
         "the COMPLETE enumeration is ambiguous and must refuse"
     );
     assert_eq!(
-        OverflowCheckOrigins::from_pairs(&complete[..1]).resolve(&canonical_vc),
+        origins_of(&complete[..1]).resolve(&canonical_vc),
         Some(BasicBlock::from_usize(4)),
         "a PREFIX of that same enumeration mints Unique(bb4) — the elision seam would \
          then delete bb4's live overflow Assert on the authority of a proof that is \
@@ -853,20 +1566,20 @@ fn a_truncated_origin_enumeration_forges_a_unique_origin() {
     );
 }
 
-/// The refusal path is INERT, not merely smaller: a `None` from the replay becomes the
-/// default table, every `resolve` misses, and every overflow check is kept.
+/// The refusal path is INERT, not merely smaller: a generation with no complete origin
+/// inventory becomes the default table, every `resolve` misses, and every overflow check
+/// is kept.
 #[test]
-fn a_refused_origin_replay_yields_an_inert_table() {
+fn a_refused_origin_inventory_yields_an_inert_table() {
     let vc = test_vc(12);
-    let canonical_vc =
-        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
+    let canonical_vc = RowKey::of(&vc).expect("test VC must have a canonical payload");
 
     let refused = OverflowCheckOrigins::default();
     assert!(refused.0.is_empty());
     assert_eq!(
         refused.resolve(&canonical_vc),
         None,
-        "a declined replay must license no elision at all"
+        "a generation with no complete inventory must license no elision at all"
     );
 }
 
@@ -875,24 +1588,57 @@ fn overflow_check_origins_key_by_exact_vc_not_source_span() {
     let true_vc = test_vc(9);
     let mut false_vc = true_vc.clone();
     false_vc.formula = Formula::Bool(false);
-    let true_key =
-        canonical_exact_vc_payload(&true_vc).expect("true test VC must have a canonical payload");
-    let false_key =
-        canonical_exact_vc_payload(&false_vc).expect("false test VC must have a canonical payload");
+    let true_key = RowKey::of(&true_vc).expect("true test VC must have a canonical payload");
+    let false_key = RowKey::of(&false_vc).expect("false test VC must have a canonical payload");
     assert_ne!(true_key, false_key, "the formula must participate in the origin identity");
 
-    let origins = OverflowCheckOrigins::from_pairs(&[
-        (trust_types::BlockId(5), true_vc),
-        (trust_types::BlockId(6), false_vc),
-    ]);
+    let origins = origins_of(&[assert_row(5, true_vc), assert_row(6, false_vc)]);
 
     assert_eq!(origins.resolve(&true_key), Some(BasicBlock::from_usize(5)));
     assert_eq!(origins.resolve(&false_key), Some(BasicBlock::from_usize(6)));
     assert_eq!(
-        origins.resolve("not a canonical verification condition"),
+        origins.resolve(&RowKey::unidentified_for_test("not a canonical verification condition")),
         None,
         "an absent exact identity must never inherit authority from a nearby source span"
     );
+}
+
+#[test]
+fn original_vc_snapshot_uses_full_original_claim_and_final_row_identity() {
+    // Trust: a native-selected BV formula is not the original typed Int VC.
+    let base = test_vc(10);
+    let target = "aarch64-apple-darwin;ptr64";
+    let result = VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("snapshot-control"),
+        time_ms: 0,
+        reason: "no proof claim".into(),
+    };
+    let rows = build_transport_results_with_runtime_checks_for_target(
+        true,
+        Some(target),
+        &[(base.clone(), result)],
+        None,
+        Some(&[None]),
+        &FxHashMap::default(),
+    );
+    let row = &rows[0];
+    let snapshot = row.original_vc_snapshot.as_ref().expect("original full VC persisted");
+    let id = row.obligation_id.as_deref().expect("final row ID");
+    let digest = row.claim_digest_sha256.as_deref().unwrap();
+    let decoded = snapshot.decode_for_row(id, digest).unwrap();
+    assert_eq!(canonical_exact_vc_payload(&decoded), canonical_exact_vc_payload(&base));
+    assert!(snapshot.decode_for_row("different-request-row", digest).is_err());
+    let mut substituted = snapshot.as_ref().clone();
+    let mut replacement = base.clone();
+    replacement.formula = trust_types::Formula::BitVec { value: 0, width: 64 };
+    substituted.original_vc_json = serde_json::to_string(&replacement).unwrap();
+    substituted.payload_sha256 =
+        trust_types::stable_sha256_hex(substituted.original_vc_json.as_bytes());
+    assert!(
+        substituted.decode_for_row(id, digest).is_err(),
+        "native BV cannot replace the original claim"
+    );
+    assert!(row.proof_evidence.is_none(), "snapshot does not manufacture proof evidence");
 }
 
 #[test]
@@ -914,7 +1660,7 @@ fn exact_vc_claim_digest_binds_every_claim_dimension() {
     assert_eq!(payload["schema"], EXACT_VC_CLAIM_SCHEMA_VERSION);
     assert_eq!(payload["semantics"]["overflow_checks"], false);
     assert!(payload["semantics"]["target"].is_null());
-    assert!(payload.get("vc").is_some(), "schema wrapper must retain the complete VC");
+    assert!(payload.get("vc").is_some(), "schema wrapper must bind the VC (claim v3, C09w)");
     let unknown = VerificationResult::Unknown {
         solver: trust_types::Symbol::intern("mock"),
         time_ms: 1,
@@ -1312,10 +2058,14 @@ fn certified_row_carries_clean_cic_artifact_and_constructive_certified_metadata(
     assert_eq!(pe.status, TransportProofStatus::Proved);
     assert_eq!(pe.strength.as_ref(), Some(&expected_strength));
     assert_eq!(
-        pe.evidence.as_ref(),
-        Some(&trust_types::ProofEvidence::from(expected_strength)),
+        pe.evidence.as_ref().map(trust_types::ProofEvidence::without_kernel_reference),
+        Some(trust_types::ProofEvidence::from(expected_strength)),
         "ProofStrength and ProofEvidence must describe the same kernel-certified constructive proof"
     );
+    // KR0 switch: and the evidence names the reference entry's theory.
+    let evidence = pe.evidence.as_ref().expect("evidence");
+    assert!(evidence.is_certified());
+    assert_eq!(evidence.kernel_theory, Some(trust_types::KernelTheoryId::LeanReferenceV1));
     assert_eq!(pe.artifacts.len(), 1, "CleanCic publication has one exact payload artifact");
     let artifact = &pe.artifacts[0];
     assert_eq!(artifact.kind, "clean_cic");
@@ -1331,6 +2081,556 @@ fn certified_row_carries_clean_cic_artifact_and_constructive_certified_metadata(
     );
     let expected_uri = format!("trust-certify://clean-cic/{digest}");
     assert_eq!(artifact.uri.as_deref(), Some(expected_uri.as_str()));
+}
+
+/// Trust: E9 evidence. An `EnsuresCitationDischarge` row ships the SAME
+/// `clean_cic` transport artifact a `KernelCertified` row does — and ONLY when
+/// the authority retained a real kernel-audited payload for exactly that row:
+///
+/// * positive: a genuine cited-theorem certificate, bound to the row, reaches
+///   the wire as one content-addressed `clean_cic` artifact that the paired
+///   `trust_certify` rechecker still accepts after the JSON round trip;
+/// * close negative twin: the identical authority WITHOUT a payload ships no
+///   `proof_evidence` at all and, since the KR0 review, authorizes no row (the
+///   row is not Proved);
+/// * moved-row control: the payload-bearing authority presented at another
+///   row index loses row authority, so nothing attaches there either.
+#[test]
+fn ensures_citation_discharge_row_carries_its_kernel_audited_clean_cic_artifact() {
+    use trust_certify::clean_island::{
+        EnsuresDischargeClause, EnsuresDischargeRoute, admit_certified_island_definition,
+        certify_ensures_discharge, recheck_ensures_discharge,
+    };
+    let mut session = trust_certify::clean_island::CleanIslandSession::new();
+    let outcome = session.check(
+        "def keep_isl (x : UInt64) : UInt64 := x\n\n\
+         theorem u64_ge_refl : forall (x : UInt64), \
+             Nat.le (UInt64.toNat x) (UInt64.toNat x) := \
+             fun x => Nat.le.refl (UInt64.toNat x)",
+    );
+    assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+    let env = session.environment().expect("untainted session");
+    let mut facets = trust_spec_elab::FacetTable::new();
+    admit_certified_island_definition(env, "keep_isl", &mut facets).expect("self admission");
+    let params: &[(&str, &str)] = &[("x", "u64")];
+    let clauses = [EnsuresDischargeClause {
+        clause_src: "result >= x",
+        route: EnsuresDischargeRoute::CitedTheorem("u64_ge_refl"),
+        facets: &facets,
+    }];
+    // Trust (nat-lift): the FIFTH E9 site takes the same clause inputs the
+    // discharge lanes run with. This surface carries no lift, so it must
+    // mint byte-identically under them.
+    let lift_inputs = trust_spec_elab::ProofClauseInputs::proof_lift(Some("u64"));
+    let certificate = certify_ensures_discharge(env, &clauses, params, "keep_isl", &lift_inputs)
+        .expect("a kernel-certified citation must mint its payload");
+
+    let vc = VerificationCondition {
+        kind: VcKind::Postcondition,
+        function: trust_types::Symbol::intern("keep_isl"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: 3,
+            col_start: 13,
+            line_end: 3,
+            col_end: 24,
+        },
+        formula: trust_types::Formula::Bool(true),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let proved = VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("clean-kernel-citation"),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat_certified(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let results = vec![(vc.clone(), proved.clone())];
+    // KR0 switch: the E9 surface's judgment passed the reference entry, and
+    // the row's payload carries exactly that certificate (the positive control
+    // that the E9 lane calls the entry AND registers its certificate beside the
+    // payload it ships).
+    let e9_reference =
+        certificate.reference().cloned().expect("the reference entry accepts the E9 judgment");
+    assert_eq!(
+        certificate
+            .evidence_for_row(&vc)
+            .as_ref()
+            .and_then(trust_certify::reference_certificate_for)
+            .as_ref(),
+        Some(&e9_reference),
+        "the E9 row's payload must carry the surface's reference certificate"
+    );
+    let authority_with = |evidence, reference| ResultProofAuthority::EnsuresCitationDischarge {
+        row: exact_result_row_identity(0, &vc).expect("canonical row"),
+        theorem: "u64_ge_refl".to_string(),
+        evidence,
+        reference,
+    };
+    let authority = |evidence| authority_with(evidence, e9_reference.clone());
+
+    // Positive.
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &[None],
+        &[],
+        &[Some(authority(certificate.evidence_for_row(&vc)))],
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, Outcome::Proved);
+    let pe = rows[0].proof_evidence.as_ref().expect("the E9 row must carry proof_evidence");
+    assert_eq!(pe.suite, "trust-certify");
+    assert_eq!(pe.backend, "clean-kernel");
+    assert_eq!(pe.status, TransportProofStatus::Proved);
+    assert_eq!(
+        pe.strength.as_ref(),
+        Some(&ProofStrength {
+            reasoning: ReasoningKind::Constructive,
+            assurance: trust_types::AssuranceLevel::Certified,
+        })
+    );
+    assert_eq!(pe.artifacts.len(), 1, "CleanCic publication has one exact payload artifact");
+    let artifact = &pe.artifacts[0];
+    assert_eq!(artifact.kind, "clean_cic");
+    assert_eq!(artifact.format.as_deref(), Some("trust-ir-cleancic-v2"));
+    let payload = artifact.metadata.as_ref().expect("CleanCic payload metadata");
+    let bytes = serde_json::to_vec(payload).expect("serialize exact CleanCic payload");
+    let digest = domain_length_bound_sha256_hex("trustc.transport-clean-cic.v2", &bytes);
+    let expected_id = format!("clean-cic:v2:{digest}");
+    assert_eq!(pe.proof_id.as_deref(), Some(expected_id.as_str()));
+    assert_eq!(artifact.artifact_id.as_deref(), pe.proof_id.as_deref());
+    // The wire payload is still the kernel-audited certificate for THIS row.
+    let decoded: trust_ir::ProofEvidence =
+        serde_json::from_value(payload.clone()).expect("decode the transported CleanCic payload");
+    assert!(recheck_ensures_discharge(
+        env,
+        &clauses,
+        params,
+        "keep_isl",
+        &lift_inputs,
+        &vc,
+        &decoded
+    ));
+
+    // Close negative twin: no payload, no transport evidence. KR0 review: a
+    // payload-free `EnsuresCitationDischarge` has no certificate bound to a
+    // payload, so it authorizes no row at all and the row is not Proved.
+    let bare = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &[None],
+        &[],
+        &[Some(authority(None))],
+    );
+    assert_ne!(bare[0].outcome, Outcome::Proved);
+    assert!(
+        bare[0].proof_evidence.is_none(),
+        "an E9 authority without a kernel-audited payload must ship evidence-free"
+    );
+
+    // KR0 review (fence gap): the E9 payload paired with ANOTHER payload's
+    // genuine reference certificate authorizes nothing: no disposition, no
+    // transport evidence. Control: the positive run above, with its own.
+    let foreign_reference = authority_test_reference(&authority_test_clean_cic(0x6e));
+    assert_ne!(foreign_reference, e9_reference);
+    let foreign = authority_with(certificate.evidence_for_row(&vc), foreign_reference);
+    assert!(!foreign.matches_row(0, &vc, None), "a foreign certificate must not bind the row");
+    assert!(
+        trust_disposition_for_authority(Some(&foreign), 0, &vc, &results[0].1, None).is_none(),
+        "a foreign certificate must not report Certified"
+    );
+    let foreign_rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &[None],
+        &[],
+        &[Some(foreign)],
+    );
+    assert!(
+        foreign_rows[0].proof_evidence.is_none(),
+        "an E9 payload with a foreign reference certificate must ship evidence-free"
+    );
+
+    // Moved-row control: the same authority at index 1 authorizes nothing.
+    let moved = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &[(test_vc(1), proved.clone()), (vc.clone(), proved)],
+        None,
+        &[None, None],
+        &[],
+        &[None, Some(authority(certificate.evidence_for_row(&vc)))],
+    );
+    assert!(
+        moved.iter().all(|row| row.proof_evidence.is_none()),
+        "a payload sealed to row 0 must not attach to any other row"
+    );
+}
+
+/// Trust (ref-self I1) — **the control owner ruling R1 requires**: a row
+/// discharged through the borrow-erased E6 PARAMETER VIEW is NOT reported
+/// `Certified`, anywhere, and hands out NO kernel proof term.
+///
+/// The SAME lane, the SAME row, the SAME cited theorem: the only difference is
+/// which authority variant the one constructor
+/// (`trust_ensures_discharge_authority`) minted. It must change exactly three
+/// things:
+///
+///   * the compiler disposition drops from `Certified`/`Constructive` to
+///     `Trusted`/`Constructive` — and only `Certified` licenses check elision;
+///   * `kernel_evidence_for` hands out NOTHING, so the wire row ships no
+///     `clean_cic` artifact and no proof-evidence envelope. Handing out a proof
+///     term is itself the claim that the kernel checked this row's own
+///     obligation, and `tcb_document_exhaustiveness` enforces that
+///     correspondence in both directions;
+///   * the row is therefore unpublishable through the authenticated lane
+///     (`authenticated_proved_row_has_publication_evidence` is false with no
+///     envelope) — ON EVERY PATH, with no dependence on whether a certificate
+///     happened to be produced, which is the property the earlier
+///     assurance+diagnostic design could not state truthfully.
+///
+/// It must change NOTHING else: the row still counts as proved
+/// (`permits_static_proved_transport_for`), because a lane that does not
+/// produce a verdict produces no capability.
+#[test]
+fn a_view_discharged_row_is_not_reported_certified() {
+    let vc = VerificationCondition {
+        kind: VcKind::Postcondition,
+        function: trust_types::Symbol::intern("k::Point::x_ref"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: 3,
+            col_start: 13,
+            line_end: 3,
+            col_end: 24,
+        },
+        formula: trust_types::Formula::Bool(true),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let proved = |strength: ProofStrength, solver: &str| VerificationResult::Proved {
+        solver: trust_types::Symbol::intern(solver),
+        time_ms: 0,
+        strength,
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    // A genuine `CleanCic` carrier, so the ordinary row really reaches the
+    // evidence block and the two rows differ only in the authority. KR0 switch:
+    // it must be one the reference entry accepted, or no Certified authority
+    // is minted at all (`authority_test_clean_cic`).
+    let evidence = authority_test_clean_cic(0xe6);
+    let row = exact_result_row_identity(0, &vc).expect("canonical row");
+    let ordinary_authority = trust_ensures_discharge_authority(
+        None,
+        None,
+        row.clone(),
+        "x_le_self".to_string(),
+        Some(evidence.clone()),
+    )
+    .expect("a reference-checked payload mints the Certified variant");
+    let view_authority = trust_ensures_discharge_authority(
+        Some(trust_types::e6_param_view::VIEW_MARKER),
+        None,
+        row,
+        "x_le_self".to_string(),
+        // Offered and DROPPED: the constructor is the single place that decides.
+        Some(evidence),
+    )
+    .expect("the view variant needs no reference certificate");
+    assert!(
+        matches!(view_authority, ResultProofAuthority::EnsuresCitationViewDischarge { .. }),
+        "the marker selects the variant"
+    );
+
+    // (a) the DISPOSITION.
+    let ordinary_result = proved(ProofStrength::smt_unsat_certified(), "clean-kernel-citation");
+    let ordinary =
+        trust_disposition_for_authority(Some(&ordinary_authority), 0, &vc, &ordinary_result, None);
+    assert_eq!(
+        ordinary,
+        Some((TrustStatus::Certified, TrustProofStrength::Constructive)),
+        "the ORDINARY import must keep reporting Certified — this lane changes nothing for it"
+    );
+
+    let view_result =
+        proved(ProofStrength::view_erased_constructive(), "clean-kernel-view-citation");
+    let viewed = trust_disposition_for_authority(Some(&view_authority), 0, &vc, &view_result, None);
+    assert_eq!(
+        viewed,
+        Some((TrustStatus::Trusted, TrustProofStrength::Constructive)),
+        "a view-discharged row must come out BELOW Certified: no Certified row may rest on an \
+         unproved aliasing assumption (owner ruling R1)"
+    );
+    assert_ne!(
+        viewed.map(|(status, _)| status),
+        Some(TrustStatus::Certified),
+        "the whole point of the ruling, stated as its own assertion"
+    );
+
+    // (b) the row still COUNTS as proved. A demotion that silently deleted the
+    // verdict would pass every assertion above and deliver nothing.
+    assert!(
+        view_authority.permits_static_proved_transport_for(0, &vc, &view_result, None),
+        "the view row must still be reported proved — `Trusted`, not absent"
+    );
+
+    // (c) NO kernel proof term, hence no wire envelope. This is the assertion
+    // that holds on EVERY path: it does not depend on a certificate existing.
+    assert!(
+        ordinary_authority.kernel_evidence_for(0, &vc, None).is_some(),
+        "the control: the ordinary variant does hand its payload out"
+    );
+    assert!(
+        view_authority.kernel_evidence_for(0, &vc, None).is_none(),
+        "a view row hands out no proof term — that is the kernel-checked claim"
+    );
+
+    let ordinary_rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &[(vc.clone(), ordinary_result.clone())],
+        None,
+        &[None],
+        &[],
+        &[Some(ordinary_authority)],
+    );
+    let ordinary_pe =
+        ordinary_rows[0].proof_evidence.as_ref().expect("the ordinary row carries evidence");
+    assert_eq!(
+        ordinary_pe.strength.as_ref().map(|s| s.assurance.clone()),
+        Some(trust_types::AssuranceLevel::Certified)
+    );
+    assert!(
+        ordinary_pe.artifacts.iter().any(|a| a.kind == "clean_cic"),
+        "the control: the ordinary row ships the clean_cic artifact publication requires"
+    );
+
+    let view_rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &[(vc.clone(), view_result.clone())],
+        None,
+        &[None],
+        &[],
+        &[Some(view_authority)],
+    );
+    assert_eq!(view_rows[0].outcome, trust_types::Outcome::Proved, "still a proved row");
+    assert!(
+        view_rows[0].proof_evidence.is_none(),
+        "a view row ships no kernel proof evidence, so the authenticated publication boundary \
+         withholds it"
+    );
+    assert!(
+        view_rows[0].native_trust_ir.is_none(),
+        "…and no NATIVE envelope either, which is the other half of \
+         `authenticated_proved_row_has_publication_evidence`"
+    );
+    assert_eq!(
+        view_rows[0].solver.as_str(),
+        "clean-kernel-view-citation",
+        "the distinct solver label is the wire's disclosure that this row rests on R1"
+    );
+}
+
+/// Trust (OR-A1, owner ruling 2026-09-27 — Inc 1a): a row discharged by a cited
+/// theorem proved only UNDER the function's own `requires` is `Trusted`,
+/// whichever link carried it, hands out NO kernel proof term, and still counts
+/// as proved. The constructor decides the conditional variant from the RUNG
+/// before it looks at the view marker, so no combination of the two inputs can
+/// seal a conditional credit as the `Certified` variant (H1).
+#[test]
+fn a_requires_conditioned_row_is_trusted_and_carries_no_kernel_evidence() {
+    use trust_certify::clean_island::RequiresLink;
+    let vc = VerificationCondition {
+        kind: VcKind::Postcondition,
+        function: trust_types::Symbol::intern("k::rmax"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: 3,
+            col_start: 13,
+            line_end: 3,
+            col_end: 24,
+        },
+        formula: trust_types::Formula::Bool(true),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let evidence = trust_ir::ProofEvidence::CleanCic {
+        term: vec![2, 7, 1, 8],
+        context: b"trust-certify.e9-ensures-discharge.context.v1\0".to_vec(),
+        lineage: trust_ir::ProofDigest::sha256([0xa1; 32]),
+        kernel_recheck: None,
+    };
+    let row = exact_result_row_identity(0, &vc).expect("canonical row");
+    for (link, view, solver) in [
+        (RequiresLink::KernelCanonical, None, "clean-kernel-requires-canonical-citation"),
+        (RequiresLink::AllowListed, None, "clean-kernel-requires-allowlist-citation"),
+        // The view marker never outranks the rung (the lanes never mint the
+        // pair, but the constructor must not depend on that).
+        (
+            RequiresLink::KernelCanonical,
+            Some(trust_types::e6_param_view::VIEW_MARKER),
+            "clean-kernel-requires-canonical-citation",
+        ),
+    ] {
+        let authority = trust_ensures_discharge_authority(
+            view,
+            Some(link),
+            row.clone(),
+            "rmax_le_left".to_string(),
+            // Offered and DROPPED, exactly as for a view row.
+            Some(evidence.clone()),
+        )
+        .expect("the conditional variant needs no reference certificate");
+        assert!(
+            matches!(
+                authority,
+                ResultProofAuthority::EnsuresCitationUnderRequiresDischarge { link: l, .. }
+                    if l == link
+            ),
+            "the rung selects the conditional variant and records the link as data"
+        );
+        let (label, strength) = trust_ensures_discharge_label(view, Some(link), false);
+        assert_eq!(label, solver, "the wire label discloses the link");
+        let result = VerificationResult::Proved {
+            solver: trust_types::Symbol::intern(label),
+            time_ms: 0,
+            strength,
+            proof_certificate: None,
+            solver_warnings: None,
+            native_proof_envelope: None,
+        };
+        assert_eq!(
+            trust_disposition_for_authority(Some(&authority), 0, &vc, &result, None),
+            Some((TrustStatus::Trusted, TrustProofStrength::Constructive)),
+            "Inc 1a: BOTH links report Trusted — Certified for the canonical link is Inc 1b"
+        );
+        assert!(
+            authority.permits_static_proved_transport_for(0, &vc, &result, None),
+            "the row still counts as proved — `Trusted`, not absent"
+        );
+        assert!(
+            authority.kernel_evidence_for(0, &vc, None).is_none(),
+            "no proof term: the requires link is not a kernel judgment in Inc 1a"
+        );
+        assert!(
+            authority.is_ensures_citation_discharge_for(0, &vc, None),
+            "the same E9 lane, so the same vacuity-gate exemption"
+        );
+        // Owner ruling S3: a static proof, but NOT an unconditional one — it
+        // rests on the function's own `requires`.
+        assert!(authority.is_static_proof_for(0, &vc, &result, None), "counts as proved");
+        assert!(
+            !authority.is_unconditional_static_proof_for(0, &vc, &result, None),
+            "a requires-conditioned row is never an all-input static proof"
+        );
+
+        // Review S8: the WIRE row, as for the view row — proved, no kernel
+        // proof evidence, no native envelope, the link-disclosing solver label.
+        // Those two absences are what make the authenticated publication
+        // boundary withhold it on every path.
+        let rows = build_transport_results_with_runtime_checks_bound(
+            false,
+            None,
+            &[(vc.clone(), result.clone())],
+            None,
+            &[None],
+            &[],
+            &[Some(authority)],
+        );
+        assert_eq!(rows[0].outcome, trust_types::Outcome::Proved, "still a proved row");
+        assert!(
+            rows[0].proof_evidence.is_none(),
+            "a requires-conditioned row ships no kernel proof evidence"
+        );
+        assert!(
+            rows[0].native_trust_ir.is_none(),
+            "…and no NATIVE envelope either, the other half of \
+             `authenticated_proved_row_has_publication_evidence`"
+        );
+        assert_eq!(
+            rows[0].solver.as_str(),
+            solver,
+            "the distinct solver label is the wire's disclosure of the requires-link"
+        );
+    }
+    // KR0 switch: with no rung, the ordinary (Certified) variant is minted only
+    // for a payload the reference entry accepted. This hand-built one it never
+    // saw, so nothing is minted; the genuine payload is the control.
+    assert!(
+        trust_ensures_discharge_authority(None, None, row.clone(), "t".to_string(), Some(evidence))
+            .is_none(),
+        "a payload with no reference certificate mints no Certified E9 authority"
+    );
+    assert!(
+        trust_ensures_discharge_authority(None, None, row.clone(), "t".to_string(), None).is_none(),
+        "nor does a discharge with no payload at all"
+    );
+    assert!(matches!(
+        trust_ensures_discharge_authority(
+            None,
+            None,
+            row,
+            "t".to_string(),
+            Some(authority_test_clean_cic(0xa1))
+        ),
+        Some(ResultProofAuthority::EnsuresCitationDischarge { .. })
+    ));
+}
+
+/// Trust (OR-A1 H2): the set of rows a conditional credit must skip is EXACTLY
+/// the rows whose existing authority is a static proof — a bare `Proved` label
+/// with no authority is not in it (that is the gap the lane exists to fill).
+#[test]
+fn a_conditional_credit_skips_exactly_the_rows_already_proved() {
+    let vc = |line: u32| VerificationCondition {
+        kind: VcKind::Postcondition,
+        function: trust_types::Symbol::intern("k::rmax"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: line,
+            col_start: 1,
+            line_end: line,
+            col_end: 9,
+        },
+        formula: trust_types::Formula::Bool(true),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let proved = || VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("clean-kernel-citation"),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat_certified(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let results = vec![(vc(1), proved()), (vc(2), proved())];
+    let row0 = exact_result_row_identity(0, &results[0].0).expect("row");
+    let authorities = vec![
+        trust_ensures_discharge_authority(
+            None,
+            None,
+            row0,
+            "thm".to_string(),
+            Some(authority_test_clean_cic(0x7d)),
+        ),
+        None,
+    ];
+    let skipped = trust_rows_with_static_proof(&results, &[None, None], &authorities);
+    assert!(skipped.contains(&0), "a row with a sealed static proof is kept");
+    assert!(!skipped.contains(&1), "a bare `Proved` label with no authority is not a proof");
 }
 
 /// M-Pkg perf: the precomputed-certification path (`certify_all` →
@@ -1397,6 +2697,372 @@ fn precomputed_certification_matches_fallback_clean_cic_artifact() {
 
     // Same proof term, whichever path produced it.
     assert_eq!(clean_cic_meta(&precomputed), clean_cic_meta(&fallback));
+}
+
+/// Trust (VF1): the grade on the wire is the grade of the authority whose
+/// disposition the row reports, and only on a row that reads `proved`: a
+/// kernel-certified row carries `KernelCertified`'s triple (no calculus credit),
+/// while a `Proved` label no authority backs (it publishes `runtime-checked`)
+/// and a refuted row carry none.
+#[test]
+fn transport_grade_is_the_row_authority_grade_and_never_outruns_the_outcome() {
+    use trust_types::authority_grade::{GradeDischarge, GradeEncoding, ObligationGrade};
+    let bv = |v: i128| Box::new(trust_types::Formula::BitVec { value: v, width: 8 });
+    let certifiable = VerificationCondition {
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::BvULt(bv(3), bv(7), 8),
+            trust_types::Formula::BvULt(bv(7), bv(3), 8),
+        ]),
+        ..test_vc(1)
+    };
+    let proved = || VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let rows = build_transport_results_with_runtime_checks(
+        true,
+        &[(certifiable.clone(), proved())],
+        None,
+        None,
+    );
+    assert_eq!(rows[0].outcome, Outcome::Proved);
+    // KR0 switch: a kernel-certified row was checked through the reference entry.
+    let kernel = ObligationGrade::new(
+        GradeEncoding::UnvalidatedEncoder,
+        GradeDischarge::KernelReferenceChecked,
+        &[],
+    );
+    assert_eq!(rows[0].grade.as_ref(), Some(&kernel));
+    assert!(!kernel.is_calculus_proved());
+    // On the wire, under its own field.
+    let wire = serde_json::to_value(&rows[0]).expect("row serializes");
+    assert_eq!(wire["grade"]["discharge"], "kernel-reference-checked");
+    assert_eq!(wire["grade"]["encoding"], "unvalidated-encoder");
+
+    // Control: the same `Proved` label over a VC no kernel certifies has no
+    // authority, publishes `runtime-checked`, and states no grade.
+    let rows =
+        build_transport_results_with_runtime_checks(true, &[(test_vc(2), proved())], None, None);
+    assert_eq!(rows[0].outcome, Outcome::RuntimeChecked);
+    assert_eq!(rows[0].grade, None, "an unbacked Proved label must not carry a grade");
+    assert!(serde_json::to_value(&rows[0]).expect("row serializes").get("grade").is_none());
+
+    // Control: a refuted row states no grade.
+    let failed = VerificationResult::Failed {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        counterexample: None,
+    };
+    let rows =
+        build_transport_results_with_runtime_checks(true, &[(certifiable, failed)], None, None);
+    assert_eq!(rows[0].outcome, Outcome::Failed);
+    assert_eq!(rows[0].grade, None);
+
+    // Control: a row whose authority matched but whose transport outcome the
+    // builder fails closed (an explicitly unsupported MIR translation keeps its
+    // kernel token and publishes `unknown`) states no grade either.
+    let unsupported = VerificationCondition {
+        kind: VcKind::UnsupportedMir {
+            kind: "FullVerification::OpaqueSemanticGap".to_string(),
+            detail: "the preserved MIR operation has no exact verifier semantics".to_string(),
+        },
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::BvULt(bv(3), bv(7), 8),
+            trust_types::Formula::BvULt(bv(7), bv(3), 8),
+        ]),
+        ..test_vc(4)
+    };
+    let results = vec![(unsupported, proved())];
+    let cleancic = certify_all(&results, None);
+    let authorities = build_result_proof_authorities(&results, &[None], None, &cleancic);
+    assert!(matches!(authorities.as_slice(), [Some(ResultProofAuthority::KernelCertified { .. })]));
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &cleancic,
+        &[],
+        &authorities,
+    );
+    assert_eq!(rows[0].outcome, Outcome::Unknown);
+    assert_eq!(rows[0].grade, None, "a fail-closed row must not keep its authority's grade");
+}
+
+/// KR0 switch: the kernel rung mints `KernelCertified` only on a payload the
+/// Clean reference entry accepted, and the emitted row names the entry's theory
+/// and environment. Negative controls: the same payload with one term byte
+/// changed (its lineage kept), and a hand-built payload the entry never saw,
+/// mint nothing and so publish no Certified row.
+#[test]
+fn kernel_rung_refuses_a_payload_the_reference_entry_never_accepted() {
+    let bv = |v: i128| Box::new(trust_types::Formula::BitVec { value: v, width: 8 });
+    let certifiable = VerificationCondition {
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::BvULt(bv(3), bv(7), 8),
+            trust_types::Formula::BvULt(bv(7), bv(3), 8),
+        ]),
+        ..test_vc(1)
+    };
+    let proved = || VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let results = vec![(certifiable, proved())];
+    let cleancic = certify_all(&results, None);
+    let Some(Some(trust_ir::ProofEvidence::CleanCic { term, context, lineage, kernel_recheck })) =
+        cleancic.first().cloned()
+    else {
+        panic!("the contradiction certifies");
+    };
+
+    // Positive: the genuine payload mints, and the row names the theory.
+    let authorities = build_result_proof_authorities(&results, &[None], None, &cleancic);
+    let [Some(ResultProofAuthority::KernelCertified { reference, .. })] = authorities.as_slice()
+    else {
+        panic!("the genuine payload mints KernelCertified: {authorities:?}");
+    };
+    assert_eq!(reference.wire_theory(), Some(trust_types::KernelTheoryId::LeanReferenceV1));
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &cleancic,
+        &[],
+        &authorities,
+    );
+    assert_eq!(rows[0].outcome, Outcome::Proved);
+    let evidence = rows[0]
+        .proof_evidence
+        .as_ref()
+        .and_then(|proof| proof.evidence.as_ref())
+        .expect("a Certified row ships its kernel evidence");
+    assert!(evidence.is_certified());
+    assert_eq!(evidence.kernel_theory, Some(trust_types::KernelTheoryId::LeanReferenceV1));
+    assert_eq!(evidence.env_digest, Some(reference.wire_env_digest()));
+    let wire = serde_json::to_value(&rows[0]).expect("row serializes");
+    assert_eq!(wire["proof_evidence"]["evidence"]["kernel_theory"], "lean-reference-v1");
+
+    // Negative control 1: one term byte changed, lineage kept.
+    let mut tampered = term.clone();
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 1;
+    }
+    let forged = vec![Some(trust_ir::ProofEvidence::CleanCic {
+        term: tampered,
+        context: context.clone(),
+        lineage,
+        kernel_recheck: kernel_recheck.clone(),
+    })];
+    // Negative control 2: a payload the entry never saw.
+    let unseen = vec![Some(trust_ir::ProofEvidence::CleanCic {
+        term: vec![0x4b],
+        context: vec![0x52],
+        lineage: trust_ir::ProofDigest::sha256_domain("kr0-switch-unseen", &[0x30]),
+        kernel_recheck: None,
+    })];
+    for refused in [forged, unseen] {
+        let authorities = build_result_proof_authorities(&results, &[None], None, &refused);
+        assert!(
+            authorities.iter().all(Option::is_none),
+            "a payload the reference entry did not accept mints nothing: {authorities:?}"
+        );
+        let rows = build_transport_results_with_runtime_checks_bound(
+            false,
+            None,
+            &results,
+            None,
+            &refused,
+            &[],
+            &authorities,
+        );
+        assert_ne!(rows[0].outcome, Outcome::Proved);
+        assert!(rows[0].proof_evidence.is_none());
+    }
+
+    // Negative control 3 (KR0 review, fence gap): the genuine payload beside
+    // ANOTHER payload's genuine certificate binds no row: no disposition and
+    // no transport evidence. Control: the positive run above, with its own.
+    let [Some(ResultProofAuthority::KernelCertified { row, evidence, .. })] =
+        authorities.as_slice()
+    else {
+        unreachable!()
+    };
+    let foreign_reference = authority_test_reference(&authority_test_clean_cic(0x6f));
+    assert_ne!(&foreign_reference, reference);
+    let foreign = ResultProofAuthority::KernelCertified {
+        replay_audit: None,
+        row: row.clone(),
+        evidence: evidence.clone(),
+        reference: foreign_reference,
+    };
+    assert!(!foreign.matches_row(0, &results[0].0, None));
+    assert!(
+        trust_disposition_for_authority(Some(&foreign), 0, &results[0].0, &results[0].1, None)
+            .is_none(),
+        "a foreign certificate must not report Certified"
+    );
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &cleancic,
+        &[],
+        &[Some(foreign)],
+    );
+    assert!(rows[0].proof_evidence.is_none(), "a foreign certificate ships no kernel evidence");
+}
+
+/// KR0 switch review (R3): the post-walk E9 install clears the row's
+/// provisional slot when no authority was minted (the reference entry refused
+/// the surface's judgment), rather than keeping what the in-walk pass left
+/// there. Controls: a minted authority is installed over the provisional one,
+/// and the TINV policy still refuses one on a premised body.
+#[test]
+fn post_walk_e9_install_clears_the_provisional_slot_without_a_minted_authority() {
+    let vc = test_vc(1);
+    let row = exact_result_row_identity(0, &vc).expect("canonical row");
+    let provisional = || {
+        Some(ResultProofAuthority::KernelCertified {
+            replay_audit: None,
+            row: row.clone(),
+            evidence: authority_test_clean_cic(0x71),
+            reference: authority_test_reference(&authority_test_clean_cic(0x71)),
+        })
+    };
+    let e9 = ResultProofAuthority::EnsuresCitationDischarge {
+        row: row.clone(),
+        theorem: "cited".into(),
+        evidence: Some(authority_test_clean_cic(0x72)),
+        reference: authority_test_reference(&authority_test_clean_cic(0x72)),
+    };
+
+    let mut slot = provisional();
+    assert!(!install_post_walk_e9_authority(&mut slot, None, false, &vc));
+    assert!(slot.is_none(), "a refused surface must leave NO authority: {slot:?}");
+
+    let mut slot = provisional();
+    assert!(install_post_walk_e9_authority(&mut slot, Some(e9.clone()), false, &vc));
+    assert!(
+        matches!(slot, Some(ResultProofAuthority::EnsuresCitationDischarge { .. })),
+        "control: the minted authority replaces the provisional one: {slot:?}"
+    );
+
+    let mut slot = provisional();
+    assert!(!install_post_walk_e9_authority(&mut slot, Some(e9), true, &vc));
+    assert!(slot.is_none(), "control: a premised body refuses the E9 authority");
+}
+
+/// Trust (VF1): the row refinements of a class grade only add premises: a
+/// kernel token on a panic-freedom catch-all may be a grounded residual and
+/// names `sibling-rows`; a conditional grounded derivation names
+/// `sibling-premises`. Controls: an ordinary kernel row and an unconditional
+/// derivation keep their class grade.
+#[test]
+fn row_grade_names_the_premises_the_class_grade_cannot_see() {
+    use trust_types::authority_grade::GradePremise;
+    let bv = |v: i128| Box::new(trust_types::Formula::BitVec { value: v, width: 8 });
+    let formula = trust_types::Formula::And(vec![
+        trust_types::Formula::BvULt(bv(3), bv(7), 8),
+        trust_types::Formula::BvULt(bv(7), bv(3), 8),
+    ]);
+    let ordinary = VerificationCondition { formula: formula.clone(), ..test_vc(1) };
+    let catchall = VerificationCondition {
+        kind: VcKind::Assertion {
+            message: "panic freedom: no assertion, `unreachable!`, or panic is reachable"
+                .to_string(),
+        },
+        formula,
+        ..test_vc(1)
+    };
+    let proved = VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    for (vc, expected) in [(ordinary, vec![]), (catchall, vec![GradePremise::SiblingRows])] {
+        let results = vec![(vc.clone(), proved.clone())];
+        let cleancic = certify_all(&results, None);
+        let authorities = build_result_proof_authorities(&results, &[None], None, &cleancic);
+        let Some(authority @ ResultProofAuthority::KernelCertified { .. }) = &authorities[0] else {
+            panic!("the bvult-antisymmetry VC kernel-certifies: {authorities:?}");
+        };
+        let grade = trust_grade_for_row(authority, &vc);
+        assert_eq!(grade.premises, expected, "{:?}", vc.kind);
+        assert_eq!(
+            (grade.encoding, grade.discharge),
+            {
+                let class = trust_grade_for_authority(authority);
+                (class.encoding, class.discharge)
+            },
+            "a refinement never moves the encoding or the discharge"
+        );
+        assert_eq!(grade.admitted(), Ok(()));
+    }
+    let vc = test_vc(3);
+    let row = exact_result_row_identity(0, &vc).expect("row identity");
+    let derivation = |unconditional| ResultProofAuthority::GroundedPanicFreedomDerivation {
+        row: row.clone(),
+        unconditional,
+    };
+    assert_eq!(
+        trust_grade_for_row(&derivation(true), &vc),
+        trust_grade_for_authority(&derivation(true))
+    );
+    let conditional = trust_grade_for_row(&derivation(false), &vc);
+    assert_eq!(
+        conditional.premises,
+        [
+            GradePremise::PanicFreeCalleeRegistry,
+            GradePremise::SiblingRows,
+            GradePremise::SiblingPremises
+        ]
+    );
+    assert_eq!(conditional.admitted(), Ok(()));
+}
+
+/// Trust (VF1): the emission choke point withdraws the grade of every row a
+/// later rewrite left neither `proved` nor `skipped`, and keeps it otherwise.
+#[test]
+fn emitted_rows_carry_a_grade_only_while_proved_or_skipped() {
+    use trust_types::authority_grade::{GradeDischarge, GradeEncoding, ObligationGrade};
+    let grade = ObligationGrade::new(
+        GradeEncoding::UnvalidatedEncoder,
+        GradeDischarge::KernelReconstructed,
+        &[],
+    );
+    let outcomes = [
+        Outcome::Proved,
+        Outcome::Skipped,
+        Outcome::Failed,
+        Outcome::Unknown,
+        Outcome::Timeout,
+        Outcome::RuntimeChecked,
+    ];
+    let mut rows: Vec<_> = outcomes
+        .iter()
+        .map(|outcome| {
+            let mut row = plain_transport_row(*outcome, false);
+            row.grade = Some(grade.clone());
+            row
+        })
+        .collect();
+    withdraw_grades_outrunning_outcome(&mut rows);
+    let kept: Vec<_> = rows.iter().map(|row| row.grade.is_some()).collect();
+    assert_eq!(kept, [true, true, false, false, false, false]);
 }
 
 /// A solver-owned `Proved` carrier need not be rewritten before the independent
@@ -1546,6 +3212,75 @@ fn certify_all_stops_after_deadline_elapsed() {
     );
 }
 
+/// Trust (T3 L4, C06a): an injected certify stop yields a CERTIFY-STOP entry for its row
+/// and leaves the sweep's evidence unchanged; a deadline cut yields one `wall-backstop`
+/// entry per `Proved` row it kept from the kernel; with the audit off, none.
+#[test]
+fn certify_sweep_reports_each_stopped_run_as_a_certify_stop() {
+    use trust_types::determinism::StopCause;
+    let bv = |v: i128| Box::new(trust_types::Formula::BitVec { value: v, width: 8 });
+    let make_vc = || VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: trust_types::Symbol::intern("test::certify_stop_rows"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: 1,
+            col_start: 1,
+            line_end: 1,
+            col_end: 5,
+        },
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::BvULt(bv(3), bv(7), 8),
+            trust_types::Formula::BvULt(bv(7), bv(3), 8),
+        ]),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let make_proved = || VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let unknown = VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        reason: "not proved".to_string(),
+    };
+    let results =
+        vec![(make_vc(), make_proved()), (make_vc(), unknown.clone()), (make_vc(), make_proved())];
+    let plain = certify_all(&results, None);
+    assert!(plain[0].is_some() && plain[1].is_none() && plain[2].is_some());
+
+    // Inject a stop into the third row's run: the evidence is the certifier's, unchanged.
+    let mut calls = 0;
+    let (evidence, cut, stops) = certify_all_until_reporting(&results, None, true, |vc| {
+        calls += 1;
+        let stop = (calls == 2).then_some(StopCause::WallBackstop);
+        (trust_certify::certify_vc(vc), stop)
+    });
+    assert_eq!(evidence, plain);
+    assert_eq!(cut, None);
+    assert_eq!(stops, vec![(2, StopCause::WallBackstop)]);
+    // The same injection with the audit off reports nothing.
+    let (_, _, quiet) = certify_all_until_reporting(&results, None, false, |vc| {
+        (trust_certify::certify_vc(vc), Some(StopCause::WallBackstop))
+    });
+    assert!(quiet.is_empty());
+
+    // A deadline already passed cuts every row; each Proved one is a CERTIFY-STOP.
+    let elapsed = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let (evidence, cut, stops) = certify_all_until_reporting(&results, Some(elapsed), true, |_| {
+        unreachable!("an elapsed deadline certifies nothing")
+    });
+    assert_eq!(evidence, vec![None, None, None]);
+    assert_eq!(cut, Some(0));
+    assert_eq!(stops, vec![(0, StopCause::WallBackstop), (2, StopCause::WallBackstop)]);
+    assert_eq!(certify_all_until(&results, Some(elapsed)), (vec![None, None, None], Some(0)));
+}
+
 /// Trust (M5 blocker #0): the promotion counterpart — an already-elapsed
 /// deadline must leave every inconclusive obligation exactly as it arrived
 /// (never upgraded to `Proved`), even though the kernel could certify it.
@@ -1577,7 +3312,7 @@ fn promote_kernel_certifiable_stops_after_deadline_elapsed() {
     let mut results = vec![(vc, unknown)];
 
     let already_elapsed = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    promote_kernel_certifiable(&mut results, Some(already_elapsed));
+    promote_kernel_certifiable(&mut results, Some(already_elapsed), &mut ClockStops::default());
     assert!(
         matches!(results[0].1, VerificationResult::Unknown { .. }),
         "an elapsed deadline must leave an inconclusive obligation un-upgraded, got {:?}",
@@ -1655,6 +3390,110 @@ fn full_verification_unsupported_ensures_recognizer_is_structural() {
         "FullVerification::trust.vc::unsupported_mir",
         "source lookalike `SpecEnsuresUnparseable` after an unrelated prefix"
     ));
+}
+
+/// Trust (CITE-ENSURES-SUBSTRING-1, 2026-10-05): `is_ensures_clause_obligation`
+/// decides an `UnsupportedMir` marker's clause kind from the final
+/// `contract_id` only. A former substring arm (`kind` contains
+/// `trust.contract::unsupported`, `detail` contains `:ensures:`) also took a
+/// `requires` marker whose OWNER def path has an `ensures` segment, and the E9
+/// lane then retired that fail-closed marker as a kernel-Certified
+/// postcondition. Every negative below was `true` before the fix.
+#[test]
+fn ensures_clause_classifier_reads_the_contract_id_clause_kind_not_a_substring() {
+    let marker = |kind: &str, detail: &str| VerificationCondition {
+        kind: VcKind::UnsupportedMir { kind: kind.to_string(), detail: detail.to_string() },
+        ..test_vc(9)
+    };
+    let native = "FullVerification::trust.contract::unsupported";
+
+    // The measured lie: the `requires` marker of `ensures::f`, spelled exactly
+    // as `legacy_unsupported_kind_detail` spells it.
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "compiler contract predicate `forall i: u64, i < x ==> i < 100` was not lowered into a \
+         typed verifier formula; contract_id=trust-contract:demo::ensures::f:requires:0; \
+         metadata_keys=[trust.contract.kind,trust.obligation.context]"
+    )));
+    // The other measured owners: a fn named `ensures`, a crate named `ensures`.
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:demo::ensures:requires:0"
+    )));
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:ensures::f:requires:0"
+    )));
+    // Other marker kinds under the same owner are not ensures stand-ins either.
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:demo::ensures::f:decreases:0"
+    )));
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:demo::ensures::f:invariant:1"
+    )));
+    // The source lookalike the exact recognizer already rejects (see
+    // `full_verification_unsupported_ensures_recognizer_is_structural`): the
+    // substring arm accepted it.
+    assert!(!is_ensures_clause_obligation(&marker(
+        native,
+        "source lookalike; contract_id=trust-contract:demo::f:ensures:0; \
+         contract_id=trust-contract:demo::f:requires:1"
+    )));
+    // A kind that merely CONTAINS the producer's spelling is not the producer's.
+    assert!(!is_ensures_clause_obligation(&marker(
+        "trust.contract::unsupported",
+        "unsupported contract predicate; contract_id=trust-contract:demo::f:ensures:0"
+    )));
+
+    // Positive controls: a real ensures marker is still an ensures stand-in,
+    // including one whose owner path has an `ensures` segment.
+    assert!(is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:demo::f:ensures:0"
+    )));
+    assert!(is_ensures_clause_obligation(&marker(
+        native,
+        "unsupported contract predicate; contract_id=trust-contract:demo::ensures::f:ensures:0; \
+         metadata_keys=[trust.contract.kind]"
+    )));
+    assert!(is_ensures_clause_obligation(&marker("SpecEnsuresUnparseable", "compiler detail")));
+    assert!(is_ensures_clause_obligation(&VerificationCondition {
+        kind: VcKind::Postcondition,
+        ..test_vc(9)
+    }));
+}
+
+/// Trust (CITE-PRIME-NONASCII-1, 2026-10-05): `rewrite_by_value_prime` must
+/// rewrite `p'` only where `p` is the whole identifier token rustc lexed. The
+/// boundary was a byte test, so the UTF-8 continuation byte of `é` in `éa'`
+/// counted as a boundary and the pass for an immutable `a` collapsed the
+/// post-state of `mut éa` to its entry value (`éa' >= éa` became the tautology
+/// `éa >= éa`, which a reflexivity theorem kernel-certified). Each of the
+/// first four assertions failed before the fix (the text was rewritten).
+#[test]
+fn by_value_prime_rewrite_decides_the_identifier_boundary_on_whole_chars() {
+    // The measured lies: a non-ASCII identifier char before the name.
+    assert_eq!(rewrite_by_value_prime("éa' >= éa", "a"), "éa' >= éa");
+    assert_eq!(rewrite_by_value_prime("δx' >= δx", "x"), "δx' >= δx");
+    // A decomposed spelling: the combining mark U+0301 is XID_Continue.
+    assert_eq!(rewrite_by_value_prime("e\u{301}a' >= e\u{301}a", "a"), "e\u{301}a' >= e\u{301}a");
+    // A non-ASCII identifier char after the prime extends the token too.
+    assert_eq!(rewrite_by_value_prime("a'é >= 1", "a"), "a'é >= 1");
+
+    // Unchanged ASCII behaviour.
+    assert_eq!(rewrite_by_value_prime("a' >= 1", "a"), "a >= 1");
+    assert_eq!(rewrite_by_value_prime("a' >= a && (a') == a", "a"), "a >= a && (a) == a");
+    assert_eq!(rewrite_by_value_prime("ya' >= a", "a"), "ya' >= a");
+    assert_eq!(rewrite_by_value_prime("_a' >= a", "a"), "_a' >= a");
+    assert_eq!(rewrite_by_value_prime("b1a' >= a", "a"), "b1a' >= a");
+    assert_eq!(rewrite_by_value_prime("a'b >= a", "a"), "a'b >= a");
+
+    // A non-ASCII parameter name is still rewritten where it is a whole token,
+    // and a non-identifier char beside it is still a boundary.
+    assert_eq!(rewrite_by_value_prime("éa' >= éa", "éa"), "éa >= éa");
+    assert_eq!(rewrite_by_value_prime("(δx')+1 > δx", "δx"), "(δx)+1 > δx");
 }
 
 #[test]
@@ -1807,6 +3646,63 @@ fn precondition_unknown_has_no_runtime_fallback() {
     assert!(
         !runtime_check_available(&VcKind::Precondition { callee: "callee".to_string() }, true,)
     );
+}
+
+/// THE COMPILER SEAM'S LOCK. No `VcKind::HardenedBoundary` — no category, no
+/// callee, no check environment — is ever "runtime-checked" to any in-compiler
+/// consumer. All six of them read this one funnel (`has_runtime_check`, the two
+/// telemetry rows, the transport row, `convert_result`, and the residual-gap
+/// tolerance scan), so pinning it here pins all six.
+///
+/// WHAT THIS CATCHES. Commit e4ae63e373 widened `VcKind::has_runtime_fallback_in`
+/// to answer the `mir_assert::*` panic subfamily `true` — a correct MEASUREMENT
+/// about codegen ("the hardening profile leaves rustc's `Assert` in the
+/// program") attached to the wrong predicate, since that one gates whether an
+/// obligation counts as DISCHARGED. A hardened boundary's obligation is that the
+/// panic is UNREACHABLE, which the surviving `Assert` does not enforce. The
+/// widening was reverted in the authority; this test fails if it comes back by
+/// either route — through the authority, or through a local relaxation of the
+/// funnel.
+#[test]
+fn no_hardened_boundary_answers_the_runtime_check_funnel() {
+    let callees = [
+        // The subfamily e4ae63e373 widened: raised over a rustc-inserted assert.
+        "mir_assert::BoundsCheck",
+        "mir_assert::Overflow(Add)",
+        "mir_assert::Overflow(Shl)",
+        "mir_assert::OverflowNeg",
+        "mir_assert::DivisionByZero",
+        "mir_assert::RemainderByZero",
+        // The call half, which stands over nothing rustc emits.
+        "std::option::Option::<T>::unwrap",
+        "std::fs::rename",
+    ];
+    for category in [
+        trust_types::HardenedVcCategory::PanicBoundary,
+        trust_types::HardenedVcCategory::UnsafeOperation,
+        trust_types::HardenedVcCategory::FfiBoundary,
+        trust_types::HardenedVcCategory::RawPathApi,
+    ] {
+        for callee in callees {
+            let kind = VcKind::HardenedBoundary {
+                category,
+                callee: callee.to_string(),
+                detail: "hardened boundary".to_string(),
+            };
+            for overflow_checks in [true, false] {
+                assert!(
+                    !runtime_check_available(&kind, overflow_checks),
+                    "{category:?} over `{callee}` must not read as runtime-checked \
+                     (overflow_checks={overflow_checks})"
+                );
+            }
+        }
+    }
+    // Control: the funnel is not simply refusing everything. The PRIMARY
+    // obligations over the same operations still answer, so a blanket `false`
+    // regression cannot hide here.
+    assert!(runtime_check_available(&VcKind::IndexOutOfBounds, false));
+    assert!(runtime_check_available(&VcKind::RemainderByZero, false));
 }
 
 #[test]
@@ -2089,6 +3985,39 @@ fn internal_proof_levels_match_trust_types_for_non_l0_kinds() {
     assert_eq!(TrustObligationKind::Deadlock.proof_level(), TrustProofLevel::L2Domain);
 }
 
+// Trust (TINV step 2, 2026-10-05): a TINV row has its own internal kind (never the
+// `Postcondition` fallback the compose gate counts as `ensures`), is L1, and crosses the ay
+// bridge proof-only (a satisfiable candidate conjunct is not a program counterexample).
+#[test]
+fn type_invariant_has_its_own_kind_and_crosses_the_bridge_proof_only() {
+    let kind = VcKind::TypeInvariant {
+        ty: "c::S".to_string(),
+        point: trust_types::TypeInvariantPoint::Return,
+        site: trust_types::TypeInvariantSite { block: 2, statement_index: 0 },
+        conjunct: 0,
+        ordinal: 0,
+        edge: None,
+    };
+    assert_eq!(convert_vc_kind(&kind), TrustObligationKind::TypeInvariant);
+    assert_ne!(convert_vc_kind(&kind), TrustObligationKind::Postcondition);
+    assert_eq!(TrustObligationKind::TypeInvariant.proof_level(), TrustProofLevel::L1Functional);
+    let failed = VerificationResult::Failed {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        counterexample: None,
+    };
+    let proved = VerificationResult::Proved {
+        solver: "ay-in-process".into(),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    assert!(!bridge_ay_verdict_is_admissible(&kind, &failed));
+    assert!(bridge_ay_verdict_is_admissible(&kind, &proved));
+}
+
 #[test]
 fn unmapped_vc_kinds_fallback_by_trust_types_proof_level() {
     assert_eq!(
@@ -2161,6 +4090,7 @@ fn arithmetic_overflow_binops_are_exact_and_unknown_categories_fail_closed() {
 fn telemetry_carries_runtime_fallback_metadata() {
     let mut details: IndexVec<ObligationId, TrustObligationDetail> = IndexVec::new();
     details.push(TrustObligationDetail {
+        assumes: Vec::new(),
         solver: rustc_span::sym::test,
         time_us: 5_000,
         counterexample: vec![],
@@ -2170,6 +4100,7 @@ fn telemetry_carries_runtime_fallback_metadata() {
         )),
     });
     details.push(TrustObligationDetail {
+        assumes: Vec::new(),
         solver: rustc_span::sym::test,
         time_us: 7_000,
         counterexample: vec![],
@@ -2204,6 +4135,7 @@ fn runtime_fallback_detail_uses_timeout_reason() {
 fn telemetry_ignores_non_runtime_checked_obligations() {
     let mut details: IndexVec<ObligationId, TrustObligationDetail> = IndexVec::new();
     details.push(TrustObligationDetail {
+        assumes: Vec::new(),
         solver: rustc_span::sym::test,
         time_us: 12_000,
         counterexample: vec![],
@@ -2234,7 +4166,7 @@ fn proof_results_with_statuses(statuses: &[TrustStatus]) -> TrustProofResults {
     }
 
     let summary = TrustFunctionSummary::from_dispositions(&dispositions);
-    TrustProofResults { dispositions, fingerprints, summary }
+    TrustProofResults { dispositions, fingerprints, summary, premises: Vec::new() }
 }
 
 #[test]
@@ -2304,6 +4236,33 @@ fn axiom_census_decline_is_fail_closed_on_an_absent_record() {
     let unanswered = verdict_axiom_decline_for_census(None)
         .expect("NO census at all must decline, not default to clean");
     assert!(unanswered.contains("no user-axiom census was recorded"));
+}
+
+/// Trust (2026-09-29, Track R review F2): a verdict whose bundle kept a std member
+/// under the runtime-checked disposition is declined by the premise authenticator
+/// WHATEVER its user-axiom census says — a CLEAN census included, which is the
+/// case a "the census already covers it" simplification would open. Every premise
+/// lane that spends another body's verdict goes through this one authenticator.
+/// No shipped program reaches it today (a kept bundle's aggregate row is reported
+/// runtime-checked, so the verdict is not established), which is why it is pinned
+/// here and not by a ui test.
+#[test]
+fn runtime_checked_std_member_verdict_is_declined_even_when_axiom_free() {
+    for recorded in [Some(true), Some(false), None] {
+        let why = verdict_premise_decline(recorded, true)
+            .expect("a member-conditional verdict must decline for every census answer");
+        assert!(
+            why.contains("CONDITIONAL on a bundled std/core/alloc member's own runtime check"),
+            "{recorded:?}: {why}"
+        );
+    }
+    // Without a kept member the census alone decides, unchanged.
+    assert_eq!(verdict_premise_decline(Some(true), false), None);
+    assert_eq!(
+        verdict_premise_decline(Some(false), false),
+        verdict_axiom_decline_for_census(Some(false))
+    );
+    assert_eq!(verdict_premise_decline(None, false), verdict_axiom_decline_for_census(None));
 }
 
 /// Trust (assumption-root gate): the census is taken over KEYS so the publish
@@ -2419,16 +4378,27 @@ fn dyn_summary_gate_decision_refuses_an_axiom_rooted_verdict_and_assumed_bookkee
     );
 }
 
+/// `dedupe_exact_vcs` over `vcs` as the consumed path holds them (T3 L4, C07: carried with
+/// their ids): the rows it keeps, after checking each still has its own id.
+fn dedupe_exact_vcs_of(vcs: Vec<VerificationCondition>) -> Vec<VerificationCondition> {
+    let mut context = trust_types::vc_context::VcContext::new();
+    let ids = vcs.iter().map(|vc| context.push_checked_row(vc).ok()).collect();
+    let mut rows = BodyRows::from_generation(&mut context, vcs, ids);
+    dedupe_exact_vcs(&mut rows);
+    assert!(rows.aligned_in(&context), "the dedupe keeps each row with its id");
+    rows.vcs().to_vec()
+}
+
 #[test]
 fn dedupe_exact_vcs_drops_duplicate_slot() {
     let vc = test_vc(10);
-    let deduped = dedupe_exact_vcs(vec![vc.clone(), vc]);
+    let deduped = dedupe_exact_vcs_of(vec![vc.clone(), vc]);
     assert_eq!(deduped.len(), 1);
 }
 
 #[test]
 fn dedupe_exact_vcs_preserves_distinct_spans() {
-    let deduped = dedupe_exact_vcs(vec![test_vc(10), test_vc(11)]);
+    let deduped = dedupe_exact_vcs_of(vec![test_vc(10), test_vc(11)]);
     assert_eq!(deduped.len(), 2);
 }
 
@@ -2446,7 +4416,7 @@ fn dedupe_exact_vcs_preserves_contract_routing_metadata() {
         trust_vcgen::vc_fingerprint(&contracted),
         "the compact structural fingerprint intentionally omits routing metadata"
     );
-    let deduped = dedupe_exact_vcs(vec![plain, contracted]);
+    let deduped = dedupe_exact_vcs_of(vec![plain, contracted]);
     assert_eq!(
         deduped.len(),
         2,
@@ -2464,6 +4434,59 @@ fn verification_is_batteries_on_with_one_off_switch() {
     assert!(!rustc_session::trust_verification_enabled_by_flags(
         rustc_session::config::TrustVerify::Off
     ));
+}
+
+/// -O parity (ruling R1, 2026-09-25): with no explicit `-Zmir-opt-level`, a
+/// verifying session runs the `-O0` MIR pipeline (level 1) at EVERY `-Copt-level`,
+/// so `TrustVerify` sees the MIR `-O0` verified. The vanilla lane must stay
+/// byte-for-byte upstream: 1 at `-Copt-level=0`, 2 at every other level.
+#[test]
+fn verifying_sessions_default_to_the_o0_mir_pipeline_and_vanilla_is_upstream() {
+    use rustc_session::config::{OptLevel, TrustVerify};
+    use rustc_session::{
+        trust_default_mir_opt_level_by_flags as level, trust_proof_session_by_flags,
+    };
+    let every = [
+        OptLevel::No,
+        OptLevel::Less,
+        OptLevel::More,
+        OptLevel::Aggressive,
+        OptLevel::Size,
+        OptLevel::SizeMin,
+    ];
+    for optimize in every {
+        // R1: a verifying unit, with or without a proof session.
+        assert_eq!(level(optimize, TrustVerify::On, false), 1, "verifying, {optimize:?}");
+        assert_eq!(level(optimize, TrustVerify::On, true), 1, "verifying, {optimize:?}");
+        // T6: a verification-off unit OF a proof session — a dependency whose
+        // encoded MIR a verified dependent re-derives — runs the same pipeline.
+        assert_eq!(level(optimize, TrustVerify::Off, true), 1, "proof-session dep, {optimize:?}");
+    }
+    // The vanilla lane (no verification, no proof session): upstream's
+    // `if optimize != No { 2 } else { 1 }`, unchanged.
+    assert_eq!(level(OptLevel::No, TrustVerify::Off, false), 1);
+    for optimize in &every[1..] {
+        assert_eq!(level(*optimize, TrustVerify::Off, false), 2, "vanilla, {optimize:?}");
+    }
+    // Which units are in a proof session.
+    assert!(trust_proof_session_by_flags(TrustVerify::On, false));
+    assert!(trust_proof_session_by_flags(TrustVerify::On, true));
+    assert!(trust_proof_session_by_flags(TrustVerify::Off, true));
+    assert!(!trust_proof_session_by_flags(TrustVerify::Off, false));
+}
+
+/// -O parity (ruling R2, 2026-09-25): a verifying session defaults overflow checks
+/// ON whatever `debug_assertions` is; the vanilla lane keeps upstream's
+/// `debug_assertions` default. (An explicit `-Coverflow-checks` bypasses this
+/// default entirely, in `Session::overflow_checks`.)
+#[test]
+fn verifying_sessions_default_overflow_checks_on_and_vanilla_is_upstream() {
+    use rustc_session::config::TrustVerify;
+    use rustc_session::trust_default_overflow_checks_by_flags as checks;
+    assert!(checks(false, TrustVerify::On));
+    assert!(checks(true, TrustVerify::On));
+    assert!(!checks(false, TrustVerify::Off));
+    assert!(checks(true, TrustVerify::Off));
 }
 
 #[test]
@@ -2646,68 +4669,15 @@ fn verification_semantics_key_changes_with_policy_and_level() {
     let mut all_policy = default_policy;
     all_policy.include_dependencies = true;
 
-    let solver = "ay:/bin/ay";
-    let default_key = verification_semantics_key_from_parts(
-        &default_policy,
-        1,
-        true,
-        solver,
-        true,
-        "aarch64-test;ptr64",
-    );
-    let all_key = verification_semantics_key_from_parts(
-        &all_policy,
-        1,
-        true,
-        solver,
-        true,
-        "aarch64-test;ptr64",
-    );
-    let level2_key = verification_semantics_key_from_parts(
-        &default_policy,
-        2,
-        true,
-        solver,
-        true,
-        "aarch64-test;ptr64",
-    );
+    let default_key =
+        verification_semantics_key_from_parts(&default_policy, 1, true, true, "aarch64-test;ptr64");
+    let all_key =
+        verification_semantics_key_from_parts(&all_policy, 1, true, true, "aarch64-test;ptr64");
+    let level2_key =
+        verification_semantics_key_from_parts(&default_policy, 2, true, true, "aarch64-test;ptr64");
 
     assert_ne!(default_key, all_key);
     assert_ne!(default_key, level2_key);
-}
-
-#[test]
-fn vc_artifact_observed_hit_still_generates_fresh_vcs_and_verdicts_for_exact_context() {
-    let fresh_calls = std::cell::Cell::new(0usize);
-    let generate_for_context = |line: u32, context: &str| {
-        // Force the same apparent observation hit for both exact contexts. The
-        // observation contains only a count and must not supply either row.
-        vc_artifact_observation_then_generate_fresh(Some(17), || {
-            fresh_calls.set(fresh_calls.get() + 1);
-            let vc = test_vc(line);
-            let verdict = VerificationResult::Unknown {
-                solver: trust_types::Symbol::intern("fresh-context-probe"),
-                time_ms: 0,
-                reason: context.to_string(),
-            };
-            (vec![vc.clone()], vec![(vc, verdict)])
-        })
-    };
-
-    let first = generate_for_context(41, "exact-context-a");
-    let second = generate_for_context(42, "exact-context-b");
-
-    assert_eq!(fresh_calls.get(), 2, "every observed hit must invoke fresh generation");
-    assert_eq!(first.0[0].location.line_start, 41);
-    assert_eq!(second.0[0].location.line_start, 42);
-    assert!(matches!(
-        &first.1[0].1,
-        VerificationResult::Unknown { reason, .. } if reason == "exact-context-a"
-    ));
-    assert!(matches!(
-        &second.1[0].1,
-        VerificationResult::Unknown { reason, .. } if reason == "exact-context-b"
-    ));
 }
 
 // Trust (cache-key soundness — crate-type/whole-program dependence): the
@@ -2720,18 +4690,11 @@ fn vc_artifact_observed_hit_still_generates_fresh_vcs_and_verdicts_for_exact_con
 #[test]
 fn verification_semantics_key_changes_with_whole_program() {
     let policy = test_policy(false, false);
-    let solver = "ay:/bin/ay";
 
     let whole_program_key =
-        verification_semantics_key_from_parts(&policy, 1, true, solver, true, "aarch64-test;ptr64");
-    let rlib_key = verification_semantics_key_from_parts(
-        &policy,
-        1,
-        true,
-        solver,
-        false,
-        "aarch64-test;ptr64",
-    );
+        verification_semantics_key_from_parts(&policy, 1, true, true, "aarch64-test;ptr64");
+    let rlib_key =
+        verification_semantics_key_from_parts(&policy, 1, true, false, "aarch64-test;ptr64");
 
     assert_ne!(
         whole_program_key, rlib_key,
@@ -2748,20 +4711,12 @@ fn verification_semantics_key_changes_with_whole_program() {
 #[test]
 fn verification_semantics_key_changes_with_target() {
     let policy = test_policy(false, false);
-    let solver = "ay:/bin/ay";
-    let key_64 = verification_semantics_key_from_parts(
-        &policy,
-        1,
-        true,
-        solver,
-        true,
-        "aarch64-apple-darwin;ptr64",
-    );
+    let key_64 =
+        verification_semantics_key_from_parts(&policy, 1, true, true, "aarch64-apple-darwin;ptr64");
     let key_32 = verification_semantics_key_from_parts(
         &policy,
         1,
         true,
-        solver,
         true,
         "i686-unknown-linux-gnu;ptr32",
     );
@@ -2777,20 +4732,12 @@ fn include_dependencies_policy_does_not_alias_default_normal_cache_keys() {
     let default_policy = test_policy(false, false);
     let dependency_policy = TrustVerifyPolicy { include_dependencies: true, ..default_policy };
 
-    let solver = "ay:/bin/ay";
-    let default_semantics_key = verification_semantics_key_from_parts(
-        &default_policy,
-        1,
-        true,
-        solver,
-        true,
-        "aarch64-test;ptr64",
-    );
+    let default_semantics_key =
+        verification_semantics_key_from_parts(&default_policy, 1, true, true, "aarch64-test;ptr64");
     let dependency_semantics_key = verification_semantics_key_from_parts(
         &dependency_policy,
         1,
         true,
-        solver,
         true,
         "aarch64-test;ptr64",
     );
@@ -2802,56 +4749,28 @@ fn include_dependencies_policy_does_not_alias_default_normal_cache_keys() {
     );
 }
 
-// Trust: REMOVED, and the requirement they stated is recorded here rather than
-// deleted with them. Two tests lived at this spot —
-// `stdlib_subject_memory_safety_policy_changes_vc_artifact_facets` and
-// `stdlib_subject_memory_safety_policy_requires_local_stdlib_ownership` —
-// asserting through a function `stdlib_subject_memory_safety_policy(bool, &str)`
-// that **has never existed in this repository**: `git log -S` over all history
-// returns exactly one commit for that symbol, 93c9817ec1, the commit that added
-// these tests. They therefore never compiled and never ran, and they are why
-// `x.py check --stage 1` (the pre-push `scoped.compiler-check` lane) has been
-// failing on rustc_mir_transform's lib test for every clone.
-//
-// They are removed rather than repaired because there is nothing to repair
-// against: no implementation, no caller, no other reference. This is NOT the
-// "delete the caller to make it compile" move the pre-push hook warns about —
-// that warning is about dropping a live assertion whose subject was retired.
-// Here the subject was never written.
-//
-// THE REQUIREMENT THEY DESCRIBED, stated so it is not lost. Both are about
-// `-Ztrust-verify-include-dependencies`-style policy, where local stdlib MIR is
-// a verification SUBJECT while non-local stdlib MIR stays suppressed:
-//
-//   1. Whether a body is a stdlib SUBJECT (rather than a suppressed dependency)
-//      must be part of `vc_artifact_facets_hash`. Two builds that disagree on
-//      that policy generate different obligation sets from byte-identical
-//      extracted MIR, so sharing a VC cache facet would let a verdict computed
-//      under suppression be replayed as one computed under obligation — the
-//      same family as the `modular_arith_ops` note at the live call site, which
-//      says outright "leaving it out would let a cached artifact from a
-//      differently-flagged build be replayed".
-//   2. The subject/dependency split must key on LOCAL OWNERSHIP of the stdlib
-//      MIR, not on the crate name: `core`/`alloc`/`std`/`proc_macro`/`test`/
-//      `panic_abort`/`panic_unwind`/`std_detect`/`unwind` are subjects only when
-//      locally built, and a user crate is never a stdlib subject.
-//
-// Neither property is enforced today, because neither the policy function nor
-// the facets-hash parameter exists. Reinstating them means implementing the
-// policy FIRST and re-adding these tests against it — not re-adding the tests.
-
+/// Trust (AW-1): only the `.await` lowering's OWN calls qualify — an
+/// Await-marked, HIR-lowered (`CallSource::Normal`) call to `Pin::new_unchecked`
+/// or `get_context`. Each control drops exactly one condition and keeps its row.
 #[test]
-fn stdlib_subject_memory_safety_policy_changes_vc_artifact_facets() {
-    let modular_arith_ops = trust_types::fx::FxHashSet::default();
-    let dependency_facets =
-        vc_artifact_facets_hash(false, false, false, &[], false, &[], &modular_arith_ops);
-    let stdlib_subject_facets =
-        vc_artifact_facets_hash(false, false, true, &[], false, &[], &modular_arith_ops);
-
-    assert_ne!(
-        dependency_facets, stdlib_subject_facets,
-        "dependency suppression and stdlib-subject memory-safety obligations must not share a VC cache facet"
-    );
+fn await_lowering_unsafe_call_predicate_requires_all_three_conditions() {
+    use rustc_attr_ir::lang_items::LangItem;
+    use rustc_span::DesugaringKind;
+    let q = await_lowering_unsafe_call_qualifies;
+    let await_mark = Some(DesugaringKind::Await);
+    // Positive: the lowering's two calls.
+    assert!(q(await_mark, CallSource::Normal, Some(LangItem::PinNewUnchecked)));
+    assert!(q(await_mark, CallSource::Normal, Some(LangItem::GetContext)));
+    // Control (async-drop elaboration): MIR-built `Misc` call, Await-marked span.
+    assert!(!q(await_mark, CallSource::Misc, Some(LangItem::PinNewUnchecked)));
+    assert!(!q(await_mark, CallSource::Misc, Some(LangItem::GetContext)));
+    assert!(!q(await_mark, CallSource::OverloadedOperator, Some(LangItem::PinNewUnchecked)));
+    // Control (user code / `for await` head / inlined): not an Await outermost mark.
+    assert!(!q(None, CallSource::Normal, Some(LangItem::PinNewUnchecked)));
+    assert!(!q(Some(DesugaringKind::ForLoop), CallSource::Normal, Some(LangItem::PinNewUnchecked)));
+    // Control: an Await-marked call to anything else (`Future::poll`, a non-lang fn).
+    assert!(!q(await_mark, CallSource::Normal, Some(LangItem::FuturePoll)));
+    assert!(!q(await_mark, CallSource::Normal, None));
 }
 
 #[test]
@@ -3163,6 +5082,87 @@ fn test_api_evidence(
         counterexample: None,
         publication: trust_verifier_api::EvidencePublicationMetadata::default(),
         diagnostics: Vec::new(),
+    }
+}
+
+// Trust: truthful structural stop accounting never upgrades an unsupported row.
+#[test]
+fn native_pre_solve_input_refusal_keeps_verdict_and_combines_backstops() {
+    use trust_types::determinism::StopCause;
+    let marker = trust_verifier_api::ROUTED_NATIVE_PRE_SOLVE_INPUT_REFUSAL_DIAGNOSTIC;
+    let mut evidence =
+        test_api_evidence(trust_verifier_api::ProofStrength::smt_unsat(), Vec::new());
+    evidence.status = trust_verifier_api::EvidenceStatus::Unsupported;
+    evidence.proof_strength = None;
+    evidence.engine = trust_verifier_api::EngineManifest::new(
+        "trust-full-verifier",
+        trust_verifier_api::API_VERSION,
+        trust_verifier_api::EngineKind::Composite,
+    );
+    for (diagnostics, expected) in [
+        (vec![], StopCause::Unclassified),
+        (vec![format!("{marker} lookalike")], StopCause::Unclassified),
+        (vec![marker.to_string()], StopCause::Unsupported),
+        (
+            vec![trust_verifier_api::ROUTED_NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC.into()],
+            StopCause::Unsupported,
+        ),
+        (
+            vec![trust_verifier_api::NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC.into()],
+            StopCause::Unclassified,
+        ),
+        (
+            vec![
+                trust_verifier_api::ROUTED_NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC.into(),
+                StopCause::WallBackstop.stamp("clock ended after completed native solve"),
+            ],
+            StopCause::WallBackstop,
+        ),
+        (
+            vec![
+                trust_verifier_api::ROUTED_NATIVE_REFUTATION_FIDELITY_DEMOTION_DIAGNOSTIC.into(),
+                StopCause::Unclassified.stamp("separate unexplained work"),
+            ],
+            StopCause::Unclassified,
+        ),
+        (
+            vec![marker.to_string(), StopCause::WallBackstop.stamp("clock ended")],
+            StopCause::WallBackstop,
+        ),
+        (
+            vec![marker.to_string(), StopCause::RssBackstop.stamp("RSS ended")],
+            StopCause::RssBackstop,
+        ),
+        (
+            vec![marker.to_string(), StopCause::SolverFault.stamp("solver failed")],
+            StopCause::SolverFault,
+        ),
+        (
+            vec![marker.to_string(), StopCause::Unclassified.stamp("unexplained work")],
+            StopCause::Unclassified,
+        ),
+    ] {
+        evidence.diagnostics = diagnostics;
+        let result = legacy_result_from_api_evidence(&evidence);
+        assert!(matches!(result, VerificationResult::Unknown { .. }));
+        assert_eq!(StopCause::of_result(&result), expected);
+        assert_eq!(transport_proof_status(&evidence), TransportProofStatus::Unsupported);
+        assert!(evidence.decline.is_none(), "stop accounting grants no fallback retry");
+    }
+    // Neither a direct native producer nor an unrelated composite producer
+    // can author the qualified router relay.
+    evidence.diagnostics = vec![marker.to_string()];
+    for (name, kind) in [
+        ("unrelated-engine", trust_verifier_api::EngineKind::Composite),
+        ("trust-mc", trust_verifier_api::EngineKind::Reachability),
+        ("trust-full-verifier", trust_verifier_api::EngineKind::Reachability),
+    ] {
+        evidence.engine =
+            trust_verifier_api::EngineManifest::new(name, trust_verifier_api::API_VERSION, kind);
+        assert_eq!(
+            StopCause::of_result(&legacy_result_from_api_evidence(&evidence)),
+            StopCause::Unclassified,
+        );
     }
 }
 
@@ -3536,6 +5536,7 @@ fn native_trust_ir_compiler_function() -> (
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let compiler_contracts = trust_types::CompilerContractBundle::new(vec![contract]);
     let vcs = vec![
@@ -3599,6 +5600,21 @@ fn native_trust_ir_compiler_function() -> (
 }
 
 #[test]
+fn native_bundle_producer_labels_preserve_all_sources() {
+    use trust_ir::NativeBundleProducer;
+
+    for (producer, expected) in [
+        (NativeBundleProducer::TRust, "Trust"),
+        (NativeBundleProducer::TSwift, "tSwift"),
+        (NativeBundleProducer::TC, "tC"),
+        (NativeBundleProducer::TrustIr, "TrustIr"),
+        (NativeBundleProducer::Clean, "Clean"),
+    ] {
+        assert_eq!(native_bundle_producer_name(producer), expected);
+    }
+}
+
+#[test]
 fn live_native_bundle_source_authority_is_exact_affine_and_one_shot() {
     let (function, compiler_contracts, vcs) = native_trust_ir_compiler_function();
     let (_, mut native_bundle) =
@@ -3622,6 +5638,402 @@ fn live_native_bundle_source_authority_is_exact_affine_and_one_shot() {
     let second = mint_source_generation_authority_for_live_native_bundle(&mut native_bundle)
         .expect_err("one exact live bundle may mint authority only once");
     assert!(second.contains("already minted"), "unexpected rejection: {second}");
+}
+
+/// Trust (C1, 2026-11-06): the seam's single issuer binds only claims that match
+/// the exact live bundle, and answers `None` for a constructor refusal, a foreign
+/// or cloned bundle, or an empty claim set.
+#[test]
+fn source_reference_facts_bind_only_exact_live_claims() {
+    let (function, compiler_contracts, vcs) = native_trust_ir_compiler_function();
+    let (_, mut native_bundle) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+    let authority = mint_source_generation_authority_for_live_native_bundle(&mut native_bundle)
+        .expect("live authority")
+        .expect("the fixture must produce a native bundle");
+    let native = native_bundle.as_ref().expect("built").as_ref().expect("present");
+    let root = native
+        .module
+        .functions
+        .iter()
+        .find(|function| !function.blocks.is_empty())
+        .expect("the fixture lowers a body");
+    let entry = root.blocks.iter().find(|block| block.id == root.entry).expect("entry block");
+    let (value, ty) = entry.params[0].clone();
+    assert_eq!(ty, trust_ir::Ty::Ptr, "the fixture's `&u32` parameter is an entry pointer");
+    let parameter = || trust_ir_bridge::ReconciledSourceReferenceParameter {
+        function: root.id,
+        parameter_index: 0,
+        value,
+        pointee: trust_ir::Ty::U32,
+    };
+
+    // An exact parameter claim binds.
+    let reconciled = trust_ir_bridge::ReconciledSourceReferenceSites {
+        parameters: vec![parameter()],
+        ..Default::default()
+    };
+    let facts = source_reference_facts::bind_reconciled_source_reference_facts(
+        native, &authority, reconciled,
+    )
+    .expect("an exact entry-pointer claim binds to the live bundle");
+    assert!(facts.authorizes_bundle(native, &authority));
+
+    // A claim the constructor refuses (a load site that is no load) yields `None`,
+    // with no retry on the remaining claims.
+    let refused = trust_ir_bridge::ReconciledSourceReferenceSites {
+        parameters: vec![parameter()],
+        loads: vec![trust_ir_bridge::ReconciledSourceReferenceLoad {
+            function: root.id,
+            block: entry.id,
+            instruction_index: u32::MAX,
+            result: value,
+            pointer: value,
+            pointee: trust_ir::Ty::U32,
+        }],
+        // Trust (2026-11-07): the reference VALUE claims (none here).
+        values: vec![],
+        withdrawn: 0,
+    };
+    assert!(
+        source_reference_facts::bind_reconciled_source_reference_facts(native, &authority, refused)
+            .is_none(),
+        "a constructor refusal must yield no facts at all"
+    );
+
+    // An empty claim set keeps the authority-only dispatch.
+    assert!(
+        source_reference_facts::bind_reconciled_source_reference_facts(
+            native,
+            &authority,
+            trust_ir_bridge::ReconciledSourceReferenceSites::default(),
+        )
+        .is_none()
+    );
+
+    // A cloned bundle has lost the live identity: no facts, even from an empty table.
+    let cloned = native.clone();
+    let reconciled = trust_ir_bridge::ReconciledSourceReferenceSites {
+        parameters: vec![parameter()],
+        ..Default::default()
+    };
+    assert!(
+        source_reference_facts::bind_reconciled_source_reference_facts(
+            &cloned, &authority, reconciled
+        )
+        .is_none(),
+        "facts must not bind to a clone of the live bundle"
+    );
+    assert!(
+        source_reference_facts::source_reference_facts_for_live_native_bundle(
+            &cloned,
+            &authority,
+            &trust_ir_bridge::LoweredSourceReferenceSites::default(),
+        )
+        .is_none()
+    );
+}
+
+/// Trust (C1, 2026-11-06): the production bundle builder on the single-body
+/// `native_trust_ir_compiler_function` fixture (a `&u32` entry parameter), with an
+/// explicit borrow-provenance clean set and conjunct (3) scope, returning the
+/// side table it published for the module it returned.
+fn build_with_source_reference_sites(
+    clean: Option<&FxHashSet<String>>,
+    scope: Option<&bundled_borrow_provenance::ReachScope>,
+) -> (
+    Result<Option<trust_ir_bridge::NativeVerificationBundle>, String>,
+    Option<trust_ir_bridge::LoweredSourceReferenceSites>,
+) {
+    let (function, compiler_contracts, vcs) = native_trust_ir_compiler_function();
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
+    ensure_default_trust_mc_function_obligation(&function, &mut bundle)
+        .expect("the fixture takes the default trust-mc row");
+    // A stale table from a previous body: every exit must replace or clear it.
+    let mut sites = Some(trust_ir_bridge::LoweredSourceReferenceSites::default());
+    let outcome = build_native_trust_ir_bundle_from_verifiable_functions(
+        &function,
+        &mut bundle,
+        vec![function.clone()],
+        &BundledMemberSourceIdentityLedger::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(), // bundled_destructor_members: none
+        &trust_ir_bridge::CallReachWithdrawals::default(),
+        clean,
+        scope,
+        &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(),
+        None,
+        &[],
+        &vcs,
+        None,
+        &mut None,
+        &mut PanicFreedomFoldAttestation::default(),
+        &mut None,
+        &mut Vec::new(),
+        false,
+        None,
+        None, // this side-table fixture has no private source-decline reference
+        &mut sites,
+    );
+    (outcome, sites)
+}
+
+/// Trust (C1, 2026-11-06): the builder publishes the side table of the EXACT
+/// module it returns, the issuer binds its claims to that bundle, and a build
+/// with no conjunct (3) scope, no clean set or an unclean root claims nothing.
+#[test]
+fn the_builder_publishes_the_side_table_of_its_final_module() {
+    let (function, _, _) = native_trust_ir_compiler_function();
+    let clean: FxHashSet<String> = [function.def_path.clone()].into_iter().collect();
+    let scope = || {
+        let mut ledger = bundled_borrow_provenance::BorrowProvenanceLedger::default();
+        ledger.record(&function.def_path, "root", true);
+        ledger.note_local_body(&function.def_path);
+        ledger.into_clean_set_and_reach_scope().1
+    };
+
+    let scope_with_root = scope();
+    let (mut native_bundle, sites) =
+        build_with_source_reference_sites(Some(&clean), Some(&scope_with_root));
+    let sites = sites.expect("an Ok(Some) build publishes its side table");
+    assert_eq!(sites.claim_count(), 1, "the clean root's `&u32` parameter is claimed");
+    let authority = mint_source_generation_authority_for_live_native_bundle(&mut native_bundle)
+        .expect("live authority")
+        .expect("the fixture produces a native bundle");
+    let native = native_bundle.as_ref().expect("built").as_ref().expect("present");
+    let reconciled = sites.reconcile(&native.module);
+    assert_eq!(reconciled.parameters.len(), 1, "the table matches the returned module");
+    assert_eq!(reconciled.withdrawn, 0);
+    let facts = source_reference_facts::source_reference_facts_for_live_native_bundle(
+        native, &authority, &sites,
+    )
+    .expect("the published table binds to the bundle it was published with");
+    assert!(facts.authorizes_bundle(native, &authority));
+    // The same non-empty table against a clone of that bundle binds nothing: the
+    // seam's own authority check and trust-mc's constructor both refuse it.
+    let cloned = native.clone();
+    assert!(
+        source_reference_facts::source_reference_facts_for_live_native_bundle(
+            &cloned, &authority, &sites,
+        )
+        .is_none(),
+        "a claimed table must not bind to a clone of the live bundle"
+    );
+
+    // No conjunct (3) scope: no provenance past the per-body classifier, no claim.
+    let (built, sites) = build_with_source_reference_sites(Some(&clean), None);
+    assert!(matches!(built, Ok(Some(_))));
+    assert_eq!(sites.expect("published").claim_count(), 0);
+    // The plain path (no clean set) and an unclean root record nothing.
+    let scope_with_root = scope();
+    let (_, sites) = build_with_source_reference_sites(None, Some(&scope_with_root));
+    assert_eq!(sites.expect("published").claim_count(), 0);
+    let scope_with_root = scope();
+    let (_, sites) =
+        build_with_source_reference_sites(Some(&FxHashSet::default()), Some(&scope_with_root));
+    assert_eq!(sites.expect("published").claim_count(), 0);
+}
+
+/// Trust (C1, 2026-11-06, a source census): outside test code, trust-mc's source
+/// reference facts constructor is NAMED exactly once in this crate and in every
+/// Trust-owned crate (`crates/`, `targo-trust/`), in
+/// `trust_verify/source_reference_facts.rs` (since 2026-11-07 the value-fact
+/// constructor; the four-argument one is never named); and `SourceGenerationAuthority::mint_from_live_lowering` is named only
+/// in `trust_verify.rs`. A second issuer anywhere a crate can reach trust-router's
+/// or trust-bmc's re-export fails here.
+///
+/// It matches the IDENTIFIER, not a call spelling, so a call split across lines,
+/// a path held in a `let` or a `use … as` alias of the path all name it. Test
+/// code is skipped: files under `tests/`/`benches/`/`examples/`, `tests.rs` and
+/// `*_tests.rs`, and the brace-matched body of an inline `#[cfg(test)] mod`. It
+/// is a tripwire over source text, not a proof: a macro that pastes the name
+/// together would evade it.
+#[test]
+fn source_reference_facts_have_a_single_production_issuer() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a source directory entry").path();
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            if path.is_dir() {
+                if name.starts_with('.') || name == "target" {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    fn is_test_source(relative: &str) -> bool {
+        relative.split('/').any(|part| matches!(part, "tests" | "benches" | "examples"))
+            || relative
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+    }
+    /// `source` without line comments and without the body of every inline
+    /// `#[cfg(test)]`-gated `mod` (braces matched outside string and char
+    /// literals). The number of test-region lines that named a census identifier
+    /// is returned too, as the walk's positive control.
+    fn production_lines(source: &str, names: &[&str]) -> (Vec<String>, usize) {
+        let mut out = Vec::new();
+        let mut skipped_hits = 0;
+        let mut depth: Option<i64> = None;
+        let mut pending_cfg_test = false;
+        for line in source.lines() {
+            let code = line.split("//").next().unwrap_or_default();
+            let trimmed = code.trim();
+            if depth.is_none() {
+                if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
+                    pending_cfg_test = true;
+                    out.push(code.to_string());
+                    continue;
+                }
+                let opens_test_mod = pending_cfg_test
+                    && (trimmed.starts_with("mod ") || trimmed.starts_with("pub(crate) mod "))
+                    && trimmed.ends_with('{');
+                if !trimmed.starts_with("#[") {
+                    pending_cfg_test = false;
+                }
+                if !opens_test_mod {
+                    out.push(code.to_string());
+                    continue;
+                }
+                depth = Some(0);
+            }
+            if names.iter().any(|name| code.contains(name)) {
+                skipped_hits += 1;
+            }
+            let mut in_string = false;
+            let mut escaped = false;
+            let mut chars = code.chars().peekable();
+            let mut d = depth.unwrap_or(0);
+            while let Some(c) = chars.next() {
+                if in_string {
+                    match (escaped, c) {
+                        (true, _) => escaped = false,
+                        (false, '\\') => escaped = true,
+                        (false, '"') => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => in_string = true,
+                    '\'' => {
+                        // Skip a char literal such as '{' or '\''; a lifetime has no
+                        // closing quote within two characters.
+                        let mut look = chars.clone();
+                        let first = look.next();
+                        let second = look.next();
+                        let third = look.next();
+                        if first == Some('\\') && third == Some('\'') {
+                            chars.next();
+                            chars.next();
+                            chars.next();
+                        } else if second == Some('\'') {
+                            chars.next();
+                            chars.next();
+                        }
+                    }
+                    '{' => d += 1,
+                    '}' => d -= 1,
+                    _ => {}
+                }
+            }
+            depth = if d <= 0 { None } else { Some(d) };
+        }
+        (out, skipped_hits)
+    }
+    fn names_identifier(code: &str, identifier: &str) -> bool {
+        code.match_indices(identifier).any(|(at, _)| {
+            let before = code[..at].chars().next_back();
+            let after = code[at + identifier.len()..].chars().next();
+            let is_ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+            !is_ident(before) && !is_ident(after)
+        })
+    }
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = crate_root.join("../..");
+    let roots = [
+        ("compiler/rustc_mir_transform/src", crate_root.join("src")),
+        ("crates", repo.join("crates")),
+        ("targo-trust", repo.join("targo-trust")),
+    ];
+    const ISSUER: &str = "from_live_source_lowering";
+    const VALUE_ISSUER: &str = "from_live_source_lowering_with_values";
+    const MINT: &str = "mint_from_live_lowering";
+    let mut issuers = Vec::new();
+    let mut value_issuers = Vec::new();
+    let mut mints = Vec::new();
+    let mut read = Vec::new();
+    let mut skipped_test_hits = 0;
+    for (label, root) in &roots {
+        assert!(root.is_dir(), "the census root {label} must exist ({})", root.display());
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        for file in &files {
+            let relative = format!(
+                "{label}/{}",
+                file.strip_prefix(root)
+                    .expect("a walked file is under its root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            read.push(relative.clone());
+            if is_test_source(&relative) {
+                continue;
+            }
+            let source = std::fs::read_to_string(file).expect("read a source file");
+            let (lines, skipped) = production_lines(&source, &[ISSUER, VALUE_ISSUER, MINT]);
+            skipped_test_hits += skipped;
+            for code in lines {
+                if names_identifier(&code, VALUE_ISSUER) {
+                    value_issuers.push(relative.clone());
+                }
+                if names_identifier(&code, ISSUER) {
+                    issuers.push(relative.clone());
+                }
+                if names_identifier(&code, MINT) {
+                    mints.push(relative.clone());
+                }
+            }
+        }
+    }
+    // Positive controls: the walk reached this crate and the re-exporting crates,
+    // and it saw (and skipped) the inline test modules that do name the census
+    // identifiers (trust-bmc's `verifier_api.rs` tests mint and issue).
+    for expected in [
+        "compiler/rustc_mir_transform/src/trust_verify.rs",
+        "crates/trust-bmc/src/verifier_api.rs",
+        "crates/trust-router/src/full_verification/native_trust_ir/bundle_evidence.rs",
+    ] {
+        assert!(read.iter().any(|file| file == expected), "the census must read {expected}");
+    }
+    assert!(skipped_test_hits > 0, "the census must have skipped inline test uses");
+    // Trust (2026-11-07): the single issuer now calls the value-fact constructor
+    // (it carries the reference VALUE records); the four-argument constructor has
+    // no production caller. Both together still name exactly one file.
+    assert!(issuers.is_empty(), "no production four-argument issuer: {issuers:?}");
+    assert_eq!(
+        value_issuers,
+        vec!["compiler/rustc_mir_transform/src/trust_verify/source_reference_facts.rs".to_string()],
+        "exactly one production source reference facts issuer"
+    );
+    assert_eq!(
+        mints,
+        vec!["compiler/rustc_mir_transform/src/trust_verify.rs".to_string()],
+        "exactly one production authority mint"
+    );
 }
 
 fn fresh_nonlegacy_vc_binding_fixture() -> (
@@ -4143,6 +6555,33 @@ fn fresh_vc_rekey_requires_exact_context_location_digest_and_schema() {
     }
 }
 
+// Trust: pre-dispatch replay must use the same exact compiler snapshot as
+// post-dispatch binding. A certifiable replacement cannot repair stale input.
+#[test]
+fn early_kernel_replay_candidates_require_the_complete_current_frozen_claim() {
+    let (function, vcs, bundle) = fresh_nonlegacy_vc_binding_fixture();
+    let context = trust_router::VerifierExecutionContext::new("early-replay-snapshot");
+    let snapshot = exact_fresh_vc_rekey_snapshot(
+        &function,
+        &trust_types::CompilerContractBundle::default(),
+        &bundle,
+        &vcs,
+        context.snapshot(),
+    );
+    assert!(snapshot.complete);
+    let candidates = early_kernel_replay_candidates(&bundle, &bundle.obligations, &vcs, &snapshot);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(RowKey::of(&candidates[0].1), RowKey::of(&vcs[0]));
+    let mut changed_vcs = vcs.clone();
+    changed_vcs[0].formula = Formula::Bool(false);
+    assert!(early_kernel_replay_candidates(&bundle, &bundle.obligations, &changed_vcs, &snapshot).is_empty());
+    let mut changed_bundle = bundle.clone();
+    changed_bundle.obligations[0].description.push_str(" changed canonical claim");
+    assert!(early_kernel_replay_candidates(&changed_bundle, &changed_bundle.obligations, &vcs, &snapshot).is_empty());
+    assert!(early_kernel_replay_candidates(&bundle, &[], &vcs, &snapshot).is_empty());
+    assert!(early_kernel_replay_candidates(&bundle, &bundle.obligations, &vcs, &ExactFreshVcRekeySnapshot::default()).is_empty());
+}
+
 #[test]
 fn impl_method_fresh_rekey_binds_exact_compiler_crate_identity() {
     let (mut function, compiler_contracts, _) = native_trust_ir_compiler_function();
@@ -4577,7 +7016,11 @@ fn fresh_vc_rekey_invalidates_legacy_compatible_proofs_and_retains_missing_vcs()
         );
     let _declined =
         promote_structurally_dead_unreachable(&mut promoted_after_integrity_failure, None);
-    promote_kernel_certifiable(&mut promoted_after_integrity_failure, None);
+    promote_kernel_certifiable(
+        &mut promoted_after_integrity_failure,
+        None,
+        &mut ClockStops::default(),
+    );
     let sentinel_index = promoted_after_integrity_failure
         .iter()
         .position(|(vc, _)| {
@@ -5303,6 +7746,26 @@ fn fresh_vc_rekey_rejects_duplicate_exact_obligations_and_maps_the_unique_row() 
     }
 }
 
+// Trust (DIVERGE-ANCHOR-1 / DIVERGE-ENTRY-1): the callee key the extractor
+// (`callee_key_for` -> `diverging_entry_of`) mints for core's own
+// `panicking::panic`: a real sysroot crate and the `diverging_entry` stamp. The
+// bridge lowers a `target: None` call as a diverging panic SITE only under that
+// stamp (`CalleeKey::opt_diverging_entry`); with `callee_key: None` the call has
+// no lowering and the bundle is refused. The same key the bridge's own unit
+// fixtures carry (`trust_ir_bridge`'s `diverging_site_anchor_tests::entry_key_for`).
+fn core_panic_entry_callee_key() -> trust_types::CalleeKey {
+    trust_types::CalleeKey {
+        sysroot_item: None,
+        krate_is_real_sysroot: true,
+        krate_name_is_ambiguous: false,
+        stable_crate_id: 0x5157_7200,
+        krate_name: "core".to_string(),
+        foreign_block_leaf: None,
+        upstream_foreign_link_symbol: None,
+        diverging_entry: Some(trust_types::DivergingEntry::PanicOrAbort),
+    }
+}
+
 fn native_trust_ir_panic_function(panic_reachable: bool) -> trust_types::VerifiableFunction {
     trust_types::VerifiableFunction {
         name: "panic_branch".to_string(),
@@ -5341,6 +7804,8 @@ fn native_trust_ir_panic_function(panic_reachable: bool) -> trust_types::Verifia
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        // Trust (DIVERGE-ENTRY-1): the stamped core entry key.
+                        callee_key: Some(core_panic_entry_callee_key()),
                         unwind: trust_types::UnwindEdge::Unreachable,
                     },
                 },
@@ -5361,6 +7826,7 @@ fn native_trust_ir_panic_function(panic_reachable: bool) -> trust_types::Verifia
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -5378,7 +7844,9 @@ fn public_native_inventory_reset_removes_all_bridge_proof_authority() {
     module.proof_certificates.push(trust_ir::ProofCertificate {
         obligation: stale_id,
         prover: "stale-bridge-prover".to_string(),
+        // Trust: stale ungraded evidence must still be removed by the reset.
         evidence: trust_ir::ProofEvidence::SmtProof(vec![1]),
+        assurance: None,
     });
     module
         .obligation_diagnostics
@@ -5389,6 +7857,14 @@ fn public_native_inventory_reset_removes_all_bridge_proof_authority() {
         ensures: Vec::new(),
         params: Vec::new(),
         proved: true,
+        // v41. This fixture plants a STALE summary to prove the bridge drops
+        // it, so both new fields stay at their pre-v41 meanings: no carried
+        // `decreases` measures, and `backed_by: None` = NOT RECORDED, which a
+        // fail-closed consumer must read as unauthenticated rather than as
+        // "backed locally".
+        decreases: Vec::new(),
+        backed_by: None,
+        effects: None,
     });
     lowered_function
         .proofs
@@ -5574,6 +8050,43 @@ fn trust_mc_direct_typed_chc_input_accepts_hardened_native_vc_payloads() {
     assert_eq!(constraint.constraint["rhs"]["op"], "not");
 }
 
+// Trust: signed remainder must keep the exact value operation and width in
+// both the replay formula and the native typed-CHC producer. A signed MIN
+// dividend's bit pattern is not an unsigned remainder problem.
+#[test]
+fn signed_remainder_payload_decodes_and_emits_distinct_typed_chc_operation() {
+    use trust_verifier_api::{TrustSpecBvBinaryOp as Bv, TrustSpecExpr, TrustSpecSort};
+    let bv8 = TrustSpecSort::BitVec { width: 8 };
+    let source = TrustSpecExpr::bv_binary(
+        Bv::Srem,
+        TrustSpecExpr::variable("x", bv8),
+        TrustSpecExpr::bitvec_literal("2", 8),
+        8,
+    );
+    assert_eq!(
+        formula_from_trust_spec_expr(&source),
+        Some(Formula::BvSRem(
+            Box::new(Formula::Var("x".to_string(), trust_types::Sort::BitVec(8))),
+            Box::new(Formula::BitVec { value: 2, width: 8 }),
+            8,
+        )),
+    );
+    let wire = trust_mc_typed_chc_expr_from_trust_spec(&source).unwrap();
+    assert_eq!(wire["op"], "bv_srem");
+    assert_eq!(wire["rhs"]["width"], 8);
+
+    let mut wrong_result = source.clone();
+    wrong_result.sort = TrustSpecSort::Bool;
+    assert_eq!(formula_from_trust_spec_expr(&wrong_result), None);
+    let wrong_rhs = TrustSpecExpr::bv_binary(
+        Bv::Srem,
+        TrustSpecExpr::variable("x", bv8),
+        TrustSpecExpr::bitvec_literal("2", 16),
+        8,
+    );
+    assert_eq!(formula_from_trust_spec_expr(&wrong_rhs), None);
+}
+
 #[test]
 fn trust_mc_typed_chc_input_marks_rust_division_and_remainder_as_truncating() {
     let int_sort = trust_verifier_api::TrustSpecSort::Int;
@@ -5670,7 +8183,9 @@ fn trust_mc_typed_chc_preserves_array_select_while_trust_wp_fails_closed() {
 
     let wp_error = trust_spec_predicate_to_trust_formula_payload(&predicate)
         .expect_err("scalar trust-wp payload must reject public arrays");
-    assert!(wp_error.contains("arrays are outside trust-wp"), "{wp_error}");
+    // Trust: 744e08d57e moved this conversion to the shared trust-wp native
+    // formula (TrustFormulaV1) and its array-sort refusal wording.
+    assert!(wp_error.contains("TrustSpecPredicate array sort is outside trust_wp"), "{wp_error}");
 
     let invalid = trust_verifier_api::TrustSpecPredicate::new(
         trust_verifier_api::TrustSpecExpr::variable(
@@ -5933,12 +8448,16 @@ fn trust_mc_typed_chc_contract_binds_hardened_obligation_to_canonical_public_con
 
 /// Build a Bool-rooted `And` chain nested exactly `depth` levels deep.
 ///
-/// `depth` is measured the way `validate_trust_spec_expr` measures it: the root
-/// sits at 0 and every child is one deeper, so the returned predicate's deepest
-/// node is at `depth`.
+/// The root sits at 0 and every child is one deeper, so the returned predicate's
+/// deepest node is at `depth`. Its JSON payload nests `2 * depth + 3` levels (the
+/// predicate object, then an expression object and its tagged `kind` object a node),
+/// and the typed-CHC contract it lowers to one level a node plus the contract's
+/// wrapper (T3 L4, C09d).
 fn trust_spec_predicate_nested_to_depth(depth: usize) -> trust_verifier_api::TrustSpecPredicate {
-    let flag =
-        trust_verifier_api::TrustSpecExpr::variable("panic_flag", trust_verifier_api::TrustSpecSort::Bool);
+    let flag = trust_verifier_api::TrustSpecExpr::variable(
+        "panic_flag",
+        trust_verifier_api::TrustSpecSort::Bool,
+    );
     // `binary(And, flag, unary(Not, flag))` already reaches depth 2, and every
     // wrap adds exactly one.
     let mut root = trust_verifier_api::TrustSpecExpr::binary(
@@ -5997,7 +8516,8 @@ fn hardened_trust_mc_obligation_with_predicate(
             },
             trust_verifier_api::MetadataEntry {
                 key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
-                value: serde_json::to_string(predicate).expect("TrustSpecPredicate should serialize"),
+                value: serde_json::to_string(predicate)
+                    .expect("TrustSpecPredicate should serialize"),
             },
             trust_verifier_api::MetadataEntry {
                 key: TRUST_SOURCE_DIGEST_METADATA_KEY.to_string(),
@@ -6011,24 +8531,54 @@ fn hardened_trust_mc_obligation_with_predicate(
     }
 }
 
-/// A VC the public API ACCEPTS can still lower to a contract the public API
-/// REJECTS, and when it does the whole function's native bundle must survive.
+/// Run `test` on a thread whose stack holds a predicate near
+/// `trust_types::json_depth::MAX_DEEP_NESTING`: building, serializing, lowering and
+/// dropping it each recurse once or more per level, and a test thread has 2 MiB (T3 L4,
+/// C09d). Lazily committed, as the deep-decode thread's stack is.
+fn on_a_deep_stack(test: impl FnOnce() + Send) {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn_scoped(scope, test)
+            .expect("the test thread starts")
+            .join()
+            .expect("the test passes");
+    });
+}
+
+/// The semantic depth of an `And` chain whose payload nests just past the readers' bound.
+fn semantic_depth_past_the_readers_bound() -> usize {
+    trust_types::json_depth::MAX_DEEP_NESTING / 2 + 1
+}
+
+/// Trust (T3 L4, C09d): a VC past the deleted 128-level public bound lowers to a contract
+/// the public API accepts, so its typed contract is minted and the row is linked to the
+/// direct typed-CHC lane. A VC whose payload nests past the bound its readers decode
+/// (`json_depth::MAX_DEEP_NESTING`) is declined for its row alone: the function's native
+/// bundle survives and validates, and a shallow sibling row of the same function is still
+/// minted and linked to its own canonical contract (plan C09d: "its siblings keep their
+/// evidence").
 ///
-/// `validate_trust_spec_expr` bounds a typed formula's expression nesting by
-/// `MAX_CONTRACT_PREDICATE_JSON_DEPTH`; `validate_bounded_json` bounds the
-/// derived contract's JSON CONTAINER nesting by the same constant. The derived
-/// contract wraps the lowered constraint in `rules[0].body.constraints[0]`, so
-/// a formula at the first bound is necessarily past the second — the two
-/// bounds are not the same measurement and were never reconciled.
-///
-/// Before the fix `finalize_trust_mc_public_semantic_contracts` pushed that
-/// contract anyway and let `bundle.validate()` fail, and the error propagated
-/// with `?` out of `build_native_trust_ir_bundle_from_verifiable_functions` —
-/// discarding the native TrustIr bundle for the WHOLE function so that every
-/// requested obligation degraded to `EvidenceStatus::Unsupported`. That is the
-/// exact chain that cost a3d's `insphere_i128` all 26 of its rows.
+/// Before C09d the typed-formula bound and the contract's JSON bound were the same 128,
+/// and the contract nests deeper than its formula, so a formula at the first bound was past
+/// the second. `finalize_trust_mc_public_semantic_contracts` pushed that contract anyway and
+/// let `bundle.validate()` fail, and the error propagated with `?` out of
+/// `build_native_trust_ir_bundle_from_verifiable_functions`, discarding the native TrustIr
+/// bundle for the WHOLE function. That is the exact chain that cost a3d's `insphere_i128`
+/// all 26 of its rows, and the decline before the push (`typed-chc-contract-decline`)
+/// stopped it. Under C09d the contract meets the readers' bound, and a payload they decode
+/// lowers to a contract inside it (one JSON level a node against the payload's two), so the
+/// row past the bound is declined one step earlier, when its payload is read: its lowering
+/// is Unsupported and no contract is built.
 #[test]
-fn unrepresentable_derived_trust_mc_contract_is_declined_not_pushed_into_the_bundle() {
+fn deep_vc_contracts_are_minted_and_an_undecodable_one_is_declined_per_row() {
+    on_a_deep_stack(|| {
+        deep_vc_row_on_a_deep_stack(1_000, true);
+        deep_vc_row_on_a_deep_stack(semantic_depth_past_the_readers_bound(), false);
+    });
+}
+
+fn deep_vc_row_on_a_deep_stack(depth: usize, expect_minted: bool) {
     let (mut function, _, _) = native_trust_ir_compiler_function();
     function.contracts.clear();
 
@@ -6050,14 +8600,19 @@ fn unrepresentable_derived_trust_mc_contract_is_declined_not_pushed_into_the_bun
         metadata: Vec::new(),
     });
 
-    // Sit exactly ON the typed-formula bound. This is the premise of the whole
-    // test: the compiler is entitled to emit this VC.
-    let predicate = trust_spec_predicate_nested_to_depth(
-        trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH,
+    // The compiler is entitled to emit this VC: the typed validator has no depth bound.
+    let predicate = trust_spec_predicate_nested_to_depth(depth);
+    predicate.validate().expect("a deep formula is a VC the public API accepts");
+    // NON-VACUITY: the payload sits on the side of the readers' bound this row tests.
+    let payload_depth = trust_types::json_depth::json_nesting_depth(
+        &serde_json::to_string(&predicate).expect("the predicate serializes"),
     );
-    predicate
-        .validate()
-        .expect("a formula at MAX_CONTRACT_PREDICATE_JSON_DEPTH is a VC the public API accepts");
+    assert!(payload_depth > 128, "past the deleted bound: {payload_depth}");
+    assert_eq!(
+        payload_depth <= trust_types::json_depth::MAX_DEEP_NESTING,
+        expect_minted,
+        "the payload nests {payload_depth} levels"
+    );
 
     let obligation_id = "vc:read_fixed_array_value:panic_boundary:1";
     bundle.obligations.push(hardened_trust_mc_obligation_with_predicate(
@@ -6065,66 +8620,28 @@ fn unrepresentable_derived_trust_mc_contract_is_declined_not_pushed_into_the_bun
         original_contract_id,
         &predicate,
     ));
+    // The sibling: a shallow row of the same function, at its own line, beside the deep one.
+    let sibling_id = "vc:read_fixed_array_value:panic_boundary:2";
+    let mut sibling = hardened_trust_mc_obligation_with_predicate(
+        sibling_id,
+        original_contract_id,
+        &trust_spec_predicate_nested_to_depth(4),
+    );
+    sibling.source = native_trust_ir_test_source_location(18);
+    bundle.obligations.push(sibling);
 
     let native_trust_ir_bundle =
         build_native_trust_ir_bundle_for_test_verifier_api(&function, &mut bundle, &[])
-            .expect(
-                "one unrepresentable derived contract must not discard the whole function's \
-                 native TrustIr bundle",
-            )
+            .expect("one row's contract must not discard the whole function's native bundle")
             .expect("the hardened obligation still requests trust-mc");
     assert!(
         !native_trust_ir_bundle.compiler_facts.obligation_sources.is_empty(),
         "the surviving native bundle must still carry the function's proof obligations"
     );
 
-    bundle
-        .validate()
-        .expect("the bundle the compiler hands to the verifier must validate");
-
-    let obligation = bundle
-        .obligations
-        .iter()
-        .find(|obligation| obligation.obligation_id == obligation_id)
-        .expect("hardened obligation should remain in the public bundle");
-
-    // NON-VACUITY: the decline actually happened. If the derived contract were
-    // representable after all, this assertion fails rather than letting the
-    // test pass for the wrong reason.
-    let public_contract_id = obligation.contract_id.as_deref();
-    assert_eq!(
-        public_contract_id,
-        Some(original_contract_id),
-        "a declined mint must leave the row's original contract identity untouched"
-    );
-    assert!(
-        !bundle.contracts.iter().any(|contract| {
-            contract.contract_id.starts_with("contract:trust-mc-typed-chc-public:")
-        }),
-        "no canonical public typed-CHC contract may be minted for an unrepresentable formula"
-    );
-    // THE TWO MINT SITES DECIDE INDEPENDENTLY, and the invariant is per-record
-    // representability, NOT that they agree.
-    //
-    // The authenticated native marker is appended before the SECOND
-    // `bundle.validate()?`, so it needs its own check or the poisoning merely
-    // relocates. But it is NOT built from the same encoding as the canonical
-    // contract: the marker goes through the native TrustIr request, which can
-    // reach a structural whole-CFG CHC where the canonical builder fell back to
-    // the flat `rules[0].body.constraints[0]` wrapper. On a3d's real
-    // `insphere_i128` both sites decline the same two rows
-    // (`panic_boundary:46`, `:48`); in this synthetic module the marker's own
-    // encoding stays inside the bound, so only the canonical mint declines.
-    //
-    // That asymmetry is SAFE, and asserting it away would be asserting a
-    // coincidence. A marker alone cannot authorize the direct typed-CHC lane:
-    // trust-bmc selects that lane through `obligation.contract_id`, and it
-    // explicitly refuses to let a native marker identity stand in for the
-    // canonical public link. So the row still falls to the whole-module
-    // transport route. What must hold is that EVERY record the bundle carries
-    // is one the bundle would accept — asserted here per record, so a future
-    // marker that IS past the bound fails here rather than at the second
-    // `bundle.validate()?`.
+    bundle.validate().expect("the bundle the compiler hands to the verifier must validate");
+    // Every record the bundle carries is one the bundle accepts, asserted per record (the
+    // native marker contract decides on its own encoding).
     for contract in &bundle.contracts {
         contract.validate().unwrap_or_else(|error| {
             panic!(
@@ -6134,31 +8651,68 @@ fn unrepresentable_derived_trust_mc_contract_is_declined_not_pushed_into_the_bun
         });
     }
 
-    // FAIL-CLOSED, NOT ADMITTED. Losing the typed contract costs the row the
-    // DIRECT typed-CHC lane and nothing else: trust-bmc's direct-lane selector
-    // keys off exactly this contract identity, so the row is left to the
-    // whole-module transport route, which must still prove it.
-    assert!(
-        !public_contract_id
+    let linked = |id: &str| -> String {
+        bundle
+            .obligations
+            .iter()
+            .find(|obligation| obligation.obligation_id == id)
+            .expect("hardened obligation should remain in the public bundle")
+            .contract_id
+            .clone()
             .expect("row keeps a contract identity")
-            .starts_with("contract:trust-mc-typed-chc"),
-        "a declined row must not be eligible for the direct typed-CHC lane"
+    };
+    let is_minted_contract = |contract_id: &str| {
+        contract_id.starts_with("contract:trust-mc-typed-chc-public:")
+            && bundle.contracts.iter().any(|contract| contract.contract_id == contract_id)
+    };
+    let public_contract_id = linked(obligation_id);
+    let public_contract_id = public_contract_id.as_str();
+    let minted = is_minted_contract(public_contract_id);
+    assert_eq!(minted, expect_minted, "depth {depth}: the canonical public contract");
+    // The sibling keeps its evidence whatever the deep row's fate: its own canonical public
+    // contract, minted into the bundle and linked to it.
+    let sibling_contract_id = linked(sibling_id);
+    assert!(
+        is_minted_contract(sibling_contract_id.as_str()),
+        "depth {depth}: the shallow sibling is linked to its own minted contract, got \
+         `{sibling_contract_id}`"
     );
+    assert_ne!(sibling_contract_id, public_contract_id, "each row has its own contract");
+    if expect_minted {
+        assert!(
+            public_contract_id.starts_with("contract:trust-mc-typed-chc-public:"),
+            "a deep row the readers decode is linked to its canonical public contract"
+        );
+    } else {
+        // FAIL-CLOSED, NOT ADMITTED: the row keeps its original identity, so trust-bmc's
+        // direct-lane selector, which keys off this contract identity, leaves it to the
+        // whole-module transport route, which must still prove it.
+        assert_eq!(
+            public_contract_id, original_contract_id,
+            "a declined row must leave its original contract identity untouched"
+        );
+    }
 }
 
-/// The decline is reached through the same per-record checker bundle validation
-/// applies — not through a private re-implementation of it that could drift.
+/// The mint decision follows the readers' bound, and every contract it mints passes the
+/// same per-record checker bundle validation applies (T3 L4, C09d).
 #[test]
 fn derived_trust_mc_contract_decline_agrees_with_bundle_validation() {
-    let deep = trust_spec_predicate_nested_to_depth(
-        trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH,
-    );
+    on_a_deep_stack(derived_trust_mc_contract_decline_on_a_deep_stack);
+}
+
+fn derived_trust_mc_contract_decline_on_a_deep_stack() {
     let shallow = trust_spec_predicate_nested_to_depth(4);
     shallow.validate().expect("a shallow formula validates");
+    let past_the_deleted_bound = trust_spec_predicate_nested_to_depth(1_000);
+    let past_the_readers_bound =
+        trust_spec_predicate_nested_to_depth(semantic_depth_past_the_readers_bound());
 
-    for (label, predicate, expect_minted) in
-        [("shallow", shallow, true), ("at-the-formula-bound", deep, false)]
-    {
+    for (label, predicate, expect_minted) in [
+        ("shallow", shallow, true),
+        ("past-the-deleted-128-level-bound", past_the_deleted_bound, true),
+        ("past-the-readers-bound", past_the_readers_bound, false),
+    ] {
         let (mut function, _, _) = native_trust_ir_compiler_function();
         function.contracts.clear();
         let obligation = hardened_trust_mc_obligation_with_predicate(
@@ -6178,12 +8732,12 @@ fn derived_trust_mc_contract_decline_agrees_with_bundle_validation() {
         assert_eq!(
             minted.is_some(),
             expect_minted,
-            "{label}: mint decision disagrees with the public API bound"
+            "{label}: mint decision disagrees with the readers' bound"
         );
         if let Some(contract) = minted {
-            contract
-                .validate()
-                .unwrap_or_else(|error| panic!("{label}: a minted contract must validate: {error}"));
+            contract.validate().unwrap_or_else(|error| {
+                panic!("{label}: a minted contract must validate: {error}")
+            });
         }
     }
 }
@@ -6218,6 +8772,132 @@ fn trust_mc_default_admission_accepts_only_exact_tls_address_nodes() {
     )))
     .with_result(trust_ir::ValueId::new(0));
     assert!(trust_mc_default_instruction_requires_fail_closed_admission(&unknown));
+}
+
+// Trust: trust-ir v67-v69 tensor instructions each get a fail-closed `error` edge in the
+// default structural CHC.
+#[test]
+fn trust_mc_default_admission_refuses_each_tensor_instruction_by_name() {
+    use trust_ir::{Inst, Ty, ValueId};
+    let v = ValueId::new;
+    let cases = [
+        Inst::TensorContract {
+            ty: Ty::I32,
+            lhs: v(0),
+            rhs: v(0),
+            batch: Vec::new(),
+            contract: Vec::new(),
+        },
+        Inst::TensorMap { ty: Ty::I32, args: vec![v(0)], body: Vec::new() },
+        Inst::TensorReduce {
+            ty: Ty::I32,
+            src: v(0),
+            op: trust_ir::TensorReduceOp::Add,
+            axes: Vec::new(),
+            order: trust_ir::TensorReduceOrder::RowMajor,
+        },
+        Inst::TensorView {
+            ty: Ty::I32,
+            src: v(0),
+            params: Vec::new(),
+            exprs: Vec::new(),
+            shape: Vec::new(),
+            index: Vec::new(),
+            fill: None,
+        },
+        Inst::TensorGather { ty: Ty::I32, data: v(0), coords: vec![v(0)] },
+        Inst::TensorScatter { ty: Ty::I32, init: v(0), src: v(0), coords: vec![v(0)] },
+    ];
+    for inst in cases {
+        let name = format!("{:?}", inst.shape());
+        let node = trust_ir::InstrNode::new(inst).with_result(v(1));
+        assert!(
+            trust_mc_default_instruction_requires_fail_closed_admission(&node),
+            "{name} must get a fail-closed error edge"
+        );
+    }
+    let positive =
+        trust_ir::InstrNode::new(Inst::Copy { ty: Ty::I32, operand: v(0) }).with_result(v(1));
+    assert!(!trust_mc_default_instruction_requires_fail_closed_admission(&positive));
+}
+
+/// A uniform array keeps the answers the admitting `_` arms gave it before it was
+/// named: `ArraySplat` and a `Const` carrying `Constant::Splat` are pure, total and
+/// arithmetic-free, so every proof-authority gate below admits them, and naming
+/// them changed no verdict. The splats are 2^40 lanes long; the gates never look
+/// at the length. The last function pins that the new arms do not mask a real
+/// hazard beside them: a wrapping add next to the same splat is still refused.
+#[test]
+fn uniform_array_arms_keep_every_proof_authority_gate_answer() {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, TyId, ValueId,
+    };
+    const LANES: u64 = 1 << 40;
+    let array_ty = Ty::Array(TyId::new(0), LANES);
+    let element = ValueId::new(1);
+    let splat = ValueId::new(2);
+    let constant_splat = ValueId::new(3);
+    let element_node =
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(7) }).with_result(element);
+    let splat_node = InstrNode::new(Inst::ArraySplat { ty: array_ty.clone(), value: element })
+        .with_result(splat);
+    let constant_splat_node = InstrNode::new(Inst::Const {
+        ty: array_ty,
+        value: Constant::Splat { elem: Box::new(Constant::Int(0)), len: LANES },
+    })
+    .with_result(constant_splat);
+
+    // Structural default CHC: no fail-closed `error` edge is required.
+    assert!(!trust_mc_default_instruction_requires_fail_closed_admission(&splat_node));
+    assert!(!trust_mc_default_instruction_requires_fail_closed_admission(&constant_splat_node));
+    // `ArithmeticSafetyOnly` coverage allowlist: hazard-free, admitted.
+    assert!(super::chc_inst_arithmetic_surface_modeled(&splat_node.inst));
+    assert!(super::chc_inst_arithmetic_surface_modeled(&constant_splat_node.inst));
+
+    let build = |wrapping_add: bool| {
+        let mut bb0 = Block::new(BlockId::new(0)).with_param(ValueId::new(0), Ty::I32);
+        bb0.body.push(element_node.clone());
+        bb0.body.push(splat_node.clone());
+        bb0.body.push(constant_splat_node.clone());
+        let mut returned = splat;
+        if wrapping_add {
+            returned = ValueId::new(4);
+            bb0.body.push(
+                InstrNode::new(Inst::BinOp {
+                    op: trust_ir::BinOp::Add,
+                    ty: Ty::I32,
+                    lhs: ValueId::new(0),
+                    rhs: element,
+                })
+                .with_result(returned),
+            );
+        }
+        bb0.body.push(InstrNode::new(Inst::Return { values: vec![returned] }));
+        let mut function =
+            Function::new(FuncId::new(0), "demo::splat", FuncTyId::new(0), BlockId::new(0));
+        function.blocks.push(bb0);
+        function
+    };
+
+    let splat_only = build(false);
+    assert!(
+        super::function_overflow_surface_fully_modeled(&splat_only),
+        "a uniform array raises no arithmetic-safety obligation"
+    );
+    assert!(
+        super::function_unbounded_int_arithmetic_is_faithful(&splat_only),
+        "a uniform array performs no arithmetic the unbounded-int model could get wrong"
+    );
+
+    let beside_a_wrapping_add = build(true);
+    assert!(
+        super::function_overflow_surface_fully_modeled(&beside_a_wrapping_add),
+        "a plain Add stays inside the standing checked-arithmetic assumption"
+    );
+    assert!(
+        !super::function_unbounded_int_arithmetic_is_faithful(&beside_a_wrapping_add),
+        "the wrapping add is still refused; the splat arm must not mask it"
+    );
 }
 
 #[test]
@@ -6811,12 +9491,20 @@ fn synthesized_panic_source_inventory_and_identity_collisions_fail_closed() {
 
     let mut exact = empty_bundle();
     synthesize_native_panic_freedom_to_verifier_api_obligations(
-        &function, &mut exact, &module, &inventory,
+        &function,
+        &mut exact,
+        &module,
+        &inventory,
+        &FxHashSet::default(),
     )
     .expect("compiler aggregate synthesizes");
     let exact_len = exact.obligations.len();
     synthesize_native_panic_freedom_to_verifier_api_obligations(
-        &function, &mut exact, &module, &inventory,
+        &function,
+        &mut exact,
+        &module,
+        &inventory,
+        &FxHashSet::default(),
     )
     .expect("an exact pre-annotation compiler row is idempotent");
     assert_eq!(exact.obligations.len(), exact_len);
@@ -6831,6 +9519,7 @@ fn synthesized_panic_source_inventory_and_identity_collisions_fail_closed() {
             &mut collision,
             &module,
             &inventory,
+            &FxHashSet::default(),
         )
         .is_err(),
         "a different preexisting row must not suppress the counted panic carrier",
@@ -6854,6 +9543,7 @@ fn synthesized_panic_source_inventory_and_identity_collisions_fail_closed() {
             &mut foreign,
             &module,
             &inventory,
+            &FxHashSet::default(),
         )
         .is_err(),
         "a foreign function-level source must not mint the target aggregate",
@@ -6897,6 +9587,7 @@ fn panic_freedom_aggregate_is_the_sole_public_carrier_of_its_panic_site() {
         &mut bundle,
         &module,
         &inventory,
+        &FxHashSet::default(),
     )
     .expect("compiler aggregate synthesizes");
 
@@ -6989,17 +9680,22 @@ fn trust_mc_default_function_chc_routing_rejects_marker_lookalikes_and_duplicate
 fn native_trust_ir_function_binding_rejects_name_mismatch_without_first_function_fallback() {
     let (function, _, _) = native_trust_ir_compiler_function();
     let mut module = trust_ir::Module::new("demo");
-    let ty = module.add_func_type(trust_ir::FuncTy {
-        params: Vec::new(),
-        returns: Vec::new(),
-        is_vararg: false,
-    });
-    module.add_function(trust_ir::Function::new(
-        trust_ir::FuncId::new(0),
-        "demo::unrelated",
-        ty,
-        trust_ir::BlockId::new(0),
-    ));
+    let ty = module
+        .add_func_type(trust_ir::FuncTy {
+            params: Vec::new(),
+            returns: Vec::new(),
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .try_add_function(trust_ir::Function::new(
+            trust_ir::FuncId::new(0),
+            "demo::unrelated",
+            ty,
+            trust_ir::BlockId::new(0),
+        ))
+        .expect("Module::try_add_function: test fixture");
 
     let err = native_trust_ir_function_id(&module, &function)
         .expect_err("native TrustIr binding must not silently choose the first function");
@@ -7189,7 +9885,51 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
         .iter()
         .map(|request| native_verifier_suite_canonical_label(request.verifier_suite()))
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(request_suites, ["trust-mc".to_string()].into_iter().collect());
+    // Trust: native WP reintegration (dcf68b84b9, DQ 2026-11-03) appends one
+    // body-aware TrustWp alternative per postcondition after the primary
+    // requests. trust-mc stays the postcondition's primary owner, and the
+    // direct trust-vc carrier still adds no native request (MIR-TRANSFORM-WP-FLEET-1).
+    assert_eq!(
+        request_suites,
+        ["trust-mc".to_string(), "trust-wp".to_string()].into_iter().collect()
+    );
+    let postcondition_proofs = native_trust_ir_bundle
+        .module
+        .proof_obligations
+        .iter()
+        .filter(|proof| proof.kind == trust_ir::ObligationKind::Postcondition)
+        .map(|proof| proof.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!postcondition_proofs.is_empty(), "the fixture carries a native postcondition");
+    let trust_mc_proofs = native_trust_ir_bundle
+        .requests
+        .iter()
+        .filter_map(|request| match request {
+            trust_ir::NativeVerificationRequest::TrustMc(request) => Some(&request.obligations),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        postcondition_proofs.is_subset(&trust_mc_proofs),
+        "trust-mc must remain the primary request for every postcondition"
+    );
+    let mut trust_wp_proofs = std::collections::BTreeSet::new();
+    for request in &native_trust_ir_bundle.requests {
+        if let trust_ir::NativeVerificationRequest::TrustWp(request) = request {
+            assert_eq!(request.mode, trust_ir::TrustWpVerificationMode::WeakestPrecondition);
+            assert_eq!(request.obligations.len(), 1, "one WP alternative per postcondition");
+            assert!(
+                trust_wp_proofs.insert(request.obligations[0]),
+                "no postcondition gets two WP alternatives"
+            );
+        }
+    }
+    assert_eq!(
+        trust_wp_proofs, postcondition_proofs,
+        "the WP alternatives cover exactly the postconditions"
+    );
     assert!(
         native_trust_ir_bundle.module.proof_certificates.is_empty(),
         "a structured direct trust-vc carrier must not mint a native certificate before the deadline-aware verifier runs"
@@ -7650,6 +10390,10 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
         bound_full_transport_results_for_test(true, &function, &bundle, &result);
     let message =
         trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: function.def_path.clone(),
             package_name: None,
             crate_name: None,
@@ -7666,7 +10410,9 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
                 .count(),
             cached: 0,
             total: transport_results.len(),
+            runtime_checks: None,
             results: transport_results,
+            transport_budget: None,
         });
     let transport_json =
         serde_json::to_value(message).expect("transport message should serialize as JSON");
@@ -8022,6 +10768,7 @@ fn direct_trust_vc_live_fixture(run_id: &str) -> DirectTrustVcCompilerFixture {
         &dispatched,
         Some(&native_bundle),
         None,
+        None, // no source reference facts
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
@@ -8132,8 +10879,7 @@ lane or in the assertion — it is NOT the historical inert-lane blocker, which 
 /// changes what a proved `#[ensures]` claims in every compiled crate — from
 /// "discharged deductively at Sound assurance" to "reachability-checked at
 /// SmtBacked" — which is a proof-authority decision reserved to the author.
-const CONTRACT_STRENGTH_GAP_IS_AN_OPEN_OWNER_CALL: &str =
-    "\n\nSEE `CONTRACT_STRENGTH_GAP_IS_AN_OPEN_OWNER_CALL`: every contract obligation is stamped \
+const CONTRACT_STRENGTH_GAP_IS_AN_OPEN_OWNER_CALL: &str = "\n\nSEE `CONTRACT_STRENGTH_GAP_IS_AN_OPEN_OWNER_CALL`: every contract obligation is stamped \
 `required_strength = {Deductive, Sound}` by trust-mir-extract, while 79558a8f2e routed \
 Precondition/Postcondition to trust-mc, which emits {Pdr, SmtBacked}. Reasoning is compared by \
 EXACT equality, so no `#[requires]`/`#[ensures]` row can be graded `proved` by its primary route \
@@ -8303,12 +11049,36 @@ fn direct_trust_vc_live_receipt_is_exact_ownership_authority_and_public_run_is_n
         assurance: trust_types::AssuranceLevel::Sound,
     };
     assert_eq!(proof_evidence.strength.as_ref(), Some(&expected_transport_strength));
+    // Trust: the evidence record is `ProofEvidence::from(strength)` — trust-types'
+    // ONE canonical legacy mapping, `Sound` -> `SmtBacked` — since f2a47900ec1
+    // (2026-09-16) made `transport_proof_evidence` stop copying
+    // `strength.assurance` verbatim. That is the saved-report publication
+    // contract (`evidence == ProofEvidence::from(strength)`) and the same
+    // spelling the clean-kernel lane's transport test pins. This expectation
+    // still said `{OwnershipAnalysis, Sound}` from 37e4acb125 and was red on
+    // every tree containing f2a47900ec1; it was NOT caused by the trust-vc pin
+    // move (6dc9f294df): the only trust-vc input here is the public strength,
+    // and `direct_trust_vc_strength_is_authoritative` refuses every value but
+    // `certified(OwnershipAnalysis)`, which `legacy_proof_strength` maps to the
+    // `{OwnershipAnalysis, Sound}` pinned above whatever trust-vc does.
+    assert_eq!(
+        proof_evidence.evidence.as_ref(),
+        Some(&trust_types::ProofEvidence::from(expected_transport_strength.clone())),
+        "transport evidence must be the canonical image of the transport strength",
+    );
     assert_eq!(
         proof_evidence.evidence.as_ref(),
         Some(&trust_types::ProofEvidence::new(
             trust_types::ReasoningKind::OwnershipAnalysis,
-            trust_types::AssuranceLevel::Sound,
+            trust_types::AssuranceLevel::SmtBacked,
         )),
+    );
+    // A spelling, not a change of standing: `Sound` and `SmtBacked` are the same
+    // rung, so the canonical mapping neither raises nor lowers this row.
+    let normalized = proof_evidence.evidence.as_ref().expect("normalized direct evidence");
+    assert_eq!(
+        normalized.assurance.strength_order(),
+        expected_transport_strength.assurance.strength_order(),
     );
     assert!(
         !proof_evidence.evidence.as_ref().expect("normalized direct evidence").is_certified(),
@@ -8557,12 +11327,14 @@ fn direct_trust_vc_final_install_rejects_mutated_evidence_deadline_and_precedenc
     let precedence_row = direct_trust_vc_fixture_row(&precedence_fixture, &precedence_id);
     let mut precedence_authorities = vec![None; precedence_fixture.results.len()];
     precedence_authorities[precedence_row] = Some(ResultProofAuthority::KernelCertified {
+        replay_audit: None,
         row: exact_result_row_identity(
             precedence_row,
             &precedence_fixture.results[precedence_row].0,
         )
         .expect("exact kernel precedence row"),
         evidence: authority_test_clean_cic(0x6d),
+        reference: authority_test_reference(&authority_test_clean_cic(0x6d)),
     });
     let precedence_report = install_direct_trust_vc_live_authorities(
         &precedence_fixture.bundle,
@@ -8602,8 +11374,12 @@ fn direct_trust_vc_receipt_survives_exact_unrelated_bridge_publication() {
         Box::new(fp),
     )));
     assert!(
-        trust_router::in_process_ay_backend::revalidate_vc_unsat_strict(&sep_vc.formula, 10_000,)
-            .is_some(),
+        trust_router::in_process_ay_backend::revalidate_vc_unsat_strict(
+            &sep_vc.formula,
+            10_000,
+            trust_types::determinism::EffortScale::BUILTIN,
+        )
+        .is_some(),
         "the bridge sibling must be independently strict-revalidated by AY",
     );
     vcs.push(sep_vc.clone());
@@ -8622,6 +11398,7 @@ fn direct_trust_vc_receipt_survives_exact_unrelated_bridge_publication() {
         &dispatched,
         Some(&native_bundle),
         None,
+        None, // no source reference facts
         &context,
         SESSION_DEFAULT_VC_TIMEOUT_MS,
     );
@@ -8748,6 +11525,7 @@ fn fresh_exact_direct_fixture_for(
             &dispatched,
             Some(&native_bundle),
             None,
+            None, // no source reference facts
             &context,
             SESSION_DEFAULT_VC_TIMEOUT_MS,
         );
@@ -8777,6 +11555,16 @@ fn fresh_exact_direct_fixture_for(
 }
 
 fn fresh_exact_direct_e4_fixture(run_id: &str) -> FreshExactDirectCompilerFixture {
+    let (function, compiler_contracts, vcs) = fresh_exact_direct_e4_inputs();
+    fresh_exact_direct_fixture_for(&function, &compiler_contracts, &vcs, &[], run_id)
+}
+
+/// The E4 fixture's function, contracts and rows: two loop-invariant rows the run proves.
+fn fresh_exact_direct_e4_inputs() -> (
+    trust_types::VerifiableFunction,
+    trust_types::CompilerContractBundle,
+    Vec<VerificationCondition>,
+) {
     let (mut function, _, _) = native_trust_ir_compiler_function();
     function.contracts.clear();
     function.preconditions.clear();
@@ -8806,7 +11594,7 @@ fn fresh_exact_direct_e4_fixture(run_id: &str) -> FreshExactDirectCompilerFixtur
             obligation: None,
         },
     ];
-    fresh_exact_direct_fixture_for(&function, &compiler_contracts, &vcs, &[], run_id)
+    (function, compiler_contracts, vcs)
 }
 
 fn fresh_exact_direct_same_span_e4_fixture(run_id: &str) -> FreshExactDirectCompilerFixture {
@@ -9747,9 +12535,11 @@ fn fresh_exact_direct_mint_rejects_mutated_carriers_and_preserves_kernel_precede
     let kernel_row = fresh_exact_direct_fixture_row(&context_and_kernel, &kernel_id);
     let mut kernel_authorities = vec![None; context_and_kernel.results.len()];
     kernel_authorities[kernel_row] = Some(ResultProofAuthority::KernelCertified {
+        replay_audit: None,
         row: exact_result_row_identity(kernel_row, &context_and_kernel.results[kernel_row].0)
             .expect("exact kernel precedence row"),
         evidence: authority_test_clean_cic(0x5a),
+        reference: authority_test_reference(&authority_test_clean_cic(0x5a)),
     });
     let kernel_report = install_fresh_exact_direct_chc_pdr_authorities(
         &context_and_kernel.bundle,
@@ -9791,6 +12581,8 @@ fn loop_vcs_do_not_suppress_no_return_panic_call_obligation() {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            // Trust (DIVERGE-ENTRY-1): the stamped core entry key.
+            callee_key: Some(core_panic_entry_callee_key()),
             unwind: trust_types::UnwindEdge::Unreachable,
         },
     }];
@@ -10216,7 +13008,7 @@ fn kernel_excluded_bounds_row_reaches_certified_result_and_transport_authority()
     };
 
     let mut results = vec![(vc.clone(), unknown())];
-    promote_kernel_certifiable(&mut results, None);
+    promote_kernel_certifiable(&mut results, None, &mut ClockStops::default());
     assert!(matches!(
         &results[0].1,
         VerificationResult::Proved { solver, .. }
@@ -10254,7 +13046,7 @@ fn kernel_excluded_bounds_row_reaches_certified_result_and_transport_authority()
 
     let mut expired = vec![(vc, unknown())];
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    promote_kernel_certifiable(&mut expired, Some(past));
+    promote_kernel_certifiable(&mut expired, Some(past), &mut ClockStops::default());
     assert!(matches!(expired[0].1, VerificationResult::Unknown { .. }));
     let expired_cleancic = certify_all(&expired, Some(past));
     assert!(expired_cleancic.iter().all(Option::is_none));
@@ -10352,11 +13144,9 @@ fn native_planning_vc_binding_reuses_full_fresh_identity_and_rejects_ambiguity()
             trust_ir::FuncId::new(0),
             crate_name,
             candidate_vcs,
+            false,
         );
-        exact_native_planning_vc_indices(&scopes, candidate)
-            .get(bounds_index)
-            .copied()
-            .flatten()
+        exact_native_planning_vc_indices(&scopes, candidate).get(bounds_index).copied().flatten()
     };
     assert_eq!(binding(&bundle, &vcs), Some(0));
 
@@ -10593,8 +13383,13 @@ fn structured_proof_unit_is_deferred_without_minting_native_trust_vc_evidence() 
             },
             trust_verifier_api::MetadataEntry {
                 key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
-                value: serde_json::to_string(&public_predicate)
-                    .expect("public direct-carrier predicate serializes canonically"),
+                // Trust: the producer's canonical bytes (sorted keys), the one
+                // spelling the direct-carrier validator accepts since 10e364d13f.
+                value: String::from_utf8(
+                    trust_types::canonical_json_bytes(&public_predicate)
+                        .expect("public direct-carrier predicate serializes canonically"),
+                )
+                .expect("canonical JSON is UTF-8"),
             },
             trust_verifier_api::MetadataEntry {
                 key: trust_vc_bridge::TRUST_VC_CONDITION_ORIGIN_METADATA_KEY.to_string(),
@@ -10701,6 +13496,7 @@ fn postcondition_identity_function_ensuring(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let compiler_contracts = trust_types::CompilerContractBundle::new(vec![contract.clone()])
         .with_typed_propositions(vec![trust_types::CompilerContractProposition {
@@ -10729,7 +13525,7 @@ fn postcondition_identity_function_ensuring(
 }
 
 #[test]
-fn postcondition_routes_to_trust_mc_without_trust_wp_carrier_or_request() {
+fn postcondition_keeps_trust_mc_primary_without_historical_wp_carrier() {
     let (function, compiler_contracts) = postcondition_identity_function();
     let (bundle, native_bundle) =
         build_full_verification_input_for_tests(&function, &compiler_contracts, &[]);
@@ -10753,13 +13549,152 @@ fn postcondition_routes_to_trust_mc_without_trust_wp_carrier_or_request() {
     let native_bundle = native_bundle
         .expect("postcondition native bundle construction")
         .expect("TrustMC-owned postcondition requests native TrustIr");
-    assert!(
-        native_bundle
-            .requests
-            .iter()
-            .all(|request| !matches!(request, trust_ir::NativeVerificationRequest::TrustWp(_))),
-        "historical TrustWP request identity must not regain compiler authority"
+    for request in &native_bundle.requests {
+        if let trust_ir::NativeVerificationRequest::TrustWp(request) = request {
+            assert_eq!(request.mode, trust_ir::TrustWpVerificationMode::WeakestPrecondition);
+            assert!(request.obligations.iter().all(|id| {
+                native_bundle.module.proof_obligations.iter().any(|proof| {
+                    proof.id == *id && proof.kind == trust_ir::ObligationKind::Postcondition
+                })
+            }));
+        }
+    }
+    // A native body-WP alternative is distinct from the retired formula-only
+    // authority. Its mere presence grants no compiler proof token.
+}
+
+// Trust: retained authored rows must carry real body formulas before native
+// identities are minted. Matching public labels/predicate digests alone must
+// not attach a different clause's body or overwrite partial/forged metadata.
+#[test]
+#[allow(deprecated)]
+fn source_clause_native_formula_binding_requires_the_independent_current_reference() {
+    let (function, contracts) = postcondition_identity_function();
+    let (raw, _) = trust_vcgen::regenerate_postcondition_production_variants(&function).unwrap();
+    assert_eq!(raw.len(), 1);
+    let reference = trust_mir_extract::contract_bundle_to_verifier_api(&function, &contracts);
+    let baseline = trust_mir_extract::function_to_verifier_api_bundle(&function, &contracts, &raw);
+    let marker_id = reference.obligations[0].obligation_id.clone();
+    let marker = |bundle: &trust_verifier_api::TrustContractBundle| {
+        bundle.obligations.iter().find(|row| row.obligation_id == marker_id).unwrap().clone()
+    };
+    let mut exact = baseline.clone();
+    let original_count = exact.obligations.len();
+    assert_eq!(
+        bind_exact_source_clause_native_formulas(
+            &function, &contracts, &raw, &reference, &mut exact, None,
+        ),
+        1
     );
+    assert_eq!(exact.obligations.len(), original_count, "catalog denominator is retained");
+    assert_eq!(marker(&exact).contract_id, marker(&baseline).contract_id);
+    assert_eq!(
+        exactly_one_obligation_context(&marker(&exact)),
+        exactly_one_obligation_context(&marker(&baseline)),
+    );
+    assert!(trust_ir_proof_formula_from_api_obligation_metadata(&marker(&exact)).is_some());
+    assert_eq!(
+        bind_exact_source_clause_native_formulas(
+            &function, &contracts, &raw, &reference, &mut exact, None,
+        ),
+        0,
+        "do not overwrite already enriched or tampered metadata"
+    );
+    for mutation in ["source", "predicate", "context", "partial-formula", "duplicate"] {
+        let mut changed = baseline.clone();
+        let row =
+            changed.obligations.iter_mut().find(|row| row.obligation_id == marker_id).unwrap();
+        match mutation {
+            "source" => row.source.line = Some(999),
+            "predicate" => {
+                row.metadata
+                    .iter_mut()
+                    .find(|entry| entry.key == TRUST_CONTRACT_PREDICATE_DIGEST_METADATA_KEY)
+                    .unwrap()
+                    .value = "a".repeat(64)
+            }
+            "context" => {
+                row.metadata
+                    .iter_mut()
+                    .find(|entry| entry.key == trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
+                    .unwrap()
+                    .value = "{}".to_string()
+            }
+            "partial-formula" => row.metadata.push(trust_verifier_api::MetadataEntry {
+                key: TRUST_VC_FORMULA_SCHEMA_METADATA_KEY.to_string(),
+                value: "forged".to_string(),
+            }),
+            "duplicate" => {
+                let duplicate = row.clone();
+                changed.obligations.push(duplicate);
+            }
+            _ => unreachable!(),
+        }
+        let before = changed.clone();
+        assert_eq!(
+            bind_exact_source_clause_native_formulas(
+                &function,
+                &contracts,
+                &raw,
+                &reference,
+                &mut changed,
+                None,
+            ),
+            0,
+            "{mutation}"
+        );
+        assert_eq!(changed, before, "refusal must not mutate {mutation}");
+    }
+}
+
+// Trust: a model of a source clause's pruned body violation remains Unknown,
+// even when a native adapter supplies a refutation marker for that residue.
+#[test]
+#[allow(deprecated)]
+fn source_clause_native_formula_pruning_never_turns_a_residue_model_into_refutation() {
+    let (mut function, contracts) = postcondition_identity_function();
+    function.preconditions.push(Formula::Eq(
+        Box::new(Formula::Select(
+            Box::new(Formula::Var(
+                "memory_map".to_string(),
+                Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
+            )),
+            Box::new(Formula::BitVec { value: 0, width: 64 }),
+        )),
+        Box::new(Formula::BitVec { value: 0, width: 8 }),
+    ));
+    let (raw, _) = trust_vcgen::regenerate_postcondition_production_variants(&function).unwrap();
+    let reference = trust_mir_extract::contract_bundle_to_verifier_api(&function, &contracts);
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&function, &contracts, &raw);
+    assert_eq!(
+        bind_exact_source_clause_native_formulas(
+            &function,
+            &contracts,
+            &raw,
+            &reference,
+            &mut bundle,
+            None,
+        ),
+        1
+    );
+    let mut marker = bundle
+        .obligations
+        .iter()
+        .find(|row| row.obligation_id == reference.obligations[0].obligation_id)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        exactly_one_metadata_value(&marker.metadata, TRUST_VC_FORMULA_PRUNED_METADATA_KEY,),
+        Some("true")
+    );
+    marker.metadata.push(trust_verifier_api::MetadataEntry {
+        key: TRUST_VC_REFUTED_METADATA_KEY.to_string(),
+        value: "test-only model of the weaker residue".to_string(),
+    });
+    assert!(matches!(legacy_result_without_native_rows(&marker),
+        VerificationResult::Unknown { reason, .. }
+            if reason.contains("weaker violation-pruned sub-conjunction")));
 }
 
 #[test]
@@ -11944,7 +14879,12 @@ fn external_dependency_body_scope_routes_to_verifier_by_policy() {
         TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
     );
     assert_eq!(
-        verification_scope_policy_decision(trust_owned_bucket, false, false, &full_dependency_policy),
+        verification_scope_policy_decision(
+            trust_owned_bucket,
+            false,
+            false,
+            &full_dependency_policy
+        ),
         TrustVerifyDecision::Verify
     );
 }
@@ -11979,16 +14919,17 @@ fn declared_bundle_scope_suppresses_the_non_local_skip_for_that_def_only() {
     assert!(!normal_policy.include_dependencies);
 }
 
-/// Trust (cross-crate value composition, Edit 2): a DECLARED crate that lands
-/// in a non-`TrustOwned*` bucket is still skipped.
+/// Trust (D4-A, 2026-09-24; was `declared_bundle_scope_does_not_admit_a_non_
+/// trust_owned_bucket`): a DECLARED crate in the `ExternalDep` bucket is now a
+/// verification SUBJECT — re-derivation, not an rmeta bit — while the sysroot
+/// (`UpstreamRustModified`: `core`/`alloc`/`std`, `rustc_*`) and `Unknown`
+/// still skip, and an UNDECLARED `ExternalDep` def still skips.
 ///
-/// `ExternalDep`'s `unsupported_is_failure()` is `false`, so a capability gap
-/// in such a body becomes an assumption row rather than a failure — the wrong
-/// direction for a body whose verdict is about to grant assumption authority to
-/// a caller. `UpstreamRustModified` (`core`/`alloc`/`std`, `rustc_*`) is the
-/// same. The bit alone must not be enough.
+/// The earlier `TrustOwned*`-only rule reasoned that an `ExternalDep` gap
+/// becomes an assumption row (`unsupported_is_failure() == false`); that method
+/// has no compiler caller, so the bucket only ever decided skip vs. verify.
 #[test]
-fn declared_bundle_scope_does_not_admit_a_non_trust_owned_bucket() {
+fn declared_bundle_scope_admits_external_dep_never_the_sysroot() {
     let normal_policy = test_policy(false, false);
 
     assert_eq!(
@@ -11996,6 +14937,16 @@ fn declared_bundle_scope_does_not_admit_a_non_trust_owned_bucket() {
             trust_mir_extract::policy::PolicyBucket::ExternalDep,
             false,
             true,
+            &normal_policy
+        ),
+        TrustVerifyDecision::Verify
+    );
+    // Undeclared: the pre-existing cost skip, unchanged.
+    assert_eq!(
+        verification_scope_policy_decision(
+            trust_mir_extract::policy::PolicyBucket::ExternalDep,
+            false,
+            false,
             &normal_policy
         ),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::ExternalDependencyScope)
@@ -12018,6 +14969,22 @@ fn declared_bundle_scope_does_not_admit_a_non_trust_owned_bucket() {
         ),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
     );
+    // The shared predicate agrees with the decision, bucket by bucket.
+    assert!(foreign_rederivation::declared_scope_bucket_is_rederivable(
+        trust_mir_extract::policy::PolicyBucket::ExternalDep
+    ));
+    assert!(foreign_rederivation::declared_scope_bucket_is_rederivable(
+        trust_mir_extract::policy::PolicyBucket::TrustOwnedDefault
+    ));
+    assert!(foreign_rederivation::declared_scope_bucket_is_rederivable(
+        trust_mir_extract::policy::PolicyBucket::TrustOwnedSpecBearing
+    ));
+    assert!(!foreign_rederivation::declared_scope_bucket_is_rederivable(
+        trust_mir_extract::policy::PolicyBucket::UpstreamRustModified
+    ));
+    assert!(!foreign_rederivation::declared_scope_bucket_is_rederivable(
+        trust_mir_extract::policy::PolicyBucket::Unknown
+    ));
     // ...and a LOCAL def can never be a "bundle scope subject", so the bit
     // cannot change any decision inside the crate being compiled.
     assert_eq!(
@@ -12029,6 +14996,169 @@ fn declared_bundle_scope_does_not_admit_a_non_trust_owned_bucket() {
         ),
         TrustVerifyDecision::Verify
     );
+}
+
+/// Trust (D4 increment B, 2026-09-25): the FOREIGN-trait arm of rungs 1 and 2
+/// serves exactly one call shape — an `ImplSource::Param` call whose `Self` is
+/// `Sized` — and names the body it is discharged in. A `dyn` site (C-UNIVERSAL,
+/// C-SEALED) and a generic call whose `Self` may be unsized (a monomorphization
+/// at `dyn T` is a virtual call) both decline, with DIFFERENT reasons so a probe
+/// run can tell which fired. The end-to-end rails are
+/// `xcrate_foreign_trait_closure_phi.rs` `dyn_root` / `unsized_self` and
+/// `xcrate_foreign_trait_closure_sealed.rs` `dyn_root` / `unsized_self`.
+#[test]
+fn foreign_trait_closure_serves_only_a_sized_generic_call() {
+    use foreign_trait_closure::{RelianceShape, shape_scanned_body};
+    let scanned = rustc_span::def_id::CRATE_DEF_ID.to_def_id();
+    let virtual_site = shape_scanned_body(RelianceShape::Virtual);
+    let unsized_self =
+        shape_scanned_body(RelianceShape::Generic { scanned_body: scanned, self_is_sized: false });
+    assert!(virtual_site.is_err());
+    assert!(unsized_self.is_err());
+    assert_ne!(virtual_site, unsized_self);
+    assert_eq!(
+        shape_scanned_body(RelianceShape::Generic { scanned_body: scanned, self_is_sized: true }),
+        Ok(scanned)
+    );
+}
+
+/// Trust (D4 increment B fix, 2026-09-25): a rung-1/rung-2 generic-dispatch key
+/// is credited to a bundle only if NO walked site carrying it declined. The key
+/// spells a type parameter by name, so a `Sized` site in the root and a `?Sized`
+/// site in a member (which the foreign-trait arm declines) can share it; the
+/// bridge spends the set by name, so one discharge would cover both. Decided the
+/// same whichever site is walked first.
+#[test]
+fn generic_dispatch_key_declined_at_any_site_is_withheld_from_the_bundle() {
+    let collided = "<X as dep::T>::m";
+    for declined_first in [false, true] {
+        let mut ledger = GenericDispatchDischarges::default();
+        if declined_first {
+            ledger.record(collided, false);
+            ledger.record(collided, true);
+        } else {
+            ledger.record(collided, true);
+            ledger.record(collided, false);
+        }
+        ledger.record("<Y as dep::T>::m", true);
+        ledger.record("<Y as dep::T>::m", true);
+        ledger.record("<Z as dep::T>::m", false);
+        assert_eq!(ledger.collisions(), vec![collided]);
+        let credited = ledger.into_credited();
+        assert!(!credited.contains(collided), "a declined site must poison its key");
+        assert!(credited.contains("<Y as dep::T>::m"));
+        assert!(!credited.contains("<Z as dep::T>::m"));
+        assert_eq!(credited.len(), 1);
+    }
+}
+
+/// Trust (D4 increment B fix, 2026-09-25): the foreign-trait closure's budget
+/// reservation is ALL OR NOTHING and checked before anything is forced; a
+/// reserved body is admitted by CONVERTING its reservation (never charged
+/// twice); reservations count against the caps for every other admission; and
+/// releasing a reservation leaves no charge for a body never admitted, while a
+/// body that was admitted (its verdict forced) keeps its charge.
+#[test]
+fn rederivation_reservation_is_all_or_nothing_and_charges_only_what_was_forced() {
+    use foreign_rederivation::{ForeignDecline, RederivationLedger};
+    use rustc_span::def_id::{CrateNum, DefIndex};
+    let def = |krate: u32, index: u32| DefId {
+        krate: CrateNum::from_u32(krate),
+        index: DefIndex::from_u32(index),
+    };
+    let caps = (2, 3);
+    let mut ledger = RederivationLedger::default();
+    // Three bodies of one crate against a per-crate cap of two: refused whole,
+    // NOTHING reserved or charged (the cost is found before the work).
+    assert_eq!(
+        ledger.try_reserve(&[def(1, 1), def(1, 2), def(1, 3)], caps),
+        Err(ForeignDecline::BudgetExhausted)
+    );
+    assert_eq!(ledger.charged_total(), 0);
+    // A set that fits is reserved whole; duplicates count once.
+    let first = ledger.try_reserve(&[def(1, 1), def(2, 1), def(1, 1)], caps).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(ledger.charged_total(), 2);
+    let second = ledger.try_reserve(&[def(3, 1), def(1, 1)], caps).unwrap();
+    assert_eq!(second, vec![def(3, 1)]);
+    assert_eq!(ledger.charged_total(), 3);
+    // Reservations count against every other admission: the total cap is full.
+    assert_eq!(
+        ledger.admission_decline(def(4, 1), false, caps),
+        Some(ForeignDecline::BudgetExhausted)
+    );
+    // A reserved body is admitted by conversion, even with the caps full.
+    assert_eq!(ledger.admission_decline(def(1, 1), true, caps), None);
+    assert_eq!(ledger.charged_total(), 3);
+    // Releasing the first reservation: `def(1, 1)` was admitted (forced) and keeps
+    // its charge; `def(2, 1)` never was, and is released with no charge.
+    ledger.release(first);
+    assert_eq!(ledger.charged_total(), 2);
+    assert_eq!(ledger.admission_decline(def(5, 1), true, caps), None);
+    assert_eq!(ledger.charged_total(), 3);
+}
+
+/// Trust (D4-A, 2026-09-24): every re-derivation decline maps to its OWN
+/// postcondition-reuse label and its own diagnostic text, so a refusal can be
+/// attributed to one conjunct (the NOTE pins in `xcrate_fmt_dep.rs` and
+/// `xcrate_rederivation_identity.rs` read these texts). Two declines sharing a
+/// label or a text would make a fixture that pins one pass for the other.
+#[test]
+fn foreign_rederivation_declines_are_distinguishable() {
+    use foreign_rederivation::{ForeignDecline, ScopeMiss};
+    let all = [
+        ForeignDecline::NotDeclared(ScopeMiss::NameNotDeclared),
+        ForeignDecline::NotDeclared(ScopeMiss::NotTheBoundCrate),
+        ForeignDecline::NotDeclared(ScopeMiss::AmbiguousName),
+        ForeignDecline::NotDeclared(ScopeMiss::DynamicLinkage),
+        ForeignDecline::SysrootOrUnknownBucket,
+        ForeignDecline::NotAFunctionBody,
+        ForeignDecline::NoEncodedMir,
+        ForeignDecline::SymbolExported,
+        ForeignDecline::UserUnsafeSource,
+        // Trust (DEP-MEMBER-REQ-1, 2026-10-05): conjunct (7).
+        ForeignDecline::InlinedRequiresCallee,
+        // Trust (T6, 2026-10-09): conjunct (8).
+        ForeignDecline::NotProofSessionMir,
+        ForeignDecline::BodyTooLarge,
+        ForeignDecline::BudgetExhausted,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a.reason(), b.reason(), "{a:?} and {b:?} share a diagnostic text");
+            assert_ne!(
+                a.compose_reason(),
+                b.compose_reason(),
+                "{a:?} and {b:?} share a reuse-lane label"
+            );
+        }
+        // Every reuse-lane label is a refusal, never the accepting outcome.
+        assert_ne!(a.compose_reason(), COMPOSE_MINT);
+    }
+    // The pre-existing labels keep their spelling (fixtures and the
+    // `TRUST_COMPOSE_DEBUG` instrument read them).
+    assert_eq!(
+        ForeignDecline::NotDeclared(ScopeMiss::NameNotDeclared).compose_reason(),
+        "identity:non-local-undeclared"
+    );
+    assert_eq!(ForeignDecline::NoEncodedMir.compose_reason(), "identity:no-mir");
+    assert_eq!(ForeignDecline::SymbolExported.compose_reason(), "identity:symbol-exported");
+}
+
+/// Trust (D4-A, 2026-09-24): the re-derivation cost bound's constants are
+/// ordered and far above the measured shapes they must admit (the largest
+/// measured ordinary formatting impl was 10 blocks / 36 statements), and the
+/// per-crate cap never exceeds the per-compilation one.
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn foreign_rederivation_cost_bound_is_ordered() {
+    assert!(foreign_rederivation::MAX_BODY_BLOCKS >= 10 * 10);
+    assert!(foreign_rederivation::MAX_BODY_STATEMENTS >= 36 * 10);
+    assert!(
+        foreign_rederivation::MAX_REDERIVED_BODIES_PER_CRATE
+            <= foreign_rederivation::MAX_REDERIVED_BODIES_TOTAL
+    );
+    assert!(foreign_rederivation::MAX_REDERIVED_BODIES_PER_CRATE > 0);
 }
 
 #[test]
@@ -12181,6 +15311,132 @@ fn default_gap_policy_tolerates_only_the_exact_defined_float_advisory_exception(
 }
 
 #[test]
+fn default_gap_policy_asks_the_fallback_question_of_unproved_rows_only() {
+    // Policy B as ruled (2026-07-25, "What still fails the build under B"): the
+    // second fatal class is "an UNPROVED row that has no runtime check". A
+    // PROVED postcondition beside a runtime-checked division is not a gap; an
+    // unproved postcondition still is.
+    let proved = || VerificationResult::Proved {
+        solver: "ay-in-process".into(),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let unknown = || VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("policy-b-test"),
+        reason: "pdr returned unknown".to_string(),
+        time_ms: 1,
+    };
+    let mut contract = test_vc(80);
+    contract.kind = VcKind::Postcondition;
+    assert!(!contract.kind.has_runtime_fallback(true), "the test needs a no-fallback kind");
+    let checked_div = test_vc(81); // `DivisionByZero`: always runtime-checked
+
+    assert_eq!(
+        residual_gap_tolerance_denial(
+            &[(contract.clone(), proved()), (checked_div.clone(), unknown())],
+            true
+        ),
+        None,
+        "a PROVED no-fallback row must not deny a gap that lies on a runtime-checked row"
+    );
+    assert_eq!(
+        residual_gap_tolerance_denial(&[(contract.clone(), unknown())], true),
+        Some(GapToleranceDenial::RowHasNoFallback),
+        "an UNPROVED no-fallback row stays fatal"
+    );
+    assert_eq!(
+        residual_gap_tolerance_denial(
+            &[(contract.clone(), proved()), (contract, unknown()), (checked_div, unknown())],
+            true
+        ),
+        Some(GapToleranceDenial::RowHasNoFallback),
+        "one proved no-fallback row does not launder a second, unproved one"
+    );
+}
+
+#[test]
+fn default_gap_policy_reports_opaque_hardened_design_mandates_but_denies_real_hardened_rows() {
+    // Hardened design mandates (2026-09-16): an OPAQUE `HardenedBoundary` row —
+    // violation formula `Bool(true)`, the transport's `design_mandate` shape —
+    // is a design requirement targo partitions as `mandated`; it must not deny
+    // the default policy's tolerance. A hardened row carrying a REAL formula
+    // is an obligation with no runtime fallback and still denies.
+    let unknown = || VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("hardened-test"),
+        reason: "opaque mandate".to_string(),
+        time_ms: 1,
+    };
+    let hardened_kind = || VcKind::HardenedBoundary {
+        category: trust_types::HardenedVcCategory::CompatObservable,
+        callee: "std::env::args".to_string(),
+        detail: "CLI boundary uses Unicode String args".to_string(),
+    };
+    let mut mandate = test_vc(90);
+    mandate.kind = hardened_kind();
+    mandate.formula = trust_types::Formula::Bool(true);
+    let checked_div = test_vc(91); // `DivisionByZero`: always runtime-checked
+    assert_eq!(
+        residual_gap_tolerance_denial(&[(mandate, unknown()), (checked_div, unknown())], true),
+        None,
+        "an opaque design mandate is reported, not fatal, under the default policy"
+    );
+
+    let mut real = test_vc(92);
+    real.kind = hardened_kind();
+    real.formula = trust_types::Formula::Le(
+        Box::new(trust_types::Formula::var("x", trust_types::Sort::Int)),
+        Box::new(trust_types::Formula::Int(0)),
+    );
+    assert_eq!(
+        residual_gap_tolerance_denial(&[(real, unknown())], true),
+        Some(GapToleranceDenial::RowHasNoFallback),
+        "a hardened row with a real formula is an obligation and stays fatal"
+    );
+
+    // G3-MANDATE-L1-ONLY-1 (2026-10-27): an L0 unsafe/FFI row whose `Bool(true)` is
+    // a modelling-gap fail-close (an FFI call with no summary) is not a design
+    // requirement and keeps denying tolerance, unknown or refuted.
+    for kind in [
+        VcKind::FfiBoundaryViolation {
+            callee: "raise".to_string(),
+            desc: "FFI call has no summary: behavior unmodeled, cannot prove safe".to_string(),
+        },
+        VcKind::HardenedBoundary {
+            category: trust_types::HardenedVcCategory::FfiBoundary,
+            callee: "getpgrp".to_string(),
+            detail: "no summary".to_string(),
+        },
+        VcKind::Assertion {
+            message: "[unsafe:unmodeled-call] call to `ext` is not covered".to_string(),
+        },
+    ] {
+        let mut gap = test_vc(93);
+        gap.kind = kind;
+        gap.formula = trust_types::Formula::Bool(true);
+        assert_eq!(
+            residual_gap_tolerance_denial(&[(gap.clone(), unknown())], true),
+            Some(GapToleranceDenial::RowHasNoFallback),
+            "an unknown L0 modelling gap is not a mandate: {:?}",
+            gap.kind
+        );
+        let failed = VerificationResult::Failed {
+            solver: trust_types::Symbol::intern("hardened-test"),
+            time_ms: 1,
+            counterexample: None,
+        };
+        assert_eq!(
+            residual_gap_tolerance_denial(&[(gap.clone(), failed)], true),
+            Some(GapToleranceDenial::RowRefuted),
+            "a refuted L0 modelling gap is a refutation: {:?}",
+            gap.kind
+        );
+    }
+}
+
+#[test]
 fn full_verification_flags_skipped_transport_artifacts() {
     let summary = TrustFunctionSummary {
         total: 1,
@@ -12193,10 +15449,13 @@ fn full_verification_flags_skipped_transport_artifacts() {
         max_level: TrustProofLevel::None,
     };
     let transport_result = TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         monitor: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "divzero".to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "division by zero".to_string(),
         location: None,
@@ -12209,6 +15468,7 @@ fn full_verification_flags_skipped_transport_artifacts() {
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
+        grade: None,
     };
 
     assert_eq!(
@@ -12320,7 +15580,7 @@ fn native_temporal_proved_run() -> trust_verifier_api::VerificationRunResult {
     authority_test_rebuild_run(&run, run.requested_obligations.clone(), run.evidence.clone())
 }
 
-fn native_test_default_admission() -> trust_verifier_api::TrustObligation {
+pub(super) fn native_test_default_admission() -> trust_verifier_api::TrustObligation {
     let (mut function, _, _) = native_trust_ir_compiler_function();
     function.contracts.clear();
     let mut bundle = trust_verifier_api::TrustContractBundle::empty(
@@ -12891,6 +16151,7 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vc = VerificationCondition {
         kind: VcKind::Postcondition,
@@ -12953,7 +16214,7 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
         &bundle.obligations,
         evidence,
     );
-    let rekey_snapshot = exact_fresh_vc_rekey_snapshot(
+    let mut rekey_snapshot = exact_fresh_vc_rekey_snapshot(
         &function,
         &compiler_contracts,
         &bundle,
@@ -13088,6 +16349,52 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
     assert!(authorities[marker_a_index].is_none());
     assert!(authorities[marker_b_index].is_none());
 
+    // Trust: a known declined return makes this otherwise-authorized body
+    // proof a partial group. This is an explicit unit-test exclusion input;
+    // the actual mixed-path generator control lives in trust-source-contract.
+    rekey_snapshot.declined_source_indices.insert(0);
+    let mut partial_results = results.clone();
+    let mut partial_authorities = authorities.clone();
+    assert_eq!(
+        apply_exact_source_clause_discharges(
+            &bundle,
+            &run,
+            std::slice::from_ref(&vc),
+            &rekey_snapshot,
+            &mut partial_results,
+            &bindings,
+            &mut partial_authorities,
+        ),
+        0,
+        "a real body authority cannot cover an unmodelled sibling return"
+    );
+    assert!(matches!(partial_results[marker_a_index].1, VerificationResult::Unknown { .. }));
+    let failed_body = VerificationResult::Failed {
+        solver: "test-refutation".into(),
+        time_ms: 1,
+        counterexample: Some(trust_types::Counterexample::new(vec![])),
+    };
+    partial_results[body_index].1 = failed_body.clone();
+    partial_authorities[body_index] = None;
+    assert_eq!(
+        apply_exact_source_clause_discharges(
+            &bundle,
+            &run,
+            std::slice::from_ref(&vc),
+            &rekey_snapshot,
+            &mut partial_results,
+            &bindings,
+            &mut partial_authorities,
+        ),
+        1,
+        "a declined sibling does not suppress an exact failed return"
+    );
+    assert_eq!(
+        serde_json::to_value(&partial_results[marker_a_index].1).unwrap(),
+        serde_json::to_value(&failed_body).unwrap()
+    );
+    rekey_snapshot.declined_source_indices.remove(&0);
+
     let mut swapped_results = results.clone();
     let swapped_bindings = bindings.clone();
     let mut swapped_authorities = authorities.clone();
@@ -13118,6 +16425,7 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
             public_obligation_id: body.obligation_id.clone(),
             row: body_row,
         }],
+        certificate: None,
     });
     assert_eq!(
         apply_exact_source_clause_discharges(
@@ -13265,6 +16573,167 @@ fn exact_source_clause_discharge_preserves_public_private_carrier_parity() {
     );
     assert!(matches!(&revoked_results[marker_a_index].1, VerificationResult::Unknown { .. }));
     assert!(revoked_authorities[marker_a_index].is_none());
+
+    // Trust (lane cond-postcond, 2026-09-17): a pending marker must NAME its
+    // defeat. The old text ("awaits sealed private body authorities") named
+    // neither the clause nor the row, and two triage rounds guessed the cause
+    // of the a7 battery blocker from it. Diagnostic only — every verdict
+    // asserted above is unchanged.
+    let pending_reason =
+        |rows: &[(VerificationCondition, VerificationResult)], index: usize| match &rows[index].1 {
+            VerificationResult::Unknown { reason, .. } => reason.clone(),
+            other => panic!("expected a pending source-clause marker, got {other:?}"),
+        };
+    let revoked_reason = pending_reason(&revoked_results, marker_a_index);
+    assert!(
+        revoked_reason.contains(&body.obligation_id)
+            && revoked_reason.contains("NO sealed private proof authority"),
+        "the body row that lost its sealed authority must be named: {revoked_reason}"
+    );
+    assert!(
+        !revoked_reason.contains("not an accepted source-clause body proof")
+            && !revoked_reason.contains("is an owner decision"),
+        "a row with NO authority at all is not an authority-SET question, so the accepted \
+         set and the owner ruling must not be cited: {revoked_reason}"
+    );
+    let unlinked_reason = pending_reason(&results, marker_b_index);
+    assert!(
+        unlinked_reason.contains("NO body verification condition is linked"),
+        "a clause with no linked body row must say exactly that: {unlinked_reason}"
+    );
+    assert!(
+        !unlinked_reason.contains("awaits sealed private body authorities"),
+        "the unnamed legacy reason must not survive on a diagnosed row: {unlinked_reason}"
+    );
+
+    // Trust (lane cond-postcond, review fix): `is_exact_source_clause_body_proof_for`
+    // is a THREE-way conjunction — row seal, result seal, accepted variant — and
+    // only the last is answered by the accepted-authority list. Reporting a
+    // carrier SKEW as "not an accepted authority" printed "Proved under
+    // `KernelCertified`, which is not an accepted source-clause body proof"
+    // immediately before naming `KernelCertified` as accepted, and sent the
+    // reader to an owner ruling that cannot repair a seal. This builds exactly
+    // that shape: an ACCEPTED variant on the body row whose frozen `row` names a
+    // different result row.
+    let mut skewed_results = results.clone();
+    let mut skewed_authorities = authorities.clone();
+    let marker_a_row = exact_result_row_identity(marker_a_index, &results[marker_a_index].0)
+        .expect("clause A marker row identity");
+    let Some(ResultProofAuthority::KernelCertified { evidence, reference, .. }) =
+        authorities[body_index].clone()
+    else {
+        panic!("fixture must carry a KernelCertified body authority");
+    };
+    skewed_authorities[body_index] =
+        Some(ResultProofAuthority::KernelCertified {
+            replay_audit: None, row: marker_a_row, evidence, reference,
+        });
+    skewed_authorities[marker_a_index] = None;
+    assert_eq!(
+        apply_exact_source_clause_discharges(
+            &bundle,
+            &run,
+            std::slice::from_ref(&vc),
+            &rekey_snapshot,
+            &mut skewed_results,
+            &bindings,
+            &mut skewed_authorities,
+        ),
+        0,
+        "an accepted authority sealed to a different row must still fail closed"
+    );
+    let skewed_reason = pending_reason(&skewed_results, marker_a_index);
+    assert!(
+        skewed_reason.contains("is not sealed to this exact result row"),
+        "a carrier skew must be reported as a seal failure, not an authority-kind \
+         failure: {skewed_reason}"
+    );
+    assert!(
+        !skewed_reason.contains("not an accepted source-clause body proof")
+            && !skewed_reason.contains("is an owner decision"),
+        "a seal failure must NOT cite the accepted-authority set or the owner ruling, \
+         which cannot repair it: {skewed_reason}"
+    );
+
+    // The converse: when the body row IS Proved under a sealed authority whose
+    // VARIANT this lane may not derive from, the accepted set is exactly the
+    // answer and must be spelled out. `DefinitionEntryAssumption` is a cheap
+    // stand-in for that class — it passes both seals and fails only the variant
+    // test, which is what `SolverRevalidated`/`DirectTrustVcLive` do in the
+    // field.
+    let mut unaccepted_results = results.clone();
+    let mut unaccepted_authorities = authorities.clone();
+    unaccepted_authorities[body_index] = Some(ResultProofAuthority::DefinitionEntryAssumption {
+        row: exact_result_row_identity(body_index, &results[body_index].0).expect("exact body row"),
+        binding: bindings[body_index].clone().expect("exact body binding"),
+    });
+    unaccepted_authorities[marker_a_index] = None;
+    assert_eq!(
+        apply_exact_source_clause_discharges(
+            &bundle,
+            &run,
+            std::slice::from_ref(&vc),
+            &rekey_snapshot,
+            &mut unaccepted_results,
+            &bindings,
+            &mut unaccepted_authorities,
+        ),
+        0,
+        "an unaccepted authority variant on the body row must still fail closed"
+    );
+    let unaccepted_reason = pending_reason(&unaccepted_results, marker_a_index);
+    assert!(
+        unaccepted_reason.contains("DefinitionEntryAssumption")
+            && unaccepted_reason.contains("not an accepted source-clause body proof"),
+        "the authority the body row actually carries must be named: {unaccepted_reason}"
+    );
+    assert!(
+        unaccepted_reason.contains("FreshExactDirectChcPdr")
+            && unaccepted_reason.contains("KernelCertified"),
+        "an authority-KIND defeat must spell out the accepted set: {unaccepted_reason}"
+    );
+
+    // The soundness argument for the whole diagnosis rests on one predicate: it
+    // rewrites the reason ONLY on rows this pass itself left `Unknown` under its
+    // own solver symbol. Pin that directly, on a row carrying a foreign
+    // `Unknown`, and pin the refine count the pass reports.
+    let mut narrowness_results = results.clone();
+    let foreign_reason = "a foreign unknown that this pass must never touch";
+    narrowness_results[marker_a_index].1 = VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("some-other-solver"),
+        time_ms: 0,
+        reason: foreign_reason.to_string(),
+    };
+    narrowness_results[marker_b_index].1 = exact_source_clause_pending_result();
+    let narrowness_authorities = vec![None; results.len()];
+    assert_eq!(
+        explain_undischarged_exact_source_clause_markers(
+            &bundle,
+            &run,
+            std::slice::from_ref(&vc),
+            &rekey_snapshot,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut narrowness_results,
+            &bindings,
+            &narrowness_authorities,
+        ),
+        1,
+        "exactly the one row under this pass's own solver symbol may be refined"
+    );
+    assert!(
+        matches!(
+            &narrowness_results[marker_a_index].1,
+            VerificationResult::Unknown { solver, reason, .. }
+                if solver.as_str() == "some-other-solver" && reason == foreign_reason
+        ),
+        "a foreign Unknown must be left byte-identical: {:?}",
+        narrowness_results[marker_a_index].1
+    );
+    assert!(
+        pending_reason(&narrowness_results, marker_b_index).contains("was not discharged"),
+        "the row under this pass's own symbol must be refined"
+    );
 
     let mut stale_results = results.clone();
     let mut stale_authorities = authorities.clone();
@@ -13528,13 +16997,35 @@ fn exact_source_clause_accepts_normal_contract_origin_e4_and_e5_markers() {
     }
 }
 
+/// KR0 switch: a GENUINE `CleanCic` payload, one per seed (`certify_vc` of the
+/// seed's own contradiction `x < 0 ∧ 0 < x`), so the Clean reference entry
+/// accepted exactly these bytes and the kernel rung may mint on it. A
+/// hand-built payload mints nothing any more
+/// (`kernel_rung_refuses_a_payload_the_reference_entry_never_accepted`).
 fn authority_test_clean_cic(seed: u8) -> trust_ir::ProofEvidence {
-    trust_ir::ProofEvidence::CleanCic {
-        term: vec![seed],
-        context: vec![seed.wrapping_add(1)],
-        lineage: trust_ir::ProofDigest::sha256_domain("authority-test", &[seed]),
-        kernel_recheck: None,
-    }
+    let x = || trust_types::Formula::Var(format!("authority_test_{seed}"), trust_types::Sort::Int);
+    let zero = || trust_types::Formula::Int(0);
+    let vc = VerificationCondition {
+        kind: trust_types::VcKind::Assertion { message: format!("authority test {seed}") },
+        function: "authority_test".into(),
+        location: trust_types::SourceSpan::default(),
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::Lt(Box::new(x()), Box::new(zero())),
+            trust_types::Formula::Lt(Box::new(zero()), Box::new(x())),
+        ]),
+        contract_metadata: None,
+        obligation: None,
+    };
+    trust_certify::certify_vc(&vc).expect("the seed's contradiction certifies")
+}
+
+/// The reference-entry certificate of a genuine payload, for tests that build a
+/// `Certified` authority by hand.
+fn authority_test_reference(
+    evidence: &trust_ir::ProofEvidence,
+) -> trust_certify::ReferenceCertificate {
+    trust_certify::reference_certificate_for(evidence)
+        .expect("the reference entry accepts the genuine payload")
 }
 
 fn proof_feedback_source_span(line: u32) -> trust_types::SourceSpan {
@@ -13673,6 +17164,7 @@ fn proof_feedback_loop_function() -> trust_types::VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -13709,8 +17201,10 @@ fn proof_feedback_kernel_authorities(
     let (initiation, consecution) = proof_feedback_e4_indices(results);
     for (seed, index) in [initiation, consecution].into_iter().enumerate() {
         authorities[index] = Some(ResultProofAuthority::KernelCertified {
+            replay_audit: None,
             row: exact_result_row_identity(index, &results[index].0).expect("exact E4 row"),
             evidence: authority_test_clean_cic(seed as u8),
+            reference: authority_test_reference(&authority_test_clean_cic(seed as u8)),
         });
     }
     authorities
@@ -13835,6 +17329,17 @@ fn loop_feedback_requires_both_exact_private_e4_authorities_and_rejects_ambiguit
     );
 }
 
+/// Trust (T3 L4, C07p): the E5 replacement plan over a VC context of its own, which the
+/// regeneration writes into and which drops with the call.
+fn e5_plan(
+    function: &trust_types::VerifiableFunction,
+    current_vcs: &[VerificationCondition],
+    feedback: &[ProofGatedLoopInvariant],
+) -> Result<Vec<ProofGatedLoopE5Replacement>, String> {
+    let mut rows = trust_types::vc_context::VcContext::new();
+    proof_gated_loop_e5_replacement_plan(function, current_vcs, feedback, &mut rows)
+}
+
 #[test]
 fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formula() {
     let function = proof_feedback_loop_function();
@@ -13846,7 +17351,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
             .expect("exact E4 pair should bind");
 
     let current_vcs = results.iter().map(|(vc, _)| vc.clone()).collect::<Vec<_>>();
-    let plan = proof_gated_loop_e5_replacement_plan(&function, &current_vcs, &feedback)
+    let plan = e5_plan(&function, &current_vcs, &feedback)
         .expect("complete E5 routes should pair exactly");
     assert!(!plan.is_empty());
     assert!(plan.iter().all(|replacement| replacement.changed));
@@ -13896,7 +17401,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
 
     let mut raw_current_vcs = current_vcs.clone();
     raw_current_vcs[wrapped_index].formula = raw_baseline[variant_index].formula.clone();
-    let raw_plan = proof_gated_loop_e5_replacement_plan(&function, &raw_current_vcs, &feedback)
+    let raw_plan = e5_plan(&function, &raw_current_vcs, &feedback)
         .expect("an exact raw production row remains accepted");
     let raw_planned_replacement = raw_plan
         .iter()
@@ -13921,7 +17426,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
             production_baseline_formula.clone(),
         ]);
         assert!(
-            proof_gated_loop_e5_replacement_plan(&function, &forged_wrapper_vcs, &feedback)
+            e5_plan(&function, &forged_wrapper_vcs, &feedback)
                 .expect_err("a forged shape-compatible environment must fail closed")
                 .contains("exact production-augmented"),
         );
@@ -13934,7 +17439,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
         production_baseline_formula,
     ]);
     assert!(
-        proof_gated_loop_e5_replacement_plan(&function, &unknown_wrapper_vcs, &feedback)
+        e5_plan(&function, &unknown_wrapper_vcs, &feedback)
             .expect_err("an unknown E5 wrapper must fail closed")
             .contains("exact production-augmented")
     );
@@ -13968,6 +17473,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
         &[],
         &candidate_authorities,
         &feedback,
+        &mut trust_types::vc_context::VcContext::new(),
     )
     .expect("fresh exact E4 authority and complete E5 replacement should revalidate");
 
@@ -13981,6 +17487,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
             &[],
             &candidate_authorities,
             &feedback,
+            &mut trust_types::vc_context::VcContext::new(),
         )
         .expect_err("formula drift must invalidate old row authority")
         .contains("E4 proof authority changed")
@@ -13994,7 +17501,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
             .expect("baseline E5 row"),
     );
     assert!(
-        proof_gated_loop_e5_replacement_plan(&function, &ambiguous_vcs, &feedback)
+        e5_plan(&function, &ambiguous_vcs, &feedback)
             .expect_err("duplicate current E5 route must fail closed")
             .contains("cardinality")
     );
@@ -14013,7 +17520,7 @@ fn loop_feedback_replaces_only_complete_e5_routes_and_solves_every_changed_formu
     extra_e5.location.line_end += 100;
     extra_route_vcs.push(extra_e5);
     assert!(
-        proof_gated_loop_e5_replacement_plan(&function, &extra_route_vcs, &feedback)
+        e5_plan(&function, &extra_route_vcs, &feedback)
             .expect_err("an extra loop-local E5 route must fail closed")
             .contains("cardinality")
     );
@@ -14029,7 +17536,7 @@ fn full_input_threads_e4_capability_into_strengthened_e5_marker_replacement() {
         proof_gated_loop_invariant_feedback_tokens(&function, &results, &[], &authorities)
             .expect("exact E4 proofs should mint one private capability");
     let mut refined_vcs = results.iter().map(|(vc, _)| vc.clone()).collect::<Vec<_>>();
-    let plan = proof_gated_loop_e5_replacement_plan(&function, &refined_vcs, &feedback)
+    let plan = e5_plan(&function, &refined_vcs, &feedback)
         .expect("the E4 capability should strengthen the exact E5 carrier");
     for replacement in plan {
         if replacement.changed {
@@ -14168,7 +17675,7 @@ fn fresh_exact_direct_receipts_are_rebuilt_for_e5_pass_two() {
     .expect("fresh exact-direct E4 receipts must enter the gated feedback lane");
     assert_eq!(feedback.len(), 1);
 
-    let plan = proof_gated_loop_e5_replacement_plan(&function, &first_vcs, &feedback)
+    let plan = e5_plan(&function, &first_vcs, &feedback)
         .expect("fresh receipt-authorized E4 pair must produce an exact E5 plan");
     assert!(plan.iter().any(|replacement| replacement.changed));
     let mut refined_vcs = first_vcs;
@@ -14231,6 +17738,7 @@ fn fresh_exact_direct_receipts_are_rebuilt_for_e5_pass_two() {
         &second.bindings,
         &second_authorities,
         &feedback,
+        &mut trust_types::vc_context::VcContext::new(),
     )
     .expect("the fully rebuilt pass-two carrier must revalidate E4 and every changed E5 formula");
 }
@@ -14257,7 +17765,7 @@ fn strict_l0_verification_reports_raw_solver_proved_without_full_evidence() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
     );
@@ -14274,7 +17782,7 @@ fn strict_l0_verification_reports_raw_solver_proved_without_full_evidence() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
     );
@@ -14547,7 +18055,7 @@ fn full_run_presence_and_public_strength_do_not_authorize_a_row() {
             &[None],
             &authorities,
             Some(&run),
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 1, skipped: 0 }),
         "a run-wide artifact bit and forged Sound/complete label must not discharge this row",
@@ -14785,6 +18293,12 @@ fn formula_less_nonaggregate_assertion_cannot_mint_private_authority() {
     ));
 }
 
+/// Every panic source of the grounding fixtures' function has a per-site row
+/// of its own — the precondition production computes with
+/// `every_catchall_panic_source_has_a_site_row` before it lets
+/// `ground_panic_freedom_catchall` re-point anything.
+const SITED: bool = true;
+
 #[test]
 fn grounded_panic_freedom_revokes_public_binding_then_rebuilds_kernel_authority() {
     let mut catchall = test_vc(49);
@@ -14808,12 +18322,12 @@ fn grounded_panic_freedom_revokes_public_binding_then_rebuilds_kernel_authority(
         test_binding_for_obligation(1, &results[1].0, &residual_obligation),
     ];
 
-    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings))
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
         .expect("the controlled rewrite must return its exact grounding record");
 
     assert_eq!(results[0].0.formula, residual.formula);
-    assert_eq!(grounded.0, catchall_obligation.obligation_id);
-    assert_eq!(grounded.1, exact_result_row_identity(0, &results[0].0).unwrap());
+    assert_eq!(grounded.public_obligation_id.as_ref(), Some(&catchall_obligation.obligation_id));
+    assert_eq!(grounded.row, exact_result_row_identity(0, &results[0].0).unwrap());
     assert!(
         bindings[0].is_none(),
         "public/native evidence for the opaque catch-all must not follow its grounded rewrite"
@@ -14843,7 +18357,7 @@ fn grounded_panic_freedom_does_not_repair_a_swapped_binding() {
     let binding_b = test_binding_for_obligation(1, &results[1].0, &obligation_b);
     let mut swapped = vec![binding_b, binding_a];
 
-    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut swapped));
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut swapped), None, SITED);
 
     assert_eq!(
         results[0].0.formula, catchall.formula,
@@ -14851,6 +18365,978 @@ fn grounded_panic_freedom_does_not_repair_a_swapped_binding() {
     );
     assert!(swapped[0].is_none(), "the stale binding must be revoked, not resealed");
     assert!(grounded.is_none(), "a rejected rewrite must not mint a grounding record");
+}
+
+fn grounding_transaction_fixture(
+    residual_formula: Formula,
+) -> (Vec<(VerificationCondition, VerificationResult)>, Vec<Option<ResultObligationBinding>>) {
+    let mut catchall = test_vc(501);
+    catchall.kind = VcKind::Assertion { message: "panic freedom: transaction".into() };
+    catchall.formula = Formula::Var("panic_reachable:transaction".into(), trust_types::Sort::Bool);
+    let mut residual = test_vc(502);
+    residual.formula = residual_formula;
+    let results = vec![(catchall, authority_test_proved()), (residual, authority_test_proved())];
+    let bindings = vec![
+        test_binding_for_obligation(
+            0,
+            &results[0].0,
+            &authority_test_native_obligation("authority:transaction:catchall", 501, 501),
+        ),
+        test_binding_for_obligation(
+            1,
+            &results[1].0,
+            &authority_test_native_obligation("authority:transaction:residual", 502, 502),
+        ),
+    ];
+    (results, bindings)
+}
+
+#[test]
+fn grounding_decline_keeps_full_original_row_and_exact_binding() {
+    // The final shape is the actual compiler06 constructor panic precondition
+    // for step=3. It is false, but is not currently a supported kernel family.
+    // Keep it distinct from both a satisfiable candidate and an opaque one.
+    let eq = Formula::Eq(Box::new(Formula::Int(3)), Box::new(Formula::Int(0)));
+    let constructor_violation = Formula::Not(Box::new(Formula::Implies(
+        Box::new(Formula::Bool(true)),
+        Box::new(Formula::Implies(
+            Box::new(Formula::Or(vec![
+                Formula::And(vec![eq.clone(), Formula::Bool(true)]),
+                Formula::And(vec![
+                    Formula::Not(Box::new(Formula::Or(vec![eq]))),
+                    Formula::Bool(false),
+                ]),
+            ])),
+            Box::new(Formula::Bool(false)),
+        )),
+    )));
+    for formula in [
+        Formula::Var("unmodeled_site".into(), trust_types::Sort::Bool),
+        Formula::Bool(true),
+        constructor_violation,
+    ] {
+        let (mut results, mut bindings) = grounding_transaction_fixture(formula.clone());
+        let before = serde_json::to_string(&results).unwrap();
+        let mut candidate = results[0].0.clone();
+        candidate.formula = formula;
+        assert!(trust_certify::certify_vc(&candidate).is_none(), "control must need a certificate");
+        let old_public_id = bindings[0].as_ref().unwrap().public_obligation_id.clone();
+
+        let grounded =
+            ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED);
+
+        assert!(grounded.is_none(), "an unearned replacement cannot commit a rewrite");
+        assert_eq!(serde_json::to_string(&results).unwrap(), before);
+        assert!(bindings[0].as_ref().is_some_and(|binding| {
+            binding.public_obligation_id == old_public_id && binding.matches_row(0, &results[0].0)
+        }));
+        assert!(bindings[1].as_ref().is_some_and(|binding| binding.matches_row(1, &results[1].0)));
+    }
+}
+
+#[test]
+fn grounding_decline_revokes_stale_binding_before_candidate_check() {
+    let (mut results, mut bindings) = grounding_transaction_fixture(Formula::Bool(true));
+    results[0].0.location.col_start += 1;
+    let before = serde_json::to_string(&results).unwrap();
+    assert!(!bindings[0].as_ref().unwrap().matches_row(0, &results[0].0));
+
+    assert!(
+        ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED).is_none()
+    );
+
+    assert_eq!(serde_json::to_string(&results).unwrap(), before);
+    assert!(bindings[0].is_none(), "a certificate miss must not preserve a stale capability");
+    assert!(bindings[1].as_ref().is_some_and(|binding| binding.matches_row(1, &results[1].0)));
+}
+
+#[test]
+fn grounding_requires_every_sibling_proved_and_nonempty_inventory() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction.clone());
+    results.truncate(1);
+    bindings.truncate(1);
+    let before = serde_json::to_string(&results).unwrap();
+    assert!(
+        ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED).is_none()
+    );
+    assert_eq!(serde_json::to_string(&results).unwrap(), before);
+    assert!(bindings[0].as_ref().unwrap().matches_row(0, &results[0].0));
+
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    results[1].1 = VerificationResult::Unknown {
+        solver: "test".into(),
+        reason: "unproved sibling".into(),
+        time_ms: 0,
+    };
+    let before = serde_json::to_string(&results).unwrap();
+    assert!(
+        ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED).is_none()
+    );
+    assert_eq!(serde_json::to_string(&results).unwrap(), before);
+    assert!(bindings[0].as_ref().unwrap().matches_row(0, &results[0].0));
+}
+
+#[test]
+fn grounding_decline_without_native_binding_cannot_create_authority() {
+    let (mut results, _) = grounding_transaction_fixture(Formula::Var(
+        "unmodeled_site".into(),
+        trust_types::Sort::Bool,
+    ));
+    let before = serde_json::to_string(&results).unwrap();
+    assert!(ground_panic_freedom_catchall(&mut results, None, None, SITED).is_none());
+    assert_eq!(serde_json::to_string(&results).unwrap(), before);
+    let bindings = vec![None, None];
+    let authorities =
+        build_result_proof_authorities(&results, &bindings, None, &certify_all(&results, None));
+    assert!(authorities.iter().all(Option::is_none), "a Proved label alone is not proof authority");
+}
+
+#[test]
+fn grounding_deadline_declines_but_still_revokes_a_stale_binding() {
+    let expired = Some(std::time::Instant::now());
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    for stale in [false, true] {
+        let (mut results, mut bindings) = grounding_transaction_fixture(contradiction.clone());
+        if stale {
+            results[0].0.function = "changed::owner".into();
+        }
+        let before = serde_json::to_string(&results).unwrap();
+        assert!(
+            ground_panic_freedom_catchall(&mut results, Some(&mut bindings), expired, SITED)
+                .is_none()
+        );
+        assert_eq!(serde_json::to_string(&results).unwrap(), before);
+        assert_eq!(bindings[0].is_none(), stale);
+        assert!(bindings[1].as_ref().unwrap().matches_row(1, &results[1].0));
+    }
+}
+
+#[test]
+fn grounding_earned_exact_certificate_survives_later_certification_deadline() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    results[0].0.contract_metadata = Some(trust_types::ContractMetadata {
+        has_ensures: true,
+        source_contract_index: Some(7),
+        ..Default::default()
+    });
+    bindings[0] = test_binding_for_obligation(
+        0,
+        &results[0].0,
+        &authority_test_native_obligation("authority:transaction:metadata", 501, 501),
+    );
+    let original = results[0].0.clone();
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    assert!(bindings[0].is_none());
+    assert_eq!(results[0].0.contract_metadata, original.contract_metadata);
+    assert_eq!(results[0].0.function, original.function);
+    assert_eq!(results[0].0.location, original.location);
+    assert!(trust_certify::replay_vc_evidence(&results[0].0, &grounded.evidence));
+
+    let mut certificates = certify_all(&results, Some(std::time::Instant::now()));
+    assert!(certificates.iter().all(Option::is_none), "later pass has no remaining time");
+    assert!(grounded.seed_exact_certificate(&results, &mut certificates));
+    assert!(trust_certify::replay_vc_evidence(&results[0].0, certificates[0].as_ref().unwrap()));
+    let authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+}
+
+#[test]
+fn grounding_earned_certificate_rejects_changed_rows_verdicts_and_carrier_skew() {
+    for mutation in 0..8 {
+        let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+        let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+        let grounded =
+            ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED).unwrap();
+        let mut certificates = vec![None, None];
+        match mutation {
+            0 => results[0].0.function = "changed::owner".into(),
+            1 => results[0].0.location.col_start += 1,
+            2 => results[0].0.kind = VcKind::DivisionByZero,
+            3 => results[0].0.formula = Formula::Bool(true),
+            4 => results[0].0.contract_metadata = Some(trust_types::ContractMetadata::default()),
+            5 => results.swap(0, 1),
+            6 => {
+                results[0].1 = VerificationResult::Unknown {
+                    solver: "test".into(),
+                    reason: "later refusal".into(),
+                    time_ms: 0,
+                }
+            }
+            7 => {
+                certificates.pop();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !grounded.seed_exact_certificate(&results, &mut certificates),
+            "mutation {mutation}"
+        );
+        assert!(certificates.iter().all(Option::is_none));
+    }
+}
+
+/// Trust (grounded catch-all premise floor, 2026-09-24): the grounding
+/// fixture in the exact state the overclaim lived in. The grounding earned its
+/// certificate, the later `certify_all` pass certified NOTHING for the sibling
+/// (its deadline had passed), the seeded certificate rebuilt `KernelCertified`
+/// for the catch-all — and the sibling, whose `Proved` label the grounding gate
+/// consumed as its premise, ends the authority phase with no authority at all.
+fn grounded_catchall_over_authority_less_sibling() -> (
+    Vec<(VerificationCondition, VerificationResult)>,
+    Vec<Option<ResultObligationBinding>>,
+    Vec<Option<ResultProofAuthority>>,
+    GroundedCatchallPremises,
+) {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let premises = grounded.premises.clone();
+    assert_eq!(premises.row, exact_result_row_identity(0, &results[0].0).unwrap());
+    assert_eq!(premises.premises, vec![(1, exact_result_row_identity(1, &results[1].0))]);
+    let mut certificates = certify_all(&results, Some(std::time::Instant::now()));
+    assert!(certificates.iter().all(Option::is_none), "the later pass has no remaining time");
+    assert!(grounded.seed_exact_certificate(&results, &mut certificates));
+    let authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(authorities[1].is_none(), "control: the sibling premise carries no authority");
+    (results, bindings, authorities, premises)
+}
+
+fn cap_one(
+    results: &[(VerificationCondition, VerificationResult)],
+    bindings: &[Option<ResultObligationBinding>],
+    authorities: &mut [Option<ResultProofAuthority>],
+    premises: &GroundedCatchallPremises,
+) -> usize {
+    cap_grounded_panic_freedom_authorities(
+        results,
+        bindings,
+        authorities,
+        None,
+        std::slice::from_ref(premises),
+    )
+}
+
+/// The overclaim and its correction: a kernel certificate over the grounded
+/// residual disjunction is no authority for whole-function panic-freedom while
+/// the sibling it was grounded on ends unproved. Before the floor pass the
+/// catch-all reports `Certified` beside that sibling; after it, nothing in the
+/// carrier is `Certified` and the catch-all reports exactly what its sibling
+/// reports.
+#[test]
+fn grounded_catchall_loses_its_kernel_token_when_a_premise_ends_without_authority() {
+    let (results, bindings, mut authorities, premises) =
+        grounded_catchall_over_authority_less_sibling();
+    let before =
+        build_proof_results_with_runtime_checks(true, &results, &[], &bindings, &authorities, None);
+    assert_eq!(before.summary.certified, 1, "the overclaim this test exists to close");
+
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 1);
+
+    assert!(
+        authorities[0].is_none(),
+        "a certificate resting on an unproved premise is no authority"
+    );
+    assert!(
+        results[0].1.is_proved(),
+        "the label is left in place; without authority it is advisory"
+    );
+    assert!(authorities[1].is_none(), "the sibling's own authority is not this pass's business");
+    let after =
+        build_proof_results_with_runtime_checks(true, &results, &[], &bindings, &authorities, None);
+    assert_eq!((after.summary.certified, after.summary.trusted), (0, 0));
+    assert_eq!(
+        after.dispositions.iter().map(|d| d.status).collect::<Vec<_>>(),
+        vec![TrustStatus::Unknown, TrustStatus::Unknown],
+        "the catch-all reports what its unproved premise reports, never more"
+    );
+    // Idempotent: a second pass finds no grounded token left to grade.
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+}
+
+/// A premise that ends `Trusted` lowers the GRADE, not the verdict: the token
+/// becomes `GroundedPanicFreedomDerivation`, sealed to the grounded row,
+/// reported `Trusted`/`Deductive`, still an unconditional static proof here, and
+/// handing out no kernel term.
+#[test]
+fn grounded_catchall_inherits_a_trusted_premise() {
+    let (results, bindings, mut authorities, premises) =
+        grounded_catchall_over_authority_less_sibling();
+    authorities[1] = Some(ResultProofAuthority::InterproceduralCalleeClosure {
+        row: exact_result_row_identity(1, &results[1].0).unwrap(),
+    });
+
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 1);
+
+    let Some(
+        authority @ ResultProofAuthority::GroundedPanicFreedomDerivation { row, unconditional },
+    ) = authorities[0].as_ref()
+    else {
+        panic!("expected the derivation variant, got {:?}", authorities[0]);
+    };
+    assert_eq!(row, &exact_result_row_identity(0, &results[0].0).unwrap());
+    assert!(*unconditional, "an unconditional premise keeps the derivation unconditional");
+    let (vc, result) = &results[0];
+    let binding = bindings[0].as_ref();
+    assert_eq!(
+        trust_disposition_for_authority(Some(authority), 0, vc, result, binding),
+        Some((TrustStatus::Trusted, TrustProofStrength::Deductive))
+    );
+    assert!(authority.is_static_proof_for(0, vc, result, binding));
+    assert!(authority.is_unconditional_static_proof_for(0, vc, result, binding));
+    assert!(authority.permits_static_proved_transport_for(0, vc, result, binding));
+    assert!(
+        authority.kernel_evidence_for(0, vc, binding).is_none(),
+        "handing out the disjunction's term would claim the kernel checked THIS row's obligation"
+    );
+    assert!(!authority.is_kernel_proof_for(0, vc, binding));
+    assert!(
+        !authority.is_exact_source_clause_body_proof_for(0, vc, result, binding),
+        "a derived aggregate may not prove a source marker"
+    );
+    assert!(
+        !authority.matches_row(1, &results[1].0, bindings[1].as_ref()),
+        "sealed to the grounded row only"
+    );
+    let after =
+        build_proof_results_with_runtime_checks(true, &results, &[], &bindings, &authorities, None);
+    assert_eq!((after.summary.certified, after.summary.trusted), (0, 2));
+    // A settled derivation is left alone by a second pass.
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+    assert!(matches!(
+        authorities[0],
+        Some(ResultProofAuthority::GroundedPanicFreedomDerivation { unconditional: true, .. })
+    ));
+}
+
+/// A `Trusted` premise that is not itself an unconditional static proof — the
+/// `assume_total` bookkeeping row — makes the derivation conditional: still a
+/// static proof at `Trusted`, but excluded by
+/// `is_unconditional_static_proof_for` exactly as `CallerPropagation` is.
+#[test]
+fn grounded_catchall_over_a_conditional_premise_is_conditional() {
+    let (results, bindings, mut authorities, premises) =
+        grounded_catchall_over_authority_less_sibling();
+    authorities[1] = Some(ResultProofAuthority::AssumedTotalCalleeAssumption {
+        row: exact_result_row_identity(1, &results[1].0).unwrap(),
+        binding: bindings[1].clone().expect("the fixture binds the sibling"),
+    });
+
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 1);
+
+    let Some(
+        authority @ ResultProofAuthority::GroundedPanicFreedomDerivation {
+            unconditional: false,
+            ..
+        },
+    ) = authorities[0].as_ref()
+    else {
+        panic!("expected a CONDITIONAL derivation, got {:?}", authorities[0]);
+    };
+    let (vc, result) = &results[0];
+    assert!(authority.is_static_proof_for(0, vc, result, bindings[0].as_ref()));
+    assert!(!authority.is_unconditional_static_proof_for(0, vc, result, bindings[0].as_ref()));
+    assert!(
+        !results_establish_unconditional_panic_freedom(&results, &bindings, &authorities),
+        "a conditional derivation can never register the function panic-free"
+    );
+}
+
+/// Re-grading is monotone. A derivation the pass already graded conditional is
+/// never raised back to unconditional by a later round, even when every
+/// premise it can still see is an unconditional static proof: inside the pass
+/// premises only ever lose authority, so a raise could only come from reading
+/// a premise set that differs from the one the conditional grade was earned on.
+#[test]
+fn grounded_catchall_conditional_derivation_is_never_raised() {
+    let (results, bindings, mut authorities, premises) =
+        grounded_catchall_over_authority_less_sibling();
+    authorities[1] = Some(ResultProofAuthority::InterproceduralCalleeClosure {
+        row: exact_result_row_identity(1, &results[1].0).unwrap(),
+    });
+    authorities[0] = Some(ResultProofAuthority::GroundedPanicFreedomDerivation {
+        row: premises.row.clone(),
+        unconditional: false,
+    });
+
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+
+    assert!(matches!(
+        authorities[0],
+        Some(ResultProofAuthority::GroundedPanicFreedomDerivation { unconditional: false, .. })
+    ));
+}
+
+/// Every premise `Certified` — the common case — leaves the grounded row's
+/// kernel token alone, and so do the two exempt premises: a functional
+/// `Postcondition` and the definition-entry `requires` marker are not panic
+/// sites. A grounding whose row no longer carries its frozen identity, or whose
+/// row carries an authority another lane sealed, is not this pass's to grade.
+#[test]
+fn grounded_catchall_keeps_its_kernel_token_when_every_premise_is_certified() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction.clone());
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let premises = grounded.premises.clone();
+    let certificates = certify_all(&results, None);
+    let mut authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+    let before = format!("{authorities:?}");
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+    assert_eq!(format!("{authorities:?}"), before);
+
+    // The exempt entry-assumption premise.
+    authorities[1] = Some(ResultProofAuthority::DefinitionEntryAssumption {
+        row: exact_result_row_identity(1, &results[1].0).unwrap(),
+        binding: bindings[1].clone().expect("the fixture binds the sibling"),
+    });
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+
+    // A grounded row that moved after the record was taken: its token, if any,
+    // is over a different formula and is not this pass's to grade.
+    authorities[1] = None;
+    let mut moved = results.clone();
+    moved[0].0.formula = Formula::Bool(true);
+    let mut moved_authorities = authorities.clone();
+    assert_eq!(cap_one(&moved, &bindings, &mut moved_authorities, &premises), 0);
+    assert!(matches!(moved_authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+
+    // A row another lane sealed is that lane's business.
+    authorities[0] = Some(ResultProofAuthority::InterproceduralCalleeClosure {
+        row: exact_result_row_identity(0, &results[0].0).unwrap(),
+    });
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+    assert!(matches!(
+        authorities[0],
+        Some(ResultProofAuthority::InterproceduralCalleeClosure { .. })
+    ));
+
+    // The exempt functional premise: an unproved `ensures` row is not a
+    // reachable panic, exactly as the panic-freedom registry treats it.
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    results[1].0.kind = VcKind::Postcondition;
+    bindings[1] = test_binding_for_obligation(
+        1,
+        &results[1].0,
+        &authority_test_native_obligation("authority:transaction:postcondition", 502, 502),
+    );
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let premises = grounded.premises.clone();
+    let mut certificates = certify_all(&results, Some(std::time::Instant::now()));
+    assert!(grounded.seed_exact_certificate(&results, &mut certificates));
+    let mut authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(authorities[1].is_none(), "control: the postcondition carries no authority");
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 0);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+}
+
+/// A premise REFUTED after the rewrite (`refute_forced_unbounded_allocations`,
+/// `refute_unsafe_demand_findings` and the R1 flips all run later) is the
+/// strongest form of a missing premise, and so is a panic-site row APPENDED
+/// after the gate ran (a call-site L0 replay or BMC refutation): the gate never
+/// read it, but it is a panic site of the same function.
+#[test]
+fn grounded_catchall_loses_its_kernel_token_when_a_panic_site_is_refuted_after_grounding() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let refuted = |solver: &str| VerificationResult::Failed {
+        solver: solver.into(),
+        time_ms: 0,
+        counterexample: None,
+    };
+
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction.clone());
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let premises = grounded.premises.clone();
+    let certificates = certify_all(&results, None);
+    let mut authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+    results[1].1 = refuted("structural-forced-unbounded-allocation");
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 1);
+    assert!(authorities[0].is_none());
+
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let premises = grounded.premises.clone();
+    results.push((test_vc(503), refuted("trust-callsite-l0-replay")));
+    bindings.push(None);
+    let certificates = certify_all(&results, None);
+    let mut authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(
+        premises.premises.iter().all(|(index, _)| *index != 2),
+        "the appended row was never read by the gate"
+    );
+    assert_eq!(cap_one(&results, &bindings, &mut authorities, &premises), 1);
+    assert!(authorities[0].is_none(), "an appended refutation still floors the catch-all");
+}
+
+/// One grounded catch-all can be another's premise, so the floor iterates to a
+/// fixpoint: the result does not depend on the order the groundings were
+/// recorded in. A carrier skew strips every grounded kernel token.
+#[test]
+fn grounded_catchall_floor_reaches_a_fixpoint_and_fails_closed_on_skew() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let mut first = test_vc(601);
+    first.kind = VcKind::Assertion { message: "panic freedom: first".into() };
+    first.formula = contradiction.clone();
+    let mut second = test_vc(602);
+    second.kind = VcKind::Assertion { message: "panic freedom: second".into() };
+    second.formula = contradiction;
+    let open = test_vc(603);
+    let results = vec![
+        (first, authority_test_proved()),
+        (second, authority_test_proved()),
+        (open, authority_test_proved()),
+    ];
+    let certificates = certify_all(&results, None);
+    let authorities = build_result_proof_authorities(&results, &[], None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(authorities[2].is_none(), "control: `Bool(true)` has no certificate");
+    let identity = |index: usize| exact_result_row_identity(index, &results[index].0);
+    let first_on_second = GroundedCatchallPremises {
+        row: identity(0).unwrap(),
+        premises: vec![(1, identity(1))],
+        calls: GroundedCallPremise::Absent,
+    };
+    let second_on_open = GroundedCatchallPremises {
+        row: identity(1).unwrap(),
+        premises: vec![(2, identity(2))],
+        calls: GroundedCallPremise::Absent,
+    };
+    for order in [
+        [first_on_second.clone(), second_on_open.clone()],
+        [second_on_open.clone(), first_on_second.clone()],
+    ] {
+        let mut graded = authorities.clone();
+        assert_eq!(
+            cap_grounded_panic_freedom_authorities(&results, &[], &mut graded, None, &order),
+            2
+        );
+        assert!(graded.iter().all(Option::is_none), "{order:?}: {graded:?}");
+    }
+
+    let mut skewed = authorities.clone();
+    skewed.push(None);
+    assert_eq!(
+        cap_grounded_panic_freedom_authorities(
+            &results,
+            &[],
+            &mut skewed,
+            None,
+            std::slice::from_ref(&second_on_open),
+        ),
+        1
+    );
+    assert!(skewed[1].is_none(), "a skewed carrier cannot be graded, so it is not trusted");
+    assert!(matches!(skewed[0], Some(ResultProofAuthority::KernelCertified { .. })));
+}
+
+/// A call the refute lane's gate discharged is a premise too: its callee's
+/// panic-freedom is a registry (or recognizer) fact the kernel never saw. With
+/// every sibling `Certified` the row still reports at most `Trusted` — the grade
+/// `InterproceduralCalleeClosure` reports for the same premise — and an
+/// unproved sibling still strips it, whichever premise is weaker. A tail call or
+/// opaque terminator the gate never examined is a premise with no authority at
+/// all: it strips the row even beside certified siblings.
+#[test]
+fn grounded_catchall_over_a_gate_discharged_call_is_at_most_trusted() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    let grounded = ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED)
+        .expect("a real closed contradiction must earn its exact certificate");
+    let mut premises = grounded.premises.clone();
+    assert_eq!(
+        premises.calls,
+        GroundedCallPremise::Absent,
+        "the sibling rewrite never records a call premise"
+    );
+    let certificates = certify_all(&results, None);
+    let authorities = build_result_proof_authorities(&results, &bindings, None, &certificates);
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+
+    // Control: the same record without a call premise keeps the kernel token.
+    let mut graded = authorities.clone();
+    assert_eq!(cap_one(&results, &bindings, &mut graded, &premises), 0);
+    assert!(matches!(graded[0], Some(ResultProofAuthority::KernelCertified { .. })));
+
+    premises.calls = GroundedCallPremise::GateDischarged;
+    let mut graded = authorities.clone();
+    assert_eq!(cap_one(&results, &bindings, &mut graded, &premises), 1);
+    assert!(
+        matches!(
+            graded[0],
+            Some(ResultProofAuthority::GroundedPanicFreedomDerivation { unconditional: true, .. })
+        ),
+        "a certified sibling cannot lift a registry-discharged call to Certified: {:?}",
+        graded[0]
+    );
+    let after =
+        build_proof_results_with_runtime_checks(true, &results, &[], &bindings, &graded, None);
+    assert_eq!((after.summary.certified, after.summary.trusted), (1, 1));
+
+    // The weaker premise wins: an authority-less sibling strips the row even
+    // though the call premise alone would have left it `Trusted`.
+    let mut graded = authorities.clone();
+    graded[1] = None;
+    assert_eq!(cap_one(&results, &bindings, &mut graded, &premises), 1);
+    assert!(graded[0].is_none());
+
+    // Nothing examined a tail call or an opaque terminator: every sibling
+    // `Certified`, and still no authority for the grounded row.
+    premises.calls = GroundedCallPremise::Unexamined;
+    let mut graded = authorities.clone();
+    assert_eq!(cap_one(&results, &bindings, &mut graded, &premises), 1);
+    assert!(graded[0].is_none(), "an unexamined terminator is no premise: {:?}", graded[0]);
+    assert!(matches!(graded[1], Some(ResultProofAuthority::KernelCertified { .. })));
+}
+
+/// A premise is graded by what it REPORTS, not by its token alone. A
+/// callee-closure token reads `Trusted`, but over a constant-false violation
+/// formula the human line's vacuity gate reports that row `Unknown` — so the
+/// grounded row standing on it keeps no authority either. The control premise,
+/// identical but for a formula the gate does not fold, grades `Trusted`.
+#[test]
+fn grounded_catchall_grades_a_premise_by_its_reported_status() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    for (premise_formula, vacuous) in [(Formula::Bool(false), true), (Formula::Bool(true), false)] {
+        let mut catchall = test_vc(611);
+        catchall.kind = VcKind::Assertion { message: "panic freedom: reported premise".into() };
+        catchall.formula = contradiction.clone();
+        let mut premise = test_vc(612);
+        premise.formula = premise_formula;
+        let results = vec![(catchall, authority_test_proved()), (premise, authority_test_proved())];
+        let identity = |index: usize| exact_result_row_identity(index, &results[index].0);
+        let certificates = certify_all(&results, None);
+        let mut authorities = build_result_proof_authorities(&results, &[], None, &certificates);
+        assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+        authorities[1] =
+            Some(ResultProofAuthority::InterproceduralCalleeClosure { row: identity(1).unwrap() });
+        assert_eq!(
+            trust_disposition_for_authority(
+                authorities[1].as_ref(),
+                1,
+                &results[1].0,
+                &results[1].1,
+                None
+            ),
+            Some((TrustStatus::Trusted, TrustProofStrength::Deductive)),
+            "the premise's token alone reads Trusted"
+        );
+        let reported =
+            build_proof_results_with_runtime_checks(true, &results, &[], &[], &authorities, None);
+        let premise_status = reported.dispositions.iter().map(|d| d.status).nth(1);
+        assert_eq!(
+            premise_status == Some(TrustStatus::Trusted),
+            !vacuous,
+            "the premise's REPORTED status (vacuous={vacuous}): {premise_status:?}"
+        );
+        let grounding = GroundedCatchallPremises {
+            row: identity(0).unwrap(),
+            premises: vec![(1, identity(1))],
+            calls: GroundedCallPremise::Absent,
+        };
+        assert_eq!(
+            cap_grounded_panic_freedom_authorities(
+                &results,
+                &[],
+                &mut authorities,
+                None,
+                std::slice::from_ref(&grounding),
+            ),
+            1
+        );
+        if vacuous {
+            assert!(authorities[0].is_none(), "an Unknown premise leaves nothing to stand on");
+        } else {
+            assert!(
+                matches!(
+                    authorities[0],
+                    Some(ResultProofAuthority::GroundedPanicFreedomDerivation {
+                        unconditional: true,
+                        ..
+                    })
+                ),
+                "a Trusted premise lowers the row to Trusted: {:?}",
+                authorities[0]
+            );
+        }
+    }
+}
+
+/// The sibling rewrite may only stand for the catch-all when every panic
+/// source the catch-all aggregates is itself a sibling row. When the caller
+/// reports otherwise (`every_catchall_panic_source_has_a_site_row` is false)
+/// the rewrite declines outright: the row, its opaque formula and its native
+/// binding stay exactly as they were, so the lane that proved it can seal its
+/// own authority instead of a certificate about a disjoint formula.
+#[test]
+fn sibling_grounding_declines_when_a_panic_source_has_no_site_row() {
+    let contradiction = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction.clone());
+    let before_results = serde_json::to_string(&results).unwrap();
+    let before_bindings = bindings.clone();
+    assert!(
+        ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, false).is_none(),
+        "no certificate may be earned for a claim the siblings do not cover"
+    );
+    assert_eq!(serde_json::to_string(&results).unwrap(), before_results);
+    assert_eq!(bindings, before_bindings);
+    assert!(bindings[0].as_ref().is_some_and(|binding| binding.matches_row(0, &results[0].0)));
+
+    // Control: the identical fixture, every source sited, grounds.
+    let (mut results, mut bindings) = grounding_transaction_fixture(contradiction);
+    assert!(
+        ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, SITED).is_some()
+    );
+}
+
+/// `native_trust_ir_panic_function` with its one call block replaced.
+fn catchall_source_fixture(terminator: trust_types::Terminator) -> trust_types::VerifiableFunction {
+    let mut function = native_trust_ir_panic_function(false);
+    function.body.blocks[1].terminator = terminator;
+    function
+}
+
+fn catchall_source_call(callee: &str, message: Option<&str>) -> trust_types::Terminator {
+    trust_types::Terminator::Call {
+        func: callee.to_string(),
+        args: message
+            .map(|message| {
+                trust_types::Operand::Constant(trust_types::ConstValue::Str {
+                    bytes: message.as_bytes().to_vec(),
+                })
+            })
+            .into_iter()
+            .collect(),
+        dest: trust_types::Place::local(0),
+        target: None,
+        span: native_trust_ir_test_span(31),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: None,
+        unwind: trust_types::UnwindEdge::Unreachable,
+    }
+}
+
+/// Which panic sources the sibling rewrite may stand for: exactly the call
+/// shapes vcgen gives a per-site row of their own (`v2_build_terminator_vc` —
+/// the `unreachable!()` sentinel, the `assert!`-family entrypoints and the
+/// exact outlined default-message family). A legacy bare
+/// `core::panicking::panic` without a sentinel message, an ordinary callee, a
+/// tail call and an opaque (unmodelled) terminator have none, so a body carrying
+/// one is refused. rustc's `UnwindTerminate` sink is no source at all: it runs
+/// only while another panic unwinds.
+#[test]
+fn every_catchall_panic_source_has_a_site_row_admits_only_sited_panic_calls() {
+    let sited = [
+        catchall_source_call(
+            "core::panicking::panic",
+            Some("internal error: entered unreachable code"),
+        ),
+        catchall_source_call("core::panicking::panic_fmt", None),
+        catchall_source_call("std::rt::begin_panic::<&str>", Some("explicit panic")),
+        catchall_source_call("core::panicking::panic_default_msg", None),
+        catchall_source_call("core::panicking::unimplemented_default_msg", None),
+        catchall_source_call("core::panicking::todo_default_msg", None),
+        catchall_source_call("core::panicking::unreachable_default_msg", None),
+        trust_types::Terminator::Return,
+        trust_types::Terminator::Opaque {
+            kind: "UnwindTerminate::InCleanup".into(),
+            targets: Vec::new(),
+            span: native_trust_ir_test_span(31),
+        },
+    ];
+    for terminator in sited {
+        let function = catchall_source_fixture(terminator.clone());
+        assert!(every_catchall_panic_source_has_a_site_row(&function), "{terminator:?}");
+    }
+    let unsited = [
+        catchall_source_call("core::panicking::panic", Some("explicit panic")),
+        catchall_source_call("core::option::unwrap_failed", None),
+        catchall_source_call("demo::half", None),
+        catchall_source_call("demo::panicking::panic_default_msg", None),
+        catchall_source_call("core::panicking::panic_default_msg_extra", None),
+        catchall_source_call("__trust_crate@forged::core::panicking::panic_default_msg", None),
+        trust_types::Terminator::TailCall {
+            func: "demo::half".to_string(),
+            args: Vec::new(),
+            span: native_trust_ir_test_span(31),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: None,
+        },
+        trust_types::Terminator::TailCall {
+            func: "core::panicking::panic_default_msg".to_string(),
+            args: Vec::new(),
+            span: native_trust_ir_test_span(31),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            callee_key: None,
+        },
+        trust_types::Terminator::Opaque {
+            kind: "InlineAsm".into(),
+            targets: vec![trust_types::BlockId(2)],
+            span: native_trust_ir_test_span(31),
+        },
+    ];
+    for terminator in unsited {
+        let function = catchall_source_fixture(terminator.clone());
+        assert!(!every_catchall_panic_source_has_a_site_row(&function), "{terminator:?}");
+    }
+}
+
+/// Trust: exercise the actual coverage floor against the ordinary producer,
+/// rather than replacing the computed premise with the fixtures' `SITED` flag.
+/// Recognizing a covered source neither proves its row nor hides another source.
+#[test]
+fn outlined_panic_catchall_floor_agrees_with_ordinary_site_rows() {
+    for callee in [
+        "core::panicking::panic_default_msg",
+        "core::panicking::unimplemented_default_msg",
+        "core::panicking::todo_default_msg",
+        "core::panicking::unreachable_default_msg",
+    ] {
+        let mut function = catchall_source_fixture(catchall_source_call(callee, None));
+        // Keep this source reachable: the older fixture deliberately guards it
+        // with false, which would let the ordinary producer omit dead scaffolding.
+        function.body.blocks[0].terminator = trust_types::Terminator::Goto(trust_types::BlockId(1));
+        let vcs = trust_vcgen::generate_vcs(&function);
+        let panic_rows: Vec<_> = vcs
+            .iter()
+            .filter(|vc| {
+                vc.location == native_trust_ir_test_span(31)
+                    && matches!(&vc.kind, VcKind::Assertion { message }
+                        if message.starts_with("panic call:"))
+            })
+            .collect();
+        assert_eq!(panic_rows.len(), 1, "{callee} must retain its ordinary site row");
+        assert_eq!(panic_rows[0].formula, Formula::Bool(true), "{callee} is reachable");
+        let sited = every_catchall_panic_source_has_a_site_row(&function);
+        assert!(sited, "the generated site row must cover {callee}");
+
+        let mut catchall = test_vc(501);
+        catchall.function = function.name.clone().into();
+        catchall.kind = VcKind::Assertion { message: "panic freedom: panic_branch".into() };
+        catchall.formula =
+            Formula::Var("panic_reachable:panic_branch".into(), trust_types::Sort::Bool);
+        let mut results = vec![
+            (catchall, authority_test_proved()),
+            (
+                (*panic_rows[0]).clone(),
+                VerificationResult::Unknown {
+                    solver: trust_types::Symbol::intern("outlined-panic-control"),
+                    time_ms: 0,
+                    reason: "the reachable panic has no proof".into(),
+                },
+            ),
+        ];
+        let mut bindings = vec![None, None];
+        let before_results = serde_json::to_string(&results).unwrap();
+        let before_bindings = bindings.clone();
+        assert!(
+            ground_panic_freedom_catchall(&mut results, Some(&mut bindings), None, sited).is_none(),
+            "a covered but unproved panic must still block grounding: {callee}"
+        );
+        assert_eq!(serde_json::to_string(&results).unwrap(), before_results);
+        assert_eq!(bindings, before_bindings);
+
+        // The covered panic remains present after an ordinary returning call;
+        // that additional source has no row and must still refuse the floor.
+        let mut extra_call = catchall_source_call("demo::half", None);
+        let trust_types::Terminator::Call { target, .. } = &mut extra_call else { unreachable!() };
+        *target = Some(trust_types::BlockId(1));
+        function.body.blocks[0].terminator = extra_call;
+        assert!(
+            !every_catchall_panic_source_has_a_site_row(&function),
+            "the row for {callee} cannot cover an additional ordinary callee"
+        );
+    }
+}
+
+/// The call premise mirrors the refute lane's call gate: a `core::panicking`
+/// failure block is a disjunct (exempt) only when the per-block
+/// `panic_calls_proven_unreachable` holds; every other call — a tail call
+/// included, which is never exempted (NEW-TAILCALL) — rests on the gate; and an
+/// opaque terminator is outside the gate's enumeration altogether — except the
+/// `UnwindTerminate` sink, which no panic-free body reaches.
+#[test]
+fn grounded_call_premise_mirrors_the_call_gate_enumeration() {
+    use GroundedCallPremise::{Absent, GateDischarged, Unexamined};
+    let bare_panic = catchall_source_fixture(catchall_source_call(
+        "core::panicking::panic",
+        Some("explicit panic"),
+    ));
+    assert_eq!(grounded_call_premise(&bare_panic, true), Absent);
+    assert_eq!(grounded_call_premise(&bare_panic, false), GateDischarged);
+    let callee = catchall_source_fixture(catchall_source_call("demo::half", None));
+    assert_eq!(grounded_call_premise(&callee, true), GateDischarged);
+    let sentinel = catchall_source_fixture(catchall_source_call(
+        "core::panicking::panic",
+        Some("internal error: entered unreachable code"),
+    ));
+    assert_eq!(
+        grounded_call_premise(&sentinel, true),
+        GateDischarged,
+        "the `unreachable!()` sentinel is never a refutation target"
+    );
+    let tail_call = catchall_source_fixture(trust_types::Terminator::TailCall {
+        func: "demo::half".to_string(),
+        args: Vec::new(),
+        span: native_trust_ir_test_span(31),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: None,
+    });
+    assert_eq!(grounded_call_premise(&tail_call, true), GateDischarged);
+    assert_eq!(grounded_call_premise(&tail_call, false), GateDischarged);
+    // A tail call to a callee the refutation recognizer reads as a target is
+    // still a call the gate decided, never an exempted failure block.
+    let tail_panic = catchall_source_fixture(trust_types::Terminator::TailCall {
+        func: "demo::m::panic".to_string(),
+        args: Vec::new(),
+        span: native_trust_ir_test_span(31),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: None,
+    });
+    assert_eq!(grounded_call_premise(&tail_panic, true), GateDischarged);
+    let opaque = catchall_source_fixture(trust_types::Terminator::Opaque {
+        kind: "InlineAsm".into(),
+        targets: vec![trust_types::BlockId(2)],
+        span: native_trust_ir_test_span(31),
+    });
+    assert_eq!(grounded_call_premise(&opaque, true), Unexamined);
+    let terminate = catchall_source_fixture(trust_types::Terminator::Opaque {
+        kind: "UnwindTerminate::InCleanup".into(),
+        targets: Vec::new(),
+        span: native_trust_ir_test_span(31),
+    });
+    assert_eq!(grounded_call_premise(&terminate, false), Absent);
+    let no_call = catchall_source_fixture(trust_types::Terminator::Return);
+    assert_eq!(grounded_call_premise(&no_call, false), Absent);
 }
 
 #[test]
@@ -15168,7 +19654,7 @@ fn same_span_public_native_rows_cannot_mint_or_cross_transport_authority() {
             &bindings,
             &authorities,
             Some(&run),
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 0, runtime_checked: 2, skipped: 0 }),
         "neither serializable public row may become compiler authority",
@@ -15298,7 +19784,7 @@ fn strict_l0_verification_ignores_non_l0_unknowns() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         None
     );
@@ -15309,6 +19795,93 @@ fn strict_l0_verification_ignores_non_l0_unknowns() {
 // returns UNKNOWN. Full mode rejects every non-proved outcome; this narrower
 // classifier additionally records the known reachable panic as a REFUTATION
 // instead of a generic capability gap.
+/// Trust (DESIGN_PHILOSOPHY §9 — defined behavior is not unsafe): a row whose
+/// `VcKind` is NOT L0 must never fail-close the build, even when the coarse
+/// verifier-API family it routes through IS in the strict-L0 set.
+///
+/// `vc_obligation_kind` (trust-mir-extract) folds `FloatOverflowToInfinity` in
+/// with genuine arithmetic panics under `ObligationKind::ArithmeticSafety`,
+/// because both go to the same engine. Level is not routing. `proof_level()`
+/// independently rules the float row `L1Functional`, precisely because overflow
+/// to +/-inf is DEFINED — never a trap, never UB.
+///
+/// The VC-keyed pass honours that ruling via `is_strict_l0_vc_kind`. The
+/// native-obligation pass keys on the coarse family instead, and used to count
+/// any row the VC-keyed pass had skipped, so it re-admitted exactly the rows §9
+/// exempts. Measured symptom: `pub fn f(x: f64) -> f64 { x * 2.0 }` — valid Rust
+/// — was rejected with "Trust Level 0 safety verification incomplete" while the
+/// advisory lane simultaneously reported the same row as vanilla-semantics.
+///
+/// The control below is the half that must NOT change: the identical shape with
+/// a genuinely L0 `VcKind` still fails closed.
+#[test]
+fn strict_l0_verification_ignores_defined_behavior_rows_routed_as_arithmetic_safety() {
+    fn failure_for(kind: VcKind) -> Option<FullVerificationFailure> {
+        let obligation = authority_test_native_obligation("authority:float", 41, 70);
+        assert_eq!(
+            obligation.kind,
+            trust_verifier_api::ObligationKind::ArithmeticSafety,
+            "the fixture must route through the coarse family this test is about",
+        );
+        // A run that REQUESTS the obligation and carries no evidence for it, so
+        // the native pass sees an unproved strict-family obligation.
+        let run = authority_test_strict_native_run(obligation.clone());
+        let run = authority_test_rebuild_run(&run, vec![obligation.clone()], Vec::new());
+
+        let mut vc = test_vc(70);
+        vc.kind = kind;
+        let unknown = VerificationResult::Unknown {
+            solver: trust_types::Symbol::intern("trust-full-verifier"),
+            time_ms: 0,
+            reason: "native full verifier evidence status: Unknown".to_string(),
+        };
+        let results = vec![(vc, unknown)];
+        let bindings = vec![test_binding_for_obligation(0, &results[0].0, &obligation)];
+        assert!(bindings[0].is_some(), "the row must bind to the native obligation");
+        strict_l0_verification_failure(
+            true,
+            &results,
+            &bindings,
+            &[],
+            Some(&run),
+            &OpenDispatchRefutationWitnesses::default(),
+        )
+    }
+
+    // Defined IEEE-754 behavior: `proof_level()` says L1Functional, so no gate.
+    let float = VcKind::FloatOverflowToInfinity {
+        op: BinOp::Mul,
+        operand_ty: trust_types::Ty::Float { width: 64 },
+    };
+    assert_eq!(
+        convert_proof_level(&float),
+        TrustProofLevel::L1Functional,
+        "premise: the float row is not an L0 safety obligation",
+    );
+    assert_eq!(
+        failure_for(float),
+        None,
+        "a defined-behavior row must never fail-close a build of valid Rust",
+    );
+
+    // CONTROL: the same shape with a genuinely L0 kind still fails closed, so the
+    // fix above is attributable to the proof level and not to the binding, the
+    // evidence-free run, or the coarse family.
+    let overflow = VcKind::ArithmeticOverflow {
+        op: BinOp::Mul,
+        operand_tys: (trust_types::Ty::u32(), trust_types::Ty::u32()),
+    };
+    assert_eq!(
+        convert_proof_level(&overflow),
+        TrustProofLevel::L0Safety,
+        "premise: integer overflow IS an L0 safety obligation",
+    );
+    assert!(
+        failure_for(overflow).is_some(),
+        "control: a genuine L0 arithmetic row must still fail closed",
+    );
+}
+
 #[test]
 fn strict_l0_verification_refutes_known_panicking_unsupported_call() {
     // The round-tripped (full-lane) representation: the original
@@ -15336,7 +19909,7 @@ fn strict_l0_verification_refutes_known_panicking_unsupported_call() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
@@ -15354,7 +19927,7 @@ fn strict_l0_verification_refutes_known_panicking_unsupported_call() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
@@ -15383,7 +19956,7 @@ fn strict_l0_verification_keeps_generic_unsupported_mir_as_unknown() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
@@ -15421,7 +19994,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
@@ -15440,7 +20013,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
     );
@@ -15466,7 +20039,7 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
         &[],
         &[],
         None,
-        &FxHashSet::default(),
+        &OpenDispatchRefutationWitnesses::default(),
     );
     // Not full-verifier-backed + Proved on an UnsupportedMir VC → counted `unknown`
     // (no runtime fallback), NEVER `failed`. The key assertion is `failed == 0`.
@@ -15479,7 +20052,9 @@ fn strict_l0_verification_refutes_native_unsupported_safety_obligation() {
         kind: "FullVerification::Postcondition".to_string(),
         detail: "postcondition not modeled".to_string(),
     };
-    assert!(!is_native_unsupported_strict_l0_safety_mir(&postcond_vc.kind));
+    assert!(!trust_types::l0_refutation::is_native_unsupported_strict_l0_safety_mir(
+        &postcond_vc.kind
+    ));
 }
 
 #[test]
@@ -15730,13 +20305,14 @@ fn v1_bridge_requires_exact_bound_semantics_not_just_span() {
         || fixed_now,
         |formula, budget_ms| {
             budgets.push(budget_ms);
-            Some(StrictSmtRevalidation {
+            Ok(StrictSmtRevalidation {
                 canonical_problem: trust_router::in_process_ay_backend::problem_smt2(formula),
                 problem_sha256: "a".repeat(64),
                 time_ms: 7,
             })
         },
-    );
+    )
+    .receipts;
     assert_eq!(budgets, vec![4_000], "an unbounded function still caps each S1 solve");
     assert!(receipts[0].is_some());
     let authorities = build_result_proof_authorities_with_revalidations(
@@ -15830,9 +20406,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
             || fixed_now,
             |formula, _| {
                 calls += 1;
-                Some(s1_test_strict_result(formula))
+                Ok(s1_test_strict_result(formula))
             },
-        );
+        )
+        .receipts;
         assert_eq!(receipts, vec![None, None]);
         assert_eq!(calls, 0, "length skew must be rejected before any solve");
     }
@@ -15847,9 +20424,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             calls += 1;
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert_eq!(extra, vec![None, None]);
     assert_eq!(calls, 0, "an extra positional capability also rejects the whole lane");
 
@@ -15864,9 +20442,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             calls += 1;
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert_eq!(receipts, vec![None, None]);
     assert_eq!(calls, 0, "swapped exact row capabilities must not reach AY");
 
@@ -15881,9 +20460,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             solved_formulas.push(formula.clone());
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert!(receipts[0].is_none());
     assert!(receipts[1].is_some());
     assert_eq!(solved_formulas, vec![results[1].0.formula.clone()]);
@@ -15901,9 +20481,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             solved_formulas.push(formula.clone());
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert!(receipts[0].is_none());
     assert!(receipts[1].is_some());
     assert_eq!(solved_formulas, vec![results[1].0.formula.clone()]);
@@ -15945,9 +20526,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             calls += 1;
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert!(receipts.iter().all(Option::is_none));
     assert_eq!(calls, 0, "public/cached/native/structural labels are not eligibility");
     let authorities = build_result_proof_authorities_with_revalidations(
@@ -15998,9 +20580,10 @@ fn s1_revalidation_rejects_carrier_skew_swaps_kernel_and_public_provenance() {
         || fixed_now,
         |formula, _| {
             calls += 1;
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert!(receipts.iter().all(Option::is_none));
     assert_eq!(calls, 0, "non-strict producer rows cannot inherit S1 eligibility");
 }
@@ -16020,14 +20603,15 @@ fn s1_receipts_are_byte_and_position_bound_before_authority_mint() {
         &cleancic,
         None,
         || fixed_now,
-        |formula, _| Some(s1_test_strict_result(formula)),
-    );
+        |formula, _| Ok(s1_test_strict_result(formula)),
+    )
+    .receipts;
     assert!(receipts.iter().all(Option::is_some));
     for (index, receipt) in receipts.iter().enumerate() {
         let receipt = receipt.as_ref().expect("fresh receipt");
         assert_eq!(receipt.row_index, index);
         assert_eq!(
-            receipt.canonical_vc.as_bytes(),
+            receipt.canonical_vc.canonical().as_bytes(),
             canonical_exact_vc_payload(&results[index].0).expect("canonical VC").as_bytes(),
         );
     }
@@ -16050,7 +20634,12 @@ fn s1_receipts_are_byte_and_position_bound_before_authority_mint() {
     assert!(swapped_authorities.iter().all(Option::is_none));
 
     let mut stale_payload = receipts.clone();
-    stale_payload[0].as_mut().expect("first receipt").canonical_vc.push(' ');
+    stale_payload[0]
+        .as_mut()
+        .expect("first receipt")
+        .canonical_vc
+        .canonical_mut_for_test()
+        .push(' ');
     let stale_authorities = build_result_proof_authorities_with_revalidations(
         &results,
         &[],
@@ -16088,9 +20677,10 @@ fn s1_revalidation_clamps_remaining_budget_and_discards_late_success() {
         || times.next().expect("pre/post clock sample"),
         |formula, budget_ms| {
             budgets.push(budget_ms);
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert_eq!(budgets, vec![250], "solve budget is min(4s, deadline remaining)");
     assert!(receipts[0].is_some());
 
@@ -16106,9 +20696,10 @@ fn s1_revalidation_clamps_remaining_budget_and_discards_late_success() {
         |formula, budget_ms| {
             calls += 1;
             assert_eq!(budget_ms, 100);
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert_eq!(calls, 1);
     assert_eq!(late, vec![None], "a strict success returned after deadline is inert");
 
@@ -16121,11 +20712,911 @@ fn s1_revalidation_clamps_remaining_budget_and_discards_late_success() {
         || start,
         |formula, _| {
             preexpired_calls += 1;
-            Some(s1_test_strict_result(formula))
+            Ok(s1_test_strict_result(formula))
         },
-    );
+    )
+    .receipts;
     assert_eq!(preexpired, vec![None]);
     assert_eq!(preexpired_calls, 0, "expired deadline rejects before solve");
+}
+
+// ---- Determinism plan §3.7 (2026-10-01): rows a CLOCK left unproved are
+// published as clock stops — `timed_out`, `wall-backstop`, the budget's ms —
+// never as a silent `unknown` with no cause and `0ms`. Measured on the release
+// lane at load ~70: aterm-codec's `base64::encode_padded` fell from 73/81
+// proved to 0/83, every row `trust-full-verifier, 0ms`, `timed_out` 0.
+
+/// An S1-eligible row whose kind has no runtime fallback with overflow checks
+/// off, so a timeout publishes as `timed_out` rather than `runtime_checked`.
+fn s1_clock_test_row(line: u32, atom_name: &str) -> (VerificationCondition, VerificationResult) {
+    let (mut vc, result) = s1_test_row(line, atom_name);
+    vc.kind = VcKind::ArithmeticOverflow {
+        op: BinOp::Add,
+        operand_tys: (trust_types::Ty::i128(), trust_types::Ty::i128()),
+    };
+    (vc, result)
+}
+
+fn s1_clock_test_eligibilities(
+    results: &[(VerificationCondition, VerificationResult)],
+) -> Vec<Option<SolverRevalidationEligibility>> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, (vc, _))| Some(s1_test_eligibility(index, vc)))
+        .collect()
+}
+
+/// The full lane's tail for an S1-only fixture: mint authority from the
+/// receipts, publish the clock stops, build the transport rows with overflow
+/// checks off.
+fn s1_clock_test_publish(
+    results: &mut [(VerificationCondition, VerificationResult)],
+    revalidations: &SolverRevalidations,
+    function_budget_ms: u64,
+) -> Vec<TransportObligationResult> {
+    let cleancic = vec![None; results.len()];
+    let authorities = build_result_proof_authorities_with_revalidations(
+        results,
+        &[],
+        None,
+        &cleancic,
+        &revalidations.receipts,
+    );
+    stamp_clock_stopped_rows(results, &authorities, &revalidations.clock_stops, function_budget_ms);
+    build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        results,
+        None,
+        &cleancic,
+        &[],
+        &authorities,
+    )
+}
+
+fn clock_test_stop_cause(
+    row: &TransportObligationResult,
+) -> Option<trust_types::determinism::StopCause> {
+    row.reason.as_deref().and_then(trust_types::determinism::StopCause::from_reason)
+}
+
+/// FAILS on the pre-fix tree: S1 filled every row past the deadline with a
+/// silent `None`, so these rows published `unknown`, `[stop:unclassified]`,
+/// `time_ms` 0 and `timed_out` 0 (and none of `SolverRevalidations`,
+/// `clock_stops` or `stamp_clock_stopped_rows` existed).
+#[test]
+fn s1_rows_a_clock_kept_from_a_receipt_publish_as_wall_backstop_timeouts() {
+    use trust_types::determinism::StopCause;
+    let fixture = vec![s1_clock_test_row(271, "clock_a"), s1_clock_test_row(272, "clock_b")];
+    let eligibilities = s1_clock_test_eligibilities(&fixture);
+    let cleancic = vec![None; fixture.len()];
+    let start = std::time::Instant::now();
+
+    // A function deadline already spent when S1 starts (a 1 ms budget at
+    // load): no row is re-solved, and each eligible row is recorded as a clock
+    // stop instead of being filled with a silent `None`.
+    let mut calls = 0;
+    let expired = revalidate_all_solver_proofs_with(
+        &fixture,
+        &eligibilities,
+        &cleancic,
+        Some(start),
+        || start,
+        |formula, _| {
+            calls += 1;
+            Ok(s1_test_strict_result(formula))
+        },
+    );
+    assert_eq!(calls, 0, "an expired deadline re-solves nothing");
+    assert_eq!(expired.receipts, vec![None, None]);
+    assert_eq!(
+        expired.clock_stops.0.iter().map(|stop| (stop.row.index, stop.clock)).collect::<Vec<_>>(),
+        vec![(0, StoppingClock::FunctionDeadline), (1, StoppingClock::FunctionDeadline)],
+    );
+    let mut results = fixture.clone();
+    let rows = s1_clock_test_publish(&mut results, &expired, 1);
+    for ((_, result), row) in results.iter().zip(&rows) {
+        assert!(
+            matches!(result, VerificationResult::Timeout { timeout_ms: 1, .. }),
+            "a clock-stopped row is a timeout naming the budget, got {result:?}"
+        );
+        assert_eq!(row.outcome, Outcome::Timeout);
+        assert_eq!(row.time_ms, 1, "the clock that ran out, never a `0ms` placeholder");
+        assert_eq!(clock_test_stop_cause(row), Some(StopCause::WallBackstop));
+    }
+    let tally = PublishedRowTally::of(&rows, None);
+    assert_eq!((tally.proved, tally.unknown, tally.timed_out), (0, 0, 2));
+    assert_eq!(tally.json_counts().timed_out, 2, "the function's `timed_out` counts both rows");
+
+    // A strict success that returns after the deadline is still discarded, and
+    // the deadline, not the re-solve, is why the row has no receipt.
+    let late_deadline = start + std::time::Duration::from_millis(100);
+    let mut late_times = [start, start + std::time::Duration::from_millis(101)].into_iter();
+    let late = revalidate_all_solver_proofs_with(
+        &fixture[..1],
+        &eligibilities[..1],
+        &cleancic[..1],
+        Some(late_deadline),
+        || late_times.next().expect("pre/post late clock sample"),
+        |formula, _| Ok(s1_test_strict_result(formula)),
+    );
+    assert_eq!(late.receipts, vec![None]);
+    assert_eq!(
+        late.clock_stops.0.iter().map(|stop| stop.clock).collect::<Vec<_>>(),
+        vec![StoppingClock::FunctionDeadline],
+    );
+
+    // S1's own four-second clock ended the re-solve, with no function
+    // deadline: a clock stop naming the allowance the re-solve was handed.
+    let own_clock = revalidate_all_solver_proofs_with(
+        &fixture[..1],
+        &eligibilities[..1],
+        &cleancic[..1],
+        None,
+        || start,
+        |_, _| Err(StopCause::WallBackstop),
+    );
+    assert_eq!(own_clock.receipts, vec![None]);
+    let mut results = fixture[..1].to_vec();
+    let rows = s1_clock_test_publish(&mut results, &own_clock, 120_000);
+    assert!(
+        matches!(results[0].1, VerificationResult::Timeout { timeout_ms: 4_000, .. }),
+        "{:?}",
+        results[0].1
+    );
+    assert_eq!(rows[0].outcome, Outcome::Timeout);
+    assert_eq!(clock_test_stop_cause(&rows[0]), Some(StopCause::WallBackstop));
+}
+
+/// Negative control: with no clock involved nothing is recorded, a minted row
+/// stays proved, and a re-solve that refuted or stopped for a reason of its
+/// own keeps today's `unknown`, `timed_out` 0.
+#[test]
+fn s1_rows_no_clock_stopped_keep_their_verdicts() {
+    use trust_types::determinism::StopCause;
+    let fixture = vec![
+        s1_clock_test_row(281, "minted"),
+        s1_clock_test_row(282, "refuted"),
+        s1_clock_test_row(283, "unexplained"),
+    ];
+    let eligibilities = s1_clock_test_eligibilities(&fixture);
+    let cleancic = vec![None; fixture.len()];
+    let now = std::time::Instant::now();
+    let mut calls = 0;
+    let revalidations = revalidate_all_solver_proofs_with(
+        &fixture,
+        &eligibilities,
+        &cleancic,
+        None,
+        || now,
+        |formula, _| {
+            calls += 1;
+            match calls {
+                1 => Ok(s1_test_strict_result(formula)),
+                2 => Err(StopCause::Solved),
+                _ => Err(StopCause::Unclassified),
+            }
+        },
+    );
+    assert_eq!(calls, 3);
+    assert!(revalidations.clock_stops.0.is_empty(), "no clock decided any of these rows");
+    let mut results = fixture.clone();
+    let rows = s1_clock_test_publish(&mut results, &revalidations, 120_000);
+    assert_eq!(rows[0].outcome, Outcome::Proved);
+    for row in &rows[1..] {
+        assert_eq!(row.outcome, Outcome::Unknown);
+        assert_eq!(clock_test_stop_cause(row), Some(StopCause::Unclassified));
+    }
+    assert_eq!(PublishedRowTally::of(&rows, None).timed_out, 0);
+}
+
+/// P4a.1: an S1 re-solve that a STATED non-reproducible stop ended (here a
+/// process-RSS reading) is recorded as that stop, and its row is published as
+/// an `Unknown` stating it, never as a timeout and never as the bare missing
+/// authority: had the stop not fired, the re-solve could have minted.
+#[test]
+fn s1_rows_a_backstop_stopped_state_that_stop() {
+    use trust_types::determinism::StopCause;
+    let fixture = vec![s1_clock_test_row(291, "rss"), s1_clock_test_row(292, "fault")];
+    let eligibilities = s1_clock_test_eligibilities(&fixture);
+    let cleancic = vec![None; fixture.len()];
+    let now = std::time::Instant::now();
+    let mut calls = 0;
+    let revalidations = revalidate_all_solver_proofs_with(
+        &fixture,
+        &eligibilities,
+        &cleancic,
+        None,
+        || now,
+        |_, _| {
+            calls += 1;
+            Err(if calls == 1 { StopCause::RssBackstop } else { StopCause::SolverFault })
+        },
+    );
+    assert_eq!(calls, 2);
+    assert_eq!(
+        revalidations.clock_stops.0.iter().map(|stop| stop.clock).collect::<Vec<_>>(),
+        vec![
+            StoppingClock::Backstop(StopCause::RssBackstop),
+            StoppingClock::Backstop(StopCause::SolverFault),
+        ]
+    );
+    let mut results = fixture.clone();
+    let rows = s1_clock_test_publish(&mut results, &revalidations, 120_000);
+    for (row, cause) in rows.iter().zip([StopCause::RssBackstop, StopCause::SolverFault]) {
+        assert_eq!(row.outcome, Outcome::Unknown);
+        assert_eq!(clock_test_stop_cause(row), Some(cause));
+    }
+    assert_eq!(PublishedRowTally::of(&rows, None).timed_out, 0);
+}
+
+/// The publisher rewrites only a row that is still undecided and still the
+/// row the clock stopped: never a refutation, an authorized proof, a held
+/// refutation, a row a later lane rebuilt, or a row that already states
+/// another backstop or a refused admission.
+#[test]
+fn clock_stops_never_touch_a_decided_authorized_or_rebuilt_row() {
+    use trust_types::determinism::StopCause;
+    let mut results = vec![
+        s1_clock_test_row(291, "failed"),
+        s1_clock_test_row(292, "authorized"),
+        s1_clock_test_row(293, "held"),
+        s1_clock_test_row(294, "rebuilt"),
+        s1_clock_test_row(296, "rss"),
+        s1_clock_test_row(297, "admission"),
+        s1_clock_test_row(295, "undecided"),
+    ];
+    results[4].1 =
+        StopCause::RssBackstop.unknown_result("memory-guard", 0, "memory limit exceeded");
+    results[5].1 =
+        StopCause::AdmissionRefused.unknown_result("trustd", 0, "resource admission refused");
+    results[0].1 = VerificationResult::Failed {
+        solver: "ay-in-process".into(),
+        time_ms: 1,
+        counterexample: None,
+    };
+    results[2].1 = VerificationResult::Unknown {
+        solver: "ay-in-process".into(),
+        time_ms: 1,
+        reason: TRUST_HELD_ASSERT_REFUTATION_REASON.to_string(),
+    };
+    results[6].1 = VerificationResult::Unknown {
+        solver: "trust-full-verifier".into(),
+        time_ms: 0,
+        reason: "native full verifier returned no evidence".to_string(),
+    };
+    let mut clock_stops = ClockStops::default();
+    for (index, (vc, _)) in results.iter().enumerate() {
+        clock_stops.record(index, vc, StoppingClock::FunctionDeadline);
+    }
+    // A later lane rebuilt row 3: the stop recorded for its old VC no longer
+    // names it.
+    results[3].0.formula = Formula::Var("rebuilt_after_the_stop".into(), Sort::Bool);
+    let mut authorities = vec![None; results.len()];
+    authorities[1] = Some(ResultProofAuthority::KernelCertified {
+        replay_audit: None,
+        row: exact_result_row_identity(1, &results[1].0).expect("exact authorized row"),
+        evidence: authority_test_clean_cic(0x5c),
+        reference: authority_test_reference(&authority_test_clean_cic(0x5c)),
+    });
+    let before = results.iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>();
+    assert_eq!(stamp_clock_stopped_rows(&mut results, &authorities, &clock_stops, 120_000), 1);
+    for index in 0..6 {
+        assert_eq!(
+            serde_json::to_value(&results[index]).unwrap(),
+            before[index],
+            "row {index} must keep its verdict"
+        );
+    }
+    assert!(matches!(
+        &results[6].1,
+        VerificationResult::Timeout { solver, timeout_ms: 120_000 }
+            if solver.as_str() == "trust-full-verifier"
+    ));
+}
+
+#[test]
+fn generic_held_clock_stamps_keep_the_marker_unknown_and_worst_stop() {
+    use trust_types::determinism::StopCause;
+    for prior in StopCause::ALL {
+        for clock in [
+            StoppingClock::FunctionDeadline,
+            StoppingClock::SolveBudget(23),
+            StoppingClock::Backstop(StopCause::SolverFault),
+        ] {
+            let mut results = vec![s1_clock_test_row(298, "generic-held-clock")];
+            results[0].1 = prior.unknown_result(
+                "native-held-clock",
+                11,
+                &format!("{} withheld symbolic model", trust_vcgen::GENERIC_REFUTATION_HELD_PREFIX),
+            );
+            let original = serde_json::to_value(&results[0].0).unwrap();
+            let mut stops = ClockStops::default();
+            stops.record(0, &results[0].0, clock);
+            let preserves_existing = matches!(
+                prior,
+                StopCause::RssBackstop | StopCause::SolverFault | StopCause::AdmissionRefused
+            );
+            assert_eq!(
+                stamp_clock_stopped_rows(&mut results, &[None], &stops, 100),
+                usize::from(!preserves_existing)
+            );
+            let clock_cause = match clock {
+                StoppingClock::Backstop(cause) => cause,
+                _ => StopCause::WallBackstop,
+            };
+            let expected =
+                if preserves_existing { prior } else { StopCause::combine(prior, clock_cause) };
+            assert_eq!(StopCause::of_result(&results[0].1), expected);
+            assert_eq!(serde_json::to_value(&results[0].0).unwrap(), original);
+            assert!(matches!(&results[0].1,VerificationResult::Unknown {solver,time_ms:11,..}
+                if solver.as_str()=="native-held-clock"));
+            assert!(result_is_held_assert_refutation(&results[0].1));
+            let rows = build_transport_results_with_runtime_checks_bound(
+                false,
+                None,
+                &results,
+                None,
+                &[None],
+                &[],
+                &[None],
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].outcome, Outcome::Unknown);
+            assert_eq!(clock_test_stop_cause(&rows[0]), Some(expected));
+        }
+    }
+}
+
+#[test]
+fn generic_held_clock_stamps_require_the_exact_recorded_row_and_no_authority() {
+    let held = || {
+        trust_types::determinism::StopCause::Unclassified.unknown_result(
+            "native-held",
+            0,
+            &format!("{} withheld symbolic model", trust_vcgen::GENERIC_REFUTATION_HELD_PREFIX),
+        )
+    };
+    for changed in 0..6 {
+        let mut results = vec![s1_clock_test_row(299, "generic-held-recorded")];
+        results[0].1 = held();
+        let mut stops = ClockStops::default();
+        stops.record(0, &results[0].0, StoppingClock::FunctionDeadline);
+        let mut authorities = vec![None];
+        match changed {
+            0 => results[0].0.formula = Formula::Var("another-query".into(), Sort::Bool),
+            1 => results[0].0.function = "foreign-function".into(),
+            2 => results[0].0.location.line_start += 1,
+            3 => results[0].0.kind = VcKind::DivisionByZero,
+            4 => {
+                let evidence = authority_test_clean_cic(0x5d);
+                let reference = authority_test_reference(&evidence);
+                authorities[0] = Some(ResultProofAuthority::KernelCertified {
+                    replay_audit: None,
+                    row: exact_result_row_identity(0, &results[0].0).unwrap(),
+                    evidence,
+                    reference,
+                })
+            }
+            5 => {
+                results.push(s1_clock_test_row(300, "neighbor"));
+                results[1].1 = held();
+                results.swap(0, 1);
+                authorities.push(None);
+            }
+            _ => unreachable!(),
+        }
+        let before = serde_json::to_value(&results).unwrap();
+        assert_eq!(
+            stamp_clock_stopped_rows(&mut results, &authorities, &stops, 100),
+            0,
+            "mutation {changed}"
+        );
+        assert_eq!(serde_json::to_value(&results).unwrap(), before);
+    }
+}
+
+/// The deadline sweeps of the kernel lanes: where each lane is cut, and which
+/// rows from the cut on are recorded — only rows a kernel proof could publish
+/// (not an `UnsupportedMir` row, not a literal-`true` or vacuously UNSAT
+/// violation). The promotion records its own cut; the certify sweep's is
+/// recorded by the authority tail
+/// (`full_lane_authority_tail_publishes_rows_its_deadline_cut_as_clock_timeouts`).
+#[test]
+fn kernel_lane_deadline_cuts_record_only_rows_a_proof_could_publish() {
+    let unknown = || VerificationResult::Unknown {
+        solver: "trust-full-verifier".into(),
+        time_ms: 0,
+        reason: "native full verifier returned no evidence".to_string(),
+    };
+    let provable = s1_clock_test_row(301, "provable").0;
+    let mut always_sat = provable.clone();
+    always_sat.formula = Formula::Bool(true);
+    let mut vacuous = provable.clone();
+    vacuous.formula = Formula::Bool(false);
+    let mut sentinel = provable.clone();
+    sentinel.kind = VcKind::UnsupportedMir {
+        kind: "FullVerification::ArithmeticSafety".to_string(),
+        detail: "typed-CHC left noOverflow_add unsupported".to_string(),
+    };
+    let results = vec![
+        (provable.clone(), unknown()),
+        (always_sat, unknown()),
+        (vacuous, unknown()),
+        (sentinel, unknown()),
+        (provable, authority_test_proved()),
+    ];
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut promoted = results.clone();
+    let mut promote_cut = ClockStops::default();
+    promote_kernel_certifiable(&mut promoted, Some(past), &mut promote_cut);
+    assert_eq!(
+        promote_cut.0.iter().map(|stop| (stop.row.index, stop.clock)).collect::<Vec<_>>(),
+        vec![(0, StoppingClock::FunctionDeadline)],
+        "the promotion records the one inconclusive row a kernel proof could publish"
+    );
+    let (cleancic, certify_cut) = certify_all_until(&results, Some(past));
+    assert_eq!(certify_cut, Some(0));
+    assert!(cleancic.iter().all(Option::is_none));
+    // Negative control: no deadline, nothing cut (and no kernel call: the
+    // certify sweep only certifies `Proved` rows, the promotion only
+    // inconclusive ones).
+    assert_eq!(certify_all_until(&results[..4], None).1, None);
+    let mut decided = vec![(
+        results[0].0.clone(),
+        VerificationResult::Failed {
+            solver: "ay-in-process".into(),
+            time_ms: 1,
+            counterexample: None,
+        },
+    )];
+    let mut uncut = ClockStops::default();
+    promote_kernel_certifiable(&mut decided, None, &mut uncut);
+    assert!(uncut.0.is_empty(), "no deadline, no clock stop");
+
+    let mut proved_cut = ClockStops::default();
+    record_kernel_lane_clock_cut(&mut proved_cut, &results, 0, |result| {
+        matches!(result, VerificationResult::Proved { .. })
+    });
+    assert_eq!(proved_cut.0.iter().map(|stop| stop.row.index).collect::<Vec<_>>(), vec![4]);
+}
+
+/// The full lane's certify + S1 step under a deadline that had passed, through
+/// the production wiring itself (`certify_and_revalidate_full_lane_rows`): the
+/// certify sweep's cut and S1 each record the two bridge-proved rows, the stamp
+/// publishes them as wall-backstop timeouts naming the budget, and the
+/// published clock count — the status note's `timed_out=` — counts both. A
+/// native unknown neither lane tries is not recorded and keeps its row.
+/// Dropping the sweep's record or the S1 merge changes the exact stop list.
+/// FAILS on the pre-fix tree: neither lane recorded its cut (S1 filled the rows
+/// with a silent `None`), so both rows published `unknown` `[stop:unclassified]`
+/// and `timed_out` stayed 0.
+#[test]
+fn full_lane_authority_tail_publishes_rows_its_deadline_cut_as_clock_timeouts() {
+    use trust_types::determinism::StopCause;
+    let native_unknown = VerificationResult::Unknown {
+        solver: "trust-full-verifier".into(),
+        time_ms: 0,
+        reason: "native full verifier returned no evidence".to_string(),
+    };
+    let mut fixture = vec![s1_clock_test_row(311, "tail_a"), s1_clock_test_row(312, "tail_b")];
+    let mut eligibilities = s1_clock_test_eligibilities(&fixture);
+    fixture.push((s1_clock_test_row(313, "tail_native").0, native_unknown));
+    eligibilities.push(None);
+    let tail = |deadline: Option<std::time::Instant>| {
+        let mut clock_stops = ClockStops::default();
+        let mut solves = 0;
+        let (cleancic, authorities) = certify_and_revalidate_full_lane_rows(
+            &fixture,
+            &[],
+            None,
+            None,
+            deadline,
+            &mut clock_stops,
+            &type_invariant::TinvRowDisclosure::default(),
+            None,
+            None,
+            |cleancic| {
+                revalidate_all_solver_proofs_with(
+                    &fixture,
+                    &eligibilities,
+                    cleancic,
+                    deadline,
+                    std::time::Instant::now,
+                    |formula, _| {
+                        solves += 1;
+                        Ok(s1_test_strict_result(formula))
+                    },
+                )
+            },
+        );
+        let mut results = fixture.clone();
+        let stamped = stamp_clock_stopped_rows(&mut results, &authorities, &clock_stops, 1);
+        let rows = build_transport_results_with_runtime_checks_bound(
+            false,
+            None,
+            &results,
+            None,
+            &cleancic,
+            &[],
+            &authorities,
+        );
+        (clock_stops, solves, stamped, rows)
+    };
+
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let (clock_stops, solves, stamped, rows) = tail(Some(past));
+    assert_eq!(solves, 0, "an expired deadline re-solves nothing");
+    assert_eq!(
+        clock_stops.0.iter().map(|stop| (stop.row.index, stop.clock)).collect::<Vec<_>>(),
+        vec![
+            // The certify sweep's cut ...
+            (0, StoppingClock::FunctionDeadline),
+            (1, StoppingClock::FunctionDeadline),
+            // ... then S1's, merged into the same record.
+            (0, StoppingClock::FunctionDeadline),
+            (1, StoppingClock::FunctionDeadline),
+        ],
+    );
+    assert_eq!(stamped, 2, "each clock-stopped row is published once");
+    for row in &rows[..2] {
+        assert_eq!(row.outcome, Outcome::Timeout);
+        assert_eq!(row.time_ms, 1, "the budget that ran out, never a `0ms` placeholder");
+        assert_eq!(clock_test_stop_cause(row), Some(StopCause::WallBackstop));
+    }
+    assert_eq!(rows[2].outcome, Outcome::Unknown, "a row no clock stopped keeps its verdict");
+    let tally = PublishedRowTally::of(&rows, None);
+    assert_eq!((tally.proved, tally.timed_out, tally.clock_stopped, tally.unknown), (0, 2, 2, 1));
+
+    // Negative control: no deadline, no clock stop. Both rows earn authority
+    // (the kernel's certificate, or a fresh S1 receipt) and stay proved.
+    let (clock_stops, _, stamped, rows) = tail(None);
+    assert!(clock_stops.0.is_empty(), "no deadline, no clock stop");
+    assert_eq!(stamped, 0);
+    assert_eq!((rows[0].outcome, rows[1].outcome), (Outcome::Proved, Outcome::Proved));
+    let tally = PublishedRowTally::of(&rows, None);
+    assert_eq!((tally.timed_out, tally.clock_stopped), (0, 0));
+}
+
+/// The `timed_out=` a release judge sums is the function's published clock
+/// count — a `timeout` row, and a runtime-checked or unknown row whose reason
+/// states the `wall-backstop` cause (under overflow checks a clock-stopped row
+/// publishes runtime-checked) — never a verdict, and never the native summary's
+/// count. The measured shape: the deadline declined the native bundle, so the
+/// native summary says `timed_out=0` while the function's rows were the
+/// clock's. Each status note prints the count exactly once; a function with no
+/// native run prints it on a line of its own, and only when a clock stopped a
+/// row. FAILS on the pre-fix tree: the notes printed the native `timed_out=0`
+/// (and `clock_stopped`, `native_verifier_status_note` and
+/// `verifier_status_timed_out_note` did not exist).
+#[test]
+fn verifier_status_notes_print_the_published_clock_count_once() {
+    use trust_types::determinism::StopCause;
+    let fixture = [s1_clock_test_row(321, "status_note")];
+    let base = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &fixture,
+        None,
+        &[None],
+        &[],
+        &[None],
+    )
+    .remove(0);
+    let row = |outcome: Outcome, reason: Option<String>| {
+        let mut row = base.clone();
+        row.outcome = outcome;
+        row.reason = reason;
+        row
+    };
+    let clock = |detail: &str| Some(StopCause::WallBackstop.stamp(detail));
+    let rows = vec![
+        row(Outcome::Timeout, clock("solver timed out")),
+        row(Outcome::RuntimeChecked, clock("solver timed out")),
+        row(Outcome::Unknown, clock("the ay solve's deadline passed")),
+        // Not the clock's: a verdict whatever its reason says, an unexplained
+        // unknown, a count stop, an assumption.
+        row(Outcome::Proved, None),
+        row(Outcome::Failed, clock("refuted by a re-solve that finished late")),
+        row(Outcome::Unknown, Some(StopCause::Unclassified.stamp("no evidence"))),
+        row(Outcome::RuntimeChecked, Some(StopCause::Effort.stamp("rlimit reached"))),
+        row(Outcome::Skipped, None),
+    ];
+    let tally = PublishedRowTally::of(&rows, None);
+    assert_eq!(tally.clock_stopped, 3);
+    assert_eq!(tally.timed_out, 1, "the wire's `timed_out` stays the timeout outcome");
+    assert_eq!(tally.total(), rows.len(), "the clock count is not a category of its own");
+
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &[]);
+    let bundle = trust_mir_extract::function_to_verifier_api_bundle(
+        &root,
+        &trust_types::CompilerContractBundle::new(Vec::new()),
+        &[],
+    );
+    let declined = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &trust_router::VerifierExecutionContext::new("clock-count-note"),
+        &format!("{NATIVE_BUNDLE_DEADLINE_DECLINE} during native trust-ir bundle construction"),
+    );
+    assert_eq!(declined.summary.timed_out, 0, "the native summary never saw the clock");
+    // What the judge reads off a line: every `timed_out=<n>`, summed.
+    let judged = |note: &str| -> usize {
+        note.match_indices("timed_out=")
+            .map(|(at, token)| {
+                note[at + token.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+    for label in ["native verifier status", "native full verifier status"] {
+        let note = native_verifier_status_note(label, &declined, tally);
+        assert!(note.starts_with(label), "{note}");
+        assert_eq!(note.matches("timed_out=").count(), 1, "{note}");
+        assert_eq!(judged(&note), 3, "{note}");
+    }
+    let note = verifier_status_timed_out_note(tally).expect("a clock stopped three rows");
+    assert_eq!(judged(&note), 3, "{note}");
+
+    // Negative control: no clock, so the native note says `timed_out=0` and a
+    // function with no native run prints no line — the output of a run no clock
+    // touched is unchanged.
+    let unclocked = PublishedRowTally::of(&rows[3..], None);
+    assert_eq!(unclocked.clock_stopped, 0);
+    let note = native_verifier_status_note("native verifier status", &declined, unclocked);
+    assert_eq!(judged(&note), 0, "{note}");
+    assert_eq!(verifier_status_timed_out_note(unclocked), None);
+}
+
+/// The ay bridge cut by the function deadline leaves the native
+/// `trust-full-verifier, 0ms` row it was going to prove — the measured release
+/// shape. FAILS on the pre-fix tree: the row published `unknown`, no stop
+/// cause, `0ms`.
+#[test]
+fn bridge_cut_by_the_deadline_publishes_the_native_row_as_a_clock_timeout() {
+    use trust_types::determinism::StopCause;
+    let mut native_placeholder = test_vc(34);
+    native_placeholder.kind = VcKind::UnsupportedMir {
+        kind: "FullVerification::ArithmeticSafety".to_string(),
+        detail: "typed-CHC left noOverflow_add unsupported".to_string(),
+    };
+    let native_unknown = VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("trust-full-verifier"),
+        time_ms: 0,
+        reason: "native arithmetic safety was unsupported".to_string(),
+    };
+    let mut precise = test_vc(34);
+    precise.kind = VcKind::ArithmeticOverflow {
+        op: BinOp::Add,
+        operand_tys: (trust_types::Ty::i128(), trust_types::Ty::i128()),
+    };
+    let atom = trust_types::Formula::Var("overflow_reachable".to_string(), trust_types::Sort::Bool);
+    precise.formula =
+        trust_types::Formula::And(vec![atom.clone(), trust_types::Formula::Not(Box::new(atom))]);
+    native_placeholder.formula = precise.formula.clone();
+    let obligation = authority_test_native_obligation("bridge:clock", 34, 34);
+    let bridge = |deadline: Option<std::time::Instant>| {
+        let mut bindings = vec![test_binding_for_obligation(0, &native_placeholder, &obligation)];
+        let mut clock_stops = ClockStops::default();
+        let (bridged, proved, _, eligibilities) =
+            bridge_v1_ay_proofs_into_native_results_recording_clock_stops(
+                5_000,
+                deadline,
+                std::slice::from_ref(&precise),
+                &mut bindings,
+                &mut clock_stops,
+                true,
+                vec![(native_placeholder.clone(), native_unknown.clone())],
+            );
+        (bridged, proved, eligibilities, bindings, clock_stops)
+    };
+
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let (mut bridged, proved, eligibilities, bindings, clock_stops) = bridge(Some(past));
+    assert_eq!(proved, 0, "the expired deadline cut the bridge before any solve");
+    assert!(eligibilities[0].is_none());
+    assert_eq!(
+        clock_stops.0.iter().map(|stop| (stop.row.index, stop.clock)).collect::<Vec<_>>(),
+        vec![(0, StoppingClock::FunctionDeadline)],
+    );
+    let authorities = vec![None];
+    assert_eq!(stamp_clock_stopped_rows(&mut bridged, &authorities, &clock_stops, 120_000), 1);
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &bridged,
+        None,
+        &[None],
+        &bindings,
+        &authorities,
+    );
+    assert_eq!(rows[0].outcome, Outcome::Timeout);
+    assert_eq!(rows[0].solver, "trust-full-verifier");
+    assert_eq!(rows[0].time_ms, 120_000);
+    assert_eq!(clock_test_stop_cause(&rows[0]), Some(StopCause::WallBackstop));
+    assert_eq!(PublishedRowTally::of(&rows, None).timed_out, 1);
+
+    // Negative control: with no deadline the bridge proves the row and minted
+    // its S1 eligibility; no clock stop is recorded.
+    let (_, proved, eligibilities, _, clock_stops) = bridge(None);
+    assert_eq!(proved, 1);
+    assert!(eligibilities[0].is_some());
+    assert!(clock_stops.0.is_empty());
+}
+
+/// A native bundle the per-function deadline declined: its rows (filled
+/// `Unsupported`, `trust-full-verifier, 0ms`) are clock stops and publish as
+/// budget timeouts, and its gap row is a clock stop too. FAILS on the pre-fix
+/// tree: every such row published `unknown` `[stop:unclassified]` at `0ms`,
+/// and the gap row an `unknown` that stated no cause.
+#[test]
+fn deadline_declined_native_bundle_publishes_clock_timeouts() {
+    use trust_types::determinism::StopCause;
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &[]);
+    let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    let refusal = trust_verifier_api::TrustObligation {
+        obligation_id: "obligation:demo:root:unsupported_mir:spawn".to_string(),
+        kind: trust_verifier_api::ObligationKind::Custom {
+            namespace: "trust.vc".to_string(),
+            name: "unsupported_mir".to_string(),
+        },
+        contract_id: None,
+        proof_item_id: None,
+        source: trust_verifier_api::SourceLocation::default(),
+        description: "unsupported MIR `UnmodeledThreadSpawnEffect`".to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: Vec::new(),
+    };
+    let decided = trust_verifier_api::TrustObligation {
+        obligation_id: "obligation:demo:root:custom:decided".to_string(),
+        kind: trust_verifier_api::ObligationKind::Custom {
+            namespace: "trust.contract".to_string(),
+            name: "decided".to_string(),
+        },
+        description: "an obligation the native engines decide".to_string(),
+        ..refusal.clone()
+    };
+    bundle.obligations.push(refusal.clone());
+    bundle.obligations.push(decided.clone());
+    let context = trust_router::VerifierExecutionContext::new("deadline-declined-bundle");
+    let declined = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        &format!("{NATIVE_BUNDLE_DEADLINE_DECLINE} before native trust-ir bundle construction"),
+    );
+    let failed = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        "typed TrustIr lowering refused the body",
+    );
+    assert!(native_run_trust_ir_lowering_failed(&declined));
+    assert!(native_run_lowering_declined_by_deadline(&declined));
+    assert!(!native_run_lowering_declined_by_deadline(&failed));
+
+    // One row per obligation, as the legacy conversion leaves them.
+    let legacy_row = |run: &trust_verifier_api::VerificationRunResult,
+                      obligation: &trust_verifier_api::TrustObligation,
+                      line: u32| {
+        let evidence = run
+            .evidence
+            .iter()
+            .find(|row| row.obligation_id == obligation.obligation_id)
+            .expect("one evidence row per obligation");
+        (s1_clock_test_row(line, "declined").0, legacy_result_from_api_evidence(evidence))
+    };
+    let rows_of = |run: &trust_verifier_api::VerificationRunResult| {
+        let results = vec![legacy_row(run, &refusal, 401), legacy_row(run, &decided, 402)];
+        let bindings = vec![
+            test_binding_for_obligation(0, &results[0].0, &refusal),
+            test_binding_for_obligation(1, &results[1].0, &decided),
+        ];
+        let mut clock_stops = ClockStops::default();
+        record_deadline_declined_bundle_clock_stops(&mut clock_stops, run, &results, &bindings);
+        (results, bindings, clock_stops)
+    };
+
+    let (mut results, bindings, clock_stops) = rows_of(&declined);
+    assert_eq!(
+        clock_stops.0.iter().map(|stop| stop.row.index).collect::<Vec<_>>(),
+        vec![1],
+        "every row but the compiler-side refusal is a clock stop"
+    );
+    let authorities = vec![None, None];
+    assert_eq!(stamp_clock_stopped_rows(&mut results, &authorities, &clock_stops, 120_000), 1);
+    let rows = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &results,
+        None,
+        &[None, None],
+        &bindings,
+        &authorities,
+    );
+    assert_eq!(rows[0].outcome, Outcome::Unknown, "the refusal keeps its own row");
+    assert_eq!(rows[1].outcome, Outcome::Timeout);
+    assert_eq!(rows[1].solver, "trust-full-verifier");
+    assert_eq!(rows[1].time_ms, 120_000);
+    assert_eq!(clock_test_stop_cause(&rows[1]), Some(StopCause::WallBackstop));
+    let gap = transport_native_lowering_gap_row(&declined);
+    assert_eq!(gap.outcome, Outcome::Timeout);
+    assert_eq!(clock_test_stop_cause(&gap), Some(StopCause::WallBackstop));
+
+    // Negative control: any other lowering failure records nothing, and its
+    // gap row stays an unknown.
+    let (_, _, clock_stops) = rows_of(&failed);
+    assert!(clock_stops.0.is_empty());
+    let gap = transport_native_lowering_gap_row(&failed);
+    assert_eq!(gap.outcome, Outcome::Unknown);
+    assert_eq!(clock_test_stop_cause(&gap), None);
+}
+
+/// A live mint lane that finds the function deadline passed names the receipts
+/// it refused, and the rows they stand for become clock stops. Negative
+/// control: the same fixture under its live context mints and names none.
+#[test]
+fn live_mint_names_the_receipts_an_expired_deadline_refused() {
+    let mut fixture = direct_trust_vc_live_fixture("compiler-direct-mint-clock");
+    let receipt_id = fixture
+        .live_receipts
+        .direct_trust_vc_receipts()
+        .keys()
+        .next()
+        .expect("one receipt")
+        .clone();
+    let row = direct_trust_vc_fixture_row(&fixture, &receipt_id);
+    let expired = fixture
+        .context
+        .clone()
+        .with_deadline(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    let mut authorities = vec![None; fixture.results.len()];
+    let report = install_direct_trust_vc_live_authorities(
+        &fixture.bundle,
+        &fixture.dispatched,
+        &expired,
+        &fixture.final_run,
+        Some(&mut fixture.live_receipts),
+        &fixture.results,
+        &fixture.bindings,
+        &mut authorities,
+    );
+    assert_eq!(report.minted, 0);
+    assert_eq!(report.clock_rejected, vec![receipt_id.clone()]);
+    let mut clock_stops = ClockStops::default();
+    record_live_mint_clock_stops(
+        &mut clock_stops,
+        &fixture.results,
+        &fixture.bindings,
+        &report.clock_rejected,
+    );
+    assert_eq!(clock_stops.0.iter().map(|stop| stop.row.index).collect::<Vec<_>>(), vec![row]);
+    let mut results = fixture.results.clone();
+    assert_eq!(stamp_clock_stopped_rows(&mut results, &authorities, &clock_stops, 120_000), 1);
+    assert!(matches!(results[row].1, VerificationResult::Timeout { timeout_ms: 120_000, .. }));
+
+    let mut live = direct_trust_vc_live_fixture("compiler-direct-mint-unexpired");
+    let mut live_authorities = vec![None; live.results.len()];
+    let live_report = install_direct_trust_vc_live_authorities(
+        &live.bundle,
+        &live.dispatched,
+        &live.context,
+        &live.final_run,
+        Some(&mut live.live_receipts),
+        &live.results,
+        &live.bindings,
+        &mut live_authorities,
+    );
+    assert_eq!(live_report.minted, 1, "{:#?}", live_report.rejected);
+    assert!(live_report.clock_rejected.is_empty());
 }
 
 #[test]
@@ -16446,7 +21937,7 @@ fn strict_l0_verification_does_not_refute_proved_known_panicking_call() {
             &[],
             &[],
             None,
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
@@ -16504,7 +21995,7 @@ fn strict_l0_verification_rejects_public_l0_api_obligations_not_compiler_proved(
             &[],
             &[],
             Some(&full_result),
-            &FxHashSet::default()
+            &OpenDispatchRefutationWitnesses::default()
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
     );
@@ -16536,190 +22027,6 @@ fn assumption_ledger_skip_abort_matrix() {
     assert!(survey_policy.is_explicit_advisory());
     assert!(!survey_policy.fail_closed());
     assert!(!survey_policy.skip_aborts_build(&assumption));
-}
-
-#[test]
-fn explicit_invalid_solver_path_fails_closed_without_sibling_fallback() {
-    let executable = std::env::current_exe().expect("current test executable");
-    let missing = executable.with_file_name("trust-missing-ay-solver");
-    let _ = std::fs::remove_file(&missing);
-
-    let identity = resolve_ay_solver_identity_from_candidates(
-        Some(missing.as_os_str().to_os_string()),
-        Some(executable),
-    );
-    assert_eq!(identity.path.as_deref(), Some(missing.as_path()));
-    assert_eq!(identity.availability, AySolverAvailability::NotExecutable);
-    assert!(identity.router_command().is_none());
-    assert!(identity.cache_fingerprint().is_none());
-}
-
-#[test]
-fn solver_identity_reuses_one_exact_path_and_content_key() {
-    let executable = std::env::current_exe().expect("current test executable");
-    let identity = resolve_ay_solver_identity_from_candidates(
-        Some(executable.as_os_str().to_os_string()),
-        Some(executable.with_file_name("must-not-be-selected")),
-    );
-    let fingerprint = identity.cache_fingerprint().expect("test executable is readable");
-
-    assert_eq!(identity.path.as_deref(), Some(executable.as_path()));
-    let snapshot = identity.snapshot_path.as_deref().expect("Session snapshot");
-    assert_ne!(snapshot, executable, "the router must not execute the mutable source path");
-    assert_eq!(identity.router_command(), snapshot.to_str());
-    assert!(snapshot.is_file());
-    assert_eq!(identity.availability, AySolverAvailability::Available);
-    assert_eq!(identity.semantics_key(), format!("ay:{fingerprint}"));
-    assert_eq!(
-        identity.binary_fingerprint.as_ref().unwrap().content_digest().len(),
-        64,
-        "the immutable identity carries a strong full-content digest"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn non_unicode_solver_path_never_fabricates_a_lossy_router_command() {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut bytes = std::env::temp_dir().as_os_str().as_bytes().to_vec();
-    bytes.extend_from_slice(format!("/trust-ay-nonunicode-{}-", std::process::id()).as_bytes());
-    bytes.push(0xff);
-    let path = PathBuf::from(OsString::from_vec(bytes));
-    let _ = std::fs::remove_file(&path);
-    assert!(path.to_str().is_none(), "test setup: path is not Unicode");
-    assert!(
-        exact_solver_command(&path).is_none(),
-        "the router's String API must never receive a lossy replacement path"
-    );
-    if let Err(error) = std::fs::write(&path, b"#!/bin/sh\nexit 0\n") {
-        // Darwin/APFS rejects ill-formed UTF-8 path components (EILSEQ), so the
-        // pure exact-conversion assertion above is the available regression on
-        // that platform. Filesystems that accept arbitrary Unix bytes exercise
-        // the complete snapshot path below.
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(error.raw_os_error(), Some(92), "unexpected path creation error: {error}");
-            return;
-        }
-        #[cfg(not(target_os = "macos"))]
-        panic!("unexpected path creation error: {error}");
-    }
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-        .expect("make solver executable");
-    let identity =
-        resolve_ay_solver_identity_from_candidates(Some(path.as_os_str().to_os_string()), None);
-    let _ = std::fs::remove_file(&path);
-
-    assert_eq!(identity.path.as_deref(), Some(path.as_path()));
-    assert_eq!(identity.availability, AySolverAvailability::Available);
-    assert!(
-        identity.router_command().is_some_and(|command| !command.contains('\u{fffd}')),
-        "the router must execute an exact private snapshot, never a lossy source path"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn solver_execution_snapshot_cannot_drift_after_identity_is_hashed() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let source =
-        std::env::temp_dir().join(format!("trust-ay-toctou-source-{}", std::process::id()));
-    let old_bytes = b"#!/bin/sh\nexit 7\n";
-    let new_bytes = b"#!/bin/sh\nexit 9\n";
-    std::fs::write(&source, old_bytes).expect("write solver");
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700))
-        .expect("make solver executable");
-
-    let identity =
-        resolve_ay_solver_identity_from_candidates(Some(source.as_os_str().to_os_string()), None);
-    let snapshot = identity.snapshot_path.as_ref().expect("snapshot").clone();
-    let original_key = identity.cache_fingerprint().expect("fingerprint").to_string();
-    std::fs::write(&source, new_bytes).expect("replace selected solver bytes");
-
-    assert_eq!(std::fs::read(&snapshot).unwrap(), old_bytes);
-    assert_ne!(std::fs::read(&source).unwrap(), std::fs::read(&snapshot).unwrap());
-    assert_eq!(
-        trust_cache::fingerprint_solver_binary("ay", &snapshot).unwrap().cache_key(),
-        original_key,
-        "the cache key must identify the exact path the router will execute"
-    );
-    assert_eq!(identity.router_command(), snapshot.to_str());
-
-    let _ = std::fs::remove_file(source);
-}
-
-#[cfg(unix)]
-#[test]
-fn same_solver_path_with_different_bytes_changes_the_crate_hash_input() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let source =
-        std::env::temp_dir().join(format!("trust-ay-replaced-in-place-{}", std::process::id()));
-    std::fs::write(&source, b"#!/bin/sh\nexit 7\n").expect("write first solver");
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700))
-        .expect("make solver executable");
-    let first =
-        resolve_ay_solver_identity_from_candidates(Some(source.as_os_str().to_os_string()), None);
-
-    std::fs::write(&source, b"#!/bin/sh\nexit 9\n").expect("replace solver at same path");
-    let second =
-        resolve_ay_solver_identity_from_candidates(Some(source.as_os_str().to_os_string()), None);
-    let _ = std::fs::remove_file(&source);
-
-    assert_eq!(first.path, second.path, "test must keep the configured path identical");
-    assert_ne!(first.semantics_key(), second.semantics_key());
-
-    let mut first_opts = rustc_session::config::Options::default();
-    first_opts.unstable_opts.trust_verify_ay_path = Some(source.clone());
-    first_opts.trust_solver_content_fingerprint = first.semantics_key();
-    let mut second_opts = first_opts.clone();
-    second_opts.trust_solver_content_fingerprint = second.semantics_key();
-    assert_ne!(
-        first_opts.dep_tracking_hash(true),
-        second_opts.dep_tracking_hash(true),
-        "same path plus replaced solver bytes must rotate the downstream crate hash"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn moved_identical_solver_bytes_keep_the_same_semantics_and_cache_key() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let base = std::env::temp_dir();
-    let path_a = base.join(format!("trust-ay-moved-a-{}", std::process::id()));
-    let path_b = base.join(format!("trust-ay-moved-b-{}", std::process::id()));
-    let bytes = b"#!/bin/sh\nexit 0\n";
-    for path in [&path_a, &path_b] {
-        std::fs::write(path, bytes).expect("write solver copy");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("make solver executable");
-    }
-    let a =
-        resolve_ay_solver_identity_from_candidates(Some(path_a.as_os_str().to_os_string()), None);
-    let b =
-        resolve_ay_solver_identity_from_candidates(Some(path_b.as_os_str().to_os_string()), None);
-    let _ = std::fs::remove_file(&path_a);
-    let _ = std::fs::remove_file(&path_b);
-
-    assert_ne!(a.path, b.path);
-    assert_eq!(a.cache_fingerprint(), b.cache_fingerprint());
-    assert_eq!(a.semantics_key(), b.semantics_key());
-
-    let mut opts_a = rustc_session::config::Options::default();
-    opts_a.unstable_opts.trust_verify_ay_path = Some(path_a);
-    opts_a.trust_solver_content_fingerprint = a.semantics_key();
-    let mut opts_b = opts_a.clone();
-    opts_b.unstable_opts.trust_verify_ay_path = Some(path_b);
-    opts_b.trust_solver_content_fingerprint = b.semantics_key();
-    assert_eq!(
-        opts_a.dep_tracking_hash(true),
-        opts_b.dep_tracking_hash(true),
-        "moving byte-identical solver contents must not invalidate downstream crates"
-    );
 }
 
 // Trust (assumption ledger, Stage 1): the ledger tags are a stable
@@ -16842,6 +22149,8 @@ fn solver_revalidation_authority_rechecks_its_complete_receipt() {
     let empty_citation = ResultProofAuthority::EnsuresCitationDischarge {
         row: exact_result_row_identity(0, &vc).expect("canonical row"),
         theorem: String::new(),
+        evidence: Some(authority_test_clean_cic(0x5d)),
+        reference: authority_test_reference(&authority_test_clean_cic(0x5d)),
     };
     assert!(
         !empty_citation.matches_row(0, &vc, None),
@@ -17164,9 +22473,10 @@ fn bridge_publication_stays_non_proved_when_injected_s1_revalidation_misses() {
         std::time::Instant::now,
         |_formula, _budget_ms| {
             attempts += 1;
-            None
+            Err(trust_types::determinism::StopCause::SolverIncomplete)
         },
-    );
+    )
+    .receipts;
     assert_eq!(attempts, 1, "fixture must reach the injected fresh replay");
     assert!(revalidations.iter().all(Option::is_none));
     let authorities = build_result_proof_authorities_with_revalidations(
@@ -17540,29 +22850,47 @@ fn bridge_lane_appends_no_evidence_without_retained_artifacts() {
 
 #[test]
 fn transport_rows_carry_compiler_design_mandate_bit() {
-    // The design-mandate bit is compiler-owned: a hardened-category VC whose
+    // The design-mandate bit is compiler-owned: an L1 hardened PROFILE RULE whose
     // violation formula is the tautology `true` (never a discharge target) is
     // flagged; a hardened VC with a real violation formula is not.
-    let mandate_vc = VerificationCondition {
-        kind: VcKind::Assertion {
-            message: "[unsafe] missing SAFETY comment on unsafe block".to_string(),
-        },
+    //
+    // G3-MANDATE-L1-ONLY-1 (2026-10-27): neither is an L0 unsafe/FFI row whose
+    // `true` is a vcgen modelling-gap fail-close (the `[unsafe] missing SAFETY
+    // comment` stand-in minted for every undecided site, an FFI call with no
+    // summary). This test used the SAFETY stand-in as its mandate until then.
+    let tautology_vc = |kind: VcKind| VerificationCondition {
+        kind,
         function: trust_types::Symbol::intern("demo::m"),
         location: native_trust_ir_test_span(3),
         formula: trust_types::Formula::Bool(true),
         contract_metadata: None,
         obligation: None,
     };
+    let unknown = || VerificationResult::Unknown {
+        solver: trust_types::Symbol::intern("ay-in-process"),
+        time_ms: 0,
+        reason: "not mechanically dischargeable".to_string(),
+    };
+    let mandate_vc = tautology_vc(VcKind::HardenedBoundary {
+        category: trust_types::HardenedVcCategory::ErrorDiscard,
+        callee: "core::result::Result::<T, E>::ok".to_string(),
+        detail: "error discarded".to_string(),
+    });
     let real_vc = unsafe_sep_assertion_vc("demo::m");
+    let safety_stand_in = tautology_vc(VcKind::Assertion {
+        message: "[unsafe] missing SAFETY comment on unsafe block".to_string(),
+    });
+    let ffi_no_summary = tautology_vc(VcKind::FfiBoundaryViolation {
+        callee: "getpgrp".to_string(),
+        desc: "FFI call has no summary: behavior unmodeled, cannot prove safe".to_string(),
+    });
+    let ffi_reconstructed = tautology_vc(VcKind::HardenedBoundary {
+        category: trust_types::HardenedVcCategory::FfiBoundary,
+        callee: "raise".to_string(),
+        detail: "no summary".to_string(),
+    });
     let results = vec![
-        (
-            mandate_vc,
-            VerificationResult::Unknown {
-                solver: trust_types::Symbol::intern("ay-in-process"),
-                time_ms: 0,
-                reason: "design mandate is not mechanically dischargeable".to_string(),
-            },
-        ),
+        (mandate_vc, unknown()),
         (
             real_vc,
             VerificationResult::Proved {
@@ -17574,12 +22902,22 @@ fn transport_rows_carry_compiler_design_mandate_bit() {
                 native_proof_envelope: None,
             },
         ),
+        (safety_stand_in, unknown()),
+        (ffi_no_summary, unknown()),
+        (ffi_reconstructed, unknown()),
     ];
 
     let rows = build_transport_results_with_runtime_checks(false, &results, None, None);
-    assert_eq!(rows.len(), 2);
-    assert!(rows[0].design_mandate, "tautology hardened row must carry the mandate bit");
+    assert_eq!(rows.len(), 5);
+    assert!(rows[0].design_mandate, "tautology L1 hardened rule must carry the mandate bit");
     assert!(!rows[1].design_mandate, "real hardened violation must not carry the mandate bit");
+    for row in &rows[2..] {
+        assert!(
+            !row.design_mandate,
+            "an L0 unsafe/FFI modelling gap is not a design mandate: {}",
+            row.description
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -17598,10 +22936,13 @@ fn extern_call_transport_row(outcome: Outcome) -> TransportObligationResult {
 /// is where `extern_call_row_callee` reads it back from.
 fn extern_call_transport_row_for(callee: &str, outcome: Outcome) -> TransportObligationResult {
     TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         monitor: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "assert".to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: format!(
             "assertion: {}extern print/format/write dispatch `{callee}` runs a user Display/Debug impl that may panic",
@@ -17617,15 +22958,19 @@ fn extern_call_transport_row_for(callee: &str, outcome: Outcome) -> TransportObl
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
+        grade: None,
     }
 }
 
 fn plain_transport_row(outcome: Outcome, design_mandate: bool) -> TransportObligationResult {
     TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         monitor: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "assert".to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "assertion: some obligation".to_string(),
         location: None,
@@ -17638,6 +22983,7 @@ fn plain_transport_row(outcome: Outcome, design_mandate: bool) -> TransportOblig
         design_mandate,
         native_trust_ir: None,
         proof_evidence: None,
+        grade: None,
     }
 }
 
@@ -17703,16 +23049,29 @@ fn memory_safe_gate_artifacts(
         certified: false,
     });
     let summary = TrustFunctionSummary::from_dispositions(&dispositions);
+    // Trust (T3 L4, C07r): the one row lives in a context of its own.
+    let mut rows = trust_types::vc_context::VcContext::new();
+    let results = RowResults::intern(&mut rows, vec![(vc, result)]);
     VerificationArtifacts {
-        proof_results: TrustProofResults { dispositions, fingerprints: IndexVec::new(), summary },
+        proof_results: TrustProofResults {
+            dispositions,
+            fingerprints: IndexVec::new(),
+            summary,
+            premises: Vec::new(),
+        },
         telemetry: TrustProofTelemetry { details: IndexVec::new() },
-        results: vec![(vc, result)],
+        results,
         transport_results: vec![row],
         full_verification: None,
         result_bindings: Vec::new(),
         proof_authorities: Vec::new(),
         overflow_check_origins: OverflowCheckOrigins::default(),
         coroutine_resume_contract: None,
+        max_proof_level: None,
+        expanded_function_identity: None,
+        runtime_checked_std_members: Vec::new(),
+        calculus_reporting: None,
+        ctx: Arc::new(rows),
     }
 }
 
@@ -18059,6 +23418,25 @@ fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
         live_states: vec![0],
         sentinel_obligation_count: 1,
     };
+    // Trust: exercise populated, exactly bound original-VC sidecars, not the
+    // default None that would hide a stale snapshot after demotion.
+    let with_snapshot = |mut row: TransportObligationResult| {
+        let target = "aarch64-apple-darwin;ptr64";
+        let mut vc = test_vc(10);
+        vc.kind = VcKind::Assertion {
+            message: row.description.strip_prefix("assertion: ").unwrap().to_string(),
+        };
+        let digest = exact_vc_claim_digest_sha256(&vc, true, Some(target)).unwrap();
+        let id = format!("coroutine-stamp-{digest}");
+        row.original_vc_snapshot = Some(Box::new(
+            trust_types::OriginalVcSnapshot::capture(&vc, true, target, &id, &digest)
+                .expect("bounded original VC snapshot"),
+        ));
+        row.obligation_id = Some(id);
+        row.claim_digest_sha256 = Some(digest);
+        row.typed_kind = Some(Box::new(vc.kind));
+        row
+    };
     let marked_sentinel = {
         let mut row = plain_transport_row(Outcome::Proved, false);
         row.description = trust_types::VcKind::Assertion {
@@ -18068,7 +23446,7 @@ fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
             ),
         }
         .description();
-        row
+        with_snapshot(row)
     };
     let aggregate = {
         let mut row = plain_transport_row(Outcome::Proved, false);
@@ -18076,8 +23454,11 @@ fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
         row.description =
             "assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable"
                 .to_string();
-        row
+        with_snapshot(row)
     };
+
+    assert!(marked_sentinel.original_vc_snapshot.is_some());
+    assert!(aggregate.original_vc_snapshot.is_some());
 
     // The marked sentinel alone is fine: it is conditional BY DESIGN and says so.
     assert!(coroutine_rows_free_of_unmarked_conditional_proof(
@@ -18111,6 +23492,35 @@ fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
     assert_eq!(stamped[0], marked_sentinel, "a marked sentinel row must pass through untouched");
     assert_eq!(stamped[1].outcome, Outcome::Skipped);
     assert!(stamped[1].proof_evidence.is_none(), "a conditional row keeps no Certified grade");
+    assert!(
+        stamped[1].original_vc_snapshot.is_none(),
+        "a reclassified conditional row keeps no original-claim replay sidecar"
+    );
+    // Trust (VF1): the aggregate was ungraded, and the stamp grades nothing.
+    assert_eq!(stamped[1].grade, None);
+    {
+        use trust_types::authority_grade::{
+            GradeDischarge, GradeEncoding, GradePremise, ObligationGrade,
+        };
+        let mut graded = aggregate.clone();
+        graded.grade = Some(ObligationGrade::new(
+            GradeEncoding::UnvalidatedEncoder,
+            GradeDischarge::KernelReconstructed,
+            &[],
+        ));
+        let stamped = stamp_coroutine_conditional_rows(&[graded], Some(&evidence));
+        assert_eq!(stamped[0].outcome, Outcome::Skipped);
+        assert!(stamped[0].proof_evidence.is_none());
+        assert!(
+            stamped[0].original_vc_snapshot.is_none(),
+            "disclosing the executor premise must not retain an original-claim replay sidecar"
+        );
+        assert_eq!(
+            stamped[0].grade.as_ref().map(|grade| grade.premises.as_slice()),
+            Some(&[GradePremise::ExecutorProtocol][..]),
+            "a conditional row's grade names the executor-protocol premise it now rests on"
+        );
+    }
     assert!(trust_types::assumption::is_coroutine_resume_conditional_row_kind(&stamped[1].kind));
     assert_eq!(
         stamped[1]
@@ -18151,13 +23561,26 @@ fn coroutine_conditional_stamp_marks_the_row_that_consumed_the_assume() {
         unauthenticated.iter().all(|row| row.proof_evidence.is_none()),
         "a conditional row keeps no Certified grade: {unauthenticated:?}"
     );
-    // Still leaves non-discharge inventory alone.
-    let mandate = plain_transport_row(Outcome::Proved, true);
+    assert!(
+        unauthenticated.iter().all(|row| row.original_vc_snapshot.is_none()),
+        "every demoted row clears its original-claim replay sidecar: {unauthenticated:?}"
+    );
+    // Still leaves non-discharge inventory alone, including its snapshot.
+    let mandate = with_snapshot(plain_transport_row(Outcome::Proved, true));
     assert_eq!(
         stamp_coroutine_conditional_rows(std::slice::from_ref(&mandate), None),
         vec![mandate],
         "a design-mandate row is inventory, never a discharge target"
     );
+    // Existing Unknown rows retain their complete diagnostic payload unchanged.
+    let unknown = with_snapshot(plain_transport_row(Outcome::Unknown, false));
+    for authenticated in [Some(&evidence), None] {
+        assert_eq!(
+            stamp_coroutine_conditional_rows(std::slice::from_ref(&unknown), authenticated),
+            vec![unknown.clone()],
+            "a row that already lacks proof is not reclassified"
+        );
+    }
 }
 
 // The published contract row is Skipped/conditional on the wire: the
@@ -18191,15 +23614,25 @@ fn memory_safe_zero_data_obligations_still_rejects_coroutine_protocol_premise() 
     let dispositions: IndexVec<ObligationId, TrustDisposition> = IndexVec::new();
     let summary = TrustFunctionSummary::from_dispositions(&dispositions);
     let artifacts = VerificationArtifacts {
-        proof_results: TrustProofResults { dispositions, fingerprints: IndexVec::new(), summary },
+        proof_results: TrustProofResults {
+            dispositions,
+            fingerprints: IndexVec::new(),
+            summary,
+            premises: Vec::new(),
+        },
         telemetry: TrustProofTelemetry { details: IndexVec::new() },
-        results: Vec::new(),
+        results: RowResults::default(),
         transport_results: Vec::new(),
         full_verification: None,
         result_bindings: Vec::new(),
         proof_authorities: Vec::new(),
         overflow_check_origins: OverflowCheckOrigins::default(),
         coroutine_resume_contract: None,
+        max_proof_level: None,
+        expanded_function_identity: None,
+        runtime_checked_std_members: Vec::new(),
+        calculus_reporting: None,
+        ctx: Arc::new(trust_types::vc_context::VcContext::new()),
     };
     assert!(
         !memory_safe_artifacts_have_non_demotable_failure(&artifacts, &[]),
@@ -18215,6 +23648,156 @@ fn memory_safe_zero_data_obligations_still_rejects_coroutine_protocol_premise() 
         memory_safe_artifacts_have_non_demotable_failure(&artifacts, &[coroutine]),
         "a synthetic protocol premise must not disappear behind summary.total == 0"
     );
+
+    // Trust (2026-10-10, ZERO-ROW-GATE): the publisher's verdict is the memory-safe
+    // gate's too. A zero-obligation body the publisher did NOT call vacuously clean
+    // (a call no authenticated registry discharges) is refused; one it did is not.
+    assert!(memory_safe_zero_obligation_body_is_unclean(&artifacts, Some(false)));
+    assert!(!memory_safe_zero_obligation_body_is_unclean(&artifacts, Some(true)));
+    assert!(
+        memory_safe_zero_obligation_body_is_unclean(&artifacts, None),
+        "a zero-obligation body with no publisher verdict fails closed"
+    );
+}
+
+// A row proved independently of native bundle construction does not prove the
+// bundle that construction discarded. The run-make companion exercises real
+// Rust source; these controls exercise the production publisher and strict
+// accounting with an actual reference-checked root proof and failure carrier.
+fn discarded_bundle_gap_fixture(reason: &str) -> VerificationArtifacts {
+    let mut vc = test_vc(417);
+    vc.formula = Formula::Eq(Box::new(Formula::Int(0)), Box::new(Formula::Int(1)));
+    let mut artifacts = memory_safe_gate_artifacts(
+        vc,
+        authority_test_proved(),
+        TrustStatus::Trusted,
+        plain_transport_row(Outcome::Proved, false),
+    );
+    let clean = certify_all(&artifacts.results, None);
+    artifacts.proof_authorities =
+        build_result_proof_authorities(&artifacts.results, &[], None, &clean);
+    assert!(all_results_have_static_proof_authority(
+        &artifacts.results,
+        &[],
+        &artifacts.proof_authorities,
+    ));
+    artifacts.transport_results = build_transport_results_with_runtime_checks_bound(
+        false,
+        None,
+        &artifacts.results,
+        None,
+        &clean,
+        &[],
+        &artifacts.proof_authorities,
+    );
+    assert_eq!(artifacts.transport_results[0].outcome, Outcome::Proved);
+
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member"]);
+    let contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let mut bundle = trust_mir_extract::function_to_verifier_api_bundle(&root, &contracts, &[]);
+    bundle.obligations = vec![
+        authority_test_native_obligation("obligation:demo:root:arithmetic", 417, 417),
+        authority_test_native_obligation("obligation:demo:member:divzero", 418, 418),
+    ];
+    let context = trust_router::VerifierExecutionContext::new("discarded-generic-bundle");
+    artifacts.full_verification = Some(native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        reason,
+    ));
+    artifacts
+}
+
+#[test]
+fn discarded_generic_bundle_keeps_gap_beside_proved_root() {
+    let artifacts = discarded_bundle_gap_fixture(
+        "TyKind::Array length N is not a concrete target usize",
+    );
+    let run = artifacts.full_verification.as_ref().unwrap();
+    assert_eq!(run.requested_obligations.len(), 2, "root and discarded-member debt");
+    assert!(native_run_trust_ir_lowering_failed(run));
+    let failure = native_full_verification_failure(Some(run)).expect("strict native debt");
+    assert!(strict_failure_is_fatal(failure, true));
+    assert!(!native_run_is_vacuously_clean(run));
+    let published = unaccounted_gap_rows(&artifacts, &artifacts.transport_results, &[], None)
+        .expect("a root proof cannot discharge discarded native members");
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0], artifacts.transport_results[0], "keep the actual root proof");
+    assert_eq!(published[1].kind, NATIVE_VERIFICATION_GAP_ROW_KIND);
+    assert_eq!(published[1].outcome, Outcome::Unknown);
+    let wire = serde_json::to_string(&published).expect("public rows serialize");
+    let decoded: Vec<TransportObligationResult> = serde_json::from_str(&wire).unwrap();
+    assert_eq!(decoded, published, "the public wire retains both proof and debt");
+    assert!(unaccounted_gap_rows(&artifacts, &published, &[], None).is_none());
+}
+
+#[test]
+fn lowering_gap_dedup_requires_the_existing_authenticated_assumption() {
+    let artifacts = discarded_bundle_gap_fixture("generic-param T");
+    let mut assumption = plain_transport_row(Outcome::Skipped, false);
+    assumption.kind = format!(
+        "assumption:{}",
+        trust_types::assumption::NATIVE_LOWERING_ASSUMPTION_TAG,
+    );
+    assumption.solver = trust_types::assumption::MEMORY_SAFE_ASSUMPTION_ROW_SOURCE.to_string();
+    assert!(transport_row_is_authenticated_native_lowering_assumption(&assumption));
+    assert!(unaccounted_gap_rows(&artifacts, &[assumption.clone()], &[], None).is_none());
+    assert!(native_run_trust_ir_lowering_failed(artifacts.full_verification.as_ref().unwrap()),
+        "transport assumption dedup never removes the strict failure");
+    assumption.solver = "untrusted-label".to_string();
+    let published = unaccounted_gap_rows(&artifacts, &[assumption.clone()], &[], None)
+        .expect("a label alone accounts for no failed bundle");
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0], assumption);
+    assert_eq!(published[1].kind, NATIVE_VERIFICATION_GAP_ROW_KIND);
+}
+
+#[test]
+fn unaccounted_lowering_gap_preserves_deadline_and_complete_run() {
+    use trust_types::determinism::StopCause;
+    let mut artifacts = discarded_bundle_gap_fixture(&format!(
+        "{NATIVE_BUNDLE_DEADLINE_DECLINE} before native trust-ir bundle construction",
+    ));
+    let published = unaccounted_gap_rows(&artifacts, &artifacts.transport_results, &[], None)
+        .expect("deadline debt remains published");
+    assert_eq!(published[1].outcome, Outcome::Timeout);
+    assert_eq!(clock_test_stop_cause(&published[1]), Some(StopCause::WallBackstop));
+    artifacts.full_verification = None;
+    assert!(unaccounted_gap_rows(&artifacts, &artifacts.transport_results, &[], None).is_none());
+    let obligation = authority_test_native_obligation("obligation:complete", 417, 417);
+    artifacts.full_verification = Some(authority_test_strict_native_run(obligation));
+    assert!(!native_run_trust_ir_lowering_failed(artifacts.full_verification.as_ref().unwrap()));
+    assert!(unaccounted_gap_rows(&artifacts, &artifacts.transport_results, &[], None).is_none(),
+        "a complete retained run receives no synthetic lowering debt");
+}
+
+/// Trust (2026-10-10, ZERO-ROW-GATE): the strict/certify empty-inventory accept is
+/// keyed on the publisher's verdict and on the published rows. Before, it read
+/// neither: `pub fn f(x: u32, n: u32) -> u32 { x.rotate_left(n) }` published one
+/// `unknown` `native-verification-gap` row (its call is discharged by no
+/// authenticated registry) and the first early return of
+/// `abort_on_full_verification_failure` accepted it, exit 0 under certify.
+#[test]
+fn zero_obligation_inventory_accept_follows_the_published_row() {
+    let gap = PublishedRowTally::of(&[transport_native_verification_gap_row()], None);
+    let clean = PublishedRowTally::of(&[transport_no_obligations_row()], None);
+    // The live shape of the hole: calls undischarged, the gap row published.
+    assert!(!zero_obligation_inventory_accepted(Some(false), gap));
+    // The verdict alone refuses, whatever the rows say.
+    assert!(!zero_obligation_inventory_accepted(Some(false), clean));
+    // The belt: an `unknown` or timed-out published row refuses even a clean verdict.
+    assert!(!zero_obligation_inventory_accepted(Some(true), gap));
+    let mut timed_out = transport_no_obligations_row();
+    timed_out.outcome = Outcome::Timeout;
+    assert!(!zero_obligation_inventory_accepted(
+        Some(true),
+        PublishedRowTally::of(&[timed_out], None)
+    ));
+    // A body with bridged obligations never takes the empty-inventory accept.
+    assert!(!zero_obligation_inventory_accepted(None, clean));
+    // The genuine vacuous body still passes.
+    assert!(zero_obligation_inventory_accepted(Some(true), clean));
 }
 
 /// F2 pin: strict batteries-on enforcement NEVER demotes, for every gap shape —
@@ -18543,10 +24126,13 @@ fn structural_drop_closure_fuel_bails_closed_and_terminates() {
 
 fn absent_callee_transport_row(outcome: Outcome) -> TransportObligationResult {
     TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         monitor: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "assert".to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: format!(
             "assertion: {}call to absent callee `core::num::u32::pow` (body not in the lowered bundle) may panic",
@@ -18562,6 +24148,7 @@ fn absent_callee_transport_row(outcome: Outcome) -> TransportObligationResult {
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
+        grade: None,
     }
 }
 
@@ -18576,10 +24163,13 @@ fn expected_absent_callee_transport_row(outcome: Outcome) -> TransportObligation
 
 fn drop_glue_transport_row(outcome: Outcome) -> TransportObligationResult {
     TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         monitor: None,
         obligation_id: None,
         claim_digest_sha256: None,
         kind: "assert".to_string(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: format!(
             "assertion: {}drop glue for `NeedsDrop` has unproven panic-freedom (user Drop impls may panic)",
@@ -18595,6 +24185,7 @@ fn drop_glue_transport_row(outcome: Outcome) -> TransportObligationResult {
         design_mandate: false,
         native_trust_ir: None,
         proof_evidence: None,
+        grade: None,
     }
 }
 
@@ -18672,6 +24263,85 @@ fn absent_expected_absent_and_drop_glue_unproved_rows_are_fatal() {
         plain_transport_row(Outcome::Proved, false),
         extern_call_transport_row(Outcome::Unknown),
     ]));
+}
+
+/// Trust (D1 increment 1): the writer-relative excuse is plugged into the ONE
+/// implementation of the assumption-panic scan, and it can only REMOVE the rows
+/// it names. With no excuse the scan is exactly the pre-existing one; excusing a
+/// writer edge never excuses a co-present non-writer absent callee; and the text
+/// parse behind the excuse matches only the FATAL absent-callee marker naming a
+/// recorded key (not the expected-absent marker, not another callee).
+#[test]
+fn writer_relative_excuse_removes_only_writer_edge_rows() {
+    let writer_edge = "<dyn core::fmt::Write as core::fmt::Write>::write_str";
+    let writer_row = |outcome| {
+        let mut row = absent_callee_transport_row(outcome);
+        row.description = format!(
+            "assertion: {}call to absent callee `{writer_edge}` (dynamic dispatch) may panic",
+            trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+        );
+        row
+    };
+    let keys: FxHashSet<String> = [writer_edge.to_string()].into_iter().collect();
+    let excuse = |row: &TransportObligationResult| {
+        absent_callee_path_of_row(row).is_some_and(|path| keys.contains(path))
+    };
+
+    // No excuse: byte-for-byte the pre-existing scan.
+    for rows in [
+        vec![writer_row(Outcome::RuntimeChecked)],
+        vec![absent_callee_transport_row(Outcome::Unknown)],
+        vec![plain_transport_row(Outcome::Proved, false)],
+        vec![
+            plain_transport_row(Outcome::Proved, false),
+            extern_call_transport_row(Outcome::Unknown),
+        ],
+    ] {
+        assert_eq!(
+            transport_rows_have_unexcused_assumption_panic(&rows, |_| false),
+            transport_rows_have_unproved_assumption_panic(&rows),
+        );
+    }
+
+    // The writer edge alone is excused ...
+    assert!(!transport_rows_have_unexcused_assumption_panic(
+        &[writer_row(Outcome::RuntimeChecked)],
+        excuse
+    ));
+    // ... but a co-present non-writer absent callee still is not.
+    assert!(transport_rows_have_unexcused_assumption_panic(
+        &[writer_row(Outcome::RuntimeChecked), absent_callee_transport_row(Outcome::Unknown)],
+        excuse
+    ));
+    // An excused writer edge never makes an expected-absent row or drop glue pass.
+    assert!(transport_rows_have_unexcused_assumption_panic(
+        &[
+            writer_row(Outcome::RuntimeChecked),
+            expected_absent_callee_transport_row(Outcome::Unknown)
+        ],
+        excuse
+    ));
+    assert!(transport_rows_have_unexcused_assumption_panic(
+        &[writer_row(Outcome::RuntimeChecked), drop_glue_transport_row(Outcome::Unknown)],
+        excuse
+    ));
+
+    // The text parse: the fatal marker naming a key, and nothing else.
+    let fatal = format!(
+        "{}call to absent callee `{writer_edge}` (dynamic dispatch) may panic",
+        trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+    );
+    assert!(fmt_writer_relative::text_names_writer_edge(&fatal, &keys));
+    let expected_absent = format!(
+        "{}call to absent callee `{writer_edge}` may panic",
+        trust_types::assumption::EXPECTED_ABSENT_CALLEE_ASSUMPTION_PREFIX
+    );
+    assert!(!fmt_writer_relative::text_names_writer_edge(&expected_absent, &keys));
+    let other = format!(
+        "{}call to absent callee `core::num::u32::pow` may panic",
+        trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+    );
+    assert!(!fmt_writer_relative::text_names_writer_edge(&other, &keys));
 }
 
 /// An extern print/format/write DISPATCH row for a leg OTHER than the b59-demotable
@@ -19051,6 +24721,278 @@ fn native_lowering_collapse_preserves_proofs_and_refutations() {
     assert!(!native_lowering_collapse_keeps_row(&plain_transport_row(Outcome::Skipped, false)));
 }
 
+/// Trust (2026-10-02, diag-vs-report review): `rows_with_l0_refutations` stamps a
+/// Level-0 refutation onto the row index-aligned with its result, and ONLY there.
+/// Pins (1) the stamp itself, for every non-proved outcome on a native-unsupported
+/// safety kind — the class is decided by the KIND, so a solver timeout on such a row
+/// is published `failed` exactly as the Level-0 summary counts it; (2) that a stamped
+/// row SURVIVES the native-lowering collapse and is NOT taken by the memory-safe
+/// panic rewrite (which needs a raw `Failed` result), so a memory-safe body can only
+/// get stricter from the stamp, never more permissive; (3) the fail-safe fallbacks:
+/// a length or typed-kind misalignment stamps nothing, and a `Proved` result is
+/// never a refutation.
+#[test]
+fn l0_refutation_stamp_is_index_aligned_and_survives_the_lowering_collapse() {
+    let mut pow = test_vc(41);
+    pow.kind = VcKind::UnsupportedMir {
+        kind: "FullVerification::ArithmeticSafety".to_string(),
+        detail: "arithmetic overflow (Mul)".to_string(),
+    };
+    let gap = test_vc(42);
+    let row_for = |vc: &VerificationCondition, outcome: Outcome| {
+        let mut row = plain_transport_row(outcome, false);
+        row.typed_kind = Some(Box::new(vc.kind.clone()));
+        row
+    };
+    let none = OpenDispatchRefutationWitnesses::default();
+
+    for outcome in [Outcome::RuntimeChecked, Outcome::Unknown, Outcome::Timeout] {
+        let results =
+            vec![(pow.clone(), bridge_test_unknown()), (gap.clone(), bridge_test_unknown())];
+        let rows = vec![row_for(&pow, outcome), row_for(&gap, Outcome::Unknown)];
+        let stamped = rows_with_l0_refutations(&results, &rows, &none)
+            .unwrap_or_else(|| panic!("{outcome:?}: the refutation row must be stamped"));
+        assert_eq!(stamped[0].outcome, Outcome::Failed, "{outcome:?}");
+        assert!(
+            stamped[0].reason.as_deref().unwrap().contains(&format!("`{}`", outcome.as_str())),
+            "{outcome:?}: the verifier's own outcome stays in the reason"
+        );
+        assert_eq!(stamped[1], rows[1], "a non-refutation row is untouched");
+        // The collapse keeps it (never hidden behind `assumption:native-lowering`) …
+        assert!(native_lowering_collapse_keeps_row(&stamped[0]));
+        // … and the memory-safe panic rewrite does not admit it (raw result is not
+        // `Failed`), so the memory-safe gate sees an unauthenticated `failed` row.
+        assert!(rewrite_memory_safe_panic_refutation_rows(true, &results, &stamped).is_none());
+    }
+
+    let results = vec![(pow.clone(), bridge_test_unknown())];
+    // Length misalignment: nothing is stamped (no row can be wrongly relabelled).
+    assert!(
+        rows_with_l0_refutations(
+            &results,
+            &[row_for(&pow, Outcome::Unknown), row_for(&gap, Outcome::Unknown)],
+            &none
+        )
+        .is_none()
+    );
+    // Kind misalignment at the same index: nothing is stamped.
+    assert!(
+        rows_with_l0_refutations(&results, &[row_for(&gap, Outcome::Unknown)], &none).is_none()
+    );
+    // A proved result is never a refutation.
+    let proved = vec![(pow.clone(), authority_test_proved())];
+    assert!(rows_with_l0_refutations(&proved, &[row_for(&pow, Outcome::Unknown)], &none).is_none());
+}
+
+/// Trust (OD-1 phase 0, 2026-10-04): the panic-freedom aggregate is decided per
+/// FOLD SITE, never on its representative. The bridge names the aggregate after its
+/// first marked site; when that is a tolerated concrete callee (`Vec::push`) and an
+/// open, uncontracted generic dispatch is co-folded behind it, the row and the
+/// Level-0 summary are both a refutation (`failed`), exactly as when the open call
+/// comes first. Measured before the fix on stage-1 `fbe76cb938`: published
+/// `runtime_checked`, summary "0 failed, … 1 runtime-checked"
+/// (`tests/ui/trust/instance_hypothesis/co_fold_open_dispatch_stays_failed.rs`).
+/// Controls: no fold sites, a co-folded site that is not a witness, and a row that
+/// does not stand for the fold each stamp nothing.
+#[test]
+fn l0_refutation_decides_the_panic_freedom_aggregate_per_fold_site() {
+    let site = |callee: &str| {
+        format!(
+            "{}{callee}` (body not in the lowered bundle) may panic",
+            trust_types::l0_refutation::ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX
+        )
+    };
+    let push = site("alloc::vec::Vec::<u32>::push");
+    let open = site("<T as cofold::Tr>::m");
+    let mut aggregate = test_vc(51);
+    aggregate.kind = VcKind::Assertion { message: push.clone() };
+    let row_for = |vc: &VerificationCondition| {
+        let mut row = plain_transport_row(Outcome::RuntimeChecked, false);
+        row.typed_kind = Some(Box::new(vc.kind.clone()));
+        row.description = format!("assertion: {}", push);
+        row
+    };
+    let results = vec![(aggregate.clone(), bridge_test_unknown())];
+    let rows = vec![row_for(&aggregate)];
+    let witnesses = |callees: &[&str], sites: Option<&[String]>| {
+        OpenDispatchRefutationWitnesses::new(callees.iter().map(|c| c.to_string()).collect(), sites)
+    };
+    let folded = [push.clone(), open.clone()];
+
+    let co_folded = witnesses(&["<T as cofold::Tr>::m"], Some(&folded));
+    assert_eq!(co_folded.co_folded_callee.as_deref(), Some("<T as cofold::Tr>::m"));
+    let stamped = rows_with_l0_refutations(&results, &rows, &co_folded)
+        .expect("a co-folded open dispatch must refute the aggregate");
+    assert_eq!(stamped[0].outcome, Outcome::Failed);
+    let reason = stamped[0].reason.as_deref().unwrap();
+    assert!(reason.contains("decided per fold site"), "{reason}");
+    assert!(reason.contains("`<T as cofold::Tr>::m`"), "{reason}");
+    assert_eq!(
+        strict_l0_verification_failure(true, &results, &[], &[], None, &co_folded),
+        Some(FullVerificationFailure { failed: 1, unknown: 0, runtime_checked: 0, skipped: 0 }),
+        "the Level-0 summary counts what the row publishes"
+    );
+
+    // Control 1: no fold recorded — the representative alone decides (not a witness).
+    let unfolded = witnesses(&["<T as cofold::Tr>::m"], None);
+    assert!(rows_with_l0_refutations(&results, &rows, &unfolded).is_none());
+    // Control 2: the co-folded site is not an adversarial witness (e.g. rung 1 or a
+    // sealed trait declined it) — nothing is stamped.
+    let not_witness = witnesses(&[], Some(&folded));
+    assert!(not_witness.co_folded_callee.is_none());
+    assert!(rows_with_l0_refutations(&results, &rows, &not_witness).is_none());
+    // Control 3: a row that does not stand for the fold is never stamped by it.
+    let mut other = test_vc(52);
+    other.kind = VcKind::Assertion { message: "attempt to divide by zero".to_string() };
+    let other_rows = vec![row_for(&other)];
+    let other_results = vec![(other, bridge_test_unknown())];
+    assert!(rows_with_l0_refutations(&other_results, &other_rows, &co_folded).is_none());
+    // A proved aggregate is never a refutation.
+    let proved = vec![(aggregate, authority_test_proved())];
+    assert!(rows_with_l0_refutations(&proved, &rows, &co_folded).is_none());
+}
+
+/// Trust (2026-10-05, rg concrete-misclassified): a fold row whose text names a
+/// CONCRETE representative (`Term::unfold_apps`, `[T]::contains` in clean-ck0) and
+/// is decided on a co-folded VIRTUAL site (`<dyn Env as Env>::m` on a caller-supplied
+/// trait object, OD-1 item 14) is still `failed` — the decision does not move — but
+/// its reason now says the deciding site is a `dyn` dispatch and that the named
+/// callee is only the fold's representative. Before, it read "… is an open,
+/// uncontracted generic trait dispatch", and preview 2 (stage-1 `c797f90c1`, 10-05)
+/// reported 11 such rows as concrete callees misclassified as generic dispatch.
+/// Controls: a generic co-folded site keeps the GENERIC wording; a body whose only
+/// fold site is the concrete callee is not stamped (`runtime_checked`).
+#[test]
+fn l0_refutation_names_a_virtual_co_folded_site_and_the_representative() {
+    let site = |callee: &str| {
+        format!(
+            "{}{callee}` (body not in the lowered bundle) may panic",
+            trust_types::l0_refutation::ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX
+        )
+    };
+    let concrete = site("ck0::term::Term::unfold_apps");
+    let virtual_site = "<dyn ck0::Env as ck0::Env>::arity";
+    let generic_site = "<T as ck0::Tr>::m";
+    let mut aggregate = test_vc(53);
+    aggregate.kind = VcKind::Assertion { message: concrete.clone() };
+    let mut row = plain_transport_row(Outcome::RuntimeChecked, false);
+    row.typed_kind = Some(Box::new(aggregate.kind.clone()));
+    row.description = format!("assertion: {concrete}");
+    let results = vec![(aggregate, bridge_test_unknown())];
+    let rows = vec![row];
+
+    let folded = [concrete.clone(), site(virtual_site)];
+    let witnesses = OpenDispatchRefutationWitnesses::new(
+        [virtual_site.to_string()].into_iter().collect(),
+        Some(&folded),
+    )
+    .with_virtual([virtual_site.to_string()].into_iter().collect());
+    let stamped = rows_with_l0_refutations(&results, &rows, &witnesses)
+        .expect("a co-folded adversarial `dyn` site refutes the aggregate");
+    assert_eq!(stamped[0].outcome, Outcome::Failed);
+    let reason = stamped[0].reason.as_deref().unwrap();
+    assert!(reason.contains(&format!("co-folded call to `{virtual_site}` is")), "{reason}");
+    assert!(reason.contains("VIRTUAL (`dyn`) trait dispatch"), "{reason}");
+    assert!(!reason.contains("GENERIC trait dispatch"), "{reason}");
+    assert!(
+        reason.contains(
+            "`ck0::term::Term::unfold_apps`, is only the fold's representative and is not \
+             itself the refuted site"
+        ),
+        "{reason}"
+    );
+
+    // Control 1: a generic co-folded site keeps the generic wording.
+    let folded_generic = [concrete.clone(), site(generic_site)];
+    let generic = OpenDispatchRefutationWitnesses::new(
+        [generic_site.to_string()].into_iter().collect(),
+        Some(&folded_generic),
+    );
+    let stamped = rows_with_l0_refutations(&results, &rows, &generic).expect("generic co-fold");
+    let reason = stamped[0].reason.as_deref().unwrap();
+    assert!(reason.contains("GENERIC trait dispatch"), "{reason}");
+    assert!(!reason.contains("VIRTUAL"), "{reason}");
+    // Control 2: the concrete callee alone is never a witness — nothing is stamped.
+    let concrete_only = [concrete];
+    let none = OpenDispatchRefutationWitnesses::new(FxHashSet::default(), Some(&concrete_only));
+    assert!(rows_with_l0_refutations(&results, &rows, &none).is_none());
+}
+
+/// Trust (OD-1, 2026-10-04, open shapes): a still-generic call that carries its
+/// callee's open-dispatch refutation is a witness like a direct open dispatch: its
+/// absent-callee row is stamped `failed`, and the reason names the callee's refuted
+/// site. Control: the same row with the call not in the witness set stays unstamped
+/// (`runtime_checked`), whatever the propagated map says.
+#[test]
+fn l0_refutation_stamps_a_propagated_open_dispatch_and_names_its_origin() {
+    let call = "prop::helper::<T>";
+    let message = format!(
+        "{}{call}` (body not in the lowered bundle) may panic",
+        trust_types::l0_refutation::ABSENT_CALLEE_ASSUMPTION_CALLEE_PREFIX
+    );
+    let mut vc = test_vc(61);
+    vc.kind = VcKind::Assertion { message: message.clone() };
+    let mut row = plain_transport_row(Outcome::RuntimeChecked, false);
+    row.typed_kind = Some(Box::new(vc.kind.clone()));
+    row.description = format!("assertion: {message}");
+    let results = vec![(vc, bridge_test_unknown())];
+    let rows = vec![row];
+    let propagated: FxHashMap<String, String> =
+        [(call.to_string(), "<U as prop::Tr>::m".to_string())].into_iter().collect();
+
+    let witnesses =
+        OpenDispatchRefutationWitnesses::new([call.to_string()].into_iter().collect(), None)
+            .with_propagated(propagated.clone());
+    let stamped = rows_with_l0_refutations(&results, &rows, &witnesses)
+        .expect("a propagated open-dispatch refutation must stamp the call's row");
+    assert_eq!(stamped[0].outcome, Outcome::Failed);
+    let reason = stamped[0].reason.as_deref().unwrap();
+    assert!(reason.contains("propagated"), "{reason}");
+    assert!(reason.contains("`<U as prop::Tr>::m`"), "{reason}");
+
+    // Control: membership in the witness set decides, never the map.
+    let not_witness = OpenDispatchRefutationWitnesses::new(FxHashSet::default(), None)
+        .with_propagated(propagated);
+    assert!(rows_with_l0_refutations(&results, &rows, &not_witness).is_none());
+}
+
+/// OD-1 phase 0 review (2026-10-04): the advisory demotions never rewrite a row the
+/// Level-0 refutation stamp decided. Measured on `52d352514b`: `#[trust::skip] f();
+/// t.m()` stamped the aggregate (text names the skipped `f`) `failed`, then the
+/// expected-absent post-pass demoted it to a `skipped` assumption row, so
+/// `--allow-l0-gaps` published `"failed":0` beside a "1 failed" Level-0 summary.
+#[test]
+fn advisory_demotions_never_rewrite_a_refuted_row() {
+    let survey = test_policy(true, false);
+    for outcome in [Outcome::Unknown, Outcome::RuntimeChecked] {
+        let row = expected_absent_callee_transport_row(outcome);
+        assert!(transport_row_is_demotable_expected_absent_callee(&row), "{outcome:?}");
+        assert!(expected_absent_callee_demotion_applies(&survey, &[row]));
+    }
+    let refuted = expected_absent_callee_transport_row(Outcome::Failed);
+    assert!(transport_row_is_unproved_expected_absent_callee(&refuted));
+    assert!(
+        !transport_row_is_demotable_expected_absent_callee(&refuted),
+        "a refuted expected-absent row must stay `failed`"
+    );
+
+    let mut total = plain_transport_row(Outcome::Unknown, false);
+    total.description = format!(
+        "assertion: {}call to `demo::audited` may panic",
+        trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX
+    );
+    assert!(transport_row_is_demotable_assumed_total_callee(&total));
+    total.outcome = Outcome::Failed;
+    assert!(transport_row_is_unproved_assumed_total_callee(&total));
+    assert!(
+        !transport_row_is_demotable_assumed_total_callee(&total),
+        "a refuted assumed-total row must stay `failed`"
+    );
+    assert!(!transport_row_is_demotable_expected_absent_callee(
+        &expected_absent_callee_transport_row(Outcome::Proved)
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Def-site `#[requires]` marker: entry-assumption discharge (P1.2)
 // ---------------------------------------------------------------------------
@@ -19119,6 +25061,7 @@ fn requires_marker_function()
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let compiler_contracts = trust_types::CompilerContractBundle::new(vec![contract]);
     (function, compiler_contracts)
@@ -19158,7 +25101,7 @@ fn compiler_function_and_default_obligation_digests_are_domain_and_content_bound
     );
 }
 
-fn unsupported_evidence_for(
+pub(super) fn unsupported_evidence_for(
     obligation: &trust_verifier_api::TrustObligation,
 ) -> trust_verifier_api::ObligationEvidence {
     trust_verifier_api::ObligationEvidence {
@@ -19477,9 +25420,14 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
         &[],
         &snapshot,
     );
-    let (results, _, _, _) =
-        bridge_v1_ay_proofs_into_native_results(500, None, &[], &mut bindings,
-        /* stamp_held_assert_refutations */ true, legacy_results);
+    let (results, _, _, _) = bridge_v1_ay_proofs_into_native_results(
+        500,
+        None,
+        &[],
+        &mut bindings,
+        /* stamp_held_assert_refutations */ true,
+        legacy_results,
+    );
     let cleancic = (0..results.len()).map(|_| None).collect::<Vec<_>>();
     let authorities =
         build_result_proof_authorities(&results, &bindings, Some(&full_result), &cleancic);
@@ -19546,7 +25494,7 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
             &bindings,
             &authorities,
             Some(&full_result),
-            &FxHashSet::default(),
+            &OpenDispatchRefutationWitnesses::default(),
         ),
         None,
         "the authenticated entry marker must be excluded before UnsupportedMir is classified L0",
@@ -19571,7 +25519,7 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
             &bindings,
             &no_authorities,
             Some(&full_result),
-            &FxHashSet::default(),
+            &OpenDispatchRefutationWitnesses::default(),
         ),
         Some(FullVerificationFailure { failed: 0, unknown: 1, runtime_checked: 0, skipped: 0 }),
         "the same UnsupportedMir row and entry solver label remain fatal without private authority",
@@ -19766,8 +25714,10 @@ fn entry_assumption_never_authorizes_unconditional_panic_freedom() {
     };
     let unconditional = vec![(test_vc(1), proved("clean-kernel-certified"))];
     let unconditional_authority = vec![Some(ResultProofAuthority::KernelCertified {
+        replay_audit: None,
         row: exact_result_row_identity(0, &unconditional[0].0).expect("serializable kernel row"),
         evidence: authority_test_clean_cic(70),
+        reference: authority_test_reference(&authority_test_clean_cic(70)),
     })];
     assert!(results_establish_unconditional_panic_freedom(
         &unconditional,
@@ -19794,9 +25744,11 @@ fn entry_assumption_never_authorizes_unconditional_panic_freedom() {
             &conditional_bindings,
             &[
                 Some(ResultProofAuthority::KernelCertified {
+                    replay_audit: None,
                     row: exact_result_row_identity(0, &conditional[0].0)
                         .expect("serializable kernel row"),
                     evidence: authority_test_clean_cic(71),
+                    reference: authority_test_reference(&authority_test_clean_cic(71)),
                 }),
                 Some(ResultProofAuthority::DefinitionEntryAssumption {
                     row: exact_result_row_identity(1, &conditional[1].0)
@@ -19860,240 +25812,6 @@ fn zero_obligation_registry_refuses_an_undischarged_call() {
     assert!(!zero_obligation_registry_gate(false, true, true, true, true));
 }
 
-// ===========================================================================
-// FALSE PROOF #12 — the whole-function panic-freedom SUBSUMPTION premise.
-//
-// #11 was closed by minting the missing panic-freedom carrier for a resolved
-// same-crate call. That carrier IS the aggregate this lane subsumes, so the
-// repair produced bodies whose ONLY row is the aggregate — and the lane's
-// premise ("every OTHER row is a static proof") is an `all()` over an EMPTY
-// set, i.e. `true`. Measured on the deployed driver `sha256:18e5a9a90a1697f6`,
-// direct `trustc` lane, `-Z trust-verify-output=json`:
-//
-//   fn r1_calls_div_leaf(a: u64) -> u64 { r1_div_leaf(a, 0) }   // ALWAYS panics
-//   -> {"kind":"assert","outcome":"proved","solver":"trust-structural-subsumption",
-//       "description":"assertion: panic freedom: no assertion, `unreachable!`, or
-//        panic is reachable"}
-//   [PF_CALLGATE] fn=P::r1_calls_div_leaf UNREGISTERED callee blocks discharge: P::r1_div_leaf
-//   [PANIC_FREEDOM_SUBSUMPTION] discharged aggregate row 0 for P::r1_calls_div_leaf
-//
-// The two trace lines are the whole finding: the call gate had ALREADY answered
-// NO for this exact function, and this lane discharged anyway.
-//
-// WHY THESE TESTS FAIL ON UNFIXED CODE. Before the repair the lane's decision
-// was, verbatim, `if !premises_hold { return; }` where `premises_hold` is the
-// `all()` over non-aggregate rows — i.e. exactly the middle argument below and
-// NOTHING else. So on unfixed code the decision for every input here is the
-// value of `rows_all_static_proofs` alone: `(0, true, true)`, `(1, true, false)`
-// and `(2, true, false)` all decided TRUE, which is what each assertion denies.
-// ===========================================================================
-
-
-
-
-
-
-// ===========================================================================
-// FRONT B — conjunct (5) is REACHABILITY-aware. Tests against the pure core
-// `panic_block_row_unreachability_premise(target_block_count,
-// distinct_proved_target_formulas, any_target_row_unproved)`.
-//
-// WHAT THIS CORE DECIDES: "does this function's own FINAL row set carry an
-// authenticated static proof that EVERY `assert!`/`panic!` refutation-target
-// block is unreachable?" Only a `true` here may arm the panic-callee exemption
-// inside `all_calls_discharge_panic_free`.
-//
-// WHY THESE TESTS FAIL ON UNFIXED CODE. Before this change the exemption's only
-// input was the recorded refute-lane flag; there was no row-evidence source at
-// all and therefore no core to interrogate. The three-argument shape below did
-// not exist, so every one of these tests fails to COMPILE against unfixed code
-// — the strongest possible "fails on unfixed code". Against the naive
-// implementation this change could have been (`some row matched a target block`
-// -> exempt) every ADVERSARIAL case below decides TRUE, which each assertion
-// denies.
-// ===========================================================================
-
-/// **ADVERSARIAL: a REACHABLE panic must still refuse.** Its refutation VC is
-/// SAT, so the row is `Failed` — an unproved target row. Measured on the
-/// deployed driver (fixture `a_reachable_panic`): `[ASSERT_REFUTE] REFUTED
-/// Assertion { message: "panic call: core::panicking::panic_fmt" }`.
-#[test]
-fn frontb_a_reachable_panic_block_is_never_exempted() {
-    assert!(
-        !panic_block_row_unreachability_premise(1, 0, true),
-        "a refuted panic-call row is a REFUSAL, not a missing datum"
-    );
-    // One unproved matching row poisons the whole exemption even when the
-    // coverage count would otherwise line up: the exemption skips ALL target
-    // blocks at once, so partial evidence is no evidence.
-    assert!(!panic_block_row_unreachability_premise(1, 1, true));
-    assert!(!panic_block_row_unreachability_premise(2, 2, true));
-}
-
-/// **ADVERSARIAL: an UNKNOWN / TIMED-OUT unreachability proof must still
-/// refuse.** This is the explicit answer to "what happens when the
-/// unreachability proof is itself unknown or timed out". Two shapes, both
-/// refused: the row is present but not `Proved` (`any_unproved`), or the
-/// candidate was never emitted at all so no formula covers the block.
-/// Measured shape: `contract_panic_annotated`'s refute-lane candidate returns
-/// `Unknown { reason: "in-process ay returned unknown: (incomplete
-/// self-check-rejected)" }`.
-#[test]
-fn frontb_an_unknown_or_timed_out_unreachability_proof_is_never_exempted() {
-    assert!(
-        !panic_block_row_unreachability_premise(1, 0, true),
-        "Unknown/Timeout on the unreachability proof must fail closed"
-    );
-    assert!(
-        !panic_block_row_unreachability_premise(1, 0, false),
-        "a target block with NO row at all is the ABSENCE of a proof, never its \
-         satisfaction — the vcgen candidate loop SILENTLY skips a guardless or \
-         ungrounded target block"
-    );
-    assert!(!panic_block_row_unreachability_premise(3, 2, false));
-}
-
-/// **ADVERSARIAL: a function with NO refutation-target block never mints a
-/// vacuous `true`.** `all()`/count reasoning over an empty set is exactly false
-/// proof #12, and #11 before it. There is nothing to exempt, so the answer is
-/// `false` — behaviour-identical for the caller and unmistakable to a later
-/// reader.
-#[test]
-fn frontb_no_target_block_never_mints_a_vacuous_exemption() {
-    assert!(
-        !panic_block_row_unreachability_premise(0, 0, false),
-        "zero target blocks is the ABSENCE of a question, never its answer"
-    );
-    assert!(!panic_block_row_unreachability_premise(0, 5, false));
-    assert!(!panic_block_row_unreachability_premise(0, 0, true));
-}
-
-/// **ADVERSARIAL, AND THE SHARPEST ONE: a function with TWO OR MORE
-/// refutation-target blocks is refused outright, even when the counts line up.**
-/// MEASURED on the deployed driver (fixture `g_two_panics_one_live`): blocks 5
-/// and 9 are two distinct `panic!` failure blocks whose `Terminator::Call`
-/// carries a BYTE-IDENTICAL `SourceSpan` (`core/src/panic.rs:62:8-62:72`) and
-/// the same callee `core::panicking::panic_fmt` — post-inline, the span is
-/// core's, not the user's. So a row proving block 5 unreachable is
-/// indistinguishable from a row proving block 9, and "as many distinct proved
-/// formulas as blocks" would be satisfiable by two rows that BOTH came from
-/// block 5 while block 9 was silently skipped by the vcgen candidate loop. Rows
-/// cannot be keyed to blocks here, so the evidence is refused rather than
-/// approximated. Multi-panic functions keep the refute lane's own count-checked
-/// flag as their only route.
-#[test]
-fn frontb_two_or_more_panic_blocks_are_refused_because_rows_cannot_be_keyed() {
-    assert!(
-        !panic_block_row_unreachability_premise(2, 2, false),
-        "two target blocks share one span+callee post-inline; a row cannot be \
-         attributed to a block, so this evidence source must refuse"
-    );
-    assert!(!panic_block_row_unreachability_premise(2, 1, false));
-    assert!(!panic_block_row_unreachability_premise(5, 5, false));
-    assert!(!panic_block_row_unreachability_premise(5, 4, false));
-    assert!(!panic_block_row_unreachability_premise(5, 1, false));
-}
-
-/// **ADVERSARIAL: more proved formulas than blocks is also a refusal.** The
-/// count is an EQUALITY, not a `>=`. A surplus means the matcher admitted a row
-/// that is not one of this function's target blocks — a recognizer drift, and
-/// recognizer widening is the shape of five of the twelve false proofs.
-#[test]
-fn frontb_surplus_proved_formulas_are_a_refusal_not_a_bonus() {
-    assert!(!panic_block_row_unreachability_premise(1, 2, false));
-    assert!(!panic_block_row_unreachability_premise(2, 9, false));
-}
-
-/// **THE COMPLETENESS CONTROL.** A function whose every refutation-target block
-/// IS covered by its own distinct, proved, privately-authorized panic-call row
-/// must arm the exemption. Without this the change could be "return false
-/// always", which passes every adversarial test above and makes the whole front
-/// dead weight. The measured population this protects is
-/// `contract_panic_annotated` (1 target block, 1 proved row,
-/// `[PF_SUBSUME] bail(#12/call-gate)` today) and `clamp_via_helper`.
-#[test]
-fn frontb_a_fully_covered_dead_panic_surface_is_exempted() {
-    assert!(
-        panic_block_row_unreachability_premise(1, 1, false),
-        "the one-dead-panic shape must arm the exemption or this front is dead \
-         weight"
-    );
-}
-
-/// Every conjunct is load-bearing: flipping any single one off a satisfied shape
-/// must refuse.
-#[test]
-fn frontb_every_row_unreachability_conjunct_is_load_bearing() {
-    assert!(panic_block_row_unreachability_premise(1, 1, false));
-    assert!(!panic_block_row_unreachability_premise(0, 0, false), "target-count conjunct");
-    assert!(!panic_block_row_unreachability_premise(1, 0, false), "coverage-equality conjunct");
-    assert!(!panic_block_row_unreachability_premise(1, 1, true), "unproved-row conjunct");
-}
-
-
-/// The row-text matcher is an IDENTITY test on compiler-produced data, not a
-/// widenable recognizer. It accepts exactly the two shapes
-/// `trust_vcgen::v2_panic_call_vc_message` can reach this seam in — bare, and
-/// with the contract-panic marker — in either the `Assertion` message spelling
-/// or the `UnsupportedMir` transport restatement's `"assertion: …"` description
-/// with its optional `"; metadata_keys=[…]"` suffix. A DIFFERENT callee whose
-/// name merely starts with this one must not match (that is the `ends_with` /
-/// prefix family of bug, lesson 4).
-#[test]
-fn frontb_panic_call_row_text_matcher_is_an_identity_test() {
-    let callee = "core::panicking::panic_fmt";
-    assert!(described_row_is_panic_call_refutation_for(
-        "panic call: core::panicking::panic_fmt",
-        callee
-    ));
-    assert!(described_row_is_panic_call_refutation_for(
-        "assertion: panic call: core::panicking::panic_fmt",
-        callee
-    ));
-    assert!(described_row_is_panic_call_refutation_for(
-        "[trust-contract-panic] panic call: core::panicking::panic_fmt",
-        callee
-    ));
-    assert!(described_row_is_panic_call_refutation_for(
-        "assertion: [trust-contract-panic] panic call: core::panicking::panic_fmt",
-        callee
-    ));
-    assert!(described_row_is_panic_call_refutation_for(
-        "assertion: panic call: core::panicking::panic_fmt; metadata_keys=[a]",
-        callee
-    ));
-    // A longer callee name that STARTS with the one under test.
-    assert!(!described_row_is_panic_call_refutation_for(
-        "panic call: core::panicking::panic_fmt_nounwind",
-        callee
-    ));
-    // A different obligation family that merely mentions a panic.
-    assert!(!described_row_is_panic_call_refutation_for(
-        "panic freedom: no assertion, `unreachable!`, or panic is reachable",
-        callee
-    ));
-    assert!(!described_row_is_panic_call_refutation_for(
-        "[trust-absent-callee-assumption] call to absent callee `p::f` (body not in \
-         the lowered bundle) may panic",
-        callee
-    ));
-    // The always-refuted unused-annotation row must never be read as a proof.
-    assert!(!described_row_is_panic_call_refutation_for(
-        "[trust-contract-panic-unused] contract_panic(message_contains = \"x\") matched \
-         no panic call in this function",
-        callee
-    ));
-    // The monomorph tag rides inside the callee string; matching is exact.
-    assert!(described_row_is_panic_call_refutation_for(
-        "panic call: p::g::<__trust_args@ab12>",
-        "p::g::<__trust_args@ab12>"
-    ));
-    assert!(!described_row_is_panic_call_refutation_for(
-        "panic call: p::g::<__trust_args@ab12>",
-        "p::g::<__trust_args@ffff>"
-    ));
-}
-
 #[test]
 fn zero_obligation_registry_requires_authenticated_call_totality() {
     let registerable = |function: &trust_types::VerifiableFunction,
@@ -20124,13 +25842,15 @@ fn zero_obligation_registry_requires_authenticated_call_totality() {
 
     let mut wrapper = native_trust_ir_panic_function(true);
     let callee = "demo::ordinary_potentially_failing_callee";
-    let trust_types::Terminator::Call { func, callee_identity, .. } =
+    let trust_types::Terminator::Call { func, callee_identity, callee_key, .. } =
         &mut wrapper.body.blocks[1].terminator
     else {
         panic!("fixture call terminator");
     };
     *func = callee.to_string();
     *callee_identity = None;
+    // An ordinary local callee carries no core diverging-entry key.
+    *callee_key = None;
     assert!(
         !registerable(&wrapper, &empty_names, &empty_identities, &empty_names, &empty_names,),
         "an ordinary unproved callee must keep its empty-result wrapper out of the registry",
@@ -20184,6 +25904,7 @@ fn zero_obligation_registry_requires_authenticated_call_totality() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
     };
     assert!(
         !registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,),
@@ -20225,7 +25946,8 @@ fn contract_assumed_disposition_cannot_seed_dynamic_static_summary() {
     let mut fingerprints = IndexVec::new();
     fingerprints.push(rustc_data_structures::fingerprint::Fingerprint::ZERO);
     let summary = TrustFunctionSummary::from_dispositions(&dispositions);
-    let proof_results = TrustProofResults { dispositions, fingerprints, summary };
+    let proof_results =
+        TrustProofResults { dispositions, fingerprints, summary, premises: Vec::new() };
     assert!(proof_results.is_fully_verified(), "modular contract result remains valid");
     // The SEAM this test exists for is the gated decision, not the row-only core:
     // `has_nonzero_accounted_static_proof` is what the dynamic-summary and rung-2
@@ -20751,12 +26473,16 @@ fn zero_obligation_call_gate_accepts_a_bridge_recognized_total_callee() {
     );
     assert!(
         all_calls_registry_or_bridge_total(
-            &FxHashSet::default(), &FxHashSet::default(),
             &FxHashSet::default(),
             &FxHashSet::default(),
-            &FxHashSet::default(), &FxHashSet::default(),
-            &FxHashSet::default(), &FxHashSet::default(),
-            &function,),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &function,
+        ),
         "a callee the bridge already models as total (and therefore ELIDES, so it \
          can never carry an obligation in EITHER lane) must not block the \
          zero-obligation registry lane"
@@ -20778,12 +26504,16 @@ fn zero_obligation_call_gate_still_refuses_cell_set() {
     );
     assert!(
         !all_calls_registry_or_bridge_total(
-            &FxHashSet::default(), &FxHashSet::default(),
             &FxHashSet::default(),
             &FxHashSet::default(),
-            &FxHashSet::default(), &FxHashSet::default(),
-            &FxHashSet::default(), &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(callee),),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(callee),
+        ),
         "the drop-running Cell::set must keep blocking zero-obligation registration"
     );
 }
@@ -20805,14 +26535,34 @@ fn cell_set_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     // No grant ⇒ blocked (this is the state R14 measured: the bridge had already
     // elided the call, and the gate refused anyway).
     assert!(
-        !all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        !all_calls_registry_or_bridge_total(
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
+            &function
+        ),
         "without a typed grant the call must keep blocking"
     );
 
     // Grant present ⇒ accepted. This is the whole point of the round.
     let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     assert!(
-        all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &granted, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        all_calls_registry_or_bridge_total(
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &granted,
+            &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
+            &function
+        ),
         "a Cell::<T>::set call whose CONCRETE payload the compiler proved needs no \
          drop glue must stop blocking the zero-obligation lane"
     );
@@ -20831,20 +26581,23 @@ fn cell_set_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
 #[test]
 fn cell_set_typed_grant_never_generalizes_across_monomorphizations() {
     let safe = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
-    let panicking =
-        "core::cell::Cell::<core::option::Option<alloc::boxed::Box<A::D>>>::set\
+    let panicking = "core::cell::Cell::<core::option::Option<alloc::boxed::Box<A::D>>>::set\
          ::<__trust_args@fedcba9876543210>";
     let empty = FxHashSet::default();
     let granted: FxHashSet<String> = [safe.to_string()].into_iter().collect();
 
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
-            &granted, &FxHashSet::default(),
-            &empty, &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(panicking),),
+            &granted,
+            &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(panicking),
+        ),
         "a grant for the drop-glue-free payload must NOT discharge a Cell::set whose \
          payload owns a panicking Drop"
     );
@@ -20879,12 +26632,16 @@ fn cell_set_typed_grant_does_not_discharge_a_neighbouring_callee() {
     ] {
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(),
+                &empty,
+                &FxHashSet::default(),
                 &empty,
                 &empty,
-                &granted, &FxHashSet::default(),
-                &empty, &FxHashSet::default(),
-                &zero_obligation_gate_fixture_calling(other),),
+                &granted,
+                &FxHashSet::default(),
+                &empty,
+                &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(other),
+            ),
             "`{other}` must keep blocking despite an unrelated Cell::set grant"
         );
     }
@@ -20916,13 +26673,16 @@ fn moved_value_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     );
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
             &empty,
             &empty,
-            &empty, &FxHashSet::default(),
-            &function,),
+            &empty,
+            &FxHashSet::default(),
+            &function,
+        ),
         "without a typed grant the moved-value call must keep blocking"
     );
 
@@ -20931,13 +26691,16 @@ fn moved_value_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     assert!(
         all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
             &empty,
             &granted,
-            &empty, &FxHashSet::default(),
-            &function,),
+            &empty,
+            &FxHashSet::default(),
+            &function,
+        ),
         "an `Option::<T>::unwrap_or` whose CONCRETE operands the compiler proved need \
          no drop glue must stop blocking the zero-obligation lane"
     );
@@ -20962,13 +26725,16 @@ fn moved_value_typed_grant_never_generalizes_across_monomorphizations() {
 
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
             &empty,
             &granted,
-            &empty, &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(panicking),),
+            &empty,
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(panicking),
+        ),
         "a grant for the drop-glue-free payload must NOT discharge an `unwrap_or` \
          whose payload owns a panicking Drop"
     );
@@ -20983,13 +26749,16 @@ fn moved_value_typed_grant_never_generalizes_across_monomorphizations() {
     ] {
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(),
+                &empty,
+                &FxHashSet::default(),
                 &empty,
                 &empty,
                 &empty,
                 &granted,
-                &empty, &FxHashSet::default(),
-                &zero_obligation_gate_fixture_calling(other),),
+                &empty,
+                &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(other),
+            ),
             "`{other}` must keep blocking despite an unrelated moved-value grant"
         );
     }
@@ -21026,34 +26795,46 @@ fn tls_const_init_try_with_grant_is_per_call_and_never_a_name_surface() {
     // WITHOUT a grant the call keeps blocking registration.
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
-            &empty, &FxHashSet::default(),
-            &empty, &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(const_init),),
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(const_init),
+        ),
         "an un-granted `try_with` must keep the zero-obligation registry lane closed"
     );
     // WITH the grant, exactly that call clears.
     assert!(
         all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
-            &empty, &FxHashSet::default(),
-            &granted, &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(const_init),),
+            &empty,
+            &FxHashSet::default(),
+            &granted,
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(const_init),
+        ),
         "the per-caller const-init grant must discharge the call it names"
     );
     // ...and NOT the LAZY key's call, whose accessor runs user initializer code.
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
             &empty,
             &empty,
-            &empty, &FxHashSet::default(),
-            &granted, &FxHashSet::default(),
-            &zero_obligation_gate_fixture_calling(lazy),),
+            &empty,
+            &FxHashSet::default(),
+            &granted,
+            &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(lazy),
+        ),
         "a const-init grant must NOT discharge a LAZY key's `try_with` (false proof #13)"
     );
     // Neither spelling — nor `LocalKey::with` — may ever join the NAME-ONLY surface.
@@ -21088,12 +26869,16 @@ fn zero_obligation_call_gate_still_refuses_the_false_proof_11_callee() {
         );
         assert!(
             !all_calls_registry_or_bridge_total(
-                &FxHashSet::default(), &FxHashSet::default(),
                 &FxHashSet::default(),
                 &FxHashSet::default(),
-                &FxHashSet::default(), &FxHashSet::default(),
-                &FxHashSet::default(), &FxHashSet::default(),
-                &zero_obligation_gate_fixture_calling(callee),),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(callee),
+            ),
             "`{callee}` must keep the zero-obligation registry lane closed"
         );
     }
@@ -21107,21 +26892,80 @@ fn zero_obligation_call_gate_registry_arms_remain_exact() {
     let callee = "demo::unrecognized_leaf";
     let function = zero_obligation_gate_fixture_calling(callee);
     let empty = FxHashSet::default();
-    assert!(!all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+    assert!(!all_calls_registry_or_bridge_total(
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &empty,
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &FxHashSet::default(),
+        &function
+    ));
 
     let mut lookalike = FxHashSet::default();
     lookalike.insert("demo::unrecognized_leaf_extra".to_string());
     lookalike.insert("unrecognized_leaf".to_string());
     assert!(
-        !all_calls_registry_or_bridge_total(&lookalike, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        !all_calls_registry_or_bridge_total(
+            &lookalike,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &FxHashSet::default(),
+            &function
+        ),
         "registry membership is exact-string, never a prefix/suffix match"
     );
 
     let mut exact = FxHashSet::default();
     exact.insert(callee.to_string());
-    assert!(all_calls_registry_or_bridge_total(&exact, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
-    assert!(all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &exact, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
-    assert!(all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &exact, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+    assert!(!all_calls_registry_or_bridge_total(
+        &exact,
+        &FxHashSet::default(),
+        &empty,
+        &empty,
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &FxHashSet::default(),
+        &function
+    ));
+    assert!(all_calls_registry_or_bridge_total(
+        &empty,
+        &FxHashSet::default(),
+        &exact,
+        &empty,
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &FxHashSet::default(),
+        &function
+    ));
+    assert!(all_calls_registry_or_bridge_total(
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &exact,
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &FxHashSet::default(),
+        &function
+    ));
+    let identity = blessing_identity(99);
+    let mut identified = function.clone();
+    let trust_types::Terminator::Call { callee_identity, .. } =
+        &mut identified.body.blocks[1].terminator else { unreachable!() };
+    *callee_identity = Some(identity);
+    let identities = [identity].into_iter().collect();
+    assert!(all_calls_registry_or_bridge_total(
+        &exact, &identities, &empty, &empty, &empty, &empty, &empty, &empty, &identified,
+    ));
 }
 
 // ===========================================================================
@@ -21166,7 +27010,15 @@ fn typed_self_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     );
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &function
         ),
         "without this caller's typed grant the call must keep blocking"
     );
@@ -21175,7 +27027,15 @@ fn typed_self_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     assert!(
         all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &granted,
+            &function
         ),
         "a `to_string` whose instantiated `Self` the compiler confirmed is `TyKind::Str` \
          must stop blocking the zero-obligation lane"
@@ -21216,9 +27076,7 @@ fn typed_self_arm_has_no_string_backdoor() {
 
     // (c) the `__trust_crate@` duplicate-crate disambiguator must not launder it.
     assert!(!total("__trust_crate@0123456789abcdef::<u64 as core::cmp::Ord>::max"));
-    assert!(!total(
-        "__trust_crate@0123456789abcdef::<str as alloc::string::ToString>::to_string"
-    ));
+    assert!(!total("__trust_crate@0123456789abcdef::<str as alloc::string::ToString>::to_string"));
     // …nor the monomorph-tag turbofish the extractor appends.
     assert!(!total(
         "<str as alloc::string::ToString>::to_string::<__trust_args@d440356f4eda3cbfcbc3129892185705>"
@@ -21234,10 +27092,19 @@ fn typed_self_arm_has_no_string_backdoor() {
     let callee = "<u64 as core::cmp::Ord>::max";
     let function = zero_obligation_gate_fixture_calling(callee);
     let empty = FxHashSet::default();
-    let other: FxHashSet<String> = ["<u32 as core::cmp::Ord>::max".to_string()].into_iter().collect();
+    let other: FxHashSet<String> =
+        ["<u32 as core::cmp::Ord>::max".to_string()].into_iter().collect();
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &other, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &other,
+            &function
         ),
         "a grant for a DIFFERENT call key must not discharge this one"
     );
@@ -21248,7 +27115,15 @@ fn typed_self_arm_has_no_string_backdoor() {
     let typed: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     assert!(
         all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &typed, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &typed,
+            &function
         ),
         "control: the typed-self record itself does admit the key"
     );
@@ -21268,7 +27143,15 @@ fn typed_self_empty_record_admits_nothing() {
         let function = zero_obligation_gate_fixture_calling(callee);
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+                &empty,
+                &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &function
             ),
             "an absent caller record must admit nothing: {callee}"
         );
@@ -21353,7 +27236,15 @@ fn string_deref_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     );
     assert!(
         !all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &function
         ),
         "without this caller's typed grant the call must keep blocking"
     );
@@ -21361,7 +27252,15 @@ fn string_deref_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
     let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     assert!(
         all_calls_registry_or_bridge_total(
-            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &granted,
+            &function
         ),
         "a `deref` whose instantiated `Self` the compiler confirmed IS the `String` \
          lang item must stop blocking the zero-obligation lane"
@@ -21392,7 +27291,15 @@ fn string_deref_arm_has_no_string_backdoor() {
         let function = zero_obligation_gate_fixture_calling(forged);
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+                &empty,
+                &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &granted,
+                &function
             ),
             "a grant minted for the honest `alloc::string::String` key must not \
              discharge the forged bare-`String` key: {forged}"
@@ -21412,7 +27319,15 @@ fn string_deref_arm_has_no_string_backdoor() {
         let function = zero_obligation_gate_fixture_calling(mimic);
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+                &empty,
+                &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &granted,
+                &function
             ),
             "path mimicry must not ride the honest grant: {mimic}"
         );
@@ -21429,7 +27344,15 @@ fn string_deref_arm_has_no_string_backdoor() {
         let function = zero_obligation_gate_fixture_calling(impostor);
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+                &empty,
+                &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &granted,
+                &function
             ),
             "a `__trust_crate@`/`__trust_args@` variant is a DIFFERENT key and must \
              not ride the honest grant: {impostor}"
@@ -21447,7 +27370,15 @@ fn string_deref_arm_has_no_string_backdoor() {
         let function = zero_obligation_gate_fixture_calling(other);
         assert!(
             !all_calls_registry_or_bridge_total(
-                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+                &empty,
+                &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &empty,
+                &granted,
+                &function
             ),
             "the record is an EXACT call-key set; `{other}` must not ride the \
              `String::deref` grant"
@@ -21465,7 +27396,8 @@ fn string_deref_arm_has_no_string_backdoor() {
          the `String::deref` record"
     );
     assert!(all_calls_registry_or_bridge_total(
-        &empty, &FxHashSet::default(),
+        &empty,
+        &FxHashSet::default(),
         &empty,
         &empty,
         &empty,
@@ -21479,7 +27411,15 @@ fn string_deref_arm_has_no_string_backdoor() {
     //     live arm rather than of an inert one.
     let function = zero_obligation_gate_fixture_calling(honest);
     assert!(all_calls_registry_or_bridge_total(
-        &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+        &empty,
+        &FxHashSet::default(),
+        &empty,
+        &empty,
+        &empty,
+        &empty,
+        &empty,
+        &granted,
+        &function
     ));
 }
 
@@ -21576,7 +27516,75 @@ fn proven_total_generic_callee_needs_the_parametric_premise() {
     }
 }
 
+/// OD-1 (2026-10-04), pinned at unit level by T6 (2026-10-09): the structural
+/// conjuncts of `sole_reified_constant_of_callee`, on hand-built MIR. A fn-pointer
+/// local is PINNED to the item it was reified from only when it has exactly one
+/// whole assignment, is never borrowed or address-taken, and no call writes it.
+/// `instance_hypothesis/fn_pointer_reseated_not_admitted.rs` pinned the
+/// exactly-one-assignment conjunct end to end under `-Zmir-opt-level=2`; a proof
+/// session refuses that option and its `-O0` pipeline keeps the call temporary
+/// that refuses the reseated site first, so only this test still sees the
+/// conjunct. Dropping it admitted `p = T::m; if b { p = T::n } p(t)` as `T::n`
+/// alone, and `T::m` was never discharged.
+#[test]
+fn a_local_assigned_twice_has_no_sole_value() {
+    use rustc_middle::mir::{Operand, RawPtrKind, Rvalue, Statement, StatementKind, WithRetag};
+    let source_info = SourceInfo::outermost(rustc_span::DUMMY_SP);
+    let place = |n: usize| Place::from(Local::from_usize(n));
+    let assign = |dest: usize, rvalue: Rvalue<'static>| {
+        Statement::new(source_info, StatementKind::Assign(Box::new((place(dest), rvalue))))
+    };
+    let copy_of = |n: usize| Rvalue::Use(Operand::Copy(place(n)), WithRetag::Yes);
+    let body_of = |statements: Vec<Statement<'static>>, terminator: TerminatorKind<'static>| {
+        let mut block =
+            BasicBlockData::new(Some(Terminator { source_info, kind: terminator }), false);
+        block.statements = statements;
+        let blocks: IndexVec<BasicBlock, BasicBlockData<'static>> = IndexVec::from_raw(vec![block]);
+        Body::new_cfg_only(blocks)
+    };
+    // `pick` accepts any copy, so only the structural conjuncts decide.
+    let pick =
+        |rvalue: &Rvalue<'_>| matches!(rvalue, Rvalue::Use(Operand::Copy(_), _)).then_some(());
+    let p = Local::from_usize(1);
+
+    // One whole assignment: the local's value.
+    let once = body_of(vec![assign(1, copy_of(2))], TerminatorKind::Return);
+    assert_eq!(sole_whole_assignment(&once, p, pick), Some(()));
+    // THE CONJUNCT: reseated — two whole assignments, each one `pick` accepts.
+    let twice = body_of(vec![assign(1, copy_of(2)), assign(1, copy_of(3))], TerminatorKind::Return);
+    assert_eq!(
+        sole_whole_assignment(&twice, p, pick),
+        None,
+        "a local assigned twice is pinned to neither value"
+    );
+    // Never assigned: no value.
+    let never = body_of(vec![assign(4, copy_of(2))], TerminatorKind::Return);
+    assert_eq!(sole_whole_assignment(&never, p, pick), None);
+    // Address taken anywhere: a write through the pointer is invisible here.
+    let escaped = body_of(
+        vec![assign(1, copy_of(2)), assign(4, Rvalue::RawPtr(RawPtrKind::Const, place(1)))],
+        TerminatorKind::Return,
+    );
+    assert_eq!(sole_whole_assignment(&escaped, p, pick), None);
+    // Written by a call.
+    let call = TerminatorKind::Call {
+        func: Operand::Copy(place(5)),
+        args: Vec::new().into_boxed_slice(),
+        destination: place(1),
+        target: None,
+        unwind: UnwindAction::Continue,
+        call_source: rustc_middle::mir::CallSource::Normal,
+        fn_span: rustc_span::DUMMY_SP,
+    };
+    let call_written = body_of(vec![assign(1, copy_of(2))], call);
+    assert_eq!(sole_whole_assignment(&call_written, p, pick), None);
+}
+
 /// R43 — `body_is_parametrically_panic_free` is an ALLOWLIST over terminators.
+///
+/// Trust (2026-10-14 merge): its first shape, `body_is_control_flow_only`, is what
+/// this pins; the second (`body_is_parameter_independent`, sweep m15) needs a
+/// `TyCtxt` and declines the same terminators in its own exhaustive match.
 ///
 /// The accepted shape is the one MEASURED for `fn err_barrier<E>(e: E) -> E { e }`
 /// on the deployed driver with `-Zdump-mir` (`bb0: { _0 = move _1; return; }`).
@@ -21592,7 +27600,6 @@ fn parametric_panic_freedom_is_a_terminator_allowlist() {
                     Some(Terminator {
                         source_info: SourceInfo::outermost(rustc_span::DUMMY_SP),
                         kind,
-                        attributes: Default::default(),
                     }),
                     false,
                 )
@@ -21603,9 +27610,9 @@ fn parametric_panic_freedom_is_a_terminator_allowlist() {
     let bb0 = BasicBlock::from_usize(0);
 
     // ACCEPTED: the identity shape, and a branchy but call-free/drop-free one.
-    assert!(body_is_parametrically_panic_free(&body_of(vec![TerminatorKind::Return])));
-    assert!(body_is_parametrically_panic_free(&body_of(vec![
-        TerminatorKind::Goto { target: bb0 },
+    assert!(body_is_control_flow_only(&body_of(vec![TerminatorKind::Return])));
+    assert!(body_is_control_flow_only(&body_of(vec![
+        TerminatorKind::Goto { target: bb0, loop_hint_attrs: Default::default() },
         TerminatorKind::Return,
     ])));
 
@@ -21615,7 +27622,7 @@ fn parametric_panic_freedom_is_a_terminator_allowlist() {
     // argument, which is exactly how `fn sink<E>(_e: E) {}` panics at
     // `E = PanickingDrop` while its generic body looks trivial.
     assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
+        !body_is_control_flow_only(&body_of(vec![
             TerminatorKind::Drop {
                 place: Place::from(Local::from_usize(0)),
                 target: bb0,
@@ -21628,38 +27635,34 @@ fn parametric_panic_freedom_is_a_terminator_allowlist() {
         "a generic `Drop` runs caller-chosen user code and must decline"
     );
     assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
+        !body_is_control_flow_only(&body_of(vec![
             TerminatorKind::UnwindResume,
             TerminatorKind::Return,
         ])),
         "the allowlist is deliberately tighter than `cannot itself panic`: a \
          cleanup path is evidence of a shape this predicate has not reasoned about"
     );
+    assert!(!body_is_control_flow_only(&body_of(vec![
+        TerminatorKind::UnwindTerminate(rustc_middle::mir::UnwindTerminateReason::Abi),
+        TerminatorKind::Return,
+    ])),);
     assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
-            TerminatorKind::UnwindTerminate(rustc_middle::mir::UnwindTerminateReason::Abi),
-            TerminatorKind::Return,
-        ])),
-    );
-    assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
+        !body_is_control_flow_only(&body_of(vec![
             TerminatorKind::Unreachable,
             TerminatorKind::Return,
         ])),
         "an allowlist declines terminators it has not reasoned about, including \
          ones that are not panics"
     );
-    assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
-            TerminatorKind::CoroutineDrop,
-            TerminatorKind::Return,
-        ])),
-    );
+    assert!(!body_is_control_flow_only(&body_of(vec![
+        TerminatorKind::CoroutineDrop,
+        TerminatorKind::Return,
+    ])),);
     // ...and the acceptance is per-BLOCK, so one bad block in an otherwise clean
     // body declines the whole body.
     assert!(
-        !body_is_parametrically_panic_free(&body_of(vec![
-            TerminatorKind::Goto { target: bb0 },
+        !body_is_control_flow_only(&body_of(vec![
+            TerminatorKind::Goto { target: bb0, loop_hint_attrs: Default::default() },
             TerminatorKind::Return,
             TerminatorKind::CoroutineDrop,
         ])),
@@ -21677,36 +27680,44 @@ fn parametric_panic_freedom_is_a_terminator_allowlist() {
 // greatest-fixed-point or an optimistic-assume-then-check scheme WOULD bless, and
 // each of those would be a false proof.
 
-fn blessing_candidate(def_path: &str, callees: &[&str]) -> ZeroObligationBlessingCandidate {
+// Explicit synthetic compiler-assigned ids for these pure state-machine
+// fixtures. Labels below are diagnostics; no production identity uses them.
+fn blessing_owner(index: u32) -> DefId {
+    DefId { krate: CrateNum::from_u32(7), index: rustc_span::def_id::DefIndex::from_u32(index) }
+}
+fn blessing_identity(index: u32) -> trust_types::CalleeIdentity {
+    trust_types::CalleeIdentity {
+        stable_crate_id: 0x4f57_4e45_52, def_index: index, substs_digest: [0x1122, 0x3344],
+    }
+}
+fn blessing_candidate(
+    owner_index: u32,
+    def_path: &str,
+    callees: &[(&str, Option<trust_types::CalleeIdentity>)],
+) -> ZeroObligationBlessingCandidate {
     ZeroObligationBlessingCandidate {
+        owner: blessing_owner(owner_index), identity: Some(blessing_identity(owner_index)),
         def_path: def_path.to_string(),
-        // R45: these fixtures exercise the STRING arms, so every call carries the
-        // fail-closed `None` identity — the pre-R45 decision procedure exactly.
-        callees: callees.iter().map(|callee| ((*callee).to_string(), None)).collect(),
-        cell_set_total: FxHashSet::default(),
-        moved_value_total: FxHashSet::default(),
-        tls_try_with_total: FxHashSet::default(),
-        typed_self_total: FxHashSet::default(),
+        callees: callees.iter().map(|(label, identity)| ((*label).to_string(), *identity)).collect(),
+        cell_set_total: FxHashSet::default(), moved_value_total: FxHashSet::default(),
+        tls_try_with_total: FxHashSet::default(), typed_self_total: FxHashSet::default(),
     }
 }
 
-/// Run the fixpoint with the bound production uses (`len + 1`), which monotone
-/// growth over a finite set always satisfies.
+/// The real owner-keyed fixpoint, mapped to diagnostic labels ONLY for these
+/// pre-existing distinct-label assertions. Collision regressions read owner sets.
 fn blessed_by_fixpoint(
     candidates: &[ZeroObligationBlessingCandidate],
-    proven: &[&str],
+    proven: &[(u32, &str)],
 ) -> FxHashSet<String> {
-    let proven: FxHashSet<String> =
-        proven.iter().map(|def_path| (*def_path).to_string()).collect();
-    zero_obligation_blessing_least_fixpoint(
-        candidates,
-        &proven,
-        &FxHashSet::default(),
-        &FxHashSet::default(),
-        &FxHashSet::default(),
+    let names = proven.iter().map(|(_, label)| (*label).to_string()).collect();
+    let identities = proven.iter().map(|(index, _)| blessing_identity(*index)).collect();
+    let blessed = zero_obligation_blessing_least_fixpoint(
+        candidates, &names, &identities, &FxHashSet::default(), &FxHashSet::default(),
         candidates.len().saturating_add(1),
-    )
-    .expect("monotone growth over a finite candidate set converges within len + 1 rounds")
+    ).expect("monotone owner growth converges within len + 1 rounds");
+    candidates.iter().filter(|candidate| blessed.contains(&candidate.owner))
+        .map(|candidate| candidate.def_path.clone()).collect()
 }
 
 /// POSITIVE. A genuinely panic-free chain `leaf -> mid -> top`, where all three
@@ -21717,9 +27728,9 @@ fn blessed_by_fixpoint(
 #[test]
 fn zero_obligation_blessing_lifts_a_genuinely_total_chain() {
     let candidates = [
-        blessing_candidate("demo::leaf", &[]),
-        blessing_candidate("demo::mid", &["demo::leaf"]),
-        blessing_candidate("demo::top", &["demo::mid"]),
+        blessing_candidate(1, "demo::leaf", &[]),
+        blessing_candidate(2, "demo::mid", &[("demo::leaf", Some(blessing_identity(1)))]),
+        blessing_candidate(3, "demo::top", &[("demo::mid", Some(blessing_identity(2)))]),
     ];
     let blessed = blessed_by_fixpoint(&candidates, &[]);
     for def_path in ["demo::leaf", "demo::mid", "demo::top"] {
@@ -21733,13 +27744,13 @@ fn zero_obligation_blessing_lifts_a_genuinely_total_chain() {
 /// that callee is in the registry, instead of being written off forever.
 #[test]
 fn zero_obligation_blessing_absorbs_a_late_arriving_callee_proof() {
-    let candidates = [blessing_candidate("demo::caller", &["demo::callee"])];
+    let candidates = [blessing_candidate(4, "demo::caller", &[("demo::callee", Some(blessing_identity(5)))])];
     assert!(
         blessed_by_fixpoint(&candidates, &[]).is_empty(),
         "with the callee still unregistered the caller must stay unblessed"
     );
     assert!(
-        blessed_by_fixpoint(&candidates, &["demo::callee"]).contains("demo::caller"),
+        blessed_by_fixpoint(&candidates, &[(5, "demo::callee")]).contains("demo::caller"),
         "a callee proved AFTER the caller's own gate ran must still lift the caller"
     );
 }
@@ -21757,9 +27768,9 @@ fn zero_obligation_blessing_absorbs_a_late_arriving_callee_proof() {
 #[test]
 fn zero_obligation_blessing_never_blesses_mutual_recursion_or_its_caller() {
     let candidates = [
-        blessing_candidate("demo::a", &["demo::b"]),
-        blessing_candidate("demo::b", &["demo::a"]),
-        blessing_candidate("demo::caller_of_cycle", &["demo::a"]),
+        blessing_candidate(6, "demo::a", &[("demo::b", Some(blessing_identity(7)))]),
+        blessing_candidate(7, "demo::b", &[("demo::a", Some(blessing_identity(6)))]),
+        blessing_candidate(8, "demo::caller_of_cycle", &[("demo::a", Some(blessing_identity(6)))]),
     ];
     assert!(
         blessed_by_fixpoint(&candidates, &[]).is_empty(),
@@ -21772,13 +27783,13 @@ fn zero_obligation_blessing_never_blesses_mutual_recursion_or_its_caller() {
 /// discharge its own call.
 #[test]
 fn zero_obligation_blessing_never_blesses_self_recursion() {
-    let candidates = [blessing_candidate("demo::f", &["demo::f"])];
+    let candidates = [blessing_candidate(9, "demo::f", &[("demo::f", Some(blessing_identity(9)))])];
     assert!(blessed_by_fixpoint(&candidates, &[]).is_empty(), "self-recursion must fail closed");
 
     // ...and it is not rescued by ALSO calling something genuinely total.
     let candidates = [
-        blessing_candidate("demo::leaf", &[]),
-        blessing_candidate("demo::f", &["demo::leaf", "demo::f"]),
+        blessing_candidate(1, "demo::leaf", &[]),
+        blessing_candidate(9, "demo::f", &[("demo::leaf", Some(blessing_identity(1))), ("demo::f", Some(blessing_identity(9)))]),
     ];
     let blessed = blessed_by_fixpoint(&candidates, &[]);
     assert!(blessed.contains("demo::leaf"));
@@ -21806,9 +27817,9 @@ fn zero_obligation_blessing_never_blesses_a_call_to_a_panicking_callee() {
             "precondition: `{callee}` must not be a recognized total call"
         );
         let candidates = [
-            blessing_candidate("fa11::fa_caller_div0", &[callee]),
+            blessing_candidate(10, "fa11::fa_caller_div0", &[(callee, None)]),
             // ...and the caller's own caller must not be lifted either.
-            blessing_candidate("fa11::fa_caller_of_caller", &["fa11::fa_caller_div0"]),
+            blessing_candidate(11, "fa11::fa_caller_of_caller", &[("fa11::fa_caller_div0", Some(blessing_identity(10)))]),
         ];
         assert!(
             blessed_by_fixpoint(&candidates, &[]).is_empty(),
@@ -21877,8 +27888,8 @@ fn zero_obligation_blessing_never_blesses_a_function_whose_obligations_were_neve
     // (2) The consequence for the fixpoint: `demo::budget_expired` is NOT a
     // candidate, so it cannot be blessed and cannot lift its caller.
     let candidates = [
-        blessing_candidate("demo::leaf", &[]),
-        blessing_candidate("demo::top", &["demo::budget_expired"]),
+        blessing_candidate(1, "demo::leaf", &[]),
+        blessing_candidate(3, "demo::top", &[("demo::budget_expired", Some(blessing_identity(12)))]),
     ];
     let blessed = blessed_by_fixpoint(&candidates, &[]);
     assert!(blessed.contains("demo::leaf"));
@@ -21901,9 +27912,9 @@ fn zero_obligation_blessing_never_blesses_a_function_whose_obligations_were_neve
 #[test]
 fn zero_obligation_blessing_stages_one_round_per_level_and_bounds_fail_closed() {
     let candidates = [
-        blessing_candidate("demo::leaf", &[]),
-        blessing_candidate("demo::mid", &["demo::leaf"]),
-        blessing_candidate("demo::top", &["demo::mid"]),
+        blessing_candidate(1, "demo::leaf", &[]),
+        blessing_candidate(2, "demo::mid", &[("demo::leaf", Some(blessing_identity(1)))]),
+        blessing_candidate(3, "demo::top", &[("demo::mid", Some(blessing_identity(2)))]),
     ];
     let empty = FxHashSet::default();
     let run = |max_rounds| {
@@ -21938,25 +27949,13 @@ fn zero_obligation_blessing_stages_one_round_per_level_and_bounds_fail_closed() 
 #[test]
 fn zero_obligation_blessing_is_independent_of_candidate_order() {
     let forward = [
-        blessing_candidate("demo::leaf", &[]),
-        blessing_candidate("demo::mid", &["demo::leaf"]),
-        blessing_candidate("demo::top", &["demo::mid"]),
-        blessing_candidate("demo::a", &["demo::b"]),
-        blessing_candidate("demo::b", &["demo::a"]),
+        blessing_candidate(1, "demo::leaf", &[]),
+        blessing_candidate(2, "demo::mid", &[("demo::leaf", Some(blessing_identity(1)))]),
+        blessing_candidate(3, "demo::top", &[("demo::mid", Some(blessing_identity(2)))]),
+        blessing_candidate(6, "demo::a", &[("demo::b", Some(blessing_identity(7)))]),
+        blessing_candidate(7, "demo::b", &[("demo::a", Some(blessing_identity(6)))]),
     ];
-    let mut reversed: Vec<ZeroObligationBlessingCandidate> = Vec::new();
-    for candidate in forward.iter().rev() {
-        reversed.push(blessing_candidate(
-            &candidate.def_path,
-            // R45: `blessing_candidate` re-attaches the fail-closed `None` identity,
-            // so the reversed copy is the same candidate in both halves.
-            &candidate
-                .callees
-                .iter()
-                .map(|(callee, _identity)| callee.as_str())
-                .collect::<Vec<_>>(),
-        ));
-    }
+    let reversed: Vec<ZeroObligationBlessingCandidate> = forward.iter().rev().cloned().collect();
     assert_eq!(blessed_by_fixpoint(&forward, &[]), blessed_by_fixpoint(&reversed, &[]));
     assert_eq!(blessed_by_fixpoint(&forward, &[]).len(), 3, "the cycle contributes nothing");
 }
@@ -21966,9 +27965,9 @@ fn zero_obligation_blessing_is_independent_of_candidate_order() {
 /// FROM. It must not be re-published as a fixpoint blessing.
 #[test]
 fn zero_obligation_blessing_skips_already_registered_functions() {
-    let candidates = [blessing_candidate("demo::leaf", &[])];
+    let candidates = [blessing_candidate(1, "demo::leaf", &[])];
     assert!(
-        blessed_by_fixpoint(&candidates, &["demo::leaf"]).is_empty(),
+        blessed_by_fixpoint(&candidates, &[(1, "demo::leaf")]).is_empty(),
         "an already-registered function is seed, not a new blessing"
     );
 }
@@ -21981,9 +27980,9 @@ fn zero_obligation_blessing_keeps_the_typed_arms_per_caller() {
     let cell_set = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
     let granted = ZeroObligationBlessingCandidate {
         cell_set_total: [cell_set.to_string()].into_iter().collect(),
-        ..blessing_candidate("demo::granted", &[cell_set])
+        ..blessing_candidate(13, "demo::granted", &[(cell_set, None)])
     };
-    let ungranted = blessing_candidate("demo::ungranted", &[cell_set]);
+    let ungranted = blessing_candidate(14, "demo::ungranted", &[(cell_set, None)]);
     let blessed = blessed_by_fixpoint(&[granted, ungranted], &[]);
     assert!(
         blessed.contains("demo::granted"),
@@ -21999,9 +27998,9 @@ fn zero_obligation_blessing_keeps_the_typed_arms_per_caller() {
     let unwrap_or = "core::option::Option::<ny_cert::rational::Rat>::unwrap_or";
     let mv_granted = ZeroObligationBlessingCandidate {
         moved_value_total: [unwrap_or.to_string()].into_iter().collect(),
-        ..blessing_candidate("demo::mv_granted", &[unwrap_or])
+        ..blessing_candidate(15, "demo::mv_granted", &[(unwrap_or, None)])
     };
-    let mv_ungranted = blessing_candidate("demo::mv_ungranted", &[unwrap_or]);
+    let mv_ungranted = blessing_candidate(16, "demo::mv_ungranted", &[(unwrap_or, None)]);
     let blessed = blessed_by_fixpoint(&[mv_granted, mv_ungranted], &[]);
     assert!(
         blessed.contains("demo::mv_granted"),
@@ -22011,6 +28010,326 @@ fn zero_obligation_blessing_keeps_the_typed_arms_per_caller() {
         !blessed.contains("demo::mv_ungranted"),
         "a moved-value grant is published PER CALLER and must never leak"
     );
+}
+
+/// NEW-TAILCALL fixture: the `zero_obligation_gate_fixture_calling` body with its
+/// one call written as `become callee()` — the `Terminator::TailCall` rustc MIR,
+/// and so the extractor, produces for `become`. The two fixtures differ in
+/// exactly the call terminator's variant.
+fn tail_call_gate_fixture_calling(
+    callee: &str,
+    callee_identity: Option<trust_types::CalleeIdentity>,
+) -> trust_types::VerifiableFunction {
+    let mut function = native_trust_ir_panic_function(false);
+    function.body.blocks[1].terminator = trust_types::Terminator::TailCall {
+        func: callee.to_string(),
+        args: Vec::new(),
+        span: native_trust_ir_test_span(31),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity,
+        callee_key: None,
+    };
+    function
+}
+
+/// NEW-TAILCALL — the zero-obligation / postcondition-only registration gate
+/// EXAMINES a tail call, and decides it by the same arms as the same call
+/// without `become`.
+///
+/// FAILS ON UNFIXED CODE: the gate collected `Terminator::Call` keys only, so the
+/// tail-call body produced an EMPTY callee list and the gate answered `true` —
+/// the shape that registered `tail(x) { become boom(x) }` unconditionally
+/// panic-free over a `boom` that panics (measured on stage 1; see
+/// `extracted_call_sites`).
+#[test]
+fn zero_obligation_call_gate_examines_a_tail_call() {
+    let empty: FxHashSet<String> = FxHashSet::default();
+    let no_identities: FxHashSet<trust_types::CalleeIdentity> = FxHashSet::default();
+    let gate = |proven: &FxHashSet<String>,
+                identities: &FxHashSet<trust_types::CalleeIdentity>,
+                function: &trust_types::VerifiableFunction| {
+        all_calls_registry_or_bridge_total(
+            proven, identities, &empty, &empty, &empty, &empty, &empty, &empty, function,
+        )
+    };
+    let callee = "tailcall::boom";
+    let plain = zero_obligation_gate_fixture_calling(callee);
+    let tail = tail_call_gate_fixture_calling(callee, None);
+
+    // An unregistered callee blocks, with and without `become`.
+    assert!(!gate(&empty, &no_identities, &plain), "control: the plain call blocks");
+    assert!(
+        !gate(&empty, &no_identities, &tail),
+        "a tail call to an unregistered callee must block registration exactly as the \
+         plain call does; a gate that never examines it passes the body vacuously"
+    );
+
+    // A same-rendered name alone clears neither call shape.
+    let registered: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(!gate(&registered, &no_identities, &plain));
+    assert!(!gate(&registered, &no_identities, &tail));
+    let identity = trust_types::CalleeIdentity {
+        stable_crate_id: 0x7a11_ca11, def_index: 5, substs_digest: [0x1111, 0x2222],
+    };
+    let identities: FxHashSet<trust_types::CalleeIdentity> = [identity].into_iter().collect();
+    let mut identified_plain = plain.clone();
+    let trust_types::Terminator::Call { callee_identity, .. } =
+        &mut identified_plain.body.blocks[1].terminator else { unreachable!() };
+    *callee_identity = Some(identity);
+    assert!(gate(&registered, &identities, &identified_plain), "the authenticated plain call remains admitted");
+    assert!(
+        gate(&empty, &identities, &tail_call_gate_fixture_calling(callee, Some(identity))),
+        "a tail call carrying a registered authenticated identity clears on the identity arm"
+    );
+    assert!(
+        !gate(&empty, &identities, &tail),
+        "a tail call with no identity is not rescued by someone else's registration"
+    );
+}
+
+/// NEW-TAILCALL — R40 records the SAME call surface the production gate walks,
+/// tail calls included, so the blessing fixpoint cannot bless a body whose
+/// `become f(..)` that gate refused.
+///
+/// MUTANT WITNESS: with the `Terminator::TailCall` arm of `extracted_call_sites`
+/// answering "not a call" (the pre-fix `Terminator::Call`-only walk), the surface
+/// below is EMPTY and the fixpoint blesses `tailcall::tail` in its first round.
+#[test]
+fn zero_obligation_blessing_records_a_tail_call() {
+    let callee = "tailcall::boom";
+    let surface =
+        zero_obligation_blessing_call_surface(&tail_call_gate_fixture_calling(callee, None))
+            .expect("every terminator of this body is classified");
+    assert_eq!(surface, vec![(callee.to_string(), None)]);
+
+    let candidate = ZeroObligationBlessingCandidate {
+        callees: surface,
+        ..blessing_candidate(17, "tailcall::tail", &[])
+    };
+    assert!(
+        !blessed_by_fixpoint(std::slice::from_ref(&candidate), &[]).contains("tailcall::tail"),
+        "a candidate whose only call is an unregistered tail call must not be blessed"
+    );
+    assert!(blessed_by_fixpoint(std::slice::from_ref(&candidate), &[(18, callee)]).is_empty(),
+        "a seed name cannot authenticate this unidentified tail call");
+    let identified = ZeroObligationBlessingCandidate {
+        callees: zero_obligation_blessing_call_surface(&tail_call_gate_fixture_calling(
+            callee, Some(blessing_identity(18)),
+        )).unwrap(),
+        ..candidate
+    };
+    assert!(blessed_by_fixpoint(&[identified], &[(18, callee)]).contains("tailcall::tail"),
+        "the same real tail-call surface with authenticated identity is admitted");
+}
+
+/// NEW-TAILCALL — the call surface is every `Call` AND every `TailCall`, in block
+/// order, each with its own key, arguments and authenticated identity; the
+/// `tail` bit is what keeps a tail call out of the panic-callee exemption.
+#[test]
+fn call_surface_includes_tail_calls_in_block_order() {
+    let identity = trust_types::CalleeIdentity {
+        stable_crate_id: 0x7a11_ca11,
+        def_index: 9,
+        substs_digest: [0x3333, 0x4444],
+    };
+    // Block 1 is the fixture's `core::panicking::panic` call; block 2's `Return`
+    // becomes `become demo::next(true)`.
+    let mut function = native_trust_ir_panic_function(true);
+    function.body.blocks[2].terminator = trust_types::Terminator::TailCall {
+        func: "demo::next".to_string(),
+        args: vec![trust_types::Operand::Constant(trust_types::ConstValue::Bool(true))],
+        span: native_trust_ir_test_span(32),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: Some(identity),
+        callee_key: None,
+    };
+    let Ok(sites) = extracted_call_sites(&function) else {
+        panic!("every terminator of this body is classified");
+    };
+    let seen: Vec<_> = sites
+        .iter()
+        .map(|site| (site.block.id, site.callee, site.args.len(), site.callee_identity, site.tail))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (trust_types::BlockId(1), "core::panicking::panic", 0, None, false),
+            (trust_types::BlockId(2), "demo::next", 1, Some(&identity), true),
+        ]
+    );
+}
+
+/// NEW-TAILCALL — the census pin for `extracted_call_sites`.
+///
+/// `trust_types::Terminator` is `#[non_exhaustive]`, so the classifier needs a
+/// wildcard arm and a new variant would compile straight into it. That arm
+/// fails every call gate closed, but only this pin makes the variant get a
+/// decision before it ships: `TERMINATOR_VARIANT_NAMES` is exhaustive by
+/// construction (`declare_model_variant_census!`), so a new variant changes it
+/// and this test fails until `CALL_SURFACE_TERMINATOR_CLASSIFICATION` — and the
+/// classifier, which the second half checks against that table one instance
+/// per variant — names it.
+#[test]
+fn call_surface_classifies_every_terminator_variant() {
+    let mut classified: Vec<&str> =
+        CALL_SURFACE_TERMINATOR_CLASSIFICATION.iter().map(|(name, _)| *name).collect();
+    let mut census: Vec<&str> = trust_types::TERMINATOR_VARIANT_NAMES.to_vec();
+    classified.sort_unstable();
+    census.sort_unstable();
+    assert_eq!(
+        classified, census,
+        "a `trust_types::Terminator` variant was added or removed: classify it in \
+         `extracted_call_sites` and in `CALL_SURFACE_TERMINATOR_CLASSIFICATION`. A call \
+         the call gates do not enumerate passes them vacuously (NEW-TAILCALL)."
+    );
+
+    let span = native_trust_ir_test_span(40);
+    let target = trust_types::BlockId(0);
+    for &(name, is_call) in CALL_SURFACE_TERMINATOR_CLASSIFICATION {
+        let terminator = match name {
+            "Terminator::Goto" => trust_types::Terminator::Goto(target),
+            "Terminator::SwitchInt" => trust_types::Terminator::SwitchInt {
+                discr: trust_types::Operand::Constant(trust_types::ConstValue::Bool(true)),
+                targets: vec![(1, target)],
+                otherwise: target,
+                exhaustive_enum_unreachable: false,
+                span: span.clone(),
+            },
+            "Terminator::Return" => trust_types::Terminator::Return,
+            "Terminator::Call" => trust_types::Terminator::Call {
+                func: "demo::callee".to_string(),
+                args: Vec::new(),
+                dest: trust_types::Place::local(0),
+                target: Some(target),
+                span: span.clone(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: None,
+                callee_key: None,
+                unwind: trust_types::UnwindEdge::Unreachable,
+            },
+            "Terminator::TailCall" => trust_types::Terminator::TailCall {
+                func: "demo::callee".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: None,
+                callee_key: None,
+            },
+            "Terminator::Assert" => trust_types::Terminator::Assert {
+                cond: trust_types::Operand::Constant(trust_types::ConstValue::Bool(true)),
+                expected: true,
+                msg: trust_types::AssertMessage::BoundsCheck,
+                target,
+                span: span.clone(),
+                unwind: trust_types::UnwindEdge::Unreachable,
+            },
+            "Terminator::Drop" => trust_types::Terminator::Drop {
+                place: trust_types::Place::local(0),
+                target,
+                span: span.clone(),
+                unwind: trust_types::UnwindEdge::Unreachable,
+            },
+            "Terminator::Opaque" => trust_types::Terminator::Opaque {
+                kind: "InlineAsm".to_string(),
+                targets: vec![target],
+                span: span.clone(),
+            },
+            "Terminator::Unreachable" => trust_types::Terminator::Unreachable,
+            "Terminator::Resume" => trust_types::Terminator::Resume,
+            other => panic!("`{other}` is in the classification table but not built here"),
+        };
+        let mut function = native_trust_ir_panic_function(false);
+        function.body.blocks =
+            vec![trust_types::BasicBlock { id: target, stmts: Vec::new(), terminator }];
+        let Ok(sites) = extracted_call_sites(&function) else {
+            panic!("`{name}` is in the classification table, so the classifier must know it");
+        };
+        assert_eq!(!sites.is_empty(), is_call, "`{name}`: table and classifier disagree");
+    }
+}
+
+/// NEW-TAILCALL — the panic-callee exemption is refused to a body with a tail
+/// call the refutation lane reads as a target.
+///
+/// The refutation candidate generator walks the tail-call projection, where
+/// `become demo::m::panic()` is an ordinary call to a callee the target
+/// recognizer matches (`ends_with("::panic")`), while the call gate walks the
+/// RAW body, where that block is no target. Before the per-block rule
+/// (NEW-EXEMPT-SPLIT) the tail call's proved candidate stood in for a skipped
+/// `assert!` block: the `tailcount` false proof of
+/// `tests/ui/trust/tail_call_callee_panic_is_not_discharged.rs`. The per-block
+/// rule refuses that shape on its own; the `tail_call_targets` conjunct refuses
+/// such a body the exemption whatever the coverage record says.
+///
+/// MUTANT WITNESS: with the `tail_call_targets` conjunct of
+/// `panic_callee_exemption_holds` removed, the assertion marked (conjunct)
+/// fails: every raw target block of that body IS covered by the record it is
+/// handed.
+#[test]
+fn panic_callee_exemption_refuses_a_tail_call_refutation_target() {
+    let tail_call_to = |callee: &str| trust_types::Terminator::TailCall {
+        func: callee.to_string(),
+        args: Vec::new(),
+        span: native_trust_ir_test_span(33),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: None,
+    };
+    let candidates = |function: &trust_types::VerifiableFunction| {
+        let context = trust_vcgen::VcgenContext::for_function(function.def_path.clone());
+        trust_vcgen::generate_full_assert_refutation_candidates_with_context(function, &context)
+            .into_parts()
+    };
+    let target_count = |function: &trust_types::VerifiableFunction| {
+        function
+            .body
+            .blocks
+            .iter()
+            .filter(|block| trust_vcgen::is_assert_refutation_target_block(block))
+            .count()
+    };
+
+    // CONTROL: bb3 is the one target block, its two paths both proved.
+    let control = exemption_split_fixture(false);
+    let (vcs, control_coverage) = candidates(&control);
+    let control_proved = vec![true; vcs.len()];
+    assert!(
+        panic_callee_exemption_holds(&control, 0, 0, &control_coverage, &control_proved),
+        "premise: every target block of the control is proved"
+    );
+
+    // bb6 (dead in the control) becomes `become demo::m::panic()`: one target in
+    // the raw body, two on the projection the candidate generator walks.
+    let mut function = exemption_split_fixture(false);
+    function.body.blocks[6].terminator = tail_call_to("demo::m::panic");
+    assert_eq!(target_count(&function), 1);
+    assert_eq!(target_count(&function.with_tail_calls_expanded()), 2);
+    // (conjunct) The control's record proves every RAW target block of this body
+    // (bb3, the same block), so only the tail-call conjunct refuses it.
+    assert!(
+        !panic_callee_exemption_holds(&function, 0, 0, &control_coverage, &control_proved),
+        "a tail call the refutation lane reads as a target: the exemption must be refused"
+    );
+    // And the generator's own record for this body, every candidate proved.
+    let (vcs, coverage) = candidates(&function);
+    assert!(!panic_callee_exemption_holds(&function, 0, 0, &coverage, &vec![true; vcs.len()]));
+
+    // A tail call the recognizer does NOT read as a target is decided by the call
+    // arms and leaves the exemption rule alone: the refusal is not a blanket one.
+    let mut ordinary = exemption_split_fixture(false);
+    ordinary.body.blocks[6].terminator = tail_call_to("demo::next");
+    let (vcs, coverage) = candidates(&ordinary);
+    assert!(panic_callee_exemption_holds(&ordinary, 0, 0, &coverage, &vec![true; vcs.len()]));
 }
 
 /// The key-level core and the `VerifiableFunction`-level gate are the same
@@ -22138,6 +28457,7 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: Some(identity),
+        callee_key: None,
     };
     assert!(all_calls_target_proven_or_abi_total_in_sets(
         &proven_names,
@@ -22865,16 +29185,23 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
     };
     let mut bundle = trust_verifier_api::TrustContractBundle::empty("monitor-bundle", subject);
 
-    let stale_monitor_metadata = || {
-        vec![
-            trust_verifier_api::MetadataEntry {
-                key: TRUST_MONITOR_STATUS_METADATA_KEY.to_string(),
-                value: "stale".to_string(),
-            },
-            trust_verifier_api::MetadataEntry {
+    // Trust: a contract row may carry a duplicated stale monitor status, which
+    // stamping collapses. An obligation row carries one stale stamp: since
+    // f0a5d152d9 the shared source-correspondence predicate
+    // (`trust_source_contract::source_monitor_metadata_matches_contract`)
+    // refuses any duplicated obligation metadata key, pinned at the end below.
+    let stale_monitor_metadata = |duplicated_status: bool| {
+        let mut metadata = vec![trust_verifier_api::MetadataEntry {
+            key: TRUST_MONITOR_STATUS_METADATA_KEY.to_string(),
+            value: "stale".to_string(),
+        }];
+        if duplicated_status {
+            metadata.push(trust_verifier_api::MetadataEntry {
                 key: TRUST_MONITOR_STATUS_METADATA_KEY.to_string(),
                 value: "duplicate".to_string(),
-            },
+            });
+        }
+        metadata.extend([
             trust_verifier_api::MetadataEntry {
                 key: TRUST_MONITOR_REASON_METADATA_KEY.to_string(),
                 value: "stale".to_string(),
@@ -22883,11 +29210,12 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
                 key: TRUST_MONITOR_PREDICATE_DIGEST_METADATA_KEY.to_string(),
                 value: "sha256:stale".to_string(),
             },
-        ]
+        ]);
+        metadata
     };
     let contract =
         |index: usize, digest: char, kind: trust_verifier_api::ContractKind, kind_label: &str| {
-            let mut metadata = stale_monitor_metadata();
+            let mut metadata = stale_monitor_metadata(true);
             metadata.push(trust_verifier_api::MetadataEntry {
                 key: "trust.contract.kind".to_string(),
                 value: kind_label.to_string(),
@@ -22937,7 +29265,7 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
                       digest: char,
                       kind: trust_verifier_api::ObligationKind,
                       kind_label: &str| {
-        let mut metadata = stale_monitor_metadata();
+        let mut metadata = stale_monitor_metadata(false);
         let contract_kind = match kind_label {
             "requires" => trust_verifier_api::ContractKind::Requires,
             "ensures" => trust_verifier_api::ContractKind::Ensures,
@@ -22960,6 +29288,12 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
             .to_metadata_entry()
             .expect("fixture context serializes"),
         );
+        // Trust: the canonical constructor writes the contract's lowering on
+        // every ordinary contract obligation; f0a5d152d9 binds the pair.
+        metadata.push(trust_verifier_api::MetadataEntry {
+            key: "trust.contract.lowering".to_string(),
+            value: "typed_formula_v1".to_string(),
+        });
         metadata.push(trust_verifier_api::MetadataEntry {
             key: TRUST_SOURCE_DIGEST_METADATA_KEY.to_string(),
             value: "d".repeat(64),
@@ -23064,6 +29398,7 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
             evidence: ClauseMonitorEvidence::Monitored(zero_eq_bound_monitor()),
         },
     ];
+    let unstamped = bundle.clone();
     stamp_certified_monitor_metadata_from_records(
         &records,
         &monitor_reference_function(&reference),
@@ -23132,6 +29467,39 @@ fn certified_monitor_metadata_is_dense_indexed_complete_and_utf8_bounded() {
     }
 
     assert_eq!(contract_ids.len(), 3, "fixture must retain all reordered contracts");
+
+    // A duplicated (stale) monitor status on the otherwise exact index-0
+    // obligation is ambiguous public metadata: it refuses the attachment.
+    let mut duplicated = unstamped;
+    let row = duplicated
+        .obligations
+        .iter_mut()
+        .find(|obligation| {
+            obligation.contract_id.as_deref().and_then(monitor_contract_source_index) == Some(0)
+                && !obligation.description.contains("mismatched")
+        })
+        .expect("index-0 obligation");
+    row.metadata.push(trust_verifier_api::MetadataEntry {
+        key: TRUST_MONITOR_STATUS_METADATA_KEY.to_string(),
+        value: "duplicate".to_string(),
+    });
+    let row_id = row.obligation_id.clone();
+    stamp_certified_monitor_metadata_from_records(
+        &records,
+        &monitor_reference_function(&reference),
+        &reference,
+        &mut duplicated,
+    );
+    let row = duplicated
+        .obligations
+        .iter()
+        .find(|obligation| obligation.obligation_id == row_id)
+        .expect("index-0 obligation after stamping");
+    assert_eq!(
+        exactly_one_metadata_value(&row.metadata, TRUST_MONITOR_STATUS_METADATA_KEY),
+        Some("unmonitored"),
+        "a duplicated obligation metadata key must fail closed",
+    );
 }
 
 fn supported_static_monitor_fixture() -> (
@@ -23214,6 +29582,11 @@ fn supported_static_monitor_fixture() -> (
         summary_facts: Vec::new(),
         metadata: vec![
             context.to_metadata_entry().expect("supported origin serializes"),
+            // Trust: the canonical constructor's obligation lowering (f0a5d152d9).
+            trust_verifier_api::MetadataEntry {
+                key: "trust.contract.lowering".to_string(),
+                value: "typed_formula_v1".to_string(),
+            },
             trust_verifier_api::MetadataEntry {
                 key: TRUST_SOURCE_DIGEST_METADATA_KEY.to_string(),
                 value: source_digest,
@@ -24517,6 +30890,27 @@ mod runtime_config_tests {
         assert!(verify_fn_deadline_from_ms(0, std::time::Instant::now()).is_none());
     }
 
+    /// gate-rca deadline (2026-10-17): the native lane may spend half of what is left of
+    /// the function clock when it starts, so the certifying lanes after it keep the other
+    /// half; no clock, no cutoff; a passed deadline leaves the native lane nothing.
+    /// Negative control: the cutoff is strictly before a live deadline, so a lane that
+    /// ran to it would still leave the certifying lanes time.
+    #[test]
+    fn the_native_lane_cutoff_is_half_of_what_is_left() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(120);
+        let cutoff = native_lane_cutoff(now, Some(deadline)).expect("a clock has a cutoff");
+        assert_eq!(cutoff, now + std::time::Duration::from_secs(60));
+        assert!(cutoff < deadline, "the certifying lanes keep a share");
+        assert_eq!(native_lane_cutoff(now, None), None, "no function clock, no cutoff");
+        let passed = now.checked_sub(std::time::Duration::from_millis(5)).unwrap_or(now);
+        assert_eq!(
+            native_lane_cutoff(now, Some(passed)),
+            Some(now),
+            "a passed deadline leaves the native lane nothing"
+        );
+    }
+
     #[test]
     fn huge_function_budget_clamps_without_becoming_the_default() {
         let now = std::time::Instant::now();
@@ -24701,6 +31095,46 @@ mod trust_mc_typed_chc_encoding_fidelity {
         names.iter().map(|n| (*n).to_string()).collect()
     }
 
+    /// The minimum a `VerifiableFunction` needs for `verifiable_body_is_acyclic`
+    /// to answer, in the two shapes that matter: `Goto -> Return` (acyclic) and
+    /// `Goto -> Goto` back to the entry (one back edge). Both terminators are ones
+    /// the acyclicity walk models, so it answers `Some(_)` rather than declining.
+    pub(super) fn cfg_shaped_function(cyclic: bool) -> trust_types::VerifiableFunction {
+        use trust_types::{BasicBlock, BlockId, LocalDecl, Terminator, Ty};
+        trust_types::VerifiableFunction {
+            name: "demo::f".into(),
+            def_path: "demo::f".into(),
+            span: SourceSpan::default(),
+            body: trust_types::VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: Vec::new(),
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: Vec::new(),
+                        terminator: if cyclic {
+                            Terminator::Goto(BlockId(0))
+                        } else {
+                            Terminator::Return
+                        },
+                    },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    }
+
     /// The measured F shape: the return place is defined by the loop-carried
     /// local, and NOTHING defines that local, so the refutation picks a value no
     /// execution reaches.
@@ -24769,7 +31203,18 @@ mod trust_mc_typed_chc_encoding_fidelity {
     fn loopy_body_on_the_flattened_arm_is_disclosed_as_over_approximation() {
         let mut obligation =
             obligation_with_metadata(trust_verifier_api::ObligationKind::Postcondition, Vec::new());
-        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, true);
+        // `return_depends_on_elided_definition` is true, so the `exact` arm is not
+        // reached and the CFG/payload arguments cannot affect this row. The cyclic
+        // shape is passed anyway so the fixture matches the case being named.
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(true),
+            None,
+            &params(&[]),
+            true,
+            true,
+            false,
+        );
 
         assert_eq!(
             fidelity_of(&obligation),
@@ -24782,16 +31227,124 @@ mod trust_mc_typed_chc_encoding_fidelity {
 
     #[test]
     fn acyclic_body_is_not_disclosed_and_keeps_its_refutation_authority() {
-        // The cost control. The flattened single-formula CHC is EXACT for an
-        // acyclic body — every non-input variable is defined by the path
-        // constraints — and it is the whole bug-detection value of this lane.
-        // Disclosing it too would turn every genuine straight-line contract
-        // violation into `unknown`.
+        // The cost control: an acyclic body must not be disclosed, because disclosing it
+        // too would turn every genuine straight-line contract violation into `unknown`.
+        //
+        // WHAT THIS TEST DOES NOT ESTABLISH, corrected 2026-09-26. It used to justify
+        // itself with "the flattened single-formula CHC is EXACT for an acyclic body —
+        // every non-input variable is defined by the path constraints". That is FALSE as a
+        // general claim, and it is the sentence a future `exact` attestation would most
+        // likely be built on, so it must not stand. `trust_verify.rs` names four
+        // producer-side over-approximations that reach this very gate FROM AN ACYCLIC BODY
+        // and "still arrive unattested and still refute": unmodeled call results, `&mut`
+        // havoc, deref-store invalidation and opaque frames. On top of that,
+        // `combine_relevant_block_defs_recorded` is documented as "a solver-performance
+        // heuristic rather than a soundness gate" and is recorded as having left `x / 2`
+        // unstated in the ACYCLIC `if x < 0 { 0 } else { x / 2 }`, making a true
+        // `result >= 0` refutable; and `prune_unlowerable_conjuncts` drops whole conjuncts.
+        //
+        // So "acyclic" is NOT a sufficient exactness predicate. What this test pins is the
+        // weaker, true thing: the DISCLOSURE is keyed on the groundedness of the return
+        // place, and an acyclic body that grounds it is not stamped. Refutation authority
+        // is a separate question and is fail-closed regardless — the positive `exact`
+        // value the consumer needs is one the compiler is forbidden to emit
+        // (crates/trust-bmc/src/verifier_api.rs:126-129), so today NOTHING in this lane
+        // carries refutation authority, disclosed or not. See
+        // docs/issues/2026-09-26-chc-refutation-authority-is-fail-closed-by-design.md.
         let mut obligation =
             obligation_with_metadata(trust_verifier_api::ObligationKind::Postcondition, Vec::new());
-        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, false);
+        // No payload is handed over, so the `exact` arm below declines for want of one
+        // and this row is stamped with NOTHING — which is what "not disclosed" means
+        // here. The `exact` arm's own positive and negative cases are the three tests
+        // after this one; this test is about the absence of the LOOP_ELIDED stamp.
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(false),
+            None,
+            &params(&[]),
+            true,
+            false,
+            false,
+        );
 
         assert_eq!(fidelity_of(&obligation), None);
+    }
+
+    /// The POSITIVE case for the `exact` arm, which had no test at all until
+    /// 2026-09-27. The arm may only fire where the flattened single-formula CHC is
+    /// what was actually submitted (an acyclic body) AND the payload grounds every
+    /// name it mentions, so a refutation cannot have picked a value no execution
+    /// reaches.
+    #[test]
+    fn an_acyclic_body_whose_payload_determines_every_name_is_stamped_exact() {
+        let mut obligation =
+            obligation_with_metadata(trust_verifier_api::ObligationKind::Postcondition, Vec::new());
+        let payload = predicate_of(spec_and(
+            spec_eq(spec_var("_0"), spec_var("n")),
+            spec_bin(trust_verifier_api::TrustSpecBinaryOp::Ge, spec_var("_0"), spec_int(5)),
+        ));
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(false),
+            Some(&payload),
+            &params(&["n"]),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            fidelity_of(&obligation),
+            Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT),
+            "an acyclic body whose payload grounds every mentioned name is the one shape \
+             this attestation is allowed to describe"
+        );
+    }
+
+    /// The payload half of the gate, on its own. Same acyclic body; one mentioned
+    /// name (the loop-carried local) is grounded by nothing, so the formula does not
+    /// determine it and no attestation may be written.
+    #[test]
+    fn an_acyclic_body_whose_payload_leaves_a_name_undetermined_is_not_stamped() {
+        let mut obligation =
+            obligation_with_metadata(trust_verifier_api::ObligationKind::Postcondition, Vec::new());
+        let payload = predicate_of(spec_eq(spec_var("_0"), spec_var("i#s0_1_s3_0")));
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(false),
+            Some(&payload),
+            &params(&["n"]),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(fidelity_of(&obligation), None);
+    }
+
+    /// The CFG half of the gate, on its own. The payload is the determining one from
+    /// the positive test; only the back edge differs. A looping body does not take the
+    /// flattened arm at all, so an exactness claim about that arm's artifact would be
+    /// a claim about an encoding that was never submitted.
+    #[test]
+    fn a_cyclic_body_is_never_stamped_exact() {
+        let mut obligation =
+            obligation_with_metadata(trust_verifier_api::ObligationKind::Postcondition, Vec::new());
+        let payload = predicate_of(spec_and(
+            spec_eq(spec_var("_0"), spec_var("n")),
+            spec_bin(trust_verifier_api::TrustSpecBinaryOp::Ge, spec_var("_0"), spec_int(5)),
+        ));
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(true),
+            Some(&payload),
+            &params(&["n"]),
+            true,
+            false,
+            false,
+        );
+
+        assert_ne!(fidelity_of(&obligation), Some(TRUST_MC_TYPED_CHC_ENCODING_FIDELITY_EXACT));
     }
 
     #[test]
@@ -24810,7 +31363,15 @@ mod trust_mc_typed_chc_encoding_fidelity {
                 value: "true".to_string(),
             }],
         );
-        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, false, true);
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &cfg_shaped_function(false),
+            None,
+            &params(&[]),
+            false,
+            true,
+            false,
+        );
 
         assert_eq!(fidelity_of(&obligation), None);
         assert!(
@@ -25207,7 +31768,15 @@ mod dataflow_redirect_never_suppresses_the_elided_definition_disclosure {
             summary_facts: Vec::new(),
             metadata: Vec::new(),
         };
-        annotate_trust_mc_typed_chc_encoding_fidelity(&mut obligation, true, true);
+        annotate_trust_mc_typed_chc_encoding_fidelity(
+            &mut obligation,
+            &super::trust_mc_typed_chc_encoding_fidelity::cfg_shaped_function(true),
+            None,
+            &Default::default(),
+            true,
+            true,
+            false,
+        );
         assert_eq!(
             api_obligation_metadata_value(
                 &obligation,
@@ -25364,6 +31933,7 @@ fn dataflow_loop_accumulator_function() -> trust_types::VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -25637,6 +32207,81 @@ fn dataflow_refuses_to_promote_a_slot_whose_address_escapes() {
     );
 }
 
+/// BMC-LANE-1: the complete constructor is an enumerated READ of every lane, so a
+/// slot whose address is packed into one — at any lane, not only the first —
+/// escapes with the aggregate exactly as a call argument does. A
+/// `MakeAggregate { .. } => false` arm (no lane reads) would keep the slot
+/// promoted while the callee writes through the packed pointer: the false-SAFE
+/// direction. The control packs only unrelated scalars and keeps the slot.
+#[test]
+fn dataflow_refuses_to_promote_a_slot_whose_address_is_packed_into_a_complete_constructor() {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, Inst, InstrNode, Ty, ValueId,
+    };
+
+    let build = |pack_slot: bool| {
+        let slot = ValueId::new(0);
+        let stored = ValueId::new(1);
+        let other = ValueId::new(2);
+        let agg = ValueId::new(3);
+        let loaded = ValueId::new(4);
+        let mut bb0 = Block::new(BlockId::new(0));
+        bb0.body.push(
+            InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None })
+                .with_result(slot),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(0) })
+                .with_result(stored),
+        );
+        bb0.body.push(InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: slot,
+            value: stored,
+            volatile: false,
+            align: None,
+        }));
+        bb0.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(7) }).with_result(other),
+        );
+        let (ty, fields) = if pack_slot {
+            // `g((7, &mut i))` with the reference spelled as the slot itself, the
+            // way any trust-ir producer may legally spell it.
+            (Ty::Tuple(vec![Ty::I32, Ty::Ptr]), vec![other, slot])
+        } else {
+            (Ty::Tuple(vec![Ty::I32, Ty::I32]), vec![other, other])
+        };
+        bb0.body.push(
+            InstrNode::new(Inst::MakeAggregate { ty, variant: None, fields }).with_result(agg),
+        );
+        bb0.body.push(InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![agg] }));
+        bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+        let mut bb1 = Block::new(BlockId::new(1));
+        bb1.body.push(
+            InstrNode::new(Inst::Load { ty: Ty::I32, ptr: slot, volatile: false, align: None })
+                .with_result(loaded),
+        );
+        bb1.body.push(InstrNode::new(Inst::Return { values: vec![loaded] }));
+
+        let mut function =
+            Function::new(FuncId::new(0), "demo::packed_slot", FuncTyId::new(0), BlockId::new(0));
+        function.blocks = vec![bb0, bb1];
+        function
+    };
+
+    assert_eq!(
+        super::ChcDataflowFrame::build(&build(false), &[]).cells.len(),
+        1,
+        "a constructor of unrelated scalars beside the slot leaves it promotable"
+    );
+    assert!(
+        super::ChcDataflowFrame::build(&build(true), &[]).cells.is_empty(),
+        "a slot whose address is a constructor lane (lane 1) escapes with the aggregate: \
+         promoting it would assert the callee cannot write it"
+    );
+}
+
 /// A CHECKED counting loop with a real `Return`, self-contained so the goal-edge
 /// tests do not reach into another module's fixture:
 /// `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i += 1; } i }`, lowered the
@@ -25678,7 +32323,13 @@ fn postcondition_goal_counting_loop_typed(
             .with_result(dest)
     };
     let store = |value: ValueId| {
-        InstrNode::new(Inst::Store { ty: ty.clone(), ptr: slot, value, volatile: false, align: None })
+        InstrNode::new(Inst::Store {
+            ty: ty.clone(),
+            ptr: slot,
+            value,
+            volatile: false,
+            align: None,
+        })
     };
 
     let mut bb0 = Block::new(BlockId::new(0)).with_param(n, ty.clone());
@@ -25729,7 +32380,11 @@ fn postcondition_goal_counting_loop_typed(
         InstrNode::new(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Bool, lhs: bit, rhs: false_const })
             .with_result(negated),
     );
-    bb2.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+    bb2.body.push(InstrNode::new(Inst::Assert {
+        cond: negated,
+        kind: trust_ir::AssertKind::Unspecified,
+        site: None,
+    }));
     bb2.body.push(store(sum));
     bb2.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
 
@@ -25820,7 +32475,11 @@ fn the_postcondition_coverage_gate_refuses_unbounded_wrapping_arithmetic() {
                     })
                     .with_result(negated),
                 );
-                bb0.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+                bb0.body.push(InstrNode::new(Inst::Assert {
+                    cond: negated,
+                    kind: trust_ir::AssertKind::Unspecified,
+                    site: None,
+                }));
             }
         }
         bb0.body.push(InstrNode::new(Inst::Return { values: vec![sum] }));
@@ -25920,7 +32579,11 @@ fn the_coverage_gate_follows_the_overflow_flag_through_the_tuple_chain() {
         })
         .with_result(negated),
     );
-    bb1.body.push(InstrNode::new(Inst::Assert { cond: negated }));
+    bb1.body.push(InstrNode::new(Inst::Assert {
+        cond: negated,
+        kind: trust_ir::AssertKind::Unspecified,
+        site: None,
+    }));
     bb1.body.push(InstrNode::new(Inst::Return { values: vec![sum] }));
 
     let mut function =
@@ -25932,6 +32595,252 @@ fn the_coverage_gate_follows_the_overflow_flag_through_the_tuple_chain() {
         super::function_unbounded_int_arithmetic_is_faithful(&function),
         "the flag is asserted false through `InsertField`/`ExtractField`, so the checked add \
          traps on overflow and the unbounded model is a sound over-approximation"
+    );
+}
+
+/// The counting loop `fn f(n: i32) -> i32 { let mut i = 0; while i < n { i += 1; } i }`
+/// in the bridge's CURRENT spelling of the checked add (BMC-LANE-1): `Overflow`
+/// packed by the complete constructor `MakeAggregate(sum, flag)`, the flag read
+/// back with `ExtractField(tuple, 1)` and asserted false, and the sum read back
+/// with `ExtractField(tuple, 0)` in the NEXT block and stored to the accumulator.
+///
+/// `variant` is the constructor's variant (`None` is the real shape; `Some(v)` makes
+/// it an enum constructor of `Ty::Enum`, whose lanes are variant `v`'s payload only,
+/// so its lane `i` is `ExtractField` field `i + 1` and must never resolve as field
+/// `i`), and
+/// `assert_flag: false` is the `overflowing_add` control. Returns the function and
+/// the `(tuple, sum, flag)` ids.
+fn postcondition_goal_counting_loop_packed(
+    variant: Option<u32>,
+    assert_flag: bool,
+) -> (trust_ir::Function, [trust_ir::ValueId; 3]) {
+    use trust_ir::{
+        Block, BlockId, Constant, FuncId, FuncTyId, Function, ICmpOp, Inst, InstrNode, OverflowOp,
+        Ty, ValueId,
+    };
+    let n = ValueId::new(1);
+    let zero = ValueId::new(2);
+    let load_guard = ValueId::new(3);
+    let guard = ValueId::new(4);
+    let load_body = ValueId::new(5);
+    let one = ValueId::new(6);
+    let sum = ValueId::new(7);
+    let flag = ValueId::new(8);
+    let negated = ValueId::new(9);
+    let slot = ValueId::new(10);
+    let load_exit = ValueId::new(11);
+    let false_const = ValueId::new(12);
+    let tuple = ValueId::new(13);
+    let read_flag = ValueId::new(14);
+    let read_sum = ValueId::new(15);
+
+    let load = |dest: ValueId| {
+        InstrNode::new(Inst::Load { ty: Ty::I32, ptr: slot, volatile: false, align: None })
+            .with_result(dest)
+    };
+    let store = |value: ValueId| {
+        InstrNode::new(Inst::Store { ty: Ty::I32, ptr: slot, value, volatile: false, align: None })
+    };
+
+    let mut bb0 = Block::new(BlockId::new(0)).with_param(n, Ty::I32);
+    bb0.body.push(
+        InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None }).with_result(slot),
+    );
+    bb0.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(0) }).with_result(zero),
+    );
+    bb0.body.push(store(zero));
+    bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+    let mut bb1 = Block::new(BlockId::new(1));
+    bb1.body.push(load(load_guard));
+    bb1.body.push(
+        InstrNode::new(Inst::ICmp { op: ICmpOp::Slt, ty: Ty::I32, lhs: load_guard, rhs: n })
+            .with_result(guard),
+    );
+    bb1.body.push(InstrNode::new(Inst::CondBr {
+        cond: guard,
+        then_target: BlockId::new(2),
+        then_args: vec![],
+        else_target: BlockId::new(3),
+        else_args: vec![],
+    }));
+
+    let mut bb2 = Block::new(BlockId::new(2));
+    bb2.body.push(load(load_body));
+    bb2.body.push(
+        InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+    );
+    bb2.body.push(
+        InstrNode::new(Inst::Overflow {
+            op: OverflowOp::AddOverflow,
+            ty: Ty::I32,
+            lhs: load_body,
+            rhs: one,
+        })
+        .with_result(sum)
+        .with_result(flag),
+    );
+    bb2.body.push(
+        InstrNode::new(Inst::MakeAggregate {
+            ty: match variant {
+                None => Ty::Tuple(vec![Ty::I32, Ty::Bool]),
+                Some(_) => Ty::Enum(trust_ir::EnumId::new(0)),
+            },
+            variant,
+            fields: vec![sum, flag],
+        })
+        .with_result(tuple),
+    );
+    bb2.body.push(
+        InstrNode::new(Inst::ExtractField { ty: Ty::Bool, aggregate: tuple, field: 1 })
+            .with_result(read_flag),
+    );
+    if assert_flag {
+        bb2.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                .with_result(false_const),
+        );
+        bb2.body.push(
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Eq,
+                ty: Ty::Bool,
+                lhs: read_flag,
+                rhs: false_const,
+            })
+            .with_result(negated),
+        );
+        bb2.body.push(InstrNode::new(Inst::Assert {
+            cond: negated,
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        }));
+    }
+    bb2.body.push(InstrNode::new(Inst::Br { target: BlockId::new(4), args: vec![] }));
+
+    // The sum's read-back lands in the assert's successor, as it does in real MIR.
+    let mut bb4 = Block::new(BlockId::new(4));
+    bb4.body.push(
+        InstrNode::new(Inst::ExtractField { ty: Ty::I32, aggregate: tuple, field: 0 })
+            .with_result(read_sum),
+    );
+    bb4.body.push(store(read_sum));
+    bb4.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
+
+    let mut bb3 = Block::new(BlockId::new(3));
+    bb3.body.push(load(load_exit));
+    bb3.body.push(InstrNode::new(Inst::Return { values: vec![load_exit] }));
+
+    let mut function =
+        Function::new(FuncId::new(0), "demo::counting_packed", FuncTyId::new(0), BlockId::new(0));
+    function.blocks = vec![bb0, bb1, bb2, bb3, bb4];
+    (function, [tuple, sum, flag])
+}
+
+/// BMC-LANE-1 respelled the checked-arithmetic pack from `Undef` + `InsertField`
+/// to the complete constructor `MakeAggregate`. The coverage gate and the
+/// encoder's field map must follow the flag and the sum through it, or the
+/// loop-carried postcondition lane refuses every checked function the bridge
+/// emits (the shape that shipped this gate inert once already). The controls: an
+/// unasserted flag (`overflowing_add`) stays refused, and an enum constructor's
+/// lanes, which are its variant's payload only (lane `i` is field `i + 1`), are
+/// never read as fields.
+#[test]
+fn the_coverage_gate_follows_the_overflow_flag_through_the_complete_constructor() {
+    let (real, [tuple, sum, flag]) = postcondition_goal_counting_loop_packed(None, true);
+    assert!(
+        super::function_unbounded_int_arithmetic_is_faithful(&real),
+        "the flag is asserted false through `MakeAggregate`/`ExtractField`, so the checked add \
+         traps on overflow and the unbounded model is a sound over-approximation"
+    );
+    let frame = super::ChcDataflowFrame::build(&real, &[]);
+    assert_eq!(
+        frame.cells.len(),
+        1,
+        "the accumulator stays promotable beside the pack: `MakeAggregate` is an enumerated \
+         read, not an opaque instruction that disqualifies every cell"
+    );
+    assert_eq!(frame.resolve_field(tuple, 0), Some(sum), "lane 0 of the pack is the sum");
+    assert_eq!(frame.resolve_field(tuple, 1), Some(flag), "lane 1 of the pack is the flag");
+    assert_eq!(frame.resolve_field(tuple, 2), None, "there is no lane 2");
+
+    let (unasserted, _) = postcondition_goal_counting_loop_packed(None, false);
+    assert!(
+        !super::function_unbounded_int_arithmetic_is_faithful(&unasserted),
+        "an unasserted overflow flag means execution continues wrapped — refuse"
+    );
+
+    let (enum_lanes, [payload, _, _]) = postcondition_goal_counting_loop_packed(Some(0), true);
+    assert!(
+        !super::function_unbounded_int_arithmetic_is_faithful(&enum_lanes),
+        "an enum constructor's lanes are its variant's payload, so `ExtractField(e, 1)` is \
+         lane 0 (the sum), not the flag: the flag does not resolve, so the gate cannot show \
+         it traps"
+    );
+    let frame = super::ChcDataflowFrame::build(&enum_lanes, &[]);
+    assert_eq!(
+        frame.resolve_field(payload, 0),
+        None,
+        "field 0 of an enum value is its tag, which is no lane of the constructor"
+    );
+    assert_eq!(
+        frame.resolve_field(payload, 1),
+        None,
+        "an enum constructor is never a field map: resolving field 1 to lane 1 (the flag) \
+         would be off by one"
+    );
+}
+
+/// End to end through the encoder: the packed loop is admitted by the
+/// postcondition lane, and the goal edge is built over it exactly as over the
+/// unpacked fixture (one goal edge, the obligation's negated conclusion).
+/// Without the `MakeAggregate` arms the coverage gate refuses it and the lane
+/// returns `None`, so this is the regression pin for the respelling.
+#[test]
+fn the_postcondition_goal_lane_admits_the_packed_checked_add() {
+    let vc = serde_json::json!({
+        "kind": "unary",
+        "op": "not",
+        "expr": {
+            "kind": "binary",
+            "op": "ge",
+            "lhs": { "kind": "var", "name": "_0", "sort": { "kind": "int" } },
+            "rhs": { "kind": "int_const", "value": "0" },
+        },
+    });
+    let (function, _) = postcondition_goal_counting_loop_packed(None, true);
+    let (_relations, rules, _vars) = super::trust_mc_dataflow_chc_for_function(
+        &function,
+        super::ChcErrorMode::PostconditionGoal,
+        Some(&super::ChcPostconditionGoal { vc: &vc, bindings: &[] }),
+    )
+    .expect("encoder runs")
+    .expect("the packed checked add traps on overflow, so the coverage gate admits it");
+    let error_rules: Vec<_> = rules
+        .as_array()
+        .expect("rules array")
+        .iter()
+        .filter(|rule| rule["head"]["name"] == "error")
+        .collect();
+    assert_eq!(error_rules.len(), 1, "exactly one goal edge: {error_rules:?}");
+    let rendered = serde_json::to_string(&error_rules[0]["body"]).expect("serializable");
+    assert!(rendered.contains("\"not\""), "the goal edge carries ¬Q: {rendered}");
+    assert!(
+        rendered.contains("_cell_v10"),
+        "the goal speaks the promoted accumulator's own column: {rendered}"
+    );
+    assert_copy_free(&rules, "PostconditionGoal (packed)");
+
+    let (unasserted, _) = postcondition_goal_counting_loop_packed(None, false);
+    assert!(
+        super::trust_mc_dataflow_chc_for_function(
+            &unasserted,
+            super::ChcErrorMode::PostconditionGoal,
+            Some(&super::ChcPostconditionGoal { vc: &vc, bindings: &[] }),
+        )
+        .expect("encoder runs")
+        .is_none(),
+        "a wrapping accumulator is refused by the lane, never encoded"
     );
 }
 
@@ -26117,12 +33026,9 @@ fn a_postcondition_goal_with_no_return_edge_falls_back() {
 /// false-verify class), `bv_slt` reads the signed image, casts re-interpret.
 #[test]
 fn bv_goal_vc_expressions_translate_exactly_or_decline() {
-    let bv_var = |name: &str| {
-        serde_json::json!({ "kind": "var", "name": name, "sort": { "kind": "bit_vec", "width": 64 } })
-    };
-    let bv_const = |value: &str| {
-        serde_json::json!({ "kind": "bit_vec_const", "value": value, "width": 64 })
-    };
+    let bv_var = |name: &str| serde_json::json!({ "kind": "var", "name": name, "sort": { "kind": "bit_vec", "width": 64 } });
+    let bv_const =
+        |value: &str| serde_json::json!({ "kind": "bit_vec_const", "value": value, "width": 64 });
 
     // bv_ult(x, c) -> lt(x:int, c:int) with the unsigned constant value.
     let translated = super::trust_mc_goal_vc_bv_expr_to_int(&serde_json::json!({
@@ -26227,8 +33133,7 @@ fn bv_goal_translation_carries_the_width_range_of_every_variable() {
 /// "variable reference `bb2_cell_v6` has sort BitVec(64), expected Int".
 #[test]
 fn the_bv_goal_system_is_sort_coherent_and_binds_the_parameter() {
-    let function =
-        postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
+    let function = postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
     // The route-log VC shape for `ensures result == n`, reduced to its load-
     // bearing conjuncts: guard eq, exit branch, return binding, negated post.
     let bv64 = || serde_json::json!({ "kind": "bit_vec", "width": 64 });
@@ -26342,11 +33247,9 @@ fn the_bv_goal_system_is_sort_coherent_and_binds_the_parameter() {
     // table matches every reference. This is the exact shape probed Safe under
     // strict `solve_pdr_proof` (the multi-predicate or chain-bearing forms
     // probe Unknown(Inconclusive)).
-    let (relations, rules, vars) = super::chc_normalize_postcondition_goal_system(
-        _relations,
-        rules,
-    )
-    .expect("normalization holds on the reference system");
+    let (relations, rules, vars) =
+        super::chc_normalize_postcondition_goal_system(_relations, rules)
+            .expect("normalization holds on the reference system");
     let relation_names: Vec<&str> = relations
         .as_array()
         .expect("relations")
@@ -26394,9 +33297,8 @@ fn the_bv_goal_system_is_sort_coherent_and_binds_the_parameter() {
 /// obligation to the trivially-safe route.
 #[test]
 fn defined_rule_locals_are_eliminated_soundly() {
-    let bool_var = |name: &str| {
-        serde_json::json!({ "kind": "var", "name": name, "sort": { "kind": "bool" } })
-    };
+    let bool_var =
+        |name: &str| serde_json::json!({ "kind": "var", "name": name, "sort": { "kind": "bool" } });
     let int_var =
         |name: &str| serde_json::json!({ "kind": "var", "name": name, "sort": { "kind": "int" } });
     let rule = serde_json::json!({
@@ -26496,8 +33398,12 @@ fn linear_relation_chains_inline_with_alpha_renaming() {
         !relations.iter().any(|relation| relation["name"] == "mid"),
         "the forwarding relation is gone: {relations:?}"
     );
-    let merged = rules.iter().find(|rule| rule["body"]["relation"]["name"] == "loophead"
-        && rule["head"]["name"] == "loophead").expect("merged back edge");
+    let merged = rules
+        .iter()
+        .find(|rule| {
+            rule["body"]["relation"]["name"] == "loophead" && rule["head"]["name"] == "loophead"
+        })
+        .expect("merged back edge");
     let rendered = serde_json::to_string(merged).expect("serializable");
     assert!(
         rendered.contains("aux$i") && rendered.contains("\"aux\""),
@@ -26519,8 +33425,7 @@ fn linear_relation_chains_inline_with_alpha_renaming() {
 fn a_signed_or_mismatched_return_declines_the_bv_goal_merge() {
     let signed = postcondition_goal_counting_loop(); // i32 fixture
     assert!(!super::chc_return_values_are_unsigned_of_width(&signed, 32));
-    let unsigned =
-        postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
+    let unsigned = postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
     assert!(super::chc_return_values_are_unsigned_of_width(&unsigned, 64));
     assert!(
         !super::chc_return_values_are_unsigned_of_width(&unsigned, 32),
@@ -26558,9 +33463,9 @@ fn goal_param_bindings_require_image_agreement_and_an_untouched_local() {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
-    let function =
-        postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
+    let function = postcondition_goal_counting_loop_typed(trust_ir::Ty::U64, trust_ir::ICmpOp::Ult);
     let bv_vars =
         vec![serde_json::json!({ "name": "n", "sort": { "kind": "bit_vec", "width": 64 } })];
 
@@ -26792,6 +33697,203 @@ fn root_owned_absent_callee_rows_counts_only_the_root_through_its_own_member_lis
     );
 }
 
+// Trust: a previously bundled body cannot regain a total summary merely
+// because its own fail-closed obligation caused the poison loop to evict it.
+fn poison_eviction_summary_fixture(transitive: bool) -> trust_ir_bridge::NativeVerificationBundle {
+    use trust_types::{BasicBlock, BlockId, LocalDecl, Place, Terminator, Ty,
+        UnwindEdge, VerifiableBody, VerifiableFunction};
+    // Trust: Native row validation needs real source spans before the credit assertions.
+    let function = |name: &str, callee: &str, line: u32| VerifiableFunction {
+        name: name.rsplit("::").next().unwrap().into(),
+        def_path: name.into(),
+        span: native_trust_ir_test_span(line),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: callee.into(), args: vec![], dest: Place::local(0),
+                        target: Some(BlockId(1)), span: native_trust_ir_test_span(line + 1),
+                        atomic: None, is_foreign: false, is_unsafe_sig: false,
+                        callee_identity: Some(bundled_assert_test_identity(callee)),
+                        callee_key: None, unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default(),
+        },
+        contracts: vec![], preconditions: vec![], postconditions: vec![],
+        spec: Default::default(), tuple_layouts: Default::default(),
+    };
+    let credited = "core::poison_fixture::credited";
+    let root = function("demo::poison_root", if transitive { "demo::middle" } else { credited }, 1);
+    let mut functions = vec![root.clone()];
+    if transitive { functions.push(function("demo::middle", credited, 11)); }
+    functions.push(function(credited, "dep::unverified_body", 21));
+    let compiler_contracts = trust_types::CompilerContractBundle::new(vec![]);
+    let mut bundle = trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    ensure_default_trust_mc_function_obligation(&root, &mut bundle).expect("default native row");
+    let ledger = bundled_assert_test_ledger(&functions);
+    let totals: FxHashSet<String> = [credited.into()].into_iter().collect();
+    build_native_trust_ir_bundle_from_verifiable_functions(
+        &root, &mut bundle, functions, &ledger,
+        &FxHashSet::default(), &FxHashSet::default(), &FxHashSet::default(),
+        &FxHashSet::default(), &totals, &FxHashSet::default(), &FxHashSet::default(),
+        &FxHashSet::default(), &FxHashSet::default(),
+        &trust_ir_bridge::CallReachWithdrawals::default(),
+        None, None, &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(), None, &[], &[], None,
+        &mut None, &mut PanicFreedomFoldAttestation::default(), &mut None,
+        &mut Vec::new(), false, None, None, &mut None,
+    ).expect("the diagnostic bundle must lower").expect("default native row retains the bundle")
+}
+
+#[test]
+fn poison_eviction_cannot_recredit_a_direct_callee_as_compiler_total() {
+    let native = poison_eviction_summary_fixture(false);
+    assert!(native.module.functions.iter().any(|function| {
+        function.blocks.iter().flat_map(|block| &block.body)
+            .any(|node| matches!(node.inst, trust_ir::Inst::Assert { .. }))
+    }), "removing a poisoned body must not erase its reachable panic marker via total credit");
+}
+
+#[test]
+fn poison_eviction_cannot_recredit_a_transitive_callee_as_compiler_total() {
+    // Trust (POISON-EVICTION-FALSE-PROOF-1): `middle` calls the poisoned body
+    // through an edge, so the body is not evicted at all: it keeps its own
+    // fail-closed marker, and `middle`'s call is neither withdrawn nor recredited.
+    let native = poison_eviction_summary_fixture(true);
+    assert!(native.module.functions.iter().any(|function| function.name == "middle"));
+    let credited = native.module.functions.iter().find(|function| function.name == "credited")
+        .expect("a body a retained caller reaches by an edge must not be evicted");
+    assert!(credited.blocks.iter().flat_map(|block| &block.body)
+        .any(|node| matches!(node.inst, trust_ir::Inst::Assert { .. })),
+        "the charged body must keep its own fail-closed marker");
+}
+
+// Trust (POISON-EVICTION-FALSE-PROOF-1): one-call bodies for the poison loop. Each
+// entry is `(def_path, callee, identity_of)`: the call names `identity_of`'s
+// identity, or none. Entry 0 is the root. `destructors` are the admitted
+// destructor members.
+fn poison_loop_fixture(
+    calls: &[(&str, &str, Option<&str>)],
+    destructors: &[&str],
+) -> trust_ir_bridge::NativeVerificationBundle {
+    use trust_types::{BasicBlock, BlockId, LocalDecl, Place, Terminator, Ty,
+        UnwindEdge, VerifiableBody, VerifiableFunction};
+    let functions: Vec<VerifiableFunction> = calls.iter().enumerate().map(|(index, call)| {
+        let (path, callee, identity_of) = *call;
+        let line = 1 + 10 * index as u32;
+        VerifiableFunction {
+            name: path.rsplit("::").next().unwrap().into(),
+            def_path: path.into(),
+            span: native_trust_ir_test_span(line),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::Unit, name: None }],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: callee.into(), args: vec![], dest: Place::local(0),
+                            target: Some(BlockId(1)), span: native_trust_ir_test_span(line + 1),
+                            atomic: None, is_foreign: false, is_unsafe_sig: false,
+                            callee_identity: identity_of.map(bundled_assert_test_identity),
+                            callee_key: None, unwind: UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0, return_ty: Ty::Unit, datatype_defs: Default::default(),
+            },
+            contracts: vec![], preconditions: vec![], postconditions: vec![],
+            spec: Default::default(), tuple_layouts: Default::default(),
+        }
+    }).collect();
+    let root = functions[0].clone();
+    let compiler_contracts = trust_types::CompilerContractBundle::new(vec![]);
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    ensure_default_trust_mc_function_obligation(&root, &mut bundle).expect("default native row");
+    let ledger = bundled_assert_test_ledger(&functions);
+    let destructors: FxHashSet<String> = destructors.iter().map(|path| (*path).into()).collect();
+    build_native_trust_ir_bundle_from_verifiable_functions(
+        &root, &mut bundle, functions, &ledger,
+        &FxHashSet::default(), &FxHashSet::default(), &FxHashSet::default(),
+        &FxHashSet::default(), &FxHashSet::default(), &FxHashSet::default(),
+        &FxHashSet::default(), &FxHashSet::default(), &destructors,
+        &trust_ir_bridge::CallReachWithdrawals::default(),
+        None, None, &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(), None, &[], &[], None,
+        &mut None, &mut PanicFreedomFoldAttestation::default(), &mut None,
+        &mut Vec::new(), false, None, None, &mut None,
+    ).expect("the diagnostic bundle must lower").expect("default native row retains the bundle")
+}
+
+fn poison_loop_keeps(native: &trust_ir_bridge::NativeVerificationBundle, name: &str) -> bool {
+    native.module.functions.iter().any(|function| {
+        function.name == name
+            && function.blocks.iter().flat_map(|block| &block.body)
+                .any(|node| matches!(node.inst, trust_ir::Inst::Assert { .. }))
+    })
+}
+
+#[test]
+fn poison_eviction_keeps_a_body_named_only_by_a_total_sentinel() {
+    // The measured false proof's shape: the root reaches the poisoned body by no
+    // edge, only through the extractor's total sentinel, whose claim the body's
+    // rows qualify. Evicting it left no row anywhere in the module.
+    let native = poison_loop_fixture(&[
+        ("demo::fmt_root", trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL,
+            Some("core::fmt_fixture::finisher")),
+        ("core::fmt_fixture::finisher", "dep::unverified_body", Some("dep::unverified_body")),
+    ], &[]);
+    assert!(poison_loop_keeps(&native, "finisher"),
+        "a body a retained credit arm names must keep its fail-closed rows");
+}
+
+#[test]
+fn poison_eviction_still_drops_a_body_no_retained_body_reaches() {
+    let native = poison_loop_fixture(&[
+        ("demo::lone_root", "dep::root_callee", Some("dep::root_callee")),
+        ("demo::unreached", "dep::unverified_body", Some("dep::unverified_body")),
+    ], &[]);
+    assert!(native.module.functions.iter().all(|function| function.name != "unreached"),
+        "control: a poisoned body nothing retained reaches is still evicted");
+}
+
+#[test]
+fn poison_eviction_keeps_an_admitted_destructor_body() {
+    // Nothing calls a destructor: a drop reaches it, and the bridge credits its
+    // ADT's drop glue because the body is in the bundle.
+    let destructor = "<demo::Bomb as core::ops::Drop>::drop";
+    let native = poison_loop_fixture(&[
+        ("demo::drop_root", "dep::root_callee", Some("dep::root_callee")),
+        (destructor, "dep::unverified_body", Some("dep::unverified_body")),
+    ], &[destructor]);
+    assert!(poison_loop_keeps(&native, "drop"),
+        "a destructor body whose drop the bridge credits must not be evicted");
+}
+
+#[test]
+fn poison_eviction_drops_a_body_reached_only_through_a_format_dispatch_row() {
+    // The dispatch arm keeps the call's own may-panic row, so the body under it
+    // carries no claim: evicting it loses nothing, and it is evicted.
+    let native = poison_loop_fixture(&[
+        ("demo::format_root", "alloc::fmt::format", Some("alloc::fmt::format")),
+        ("alloc::fmt::format", "dep::unverified_body", Some("dep::unverified_body")),
+    ], &[]);
+    assert!(native.module.functions.iter().all(|function| function.name != "format"),
+        "a body reached only through a call with its own fail-closed row may be evicted");
+    // The published module's rows are reset to the verifier-api bundle, so read the
+    // lowered IR: the root's one call is the dispatch arm's `Assert(false)`.
+    assert!(poison_loop_keeps(&native, "format_root"),
+        "the root's dispatch call keeps its own fail-closed marker");
+}
+
 // ---------------------------------------------------------------------------
 // Bundled-member identity: source population READS the owner, never re-stamps it.
 // ---------------------------------------------------------------------------
@@ -26953,6 +34055,7 @@ fn bundled_assert_test_function_with_calls(
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: Some(bundled_assert_test_identity(callee)),
+                callee_key: None,
                 unwind: trust_types::UnwindEdge::Unreachable,
             },
         });
@@ -26981,6 +34084,7 @@ fn bundled_assert_test_function_with_calls(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -26996,6 +34100,13 @@ fn bundled_assert_test_ledger(
             // The existing gate tests exercise the FOREIGN path — the class the
             // gate exists for — so the helper records non-local provenance.
             false,
+            // ... and a foreign def is not the monomorphization question either.
+            false,
+            // Not a caller-bundle question: no member here was verified as its own root.
+            false,
+            // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+            // disposition is exercised by its own tests.
+            false,
         )
         .expect("synthetic member source must serialize");
     }
@@ -27008,7 +34119,180 @@ fn bundled_assert_test_gate(
     vcs: &[VerificationCondition],
 ) -> Result<(), String> {
     let ledger = bundled_assert_test_ledger(members);
-    ensure_bundled_member_asserts_exactly_charged(root, members, &ledger, vcs)
+    ensure_bundled_member_asserts_exactly_charged(
+        root,
+        members,
+        &ledger,
+        vcs,
+        &FxHashSet::default(),
+    )
+}
+
+/// Trust (2026-10-02, census-vcgen-hang): the `Vec`-forwarder gate
+/// (`vec_index_forwarder::charge_vec_index_forwarders`) regenerates the root's
+/// owned-`Vec` index row at EVERY root call site of a forwarder. Unscoped, each
+/// regeneration rebuilt the root's whole-function statement-version oracle:
+/// O(sites x body), minutes past the 120 s budget on aterm-census
+/// `run_lock_order_census` (1114 blocks, 24 sites), inside native bundle
+/// construction, where nothing polled the deadline. Pinned at the gate, both
+/// halves: one VC-gen memo scope for the batch (ONE oracle for every site, where
+/// the same replays unscoped build one per site), and a forwarder REFUSED, not
+/// replayed, once the function's deadline has passed.
+#[test]
+fn vec_index_forwarder_gate_replays_under_one_scope_and_stops_at_the_deadline() {
+    const INDEX: &str = "<std::vec::Vec<u32> as core::ops::index::Index<usize>>::index";
+    const SITES: usize = 8;
+    let usize_ty = || trust_types::Ty::Int { width: 64, signed: false };
+    let mut locals = vec![
+        trust_types::LocalDecl { index: 0, ty: trust_types::Ty::Unit, name: Some("ret".into()) },
+        trust_types::LocalDecl {
+            index: 1,
+            ty: trust_types::Ty::Ref {
+                mutable: false,
+                inner: Box::new(trust_types::Ty::adt("std::vec::Vec<u32>", vec![])),
+            },
+            name: Some("v".into()),
+        },
+        trust_types::LocalDecl { index: 2, ty: usize_ty(), name: Some("i".into()) },
+    ];
+    // `fn root(v: &Vec<u32>, i: usize)`: SITES calls `v[i]`, one per block, each
+    // through its own index temp and destination, every call naming the forwarder
+    // by name AND by its compiler-authenticated identity.
+    let mut blocks = Vec::new();
+    for k in 0..SITES {
+        let index_temp = locals.len();
+        locals.push(trust_types::LocalDecl { index: index_temp, ty: usize_ty(), name: None });
+        let dest = locals.len();
+        locals.push(trust_types::LocalDecl {
+            index: dest,
+            ty: trust_types::Ty::Ref {
+                mutable: false,
+                inner: Box::new(trust_types::Ty::Int { width: 32, signed: false }),
+            },
+            name: None,
+        });
+        blocks.push(trust_types::BasicBlock {
+            id: trust_types::BlockId(k),
+            stmts: vec![trust_types::Statement::Assign {
+                place: trust_types::Place::local(index_temp),
+                rvalue: trust_types::Rvalue::Use(trust_types::Operand::Copy(
+                    trust_types::Place::local(2),
+                )),
+                span: native_trust_ir_test_span(400 + k as u32),
+            }],
+            terminator: trust_types::Terminator::Call {
+                func: INDEX.to_string(),
+                args: vec![
+                    trust_types::Operand::Copy(trust_types::Place::local(1)),
+                    trust_types::Operand::Copy(trust_types::Place::local(index_temp)),
+                ],
+                dest: trust_types::Place::local(dest),
+                target: Some(trust_types::BlockId(k + 1)),
+                span: native_trust_ir_test_span(400 + k as u32),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: Some(bundled_assert_test_identity(INDEX)),
+                callee_key: None,
+                unwind: trust_types::UnwindEdge::Unreachable,
+            },
+        });
+    }
+    blocks.push(trust_types::BasicBlock {
+        id: trust_types::BlockId(SITES),
+        stmts: Vec::new(),
+        terminator: trust_types::Terminator::Return,
+    });
+    let root = trust_types::VerifiableFunction {
+        name: "root".to_string(),
+        def_path: "demo::root".to_string(),
+        span: native_trust_ir_test_span(399),
+        body: trust_types::VerifiableBody {
+            locals,
+            blocks,
+            arg_count: 2,
+            return_ty: trust_types::Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    let forwarder = bundled_assert_test_function_with_calls(INDEX, INDEX, &[]);
+    let members = [root.clone(), forwarder.clone()];
+    let mut ledger = bundled_assert_test_ledger(&members);
+    vec_index_forwarder::attach_vec_index_forwarder_for_test(
+        &mut ledger,
+        &forwarder,
+        vec_index_forwarder::VecIndexForwarderKind::Index,
+    );
+    let key = bundled_member_source_identity_key(&forwarder).expect("synthetic member serializes");
+
+    // The root's inventory: its own owned-Vec index row at every site, regenerated
+    // UNSCOPED here, which is also the control for the counter below.
+    trust_vcgen::reset_analysis_memo_stats();
+    let vcs: Vec<VerificationCondition> = (0..SITES)
+        .map(|k| {
+            let (kind, body) =
+                trust_vcgen::owned_vec_scalar_index_row(&root, trust_types::BlockId(k))
+                    .expect("every site is an owned-Vec scalar index row");
+            VerificationCondition {
+                kind,
+                function: trust_types::Symbol::intern("demo::root"),
+                location: native_trust_ir_test_span(400 + k as u32),
+                formula: trust_types::Formula::Bool(true),
+                contract_metadata: None,
+                obligation: Some(trust_types::ObligationRecord {
+                    body,
+                    wrappers: Vec::new(),
+                    subject: None,
+                    width: None,
+                }),
+            }
+        })
+        .collect();
+    let unscoped_oracles = trust_vcgen::analysis_memo_stats().entry_versions_computed;
+    assert!(
+        unscoped_oracles >= SITES as u64,
+        "control: unscoped replays build one oracle per site ({unscoped_oracles} for {SITES})"
+    );
+
+    // The gate, no deadline in force: every site replayed and matched, one oracle.
+    trust_vcgen::reset_analysis_memo_stats();
+    let mut charges =
+        vec_index_forwarder::charge_vec_index_forwarders(&root, &members, &ledger, &vcs)
+            .expect("the gate runs");
+    let gate_oracles = trust_vcgen::analysis_memo_stats().entry_versions_computed;
+    assert_eq!(
+        charges.verdicts.remove(&key),
+        Some(Ok(())),
+        "ANTI-VACUITY: the forwarder's every root site must be replayed and matched"
+    );
+    assert_eq!(gate_oracles, 1, "the gate must replay all {SITES} sites under ONE memo scope");
+
+    // The function's deadline has passed: the forwarder is refused before a replay.
+    let _budget = trust_types::verify_budget::VerifyBudgetGuard::install(
+        Some(std::time::Instant::now()),
+        u64::MAX,
+    );
+    trust_vcgen::reset_analysis_memo_stats();
+    let mut charges =
+        vec_index_forwarder::charge_vec_index_forwarders(&root, &members, &ledger, &vcs)
+            .expect("the gate runs");
+    let refused = charges.verdicts.remove(&key).expect("the forwarder is judged");
+    let reason = refused.expect_err("a passed deadline must refuse the forwarder");
+    assert!(
+        reason.contains(NATIVE_BUNDLE_DEADLINE_DECLINE)
+            && reason.contains("while the root's owned-Vec index rows were regenerated"),
+        "refused for the wrong reason: {reason}"
+    );
+    assert_eq!(
+        trust_vcgen::analysis_memo_stats().entry_versions_computed,
+        0,
+        "no row may be regenerated past the deadline"
+    );
 }
 
 /// The 90f22093e9 local-member repair, both directions.
@@ -27033,6 +34317,16 @@ fn bundled_member_assert_gate_local_exemption_is_local_only() {
             &member,
             Some(bundled_assert_test_identity(&member.name)),
             local,
+            // This test is about the LOCALITY conjunct; hold the
+            // monomorphization one at its exempting value so the two are
+            // measured independently. `..._local_but_generic_is_not_exempt`
+            // below moves this one instead.
+            false,
+            // Not a caller-bundle question: no member here was verified as its own root.
+            false,
+            // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+            // disposition is exercised by its own tests.
+            false,
         )
         .expect("synthetic member source must serialize")
     };
@@ -27040,27 +34334,762 @@ fn bundled_member_assert_gate_local_exemption_is_local_only() {
     // Local: admitted with zero caller-side VCs.
     let mut local_ledger = BundledMemberSourceIdentityLedger::default();
     record(&mut local_ledger, true);
-    ensure_bundled_member_asserts_exactly_charged(&root, &members, &local_ledger, &[])
-        .expect("a LOCAL Assert-bearing member must be exempt from the charging gate");
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &local_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect("a LOCAL Assert-bearing member must be exempt from the charging gate");
 
     // Foreign: the same member with no charge rows must refuse.
     let mut foreign_ledger = BundledMemberSourceIdentityLedger::default();
     record(&mut foreign_ledger, false);
-    ensure_bundled_member_asserts_exactly_charged(&root, &members, &foreign_ledger, &[])
-        .expect_err("a FOREIGN Assert-bearing member with no caller charge must refuse");
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &foreign_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect_err("a FOREIGN Assert-bearing member with no caller charge must refuse");
 
     // Disagreeing provenance: fail closed, gate stays on.
     let mut mixed_ledger = BundledMemberSourceIdentityLedger::default();
     record(&mut mixed_ledger, true);
     record(&mut mixed_ledger, false);
-    ensure_bundled_member_asserts_exactly_charged(&root, &members, &mixed_ledger, &[])
-        .expect_err("disagreeing locality provenance must keep the member gated");
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &mixed_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect_err("disagreeing locality provenance must keep the member gated");
 }
 
-fn exact_bundled_div_assert_member(
+/// Trust (BMC-LANE-1, 2026-11-09): the bridge's R107 exemption set is decided by the
+/// member ledger on the RESOLVED body, never by a printed name (hostile review 4, F1:
+/// a root built `--crate-name core` prints `core::…` and was exempted by name).
+#[test]
+fn compiler_authenticated_sysroot_members_is_the_ledger_verdict_only() {
+    let root = bundled_assert_test_function_with_calls("root", "core::root", &["wrap"]);
+    let authentic = exact_bundled_div_assert_member("wrap", "core::wrap");
+    let impostor = exact_bundled_div_assert_member("wrap", "mydep::wrap");
+    let local = exact_bundled_div_assert_member("local", "core::local");
+    let mixed = exact_bundled_div_assert_member("mixed", "core::mixed");
+    // Hostile review 5, F4: one path recorded it foreign, another local, both
+    // authentic (a sysroot build's own crate is authentic). It is not foreign.
+    let split = exact_bundled_div_assert_member("split", "core::split");
+    // Two bodies under one def path: only the first is authenticated.
+    let shared = exact_bundled_div_assert_member("shared_a", "core::shared");
+    let shared_twin = exact_bundled_div_assert_member("shared_b", "core::shared");
+    // A member printed with the root's def path, itself authenticated.
+    let root_twin = exact_bundled_div_assert_member("root_twin", "core::root");
+    let unrecorded = exact_bundled_div_assert_member("unrecorded", "core::unrecorded");
+
+    let record = |ledger: &mut BundledMemberSourceIdentityLedger,
+                  member: &trust_types::VerifiableFunction,
+                  local: bool,
+                  authentic: bool| {
+        record_bundled_member_source_identity(
+            ledger,
+            member,
+            Some(bundled_assert_test_identity(&member.name)),
+            local,
+            false,
+            false,
+            authentic,
+        )
+        .expect("synthetic member source must serialize")
+    };
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    // The root is recorded as an authentic foreign body: index zero is still no member.
+    record(&mut ledger, &root, false, true);
+    record(&mut ledger, &authentic, false, true);
+    record(&mut ledger, &impostor, false, false);
+    record(&mut ledger, &local, true, true);
+    record(&mut ledger, &mixed, false, true);
+    record(&mut ledger, &mixed, false, false);
+    record(&mut ledger, &split, false, true);
+    record(&mut ledger, &split, true, true);
+    record(&mut ledger, &shared, false, true);
+    record(&mut ledger, &root_twin, false, true);
+
+    let functions = [
+        root.clone(),
+        authentic.clone(),
+        impostor,
+        local,
+        mixed,
+        split,
+        shared,
+        shared_twin,
+        root_twin,
+        unrecorded,
+    ];
+    let members = compiler_authenticated_sysroot_members(&functions, &ledger)
+        .expect("synthetic member sources must serialize");
+    assert_eq!(
+        members,
+        FxHashSet::from_iter(["core::wrap".to_string()]),
+        "only the foreign member every path authenticated, under a def path no \
+         unauthenticated function shares, may be exempt"
+    );
+
+    // An empty ledger exempts nothing, whatever the names print.
+    let none = compiler_authenticated_sysroot_members(
+        &functions,
+        &BundledMemberSourceIdentityLedger::default(),
+    )
+    .expect("synthetic member sources must serialize");
+    assert!(none.is_empty(), "an unrecorded member is never exempt: {none:?}");
+
+    // A bundle of the root alone exempts nothing, though the ledger authenticates it.
+    let alone = compiler_authenticated_sysroot_members(&[root.clone()], &ledger)
+        .expect("synthetic member sources must serialize");
+    assert!(alone.is_empty(), "the root is never a member: {alone:?}");
+
+    // Hostile review 5, F3: the verdict is on the exact BODY. A member with the
+    // authenticated member's name and def path but another body is not that member,
+    // so a lookup on (name, def path) alone would exempt it.
+    let mut body_twin = authentic.clone();
+    body_twin.body.locals[1].name = Some("lhs_twin".into());
+    let twin = compiler_authenticated_sysroot_members(&[root, body_twin], &ledger)
+        .expect("synthetic member sources must serialize");
+    assert!(twin.is_empty(), "another body under an authenticated name is charged: {twin:?}");
+}
+
+/// Trust (BMC-LANE-1 hostile review 5, F4): a `StepBy` constructor qualification
+/// needs EVERY admitting path to have recorded the member foreign. It read
+/// `def_is_local`, which is ANDed toward local, so a member one path recorded local
+/// and another foreign read as foreign and qualified.
+#[test]
+fn step_by_qualification_refuses_a_member_any_path_recorded_local() {
+    let member = exact_bundled_div_assert_member("step_by", "core::iter::Iterator::step_by");
+    let identity = bundled_assert_test_identity(&member.name);
+    let qualification = || step_by_constructor::ConstructorQualification {
+        identity,
+        role: step_by_constructor::ConstructorMember::IteratorStepBy,
+        no_drop_blocks: Vec::new(),
+    };
+    let ledger_of = |localities: &[bool]| {
+        let mut ledger = BundledMemberSourceIdentityLedger::default();
+        for &local in localities {
+            record_bundled_member_source_identity(
+                &mut ledger,
+                &member,
+                Some(identity),
+                local,
+                false,
+                false,
+                false,
+            )
+            .expect("synthetic member source must serialize");
+        }
+        ledger
+    };
+    let mut foreign = ledger_of(&[false, false]);
+    step_by_constructor::record_qualification(&mut foreign, &member, qualification())
+        .expect("a member every path recorded foreign qualifies");
+    for localities in [[false, true], [true, false], [true, true]] {
+        let mut ledger = ledger_of(&localities);
+        assert!(
+            step_by_constructor::record_qualification(&mut ledger, &member, qualification())
+                .is_err(),
+            "paths {localities:?}: a member any path recorded local never qualifies"
+        );
+    }
+}
+
+/// `fn root(p: *const u8) -> NonNull<u8> { wrap_ptr(p) }`, and `wrap_ptr`, a
+/// member at `member_def_path` whose body is the transmute `_0 = _1 as NonNull<u8>`:
+/// the shape R107 charges unless the compiler authenticated the member.
+fn r107_forwarding_fixture(
+    member_def_path: &str,
+) -> (trust_types::VerifiableFunction, trust_types::VerifiableFunction) {
+    let raw_u8 =
+        || trust_types::Ty::RawPtr { mutable: false, pointee: Box::new(trust_types::Ty::u8()) };
+    let nonnull_u8 = || {
+        trust_types::Ty::adt(
+            "core::ptr::non_null::NonNull",
+            vec![("pointer".to_string(), raw_u8())],
+        )
+    };
+    let function = |name: &str, def_path: &str, line: u32, block: trust_types::BasicBlock| {
+        let mut blocks = vec![block];
+        if blocks[0].stmts.is_empty() {
+            blocks.push(trust_types::BasicBlock {
+                id: trust_types::BlockId(1),
+                stmts: Vec::new(),
+                terminator: trust_types::Terminator::Return,
+            });
+        }
+        trust_types::VerifiableFunction {
+            name: name.to_string(),
+            def_path: def_path.to_string(),
+            span: native_trust_ir_test_span(line),
+            body: trust_types::VerifiableBody {
+                locals: vec![
+                    trust_types::LocalDecl { index: 0, ty: nonnull_u8(), name: None },
+                    trust_types::LocalDecl { index: 1, ty: raw_u8(), name: Some("p".into()) },
+                ],
+                blocks,
+                arg_count: 1,
+                return_ty: nonnull_u8(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        }
+    };
+    let root = function(
+        "root",
+        "demo::root",
+        340,
+        trust_types::BasicBlock {
+            id: trust_types::BlockId(0),
+            stmts: Vec::new(),
+            terminator: trust_types::Terminator::Call {
+                func: "wrap_ptr".to_string(),
+                args: vec![trust_types::Operand::Copy(trust_types::Place::local(1))],
+                dest: trust_types::Place::local(0),
+                target: Some(trust_types::BlockId(1)),
+                span: native_trust_ir_test_span(341),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: Some(bundled_assert_test_identity("wrap_ptr")),
+                callee_key: None,
+                unwind: trust_types::UnwindEdge::Unreachable,
+            },
+        },
+    );
+    let member = function(
+        "wrap_ptr",
+        member_def_path,
+        350,
+        trust_types::BasicBlock {
+            id: trust_types::BlockId(0),
+            stmts: vec![trust_types::Statement::Assign {
+                place: trust_types::Place::local(0),
+                rvalue: trust_types::Rvalue::Cast(
+                    trust_types::Operand::Copy(trust_types::Place::local(1)),
+                    nonnull_u8(),
+                ),
+                span: native_trust_ir_test_span(351),
+            }],
+            terminator: trust_types::Terminator::Return,
+        },
+    );
+    (root, member)
+}
+
+/// The native bundle builder's lowering of the `r107_forwarding_fixture` bundle under
+/// a ledger that recorded the member once with `provenance` (`(local, authentic)`), or
+/// not at all.
+fn r107_forwarding_build(
+    member_def_path: &str,
+    provenance: Option<(bool, bool)>,
+) -> Result<Option<trust_ir_bridge::NativeVerificationBundle>, String> {
+    let (root, member) = r107_forwarding_fixture(member_def_path);
+    let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    if let Some((local, authentic)) = provenance {
+        record_runtime_check_provenance(&mut ledger, &member, local, authentic);
+    }
+    build_native_trust_ir_bundle_from_verifiable_functions(
+        &root,
+        &mut bundle,
+        vec![root.clone(), member],
+        &ledger,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(), // bundled_destructor_members: none
+        &trust_ir_bridge::CallReachWithdrawals::default(), // call_reach_open_callees: no withdrawals
+        None,
+        None, // borrow_reach_scope: no scoped conjunct 3 on the test seam
+        &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(), // Trust: no grow pins
+        None,
+        &[],
+        &[],
+        None,
+        &mut None,
+        &mut PanicFreedomFoldAttestation::default(),
+        &mut None,
+        &mut Vec::new(),
+        false,
+        None,      // no query/HIR source carry on this fixture
+        None,      // no private query-bound source reference on this fixture
+        &mut None, // no source reference side table on this fixture
+    )
+}
+
+/// The `(ICmp, Assert)` counts of the one bundled member (every function but `root`).
+fn r107_member_charge(native: &trust_ir_bridge::NativeVerificationBundle) -> (usize, usize) {
+    let lowered: Vec<_> =
+        native.module.functions.iter().filter(|function| function.name != "root").collect();
+    let [member] = lowered.as_slice() else {
+        panic!("one bundled member, got {:?}", native.module.functions)
+    };
+    let nodes = || member.blocks.iter().flat_map(|block| block.body.iter());
+    (
+        nodes().filter(|node| matches!(node.inst, trust_ir::Inst::ICmp { .. })).count(),
+        nodes().filter(|node| matches!(node.inst, trust_ir::Inst::Assert { .. })).count(),
+    )
+}
+
+/// Trust (BMC-LANE-1 hostile review 5, F3): the R107 sysroot-member set reaches the
+/// bridge through the native bundle builder, from the member ledger, and nothing else
+/// exempts. A member the ledger authenticates as a foreign `core` body lowers with no
+/// `!= 0` charge. Under every other verdict (a foreign body that is not authentic core,
+/// a local body, no ledger entry) the same member keeps its `(1, 1)` charge. That
+/// unkinded Assert does not refuse the bundle: it joins the whole-function
+/// panic-freedom aggregate, and its being unlinked is what withholds a printing
+/// program's `std-print-dispatch` attestation (`panic_freedom_fold_is_exclusive_for`).
+/// The bridge's test seam alone could not see a builder that stopped forwarding the
+/// set.
+///
+/// This reaches the instance-hypothesis entry: no test can mint the paired-condvar
+/// crate certificate that selects the compiler-context entry production takes, whose
+/// forwarding the e2e program r09's `std-print-dispatch` row pins
+/// (docs/DECISION_QUEUE.md BMC-LANE-1, hostile review 5).
+#[test]
+fn r107_sysroot_member_set_reaches_the_bridge_from_the_ledger() {
+    let member_path = "core::ptr::non_null::NonNull::<u8>::wrap_ptr";
+    let exempt = r107_forwarding_build(member_path, Some((false, true)))
+        .expect("an authenticated std member's transmute is std's obligation")
+        .expect("the root's call binds a native bundle");
+    assert_eq!(r107_member_charge(&exempt), (0, 0), "the authenticated member is not charged");
+
+    for (provenance, shape) in [
+        (Some((false, false)), "a foreign body that is not authentic core"),
+        (Some((true, true)), "a local body"),
+        (None, "a member absent from the ledger"),
+    ] {
+        let charged = r107_forwarding_build(member_path, provenance)
+            .unwrap_or_else(|err| panic!("{shape}: the bundle is kept: {err}"))
+            .unwrap_or_else(|| panic!("{shape}: the root's call binds a native bundle"));
+        assert_eq!(r107_member_charge(&charged), (1, 1), "{shape} is charged");
+    }
+}
+
+/// Trust (generics, 2026-09-13): being LOCAL is not sufficient for the exemption —
+/// the bundled body must also BE the body the member's own root run verified.
+///
+/// The exemption's justification is "the universal-root policy verifies every
+/// eligible local body as its own root in the same compile, so a local member's
+/// Asserts are charged to the member's own run". That is exact for a local
+/// NON-generic member. It is false for a per-instance member: the own-root run of a
+/// local generic is over the POLYMORPHIC body, whose type parameters the producer
+/// erased to `Ty::Unit`. An Assert that exists only at a concrete instantiation — a
+/// bounds, overflow or layout check whose operands become concrete only there — is
+/// absent from that run, so exempting the instance charges it to NOBODY, which is
+/// the exact false-proof class this gate exists to close.
+///
+/// This test is written BEFORE the lane that admits such members, so the guard can
+/// never be briefly open. It must keep failing closed if that lane lands.
+#[test]
+fn bundled_member_assert_gate_local_but_generic_is_not_exempt() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), member.clone()];
+
+    let record = |ledger: &mut BundledMemberSourceIdentityLedger, requires_mono: bool| {
+        record_bundled_member_source_identity(
+            ledger,
+            &member,
+            Some(bundled_assert_test_identity(&member.name)),
+            true,
+            requires_mono,
+            // Not a caller-bundle question: no member here was verified as its own root.
+            false,
+            // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+            // disposition is exercised by its own tests.
+            false,
+        )
+        .expect("synthetic member source must serialize")
+    };
+
+    // Control: local and NOT requiring monomorphization — the pre-existing
+    // exemption, unchanged. Without this the test below could pass for the wrong
+    // reason (e.g. a member that is gated for some unrelated cause).
+    let mut mono_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut mono_ledger, false);
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &mono_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect("a LOCAL non-generic Assert-bearing member must stay exempt");
+
+    // The new conjunct: local, but the def requires monomorphization.
+    let mut generic_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut generic_ledger, true);
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &generic_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect_err(
+        "a LOCAL member whose def requires monomorphization must NOT be exempt: its own \
+         root run is over the parameter-erased body, so an Assert that exists only at a \
+         concrete instantiation would be charged to nobody",
+    );
+
+    // Composition is fail-closed in the opposite polarity to locality: if ANY
+    // admitting path says the def requires monomorphization, the gate stays on.
+    let mut mixed_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut mixed_ledger, false);
+    record(&mut mixed_ledger, true);
+    ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &mixed_ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect_err("disagreeing monomorphization provenance must keep the member gated");
+}
+
+// ---------------------------------------------------------------------------
+// Trust (2026-09-29): the runtime-checked std-member disposition of the gate.
+// A member refused as a COMPLETENESS gap, foreign, whose body is an AUTHENTIC
+// sysroot crate's, is kept and recorded; every other refusal still refuses the
+// whole bundle. See `RuntimeCheckedStdMember`.
+// ---------------------------------------------------------------------------
+
+/// `exact_bundled_div_assert_member` with its Div replaced by an `Overflow(Add)`
+/// Assert over an `Add`: refused by the bridge as `AssertKindOutsideLane`.
+fn kind_refused_overflow_member(name: &str, def_path: &str) -> trust_types::VerifiableFunction {
+    let mut member = exact_bundled_div_assert_member(name, def_path);
+    let trust_types::Terminator::Assert { msg, .. } = &mut member.body.blocks[0].terminator else {
+        panic!("the fixture's entry block ends in its Assert");
+    };
+    *msg = trust_types::AssertMessage::Overflow(trust_types::BinOp::Add);
+    let trust_types::Statement::Assign { rvalue, .. } = &mut member.body.blocks[1].stmts[0] else {
+        panic!("the fixture's success block computes its operation");
+    };
+    let trust_types::Rvalue::BinaryOp(op, ..) = rvalue else {
+        panic!("the fixture's operation is a binary op");
+    };
+    *op = trust_types::BinOp::Add;
+    assert!(matches!(
+        trust_ir_bridge::bundled_member_assert_admission(&member),
+        trust_ir_bridge::BundledMemberAssertAdmission::Refused {
+            class: trust_ir_bridge::MemberAssertRefusalClass::AssertKindOutsideLane,
+            ..
+        }
+    ));
+    member
+}
+
+/// `exact_bundled_div_assert_member` dividing by a ZERO constant: refused by the
+/// bridge as `Other` (a guaranteed trap is a defect, not a completeness gap).
+fn other_refused_zero_divisor_member(
     name: &str,
     def_path: &str,
 ) -> trust_types::VerifiableFunction {
+    let mut member = exact_bundled_div_assert_member(name, def_path);
+    let trust_types::Statement::Assign { rvalue, .. } = &mut member.body.blocks[1].stmts[0] else {
+        panic!("the fixture's success block computes its operation");
+    };
+    let trust_types::Rvalue::BinaryOp(_, _, divisor) = rvalue else {
+        panic!("the fixture's operation is a binary op");
+    };
+    *divisor = trust_types::Operand::Constant(trust_types::ConstValue::Uint(0, 8));
+    assert!(matches!(
+        trust_ir_bridge::bundled_member_assert_admission(&member),
+        trust_ir_bridge::BundledMemberAssertAdmission::Refused {
+            class: trust_ir_bridge::MemberAssertRefusalClass::Other,
+            ..
+        }
+    ));
+    member
+}
+
+fn record_runtime_check_provenance(
+    ledger: &mut BundledMemberSourceIdentityLedger,
+    member: &trust_types::VerifiableFunction,
+    local: bool,
+    authentic: bool,
+) {
+    record_bundled_member_source_identity(
+        ledger,
+        member,
+        Some(bundled_assert_test_identity(&member.name)),
+        local,
+        false,
+        false,
+        authentic,
+    )
+    .expect("synthetic member source must serialize");
+}
+
+fn runtime_check_gate(
+    root: &trust_types::VerifiableFunction,
+    members: &[trust_types::VerifiableFunction],
+    ledger: &BundledMemberSourceIdentityLedger,
+) -> Result<BundledMemberAssertGate, String> {
+    ensure_bundled_member_asserts_exactly_charged_with_charges(
+        root,
+        members,
+        ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+}
+
+/// The one admitting shape: KIND refusal, foreign, authentic sysroot body. The
+/// bundle is kept, the member is recorded ONCE, and nothing is charged for it.
+#[test]
+fn runtime_checked_std_member_is_kept_only_for_an_authentic_foreign_completeness_gap() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["sum_closure"]);
+    let member = kind_refused_overflow_member("sum_closure", "core::iter::sum::{closure#0}");
+    let members = [root.clone(), member.clone()];
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut ledger, &member, false, true);
+    let gate = runtime_check_gate(&root, &members, &ledger)
+        .expect("an authentic foreign std member's completeness gap keeps the bundle");
+    assert!(gate.own_charges.is_empty(), "the kept member is charged to no caller-side row");
+    assert_eq!(
+        gate.runtime_checked_std_members,
+        vec![RuntimeCheckedStdMember {
+            def_path: "core::iter::sum::{closure#0}".into(),
+            class: trust_ir_bridge::MemberAssertRefusalClass::AssertKindOutsideLane,
+            reason: "member Assert kind `Overflow(Add)` is outside the exact Div/Rem/BoundsCheck lane",
+        }]
+    );
+    // A member reached twice is recorded once (dedupe by `def_path`).
+    let twice = [root.clone(), member.clone(), member.clone()];
+    let gate = runtime_check_gate(&root, &twice, &ledger).expect("still kept");
+    assert_eq!(gate.runtime_checked_std_members.len(), 1);
+}
+
+/// Every conjunct is fail-closed: not authentic, local, `Other`, a ledger miss,
+/// and a tolerated member followed by an `Other` refusal all refuse the bundle.
+#[test]
+fn runtime_checked_std_member_refuses_every_other_shape() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["sum_closure"]);
+    let member = kind_refused_overflow_member("sum_closure", "core::iter::sum::{closure#0}");
+    let members = [root.clone(), member.clone()];
+
+    // (KIND, NOT authentic): a `--crate-name core` impostor's body.
+    let mut impostor = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut impostor, &member, false, false);
+    let err = runtime_check_gate(&root, &members, &impostor)
+        .err()
+        .expect("a non-authentic body's refused Assert must refuse the bundle");
+    assert!(err.contains("refused Assert-bearing member `core::iter::sum::{closure#0}`"), "{err}");
+
+    // (KIND, local but generic — the only local member the exemption above does
+    // not already skip): its own root run owns its Asserts, never this row.
+    let mut local = BundledMemberSourceIdentityLedger::default();
+    record_bundled_member_source_identity(
+        &mut local,
+        &member,
+        Some(bundled_assert_test_identity(&member.name)),
+        true,
+        true,
+        false,
+        true,
+    )
+    .expect("synthetic member source must serialize");
+    assert!(
+        runtime_check_gate(&root, &members, &local).is_err(),
+        "a LOCAL member is never kept under the std disposition"
+    );
+
+    // (`Other`, authentic): an integrity/defect refusal is never tolerated.
+    let zero = other_refused_zero_divisor_member("sum_closure", "core::iter::sum::{closure#0}");
+    let zero_members = [root.clone(), zero.clone()];
+    let mut other = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut other, &zero, false, true);
+    assert!(
+        runtime_check_gate(&root, &zero_members, &other).is_err(),
+        "an `Other` refusal refuses the bundle even for an authentic body"
+    );
+
+    // Ledger miss: no provenance, no disposition.
+    assert!(
+        runtime_check_gate(&root, &members, &BundledMemberSourceIdentityLedger::default()).is_err(),
+        "a member absent from the ledger counts as not authentic"
+    );
+
+    // Tolerated FIRST, then an `Other` refusal: scanning continues, and the later
+    // refusal refuses the whole bundle.
+    let root2 =
+        bundled_assert_test_function_with_calls("root", "demo::root", &["sum_closure", "zero"]);
+    let zero2 = other_refused_zero_divisor_member("zero", "core::zero");
+    let both = [root2.clone(), member.clone(), zero2.clone()];
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut ledger, &member, false, true);
+    record_runtime_check_provenance(&mut ledger, &zero2, false, true);
+    let err = runtime_check_gate(&root2, &both, &ledger)
+        .err()
+        .expect("a later `Other` refusal still refuses the bundle");
+    assert!(err.contains("`core::zero`"), "{err}");
+}
+
+/// The plain wrapper has no way to publish the rows the disposition owes, so it
+/// must refuse a bundle whose admission rests on it (C8).
+#[test]
+fn the_plain_gate_refuses_a_bundle_that_owes_runtime_checked_rows() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["sum_closure"]);
+    let member = kind_refused_overflow_member("sum_closure", "core::iter::sum::{closure#0}");
+    let members = [root.clone(), member.clone()];
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut ledger, &member, false, true);
+    assert!(runtime_check_gate(&root, &members, &ledger).is_ok());
+    let err = ensure_bundled_member_asserts_exactly_charged(
+        &root,
+        &members,
+        &ledger,
+        &[],
+        &FxHashSet::default(),
+    )
+    .expect_err("the plain gate cannot publish the member row");
+    assert!(err.contains("needs a caller that publishes its row"), "{err}");
+}
+
+/// Authenticity composes fail-closed across the two recording lanes (`&=`): one
+/// admitting path that says "not authentic" refuses the disposition.
+#[test]
+fn runtime_checked_std_member_authenticity_composes_fail_closed() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["sum_closure"]);
+    let member = kind_refused_overflow_member("sum_closure", "core::iter::sum::{closure#0}");
+    let members = [root.clone(), member.clone()];
+    let mut agree = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut agree, &member, false, true);
+    record_runtime_check_provenance(&mut agree, &member, false, true);
+    assert!(runtime_check_gate(&root, &members, &agree).is_ok());
+    for (first, second) in [(true, false), (false, true)] {
+        let mut split = BundledMemberSourceIdentityLedger::default();
+        record_runtime_check_provenance(&mut split, &member, false, first);
+        record_runtime_check_provenance(&mut split, &member, false, second);
+        assert!(
+            runtime_check_gate(&root, &members, &split).is_err(),
+            "disagreeing authenticity ({first}, {second}) must refuse"
+        );
+    }
+    // Trust (BMC-LANE-1 hostile review 5, F4): and locality, toward NOT foreign. The
+    // disposition read `!def_is_local`, which is ANDed toward local, so one path that
+    // recorded the member local and one foreign read as foreign and kept the bundle. A
+    // sysroot build's own crate is authentic (`crate_is_compiler_resident_sysroot`).
+    for (first, second) in [(true, false), (false, true)] {
+        let mut split = BundledMemberSourceIdentityLedger::default();
+        record_runtime_check_provenance(&mut split, &member, first, true);
+        record_runtime_check_provenance(&mut split, &member, second, true);
+        assert!(
+            runtime_check_gate(&root, &members, &split).is_err(),
+            "disagreeing locality ({first}, {second}) must refuse"
+        );
+    }
+}
+
+/// C2: the builder records the member list the moment the gate admits it, and
+/// NO later exit clears it — the `Ok(None)` no-bindings exit included. A verdict
+/// built on the kept bundle can never lose the rows it owes. Stale content from a
+/// previous body is cleared at entry, never inherited.
+fn build_with_runtime_checked_member(
+    root_calls: &[&str],
+) -> (Result<Option<trust_ir_bridge::NativeVerificationBundle>, String>, Vec<RuntimeCheckedStdMember>)
+{
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", root_calls);
+    let member = kind_refused_overflow_member("sum_closure", "core::iter::sum::{closure#0}");
+    let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    let trust_ir_functions = vec![root.clone(), member.clone()];
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    record_runtime_check_provenance(&mut ledger, &member, false, true);
+    let mut kept = vec![RuntimeCheckedStdMember {
+        def_path: "stale::previous".into(),
+        class: trust_ir_bridge::MemberAssertRefusalClass::GuardedOrNonEntryPrefix,
+        reason: "stale",
+    }];
+    let outcome = build_native_trust_ir_bundle_from_verifiable_functions(
+        &root,
+        &mut bundle,
+        trust_ir_functions,
+        &ledger,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(), // bundled_destructor_members: none
+        &trust_ir_bridge::CallReachWithdrawals::default(), // call_reach_open_callees: no withdrawals
+        None,
+        None, // borrow_reach_scope: no scoped conjunct 3 on the test seam
+        &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(), // Trust: no grow pins
+        None,
+        &[],
+        &[],
+        None,
+        &mut None,
+        &mut PanicFreedomFoldAttestation::default(),
+        &mut None,
+        &mut kept,
+        false,
+        None, // no query/HIR source carry on this fixture
+        None, // no private query-bound source reference on this fixture
+        &mut None, // no source reference side table on this fixture
+    );
+    (outcome, kept)
+}
+
+#[test]
+fn the_builder_keeps_the_runtime_checked_list_on_every_exit() {
+    let paths = |kept: &[RuntimeCheckedStdMember]| {
+        kept.iter().map(|member| member.def_path.clone()).collect::<Vec<_>>()
+    };
+    // A root that CALLS the member: the synthesized panic-freedom row binds, so
+    // the builder returns a bundle.
+    let (outcome, kept) = build_with_runtime_checked_member(&["sum_closure"]);
+    assert!(
+        matches!(outcome, Ok(Some(_))),
+        "a root calling the member binds its panic-freedom row: {:?}",
+        outcome.as_ref().map(Option::is_some)
+    );
+    assert_eq!(paths(&kept), ["core::iter::sum::{closure#0}"]);
+    // A root that binds NO public obligation: the builder takes its `Ok(None)`
+    // exit, which clears every OTHER out-parameter — and must not clear this one.
+    let (outcome, kept) = build_with_runtime_checked_member(&[]);
+    assert!(
+        matches!(outcome, Ok(None)),
+        "this fixture binds no public obligation, so the builder takes its `Ok(None)` exit: {:?}",
+        outcome.as_ref().map(Option::is_some)
+    );
+    assert_eq!(
+        paths(&kept),
+        ["core::iter::sum::{closure#0}"],
+        "the list the gate recorded survives the `Ok(None)` exit, and the stale entry does not"
+    );
+}
+
+fn exact_bundled_div_assert_member(name: &str, def_path: &str) -> trust_types::VerifiableFunction {
     let span = native_trust_ir_test_span(320);
     trust_types::VerifiableFunction {
         name: name.to_string(),
@@ -27124,6 +35153,7 @@ fn exact_bundled_div_assert_member(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -27131,10 +35161,8 @@ fn bundled_assert_test_summary(
     member: &trust_types::VerifiableFunction,
     callee: &str,
 ) -> trust_vcgen::FunctionSummary {
-    let trust_ir_bridge::BundledMemberAssertAdmission::Derived {
-        param_names,
-        requires,
-    } = trust_ir_bridge::bundled_member_assert_admission(member)
+    let trust_ir_bridge::BundledMemberAssertAdmission::Derived { param_names, requires } =
+        trust_ir_bridge::bundled_member_assert_admission(member)
     else {
         panic!("synthetic member must derive its complete Assert population");
     };
@@ -27186,10 +35214,7 @@ fn bundled_member_assert_gate_accepts_exact_multi_call_cardinality() {
     let member = exact_bundled_div_assert_member("member", "demo::member");
     let vcs = bundled_assert_exact_precondition_vcs(&root, &member);
     assert_eq!(vcs.len(), 2);
-    assert_eq!(
-        bundled_assert_test_gate(&root, &[root.clone(), member], &vcs),
-        Ok(())
-    );
+    assert_eq!(bundled_assert_test_gate(&root, &[root.clone(), member], &vcs), Ok(()));
 }
 
 #[test]
@@ -27277,9 +35302,10 @@ fn bundled_member_assert_gate_requires_member_and_call_concrete_identity() {
             &absent_members,
             &ledger,
             &exact,
+            &FxHashSet::default(),
         )
-            .expect_err("a display name is not fallback proof identity")
-            .contains("carries no compiler-authenticated concrete identity")
+        .expect_err("a display name is not fallback proof identity")
+        .contains("carries no compiler-authenticated concrete identity")
     );
 
     let mut conflicting = root.clone();
@@ -27296,9 +35322,10 @@ fn bundled_member_assert_gate_requires_member_and_call_concrete_identity() {
             &conflicting_members,
             &ledger,
             &exact,
+            &FxHashSet::default(),
         )
-            .expect_err("same-key duplicate calls must still agree on concrete body identity")
-            .contains("does not match the exact extracted member source")
+        .expect_err("same-key duplicate calls must still agree on concrete body identity")
+        .contains("does not match the exact extracted member source")
     );
 
     assert!(
@@ -27307,6 +35334,7 @@ fn bundled_member_assert_gate_requires_member_and_call_concrete_identity() {
             &members,
             &BundledMemberSourceIdentityLedger::default(),
             &exact,
+            &FxHashSet::default(),
         )
         .expect_err("the member body itself needs compiler-owned provenance")
         .contains("exact extracted source has no unique")
@@ -27315,11 +35343,7 @@ fn bundled_member_assert_gate_requires_member_and_call_concrete_identity() {
 
 #[test]
 fn bundled_member_regeneration_is_stable_with_unrelated_summaries() {
-    let root = bundled_assert_test_function_with_calls(
-        "root",
-        "demo::root",
-        &["member", "other"],
-    );
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member", "other"]);
     let member = exact_bundled_div_assert_member("member", "demo::member");
     let minimal = bundled_assert_exact_precondition_vcs(&root, &member);
     assert_eq!(minimal.len(), 1);
@@ -27344,10 +35368,7 @@ fn bundled_member_regeneration_is_stable_with_unrelated_summaries() {
             .all(|(expected, actual)| exact_bundled_member_precondition_vc(expected, actual)),
         "unrelated summary entries must not perturb a derived member's exact row"
     );
-    assert_eq!(
-        bundled_assert_test_gate(&root, &[root.clone(), member], &all),
-        Ok(())
-    );
+    assert_eq!(bundled_assert_test_gate(&root, &[root.clone(), member], &all), Ok(()));
 }
 
 #[test]
@@ -27370,13 +35391,9 @@ fn bundled_member_assert_gate_rejects_pure_and_mixed_transitive_topologies() {
         bundled_assert_test_function_with_calls("root", "demo::root", &["member", "middle"]);
     let direct_row = bundled_assert_exact_precondition_vcs(&mixed_root, &member);
     assert!(
-        bundled_assert_test_gate(
-            &mixed_root,
-            &[mixed_root.clone(), middle, member],
-            &direct_row,
-        )
-        .expect_err("a direct row cannot also charge the nested call")
-        .contains("called from 1 bundled-member site(s)")
+        bundled_assert_test_gate(&mixed_root, &[mixed_root.clone(), middle, member], &direct_row,)
+            .expect_err("a direct row cannot also charge the nested call")
+            .contains("called from 1 bundled-member site(s)")
     );
 }
 
@@ -27407,13 +35424,588 @@ fn bundled_member_assert_gate_rejects_ambiguous_member_identity() {
     let second = exact_bundled_div_assert_member("member", "demo::member_b");
     let row = bundled_assert_exact_precondition_vcs(&root, &first);
     assert!(
-        bundled_assert_test_gate(
-            &root,
-            &[root.clone(), first, second],
-            &row,
+        bundled_assert_test_gate(&root, &[root.clone(), first, second], &row,)
+            .expect_err("one call key matching two bodies is ambiguous")
+            .contains("matched 2 members")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trust (2026-09-25): the OWNED-CHARGE credit for a transitive Assert-bearing
+// member (`member_assert_ownership`). `middle` plays the s03/i04 closure: a
+// LOCAL, non-generic body verified as its own root, whose own run charged the
+// FOREIGN Assert-bearing `member` exactly at its call. Every charge used below is
+// produced by the REAL gate run with `middle` as the root — never hand-built —
+// so the round trip "own run records, caller's bundle credits" is what is tested.
+// ---------------------------------------------------------------------------
+
+/// What `owner`'s OWN root run charged: the production gate, `owner` as root,
+/// `member` recorded as the foreign member it is.
+fn owned_charge_own_run(
+    owner: &trust_types::VerifiableFunction,
+    member: &trust_types::VerifiableFunction,
+) -> Vec<member_assert_ownership::OwnRootMemberAssertCharge> {
+    let members = [owner.clone(), member.clone()];
+    let rows = bundled_assert_exact_precondition_vcs(owner, member);
+    ensure_bundled_member_asserts_exactly_charged_with_charges(
+        owner,
+        &members,
+        &bundled_assert_test_ledger(&members),
+        &rows,
+        &FxHashSet::default(),
+    )
+    .expect("the owner's own run charges the member exactly at its direct call")
+    .own_charges
+}
+
+/// One bundled body's provenance in an owned-charge test ledger.
+struct OwnedChargeTestEntry<'a> {
+    function: &'a trust_types::VerifiableFunction,
+    local: bool,
+    requires_mono: bool,
+    evidence: member_assert_ownership::OwnRootAssertChargeEvidence,
+}
+
+/// `member` is always recorded FOREIGN (the class the gate exists for); each
+/// entry is recorded with its own locality/mono flags and then carries its
+/// own-root evidence exactly as the live closure builder attaches it.
+fn owned_charge_test_ledger(
+    member: &trust_types::VerifiableFunction,
+    entries: Vec<OwnedChargeTestEntry<'_>>,
+) -> BundledMemberSourceIdentityLedger {
+    let mut ledger = BundledMemberSourceIdentityLedger::default();
+    record_bundled_member_source_identity(
+        &mut ledger,
+        member,
+        Some(bundled_assert_test_identity(&member.name)),
+        false,
+        false,
+        false,
+        // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+        // disposition is exercised by its own tests.
+        false,
+    )
+    .expect("synthetic member source must serialize");
+    for entry in entries {
+        record_bundled_member_source_identity(
+            &mut ledger,
+            entry.function,
+            Some(bundled_assert_test_identity(&entry.function.name)),
+            entry.local,
+            entry.requires_mono,
+            true,
+            // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+            // disposition is exercised by its own tests.
+            false,
         )
-        .expect_err("one call key matching two bodies is ambiguous")
-        .contains("matched 2 members")
+        .expect("synthetic owner source must serialize");
+        member_assert_ownership::attach_own_root_assert_charge_evidence(
+            &mut ledger,
+            entry.function,
+            entry.evidence,
+        )
+        .expect("evidence is attached after the owner is recorded");
+    }
+    ledger
+}
+
+fn owned_charge_gate(
+    root: &trust_types::VerifiableFunction,
+    members: &[trust_types::VerifiableFunction],
+    ledger: &BundledMemberSourceIdentityLedger,
+    vcs: &[VerificationCondition],
+) -> Result<Vec<member_assert_ownership::OwnRootMemberAssertCharge>, String> {
+    ensure_bundled_member_asserts_exactly_charged_with_charges(
+        root,
+        members,
+        ledger,
+        vcs,
+        &FxHashSet::default(),
+    )
+    .map(|gate| gate.own_charges)
+}
+
+/// The recording half: the gate hands back exactly what the ROOT charged — one
+/// entry per member admitted through exact root regeneration, with the root's
+/// call-site multiset and the regenerated rows — and nothing for a member it
+/// admitted any other way.
+#[test]
+fn owned_charge_gate_records_exactly_the_roots_own_charges() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member", "member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), member.clone()];
+    let rows = bundled_assert_exact_precondition_vcs(&root, &member);
+    let charges = owned_charge_gate(&root, &members, &bundled_assert_test_ledger(&members), &rows)
+        .expect("the exact two-call charge admits");
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].call_sites.len(), 2, "one entry per direct call site");
+    assert_eq!(charges[0].rows.len(), 2, "one row per call per derived requires");
+    assert_eq!(charges[0].member_identity, bundled_assert_test_identity("member"));
+    assert!(charges[0].member == bundled_member_source_identity_key(&member).unwrap());
+
+    // A LOCAL member is exempt from the gate: it is charged by its own run, and
+    // this root therefore records NO charge for it.
+    let mut local_ledger = BundledMemberSourceIdentityLedger::default();
+    record_bundled_member_source_identity(
+        &mut local_ledger,
+        &member,
+        Some(bundled_assert_test_identity(&member.name)),
+        true,
+        false,
+        false,
+        // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+        // disposition is exercised by its own tests.
+        false,
+    )
+    .unwrap();
+    assert!(
+        owned_charge_gate(&root, &members, &local_ledger, &[])
+            .expect("a local member stays exempt")
+            .is_empty()
+    );
+}
+
+/// The s03/i04 shape, end to end on the gate: `root -> middle -> member`, where
+/// `middle` is local, non-generic, and its OWN run charged `member`. Admitted, and
+/// the root records no charge of its own (it made none). The same bundle with no
+/// evidence on `middle` must keep the pre-existing refusal — the control that
+/// shows the admission comes from the evidence and nothing else.
+#[test]
+fn owned_charge_admits_a_transitive_member_owned_by_a_local_own_root() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["middle"]);
+    let middle = bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), middle.clone(), member.clone()];
+    let own = owned_charge_own_run(&middle, &member);
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].call_sites.len(), 1);
+
+    let owned = owned_charge_test_ledger(
+        &member,
+        vec![OwnedChargeTestEntry {
+            function: &middle,
+            local: true,
+            requires_mono: false,
+            evidence: member_assert_ownership::OwnRootAssertChargeEvidence::Charged(own.clone()),
+        }],
+    );
+    let charged = owned_charge_gate(&root, &members, &owned, &[])
+        .expect("every site of the member is owned by middle's own accepted run");
+    assert!(charged.is_empty(), "the root charged nothing itself");
+
+    let unowned = owned_charge_test_ledger(
+        &member,
+        vec![OwnedChargeTestEntry {
+            function: &middle,
+            local: true,
+            requires_mono: false,
+            evidence: member_assert_ownership::OwnRootAssertChargeEvidence::NotRecorded,
+        }],
+    );
+    let refusal = owned_charge_gate(&root, &members, &unowned, &[])
+        .expect_err("with no own-root evidence the transitive member stays refused");
+    assert!(refusal.contains("transitive member"), "{refusal}");
+    assert!(refusal.contains("not owned"), "{refusal}");
+}
+
+/// Every conjunct of the rule, removed one at a time, refuses. Each arm starts
+/// from the admitted configuration above and changes exactly one thing.
+#[test]
+fn owned_charge_refuses_when_any_conjunct_is_missing() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["middle"]);
+    let middle = bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), middle.clone(), member.clone()];
+    let own = owned_charge_own_run(&middle, &member);
+    let with = |local: bool,
+                requires_mono: bool,
+                evidence: member_assert_ownership::OwnRootAssertChargeEvidence| {
+        owned_charge_test_ledger(
+            &member,
+            vec![OwnedChargeTestEntry { function: &middle, local, requires_mono, evidence }],
+        )
+    };
+    let charged = |charges: Vec<member_assert_ownership::OwnRootMemberAssertCharge>| {
+        member_assert_ownership::OwnRootAssertChargeEvidence::Charged(charges)
+    };
+
+    // Rule 1: a FOREIGN intermediate — the `Wrapping<u8>` canary's shape — never
+    // owns a charge, even carrying evidence.
+    assert!(
+        owned_charge_gate(&root, &members, &with(false, false, charged(own.clone())), &[])
+            .expect_err("a foreign intermediate has no own root run here")
+            .contains("not a local body")
+    );
+    // Rule 1: local but generic — its own run verified the parameter-erased body.
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, true, charged(own.clone())), &[])
+            .expect_err("a per-instance member's own run is a different body")
+            .contains("not a local body")
+    );
+    // Rule 2: the own run supplied no credit (not accepted, a row unproved, a
+    // contract, a premise ...). The reason is carried into the refusal.
+    let refused = member_assert_ownership::OwnRootAssertChargeEvidence::Refused(
+        "its own verification has not finished accepted in this compilation",
+    );
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, refused), &[])
+            .expect_err("no accepted own run, no credit")
+            .contains("has not finished accepted")
+    );
+    // Rule 2(a): the own run charged nothing for this member.
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, charged(Vec::new())), &[])
+            .expect_err("an own run that charged nothing owns nothing")
+            .contains("no unique charge")
+    );
+    // Rule 4: a charge for a DIFFERENT member source (same call key, other body).
+    let other_member = exact_bundled_div_assert_member("member", "demo::other_member");
+    let other_source = owned_charge_own_run(&middle, &other_member);
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, charged(other_source)), &[])
+            .expect_err("a charge must name this exact member source")
+            .contains("no unique charge")
+    );
+    // Rule 4: the same source under a different concrete identity.
+    let mut other_identity = own.clone();
+    other_identity[0].member_identity = bundled_assert_test_identity("different-member");
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, charged(other_identity)), &[])
+            .expect_err("a charge must carry this member's concrete identity")
+            .contains("no unique charge")
+    );
+    // Rule 4: an own run that charged a DIFFERENT call-site multiset (two calls)
+    // cannot own this body's single site.
+    let twice =
+        bundled_assert_test_function_with_calls("middle", "demo::middle", &["member", "member"]);
+    let two_sites = owned_charge_own_run(&twice, &member);
+    assert_eq!(two_sites[0].call_sites.len(), 2);
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, charged(two_sites)), &[])
+            .expect_err("the charged sites must be exactly this body's sites")
+            .contains("differ from the sites")
+    );
+    // Rule 4: a duplicated charge entry is ambiguous, not twice as good.
+    let mut duplicated = own.clone();
+    duplicated.push(own[0].clone());
+    assert!(
+        owned_charge_gate(&root, &members, &with(true, false, charged(duplicated)), &[])
+            .expect_err("two charges for one member are ambiguous")
+            .contains("no unique charge")
+    );
+    // Control: the unmodified configuration admits.
+    owned_charge_gate(&root, &members, &with(true, false, charged(own)), &[])
+        .expect("the admitted configuration, unchanged");
+}
+
+/// Rule 4, per site: a call reaching the member under a display ALIAS (the
+/// identity matches, the key binds no bundled body) is not a site the owner's
+/// charge could have named. It refuses even with valid evidence.
+#[test]
+fn owned_charge_refuses_an_alias_site_even_with_evidence() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["middle"]);
+    let mut middle =
+        bundled_assert_test_function_with_calls("middle", "demo::middle", &["rendered-alias"]);
+    let trust_types::Terminator::Call { callee_identity, .. } =
+        &mut middle.body.blocks[0].terminator
+    else {
+        unreachable!();
+    };
+    *callee_identity = Some(bundled_assert_test_identity("member"));
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let honest_middle =
+        bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let own = owned_charge_own_run(&honest_middle, &member);
+    let ledger = owned_charge_test_ledger(
+        &member,
+        vec![OwnedChargeTestEntry {
+            function: &middle,
+            local: true,
+            requires_mono: false,
+            evidence: member_assert_ownership::OwnRootAssertChargeEvidence::Charged(own),
+        }],
+    );
+    assert!(
+        owned_charge_gate(&root, &[root.clone(), middle, member], &ledger, &[])
+            .expect_err("an aliased site binds no body the charge named")
+            .contains("does not bind exactly one bundled body")
+    );
+}
+
+/// EVERY site must be owned. Two local intermediates call the member; only one
+/// carries evidence. Refused, naming the unowned one; admitted once both do.
+#[test]
+fn owned_charge_requires_every_bundled_site_owned() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["left", "right"]);
+    let left = bundled_assert_test_function_with_calls("left", "demo::left", &["member"]);
+    // `right`'s call sits at a different source site from `left`'s, as two real
+    // bodies' calls do, so one owner's charge cannot name the other's site.
+    let mut right = bundled_assert_test_function_with_calls("right", "demo::right", &["member"]);
+    let trust_types::Terminator::Call { span, .. } = &mut right.body.blocks[0].terminator else {
+        unreachable!();
+    };
+    *span = native_trust_ir_test_span(400);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), left.clone(), right.clone(), member.clone()];
+    let left_own = owned_charge_own_run(&left, &member);
+    let right_own = owned_charge_own_run(&right, &member);
+    let ledger = |right_evidence: member_assert_ownership::OwnRootAssertChargeEvidence| {
+        owned_charge_test_ledger(
+            &member,
+            vec![
+                OwnedChargeTestEntry {
+                    function: &left,
+                    local: true,
+                    requires_mono: false,
+                    evidence: member_assert_ownership::OwnRootAssertChargeEvidence::Charged(
+                        left_own.clone(),
+                    ),
+                },
+                OwnedChargeTestEntry {
+                    function: &right,
+                    local: true,
+                    requires_mono: false,
+                    evidence: right_evidence,
+                },
+            ],
+        )
+    };
+    let refusal = owned_charge_gate(
+        &root,
+        &members,
+        &ledger(member_assert_ownership::OwnRootAssertChargeEvidence::NotRecorded),
+        &[],
+    )
+    .expect_err("one unowned site refuses the member");
+    assert!(refusal.contains("demo::right"), "{refusal}");
+    // `left`'s charge cannot stand in for `right`'s site: the sites differ.
+    let borrowed = owned_charge_gate(
+        &root,
+        &members,
+        &ledger(member_assert_ownership::OwnRootAssertChargeEvidence::Charged(left_own.clone())),
+        &[],
+    )
+    .expect_err("another owner's charge does not own this body's site");
+    assert!(borrowed.contains("differ from the sites"), "{borrowed}");
+    owned_charge_gate(
+        &root,
+        &members,
+        &ledger(member_assert_ownership::OwnRootAssertChargeEvidence::Charged(right_own)),
+        &[],
+    )
+    .expect("both sites owned, each by its own run");
+}
+
+/// Mixed topology: the root calls the member directly AND through an owned local
+/// body. The direct site is charged by exact regeneration exactly as before (its
+/// row is still required), the nested site by its owner.
+#[test]
+fn owned_charge_mixed_topology_still_charges_the_direct_site() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member", "middle"]);
+    let middle = bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), middle.clone(), member.clone()];
+    let ledger = owned_charge_test_ledger(
+        &member,
+        vec![OwnedChargeTestEntry {
+            function: &middle,
+            local: true,
+            requires_mono: false,
+            evidence: member_assert_ownership::OwnRootAssertChargeEvidence::Charged(
+                owned_charge_own_run(&middle, &member),
+            ),
+        }],
+    );
+    let direct = bundled_assert_exact_precondition_vcs(&root, &member);
+    let charged = owned_charge_gate(&root, &members, &ledger, &direct)
+        .expect("direct site regenerated exactly, nested site owned");
+    assert_eq!(charged.len(), 1);
+    assert_eq!(charged[0].call_sites.len(), 1, "only the ROOT's own site is recorded");
+    assert!(
+        owned_charge_gate(&root, &members, &ledger, &[])
+            .expect_err("owning the nested site does not excuse the direct one")
+            .contains("expected 1 exact caller-side precondition row(s), found 0")
+    );
+}
+
+/// Composition across admitting paths is fail-closed: two different charges, or a
+/// refusal on any path, or an identity disagreement on the member record itself,
+/// leaves nothing to credit.
+#[test]
+fn owned_charge_evidence_composes_fail_closed() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["middle"]);
+    let middle = bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), middle.clone(), member.clone()];
+    let own = owned_charge_own_run(&middle, &member);
+    let twice =
+        bundled_assert_test_function_with_calls("middle", "demo::middle", &["member", "member"]);
+    let other = owned_charge_own_run(&twice, &member);
+    let charged = |charges: &Vec<member_assert_ownership::OwnRootMemberAssertCharge>| {
+        member_assert_ownership::OwnRootAssertChargeEvidence::Charged(charges.clone())
+    };
+    let base = || {
+        owned_charge_test_ledger(
+            &member,
+            vec![OwnedChargeTestEntry {
+                function: &middle,
+                local: true,
+                requires_mono: false,
+                evidence: charged(&own),
+            }],
+        )
+    };
+
+    // Same evidence twice: unchanged, still admits.
+    let mut same = base();
+    member_assert_ownership::attach_own_root_assert_charge_evidence(
+        &mut same,
+        &middle,
+        charged(&own),
+    )
+    .unwrap();
+    owned_charge_gate(&root, &members, &same, &[]).expect("identical evidence composes");
+
+    // Disagreeing evidence: Conflicting.
+    let mut conflicting = base();
+    member_assert_ownership::attach_own_root_assert_charge_evidence(
+        &mut conflicting,
+        &middle,
+        charged(&other),
+    )
+    .unwrap();
+    assert!(
+        owned_charge_gate(&root, &members, &conflicting, &[])
+            .expect_err("disagreeing evidence credits nothing")
+            .contains("disagreed")
+    );
+
+    // A refusal on any path wins over a charge.
+    let mut refused = base();
+    member_assert_ownership::attach_own_root_assert_charge_evidence(
+        &mut refused,
+        &middle,
+        member_assert_ownership::OwnRootAssertChargeEvidence::Refused("refused on another path"),
+    )
+    .unwrap();
+    assert!(
+        owned_charge_gate(&root, &members, &refused, &[])
+            .expect_err("a refusal on any admitting path withholds credit")
+            .contains("refused on another path")
+    );
+
+    // A second admission of the same owner source under a DIFFERENT identity
+    // poisons the owner's record, evidence included.
+    let mut split_identity = base();
+    record_bundled_member_source_identity(
+        &mut split_identity,
+        &middle,
+        Some(bundled_assert_test_identity("some-other-owner")),
+        true,
+        false,
+        true,
+        // Trust (2026-09-29): not an authentic sysroot body — the runtime-checked
+        // disposition is exercised by its own tests.
+        false,
+    )
+    .unwrap();
+    assert!(
+        owned_charge_gate(&root, &members, &split_identity, &[])
+            .expect_err("an owner record that no longer names one body owns nothing")
+            .contains("disagreed")
+    );
+
+    // Evidence attached before the owner was recorded is an ordering error.
+    member_assert_ownership::attach_own_root_assert_charge_evidence(
+        &mut BundledMemberSourceIdentityLedger::default(),
+        &middle,
+        charged(&own),
+    )
+    .expect_err("evidence needs a recorded owner");
+}
+
+/// Rule 2(c): at promotion, every charged row must be present in the owner's own
+/// results and every result row at that (kind, function, site) must be `Trusted`
+/// or `Certified` — a row-bound authority status, never a public label.
+#[test]
+fn owned_charge_rows_must_be_statically_proved_in_the_owners_results() {
+    let middle = bundled_assert_test_function_with_calls("middle", "demo::middle", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let own = owned_charge_own_run(&middle, &member);
+    assert_eq!(own[0].rows.len(), 1);
+    let row = own[0].rows[0].clone();
+    let unknown = || VerificationResult::Unknown {
+        solver: "trust-full-verifier".into(),
+        time_ms: 0,
+        reason: "test placeholder; only the disposition is read".to_string(),
+    };
+    let one = vec![(row.clone(), unknown())];
+    let check = |results: &[(VerificationCondition, VerificationResult)],
+                 statuses: &[TrustStatus]| {
+        member_assert_ownership::charged_rows_statically_proved(
+            &own,
+            results,
+            &proof_results_with_statuses(statuses).dispositions,
+        )
+    };
+
+    assert_eq!(check(&one, &[TrustStatus::Trusted]), Ok(()));
+    assert_eq!(check(&one, &[TrustStatus::Certified]), Ok(()));
+    for weak in [
+        TrustStatus::RuntimeChecked,
+        TrustStatus::Unknown,
+        TrustStatus::Timeout,
+        TrustStatus::Failed,
+    ] {
+        assert!(check(&one, &[weak]).is_err(), "{weak:?} must not credit a charge");
+    }
+    // Absent row.
+    assert!(check(&[], &[]).is_err(), "a charged row absent from the results");
+    // Misaligned arrays fail closed.
+    assert!(check(&one, &[]).is_err(), "results and dispositions must align");
+    // A second, unproved row at the same site is not hidden by a proved one.
+    let two = vec![(row.clone(), unknown()), (row.clone(), unknown())];
+    assert!(check(&two, &[TrustStatus::Trusted, TrustStatus::RuntimeChecked]).is_err());
+    assert_eq!(check(&two, &[TrustStatus::Trusted, TrustStatus::Certified]), Ok(()));
+
+    // The published row is REBUILT from the verifier-api obligation: its
+    // `function` is the def path (the regenerated row carries the short name) and
+    // its formula may be the reconstructed payload. The join is on (kind, site),
+    // so both still match — measured necessity, not convenience: a join on
+    // `function` would never fire on the live compiler.
+    let mut rebuilt = row.clone();
+    rebuilt.function = trust_types::Symbol::intern("demo::middle");
+    rebuilt.formula = Formula::Bool(false);
+    assert_eq!(check(&[(rebuilt, unknown())], &[TrustStatus::Trusted]), Ok(()));
+    // A row at another site, or of another kind, is not this charge's row.
+    let mut elsewhere = row.clone();
+    elsewhere.location.line_start += 1;
+    elsewhere.location.line_end += 1;
+    assert!(check(&[(elsewhere, unknown())], &[TrustStatus::Trusted]).is_err());
+    let mut other_callee = row.clone();
+    other_callee.kind = VcKind::Precondition { callee: "other".to_string() };
+    assert!(check(&[(other_callee, unknown())], &[TrustStatus::Trusted]).is_err());
+
+    // A charge with TWO distinct formulas at one site needs two rows there: one
+    // proved row cannot stand in for a dropped second `requires`.
+    let mut two_requires = own.clone();
+    let mut second = row.clone();
+    second.formula = Formula::Bool(true);
+    two_requires[0].rows.push(second);
+    let proved_one = member_assert_ownership::charged_rows_statically_proved(
+        &two_requires,
+        &one,
+        &proof_results_with_statuses(&[TrustStatus::Trusted]).dispositions,
+    );
+    assert!(proved_one.is_err(), "one row cannot cover two distinct charged formulas");
+    assert_eq!(
+        member_assert_ownership::charged_rows_statically_proved(
+            &two_requires,
+            &two,
+            &proof_results_with_statuses(&[TrustStatus::Trusted, TrustStatus::Certified])
+                .dispositions,
+        ),
+        Ok(())
     );
 }
 
@@ -27433,14 +36025,13 @@ fn bundled_member_admission_error_is_a_strict_native_failure_not_vacuous_success
     let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member"]);
     let member = exact_bundled_div_assert_member("member", "demo::member");
     let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
-    let mut bundle = trust_mir_extract::function_to_verifier_api_bundle(
-        &root,
-        &compiler_contracts,
-        &[],
-    );
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
     let trust_ir_functions = vec![root.clone(), member];
     let member_identities = bundled_assert_test_ledger(&trust_ir_functions);
     let mut coroutine_evidence = None;
+    let mut stale_source_reference_sites =
+        Some(trust_ir_bridge::LoweredSourceReferenceSites::default());
     let reason = build_native_trust_ir_bundle_from_verifiable_functions(
         &root,
         &mut bundle,
@@ -27453,16 +36044,35 @@ fn bundled_member_admission_error_is_a_strict_native_failure_not_vacuous_success
         &FxHashSet::default(),
         &FxHashSet::default(),
         &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(), // bundled_destructor_members: none
+        &trust_ir_bridge::CallReachWithdrawals::default(), // call_reach_open_callees: no withdrawals
         None,
+        None, // borrow_reach_scope: no scoped conjunct 3 on the test seam
+        &trust_ir_bridge::InstanceHypothesisSites::default(),
+        &trust_ir_bridge::CompilerAllocGrowPins::default(), // Trust: no grow pins
         None,
         &[],
         &[],
         None,
         &mut coroutine_evidence,
+        &mut PanicFreedomFoldAttestation::default(), // not consumed on this seam
+        &mut None,       // own-root Assert charges: published only by the live caller
+        &mut Vec::new(), // runtime-checked std members: this member is Derived, never tolerated
+        false,
+        None, // no query/HIR source carry on this fixture
+        None, // no private query-bound source reference on this fixture
+        // Trust (C1, 2026-11-06): a stale table from a previous body; the Err exit
+        // must leave none behind.
+        &mut stale_source_reference_sites,
     )
     .expect_err("the production builder must propagate the admission refusal");
     assert!(reason.contains("expected 1 exact caller-side precondition row(s), found 0"));
     assert!(coroutine_evidence.is_none());
+    assert!(
+        stale_source_reference_sites.is_none(),
+        "an Err exit publishes no source reference side table"
+    );
 
     let context = trust_router::VerifierExecutionContext::new("bundled-assert-admission-test");
     let failed = native_trust_ir_bundle_build_failure_result(
@@ -27472,12 +36082,4272 @@ fn bundled_member_admission_error_is_a_strict_native_failure_not_vacuous_success
         &reason,
     );
     assert!(native_run_trust_ir_lowering_failed(&failed));
-    assert!(!native_lowering_failure_is_generic_monomorphization_only(&failed));
     assert!(
         !native_run_is_vacuously_clean(&failed),
         "the strict gate must not reinterpret an admission Err as nothing to prove"
     );
-    assert!(failed.evidence.iter().all(|row| {
-        row.status == trust_verifier_api::EvidenceStatus::Unsupported
+    assert!(
+        failed
+            .evidence
+            .iter()
+            .all(|row| { row.status == trust_verifier_api::EvidenceStatus::Unsupported })
+    );
+}
+
+// Trust (W11): when typed-TrustIr lowering of a function fails, every row of
+// its bundle becomes an `Unsupported` lowering-failure row. A compiler-side
+// `unsupported_mir` refusal marker (`UnmodeledThreadSpawnEffect`) must still
+// NAME the refusal it carries — `; obligation: <description>` after the shared
+// lowering-failure text — so a lowering failure elsewhere in the function
+// cannot hide which refusal the row is; every other row keeps the bare text.
+#[test]
+fn bundle_build_failure_row_names_the_unsupported_mir_refusal_it_carries() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &[]);
+    let compiler_contracts = trust_types::CompilerContractBundle::new(Vec::new());
+    let mut bundle =
+        trust_mir_extract::function_to_verifier_api_bundle(&root, &compiler_contracts, &[]);
+    let refusal = trust_verifier_api::TrustObligation {
+        obligation_id: "obligation:demo:root:unsupported_mir:spawn".to_string(),
+        kind: trust_verifier_api::ObligationKind::Custom {
+            namespace: "trust.vc".to_string(),
+            name: "unsupported_mir".to_string(),
+        },
+        contract_id: None,
+        proof_item_id: None,
+        source: trust_verifier_api::SourceLocation::default(),
+        description: "unsupported MIR `UnmodeledThreadSpawnEffect`: local callee transitively \
+                      spawns a std thread; caller effect is unmodeled"
+            .to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: Vec::new(),
+    };
+    let other = trust_verifier_api::TrustObligation {
+        obligation_id: "obligation:demo:root:custom:other".to_string(),
+        kind: trust_verifier_api::ObligationKind::Custom {
+            namespace: "trust.contract".to_string(),
+            name: "unsupported".to_string(),
+        },
+        description: "unsupported contract predicate".to_string(),
+        ..refusal.clone()
+    };
+    bundle.obligations.push(refusal.clone());
+    bundle.obligations.push(other.clone());
+
+    let context = trust_router::VerifierExecutionContext::new("unsupported-mir-lowering-failure");
+    let failed = native_trust_ir_bundle_build_failure_result(
+        &bundle,
+        &bundle.obligations,
+        &context,
+        "typed TrustIr lowering refused the body",
+    );
+    assert!(native_run_trust_ir_lowering_failed(&failed));
+    let row_of = |id: &str| {
+        failed
+            .evidence
+            .iter()
+            .find(|row| row.obligation_id == id)
+            .unwrap_or_else(|| panic!("no evidence row for `{id}`: {:?}", failed.evidence))
+    };
+    let refusal_row = row_of(&refusal.obligation_id);
+    assert_eq!(refusal_row.status, trust_verifier_api::EvidenceStatus::Unsupported);
+    assert_eq!(
+        refusal_row.diagnostics,
+        vec![format!(
+            "{NATIVE_TRUST_IR_LOWERING_FAILED_MARKER}: typed TrustIr lowering refused the body; \
+             obligation: {}",
+            refusal.description
+        )]
+    );
+    let other_row = row_of(&other.obligation_id);
+    assert_eq!(other_row.status, trust_verifier_api::EvidenceStatus::Unsupported);
+    assert_eq!(
+        other_row.diagnostics,
+        vec![format!(
+            "{NATIVE_TRUST_IR_LOWERING_FAILED_MARKER}: typed TrustIr lowering refused the body"
+        )]
+    );
+}
+
+// Trust (VF5): the "proved (calculus)" mint, grade and E4.7 exclusion.
+mod calculus_row_tests;
+mod callee_identity_gate_tests;
+mod zero_obligation_owner_tests;
+mod const_init_tls_accessor_terminator_rule_tests;
+mod discharge_call_gate_arm_tests;
+// Trust (plan P4 / T4.1): the Liskov router's deployed inventory decides on the linked ay.
+mod liskov_router_tests;
+mod panic_freedom_registration_tests;
+// Trust (TINV step 10.4): the TypeInvariantComposed mint, cap pass and exclusions.
+mod tinv_grading_tests;
+mod whole_function_receipt_tests;
+// Trust (T3 L4, C09w): the claim v3 and fingerprint v4 encoders, mutated field by field.
+mod wire_identity_tests;
+
+// Trust (2026-09-17): `TransportObligationResult::gap_class` — the wire's own
+// statement of a row's completeness-gap class: attested per FUNCTION where the
+// panic-freedom fold is visible, then stamped by the transport builder on the
+// one row that is that aggregate.
+mod transport_gap_class_tests {
+    use super::*;
+
+    const STD_PRINT: trust_types::TransportGapClass =
+        trust_types::TransportGapClass::StdPrintDispatch;
+
+    /// The r09 wire shape: an ABSENT-callee panic-freedom row (not the extern
+    /// print/format/write DISPATCH shape) naming the `std::io::stdio::` spelling.
+    fn absent_std_print_row(callee: &str, outcome: Outcome) -> TransportObligationResult {
+        let mut row = absent_callee_transport_row(outcome);
+        row.description = format!(
+            "assertion: {}call to absent callee `{callee}` (body not in the lowered bundle) may panic",
+            trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+        );
+        row
+    }
+
+    // ---- the fold attestation ------------------------------------------------
+
+    fn pf(id: u32, source_id: &str, description: &str) -> trust_ir::ProofObligation {
+        let mut obligation = trust_ir::ProofObligation::new(
+            trust_ir::ProofId::new(id),
+            trust_ir::ObligationKind::PanicFreedom,
+            trust_ir::ProofStatus::Pending,
+            description,
+        );
+        obligation.formula = Some(trust_ir::ProofFormula {
+            schema: "test".to_string(),
+            payload: serde_json::json!({ "source_id": source_id }).to_string(),
+            smtlib: None,
+            sort: None,
+            bindings: Vec::new(),
+        });
+        obligation
+    }
+    fn aggregate(id: u32, function: &str) -> trust_ir::ProofObligation {
+        pf(
+            id,
+            &format!("mir-assertions:{function}:panic-freedom"),
+            &format!("{function}: all assertions hold"),
+        )
+    }
+    fn absent_site(id: u32, function: &str, bb: u32, callee: &str) -> trust_ir::ProofObligation {
+        pf(
+            id,
+            &format!("mir-assert:{function}:bb{bb}:terminator"),
+            &format!(
+                "{}call to absent callee `{callee}` (body not in the lowered bundle) may panic",
+                trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+            ),
+        )
+    }
+    fn panic_site(id: u32, function: &str, bb: u32, callee: &str) -> trust_ir::ProofObligation {
+        pf(
+            id,
+            &format!("mir-assert:{function}:bb{bb}:terminator"),
+            &format!("panic call `{callee}` must be unreachable"),
+        )
+    }
+
+    /// A module of `functions` (index = FuncId), each with the given number of
+    /// blocks; `asserts` places one `Inst::Assert` per (function, block) at body
+    /// index 1 (after the `Const false` that feeds it).
+    fn module_with(functions: &[(&str, u32)], asserts: &[(u32, u32)]) -> trust_ir::Module {
+        let mut module = trust_ir::Module::new("demo");
+        let sig = module
+            .add_func_type(trust_ir::FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        for (index, (name, blocks)) in functions.iter().enumerate() {
+            let mut function = trust_ir::Function::new(
+                trust_ir::FuncId::new(index as u32),
+                *name,
+                sig,
+                trust_ir::BlockId::new(0),
+            );
+            for bb in 0..*blocks {
+                let mut block = trust_ir::Block::new(trust_ir::BlockId::new(bb));
+                if asserts.contains(&(index as u32, bb)) {
+                    let cond = trust_ir::ValueId::new(bb);
+                    block.body.push(
+                        trust_ir::InstrNode::new(trust_ir::Inst::Const {
+                            ty: trust_ir::Ty::Bool,
+                            value: trust_ir::Constant::Bool(false),
+                        })
+                        .with_result(cond),
+                    );
+                    block.body.push(trust_ir::InstrNode::new(trust_ir::Inst::Assert {
+                        cond,
+                        kind: trust_ir::AssertKind::Unspecified,
+                        site: None,
+                    }));
+                }
+                block
+                    .body
+                    .push(trust_ir::InstrNode::new(trust_ir::Inst::Return { values: vec![] }));
+                function.blocks.push(block);
+            }
+            module.try_add_function(function).expect("Module::try_add_function: test fixture");
+        }
+        module
+    }
+    fn sited(
+        mut obligation: trust_ir::ProofObligation,
+        function: u32,
+        bb: u32,
+    ) -> trust_ir::ProofObligation {
+        obligation = obligation.with_function(trust_ir::FuncId::new(function));
+        obligation.with_site(trust_ir::ObligationSite::new(
+            trust_ir::FuncId::new(function),
+            trust_ir::BlockId::new(bb),
+            1,
+        ))
+    }
+    const ROOT: trust_ir::FuncId = trust_ir::FuncId::new(0);
+    fn own(ids: &[u32]) -> FxHashSet<trust_ir::FuncId> {
+        ids.iter().map(|id| trust_ir::FuncId::new(*id)).collect()
+    }
+
+    /// The r09 bundle, measured 2026-09-17 (`TRUST_MEMBER_PANIC_CENSUS=1` for the
+    /// obligations, `-Ztrust-dump=native-bundle` for the instructions): root
+    /// `main` with ONE assert — the `_print` marker at bb3 — plus three
+    /// assert-free members; obligations = the root aggregate and that one
+    /// absent-callee `_print` site.
+    #[test]
+    fn the_r09_fold_is_attested() {
+        let mut module = module_with(
+            &[
+                ("main", 4),
+                ("double", 1),
+                ("core::fmt::rt::Argument::<'_>::new_display::<i32>", 1),
+                ("core::fmt::Arguments::<'_>::new::<4, 1>", 1),
+            ],
+            &[(0, 3)],
+        );
+        module.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        // The marker obligation is SITELESS on the real bridge (measured); it is
+        // owned by `main` and its source id names bb3's terminator.
+        module
+            .proof_obligations
+            .push(absent_site(1, "main::main", 3, "std::io::stdio::_print").with_function(ROOT));
+        assert!(panic_freedom_fold_is_std_print_exclusive(&module, &own(&[0])));
+        // With an exact STEP-1 site it is attested the same way.
+        let mut with_site = module_with(&[("main", 4)], &[(0, 3)]);
+        with_site.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        with_site.proof_obligations.push(sited(
+            absent_site(1, "main::main", 3, "std::io::stdio::_print"),
+            0,
+            3,
+        ));
+        assert!(panic_freedom_fold_is_std_print_exclusive(&with_site, &own(&[0])));
+        // A siteless marker obligation naming ANOTHER block, or owned by another
+        // function, does not account for main's bb3 assert.
+        let mut wrong_block = module_with(&[("main", 4)], &[(0, 3)]);
+        wrong_block.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        wrong_block
+            .proof_obligations
+            .push(absent_site(1, "main::main", 2, "std::io::stdio::_print").with_function(ROOT));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&wrong_block, &own(&[0])));
+        let mut wrong_owner = module_with(&[("main", 4), ("other", 1)], &[(0, 3)]);
+        wrong_owner.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        wrong_owner.proof_obligations.push(
+            absent_site(1, "main::main", 3, "std::io::stdio::_print")
+                .with_function(trust_ir::FuncId::new(1)),
+        );
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&wrong_owner, &own(&[0])));
+
+        // `eprintln!` is the same backend; two print sites are still the backend alone.
+        let mut two = module_with(&[("main", 6)], &[(0, 3), (0, 5)]);
+        two.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        two.proof_obligations.push(sited(
+            absent_site(1, "main::main", 3, "std::io::stdio::_print"),
+            0,
+            3,
+        ));
+        two.proof_obligations.push(sited(
+            absent_site(2, "main::main", 5, "std::io::_eprint"),
+            0,
+            5,
+        ));
+        assert!(panic_freedom_fold_is_std_print_exclusive(&two, &own(&[0])));
+    }
+
+    /// The assert twin (battery row r28), measured the same way: the user's
+    /// unmarked panic site folds under the same aggregate — NOT attested.
+    #[test]
+    fn one_folded_user_panic_site_withholds_the_attestation() {
+        let mut module = module_with(&[("main", 7)], &[(0, 3), (0, 6)]);
+        module.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        module.proof_obligations.push(sited(
+            panic_site(1, "main::main", 3, "core::panicking::panic"),
+            0,
+            3,
+        ));
+        module.proof_obligations.push(sited(
+            absent_site(2, "main::main", 6, "std::io::stdio::_print"),
+            0,
+            6,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&module, &own(&[0])));
+    }
+
+    /// The pow twin and its relatives: a second absent callee; a bundled MEMBER's
+    /// aggregate and its own panic site; a dependency-rooted `_print`; drop glue;
+    /// an assumed-total marker — every one withholds the attestation on its own.
+    #[test]
+    fn any_other_folded_source_withholds_the_attestation() {
+        let base = |extra_fn: &[(&str, u32)], asserts: &[(u32, u32)]| {
+            let mut fns = vec![("main", 6)];
+            fns.extend_from_slice(extra_fn);
+            let mut all = vec![(0, 3)];
+            all.extend_from_slice(asserts);
+            let mut module = module_with(&fns, &all);
+            module.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+            module.proof_obligations.push(sited(
+                absent_site(1, "main::main", 3, "std::io::stdio::_print"),
+                0,
+                3,
+            ));
+            module
+        };
+        let mut other_absent = base(&[], &[(0, 5)]);
+        other_absent.proof_obligations.push(sited(
+            absent_site(2, "main::main", 5, "core::num::<impl u32>::pow"),
+            0,
+            5,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&other_absent, &own(&[0])));
+
+        let mut member_site = base(&[("core::num::imp::overflow_panic::pow", 1)], &[(1, 0)]);
+        member_site.proof_obligations.push(
+            aggregate(2, "core::num::imp::overflow_panic::pow")
+                .with_function(trust_ir::FuncId::new(1)),
+        );
+        member_site.proof_obligations.push(sited(
+            panic_site(3, "core::num::imp::overflow_panic::pow", 0, "core::panicking::panic_fmt"),
+            1,
+            0,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&member_site, &own(&[0])));
+
+        let mut dep_rooted = base(&[], &[(0, 5)]);
+        dep_rooted.proof_obligations.push(sited(
+            absent_site(2, "main::main", 5, "depA::a::std::io::_print"),
+            0,
+            5,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&dep_rooted, &own(&[0])));
+
+        let mut drop_glue = base(&[], &[(0, 5)]);
+        drop_glue.proof_obligations.push(sited(
+            pf(
+                2,
+                "mir-assert:main::main:bb5:terminator",
+                &format!(
+                    "{}drop glue for `main::S` may panic",
+                    trust_types::assumption::DROP_GLUE_ASSUMPTION_PREFIX
+                ),
+            ),
+            0,
+            5,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&drop_glue, &own(&[0])));
+
+        let mut assumed_total = base(&[], &[(0, 5)]);
+        assumed_total.proof_obligations.push(sited(
+            pf(
+                2,
+                "mir-assert:main::main:bb5:terminator",
+                &format!(
+                    "{}call to audited callee `dep::f`",
+                    trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX
+                ),
+            ),
+            0,
+            5,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&assumed_total, &own(&[0])));
+
+        // An obligation whose source id cannot be read is still judged by its shape.
+        let mut unreadable_other = base(&[], &[(0, 5)]);
+        let mut o = sited(panic_site(2, "main::main", 5, "core::panicking::panic"), 0, 5);
+        o.formula = None;
+        unreadable_other.proof_obligations.push(o);
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&unreadable_other, &own(&[0])));
+    }
+
+    /// The second gate, over INSTRUCTIONS: an `Inst::Assert` the obligation scan
+    /// cannot see (a member's bounds/overflow check, an assert with no obligation
+    /// at its site) is folded under the aggregate's CHC all the same.
+    #[test]
+    fn an_assert_instruction_without_a_print_or_root_row_withholds_the_attestation() {
+        let attested = |module: &trust_ir::Module| {
+            panic_freedom_fold_is_std_print_exclusive(module, &own(&[0]))
+        };
+        let with_print = |fns: &[(&str, u32)], asserts: &[(u32, u32)]| {
+            let mut module = module_with(fns, asserts);
+            module.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+            module.proof_obligations.push(sited(
+                absent_site(1, "main::main", 3, "std::io::stdio::_print"),
+                0,
+                3,
+            ));
+            module
+        };
+        // A root-owned overflow check with its own counted row: accounted for.
+        let mut root_overflow = with_print(&[("main", 6)], &[(0, 3), (0, 5)]);
+        let mut overflow = trust_ir::ProofObligation::new(
+            trust_ir::ProofId::new(2),
+            trust_ir::ObligationKind::ArithmeticSafety,
+            trust_ir::ProofStatus::Pending,
+            "arithmetic overflow (Mul)",
+        );
+        overflow.formula = None;
+        root_overflow.proof_obligations.push(sited(overflow.clone(), 0, 5));
+        assert!(attested(&root_overflow));
+
+        // The SAME check inside a bundled member: no row anywhere — withheld ...
+        let mut member_overflow =
+            with_print(&[("main", 4), ("core::x::helper", 1)], &[(0, 3), (1, 0)]);
+        member_overflow.proof_obligations.push(sited(overflow.clone(), 1, 0));
+        assert!(!attested(&member_overflow));
+        // ... unless the member is LOCAL and not per-instance — verified as its own
+        // root in the same compile, so its check has its own row there (the r09
+        // shape: `double`'s `x * 2` overflow check, bundled under `main`).
+        assert!(panic_freedom_fold_is_std_print_exclusive(&member_overflow, &own(&[0, 1])));
+        // A local member's UNMARKED panic site is still a folded panic source.
+        let mut local_member_panic =
+            with_print(&[("main", 4), ("crate::helper", 1)], &[(0, 3), (1, 0)]);
+        local_member_panic.proof_obligations.push(sited(
+            panic_site(2, "crate::helper", 0, "core::panicking::panic"),
+            1,
+            0,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&local_member_panic, &own(&[0, 1])));
+
+        // A member's bounds check, likewise.
+        let mut member_bounds =
+            with_print(&[("main", 4), ("core::x::helper", 1)], &[(0, 3), (1, 0)]);
+        let mut bounds = overflow.clone();
+        bounds.kind = trust_ir::ObligationKind::BoundsCheck;
+        member_bounds.proof_obligations.push(sited(bounds, 1, 0));
+        assert!(!attested(&member_bounds));
+
+        // An assert with NO obligation at its site, in the root or a member.
+        let root_bare = with_print(&[("main", 6)], &[(0, 3), (0, 5)]);
+        assert!(!attested(&root_bare));
+        let member_bare = with_print(&[("main", 4), ("core::x::helper", 1)], &[(0, 3), (1, 0)]);
+        assert!(!attested(&member_bare));
+
+        // A root-owned assert whose only obligation is a PanicFreedom row that is
+        // not the print marker is the r28 shape — already withheld by the scan.
+        let mut root_panic = with_print(&[("main", 6)], &[(0, 3), (0, 5)]);
+        root_panic.proof_obligations.push(sited(
+            panic_site(2, "main::main", 5, "core::panicking::panic"),
+            0,
+            5,
+        ));
+        assert!(!attested(&root_panic));
+    }
+
+    /// The extern print/format/write DISPATCH shape is a user `Display` reached
+    /// through the machinery: never the class, even alone. Nor an empty fold.
+    #[test]
+    fn the_dispatch_shape_and_an_empty_fold_are_not_attested() {
+        let mut dispatch = module_with(&[("main", 4)], &[(0, 3)]);
+        dispatch.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        dispatch.proof_obligations.push(sited(
+            pf(
+                1,
+                "mir-assert:main::main:bb3:terminator",
+                &format!(
+                    "{}extern print/format/write dispatch `std::io::_print` runs a user Display/Debug impl that may panic",
+                    trust_types::assumption::EXTERN_CALL_ASSUMPTION_PREFIX
+                ),
+            ),
+            0, 3,
+        ));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&dispatch, &own(&[0])));
+
+        let mut only_aggregate = module_with(&[("main", 1)], &[]);
+        only_aggregate.proof_obligations.push(aggregate(0, "main::main").with_function(ROOT));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(&only_aggregate, &own(&[0])));
+        assert!(!panic_freedom_fold_is_std_print_exclusive(
+            &module_with(&[("main", 1)], &[]),
+            &own(&[0])
+        ));
+    }
+
+    // ---- the row-level gate -------------------------------------------------
+
+    #[test]
+    fn without_an_attestation_no_row_is_classed_whatever_its_shape() {
+        for row in [
+            absent_std_print_row("std::io::stdio::_print", Outcome::RuntimeChecked),
+            absent_std_print_row("std::io::_print", Outcome::Unknown),
+            stdout_print_extern_call_transport_row(Outcome::RuntimeChecked),
+        ] {
+            assert_eq!(transport_gap_class(None, &row), None, "{}", row.description);
+        }
+    }
+
+    #[test]
+    fn with_an_attestation_only_the_absent_print_row_is_classed_and_never_a_proved_one() {
+        for row in [
+            absent_std_print_row("std::io::stdio::_print", Outcome::RuntimeChecked),
+            absent_std_print_row("std::io::_print", Outcome::Unknown),
+            absent_std_print_row("std::io::stdio::_eprint", Outcome::RuntimeChecked),
+            absent_std_print_row("std::io::_eprint", Outcome::Skipped),
+        ] {
+            assert_eq!(
+                transport_gap_class(Some(STD_PRINT), &row),
+                Some(STD_PRINT),
+                "{}",
+                row.description
+            );
+        }
+        assert_eq!(
+            transport_gap_class(
+                Some(STD_PRINT),
+                &absent_std_print_row("std::io::_print", Outcome::Proved)
+            ),
+            None
+        );
+        for row in [
+            // the DISPATCH shape is not the attested row even under an attestation
+            stdout_print_extern_call_transport_row(Outcome::RuntimeChecked),
+            absent_callee_transport_row(Outcome::RuntimeChecked),
+            absent_std_print_row("depA::a::std::io::_print", Outcome::RuntimeChecked),
+            absent_std_print_row("std::io::_print_hook", Outcome::RuntimeChecked),
+            absent_std_print_row("core::fmt::write", Outcome::RuntimeChecked),
+            expected_absent_callee_transport_row(Outcome::RuntimeChecked),
+            drop_glue_transport_row(Outcome::RuntimeChecked),
+            plain_transport_row(Outcome::RuntimeChecked, false),
+        ] {
+            assert_eq!(transport_gap_class(Some(STD_PRINT), &row), None, "{}", row.description);
+        }
+    }
+
+    // ---- the builder --------------------------------------------------------
+
+    fn absent_callee_vc(function: &str, callee: &str) -> VerificationCondition {
+        VerificationCondition {
+            kind: VcKind::Assertion {
+                message: format!(
+                    "{}call to absent callee `{callee}` (body not in the lowered bundle) may panic",
+                    trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+                ),
+            },
+            function: trust_types::Symbol::intern(function),
+            location: native_trust_ir_test_span(1),
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+    fn unsupported() -> VerificationResult {
+        VerificationResult::Unknown {
+            solver: trust_types::Symbol::intern("trust-full-verifier"),
+            time_ms: 0,
+            reason: "native full verifier evidence status: Unsupported".to_string(),
+        }
+    }
+
+    /// The load-bearing line is the builder's stamp, not the recognizer: run the
+    /// r09 wire shape THROUGH the builder with the attestation keyed the way the
+    /// session ledger keys it, and read `gap_class` off the rows it returns.
+    #[test]
+    fn the_builder_stamps_the_attested_function_s_print_row_and_no_other() {
+        let results = vec![
+            (absent_callee_vc("main::main", "std::io::stdio::_print"), unsupported()),
+            (absent_callee_vc("main::main", "core::num::<impl u32>::pow"), unsupported()),
+            (absent_callee_vc("main::other", "std::io::stdio::_print"), unsupported()),
+        ];
+        let mut attested = FxHashMap::default();
+        attested.insert("main::main".to_string(), STD_PRINT);
+        let rows = build_transport_results_with_runtime_checks_attested(
+            false, &results, None, None, &attested,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].kind, "assert");
+        assert_ne!(rows[0].outcome, Outcome::Proved);
+        assert_eq!(rows[0].gap_class, Some(STD_PRINT), "{}", rows[0].description);
+        assert_eq!(rows[1].gap_class, None, "{}", rows[1].description);
+        assert_eq!(
+            rows[2].gap_class, None,
+            "an unattested function's print row: {}",
+            rows[2].description
+        );
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(json["gap_class"], serde_json::json!("std-print-dispatch"));
+        assert!(serde_json::to_value(&rows[1]).unwrap().get("gap_class").is_none());
+
+        // The no-attestation seams every other test drives stamp nothing.
+        let plain = build_transport_results_with_runtime_checks(false, &results, None, None);
+        assert!(plain.iter().all(|row| row.gap_class.is_none()));
+    }
+
+    /// The field rides the wire under its kebab-case name, is ABSENT when `None`,
+    /// and a wire written before the field existed still deserializes.
+    #[test]
+    fn the_class_serializes_as_kebab_case_and_is_absent_when_none() {
+        let mut row = absent_std_print_row("std::io::stdio::_print", Outcome::RuntimeChecked);
+        row.gap_class = transport_gap_class(Some(STD_PRINT), &row);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["gap_class"], serde_json::json!("std-print-dispatch"));
+        let back: TransportObligationResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.gap_class, Some(STD_PRINT));
+
+        let plain = plain_transport_row(Outcome::RuntimeChecked, false);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("gap_class").is_none(), "{json}");
+        let mut without = json.clone();
+        without.as_object_mut().unwrap().remove("gap_class");
+        let back: TransportObligationResult = serde_json::from_value(without).unwrap();
+        assert_eq!(back.gap_class, None);
+    }
+}
+
+/// Trust (trust-ir SPEC §17, ratified 2026-09-27): the native verification
+/// bundle's `TargetInfo` claims no aggregate classification this compiler did
+/// not perform. It used to stamp `Default::default()` — `NativeC`, "every
+/// by-value aggregate slot crosses where the target's C ruleset places it" — over
+/// Rust-ABI instances passing `Ty::Struct` by value, which nothing here
+/// classified. The physical facts stay read from the target, on a 64-bit and a
+/// 32-bit big-endian shape alike (trust-mc's 64-bit refusal is its boundary, not
+/// this stamp's).
+#[test]
+fn native_bundle_target_info_stamps_unclassified() {
+    for (triple, pointer_width_bits, endian, pointer_size, endianness) in [
+        (
+            "aarch64-apple-darwin",
+            64u16,
+            rustc_abi::Endian::Little,
+            8u32,
+            trust_ir::Endianness::Little,
+        ),
+        (
+            "x86_64-unknown-linux-gnu",
+            64,
+            rustc_abi::Endian::Little,
+            8,
+            trust_ir::Endianness::Little,
+        ),
+        ("powerpc-unknown-linux-gnu", 32, rustc_abi::Endian::Big, 4, trust_ir::Endianness::Big),
+    ] {
+        let info = native_bundle_target_info(triple.to_string(), pointer_width_bits, endian);
+        assert_eq!(
+            info.struct_passing,
+            trust_ir::StructPassingPolicy::Unclassified,
+            "{triple}: the native bundle performs no aggregate classification, so its policy \
+             must say so (`NativeC`, the `Default`, would claim the target's C placement)"
+        );
+        assert_eq!(info.triple, triple);
+        assert_eq!(info.pointer_size, pointer_size, "{triple}: pointer size is a target fact");
+        assert_eq!(info.endianness, endianness, "{triple}: endianness is a target fact");
+        assert_eq!(info.abi, None, "{triple}: no calling-convention ruleset is claimed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust (skip taxonomy, 2026-09-16) — the four verdicts a skip can be.
+//
+// Measured motivation: `targo trust check -p aterm-types` reported 569 errors
+// with ZERO refutations, and 219 of them — the largest single class — were
+// `Trust full verification skipped`, all of one cause. These pin the mapping
+// so a later variant cannot quietly land in the wrong bucket.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skip_class_names_the_four_verdicts_apart() {
+    use trust_mir_extract::supportability::UnsupportedReason;
+
+    // Only the toolchain's own capability gap is attributed to Trust.
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::TreatedAsAssumption(
+            UnsupportedReason::Coroutine
+        )),
+        super::SkipClass::ToolchainGap
+    );
+    // A source attribute is the AUTHOR's premise, never a Trust gap.
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::UserOptOut),
+        super::SkipClass::Declared
+    );
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::AssumedTotal),
+        super::SkipClass::Declared
+    );
+    // Neither of these is proof inventory at all.
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::ContractGeneratedClosure),
+        super::SkipClass::NotASubject
+    );
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::UnreachableStart),
+        super::SkipClass::NotASubject
+    );
+    // Scope is cost policy.
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::NonLocalMir),
+        super::SkipClass::OutOfScope
+    );
+    assert_eq!(
+        super::skip_class(&super::TrustVerifySkipReason::ExternalDependencyScope),
+        super::SkipClass::OutOfScope
+    );
+    // Trust (CB4): rustc's libtest harness code is its own class.
+    assert_eq!(super::skip_class(&harness_exclusion_fixture()), super::SkipClass::HarnessGlue);
+}
+
+/// Trust (CB4): an excluded libtest harness body, as the decision carries it.
+fn harness_exclusion_fixture() -> super::TrustVerifySkipReason {
+    super::TrustVerifySkipReason::TestHarnessSynthesized(
+        super::test_harness_exclusion::TestHarnessExclusion {
+            item: rustc_middle::middle::trust_test_harness::TestHarnessItem::HarnessMain,
+            test_function: None,
+            row_reason: trust_types::exclusion::test_harness_exclusion_reason(
+                trust_types::exclusion::TestHarnessExclusionItem::HarnessMain,
+                None,
+            )
+            .expect("main reason"),
+        },
+    )
+}
+
+/// Trust (CB4): an excluded libtest harness body is never a verification
+/// failure in any policy, never an `assumption:` row, and is censused under the
+/// same tag its `excluded:` row carries.
+#[test]
+fn test_harness_exclusion_is_never_a_gap_nor_an_assumption() {
+    let reason = harness_exclusion_fixture();
+    for policy in [
+        rustc_session::config::TrustPolicy::Strict,
+        rustc_session::config::TrustPolicy::Certify,
+        rustc_session::config::TrustPolicy::MemorySafe,
+        rustc_session::config::TrustPolicy::Advisory,
+    ] {
+        for include_dependencies in [false, true] {
+            let policy = super::TrustVerifyPolicy { include_dependencies, policy };
+            assert!(
+                !policy.skip_is_full_verification_failure(&reason),
+                "{:?}/{include_dependencies}: harness glue is never a gap",
+                policy.policy
+            );
+            assert!(!policy.skip_aborts_build(&reason));
+        }
+    }
+    assert!(!super::skip_reason_is_recorded_assumption(&reason));
+    assert_eq!(super::skip_assumption_tag(&reason), "test-harness-synthesized");
+    // The assumption record plan writes NOTHING for it in any output mode: the
+    // exclusion row is written by its own path, never as `assumption:*`.
+    for emit_json in [false, true] {
+        for emit_human in [false, true] {
+            let plan = super::skip_record_plan(
+                super::skip_reason_is_recorded_assumption(&reason),
+                false,
+                false,
+                emit_json,
+                emit_human,
+            );
+            assert!(!plan.machine_row && !plan.human_note);
+        }
+    }
+}
+
+#[test]
+fn skip_headline_keeps_the_pinned_prefix_intact() {
+    // Every pinned expectation — the `//~ ERROR Trust full verification skipped
+    // `x`` annotations in tests/ui/trust/ and the `.contains(...)` assertions in
+    // tests/run-make/trust-assumption-rows/ — is a SUBSTRING match on the
+    // headline up to and including the closing backtick. The attribution clause
+    // may only ever be APPENDED after it.
+    for class in [
+        super::SkipClass::NotASubject,
+        super::SkipClass::Declared,
+        super::SkipClass::ToolchainGap,
+        super::SkipClass::OutOfScope,
+        super::SkipClass::HarnessGlue,
+    ] {
+        let headline =
+            format!("Trust full verification skipped `demo::f`{}", class.headline_suffix());
+        assert!(
+            headline.starts_with("Trust full verification skipped `demo::f`"),
+            "the attribution clause must not move the pinned prefix: {headline}"
+        );
+        assert!(
+            class.headline_suffix().starts_with(':'),
+            "the clause must read as a continuation of the headline, not a new sentence"
+        );
+        // The attribution note must name WHO the row is about; that is the whole
+        // point of splitting the class out.
+        assert!(class.attribution().starts_with("ATTRIBUTION: "));
+    }
+}
+
+#[test]
+fn every_skip_class_has_a_distinct_stable_tag() {
+    let tags: Vec<&str> = [
+        super::SkipClass::NotASubject,
+        super::SkipClass::Declared,
+        super::SkipClass::ToolchainGap,
+        super::SkipClass::OutOfScope,
+        super::SkipClass::HarnessGlue,
+    ]
+    .iter()
+    .map(|c| c.tag())
+    .collect();
+    let mut sorted = tags.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), tags.len(), "census tags must not collide: {tags:?}");
+}
+
+#[test]
+fn recorded_assumption_set_is_exactly_the_locally_verifiable_skips() {
+    use trust_mir_extract::supportability::UnsupportedReason;
+
+    // RECORD-THEN-RULE contract: every skip reason that reaches the ledger is a
+    // body the pass also credited in `processed_bodies` (a LOCAL body), so under
+    // JSON transport output each such body now emits exactly one function
+    // envelope in EVERY policy — strict included, where it used to emit none
+    // (a step-4 narrowed def is the one exception: it records nothing). The two
+    // scope reasons are non-local and correctly excluded; the contract closure
+    // is not inventory.
+    for reason in [
+        super::TrustVerifySkipReason::TreatedAsAssumption(UnsupportedReason::GenericParam),
+        super::TrustVerifySkipReason::UnreachableStart,
+        super::TrustVerifySkipReason::UserOptOut,
+        super::TrustVerifySkipReason::AssumedTotal,
+    ] {
+        assert!(
+            super::skip_reason_is_recorded_assumption(&reason),
+            "{reason:?} must leave a ledger row"
+        );
+    }
+    for reason in [
+        super::TrustVerifySkipReason::NonLocalMir,
+        super::TrustVerifySkipReason::ExternalDependencyScope,
+        super::TrustVerifySkipReason::ContractGeneratedClosure,
+        // Trust (CB4): an exclusion writes its own `excluded:` row instead.
+        harness_exclusion_fixture(),
+    ] {
+        assert!(
+            !super::skip_reason_is_recorded_assumption(&reason),
+            "{reason:?} is not a local proof-inventory gap"
+        );
+    }
+}
+
+/// Trust (2026-10-17, coverage identity): every skip reason a CREDITED local body
+/// can take publishes exactly one envelope, from exactly one of the three skip
+/// emitters. `UninhabitedArgument` (317ceb0e32, 2026-10-01) was credited and published none:
+/// targo's exact-set check of processed identities against envelopes then refused
+/// strict runs and dropped advisory coverage (aterm-serde's seven
+/// `Impossible::end(self)` bodies on the 2026-10-16 candidate gate).
+#[test]
+fn every_credited_skip_publishes_exactly_one_envelope() {
+    use trust_mir_extract::supportability::UnsupportedReason;
+
+    let is_harness = |reason: &super::TrustVerifySkipReason| {
+        matches!(reason, super::TrustVerifySkipReason::TestHarnessSynthesized(_))
+    };
+    // Credited local bodies (`trust_coverage_eligible_body`): one emitter each.
+    for reason in [
+        super::TrustVerifySkipReason::UninhabitedArgument,
+        super::TrustVerifySkipReason::UnreachableStart,
+        super::TrustVerifySkipReason::UserOptOut,
+        super::TrustVerifySkipReason::AssumedTotal,
+        super::TrustVerifySkipReason::TreatedAsAssumption(UnsupportedReason::GenericParam),
+        harness_exclusion_fixture(),
+    ] {
+        let emitters = [
+            super::skip_reason_is_recorded_assumption(&reason),
+            is_harness(&reason),
+            super::skip_publishes_zero_obligation_envelope(&reason),
+        ];
+        assert_eq!(
+            emitters.iter().filter(|publishes| **publishes).count(),
+            1,
+            "{reason:?}: a credited body publishes exactly one envelope, got {emitters:?}"
+        );
+    }
+    // The uncallable body is the one that publishes the zero-obligation row.
+    assert!(super::skip_publishes_zero_obligation_envelope(
+        &super::TrustVerifySkipReason::UninhabitedArgument
+    ));
+    // Not local proof inventory: no envelope of any kind.
+    for reason in [
+        super::TrustVerifySkipReason::NonLocalMir,
+        super::TrustVerifySkipReason::ExternalDependencyScope,
+        super::TrustVerifySkipReason::ContractGeneratedClosure,
+    ] {
+        assert!(
+            !super::skip_reason_is_recorded_assumption(&reason)
+                && !super::skip_publishes_zero_obligation_envelope(&reason),
+            "{reason:?} is not in the local proof inventory"
+        );
+    }
+    // The row it publishes is the one targo recognises as the exact
+    // zero-obligation inventory row (targo-trust `is_exact_zero_obligation_inventory_row`).
+    let row = super::transport_no_obligations_row();
+    assert_eq!(row.kind, "no_obligations");
+    assert!(matches!(row.outcome, Outcome::Proved));
+    assert_eq!(row.description, "function has no panic obligations (trivially panic-free)");
+    assert_eq!(row.solver, "trust-structural");
+    assert_eq!(row.time_ms, 0);
+    assert!(row.location.is_none() && row.counterexample.is_none());
+    assert_eq!(row.reason.as_deref(), Some("verified: zero panic obligations"));
+}
+
+// ---------------------------------------------------------------------------
+// Trust (skip taxonomy, round 2, 2026-09-16) — THE DEDUPLICATION VERIFIES
+// ITSELF.
+//
+// Round 1 withheld an inherited body's skip error on an IMPLICATION: the
+// declaration it inherits from also reaches the pass, takes the same
+// `UserOptOut` decision under the same policy, and emits the error this one is
+// deferring to. That implication quantifies over `classify_def` agreement, walk
+// reachability and policy agreement. If it ever fails, a real finding is
+// withheld and NOTHING says so — a refutation reaching a green build.
+//
+// These pin the reconciliation that replaces the implication with a check. The
+// function under test is pure on purpose: the property has to hold for every
+// input shape, not only for the shapes a compiler run happens to produce.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn deferred_fixture(func: &str, origin: &str, demanded: bool) -> super::DeferredInheritedSkip {
+    use rustc_hir::def_id::{CrateNum, DefId, DefIndex};
+    super::DeferredInheritedSkip {
+        func_path: func.to_string(),
+        origin: origin.to_string(),
+        // Never dereferenced by the reconciler; it only reaches `tcx.def_span`
+        // on the emission path, which this test does not take.
+        def_id: DefId { krate: CrateNum::from_u32(0), index: DefIndex::from_u32(0) },
+        class: super::SkipClass::Declared,
+        reason: "full verification policy rejected skip reason `UserOptOut`".to_string(),
+        ledger_row: None,
+        demanded_error: demanded,
+    }
+}
+
+#[test]
+fn an_orphaned_inherited_skip_is_returned_for_emission_not_dropped() {
+    // THE PLANTED REFUTATION, in pure form: `f::{closure#0}` had its error
+    // deferred to `f`, and `f` never emitted one. Round 1 printed nothing at
+    // all in this state.
+    let deferred = vec![deferred_fixture("demo::f::{closure#0}", "demo::f", true)];
+    let declared = std::collections::BTreeSet::new();
+    let (covered, orphans, demanding) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert_eq!(demanding, 1);
+    assert!(covered.is_empty(), "nothing may be accounted to a declaration that did not report");
+    assert_eq!(orphans.len(), 1, "the withheld body must come back for emission");
+    assert_eq!(orphans[0].func_path, "demo::f::{closure#0}");
+}
+
+#[test]
+fn a_reported_declaration_absorbs_its_nested_bodies_and_accounts_for_them() {
+    let deferred = vec![
+        deferred_fixture("demo::f::{closure#0}", "demo::f", true),
+        deferred_fixture("demo::f::{closure#1}", "demo::f", true),
+        deferred_fixture("demo::g::{closure#0}", "demo::g", true),
+    ];
+    let declared: std::collections::BTreeSet<String> =
+        ["demo::f".to_string(), "demo::g".to_string()].into_iter().collect();
+    let (covered, orphans, demanding) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert_eq!(demanding, 3);
+    assert!(orphans.is_empty(), "every deferral had a reporting declaration");
+    // (b) the `also covers N` account, computed from the reconciled sets.
+    assert_eq!(covered.get("demo::f").copied(), Some(2));
+    assert_eq!(covered.get("demo::g").copied(), Some(1));
+    assert_eq!(covered.values().sum::<usize>(), 3, "the account must be exactly the fold-in count");
+}
+
+#[test]
+fn one_missing_declaration_does_not_hide_behind_its_reporting_siblings() {
+    // The partial case is the dangerous one: `g` reported, `f` did not. A
+    // count-only check ("3 deferred, 3 covered-ish") would pass; the set check
+    // names the one body whose report went missing.
+    let deferred = vec![
+        deferred_fixture("demo::f::{closure#0}", "demo::f", true),
+        deferred_fixture("demo::g::{closure#1}", "demo::g", true),
+        deferred_fixture("demo::g::{closure#0}", "demo::g", true),
+    ];
+    let declared: std::collections::BTreeSet<String> =
+        ["demo::g".to_string()].into_iter().collect();
+    let (covered, orphans, _) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert_eq!(covered.get("demo::g").copied(), Some(2));
+    assert_eq!(covered.get("demo::f").copied(), None);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].func_path, "demo::f::{closure#0}");
+}
+
+#[test]
+fn orphans_are_emitted_in_a_deterministic_order() {
+    // Diagnostics that reorder between runs are not diffable, and this set is
+    // built by iterating a walk whose order is not part of the contract.
+    let deferred = vec![
+        deferred_fixture("demo::z::{closure#0}", "demo::z", true),
+        deferred_fixture("demo::a::{closure#0}", "demo::a", true),
+        deferred_fixture("demo::m::{closure#0}", "demo::m", true),
+    ];
+    let declared = std::collections::BTreeSet::new();
+    let (_, orphans, _) = super::reconcile_inherited_skips(&deferred, &declared);
+    let names: Vec<&str> = orphans.iter().map(|o| o.func_path.as_str()).collect();
+    assert_eq!(names, ["demo::a::{closure#0}", "demo::m::{closure#0}", "demo::z::{closure#0}"]);
+}
+
+#[test]
+fn a_deferral_that_withheld_nothing_carries_no_obligation() {
+    // Advisory/nonfatal lanes: the body's own decision did not demand an error,
+    // so nothing was suppressed and there is nothing to recover. This is the
+    // clause that keeps the reconciliation from reddening a green build.
+    let deferred = vec![
+        deferred_fixture("demo::f::{closure#0}", "demo::f", false),
+        deferred_fixture("demo::g::{closure#0}", "demo::g", false),
+    ];
+    let declared = std::collections::BTreeSet::new();
+    let (covered, orphans, demanding) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert_eq!(demanding, 0, "no deferral withheld a printed error");
+    assert!(orphans.is_empty(), "an advisory lane must not gain an error from this lane");
+    assert!(covered.is_empty());
+}
+
+#[test]
+fn a_demanding_deferral_beside_a_silent_one_is_still_recovered() {
+    // Mixed lane (the `classify_def` divergence the judge named): the closure's
+    // own decision demanded proof while the declaration's did not, so the
+    // declaration is silent and the closure's report would vanish. It must not.
+    let deferred = vec![
+        deferred_fixture("demo::f::{closure#0}", "demo::f", true),
+        deferred_fixture("demo::h::{closure#0}", "demo::h", false),
+    ];
+    let declared = std::collections::BTreeSet::new();
+    let (_, orphans, demanding) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert_eq!(demanding, 1);
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].func_path, "demo::f::{closure#0}");
+}
+
+#[test]
+fn the_account_never_credits_a_declaration_that_only_appears_as_an_origin() {
+    // `declared_skip_errors` is written from the ONE emission seam, so being
+    // named as an origin is not evidence of having reported. If this ever
+    // regressed to "origin seen => covered", the orphan set would be empty and
+    // the whole lane would be back to trusting the implication.
+    let deferred = vec![
+        deferred_fixture("demo::f::{closure#0}", "demo::f", true),
+        deferred_fixture("demo::f::{closure#1}", "demo::f", true),
+    ];
+    let declared = std::collections::BTreeSet::new();
+    let (covered, orphans, _) = super::reconcile_inherited_skips(&deferred, &declared);
+    assert!(covered.is_empty());
+    assert_eq!(orphans.len(), 2);
+}
+
+#[test]
+fn a_declined_body_gets_at_most_one_skip_diagnostic() {
+    // THE DOUBLE-EMIT REGRESSION. The skip arm of `run_pass` used to be two
+    // independent `if`s: the step-4 library-lane abort, then the ordinary policy
+    // abort. A step-4 narrowed def is `TreatedAsAssumption`, which every
+    // fail-closed policy also rejects, so BOTH fired and one body printed two
+    // `Trust full verification skipped` errors. The plan is now one value, and
+    // this drives every combination of its three inputs.
+    use super::SkipDiagnosticPlan::*;
+    for inherited in [false, true] {
+        for step4 in [false, true] {
+            for aborts in [false, true] {
+                let plan = super::skip_diagnostic_plan(inherited, step4, aborts);
+                let expected = if inherited {
+                    DeferredToDeclaration
+                } else if step4 {
+                    Step4ProofRequired
+                } else if aborts {
+                    PolicyRejected
+                } else {
+                    NoError
+                };
+                assert_eq!(plan, expected, "inherited={inherited} step4={step4} aborts={aborts}");
+            }
+        }
+    }
+    // The exact state that double-emitted: narrowed by step 4 AND rejected by
+    // the fail-closed policy. ONE diagnostic, the step-4 one.
+    assert_eq!(super::skip_diagnostic_plan(false, true, true), Step4ProofRequired);
+    // Nothing that demands an error is ever planned as silence, except the
+    // inherited deferral, which the crate checkpoint reconciles.
+    for step4 in [false, true] {
+        for aborts in [false, true] {
+            if step4 || aborts {
+                assert_ne!(super::skip_diagnostic_plan(false, step4, aborts), NoError);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_step4_narrowed_def_records_no_assumption_row_in_any_mode() {
+    // WIRING B: a def the step-4 library lane narrowed must never leave an
+    // assumption record where a proof was promised. Before `skip_record_plan`
+    // this was one `&& !step4_demands_proof` conjunct in `run_pass`, and
+    // deleting it failed no test (the lane needs a std build to reach). Every
+    // policy, every output mode, every recorded-reason answer: no row, no note.
+    for recorded in [false, true] {
+        for aborts in [false, true] {
+            for json in [false, true] {
+                for human in [false, true] {
+                    let plan = super::skip_record_plan(recorded, true, aborts, json, human);
+                    assert_eq!(
+                        plan,
+                        super::SkipRecordPlan { machine_row: false, human_note: false },
+                        "recorded={recorded} aborts={aborts} json={json} human={human}"
+                    );
+                    assert_eq!(plan.ledger_claim("treated-as-assumption"), None);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_skip_error_claims_a_ledger_row_only_when_one_is_written() {
+    // The error's "also recorded as an `assumption:<tag>` transport row" note
+    // is `SkipRecordPlan::ledger_claim`, read off the SAME field that decides
+    // whether `record_skip_assumption` writes the row. Human-only output
+    // writes no machine row, so it may make no claim.
+    for step4 in [false, true] {
+        for aborts in [false, true] {
+            for human in [false, true] {
+                let human_only = super::skip_record_plan(true, step4, aborts, false, human);
+                assert!(!human_only.machine_row);
+                assert_eq!(human_only.ledger_claim("user-opt-out"), None);
+            }
+        }
+    }
+    // JSON (or both): a recorded, non-step-4 reason writes the row under EVERY
+    // policy (RECORD, THEN RULE) and the claim names exactly its tag.
+    for aborts in [false, true] {
+        for human in [false, true] {
+            let plan = super::skip_record_plan(true, false, aborts, true, human);
+            assert!(plan.machine_row, "aborts={aborts} human={human}");
+            assert_eq!(plan.ledger_claim("user-opt-out"), Some("user-opt-out"));
+        }
+    }
+    // A reason that is not a recorded assumption writes and claims nothing.
+    for aborts in [false, true] {
+        let plan = super::skip_record_plan(false, false, aborts, true, true);
+        assert_eq!(plan, super::SkipRecordPlan { machine_row: false, human_note: false });
+    }
+    // The human line is for a lane that prints no error: a fail-closed policy's
+    // ERROR is the human statement.
+    assert!(super::skip_record_plan(true, false, false, false, true).human_note);
+    assert!(!super::skip_record_plan(true, false, true, false, true).human_note);
+}
+
+#[test]
+fn spec_denotation_pointer_domain_must_match_compilation_target() {
+    use trust_spec_elab::TargetPointerWidth;
+    use trust_types::CompilerContractValueDomain as Domain;
+
+    assert_eq!(
+        spec_denotation_domain_spellings(
+            Domain::PointerSizedInt { width: 64, signed: false },
+            TargetPointerWidth::W64,
+        ),
+        Ok(("usize", "usize64"))
+    );
+    assert_eq!(
+        spec_denotation_domain_spellings(
+            Domain::PointerSizedInt { width: 64, signed: true },
+            TargetPointerWidth::W64,
+        ),
+        Ok(("isize", "isize64"))
+    );
+    for signed in [false, true] {
+        let error = spec_denotation_domain_spellings(
+            Domain::PointerSizedInt { width: 32, signed },
+            TargetPointerWidth::W64,
+        )
+        .expect_err("a 32-bit pointer sidecar cannot denote a 64-bit target binding");
+        assert!(error.contains("32-bit") && error.contains("64-bit"), "{error}");
+    }
+}
+
+/// Trust (memory, compacted artifact slots): the panic-freedom premise reads a
+/// verified body's artifact from its COMPACT slot. Every answer it takes must be
+/// the one the full artifact gives — for a body where each answer is `true` and
+/// for one where each is `false`, so neither arm can pass by answering a constant.
+#[test]
+fn compact_artifact_slot_answers_every_premise_question_as_the_full_artifact_does() {
+    let assumed_total = VerificationResult::Proved {
+        solver: TRUST_ASSUMED_TOTAL_SOLVER.into(),
+        time_ms: 0,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let mut every_answer_true = memory_safe_gate_artifacts(
+        test_vc(3),
+        assumed_total,
+        TrustStatus::Unknown,
+        absent_callee_transport_row(Outcome::Unknown),
+    );
+    every_answer_true.runtime_checked_std_members = vec![RuntimeCheckedStdMember {
+        def_path: "core::iter::sum::{closure#0}".into(),
+        class: trust_ir_bridge::MemberAssertRefusalClass::AssertKindOutsideLane,
+        reason: "member Assert kind `Overflow(Add)` is outside the exact Div/Rem/BoundsCheck lane",
+    }];
+    every_answer_true.full_verification = Some(native_run_result(
+        trust_verifier_api::VerificationRunStatus::Proved,
+        trust_verifier_api::VerificationRunSummary::default(),
+    ));
+    let every_answer_false = memory_safe_gate_artifacts(
+        test_vc(4),
+        failed_test_result(),
+        TrustStatus::Unknown,
+        plain_transport_row(Outcome::Proved, false),
+    );
+
+    for (full, expected) in [(every_answer_true, true), (every_answer_false, false)] {
+        let compact = CompactArtifacts::project(&full);
+        let full = PremiseArtifacts::Full(Arc::new(full));
+        let compact = PremiseArtifacts::Compact(Arc::new(compact));
+        for (arm, view) in [("full", &full), ("compact", &compact)] {
+            assert_eq!(
+                transport_rows_have_unproved_assumption_panic(view.transport_results()),
+                expected,
+                "{arm}: unproved assumption-panic row"
+            );
+            assert_eq!(view.has_runtime_checked_std_member(), expected, "{arm}: runtime member");
+            assert_eq!(view.native_run_is_vacuously_clean(), expected, "{arm}: vacuous run");
+            assert_eq!(
+                view.spends_a_user_assumed_total_axiom(),
+                expected,
+                "{arm}: assumed-total axiom"
+            );
+            assert_eq!(view.row_count(), 1, "{arm}: row count");
+            assert_eq!(view.row_kind(0), Some(&VcKind::DivisionByZero), "{arm}: row kind");
+            assert_eq!(view.row_kind(1), None, "{arm}: no row past the end");
+        }
+    }
+
+    // Trust (memory, 2026-11-01): the compact slot's transport rows keep no VC or proof
+    // payload (`premise_transport_row`), and every premise answer is still the full
+    // artifact's. The rows here carry every payload a row can — a kernel-certified
+    // `clean_cic` artifact with its real `metadata`, native and proof artifacts with bytes,
+    // diagnostics, a VC snapshot — and every field the compaction keeps for the exact-shape
+    // predicates (a typed kind, a counterexample and its model), and between them make
+    // every predicate answer both ways, so no comparison is vacuous.
+    let rows = premise_parity_rows();
+    let fold_sites = premise_parity_fold_sites();
+    let edge_keys = premise_parity_edge_keys();
+    let mut full = memory_safe_gate_artifacts(
+        test_vc(5),
+        failed_test_result(),
+        TrustStatus::Unknown,
+        plain_transport_row(Outcome::Proved, false),
+    );
+    full.transport_results = rows.clone();
+    let compact = CompactArtifacts::project(&full);
+    let full = PremiseArtifacts::Full(Arc::new(full));
+    let compact = PremiseArtifacts::Compact(Arc::new(compact));
+    let (full_rows, compact_rows) = (full.transport_results(), compact.transport_results());
+    assert_eq!(full_rows, rows.as_slice(), "the full arm reads the rows as built");
+    assert_eq!(compact_rows.len(), full_rows.len(), "one compact row per row, in order");
+
+    // Every per-row answer, row by row; and every answer is given both ways somewhere.
+    let answers_of = |rows: &[TransportObligationResult]| -> Vec<Vec<(&'static str, String)>> {
+        rows.iter().map(|row| premise_row_answers(row, &edge_keys)).collect()
+    };
+    let full_answers = answers_of(full_rows);
+    assert_eq!(answers_of(compact_rows), full_answers, "per-row premise answers");
+    for (index, (name, _)) in full_answers[0].iter().enumerate() {
+        let distinct: FxHashSet<&String> = full_answers.iter().map(|row| &row[index].1).collect();
+        assert!(distinct.len() > 1, "the fixture must make `{name}` answer more than one way");
+    }
+    // Every whole-slice answer; and the fixture makes each one non-trivially.
+    let full_slice = premise_slice_answers(full_rows, &fold_sites, &edge_keys);
+    assert_eq!(
+        premise_slice_answers(compact_rows, &fold_sites, &edge_keys),
+        full_slice,
+        "whole-slice premise answers"
+    );
+    assert!(full.spends_a_user_assumed_total_axiom(), "full: assumed-total axiom");
+    assert!(compact.spends_a_user_assumed_total_axiom(), "compact: assumed-total axiom");
+    assert_eq!(compact.row_count(), full.row_count(), "row count");
+    assert_eq!(compact.row_kind(0), full.row_kind(0), "row kind");
+    assert_eq!(compact.has_runtime_checked_std_member(), full.has_runtime_checked_std_member());
+    assert_eq!(compact.native_run_is_vacuously_clean(), full.native_run_is_vacuously_clean());
+    // Without the rows that spend the axiom the answer flips, on both arms alike.
+    let unspent: Vec<TransportObligationResult> = rows
+        .iter()
+        .filter(|row| {
+            !transport_row_is_assumed_total_assumption(row)
+                && !transport_row_is_unproved_assumed_total_callee(row)
+        })
+        .cloned()
+        .collect();
+    let unspent_compact: Vec<TransportObligationResult> =
+        unspent.iter().map(premise_transport_row).collect();
+    assert!(!transport_rows_spend_a_user_assumed_total_axiom(&unspent));
+    assert!(!transport_rows_spend_a_user_assumed_total_axiom(&unspent_compact));
+    // Without the assumption-panic rows the conjunct-3 answer flips too.
+    let panic_free: Vec<TransportObligationResult> = rows
+        .iter()
+        .filter(|row| !transport_row_is_unproved_assumption_panic(row))
+        .cloned()
+        .collect();
+    let panic_free_compact: Vec<TransportObligationResult> =
+        panic_free.iter().map(premise_transport_row).collect();
+    assert_eq!(
+        premise_slice_answers(&panic_free_compact, &fold_sites, &edge_keys),
+        premise_slice_answers(&panic_free, &fold_sites, &edge_keys),
+    );
+    assert!(!transport_rows_have_unproved_assumption_panic(&panic_free_compact));
+    assert!(transport_rows_have_unproved_assumption_panic(compact_rows));
+
+    // Field by field: what the readers read is the full row's; no payload is left.
+    for (index, (full_row, compact_row)) in full_rows.iter().zip(compact_rows).enumerate() {
+        assert_eq!(
+            reader_visible_fields(compact_row),
+            reader_visible_fields(full_row),
+            "row {index}: a field a premise reader reads"
+        );
+        assert_eq!(
+            compact_row,
+            &expected_compact_row(full_row),
+            "row {index}: the compact row is the full row with exactly its payloads dropped"
+        );
+        assert_no_transport_payload(compact_row, index);
+    }
+    // Positive control: the fixture really carries every payload the compaction drops,
+    // so `assert_no_transport_payload` above cannot pass on a payload-free fixture ...
+    assert!(full_rows.iter().any(|row| row.original_vc_snapshot.is_some()));
+    // ... and every field it keeps although no compact-slot reader reads it today (a field
+    // whose absence an exact-shape predicate reads as acceptance), so the comparison with
+    // `expected_compact_row` above cannot pass on a fixture where they are all `None`.
+    assert!(full_rows.iter().any(|row| row.typed_kind.is_some()));
+    assert!(full_rows.iter().any(|row| row.counterexample.is_some()));
+    assert!(full_rows.iter().any(|row| row.counterexample_model.is_some()));
+    for (index, (full_row, compact_row)) in full_rows.iter().zip(compact_rows).enumerate() {
+        assert_eq!(compact_row.typed_kind, full_row.typed_kind, "row {index}: typed kind");
+        assert_eq!(compact_row.counterexample, full_row.counterexample, "row {index}");
+        assert_eq!(compact_row.counterexample_model, full_row.counterexample_model, "row {index}");
+    }
+    let full_artifacts = || {
+        full_rows.iter().flat_map(|row| {
+            row.native_trust_ir
+                .iter()
+                .flat_map(|native| native.artifacts.iter())
+                .chain(row.proof_evidence.iter().flat_map(|proof| proof.artifacts.iter()))
+        })
+    };
+    assert!(full_artifacts().any(|artifact| artifact.materialization.is_some()));
+    assert!(
+        full_artifacts()
+            .any(|artifact| artifact.kind == "clean_cic" && artifact.metadata.is_some()),
+        "the fixture must carry a real kernel-certified clean_cic payload"
+    );
+    assert!(full_rows.iter().any(|row| {
+        row.native_trust_ir.as_ref().is_some_and(|native| !native.diagnostics.is_empty())
+            && row.proof_evidence.as_ref().is_some_and(|proof| !proof.diagnostics.is_empty())
     }));
+
+    // Mutation check on the oracle itself: a compaction that dropped any reader-visible
+    // field, or turned a present evidence record into `None`, is caught by the comparisons
+    // above. Each mutant changes one field of every compact row the way a wrong projection
+    // would, and must disagree with the full rows somewhere.
+    type Mutant = (&'static str, fn(&mut TransportObligationResult));
+    let mutants: [Mutant; 8] = [
+        ("kind dropped", |row| row.kind = String::new()),
+        ("description dropped", |row| row.description = String::new()),
+        ("outcome lost", |row| row.outcome = Outcome::Unknown),
+        ("design mandate lost", |row| row.design_mandate = false),
+        ("proof evidence Some -> None", |row| row.proof_evidence = None),
+        ("native TrustIr Some -> None", |row| row.native_trust_ir = None),
+        ("evidence invented", |row| {
+            row.proof_evidence.get_or_insert_with(test_transport_proof_evidence);
+        }),
+        // Adversarial review finding 1: the exact-shape predicates admit only a `None`
+        // typed kind, so a projection that drops it admits the typed twins.
+        ("typed kind dropped", |row| row.typed_kind = None),
+    ];
+    for (name, mutate) in mutants {
+        let mutated: Vec<TransportObligationResult> = compact_rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                mutate(&mut row);
+                row
+            })
+            .collect();
+        let caught = answers_of(&mutated) != full_answers
+            || premise_slice_answers(&mutated, &fold_sites, &edge_keys) != full_slice
+            || mutated
+                .iter()
+                .zip(full_rows)
+                .any(|(mutant, row)| reader_visible_fields(mutant) != reader_visible_fields(row));
+        assert!(caught, "mutant `{name}` must be caught");
+        // And by the premise answers alone, not only by the field comparison: every one of
+        // these fields decides some reader's answer on this fixture.
+        assert!(
+            answers_of(&mutated) != full_answers
+                || premise_slice_answers(&mutated, &fold_sites, &edge_keys) != full_slice,
+            "mutant `{name}` must change a premise answer"
+        );
+    }
+}
+
+/// The writer-edge callee the compact-slot parity rows name (`row_names_writer_edge`).
+fn premise_parity_edge_keys() -> FxHashSet<String> {
+    ["core::num::u32::pow".to_string()].into_iter().collect()
+}
+
+/// The marked sites folded into the parity rows' panic-freedom aggregate
+/// (`transport_rows_with_fold_sites`): one writer edge, one vanilla absent callee.
+fn premise_parity_fold_sites() -> Vec<String> {
+    vec![
+        absent_callee_transport_row(Outcome::Unknown).description,
+        format!(
+            "assertion: {}call to absent callee `core::num::u32::wrapping_div` (body not in the lowered bundle) may panic",
+            trust_types::assumption::ABSENT_CALLEE_ASSUMPTION_PREFIX
+        ),
+    ]
+}
+
+/// A VC snapshot, a typed kind, a counterexample and its model on `row`.
+fn with_vc_and_model_payloads(mut row: TransportObligationResult) -> TransportObligationResult {
+    row.original_vc_snapshot = Some(Box::new(trust_types::OriginalVcSnapshot {
+        schema: "trust.original-vc-snapshot.v1".to_string(),
+        obligation_id: "vc:test::f:divzero:0".to_string(),
+        claim_digest_sha256: "0".repeat(64),
+        typed_input_digest_sha256: None,
+        expanded_function_identity: None,
+        overflow_checks: true,
+        target: "aarch64-apple-darwin".to_string(),
+        payload_sha256: "1".repeat(64),
+        original_vc_json: "{\"formula\":{\"Bool\":true}}".repeat(256),
+    }));
+    row.typed_kind = Some(Box::new(VcKind::DivisionByZero));
+    row.counterexample = Some("x = 0".to_string());
+    row.counterexample_model =
+        Some(Counterexample::new(vec![("x".to_string(), CounterexampleValue::Uint(0))]));
+    row
+}
+
+/// `row` with a native-TrustIr record and a proof record whose artifacts carry bytes
+/// (`metadata`, `materialization`) and whose diagnostics are set. A proof record the row
+/// already has (a `clean_cic` one) keeps its own artifacts and gains a diagnostic.
+fn with_evidence_payloads(mut row: TransportObligationResult) -> TransportObligationResult {
+    let artifact = |kind: &str| TransportEvidenceArtifact {
+        kind: kind.to_string(),
+        format: Some("json".to_string()),
+        artifact_id: Some(format!("{kind}-id")),
+        digest: Some(TransportArtifactDigest {
+            algorithm: "sha256".to_string(),
+            value: "2".repeat(64),
+        }),
+        uri: Some(format!("trust-test://{kind}")),
+        materialization: Some(
+            trust_types::TransportArtifactMaterialization::from_exact_bytes(
+                &[7u8; 512],
+                "native-cache",
+                Vec::new(),
+            )
+            .expect("a bounded, canonical materialization"),
+        ),
+        metadata: Some(serde_json::json!({ "bytes": vec![1u8; 512] })),
+    };
+    let diagnostic = transport_diagnostic(
+        "compact_parity_diagnostic",
+        TransportEvidenceDiagnosticSeverity::Warning,
+        "evidence diagnostic the compact slot drops",
+    );
+    let mut native = test_transport_native_trust_ir();
+    native.artifacts = vec![artifact("native_trust_ir")];
+    native.diagnostics = vec![diagnostic.clone()];
+    row.native_trust_ir = Some(native);
+    let proof = row.proof_evidence.get_or_insert_with(|| {
+        let mut proof = test_transport_proof_evidence();
+        proof.artifacts = vec![artifact("solver_transcript"), artifact("proof_check_report")];
+        proof
+    });
+    proof.diagnostics.push(diagnostic);
+    row
+}
+
+/// A real kernel-certified row: the transport builder's own `clean_cic` artifact, whose
+/// `metadata` is the serialized CleanCic payload (as in
+/// `certified_row_carries_clean_cic_artifact_and_constructive_certified_metadata`).
+fn kernel_certified_clean_cic_row() -> TransportObligationResult {
+    let bv = |v: i128| Box::new(trust_types::Formula::BitVec { value: v, width: 8 });
+    let vc = VerificationCondition {
+        kind: VcKind::DivisionByZero,
+        function: trust_types::Symbol::intern("test::certified"),
+        location: trust_types::SourceSpan {
+            file: "t.rs".to_string(),
+            line_start: 1,
+            col_start: 1,
+            line_end: 1,
+            col_end: 5,
+        },
+        formula: trust_types::Formula::And(vec![
+            trust_types::Formula::BvULt(bv(3), bv(7), 8),
+            trust_types::Formula::BvULt(bv(7), bv(3), 8),
+        ]),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let proved = VerificationResult::Proved {
+        solver: trust_types::Symbol::intern("ay"),
+        time_ms: 1,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: None,
+        solver_warnings: None,
+        native_proof_envelope: None,
+    };
+    let mut rows = build_transport_results_with_runtime_checks(false, &[(vc, proved)], None, None);
+    assert_eq!(rows.len(), 1);
+    let row = rows.remove(0);
+    assert!(
+        row.proof_evidence.as_ref().is_some_and(|proof| proof
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "clean_cic" && artifact.metadata.is_some())),
+        "the builder's certified row carries its clean_cic payload"
+    );
+    row
+}
+
+/// The compact-slot parity rows: between them every predicate a compact-slot reader asks
+/// answers both ways, and each payload the compaction drops is present somewhere.
+fn premise_parity_rows() -> Vec<TransportObligationResult> {
+    let assumed_total_assumption = {
+        let mut row = plain_transport_row(Outcome::Skipped, false);
+        row.kind =
+            format!("assumption:{}", trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_TAG);
+        row
+    };
+    let unproved_assumed_total_callee = {
+        let mut row = plain_transport_row(Outcome::Unknown, false);
+        row.description = format!(
+            "assertion: {}call to `demo::audited` may panic",
+            trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_PREFIX
+        );
+        row
+    };
+    vec![
+        // A kernel-certified row with its real clean_cic payload, and every other payload.
+        with_evidence_payloads(with_vc_and_model_payloads(kernel_certified_clean_cic_row())),
+        // The writer-edge absent callee, unproved and proved.
+        with_evidence_payloads(with_vc_and_model_payloads(absent_callee_transport_row(
+            Outcome::Unknown,
+        ))),
+        with_evidence_payloads(absent_callee_transport_row(Outcome::Proved)),
+        // The other three assumption-panic classes, and the demotable extern leg.
+        with_vc_and_model_payloads(expected_absent_callee_transport_row(Outcome::Unknown)),
+        with_evidence_payloads(drop_glue_transport_row(Outcome::RuntimeChecked)),
+        with_vc_and_model_payloads(extern_call_transport_row_for(
+            "core::fmt::write",
+            Outcome::Unknown,
+        )),
+        with_evidence_payloads(extern_call_transport_row(Outcome::Unknown)),
+        // The assumed-total assumption row and the twins that each break one conjunct of
+        // `transport_row_is_assumed_total_assumption`: the design mandate, a proof record,
+        // a native record.
+        assumed_total_assumption.clone(),
+        TransportObligationResult { design_mandate: true, ..assumed_total_assumption.clone() },
+        TransportObligationResult {
+            proof_evidence: Some(test_transport_proof_evidence()),
+            ..assumed_total_assumption.clone()
+        },
+        TransportObligationResult {
+            native_trust_ir: Some(test_transport_native_trust_ir()),
+            ..with_vc_and_model_payloads(assumed_total_assumption)
+        },
+        unproved_assumed_total_callee,
+        // A plain proved row with every payload.
+        with_evidence_payloads(with_vc_and_model_payloads(plain_transport_row(
+            Outcome::Proved,
+            false,
+        ))),
+        // Adversarial review finding 1: the exact-shape assumption rows, each beside a twin
+        // that differs from it ONLY in `typed_kind` (which the shape refuses), and the
+        // assumed-total assumption's own typed twin. A projection that dropped `typed_kind`
+        // would admit the twins on the compact arm alone.
+        exact_shape_instance_hypothesis_row(),
+        with_typed_kind(exact_shape_instance_hypothesis_row()),
+        exact_shape_termination_unmeasured_row(),
+        with_typed_kind(exact_shape_termination_unmeasured_row()),
+        with_typed_kind(assumed_total_assumption_row()),
+    ]
+}
+
+/// The exact compiler shape of an `assumption:instance-hypothesis` definition row
+/// (`instance_hypothesis::transport_row_is_instance_hypothesis_assumption`).
+fn exact_shape_instance_hypothesis_row() -> TransportObligationResult {
+    let mut row = plain_transport_row(Outcome::Skipped, false);
+    row.kind =
+        format!("assumption:{}", trust_types::assumption::INSTANCE_HYPOTHESIS_ASSUMPTION_TAG);
+    row.solver = trust_types::assumption::INSTANCE_HYPOTHESIS_ROW_SOLVER.to_string();
+    row.description = "unverified assumption: every instance of `demo::f` is panic-free".into();
+    row
+}
+
+/// The exact compiler shape of an `assumption:termination-unmeasured` charge row
+/// (`termination_unmeasured::transport_row_is_termination_unmeasured_assumption`).
+fn exact_shape_termination_unmeasured_row() -> TransportObligationResult {
+    let mut row = plain_transport_row(Outcome::Skipped, false);
+    row.kind =
+        format!("assumption:{}", trust_types::assumption::TERMINATION_UNMEASURED_ASSUMPTION_TAG);
+    row.solver = trust_types::assumption::TERMINATION_UNMEASURED_ROW_SOLVER.to_string();
+    row.description = "unverified assumption: `demo::f` terminates".into();
+    row
+}
+
+/// The in-band assumed-total assumption row (`transport_row_is_assumed_total_assumption`).
+fn assumed_total_assumption_row() -> TransportObligationResult {
+    let mut row = plain_transport_row(Outcome::Skipped, false);
+    row.kind =
+        format!("assumption:{}", trust_types::assumption::ASSUMED_TOTAL_CALLEE_ASSUMPTION_TAG);
+    row
+}
+
+/// `row` with a typed kind and nothing else changed.
+fn with_typed_kind(mut row: TransportObligationResult) -> TransportObligationResult {
+    row.typed_kind = Some(Box::new(VcKind::Postcondition));
+    row
+}
+
+/// Adversarial review of COMPACT-SLOT-PAYLOAD-1, finding 1: a compact row has the full
+/// row's type, so every row predicate in this crate compiles against it. The exact-shape
+/// predicates read `typed_kind.is_none()` as ACCEPTANCE; a projection that dropped
+/// `typed_kind` (as the first cut did) made a refused typed row admitted on the compact
+/// arm, failing open for any premise reader that adopted one of them. This asks each such
+/// predicate of every exact-shape row and of its twin that differs only in the field the
+/// shape refuses, on the full row and on its compact projection, and checks each kept
+/// field (`typed_kind`, `counterexample`, `counterexample_model`) survives verbatim.
+#[test]
+fn compact_slot_rows_answer_exact_shape_predicates_as_full_rows_do() {
+    let shape_answers = |row: &TransportObligationResult| -> [(&'static str, bool); 3] {
+        [
+            (
+                "instance_hypothesis_assumption",
+                instance_hypothesis::transport_row_is_instance_hypothesis_assumption(row),
+            ),
+            (
+                "termination_unmeasured_assumption",
+                termination_unmeasured::transport_row_is_termination_unmeasured_assumption(row),
+            ),
+            ("assumed_total_assumption", transport_row_is_assumed_total_assumption(row)),
+        ]
+    };
+    let with_counterexample = |mut row: TransportObligationResult| {
+        row.counterexample = Some("x = 0".to_string());
+        row.counterexample_model =
+            Some(Counterexample::new(vec![("x".to_string(), CounterexampleValue::Uint(0))]));
+        row
+    };
+    // (row, the answer each exact-shape predicate must give on the FULL row)
+    let cases: Vec<(TransportObligationResult, [bool; 3])> = vec![
+        (exact_shape_instance_hypothesis_row(), [true, false, false]),
+        (with_typed_kind(exact_shape_instance_hypothesis_row()), [false, false, false]),
+        (exact_shape_termination_unmeasured_row(), [false, true, false]),
+        (with_typed_kind(exact_shape_termination_unmeasured_row()), [false, false, false]),
+        (assumed_total_assumption_row(), [false, false, true]),
+        // `transport_row_is_assumed_total_assumption` does not read the typed kind today;
+        // the twin pins that the compact arm agrees either way.
+        (with_typed_kind(assumed_total_assumption_row()), [false, false, true]),
+        (
+            with_counterexample(with_typed_kind(exact_shape_instance_hypothesis_row())),
+            [false, false, false],
+        ),
+    ];
+    for (index, (full_row, expected)) in cases.iter().enumerate() {
+        let full_answers = shape_answers(full_row);
+        assert_eq!(
+            full_answers.map(|(_, answer)| answer),
+            *expected,
+            "case {index}: the full row's own answers ({full_answers:?})"
+        );
+        let compact_row = premise_transport_row(full_row);
+        assert_eq!(
+            shape_answers(&compact_row),
+            full_answers,
+            "case {index}: an exact-shape predicate answers the compact row differently"
+        );
+        assert_eq!(compact_row.typed_kind, full_row.typed_kind, "case {index}: typed kind");
+        assert_eq!(compact_row.counterexample, full_row.counterexample, "case {index}");
+        assert_eq!(compact_row.counterexample_model, full_row.counterexample_model, "case {index}");
+    }
+    // Through the real slot too: the compact arm's rows are the projection's.
+    let mut full = memory_safe_gate_artifacts(
+        test_vc(6),
+        failed_test_result(),
+        TrustStatus::Unknown,
+        plain_transport_row(Outcome::Proved, false),
+    );
+    full.transport_results = cases.iter().map(|(row, _)| row.clone()).collect();
+    let compact = PremiseArtifacts::Compact(Arc::new(CompactArtifacts::project(&full)));
+    let full = PremiseArtifacts::Full(Arc::new(full));
+    for (index, (full_row, compact_row)) in
+        full.transport_results().iter().zip(compact.transport_results()).enumerate()
+    {
+        assert_eq!(shape_answers(compact_row), shape_answers(full_row), "slot row {index}");
+    }
+}
+
+/// Adversarial review of COMPACT-SLOT-PAYLOAD-1, finding 2: the writer-relative excuse
+/// (`fmt_writer_relative::WriterEdgeExcuse`) reads the compact slot's rows, and its row
+/// logic is the session-free `writer_edge_rows_excused`, asked here directly (not a copy of
+/// its steps) of every rows/keys/fold-ledger case it decides, on the full slice and on the
+/// compact slot's — both through `premise_transport_row` and through the real slot. Every
+/// row carries every payload, so a reader of any dropped field shows here.
+#[test]
+fn writer_edge_excuse_answers_a_compact_slice_as_it_answers_the_full_one() {
+    let edge_keys = premise_parity_edge_keys();
+    let writer_site = absent_callee_transport_row(Outcome::Unknown).description;
+    let vanilla_site = premise_parity_fold_sites()[1].clone();
+    let writer_edge = with_evidence_payloads(with_vc_and_model_payloads(
+        absent_callee_transport_row(Outcome::Unknown),
+    ));
+    let certified =
+        with_evidence_payloads(with_vc_and_model_payloads(kernel_certified_clean_cic_row()));
+    let proved = with_evidence_payloads(with_vc_and_model_payloads(plain_transport_row(
+        Outcome::Proved,
+        false,
+    )));
+    let drop_glue = with_evidence_payloads(with_vc_and_model_payloads(drop_glue_transport_row(
+        Outcome::Unknown,
+    )));
+    let no_keys = FxHashSet::default();
+    // (name, rows, edge keys, fold ledger, the excuse's answer on the full slice)
+    let cases: Vec<(
+        &str,
+        Vec<TransportObligationResult>,
+        &FxHashSet<String>,
+        Option<Vec<String>>,
+        bool,
+    )> = vec![
+        (
+            "writer edge folded alone, certified and proved rows beside it",
+            vec![writer_edge.clone(), certified.clone(), proved.clone()],
+            &edge_keys,
+            Some(vec![writer_site.clone()]),
+            true,
+        ),
+        (
+            "no assumption-panic row at all, no ledger entry",
+            vec![certified.clone(), proved.clone()],
+            &edge_keys,
+            None,
+            true,
+        ),
+        (
+            "a vanilla site folded beside the writer edge",
+            vec![writer_edge.clone(), certified.clone()],
+            &edge_keys,
+            Some(vec![writer_site.clone(), vanilla_site]),
+            false,
+        ),
+        (
+            "a fold row with no ledger entry fails closed",
+            vec![writer_edge.clone(), certified.clone()],
+            &edge_keys,
+            None,
+            false,
+        ),
+        (
+            "no recorded writer-edge key",
+            vec![writer_edge.clone(), certified.clone()],
+            &no_keys,
+            Some(vec![writer_site.clone()]),
+            false,
+        ),
+        (
+            "an unexcused drop-glue row beside the writer edge",
+            vec![writer_edge.clone(), drop_glue, certified.clone()],
+            &edge_keys,
+            Some(vec![writer_site.clone()]),
+            false,
+        ),
+    ];
+    let mut answers_seen = FxHashSet::default();
+    for (name, rows, keys, ledger, expected) in &cases {
+        let ledger = ledger.as_deref();
+        let full_answer = fmt_writer_relative::writer_edge_rows_excused(
+            rows,
+            keys,
+            &FxHashSet::default(),
+            ledger,
+        );
+        assert_eq!(full_answer, *expected, "{name}: the full slice's own answer");
+        answers_seen.insert(full_answer);
+        let projected: Vec<TransportObligationResult> =
+            rows.iter().map(premise_transport_row).collect();
+        assert_eq!(
+            fmt_writer_relative::writer_edge_rows_excused(
+                &projected,
+                keys,
+                &FxHashSet::default(),
+                ledger
+            ),
+            full_answer,
+            "{name}: the compact rows"
+        );
+        let mut artifacts = memory_safe_gate_artifacts(
+            test_vc(7),
+            failed_test_result(),
+            TrustStatus::Unknown,
+            plain_transport_row(Outcome::Proved, false),
+        );
+        artifacts.transport_results = rows.clone();
+        let compact = PremiseArtifacts::Compact(Arc::new(CompactArtifacts::project(&artifacts)));
+        let full = PremiseArtifacts::Full(Arc::new(artifacts));
+        assert_eq!(
+            fmt_writer_relative::writer_edge_rows_excused(
+                full.transport_results(),
+                keys,
+                &FxHashSet::default(),
+                ledger
+            ),
+            full_answer,
+            "{name}: the full slot"
+        );
+        assert_eq!(
+            fmt_writer_relative::writer_edge_rows_excused(
+                compact.transport_results(),
+                keys,
+                &FxHashSet::default(),
+                ledger
+            ),
+            full_answer,
+            "{name}: the compact slot"
+        );
+    }
+    assert_eq!(answers_seen.len(), 2, "the cases must make the excuse answer both ways");
+}
+
+// Trust: main's P-SPLIT authority and compact row ownership must compose.
+#[test]
+fn writer_edge_excuse_preserves_recorded_names_split_sites_when_compacted() {
+    let writer_keys = premise_parity_edge_keys();
+    let split_name = "core::str::split::names_split";
+    let split_keys: FxHashSet<String> = [split_name.to_string()].into_iter().collect();
+    let writer = with_evidence_payloads(with_vc_and_model_payloads(absent_callee_transport_row(
+        Outcome::Unknown,
+    )));
+    let mut split = writer.clone();
+    split.description = split.description.replace("core::num::u32::pow", split_name);
+    let sites = vec![writer.description.clone(), split.description.clone()];
+    let rows = vec![writer, split];
+    let compact: Vec<_> = rows.iter().map(premise_transport_row).collect();
+    for slice in [&rows[..], &compact[..]] {
+        assert!(fmt_writer_relative::writer_edge_rows_excused(
+            slice,
+            &writer_keys,
+            &split_keys,
+            Some(&sites)
+        ));
+        assert!(
+            !fmt_writer_relative::writer_edge_rows_excused(
+                slice,
+                &writer_keys,
+                &FxHashSet::default(),
+                Some(&sites)
+            ),
+            "a split site needs its recorded key"
+        );
+        assert!(
+            !fmt_writer_relative::writer_edge_rows_excused(slice, &writer_keys, &split_keys, None),
+            "a marked aggregate still needs its fold ledger"
+        );
+        let mut extra_site = sites.clone();
+        extra_site.push(premise_parity_fold_sites()[1].clone());
+        assert!(
+            !fmt_writer_relative::writer_edge_rows_excused(
+                slice,
+                &writer_keys,
+                &split_keys,
+                Some(&extra_site)
+            ),
+            "an unrelated folded callee remains unexcused"
+        );
+    }
+}
+
+// Trust: a machinery key cannot stand in for the class's own writer edge.
+#[test]
+fn writer_edge_excuse_requires_a_recorded_writer_key_even_without_rows() {
+    let no_writer_keys = FxHashSet::default();
+    let split_name = "core::str::split::names_split";
+    let split_keys: FxHashSet<String> = [split_name.to_string()].into_iter().collect();
+    let empty: Vec<TransportObligationResult> = Vec::new();
+    let mut split = with_evidence_payloads(with_vc_and_model_payloads(
+        absent_callee_transport_row(Outcome::Unknown),
+    ));
+    split.description = split.description.replace("core::num::u32::pow", split_name);
+    let sites = vec![split.description.clone()];
+    let rows = vec![split];
+    let compact: Vec<_> = rows.iter().map(premise_transport_row).collect();
+    for slice in [&empty[..], &rows[..], &compact[..]] {
+        for ledger in [None, Some(&sites[..])] {
+            assert!(
+                !fmt_writer_relative::writer_edge_rows_excused(
+                    slice,
+                    &no_writer_keys,
+                    &FxHashSet::default(),
+                    ledger
+                ),
+                "empty writer keys are refused"
+            );
+            assert!(
+                !fmt_writer_relative::writer_edge_rows_excused(
+                    slice,
+                    &no_writer_keys,
+                    &split_keys,
+                    ledger
+                ),
+                "recorded machinery alone does not authorize a writer-relative class"
+            );
+        }
+    }
+}
+
+/// Adversarial review of COMPACT-SLOT-PAYLOAD-1, finding 3: the fold expansion the
+/// fail-closed gate judges BORROWS the body's transport rows and builds only the per-site
+/// rows. It used to deep-copy every row (`rows.to_vec()`), certified `clean_cic` payload
+/// included, once per verified body and per writer-relative premise asked of a full slot.
+#[test]
+fn fold_judged_rows_borrow_the_transport_rows_and_build_only_the_site_rows() {
+    let aggregate = absent_callee_transport_row(Outcome::Unknown);
+    let rows = vec![
+        with_evidence_payloads(with_vc_and_model_payloads(kernel_certified_clean_cic_row())),
+        aggregate.clone(),
+        with_evidence_payloads(plain_transport_row(Outcome::Proved, false)),
+    ];
+    let sites = premise_parity_fold_sites();
+    for ledger in [Some(sites.as_slice()), None] {
+        let judged = transport_rows_with_fold_sites(&rows, ledger);
+        let judged: Vec<&TransportObligationResult> = judged.iter().collect();
+        let site_rows = ledger.map_or(0, <[String]>::len);
+        assert_eq!(judged.len(), rows.len() + site_rows, "{ledger:?}: one row per site");
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                std::ptr::eq(judged[index], row),
+                "{ledger:?}: transport row {index} must be borrowed, not copied"
+            );
+        }
+        for (site, row) in sites.iter().zip(&judged[rows.len()..]) {
+            assert_eq!(
+                *row,
+                &TransportObligationResult { description: site.clone(), ..aggregate.clone() },
+                "a site row is the aggregate with that site's text"
+            );
+        }
+    }
+    // No row stands for the fold: nothing is added, whatever the ledger says.
+    let unfolded = vec![rows[0].clone(), rows[2].clone()];
+    let judged = transport_rows_with_fold_sites(&unfolded, Some(sites.as_slice()));
+    let judged: Vec<&TransportObligationResult> = judged.iter().collect();
+    assert_eq!(judged.len(), unfolded.len());
+    assert!(judged.iter().zip(&unfolded).all(|(judged, row)| std::ptr::eq(*judged, row)));
+}
+
+/// Every answer a compact-slot reader takes of one transport row, named.
+fn premise_row_answers(
+    row: &TransportObligationResult,
+    edge_keys: &FxHashSet<String>,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("assumption_panic_row_cause", format!("{:?}", assumption_panic_row_cause(row))),
+        ("unproved_assumption_panic", transport_row_is_unproved_assumption_panic(row).to_string()),
+        ("unproved_absent_callee", transport_row_is_unproved_absent_callee(row).to_string()),
+        (
+            "unproved_expected_absent_callee",
+            transport_row_is_unproved_expected_absent_callee(row).to_string(),
+        ),
+        ("unproved_drop_glue", transport_row_is_unproved_drop_glue(row).to_string()),
+        (
+            "fatal_unproved_extern_call",
+            transport_row_is_fatal_unproved_extern_call(row).to_string(),
+        ),
+        (
+            "unproved_assumed_total_callee",
+            transport_row_is_unproved_assumed_total_callee(row).to_string(),
+        ),
+        ("assumed_total_assumption", transport_row_is_assumed_total_assumption(row).to_string()),
+        ("stands_for_fold", transport_row_stands_for_fold(row).to_string()),
+        ("absent_callee_path", format!("{:?}", absent_callee_path_of_row(row))),
+        ("extern_call_callee", format!("{:?}", extern_call_row_callee(&row.description))),
+        (
+            "names_writer_edge",
+            fmt_writer_relative::row_names_writer_edge(row, edge_keys).to_string(),
+        ),
+        // Not read by a compact-slot reader today: the exact-shape predicates, which read
+        // `typed_kind` (adversarial review finding 1). Asked so a premise reader that adopts
+        // one is already covered.
+        (
+            "instance_hypothesis_assumption",
+            instance_hypothesis::transport_row_is_instance_hypothesis_assumption(row).to_string(),
+        ),
+        (
+            "termination_unmeasured_assumption",
+            termination_unmeasured::transport_row_is_termination_unmeasured_assumption(row)
+                .to_string(),
+        ),
+    ]
+}
+
+/// Every answer a compact-slot reader takes of a body's whole transport-row slice, named:
+/// conjunct 3 under each `RowExcuse` that reads rows without a session, the fold
+/// expansion the writer-relative excuse judges (row by row, and under its writer-edge
+/// excuse), and the in-band assumed-total witness.
+fn premise_slice_answers(
+    rows: &[TransportObligationResult],
+    fold_sites: &[String],
+    edge_keys: &FxHashSet<String>,
+) -> Vec<(&'static str, String)> {
+    use super::trait_panic_free::RowExcuse as _;
+    let judged = transport_rows_with_fold_sites(rows, Some(fold_sites));
+    vec![
+        ("len", rows.len().to_string()),
+        (
+            "have_unproved_assumption_panic",
+            transport_rows_have_unproved_assumption_panic(rows).to_string(),
+        ),
+        (
+            "no_excuse_excused",
+            trait_panic_free::NoExcuse.assumption_panic_rows_excused(rows).to_string(),
+        ),
+        (
+            "instance_relative_excused",
+            trait_panic_free::InstanceRelative.assumption_panic_rows_excused(rows).to_string(),
+        ),
+        (
+            "spend_assumed_total_axiom",
+            transport_rows_spend_a_user_assumed_total_axiom(rows).to_string(),
+        ),
+        ("any_stands_for_fold", rows.iter().any(transport_row_stands_for_fold).to_string()),
+        ("fold_judged_len", judged.iter().count().to_string()),
+        (
+            "fold_judged_rows",
+            format!(
+                "{:?}",
+                judged.iter().map(|row| premise_row_answers(row, edge_keys)).collect::<Vec<_>>()
+            ),
+        ),
+        (
+            "fold_unexcused_beside_writer_edges",
+            transport_rows_have_unexcused_assumption_panic(judged.iter(), |row| {
+                fmt_writer_relative::row_names_writer_edge(row, edge_keys)
+            })
+            .to_string(),
+        ),
+        // The writer-relative excuse itself (finding 2), with the ledger and without it.
+        (
+            "writer_edge_rows_excused",
+            fmt_writer_relative::writer_edge_rows_excused(
+                rows,
+                edge_keys,
+                &FxHashSet::default(),
+                Some(fold_sites),
+            )
+            .to_string(),
+        ),
+        (
+            "writer_edge_rows_excused_without_ledger",
+            fmt_writer_relative::writer_edge_rows_excused(
+                rows,
+                edge_keys,
+                &FxHashSet::default(),
+                None,
+            )
+            .to_string(),
+        ),
+    ]
+}
+
+/// The fields of a transport row a row predicate reads: what a compact-slot reader reads
+/// (`premise_transport_row`'s WHO READS list: `kind`, `description`, `outcome`,
+/// `design_mandate`, whether each evidence record is present), and the fields whose
+/// absence an exact-shape predicate reads as acceptance (its ALSO KEPT list: `typed_kind`,
+/// whether a counterexample or its model is present).
+fn reader_visible_fields(
+    row: &TransportObligationResult,
+) -> (&str, &str, Outcome, bool, bool, bool, Option<&VcKind>, bool, bool) {
+    (
+        &row.kind,
+        &row.description,
+        row.outcome,
+        row.design_mandate,
+        row.native_trust_ir.is_some(),
+        row.proof_evidence.is_some(),
+        row.typed_kind.as_deref(),
+        row.counterexample.is_some(),
+        row.counterexample_model.is_some(),
+    )
+}
+
+/// The full row with exactly the payloads `premise_transport_row` drops taken out: the
+/// test's own statement of the keep/drop table, so a change to either side shows here.
+fn expected_compact_row(row: &TransportObligationResult) -> TransportObligationResult {
+    let mut expected = row.clone();
+    expected.original_vc_snapshot = None;
+    if let Some(native) = expected.native_trust_ir.as_mut() {
+        native.diagnostics.clear();
+        for artifact in &mut native.artifacts {
+            artifact.metadata = None;
+            artifact.materialization = None;
+        }
+    }
+    if let Some(proof) = expected.proof_evidence.as_mut() {
+        proof.diagnostics.clear();
+        for artifact in &mut proof.artifacts {
+            artifact.metadata = None;
+            artifact.materialization = None;
+        }
+    }
+    expected
+}
+
+/// A compact row holds no VC or proof payload.
+fn assert_no_transport_payload(row: &TransportObligationResult, index: usize) {
+    assert!(row.original_vc_snapshot.is_none(), "row {index}: VC snapshot kept");
+    if let Some(native) = &row.native_trust_ir {
+        assert!(native.diagnostics.is_empty(), "row {index}: native diagnostics kept");
+        for artifact in &native.artifacts {
+            assert!(artifact.metadata.is_none(), "row {index}: native artifact metadata kept");
+            assert!(
+                artifact.materialization.is_none(),
+                "row {index}: native artifact materialization kept"
+            );
+        }
+    }
+    if let Some(proof) = &row.proof_evidence {
+        assert!(proof.diagnostics.is_empty(), "row {index}: proof diagnostics kept");
+        for artifact in &proof.artifacts {
+            assert!(artifact.metadata.is_none(), "row {index}: proof artifact metadata kept");
+            assert!(
+                artifact.materialization.is_none(),
+                "row {index}: proof artifact materialization kept"
+            );
+        }
+    }
+}
+
+/// Trust (T3 L4, C07): the production compaction (`SessionArtifactCache::compact_after_pass`,
+/// what `compact_cached_artifacts_after_pass` runs when a verify pass returns) leaves the
+/// slot no handle to the body's VC context, so once the pass drops its own handle the
+/// context is released; and the cache's sweep counts each compacted context exactly once,
+/// when it is released.
+#[test]
+fn a_compacted_slot_releases_the_body_context() {
+    // Trust (T3 L4, C07r): the fixture's one row is interned in its own context.
+    let full = memory_safe_gate_artifacts(
+        test_vc(5),
+        failed_test_result(),
+        TrustStatus::Unknown,
+        plain_transport_row(Outcome::Proved, false),
+    );
+    assert!(full.results.aligned_in(&full.ctx));
+    let weak = Arc::downgrade(&full.ctx);
+    // The pass's handle, and the slot's.
+    let pass = Arc::new(full);
+    let key: ArtifactCacheKey = "a_compacted_slot_releases_the_body_context".to_string();
+    let mut cache = SessionArtifactCache::default();
+    cache.entries.insert(key.clone(), CachedArtifacts::Full(Arc::clone(&pass)));
+    // The pass returns: its guard compacts the slot while the pass still holds its handle,
+    // so the context is alive, and not yet counted.
+    cache.compact_after_pass(&key);
+    assert_eq!((cache.compacted, cache.compacted_after_handle_dropped), (1, 0));
+    assert!(weak.upgrade().is_some());
+    assert_eq!((cache.contexts_released, cache.compacted_contexts.len()), (0, 1));
+    // A clone of the artifacts shares the context; it is not copied.
+    let clone = (*pass).clone();
+    assert!(Arc::ptr_eq(&clone.ctx, &pass.ctx));
+    drop(clone);
+    drop(pass);
+    assert!(weak.upgrade().is_none(), "the compacted slot must not keep the context alive");
+    let Some(CachedArtifacts::Compact(compact)) = cache.entries.get(&key) else {
+        panic!("the slot must be compacted");
+    };
+    assert_eq!(compact.row_kinds.len(), 1, "the projection still answers its readers");
+    // A slot compacted already is left as it is.
+    cache.compact_after_pass(&key);
+    assert_eq!(cache.compacted, 1);
+    cache.sweep_compacted_contexts();
+    cache.sweep_compacted_contexts();
+    assert_eq!((cache.contexts_released, cache.compacted_contexts.len()), (1, 0));
+}
+
+/// Trust (T3 L4, C07r; plan C07r change 1): the full lane's carrier is built by the
+/// production rebuild (`full_verification_row_results_bound`, which
+/// `collect_full_verification_artifacts_once` runs where the run's evidence rebuilds its
+/// rows): each rebuilt row, here the E4 fixture's two, has an id in the body's context that
+/// reads back as the row, beside the binding the rebuild gives it, and the carrier reads
+/// as those rows. The seam's oracle agrees on every row, and catches a misalignment planted
+/// in the carrier.
+#[test]
+fn full_verification_results_are_carried_on_rows() {
+    use trust_types::vc_context::{Oracle, ParityCount, VcContext, same_row};
+    let (function, compiler_contracts, vcs) = fresh_exact_direct_e4_inputs();
+    let fixture =
+        fresh_exact_direct_fixture_for(&function, &compiler_contracts, &vcs, &[], "t3-l4-c07r");
+    assert_eq!(fixture.results.len(), 2, "the fixture rebuilds its two rows");
+    assert!(!same_row(&fixture.results[0].0, &fixture.results[1].0), "two distinct rows");
+    let snapshot = exact_fresh_vc_rekey_snapshot(
+        &function,
+        &compiler_contracts,
+        &fixture.bundle,
+        &vcs,
+        fixture.final_run.context.clone(),
+    );
+    let mut rows = VcContext::new();
+    let (mut results, bindings) = full_verification_row_results_bound(
+        &mut rows,
+        &function,
+        &fixture.bundle,
+        &fixture.final_run,
+        &vcs,
+        &snapshot,
+        0,
+    );
+    assert!(results.aligned_in(&rows));
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 2, mismatches: 0 });
+    assert_eq!((results.len(), bindings.len()), (2, fixture.bindings.len()));
+    for ((vc, result), (rebuilt, verdict)) in results.iter().zip(&fixture.results) {
+        assert!(same_row(vc, rebuilt));
+        assert_eq!(format!("{result:?}"), format!("{verdict:?}"));
+    }
+    results.check_in(&rows);
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 4, mismatches: 0 });
+    // Negative control: swapped ids are caught, by the alignment check and by the oracle.
+    results.misalign_for_test(0, 1);
+    assert!(!results.aligned_in(&rows));
+    results.check_in(&rows);
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 6, mismatches: 2 });
+}
+
+/// Trust (T3 L4, C07r; plan C07r change 1): the production bridge on the carrier
+/// (`bridge_v1_ay_proofs_into_row_results`, which `collect_full_verification_artifacts_once`
+/// runs) proves a row and leaves it on its id in the body's context: a verdict change keeps
+/// the id, and joins nothing. Then frozen into its artifacts (`UnfrozenArtifacts::freeze`),
+/// the bridged row reads back from the artifacts' own context.
+#[test]
+fn bridged_results_are_carried_on_rows() {
+    use trust_types::vc_context::{Oracle, ParityCount, VcContext, same_row};
+    let mut assertion = test_vc(335);
+    assertion.kind = VcKind::Assertion { message: "safe assertion".to_string() };
+    let atom = Formula::Var("assertion_guard".to_string(), Sort::Bool);
+    assertion.formula = Formula::And(vec![atom.clone(), Formula::Not(Box::new(atom))]);
+    let obligation = authority_test_native_obligation("bridge:c07r-rows", 335, 335);
+    let mut bindings = vec![test_binding_for_obligation(0, &assertion, &obligation)];
+    let mut rows = VcContext::new();
+    let mut results =
+        RowResults::intern(&mut rows, vec![(assertion.clone(), bridge_test_unknown())]);
+    let ids = results.ids().to_vec();
+    let function = bridge_test_function();
+    let scope = trust_vcgen::GenericRefutationScope::for_function(&function, &[], &[]);
+    let (proved, failed, _) = bridge_v1_ay_proofs_into_row_results(
+        &scope,
+        5_000,
+        trust_types::determinism::EffortScale::BUILTIN,
+        None,
+        std::slice::from_ref(&assertion),
+        &mut bindings,
+        &mut ClockStops::default(),
+        /* stamp_held_assert_refutations */ true,
+        &mut results,
+        &mut rows,
+        None,
+    );
+    assert_eq!((proved, failed), (1, 0));
+    assert!(matches!(results[0].1, VerificationResult::Proved { .. }));
+    assert!(same_row(&results[0].0, &assertion));
+    assert_eq!(results.ids(), ids.as_slice(), "the bridged row keeps its id");
+    assert!(results.aligned_in(&rows));
+    assert_eq!(rows.parity(Oracle::Row), ParityCount { rows: 1, mismatches: 0 });
+    let mut artifacts = memory_safe_gate_artifacts(
+        test_vc(336),
+        failed_test_result(),
+        TrustStatus::Unknown,
+        plain_transport_row(Outcome::Proved, false),
+    );
+    artifacts.results = results;
+    let frozen = UnfrozenArtifacts::new(artifacts).freeze(rows);
+    assert!(frozen.results.aligned_in(&frozen.ctx));
+    assert!(matches!(frozen.results[0].1, VerificationResult::Proved { .. }));
+}
+
+/// Trust (T3 L4, C07r; L4-C07p-2): a run's artifacts are not `VerificationArtifacts` until
+/// the body's context is frozen into them (`UnfrozenArtifacts::freeze`, which
+/// `collect_full_verification_artifacts` runs on the run it selects). Frozen with the context
+/// their results were interned into, every row reads back from the artifacts' own context;
+/// frozen with another (negative control), none does.
+#[test]
+fn a_run_reads_back_from_the_context_frozen_into_it() {
+    use trust_types::vc_context::VcContext;
+    let run = || {
+        let mut artifacts = memory_safe_gate_artifacts(
+            test_vc(7),
+            failed_test_result(),
+            TrustStatus::Unknown,
+            plain_transport_row(Outcome::Proved, false),
+        );
+        let mut rows = VcContext::new();
+        artifacts.results = RowResults::intern(&mut rows, artifacts.results.to_vec());
+        (UnfrozenArtifacts::new(artifacts), rows)
+    };
+    let (unfrozen, rows) = run();
+    // It reads as the parts the run selection needs.
+    assert_eq!(unfrozen.results().len(), 1);
+    assert!(unfrozen.result_bindings().is_empty() && unfrozen.proof_authorities().is_empty());
+    let frozen = unfrozen.freeze(rows);
+    assert!(frozen.results.aligned_in(&frozen.ctx));
+    let (unfrozen, _rows) = run();
+    let frozen = unfrozen.freeze(VcContext::new());
+    assert!(!frozen.results.aligned_in(&frozen.ctx), "the wrong context reads no row back");
+}
+
+/// Trust (T3 L4, C07r; L4-E9-1): a body with a pending import citation keeps its VC context
+/// past its verify pass, held by its record's provisional artifacts (a `CitationHold`) and
+/// counted, until the amendment drops them; the amendment's verdict change keeps every row
+/// on that context. A record dropped without its amendment ends its hold too, so the count
+/// is exact whatever path a record takes. (Every other body's context is released at
+/// compaction: `a_compacted_slot_releases_the_body_context`.)
+#[test]
+fn a_pending_citation_holds_the_body_context_until_its_amendment() {
+    let gate_artifacts = |line| {
+        Arc::new(memory_safe_gate_artifacts(
+            test_vc(line),
+            failed_test_result(),
+            TrustStatus::Unknown,
+            plain_transport_row(Outcome::Failed, false),
+        ))
+    };
+    let counts = |attached, held, max_held| CitationHoldCensus { attached, held, max_held };
+    let provisional = gate_artifacts(9);
+    let context = Arc::downgrade(&provisional.ctx);
+    let holds = CitationContextHolds::default();
+    let mut record: Option<CitationHold> = None;
+    // The quarantine attaches the provisional artifacts; the pass then drops its own handle.
+    holds.attach(&mut record, &provisional);
+    drop(provisional);
+    assert!(context.upgrade().is_some(), "the record holds the context past the pass");
+    assert_eq!(holds.census(), counts(1, 1, 1));
+    // A second quarantine of the same record replaces its artifacts: one hold, not two.
+    let requarantined = Arc::clone(&record.as_ref().expect("attached").artifacts);
+    holds.attach(&mut record, &requarantined);
+    drop(requarantined);
+    assert_eq!(holds.census(), counts(1, 1, 1));
+    // Another body's record holds its own context beside it.
+    let mut other_record: Option<CitationHold> = None;
+    holds.attach(&mut other_record, &gate_artifacts(10));
+    assert_eq!(holds.census(), counts(2, 2, 2));
+    // The amendment takes the provisional artifacts and changes a verdict on a clone that
+    // shares their context; every row still reads back from it.
+    let provisional = record.take().expect("attached");
+    let mut amended = (*provisional).clone();
+    assert!(Arc::ptr_eq(&amended.ctx, &provisional.ctx));
+    let previous = amended.results.set_result(0, authority_test_proved());
+    assert!(matches!(previous, Some(VerificationResult::Failed { .. })));
+    assert!(matches!(amended.results[0].1, VerificationResult::Proved { .. }));
+    assert!(amended.results.aligned_in(&amended.ctx));
+    assert!(amended.results.set_result(1, authority_test_proved()).is_none());
+    // Published, the amended artifacts drop; dropping the provisional ones ends the hold,
+    // and the context goes.
+    drop(amended);
+    assert!(context.upgrade().is_some(), "the provisional artifacts still hold it");
+    drop(provisional);
+    assert!(context.upgrade().is_none(), "the amendment released the body context");
+    assert_eq!(holds.census(), counts(2, 1, 2));
+    // A record dropped unamended (drained and dropped, replaced, or unwound) ends its hold.
+    drop(other_record);
+    assert_eq!(holds.census(), counts(2, 0, 2));
+}
+
+/// Trust (T3 L4, C07p; design D-VC-6): a crate phase's short-lived producer (an R1 harvest)
+/// runs with a VC context of its own, which drops when the producer ends: a witness held
+/// in the context's memo is gone once the harvest returns, and the context's row-oracle
+/// count has been folded into the phase's tally.
+#[test]
+fn a_harvest_context_drops_when_the_harvest_ends() {
+    #[derive(Default)]
+    struct Witness(Option<Arc<()>>);
+    let held = Arc::new(());
+    let weak = Arc::downgrade(&held);
+    let mut parity = trust_types::vc_context::ParityTally::default();
+    let harvested = with_scoped_rows(&mut parity, |rows| {
+        rows.push_checked_row(&test_vc(5)).expect("a test context has room");
+        rows.memo().with::<Witness, _>(trust_types::vc_context::MemoSlot::Lowering, |slot| {
+            slot.0 = Some(Arc::clone(&held));
+            slot.0.is_some()
+        })
+    });
+    assert_eq!(harvested, Some(true), "the witness is held by the harvest's context");
+    drop(held);
+    assert!(weak.upgrade().is_none(), "the harvest's context must drop with the harvest");
+    assert_eq!(
+        parity.get(trust_types::vc_context::Oracle::Row),
+        trust_types::vc_context::ParityCount { rows: 1, mismatches: 0 },
+    );
+    // Negative control: a context that outlives the harvest keeps the witness alive.
+    let held = Arc::new(());
+    let weak = Arc::downgrade(&held);
+    let kept = trust_types::vc_context::VcContext::new();
+    let stored =
+        kept.memo().with::<Witness, _>(trust_types::vc_context::MemoSlot::Lowering, |slot| {
+            slot.0 = Some(Arc::clone(&held));
+            slot.0.is_some()
+        });
+    assert_eq!(stored, Some(true));
+    drop(held);
+    assert!(weak.upgrade().is_some(), "a live context holds what its memo holds");
+    drop(kept);
+    assert!(weak.upgrade().is_none());
+}
+
+/// Trust (T3 L4, C07p; plan C07p, "a source census"): the compiler's vcgen producer calls
+/// that still build eager trees only, each pinned with its reason. Every other
+/// `generate_*`, `regenerate_*` or `infer_return_candidate` call in this crate's sources
+/// names its `_rows` variant and writes into the body's VC context (or a crate phase's
+/// scoped one), so a new tree-only call fails here until it is given one or pinned.
+#[test]
+fn tree_only_vcgen_producer_calls_are_pinned() {
+    const PINNED: &[(&str, &str, &str)] = &[
+        (
+            "trust_verify.rs",
+            "generate_callsite_precondition_vcs",
+            "the bundled-member Assert gate's count-and-kind check of the root's call-site \
+             rows under a synthetic summary database: compared, never solved or carried",
+        ),
+        (
+            "trust_verify.rs",
+            "generate_per_path_assert_refutation_vcs_with_context",
+            "a `RefuteOnlyVc` yields its query only inside `refute_with`, whose closure \
+             interns it into the body's context before it is solved",
+        ),
+        (
+            "trust_verify.rs",
+            "generate_vcs",
+            "`exact_definition_entry_assumption_rows`: a generation witnessing the entry rows' \
+             provenance, compared byte for byte with carried rows and never solved; its rows \
+             join a fresh VC context of their own at the generation's sink (C08s), not the \
+             body's",
+        ),
+        (
+            "trust_verify.rs",
+            "generate_vcs_with_discharge_and_overflow_origins",
+            "the consumed generation: vcgen interns each row into the body's context as it \
+             joins the generation's sink and hands back their ids (`ConsumedGeneration`, \
+             C07, C08s)",
+        ),
+        (
+            "trust_verify/step_by_constructor.rs",
+            "generate_callsite_precondition_vcs",
+            "`ConstructorPlan::root_charges`, a `#[cfg(test)]` helper: the single-database \
+             regeneration of the constructor root's charges that the unit tests ask, never \
+             solved",
+        ),
+        (
+            "trust_verify/step_by_constructor.rs",
+            "generate_callsite_precondition_vcs_for_each",
+            "the constructor root's charges (`reconcile_bundle`): one caller-side \
+             regeneration of the root per member database, an independent reconstruction \
+             reconciled with the carried rows (`bind_public_root_charges`), never solved",
+        ),
+    ];
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read a source directory") {
+            let path = entry.expect("read a source directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    // What the census reads, and its limits. A call is read by its path and its `(` on one
+    // line (the formatter never splits them); a call through a macro or a function value,
+    // and a producer of another crate that calls vcgen itself (`trust_ir_bridge`'s), are
+    // not read, and a module path segment of an import is taken as a prefix even where a
+    // local module shares its name, which can only add a finding.
+    fn tree_only_producer(name: &str) -> bool {
+        (name.starts_with("generate_")
+            || name.starts_with("regenerate_")
+            || name == "infer_return_candidate")
+            && !name.ends_with("_rows")
+    }
+    // Every `use` (or `extern crate`) of trust_vcgen in `source`, each read to its `;`.
+    fn vcgen_imports(source: &str) -> Vec<String> {
+        let mut imports = Vec::new();
+        let mut open: Option<String> = None;
+        for line in source.lines() {
+            let code = line.split("//").next().unwrap_or_default().trim();
+            let statement = ["pub(crate) ", "pub(super) ", "pub "]
+                .iter()
+                .find_map(|visibility| code.strip_prefix(visibility))
+                .unwrap_or(code);
+            let opens = ["use trust_vcgen", "use ::trust_vcgen", "extern crate trust_vcgen"]
+                .iter()
+                .any(|start| statement.starts_with(start));
+            if open.is_none() && opens {
+                open = Some(String::new());
+            }
+            if let Some(mut import) = open.take() {
+                import.push_str(statement);
+                import.push(' ');
+                if code.contains(';') {
+                    imports.push(import);
+                } else {
+                    open = Some(import);
+                }
+            }
+        }
+        imports
+    }
+    // Test sources call the tree-only producers on purpose, to compare against them.
+    fn is_test_source(relative: &str) -> bool {
+        relative.split('/').any(|part| part == "tests")
+            || relative
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    assert!(
+        files.iter().any(|file| file.ends_with("trust_verify.rs")),
+        "the census must read this crate's sources (positive control)",
+    );
+    let mut found = BTreeSet::new();
+    for file in &files {
+        let relative = file
+            .strip_prefix(&src)
+            .expect("a walked file is under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if is_test_source(&relative) {
+            continue;
+        }
+        let source = std::fs::read_to_string(file).expect("read a source file");
+        // The prefixes a call into trust_vcgen can be spelled with in this file: the crate,
+        // and every module path segment an import of it names (`houdini::{self, ..}` is
+        // called as `houdini::<name>(`). An import that names a tree-only producer, a glob
+        // and a rename would each let a call drop every such prefix, so each is found as a
+        // `use` entry, which no reason pins: write the call with its path instead.
+        let mut prefixes = vec!["trust_vcgen::".to_string()];
+        for import in vcgen_imports(&source) {
+            if import.contains('*') || import.contains(" as ") {
+                found.insert((relative.clone(), "use trust_vcgen: a glob or a rename".to_string()));
+            }
+            for word in import.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if tree_only_producer(word) {
+                    found.insert((relative.clone(), format!("use {word}")));
+                }
+                let module = word.starts_with(|c: char| c.is_ascii_lowercase())
+                    && !["use", "pub", "crate", "super", "self", "extern", "as", "trust_vcgen"]
+                        .contains(&word);
+                if module {
+                    prefixes.push(format!("{word}::"));
+                }
+            }
+        }
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for prefix in &prefixes {
+                for (at, _) in code.match_indices(prefix.as_str()) {
+                    // A prefix is a whole path segment: `xhoudini::` is not `houdini::`.
+                    if code[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let rest = &code[at + prefix.len()..];
+                    let path_len = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                        .unwrap_or(rest.len());
+                    if !rest[path_len..].starts_with('(') {
+                        continue;
+                    }
+                    let name = rest[..path_len].rsplit("::").next().unwrap_or_default();
+                    if tree_only_producer(name) {
+                        found.insert((relative.clone(), name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let pinned: BTreeSet<(String, String)> = PINNED
+        .iter()
+        .map(|&(file, name, reason)| {
+            assert!(!reason.is_empty(), "{file} {name}: a pinned call carries its reason");
+            (file.to_string(), name.to_string())
+        })
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "a tree-only vcgen producer call must become its `_rows` variant (writing into the \
+         body's context) or be pinned here with its reason",
+    );
+}
+
+/// Trust (NEW-EXEMPT-SPLIT, 2026-09-27): the fixture of
+/// [`panic_callee_exemption_is_decided_per_target_block`] — in miniature the
+/// shape measured on real MIR
+/// (`tests/ui/trust/panic_callee_exemption_is_per_target_block.rs`):
+///
+/// ```text
+/// fn split(x: u64) -> u64 {
+///     if x < 3 || x > 100 { assert!(x != 50); }   // bb3: two paths
+///     let v = external::opaque_u64();
+///     assert!(v == 10);                            // bb6: no candidate
+///     x
+/// }
+/// ```
+///
+/// With `declined == false`, bb4 jumps straight to the return and bb6's panic
+/// call is replaced by `Unreachable`, leaving bb3 the only target block.
+fn exemption_split_fixture(declined: bool) -> trust_types::VerifiableFunction {
+    use trust_types::{
+        BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, Statement,
+        Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
+    };
+    let span = native_trust_ir_test_span(40);
+    let cmp = |dest: usize, op: BinOp, local: usize, constant: u128| Statement::Assign {
+        place: Place::local(dest),
+        rvalue: Rvalue::BinaryOp(
+            op,
+            Operand::Copy(Place::local(local)),
+            Operand::Constant(ConstValue::Uint(constant, 64)),
+        ),
+        span: span.clone(),
+    };
+    // `if b { on_true } else { on_false }` on the Bool local `b`.
+    let branch = |b: usize, on_false: usize, on_true: usize| Terminator::SwitchInt {
+        discr: Operand::Copy(Place::local(b)),
+        targets: vec![(0, BlockId(on_false))],
+        otherwise: BlockId(on_true),
+        exhaustive_enum_unreachable: false,
+        span: span.clone(),
+    };
+    let call = |callee: &str, dest: usize, target: Option<usize>| Terminator::Call {
+        func: callee.to_string(),
+        args: Vec::new(),
+        dest: Place::local(dest),
+        target: target.map(BlockId),
+        span: span.clone(),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: None,
+        unwind: UnwindEdge::Unreachable,
+    };
+    let block = |id: usize, stmts: Vec<Statement>, terminator: Terminator| BasicBlock {
+        id: BlockId(id),
+        stmts,
+        terminator,
+    };
+    let local = |index: usize, ty: Ty, name: Option<&str>| LocalDecl {
+        index,
+        ty,
+        name: name.map(str::to_string),
+    };
+    VerifiableFunction {
+        name: "split".to_string(),
+        def_path: "demo::split".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                local(0, Ty::u64(), None),
+                local(1, Ty::u64(), Some("x")),
+                local(2, Ty::Bool, Some("lt3")),
+                local(3, Ty::Bool, Some("gt100")),
+                local(4, Ty::Bool, Some("ne50")),
+                local(5, Ty::Unit, None),
+                local(6, Ty::u64(), Some("v")),
+                local(7, Ty::Bool, Some("eq10")),
+                local(8, Ty::Unit, None),
+            ],
+            blocks: vec![
+                block(0, vec![cmp(2, BinOp::Lt, 1, 3)], branch(2, 1, 2)),
+                block(1, vec![cmp(3, BinOp::Gt, 1, 100)], branch(3, 4, 2)),
+                block(2, vec![cmp(4, BinOp::Ne, 1, 50)], branch(4, 3, 4)),
+                block(3, Vec::new(), call("core::panicking::panic", 5, None)),
+                block(
+                    4,
+                    Vec::new(),
+                    if declined {
+                        call("external::opaque_u64", 6, Some(5))
+                    } else {
+                        Terminator::Goto(BlockId(7))
+                    },
+                ),
+                block(5, vec![cmp(7, BinOp::Eq, 6, 10)], branch(7, 6, 7)),
+                block(
+                    6,
+                    Vec::new(),
+                    if declined {
+                        call("core::panicking::assert_failed::<u64, u64>", 8, None)
+                    } else {
+                        Terminator::Unreachable
+                    },
+                ),
+                block(
+                    7,
+                    vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: span.clone(),
+                    }],
+                    Terminator::Return,
+                ),
+            ],
+            arg_count: 1,
+            return_ty: Ty::u64(),
+            datatype_defs: Default::default(),
+        },
+        contracts: Vec::new(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// NEW-EXEMPT-SPLIT — the panic-callee exemption is decided per TARGET BLOCK:
+/// every target block covered by candidates for all of its paths, each proved.
+///
+/// The retired rule, `#proved candidates == #target blocks`, is SATISFIED by
+/// the `split` fixture — two proved paths of bb3 against the two target blocks
+/// bb3 and bb6 — while bb6 was never a candidate: the false `Certified` proof
+/// of docs/KNOWN_HAZARDS.md, "the panic-callee exemption counted candidates,
+/// not blocks". The same rule REFUSED the control, whose one target block has
+/// two proved paths.
+#[test]
+fn panic_callee_exemption_is_decided_per_target_block() {
+    let candidates = |function: &trust_types::VerifiableFunction| {
+        let context = trust_vcgen::VcgenContext::for_function(function.def_path.clone());
+        trust_vcgen::generate_full_assert_refutation_candidates_with_context(function, &context)
+            .into_parts()
+    };
+    let target_count = |function: &trust_types::VerifiableFunction| {
+        function
+            .body
+            .blocks
+            .iter()
+            .filter(|block| trust_vcgen::is_assert_refutation_target_block(block))
+            .count()
+    };
+
+    let split = exemption_split_fixture(true);
+    let (vcs, coverage) = candidates(&split);
+    // The premise: both candidates are paths of bb3, and the retired count
+    // balances.
+    assert_eq!(vcs.len(), 2);
+    assert!(
+        (0..vcs.len())
+            .all(|index| coverage.candidate_target_block(index) == Some(trust_types::BlockId(3)))
+    );
+    assert_eq!(target_count(&split), vcs.len());
+    assert!(
+        !panic_callee_exemption_holds(&split, 0, 0, &coverage, &[true, true]),
+        "bb6 has no candidate, so no proof covers it: every proved path of bb3 must not \
+         exempt bb6's panic call"
+    );
+
+    let control = exemption_split_fixture(false);
+    let (vcs, coverage) = candidates(&control);
+    assert_eq!(vcs.len(), 2, "one candidate per path of bb3");
+    assert_eq!(target_count(&control), 1);
+    assert!(
+        panic_callee_exemption_holds(&control, 0, 0, &coverage, &[true, true]),
+        "bb3's two paths are both proved: the one target block is covered"
+    );
+    assert!(!panic_callee_exemption_holds(&control, 0, 0, &coverage, &[false, true]));
+    assert!(!panic_callee_exemption_holds(&control, 0, 0, &coverage, &[true, false]));
+    assert!(!panic_callee_exemption_holds(&control, 0, 0, &coverage, &[true]), "a lost verdict");
+    assert!(
+        !panic_callee_exemption_holds(&control, 1, 0, &coverage, &[true, true]),
+        "a refutation"
+    );
+    assert!(!panic_callee_exemption_holds(&control, 0, 1, &coverage, &[true, true]), "an unknown");
+    // A proved candidate the caller appended (a coroutine-sentinel row) covers
+    // nothing: with only it proved, bb3 stays unproved.
+    assert!(!panic_callee_exemption_holds(&control, 0, 0, &coverage, &[false, false, true]));
+    // A coverage record from ANOTHER body cannot vouch for this one's target
+    // blocks: the raw-body check reads `func` itself.
+    assert!(!panic_callee_exemption_holds(&split, 0, 0, &coverage, &[true, true]));
+}
+
+/// Review 2026-10-01: an ay count stop folded into a held assertion
+/// refutation erased the exact marker, so the refuted row regained its
+/// runtime-check tolerance. The fold now skips held refutations.
+#[test]
+fn a_count_stop_never_folds_into_a_held_refutation() {
+    let unknown = |reason: String| VerificationResult::Unknown {
+        solver: "z4-chc".into(),
+        time_ms: 0,
+        reason,
+    };
+    let held = unknown(TRUST_HELD_ASSERT_REFUTATION_REASON.to_string());
+    let held_loop =
+        unknown(format!("{} a loop counterexample", trust_vcgen::GENERIC_REFUTATION_HELD_PREFIX));
+    let plain = unknown("native full verifier evidence status: Unknown".to_string());
+    assert!(!may_fold_count_stop(&held), "a held assertion refutation keeps its marker");
+    assert!(!may_fold_count_stop(&held_loop), "a held loop refutation keeps its marker");
+    assert!(may_fold_count_stop(&plain), "an undecided row still states its count stop");
+    // The defect the guard prevents: folding rewrites the exact marker.
+    let folded = format!(
+        "{TRUST_HELD_ASSERT_REFUTATION_REASON}; the ay producer stopped on its effort count"
+    );
+    assert!(!result_is_held_assert_refutation(&unknown(folded)));
+}
+
+/// Trust (2026-10-03, level-0 charges): the level a body's obligations are
+/// filtered at. Level 0 stays level 0 only for a body that owes nothing: a body
+/// that owes a callee's `requires` (its `Precondition` row is `L1Functional`) and
+/// a certify session are lifted to L1 on every policy, and nothing ever lowers
+/// a configured level. MEASURED before the lift (stage 1 of `782780ea0d`):
+/// `p() { add1(u32::MAX) }` at level 0 built exit 0 under certify and under the
+/// strict default, and the certify build returned `0`; certify at level 0 built
+/// `spin()` exit 0.
+#[test]
+fn effective_max_level_lifts_what_a_lower_level_would_drop() {
+    use rustc_session::config::TrustPolicy;
+    use trust_types::ProofLevel::{L0Safety, L1Functional, L2Domain};
+    let level = effective_max_level_from_parts;
+    for policy in [TrustPolicy::Strict, TrustPolicy::Advisory, TrustPolicy::MemorySafe] {
+        // The control: a body that owes nothing keeps its configured level.
+        assert_eq!(level(0, policy, false, false), L0Safety, "{policy:?}");
+        assert_eq!(level(1, policy, false, false), L1Functional, "{policy:?}");
+        assert_eq!(level(2, policy, false, false), L2Domain, "{policy:?}");
+        // A contract of its own (unchanged).
+        assert_eq!(level(0, policy, true, false), L1Functional, "{policy:?}");
+        // The fix: a caller owing a callee `requires` is charged it at level 0.
+        assert_eq!(level(0, policy, false, true), L1Functional, "{policy:?}");
+        // Never a lowering.
+        assert_eq!(level(2, policy, false, true), L2Domain, "{policy:?}");
+        assert_eq!(level(2, policy, true, true), L2Domain, "{policy:?}");
+    }
+    // Certify never runs below L1, owing or not (the driver refuses the
+    // configuration; this is the pass's own floor).
+    assert_eq!(level(0, TrustPolicy::Certify, false, false), L1Functional);
+    assert_eq!(level(0, TrustPolicy::Certify, false, true), L1Functional);
+    assert_eq!(level(1, TrustPolicy::Certify, false, false), L1Functional);
+    assert_eq!(level(2, TrustPolicy::Certify, false, false), L2Domain);
+    // Out-of-domain values read as the default (the driver refuses them first).
+    assert_eq!(level(3, TrustPolicy::Strict, false, false), L2Domain);
+}
+
+/// Trust (2026-10-03): which policies let the indirect-call gate resolve a VANILLA
+/// sysroot function item handed to generic code as a value
+/// (`sysroot_callable_item`). Exactly the two that tolerate the vanilla-sysroot
+/// `runtime_checked` absent-callee row: the default `strict` policy (ruling B
+/// reports and builds it) and advisory (fails nothing). `certify` and memory-safe
+/// refuse that row, so on them only a constructor or an item shown unable to panic
+/// is resolved. MEASURED before (stage 1 of `6011b74bad`):
+/// `o.unwrap_or_else(AssertUnwindSafe(std::thread::current))` and
+/// `o.unwrap_or_else(std::thread::park)` built exit 0 under certify and
+/// memory-safe, through the vanilla arm this table now withholds there.
+#[test]
+fn only_the_policies_that_tolerate_the_vanilla_row_resolve_a_vanilla_callable_item() {
+    use rustc_session::config::TrustPolicy;
+    let tolerates = sysroot_callable_item::policy_tolerates_vanilla_sysroot_row;
+    assert!(tolerates(TrustPolicy::Strict), "the default policy reports the row and builds");
+    assert!(tolerates(TrustPolicy::Advisory), "advisory fails nothing");
+    assert!(!tolerates(TrustPolicy::Certify), "certify demands full static discharge");
+    assert!(!tolerates(TrustPolicy::MemorySafe), "memory-safe admits only marked rows");
+    // The rule is the conjunction of the two policy predicates the rows are judged
+    // by, so a new policy variant is classified by them, not by a list here.
+    for policy in
+        [TrustPolicy::Strict, TrustPolicy::Certify, TrustPolicy::Advisory, TrustPolicy::MemorySafe]
+    {
+        assert_eq!(
+            tolerates(policy),
+            !policy.requires_full_discharge() && !policy.is_memory_safe(),
+            "{policy:?}"
+        );
+    }
+}
+
+/// Trust (2026-10-03): the refusal note names the item and its first sentence is
+/// stable: `tests/ui/trust/sysroot_fn_item_handed_to_generic_code.rs` matches on
+/// it.
+#[test]
+fn the_unaccounted_sysroot_callable_note_names_the_item_and_the_options() {
+    let note =
+        sysroot_callable_item::unaccounted_sysroot_callable_note("std::thread::current::current");
+    assert!(note.starts_with(
+        "`std::thread::current::current` is a std/core/alloc function handed to generic code \
+         as a value"
+    ));
+    assert!(note.contains("`-Z trust-policy=certify` and `-Z trust-policy=memory-safe`"));
+    assert!(note.contains("|| std::thread::current::current(..)"), "{note}");
+    assert!(note.contains("The default policy reports"), "{note}");
+}
+
+/// Trust (2026-10-03, INTERPOSE-SUM-1): an empty body with the given `def_path`,
+/// for the summary identity gate's test. Its `name` records its position in the
+/// extraction, so the merge order of the per-lane maps is visible.
+fn interpose_summary_function(position: usize, def_path: &str) -> trust_types::VerifiableFunction {
+    trust_types::VerifiableFunction {
+        name: format!("{def_path}#{position}"),
+        def_path: def_path.into(),
+        span: SourceSpan::default(),
+        body: trust_types::VerifiableBody {
+            locals: vec![],
+            blocks: vec![],
+            arg_count: 0,
+            return_ty: trust_types::Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// Trust (2026-10-03, INTERPOSE-SUM-1): the six body-derived summary lanes are
+/// handed no refused body. The runs between refused bodies go to `compute` in
+/// order, a later body with the same key still wins the merge (as in one pass),
+/// and when the gate admits nothing, `compute` is never called.
+// `summaries_over_admitted_runs` merges through `IntoIterator`; its result does not
+// depend on a map's iteration order (see its doc).
+#[allow(rustc::potential_query_instability)]
+#[test]
+fn summary_lanes_are_never_handed_an_interposable_body() {
+    let funcs: Vec<trust_types::VerifiableFunction> =
+        ["exported0", "a", "b", "exported1", "exported1", "c", "a", "exported2"]
+            .into_iter()
+            .enumerate()
+            .map(|(position, def_path)| interpose_summary_function(position, def_path))
+            .collect();
+    let refused: FxHashSet<&str> = ["exported0", "exported1", "exported2"].into_iter().collect();
+
+    let runs = admitted_summary_runs(&funcs, Some(&refused));
+    let run_names: Vec<Vec<&str>> =
+        runs.iter().map(|run| run.iter().map(|func| func.name.as_str()).collect()).collect();
+    assert_eq!(run_names, vec![vec!["a#1", "b#2"], vec!["c#5", "a#6"]]);
+
+    let handed = std::cell::RefCell::new(Vec::new());
+    let merged: FxHashMap<String, String> = summaries_over_admitted_runs(&runs, |run| {
+        handed.borrow_mut().extend(run.iter().map(|func| func.name.clone()));
+        run.iter().map(|func| (func.def_path.clone(), func.name.clone())).collect()
+    });
+    assert_eq!(handed.into_inner(), ["a#1", "b#2", "c#5", "a#6"]);
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged.get("a").map(String::as_str), Some("a#6"), "the later body wins");
+    assert_eq!(merged.get("b").map(String::as_str), Some("b#2"));
+    assert_eq!(merged.get("c").map(String::as_str), Some("c#5"));
+    for exported in ["exported0", "exported1", "exported2"] {
+        assert!(!merged.contains_key(exported), "{exported} lent a summary");
+    }
+
+    // Nothing refused: one run, the whole extraction.
+    let nothing_refused = FxHashSet::default();
+    let whole = admitted_summary_runs(&funcs, Some(&nothing_refused));
+    assert_eq!(whole.len(), 1);
+    assert_eq!(whole[0].len(), funcs.len());
+
+    // The gate admits nothing (its parallel-vector check failed): no runs, and no
+    // lane is computed at all.
+    let none = admitted_summary_runs(&funcs, None);
+    assert!(none.is_empty());
+    let computed = std::cell::Cell::new(false);
+    let empty: FxHashMap<String, String> = summaries_over_admitted_runs(&none, |_| {
+        computed.set(true);
+        FxHashMap::default()
+    });
+    assert!(empty.is_empty());
+    assert!(!computed.get(), "a lane was computed although the gate admits nothing");
+}
+
+// Trust (SPEC-FLOAT-EQ-STRUCTURAL-1): over a Float sort the public `eq` is IEEE
+// equality (the encoder writes it only for `Formula::FpEq`), so the decoder must
+// rebuild `FpEq`, never structural `Eq`: the kernel recognizers certify
+// `Not(Eq(t, t))` by reflexivity, which is false for a NaN.
+#[test]
+fn float_eq_payload_decodes_to_ieee_fp_eq() {
+    use trust_verifier_api::{TrustSpecBinaryOp as Bin, TrustSpecExpr, TrustSpecSort};
+
+    let f64s = TrustSpecSort::Float { eb: 11, sb: 53 };
+    let fv = |name: &str| {
+        Box::new(Formula::Var(name.to_string(), trust_types::Sort::Float { eb: 11, sb: 53 }))
+    };
+    let eq = TrustSpecExpr::binary(
+        Bin::Eq,
+        TrustSpecExpr::variable("x", f64s),
+        TrustSpecExpr::variable("y", f64s),
+    );
+    assert_eq!(formula_from_trust_spec_expr(&eq), Some(Formula::FpEq(fv("x"), fv("y"))));
+    let ne = TrustSpecExpr::binary(
+        Bin::Ne,
+        TrustSpecExpr::variable("x", f64s),
+        TrustSpecExpr::variable("y", f64s),
+    );
+    assert_eq!(
+        formula_from_trust_spec_expr(&ne),
+        Some(Formula::Not(Box::new(Formula::FpEq(fv("x"), fv("y")))))
+    );
+    // Integer equality keeps its structural node.
+    let int_eq = TrustSpecExpr::binary(
+        Bin::Eq,
+        TrustSpecExpr::variable("n", TrustSpecSort::Int),
+        TrustSpecExpr::int_literal("0"),
+    );
+    assert!(matches!(formula_from_trust_spec_expr(&int_eq), Some(Formula::Eq(..))));
+}
+
+/// DC-1: `Enumerate`'s `usize` counter is overflow-checked in the caller's profile,
+/// so `total_std_iterator_ty` admits it only over an inner that yields at most
+/// `usize::MAX` items. `Range<T>` yields at most `2^bits(T) - 1`, which fits iff
+/// `T` is no wider than the target pointer. Measured before the fix (stage 1
+/// `3fbce29e3`, `-Copt-level=0`): `Skip<Enumerate<Range<u128>>>::next` panics at
+/// `enumerate.rs:96:22`, and the compiler had credited it panic-free.
+#[test]
+fn dc1_enumerate_range_bound_is_the_target_pointer_width() {
+    // 64-bit target: `usize`/`isize` (pointer-sized, `None`) and every width up
+    // to 64 fit; `u128`/`i128` do not.
+    for bits in [None, Some(8), Some(16), Some(32), Some(64)] {
+        assert!(int_range_len_fits_usize(bits, 64), "{bits:?} fits a 64-bit usize");
+    }
+    assert!(!int_range_len_fits_usize(Some(128), 64), "u128/i128 ranges are over-long");
+    // 32-bit target: `u64` is over-long too; the pointer-sized range still fits.
+    assert!(!int_range_len_fits_usize(Some(64), 32));
+    assert!(int_range_len_fits_usize(Some(32), 32));
+    assert!(int_range_len_fits_usize(None, 32));
+    // 16-bit target.
+    assert!(!int_range_len_fits_usize(Some(32), 16));
+    assert!(int_range_len_fits_usize(Some(16), 16));
+}
+
+/// T4 (DECISION_QUEUE T4-SMTLIB-CEILING-1): a violation whose SMT-LIB rendering
+/// ALONE exceeds the verifier-API transport ceiling. Balanced, so neither the
+/// rendering nor the native lowering recurses deeply.
+fn t4_oversized_smtlib_violation() -> Formula {
+    let mut level: Vec<Formula> = (0..131_072i128)
+        .map(|index| {
+            Formula::Eq(
+                Box::new(Formula::Var(format!("v{}", index % 64), Sort::Int)),
+                Box::new(Formula::Int(index)),
+            )
+        })
+        .collect();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| match pair {
+                [single] => single.clone(),
+                pair => Formula::Or(pair.to_vec()),
+            })
+            .collect();
+    }
+    let formula = level.pop().expect("non-empty disjunction");
+    assert!(
+        formula.to_smtlib().len() > trust_verifier_api::MAX_METADATA_VALUE_BYTES,
+        "the fixture must exceed the transport ceiling on its SMT-LIB rendering alone"
+    );
+    formula
+}
+
+/// T4 regression, on the COMPILER path that failed in the measurement: one VC
+/// whose SMT-LIB rendering is over 1 MiB made the public bundle fail
+/// `bundle.validate()` inside `finalize_trust_mc_public_semantic_contracts`
+/// ("compiler-derived trust-mc public semantic contract finalization failed:
+/// verifier obligation metadata value exceeds the byte limit"), which discarded
+/// the native TrustIr bundle for the whole function and drove every sibling row
+/// through `fresh-vc-rekey-integrity` (Level-0 safety rows on to `failed`).
+///
+/// The native bundle must now survive, the oversized row must carry no formula
+/// any engine can read (marker, no typed payload — it can only decline), and the
+/// fresh-VC rekey must bind EVERY row, the oversized one included, exactly.
+#[test]
+fn t4_oversized_smtlib_vc_keeps_the_native_bundle_and_an_exact_rekey() {
+    let (function, compiler_contracts, mut vcs) = native_trust_ir_compiler_function();
+    vcs.push(VerificationCondition {
+        kind: VcKind::Unreachable,
+        function: trust_types::Symbol::intern("demo::checked_transfer"),
+        location: native_trust_ir_test_span(12),
+        formula: t4_oversized_smtlib_violation(),
+        contract_metadata: None,
+        obligation: None,
+    });
+    let oversized_index = vcs.len() - 1;
+
+    let (bundle, native_trust_ir_bundle) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+    let native_trust_ir_bundle = native_trust_ir_bundle
+        .expect(
+            "one oversized SMT-LIB rendering must not fail finalization and discard the \
+             whole function's native TrustIr bundle",
+        )
+        .expect("the arithmetic-safety sibling still requires native TrustIr");
+    assert!(
+        !native_trust_ir_bundle.compiler_facts.obligation_sources.is_empty(),
+        "the surviving native bundle must still carry the function's proof obligations"
+    );
+    bundle.validate().expect("the bundle the compiler hands to the verifier must validate");
+    for obligation in &bundle.obligations {
+        for entry in &obligation.metadata {
+            assert!(
+                entry.value.len() <= trust_verifier_api::MAX_METADATA_VALUE_BYTES,
+                "`{}` on `{}` still exceeds the transport ceiling",
+                entry.key,
+                obligation.obligation_id
+            );
+        }
+    }
+
+    // The oversized row is published, its omission recorded, with no formula a
+    // transport engine could read: never the full rendering, never a typed
+    // payload, never `false` (the default-admission row's reserved value).
+    let oversized = bundle
+        .obligations
+        .iter()
+        .find(|obligation| {
+            api_obligation_metadata_value(obligation, "trust.vc.formula.smtlib2.omitted_bytes")
+                .is_some()
+        })
+        .expect("the oversized row is published with its omission recorded");
+    let smtlib = api_obligation_metadata_value(oversized, TRUST_VC_FORMULA_SMTLIB_METADATA_KEY)
+        .expect("the oversized row keeps an smtlib2 entry for the identity re-derivation");
+    assert!(smtlib.starts_with("trust-omitted-smtlib2:"), "unexpected carrier: {smtlib:.120}");
+    assert_ne!(smtlib, "false");
+    assert_eq!(api_obligation_metadata_value(oversized, "trust.vc.formula.payload"), None);
+
+    // Every row, the oversized one included, re-keys exactly onto its fresh VC.
+    let expected_context =
+        trust_router::VerifierExecutionContext::new("t4-oversized-smtlib-test").snapshot();
+    let snapshot = exact_fresh_vc_rekey_snapshot(
+        &function,
+        &compiler_contracts,
+        &bundle,
+        &vcs,
+        expected_context,
+    );
+    assert!(snapshot.complete, "compiler-built inventory must snapshot exactly");
+    let bound = bundle
+        .obligations
+        .iter()
+        .filter_map(|obligation| {
+            exact_fresh_vc_index_for_obligation_without_multiplicity(&function, obligation, &vcs)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for index in 0..vcs.len() {
+        assert!(bound.contains(&index), "fresh VC {index} lost its exact public row: {bound:?}");
+    }
+    assert_eq!(
+        exact_fresh_vc_index_for_obligation_without_multiplicity(&function, oversized, &vcs),
+        Some(oversized_index)
+    );
+}
+
+/// Trust: an oversized MIR-memory unit must not discard the native bundle or any
+/// fresh public VC. The affected formula is satisfiable, so the planning
+/// kernel recognizer cannot hide the missing transport behind a separate proof.
+#[test]
+#[allow(deprecated)]
+fn oversized_memory_unit_keeps_native_bundle_and_exact_fresh_rekey() {
+    let (mut function, compiler_contracts, mut vcs) = native_trust_ir_compiler_function();
+    let oversized_index = 1;
+    vcs[oversized_index].formula = Formula::Lt(
+        Box::new(Formula::Var("amount".to_string(), trust_types::Sort::Int)),
+        Box::new(Formula::Int(0)),
+    );
+    assert!(
+        certify_vc_for_native_planning_audited(&vcs[oversized_index]).is_none(),
+        "the affected row must exercise missing transport, not kernel-certified exclusion"
+    );
+    assert!(
+        vcs[oversized_index].formula.to_smtlib().len()
+            < trust_verifier_api::MAX_METADATA_VALUE_BYTES,
+        "the existing SMT-LIB guard must not cause this omission"
+    );
+    let ordinary =
+        trust_mir_extract::function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
+    let ordinary_memory = ordinary
+        .obligations
+        .iter()
+        .find(|row| row.kind == trust_verifier_api::ObligationKind::Ownership)
+        .expect("the ordinary control contains its ownership obligation");
+    assert!(
+        test_obligation_metadata(ordinary_memory, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).len()
+            < trust_verifier_api::MAX_METADATA_VALUE_BYTES
+    );
+    assert!(
+        test_obligation_metadata(ordinary_memory, TRUST_VC_MIR_MEMORY_PROOF_UNIT_METADATA_KEY)
+            .len()
+            < trust_verifier_api::MAX_METADATA_VALUE_BYTES
+    );
+    let public_catalog = |bundle: &trust_verifier_api::TrustContractBundle| {
+        bundle
+            .obligations
+            .iter()
+            .map(|row| (row.obligation_id.clone(), row.kind.clone(), row.required_strength.clone()))
+            .collect::<Vec<_>>()
+    };
+    // Trust: normal native finalization adds the whole-function admission row.
+    // Establish that complete control inventory before growing only the memory
+    // payload, including every row's kind and required proof strength.
+    let mut expected_catalog = public_catalog(&ordinary);
+    expected_catalog.push((
+        default_trust_mc_function_obligation_id(&function),
+        trust_verifier_api::ObligationKind::ArithmeticSafety,
+        None,
+    ));
+    let (ordinary_finalized, ordinary_native) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+    ordinary_finalized.validate().expect("the ordinary finalized control must validate");
+    ordinary_native
+        .expect("ordinary control finalization must succeed")
+        .expect("the ordinary arithmetic sibling requires its native bundle")
+        .validate()
+        .expect("the ordinary native control must validate");
+    assert_eq!(
+        public_catalog(&ordinary_finalized),
+        expected_catalog,
+        "normal finalization preserves all original rows and adds its function admission"
+    );
+    // Every sortable local is carried by the MIR-memory ownership state.
+    // Their names alone exceed the limit while the formula remains small.
+    for index in 0..300 {
+        function.body.locals.push(trust_types::LocalDecl {
+            index: index + 2,
+            ty: trust_types::Ty::Int { width: 32, signed: true },
+            name: Some(format!("unused_{index}_{}", "a".repeat(4096))),
+        });
+    }
+    assert!(
+        function
+            .body
+            .locals
+            .iter()
+            .filter_map(|local| local.name.as_ref())
+            .map(String::len)
+            .sum::<usize>()
+            > trust_verifier_api::MAX_METADATA_VALUE_BYTES
+    );
+    let before_native =
+        trust_mir_extract::function_to_verifier_api_bundle(&function, &compiler_contracts, &vcs);
+    assert_eq!(
+        public_catalog(&before_native),
+        public_catalog(&ordinary),
+        "growing unused local names must not change the public obligation inventory"
+    );
+
+    let (bundle, native) =
+        build_full_verification_input_for_tests(&function, &compiler_contracts, &vcs);
+    let native = native
+        .expect("one over-limit MIR-memory unit must not fail native finalization")
+        .expect("the valid arithmetic sibling still requires its native bundle");
+    bundle.validate().expect("the complete public bundle must validate");
+    native.validate().expect("the surviving native bundle must validate");
+    assert_eq!(
+        public_catalog(&bundle),
+        expected_catalog,
+        "over-limit native finalization must preserve every finalized public row and strength"
+    );
+    assert!(bundle.obligations.iter().all(|row| {
+        row.metadata
+            .iter()
+            .all(|entry| entry.value.len() <= trust_verifier_api::MAX_METADATA_VALUE_BYTES)
+    }));
+    let row_for = |index| {
+        bundle
+            .obligations
+            .iter()
+            .find(|row| {
+                exact_fresh_vc_index_for_obligation_without_multiplicity(&function, row, &vcs)
+                    == Some(index)
+            })
+            .expect("every fresh VC retains an exactly bound public row")
+    };
+    let affected = row_for(oversized_index);
+    let sibling = row_for(0);
+    assert_eq!(affected.kind, trust_verifier_api::ObligationKind::Ownership);
+    assert_eq!(
+        test_obligation_metadata(affected, TRUST_TRUST_IR_NATIVE_TRANSPORT_STATUS_METADATA_KEY),
+        "unsupported"
+    );
+    for key in [
+        TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY,
+        TRUST_VC_MIR_MEMORY_PROOF_UNIT_METADATA_KEY,
+        TRUST_TRUST_IR_NATIVE_PROOF_UNIT_METADATA_KEY,
+        trust_router::full_verification::TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY,
+    ] {
+        assert_eq!(api_obligation_metadata_value(affected, key), None, "retained {key}");
+    }
+    assert!(
+        test_obligation_metadata(affected, TRUST_VC_FORMULA_SMTLIB_METADATA_KEY)
+            .starts_with("trust-omitted-mir-memory-proof-unit:")
+    );
+    assert!(native.obligation_source_by_public_id(&affected.obligation_id).is_none());
+    assert!(
+        native.obligation_source_by_public_id(&sibling.obligation_id).is_some(),
+        "the valid arithmetic sibling must keep its native source binding"
+    );
+    assert!(
+        api_obligation_metadata_value(sibling, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).is_some()
+    );
+    assert!(matches!(
+        trust_vc_native_trust_ir_certificate_import(affected),
+        TrustVcNativeTrustIrCertificateImport::Unavailable { status: "unsupported", .. }
+    ));
+
+    let context = trust_router::VerifierExecutionContext::new("oversized-memory-native-rekey");
+    let expected_context = context.snapshot();
+    let snapshot = exact_fresh_vc_rekey_snapshot(
+        &function,
+        &compiler_contracts,
+        &bundle,
+        &vcs,
+        expected_context.clone(),
+    );
+    assert!(snapshot.complete, "the omitted row must not poison exact fresh rekeying");
+    let bound_indices = snapshot
+        .by_obligation_id
+        .values()
+        .map(|binding| binding.vc_index)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(bound_indices, (0..vcs.len()).collect::<std::collections::BTreeSet<_>>());
+
+    // Probe only the affected transport with the actual in-process engine set.
+    // The complete public catalog and the sibling's native binding remain above;
+    // no synthetic favorable evidence or independent kernel proof is supplied.
+    let live = verify_full_bundle_with_live_receipts(
+        &bundle,
+        std::slice::from_ref(affected),
+        Some(&native),
+        None,
+        None, // no source reference facts
+        &context,
+        SESSION_DEFAULT_VC_TIMEOUT_MS,
+    );
+    assert_eq!(live.result.requested_obligations.as_slice(), std::slice::from_ref(affected));
+    let evidence = live
+        .result
+        .evidence
+        .iter()
+        .filter(|item| item.obligation_id == affected.obligation_id)
+        .collect::<Vec<_>>();
+    let [evidence] = evidence.as_slice() else {
+        panic!("the affected row must produce exactly one refusal: {:?}", live.result);
+    };
+    assert!(matches!(
+        evidence.status,
+        trust_verifier_api::EvidenceStatus::Unsupported
+            | trust_verifier_api::EvidenceStatus::Unknown
+    ));
+    assert!(evidence.proof_strength.is_none());
+    assert!(evidence.artifacts.is_empty());
+    assert!(matches!(
+        legacy_result_from_api_evidence(evidence),
+        VerificationResult::Unknown { .. }
+    ));
+    assert!(
+        !live
+            .live_receipts
+            .expect("live dispatch returns its receipt inventory")
+            .direct_trust_vc_receipts()
+            .contains_key(&affected.obligation_id)
+    );
+
+    let mut missing = bundle.clone();
+    missing.obligations.retain(|row| row.obligation_id != affected.obligation_id);
+    assert!(
+        !exact_fresh_vc_rekey_snapshot(
+            &function,
+            &compiler_contracts,
+            &missing,
+            &vcs,
+            expected_context.clone(),
+        )
+        .complete,
+        "removing the omitted public row must remain an integrity failure"
+    );
+    let mut tampered = bundle.clone();
+    let changed = tampered
+        .obligations
+        .iter_mut()
+        .find(|row| row.obligation_id == affected.obligation_id)
+        .unwrap();
+    changed
+        .metadata
+        .iter_mut()
+        .find(|entry| entry.key == TRUST_VC_FORMULA_SMTLIB_METADATA_KEY)
+        .unwrap()
+        .value
+        .push_str("-tampered");
+    tampered.validate().expect("the mutation must target exact identity, not structural validity");
+    assert!(
+        !exact_fresh_vc_rekey_snapshot(
+            &function,
+            &compiler_contracts,
+            &tampered,
+            &vcs,
+            expected_context,
+        )
+        .complete,
+        "changing the omission marker must not retain a fresh binding"
+    );
+}
+
+// ─── argument premise: per-row grading (gate RCA "premise", 2026-10-17) ─────────
+
+/// Two kernel-certified rows of a premise-carrying body, as the 2026-10-16 gate's
+/// `aterm_gpu::renderer::clip_textured_quad_x` had them: row 0 is a VC the premise
+/// shaped (the premise-free generation produces a DIFFERENT formula at that site),
+/// row 1 a constant-index bounds row the premise-free generation produces
+/// byte-identically. Returns the carrier, the kernel tokens, and the premise-free
+/// payload set (row 1's payload and the premise-free twin of row 0).
+fn argument_premise_two_row_fixture() -> (
+    Vec<(VerificationCondition, VerificationResult)>,
+    Vec<Option<ResultProofAuthority>>,
+    FxHashSet<RowKey>,
+) {
+    // `*n += 1` under `if *n < 8`, after a store through the other `&mut` argument:
+    // with the premise the guard survives the store, without it the guard is gone.
+    let guard =
+        Formula::Lt(Box::new(Formula::Var("n*".into(), Sort::Int)), Box::new(Formula::Int(8)));
+    let overflow = Formula::Gt(
+        Box::new(Formula::Add(
+            Box::new(Formula::Var("n*".into(), Sort::Int)),
+            Box::new(Formula::Int(1)),
+        )),
+        Box::new(Formula::Int(i128::from(u64::MAX))),
+    );
+    let mut shaped = test_vc(30);
+    shaped.kind = VcKind::ArithmeticOverflow {
+        op: trust_types::BinOp::Add,
+        operand_tys: (trust_types::Ty::usize(), trust_types::Ty::usize()),
+    };
+    shaped.formula = Formula::And(vec![guard, overflow.clone()]);
+    let mut premise_free_twin = shaped.clone();
+    premise_free_twin.formula = overflow;
+    // `rect[2]` on `&mut [f32; 4]`: no argument name in it at all.
+    let mut constant_index = test_vc(31);
+    constant_index.kind = VcKind::IndexOutOfBounds;
+    constant_index.formula =
+        Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Int(2)), Box::new(Formula::Int(4)))));
+    let results =
+        vec![(shaped, authority_test_proved()), (constant_index, authority_test_proved())];
+    let tokens = results
+        .iter()
+        .enumerate()
+        .map(|(index, (vc, _))| {
+            Some(ResultProofAuthority::KernelCertified {
+                replay_audit: None,
+                row: exact_result_row_identity(index, vc).expect("exact row"),
+                evidence: authority_test_clean_cic(0x40 + index as u8),
+                reference: authority_test_reference(&authority_test_clean_cic(0x40 + index as u8)),
+            })
+        })
+        .collect();
+    let premise_free = [&premise_free_twin, &results[1].0]
+        .into_iter()
+        .map(|vc| exact_vc_key(vc).expect("exact payload").canonical_payload)
+        .collect();
+    (results, tokens, premise_free)
+}
+
+/// A premise-free generation that produced exactly `payloads` and dispatched nothing.
+fn premise_free_rows_with_payloads(
+    payloads: FxHashSet<RowKey>,
+) -> argument_premise::PremiseFreeRows {
+    argument_premise::PremiseFreeRows::new(Some(argument_premise::PremiseFreeGeneration {
+        payloads,
+        solver_vcs: Vec::new(),
+    }))
+}
+
+/// The fix and its negative control in one carrier: the row the premise shaped is
+/// demoted (`Trusted`, no kernel evidence, so the authenticated boundary withholds
+/// it), the row the premise-free generation produces byte-identically keeps its
+/// kernel token (`Certified`, kernel evidence attached). Before 2026-10-17 both were
+/// demoted (the body-wide demotion the gate measured: base 17 proved, candidate 0).
+#[test]
+fn argument_premise_demotes_only_the_rows_the_premise_shaped() {
+    let (results, mut authorities, payloads) = argument_premise_two_row_fixture();
+    let premise_free = premise_free_rows_with_payloads(payloads);
+
+    let (kept, demoted) = demote_argument_premise_authorities(
+        &mut authorities,
+        argument_premise::NOALIAS_MUT_ARGS,
+        &premise_free,
+        &[],
+    );
+    assert_eq!((kept, demoted), (1, 1));
+
+    let (shaped_vc, shaped_result) = &results[0];
+    let shaped = authorities[0].as_ref().expect("the shaped row keeps an authority");
+    assert!(
+        matches!(
+            shaped,
+            ResultProofAuthority::ArgumentPremiseKernelDischarge { premise, .. }
+                if *premise == argument_premise::NOALIAS_MUT_ARGS
+        ),
+        "negative control: a VC the premise shaped is never kernel-certified, got {shaped:?}"
+    );
+    assert_eq!(
+        trust_disposition_for_authority(Some(shaped), 0, shaped_vc, shaped_result, None),
+        Some((TrustStatus::Trusted, TrustProofStrength::Constructive))
+    );
+    assert!(shaped.kernel_evidence_for(0, shaped_vc, None).is_none());
+    assert!(!shaped.is_unconditional_static_proof_for(0, shaped_vc, shaped_result, None));
+
+    let (free_vc, free_result) = &results[1];
+    let free = authorities[1].as_ref().expect("the premise-free row keeps its token");
+    assert!(
+        matches!(free, ResultProofAuthority::KernelCertified { .. }),
+        "a VC the premise-free generation also produces keeps its certificate, got {free:?}"
+    );
+    assert_eq!(
+        trust_disposition_for_authority(Some(free), 1, free_vc, free_result, None),
+        Some((TrustStatus::Certified, TrustProofStrength::Constructive))
+    );
+    assert!(free.kernel_evidence_for(1, free_vc, None).is_some());
+
+    let report =
+        build_proof_results_with_runtime_checks(true, &results, &[], &[], &authorities, None);
+    assert_eq!((report.summary.certified, report.summary.trusted), (1, 1));
+}
+
+/// Without a premise-free generation, or when it could not complete (`None`: a
+/// tripped budget), no row is shown premise-free and every token is demoted, as
+/// before per-row grading. A grounded catch-all's token is demoted even when its
+/// payload is premise-free: its residual is faithful only under its siblings'
+/// verdicts. The body-wide passes stay: an E9 citation is stripped and a grounded
+/// derivation becomes conditional.
+#[test]
+fn argument_premise_fails_closed_without_a_premise_free_generation() {
+    for premise_free in [
+        argument_premise::PremiseFreeRows::unavailable(),
+        argument_premise::PremiseFreeRows::new(None),
+    ] {
+        let (_, mut authorities, _) = argument_premise_two_row_fixture();
+        assert_eq!(
+            demote_argument_premise_authorities(
+                &mut authorities,
+                argument_premise::REFERENCE_ARG_BOX_VALID,
+                &premise_free,
+                &[],
+            ),
+            (0, 2)
+        );
+        assert!(authorities.iter().all(|authority| matches!(
+            authority,
+            Some(ResultProofAuthority::ArgumentPremiseKernelDischarge { .. })
+        )));
+    }
+
+    let (results, mut authorities, payloads) = argument_premise_two_row_fixture();
+    let premise_free = premise_free_rows_with_payloads(payloads);
+    let grounding = GroundedCatchallPremises {
+        row: exact_result_row_identity(1, &results[1].0).unwrap(),
+        premises: vec![(0, exact_result_row_identity(0, &results[0].0))],
+        calls: GroundedCallPremise::Absent,
+    };
+    assert_eq!(
+        demote_argument_premise_authorities(
+            &mut authorities,
+            argument_premise::NOALIAS_MUT_ARGS,
+            &premise_free,
+            std::slice::from_ref(&grounding),
+        ),
+        (0, 2),
+        "a grounded catch-all keeps no kernel token in a premise-carrying body"
+    );
+
+    let mut authorities = vec![
+        Some(ResultProofAuthority::GroundedPanicFreedomDerivation {
+            row: exact_result_row_identity(0, &results[0].0).unwrap(),
+            unconditional: true,
+        }),
+        Some(ResultProofAuthority::EnsuresCitationDischarge {
+            row: exact_result_row_identity(1, &results[1].0).unwrap(),
+            theorem: "cited".into(),
+            evidence: Some(authority_test_clean_cic(0x51)),
+            reference: authority_test_reference(&authority_test_clean_cic(0x51)),
+        }),
+    ];
+    assert_eq!(
+        demote_argument_premise_authorities(
+            &mut authorities,
+            argument_premise::NOALIAS_MUT_ARGS,
+            &premise_free,
+            &[],
+        ),
+        (0, 0)
+    );
+    assert!(matches!(
+        authorities[0],
+        Some(ResultProofAuthority::GroundedPanicFreedomDerivation { unconditional: false, .. })
+    ));
+    assert!(authorities[1].is_none());
+}
+
+/// The second half of the fix: a row whose VC the premise changed dispatches its
+/// premise-free TWIN when the twin is proved, and is then graded like a premise-free
+/// body's row. Each row carries the obligation record a real one does, and a twin
+/// differs from its premised row in the formula AND in the record's wrappers (the
+/// facts the premise kept are conjoined there too): keyed with the wrappers, no real
+/// row had a twin (2026-10-18, `clip_textured_quad_x`). Negative controls: a twin the
+/// decision procedure does not prove (the false refutation the premise exists to
+/// stop) is never dispatched, a row with two candidate twins adopts neither, a
+/// premise-free VC of a different obligation at the same site (another record body)
+/// is no twin, and no generation adopts nothing.
+#[test]
+fn argument_premise_adopts_only_a_decided_unique_twin() {
+    let guard =
+        Formula::Lt(Box::new(Formula::Var("n*".into(), Sort::Int)), Box::new(Formula::Int(8)));
+    // `facts` are what the generation conjoined around the obligation `body`, in the
+    // formula and as the record's `ConjoinFactsLast` wrapper, as vcgen emits them.
+    let row = |line: u32, kind: VcKind, facts: Vec<Formula>, body: Formula| {
+        let mut vc = test_vc(line);
+        vc.kind = kind;
+        vc.formula =
+            Formula::And(facts.iter().cloned().chain(std::iter::once(body.clone())).collect());
+        vc.obligation = Some(trust_types::ObligationRecord {
+            body,
+            wrappers: vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }],
+            subject: None,
+            width: None,
+        });
+        vc
+    };
+    let overflow = || VcKind::ArithmeticOverflow {
+        op: trust_types::BinOp::Add,
+        operand_tys: (trust_types::Ty::usize(), trust_types::Ty::usize()),
+    };
+    // Row 0: `rect[0] = x0` — the premise kept `old_x = rect*[0]` (an equation the
+    // bounds conclusion does not need); its twin drops it.
+    let kept_fact = Formula::Eq(
+        Box::new(Formula::Var("old_x".into(), Sort::Int)),
+        Box::new(Formula::Var("rect*[0]".into(), Sort::Int)),
+    );
+    let bounds =
+        Formula::Not(Box::new(Formula::Lt(Box::new(Formula::Int(0)), Box::new(Formula::Int(4)))));
+    let shaped_bounds = row(40, VcKind::IndexOutOfBounds, vec![kept_fact], bounds.clone());
+    let twin_bounds = row(40, VcKind::IndexOutOfBounds, vec![], bounds);
+    // Row 1: untouched by the premise (byte-identical in both generations).
+    let untouched = row(41, overflow(), vec![], Formula::Bool(false));
+    // Row 2: `*n += 1` — needs the guard only the premise keeps; its twin is the
+    // false refutation.
+    let unguarded = Formula::Gt(
+        Box::new(Formula::Add(
+            Box::new(Formula::Var("n*".into(), Sort::Int)),
+            Box::new(Formula::Int(1)),
+        )),
+        Box::new(Formula::Int(i128::from(u64::MAX))),
+    );
+    let shaped_guarded = row(42, overflow(), vec![guard], unguarded.clone());
+    let twin_guarded = row(42, overflow(), vec![], unguarded);
+
+    let payload =
+        |vc: &VerificationCondition| exact_vc_key(vc).expect("exact payload").canonical_payload;
+    let generation = |free: Vec<VerificationCondition>| {
+        argument_premise::PremiseFreeRows::new(Some(argument_premise::PremiseFreeGeneration {
+            payloads: free.iter().map(payload).collect(),
+            solver_vcs: free,
+        }))
+    };
+    let premise_free =
+        generation(vec![twin_bounds.clone(), untouched.clone(), twin_guarded.clone()]);
+    let mut solver_vcs = vec![shaped_bounds.clone(), untouched.clone(), shaped_guarded.clone()];
+    let mut asked = Vec::new();
+    let adopted =
+        argument_premise::adopt_premise_free_twins(&mut solver_vcs, &premise_free, |twin| {
+            asked.push(twin.location.line_start);
+            twin.location.line_start == 40
+        });
+    assert_eq!(adopted, 1);
+    assert_eq!(asked, vec![40, 42], "only the rows the premise changed are asked about");
+    assert_eq!(payload(&solver_vcs[0]), payload(&twin_bounds), "the decided twin is dispatched");
+    assert_eq!(payload(&solver_vcs[1]), payload(&untouched));
+    assert_eq!(
+        payload(&solver_vcs[2]),
+        payload(&shaped_guarded),
+        "negative control: an undecided twin never is"
+    );
+
+    // Graded after dispatch: the adopted twin and the untouched row keep their kernel
+    // tokens, the guarded row (premised VC) is demoted.
+    let results: Vec<_> =
+        solver_vcs.iter().map(|vc| (vc.clone(), authority_test_proved())).collect();
+    let mut authorities: Vec<_> = results
+        .iter()
+        .enumerate()
+        .map(|(index, (vc, _))| {
+            Some(ResultProofAuthority::KernelCertified {
+                replay_audit: None,
+                row: exact_result_row_identity(index, vc).expect("exact row"),
+                evidence: authority_test_clean_cic(0x60 + index as u8),
+                reference: authority_test_reference(&authority_test_clean_cic(0x60 + index as u8)),
+            })
+        })
+        .collect();
+    assert_eq!(
+        demote_argument_premise_authorities(
+            &mut authorities,
+            argument_premise::NOALIAS_MUT_ARGS,
+            &premise_free,
+            &[],
+        ),
+        (2, 1)
+    );
+    assert!(matches!(authorities[0], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(authorities[1], Some(ResultProofAuthority::KernelCertified { .. })));
+    assert!(matches!(
+        authorities[2],
+        Some(ResultProofAuthority::ArgumentPremiseKernelDischarge { .. })
+    ));
+
+    // Two candidate twins for one row: neither is adopted, nothing is asked.
+    let mut other_twin = twin_bounds.clone();
+    other_twin.formula = Formula::Bool(false);
+    let ambiguous = generation(vec![twin_bounds.clone(), other_twin]);
+    let mut solver_vcs = vec![shaped_bounds.clone()];
+    assert_eq!(
+        argument_premise::adopt_premise_free_twins(&mut solver_vcs, &ambiguous, |_| {
+            panic!("an ambiguous twin is never asked about")
+        }),
+        0
+    );
+    assert_eq!(payload(&solver_vcs[0]), payload(&shaped_bounds));
+
+    // A premise-free VC of the same kind at the same site but of ANOTHER obligation
+    // (its record body differs): no twin, nothing is asked.
+    let mut other_obligation = twin_bounds.clone();
+    other_obligation.formula = Formula::Bool(false);
+    other_obligation.obligation.as_mut().expect("record").body = Formula::Bool(false);
+    let unrelated = generation(vec![other_obligation]);
+    let mut solver_vcs = vec![shaped_bounds.clone()];
+    assert_eq!(
+        argument_premise::adopt_premise_free_twins(&mut solver_vcs, &unrelated, |_| {
+            panic!("a different obligation is never asked about")
+        }),
+        0
+    );
+    assert_eq!(payload(&solver_vcs[0]), payload(&shaped_bounds));
+
+    // No premise-free generation (no premise, or a tripped budget): nothing adopted.
+    for none in [
+        argument_premise::PremiseFreeRows::unavailable(),
+        argument_premise::PremiseFreeRows::new(None),
+    ] {
+        let mut solver_vcs = vec![shaped_bounds.clone()];
+        assert_eq!(argument_premise::adopt_premise_free_twins(&mut solver_vcs, &none, |_| true), 0);
+        assert_eq!(payload(&solver_vcs[0]), payload(&shaped_bounds));
+    }
+}
+
+// Trust: source catalog rows must carry their aggregate VC identity before
+// native claim minting. Keep the consumer's missing-digest refusal intact.
+#[test]
+#[allow(deprecated)]
+fn source_clause_native_formula_digest_reaches_the_unchanged_native_consumer() {
+    let (mut function, contracts) = postcondition_identity_function_ensuring(
+        "result > 0",
+        Formula::Gt(Box::new(Formula::Var("_0".to_string(), Sort::Int)), Box::new(Formula::Int(0))),
+    );
+    function.body.blocks[0].stmts[0] = trust_types::Statement::Assign {
+        place: trust_types::Place::local(0),
+        rvalue: trust_types::Rvalue::Use(trust_types::Operand::Constant(
+            trust_types::ConstValue::Uint(0, 64),
+        )),
+        span: function.span.clone(),
+    };
+    let (raw, _) = trust_vcgen::regenerate_postcondition_production_variants(&function).unwrap();
+    let reference = trust_mir_extract::contract_bundle_to_verifier_api(&function, &contracts);
+    let mut bound = trust_mir_extract::function_to_verifier_api_bundle(&function, &contracts, &raw);
+    let marker_id = reference.obligations[0].obligation_id.clone();
+    let original = bound.obligations.iter().find(|row| row.obligation_id == marker_id).unwrap();
+    assert!(original.metadata.iter().all(|entry| entry.key != TRUST_VC_DIGEST_METADATA_KEY));
+    assert_eq!(
+        bind_exact_source_clause_native_formulas(
+            &function, &contracts, &raw, &reference, &mut bound, None,
+        ),
+        1
+    );
+    let marker = bound.obligations.iter().find(|row| row.obligation_id == marker_id).unwrap();
+    let aggregate_digest =
+        exactly_one_metadata_value(&marker.metadata, TRUST_VC_DIGEST_METADATA_KEY)
+            .expect("aggregate identity must exist before native minting")
+            .to_string();
+    for missing_digest in [true, false] {
+        let mut bundle = bound.clone();
+        if missing_digest {
+            bundle
+                .obligations
+                .iter_mut()
+                .find(|row| row.obligation_id == marker_id)
+                .unwrap()
+                .metadata
+                .retain(|entry| entry.key != TRUST_VC_DIGEST_METADATA_KEY);
+        }
+        let native =
+            build_native_trust_ir_bundle_for_test_verifier_api(&function, &mut bundle, &[])
+                .expect("source-clause native construction")
+                .expect("source-clause TrustMC request");
+        native.validate().expect("native identities must remain coherent");
+        let marker = bundle.obligations.iter().find(|row| row.obligation_id == marker_id).unwrap();
+        if !missing_digest {
+            assert_eq!(
+                exactly_one_metadata_value(&marker.metadata, TRUST_VC_DIGEST_METADATA_KEY),
+                Some(aggregate_digest.as_str())
+            );
+            assert_eq!(
+                exactly_one_metadata_value(
+                    &marker.metadata,
+                    TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
+                ),
+                Some(aggregate_digest.as_str()),
+                "typed CHC must bind the already committed aggregate identity"
+            );
+        }
+        let engine =
+            trust_router::FullVerificationEngine::with_required_native_engines_timeout_ms(1000);
+        let context =
+            trust_router::VerifierExecutionContext::new("source-clause-digest-binding-test");
+        let result = engine.verify_obligations_with_native_trust_ir_bundle(
+            &bundle,
+            &[marker.clone()],
+            &native,
+            &context,
+        );
+        result.validate_derived_state().expect("canonical native result");
+        let evidence = result
+            .evidence
+            .iter()
+            .find(|row| row.obligation_id == marker_id)
+            .expect("retained source-clause evidence");
+        if missing_digest {
+            assert!(
+                evidence.diagnostics.iter().any(|reason| reason.contains(
+                    "is missing typed trust_mc CHC/PDR digest metadata `trust.vc.digest.sha256`"
+                )),
+                "missing producer digest must retain its original refusal: {evidence:#?}"
+            );
+        } else {
+            assert_eq!(
+                evidence.status,
+                trust_verifier_api::EvidenceStatus::Failed,
+                "constant zero violates the unconditional positive ensures clause"
+            );
+            assert!(
+                evidence.diagnostics.iter().all(|reason| {
+                    !reason.contains("native trust_mc public/TrustIr claim binding rejected")
+                        && !reason
+                            .contains("native trust_mc public/TrustIr claim inventory rejected")
+                }),
+                "complete producer identity must pass the unchanged native binding: {evidence:#?}"
+            );
+        }
+    }
+}
+
+/// Trust (TG15 open item 4): an uncited `ensures` denotation applies the
+/// function's own import to the FULL signature in DECLARATION order, the table
+/// every authority lane passes, never to the clause's variables in the
+/// name-sorted order the query-owned domain table holds them in.
+///
+/// `fn first(b: u8, a: u8) -> u8 { b }` is minted as the projection
+/// `fun b a => b`, so `result >= b && a == a` holds of it. The name-sorted list
+/// `[a, b]` built `first(a, b) >= b && a == a`: it typechecks and says
+/// `a >= b`, a false proposition printed as the clause's meaning. The same list
+/// refused two rows the authority lanes build: mixed carriers in swapped slots
+/// (`fn gate(x: u8, flag: bool) -> u8 { x }`), and a clause naming only some
+/// parameters (`result >= b`), whose self-call lost the others.
+#[test]
+fn uncited_ensures_denotation_applies_the_self_call_in_declaration_order() {
+    use trust_spec_elab::{
+        Domain, FacetTable, MachineUIntWidth, ProofClauseInputs, TargetPointerWidth,
+    };
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(name, ty)| (name.to_string(), ty.to_string())).collect()
+    }
+    fn params_for(signature: &[(&str, &str)], typed: &[(&str, &str)]) -> Vec<(String, String)> {
+        spec_denotation_ensures_params(&rows(signature), &rows(typed), TargetPointerWidth::W64)
+            .expect("every row here has a statement spelling")
+    }
+    /// The row as the lane builds it now.
+    fn denote(
+        facets: &FacetTable,
+        clause: &str,
+        self_fn: &str,
+        signature: &[(&str, &str)],
+        typed: &[(&str, &str)],
+    ) -> Result<clean_kernel::Expr, String> {
+        spec_clean_uncited_ensures_goal(
+            clause,
+            &rows(signature),
+            &rows(typed),
+            self_fn,
+            facets,
+            TargetPointerWidth::W64,
+        )
+        .map(|elaborated| elaborated.goal)
+    }
+    /// The row as the lane built it before: the clause's own variables, in
+    /// the table's name-sorted order, with `result` dropped.
+    fn before(
+        facets: &FacetTable,
+        clause: &str,
+        self_fn: &str,
+        typed: &[(&str, &str)],
+    ) -> Result<clean_kernel::Expr, String> {
+        let params =
+            typed.iter().copied().filter(|(name, _)| *name != "result").collect::<Vec<_>>();
+        let inputs = ProofClauseInputs::proof_lift(Some("u8"));
+        trust_spec_elab::elaborate_ensures_in(clause, &params, self_fn, facets, &inputs)
+            .map(|elaborated| elaborated.goal)
+    }
+
+    // The list: every parameter, in declaration order, at this lane's
+    // spelling. An unmentioned pointer-sized parameter takes the
+    // statement-only `usize64` (never the bare `usize` the binding gate
+    // refuses, nor the discharge lanes' `u64`); `result.<field>` is not one.
+    assert_eq!(
+        params_for(
+            &[("b", "u8"), ("a", "u8"), ("result", "u8")],
+            &[("a", "u8"), ("b", "u8"), ("result", "u8")],
+        ),
+        rows(&[("b", "u8"), ("a", "u8")]),
+    );
+    assert_eq!(
+        params_for(
+            &[("n", "usize"), ("x", "u8"), ("result", "u8"), ("result.f", "u8")],
+            &[("result", "u8"), ("x", "u8")],
+        ),
+        rows(&[("n", "usize64"), ("x", "u8")]),
+    );
+
+    // `first` and `gate` above, minted as the projections they are.
+    let mut env = clean_kernel::Environment::with_prelude();
+    let u8d = || Domain::Machine(MachineUIntWidth::U8);
+    let mut facets = FacetTable::from_structural_facets([
+        ("first", true, true, true, true),
+        ("gate", true, true, true, true),
+    ]);
+    let first =
+        trust_spec_elab::admit_projection_function(&mut env, "first_def", &[u8d(), u8d()], 0)
+            .expect("`fun b a => b` admits");
+    facets.admit("first", first);
+    let gate =
+        trust_spec_elab::admit_projection_function(&mut env, "gate_def", &[u8d(), Domain::Bool], 0)
+            .expect("`fun x flag => x` admits");
+    facets.admit("gate", gate);
+    let tc = clean_kernel::TypeChecker::new(&env);
+
+    // (1) Equal carriers. Before: a well-typed WRONG proposition.
+    let clause = "result >= b && a == a";
+    let signature = [("b", "u8"), ("a", "u8"), ("result", "u8")];
+    let typed = [("a", "u8"), ("b", "u8"), ("result", "u8")];
+    let want =
+        trust_spec_elab::elaborate_goal_typed("b >= b && a == a", &[("b", "u8"), ("a", "u8")])
+            .expect("the statement `first` satisfies elaborates");
+    let goal = denote(&facets, clause, "first", &signature, &typed)
+        .expect("the declaration-order self-call elaborates");
+    assert!(tc.is_def_eq(&goal, &want), "`result` must be `first(b, a)`, which is `b`: {goal}");
+    let swapped = before(&facets, clause, "first", &typed)
+        .expect("the swapped self-call typechecks, which is why the row was silently wrong");
+    assert!(
+        !tc.is_def_eq(&swapped, &want),
+        "`first(a, b)` is `a`, so the old row stated `a >= b`, not the clause: {swapped}"
+    );
+
+    // (2) Mixed carriers. Before: `flag` in `x`'s slot, refused.
+    let clause = "result == x && flag == flag";
+    let typed = [("flag", "bool"), ("result", "u8"), ("x", "u8")];
+    let goal =
+        denote(&facets, clause, "gate", &[("x", "u8"), ("flag", "bool"), ("result", "u8")], &typed)
+            .expect("the declaration-order self-call elaborates");
+    let want = trust_spec_elab::elaborate_goal_typed(
+        "x == x && flag == flag",
+        &[("x", "u8"), ("flag", "bool")],
+    )
+    .expect("the statement `gate` satisfies elaborates");
+    assert!(tc.is_def_eq(&goal, &want), "`result` must be `gate(x, flag)`, which is `x`: {goal}");
+    assert!(
+        before(&facets, clause, "gate", &typed).is_err(),
+        "control: the name-sorted list puts a `bool` in a `u8` slot"
+    );
+
+    // (3) A clause naming only some parameters. Before: the self-call lost `a`.
+    let typed = [("b", "u8"), ("result", "u8")];
+    let goal = denote(&facets, "result >= b", "first", &signature, &typed)
+        .expect("every parameter is an argument of the self-call");
+    tc.infer_type(&goal).expect("the goal is well-typed");
+    assert!(
+        before(&facets, "result >= b", "first", &typed).is_err_and(|e| e.contains("arity")),
+        "control: the clause-only list applies `first` to one argument"
+    );
+}
+
+#[path = "tests/native_wp_source.rs"]
+mod native_wp_source_tests;
+
+#[path = "tests/unsigned_source_clause.rs"]
+mod unsigned_source_clause_tests;
+
+// Trust: the S4 strict-acceptance lineage must accept the router's designated
+// deductive alternative for a postcondition (its proof under the UNIQUE trust-wp
+// request holding the stamped proof obligation), and nothing broader.
+#[test]
+fn strict_lineage_accepts_only_the_unique_wp_alternative_of_a_postcondition() {
+    let evidence_with = |artifacts: Vec<trust_verifier_api::EvidenceArtifact>| {
+        trust_verifier_api::ObligationEvidence {
+            evidence_id: "lineage:wp-alternative".to_string(),
+            obligation_id: "lineage:wp-alternative".to_string(),
+            engine: trust_verifier_api::EngineManifest::new(
+                "trust-wp",
+                "lineage-test",
+                trust_verifier_api::EngineKind::Deductive,
+            ),
+            status: trust_verifier_api::EvidenceStatus::Proved,
+            decline: None,
+            proof_strength: None,
+            artifacts,
+            counterexample: None,
+            publication: trust_verifier_api::EvidencePublicationMetadata::default(),
+            diagnostics: Vec::new(),
+        }
+    };
+    let mut postcondition = authority_test_native_obligation("lineage:wp-alternative", 9, 9);
+    postcondition.kind = trust_verifier_api::ObligationKind::Postcondition;
+    let arithmetic = authority_test_native_obligation("lineage:wp-alternative", 9, 9);
+    let wp = authority_test_native_artifact_lineage("trust-wp", "3", "9");
+
+    // Controls: the stamped primary lineage is accepted, a wrong proof id is not.
+    let primary = evidence_with(authority_test_native_artifact_lineage("trust-mc", "7", "9"));
+    assert!(evidence_has_exact_native_trust_ir_artifact_lineage(&postcondition, &primary));
+    assert!(evidence_has_exact_native_trust_ir_artifact_lineage(&arithmetic, &primary));
+    let wrong_primary =
+        evidence_with(authority_test_native_artifact_lineage("trust-mc", "7", "10"));
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(&postcondition, &wrong_primary));
+
+    // The unique WP alternative of a postcondition is accepted ...
+    assert!(evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(wp.clone())
+    ));
+    // ... but never for an obligation kind the router has no WP fallback for,
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &arithmetic,
+        &evidence_with(wp.clone())
+    ));
+    // a different proof obligation,
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(authority_test_native_artifact_lineage("trust-wp", "3", "10"))
+    ));
+    // two WP requests claiming the same proof obligation,
+    let mut ambiguous = wp.clone();
+    ambiguous.extend(authority_test_native_artifact_lineage("trust-wp", "4", "9"));
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(ambiguous)
+    ));
+    // even when the second request's chain is incomplete (only its proof
+    // artifact is present), since the evidence still names two WP requests,
+    let mut half_ambiguous = authority_test_native_artifact_lineage("trust-wp", "3", "9");
+    let mut second = authority_test_native_artifact_lineage("trust-wp", "4", "9");
+    half_ambiguous.push(second.remove(2));
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(half_ambiguous)
+    ));
+    // a non-canonical request id,
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(authority_test_native_artifact_lineage("trust-wp", "03", "9"))
+    ));
+    // or any other suite.
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(authority_test_native_artifact_lineage("trust-vc", "3", "9"))
+    ));
+    // A broken chain (proof artifact without its request) is refused too.
+    let mut broken = wp;
+    broken.remove(1);
+    assert!(!evidence_has_exact_native_trust_ir_artifact_lineage(
+        &postcondition,
+        &evidence_with(broken)
+    ));
+}
+
+#[test]
+fn wave494_write_canonical_json_value_matches_reference_across_ascii_escapes_and_maps() {
+    fn reference_canonical_json(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Null => out.push_str("null"),
+            serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+            serde_json::Value::String(s) => out.push_str(&serde_json::to_string(s).unwrap()),
+            serde_json::Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    reference_canonical_json(item, out);
+                }
+                out.push(']');
+            }
+            serde_json::Value::Object(entries) => {
+                out.push('{');
+                let mut pairs: Vec<_> = entries.iter().collect();
+                pairs.sort_by(|(l, _), (r, _)| l.cmp(r));
+                for (i, (k, v)) in pairs.into_iter().enumerate() {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(k).unwrap());
+                    out.push(':');
+                    reference_canonical_json(v, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    // Every single ASCII byte 0x00..=0x7f plus multi-byte Unicode and mixed escapes.
+    for byte in 0u8..=0x7f {
+        let ch = char::from(byte);
+        let sample = format!("prefix_{ch}_suffix");
+        let mut actual = String::new();
+        write_canonical_json_string(&sample, &mut actual).expect("string serializes");
+        let expected = serde_json::to_string(&sample).expect("serde_json string");
+        assert_eq!(actual, expected, "mismatch on ASCII byte {byte:#04x}");
+    }
+    for sample in ["", "plain_ident::path<u64>", "quote\"and\\slash\n\t\r", "λ\u{2028}\u{2029}😀"] {
+        let mut actual = String::new();
+        write_canonical_json_string(sample, &mut actual).expect("string serializes");
+        assert_eq!(actual, serde_json::to_string(sample).unwrap());
+    }
+
+    let mut unsorted = serde_json::Map::new();
+    unsorted.insert("zeta".to_string(), serde_json::json!(-9223372036854775808i64));
+    unsorted.insert("alpha".to_string(), serde_json::json!(18446744073709551615u64));
+    unsorted.insert("mu\"key".to_string(), serde_json::json!([null, true, false, {}, {"only": 42}]));
+    let nested = serde_json::Value::Object(unsorted);
+
+    let mut actual = String::new();
+    write_canonical_json_value(&nested, &mut actual).expect("canonical json");
+    let mut expected = String::new();
+    reference_canonical_json(&nested, &mut expected);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn wave494_exact_vc_routing_payload_matches_formula_erased_clone() {
+    let raw = Formula::Eq(
+        Box::new(Formula::Var("x".into(), Sort::Int)),
+        Box::new(Formula::Int(7)),
+    );
+    let mut plain = test_vc(494);
+    plain.formula = raw.clone();
+
+    let mut rich = loop_bridge_query(raw, vec![Formula::Bool(true)]);
+    rich.contract_metadata = Some(trust_types::ContractMetadata {
+        has_requires: true,
+        has_ensures: true,
+        has_loop_invariant: true,
+        source_contract_index: Some(3),
+        ..Default::default()
+    });
+
+    for vc in [&plain, &rich] {
+        let actual = exact_vc_routing_payload(vc).expect("borrowed routed VC serializes");
+        let mut cloned = vc.clone();
+        cloned.formula = Formula::Bool(false);
+        let expected = serde_json::to_string(&cloned).expect("cloned routed VC serializes");
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn wave494_exact_live_compiler_proved_result_matches_without_cloning() {
+    let base = VerificationResult::Proved {
+        solver: "ay-in-process".into(),
+        time_ms: 17,
+        strength: ProofStrength::smt_unsat(),
+        proof_certificate: Some(vec![1, 2, 3, 4]),
+        solver_warnings: Some(vec!["note-a".to_string()]),
+        native_proof_envelope: None,
+    };
+    let snapshot = ExactLiveCompilerProvedResult::from_result(&base).expect("Proved snapshot");
+    assert!(snapshot.matches(&base));
+
+    let mut wrong_solver = base.clone();
+    if let VerificationResult::Proved { solver, .. } = &mut wrong_solver {
+        *solver = "other-solver".into();
+    }
+    assert!(!snapshot.matches(&wrong_solver));
+
+    let mut wrong_time = base.clone();
+    if let VerificationResult::Proved { time_ms, .. } = &mut wrong_time {
+        *time_ms = 18;
+    }
+    assert!(!snapshot.matches(&wrong_time));
+
+    let mut wrong_cert = base.clone();
+    if let VerificationResult::Proved { proof_certificate, .. } = &mut wrong_cert {
+        *proof_certificate = Some(vec![1, 2, 3, 5]);
+    }
+    assert!(!snapshot.matches(&wrong_cert));
+
+    let mut wrong_warn = base.clone();
+    if let VerificationResult::Proved { solver_warnings, .. } = &mut wrong_warn {
+        *solver_warnings = None;
+    }
+    assert!(!snapshot.matches(&wrong_warn));
+
+    assert!(!snapshot.matches(&VerificationResult::Unknown {
+        reason: "budget".to_string(),
+        solver: "ay-in-process".into(),
+        time_ms: 0,
+    }));
+}
+
+#[test]
+fn wave494_transport_monitor_evidence_single_pass_parity() {
+    let digest = format!("sha256:{}", "deadbeef".repeat(8));
+    let entries = vec![
+        trust_verifier_api::MetadataEntry {
+            key: "unrelated.key".to_string(),
+            value: "ignored".to_string(),
+        },
+        trust_verifier_api::MetadataEntry {
+            key: TRUST_MONITOR_PREDICATE_DIGEST_METADATA_KEY.to_string(),
+            value: digest.clone(),
+        },
+        trust_verifier_api::MetadataEntry {
+            key: TRUST_MONITOR_STATUS_METADATA_KEY.to_string(),
+            value: "monitored".to_string(),
+        },
+        trust_verifier_api::MetadataEntry {
+            key: TRUST_MONITOR_REASON_METADATA_KEY.to_string(),
+            value: "exact monitor".to_string(),
+        },
+    ];
+    let parsed = transport_monitor_evidence_from_metadata(&entries).expect("valid monitor");
+    assert_eq!(parsed.status, trust_types::TransportMonitorStatus::Monitored);
+    assert_eq!(parsed.reason, "exact monitor");
+    assert_eq!(parsed.predicate_digest, digest);
+
+    let missing_reason = entries[..3].to_vec();
+    assert!(transport_monitor_evidence_from_metadata(&missing_reason).is_none());
 }

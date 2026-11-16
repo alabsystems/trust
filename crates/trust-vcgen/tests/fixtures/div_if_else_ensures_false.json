@@ -1,0 +1,541 @@
+{
+  "name": "g",
+  "def_path": "d2::g",
+  "span": {
+    "file": "<dump-root>/divfix/d2.rs",
+    "line_start": 1,
+    "col_start": 0,
+    "line_end": 6,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 7,
+                "line_end": 5,
+                "col_end": 7
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 3,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/divfix/d2.rs",
+              "line_start": 5,
+              "col_start": 4,
+              "line_end": 5,
+              "col_end": 4
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Int": 0
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 4,
+                "line_end": 5,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 2
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 26,
+                "line_end": 5,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 4,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 4,
+            "span": {
+              "file": "<dump-root>/divfix/d2.rs",
+              "line_start": 5,
+              "col_start": 26,
+              "line_end": 5,
+              "col_end": 26
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 2,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 6,
+                "col_start": 1,
+                "line_end": 6,
+                "col_end": 1
+              }
+            }
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Constant": {
+                      "Int": 2
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 26,
+                "line_end": 5,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -2147483648
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 26,
+                "line_end": 5,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 5,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 6,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 26,
+                "line_end": 5,
+                "col_end": 26
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 7,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Div"
+            },
+            "target": 5,
+            "span": {
+              "file": "<dump-root>/divfix/d2.rs",
+              "line_start": 5,
+              "col_start": 26,
+              "line_end": 5,
+              "col_end": 26
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 2
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 26,
+                "line_end": 5,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 8,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/divfix/d2.rs",
+                "line_start": 5,
+                "col_start": 4,
+                "line_end": 5,
+                "col_end": 4
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": true
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "<dump-root>/divfix/d2.rs",
+        "line_start": 2,
+        "col_start": 13,
+        "line_end": 2,
+        "col_end": 19
+      },
+      "body": "__trust_lowered_compiler_contract__:x >= 0"
+    },
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "<dump-root>/divfix/d2.rs",
+        "line_start": 3,
+        "col_start": 12,
+        "line_end": 3,
+        "col_end": 23
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) >= (1)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        },
+        {
+          "Int": 0
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": -2147483648
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2147483647
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Ge": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 1
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [
+      "x >= 0"
+    ],
+    "ensures": [
+      "(result) >= (1)"
+    ],
+    "invariants": []
+  }
+}

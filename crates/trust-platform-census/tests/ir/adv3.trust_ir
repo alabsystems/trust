@@ -1,0 +1,465 @@
+; TrustIr text format v1
+; trustc c054d5b16f0689fc92ce4d9a4c2b6decfb881e07 2026-10-08
+module "adv3"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "adv3.rs"
+
+struct @"std::ptr::NonNull<i32>" { pointer: ptr @0 } size=8 align=8 repr=transparent id=0
+
+struct @"std::marker::PhantomData<&i32>" {  } size=0 align=1 id=1
+
+struct @"std::slice::Iter<'_, i32>" { ptr: struct.0 @0, end_or_len: ptr @8, _marker: struct.1 } size=16 align=8 id=2
+
+functy.0 = (fatptr<slice ty.0>, ptr, ptr) -> (i32)
+
+functy.1 = (ptr, ptr) -> ()
+
+functy.2 = (ptr, ptr) -> (i32)
+
+functy.3 = () -> (i32)
+
+functy.4 = (...) -> (i32)
+
+functy.5 = (fatptr<slice ty.0>) -> (struct.2)
+
+functy.6 = (struct.2, (i32)) -> ()
+
+functy.7 = (i32) -> ()
+
+functy.8 = (i32) -> (i32)
+
+functy.9 = (i32, i32) -> (i32)
+
+type ty.0 = i32
+
+rustcc fn @adv_for_each_dup(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="srcs", %1="path", %2="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 9 4
+    ; #scope: 2 parent=1 at 0 11 8
+    ; #scope: 3 parent=2 at 0 13 8
+bb0(%0: fatptr<slice ty.0>, %1: ptr, %2: ptr):
+    %6 = call @func.8()  ; #loc: 0 9 23  ; #scope: 0
+    %7 = const i32 0  ; #loc: 0 10 14  ; #scope: 1
+    %8 = icmp eq i32 %6, %7  ; #loc: 0 10 7  ; #scope: 1
+    condbr %8, bb1, bb2  ; #loc: 0 10 4  ; #scope: 1
+bb1:
+    %9 = const i32 3  ; #loc: 0 11 21  ; #scope: 1
+    br bb4(%9)  ; #loc: 0 12 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 10 4  ; #scope: 1
+bb3:
+    ret %6  ; #loc: 0 18 1  ; #scope: 0
+bb4(%3: i32):
+    %10 = const i32 2147483647  ; #loc: 0 12 19  ; #scope: 2
+    %11 = icmp slt i32 %3, %10  ; #loc: 0 12 14  ; #scope: 2
+    condbr %11, bb6, bb7  ; #loc: 0 12 8  ; #scope: 2
+bb5(%4: i32):
+    %12 = const i32 0  ; #loc: 0 13 16  ; #scope: 2
+    %13 = call @func.10(%0)  ; #loc: 0 14 13  ; #scope: 3
+    %14 = const (i32) { 0 }  ; #loc: 0 14 29  ; #scope: 3
+    %15 = insertfield (i32) %14, 0, %12  ; #loc: 0 14 29  ; #scope: 3
+    call @func.11(%13, %15)  ; #loc: 0 14 20  ; #scope: 3
+    %16 = call @func.12(%1, %2)  ; #loc: 0 15 17  ; #scope: 3
+    %17 = const i32 127  ; #loc: 0 15 54  ; #scope: 3
+    call @func.13(%17)  ; #loc: 0 15 42  ; #scope: 3
+    unreachable  ; #loc: 0 15 42  ; #scope: 3
+bb6:
+    %18 = const i32 2  ; #loc: 0 12 55  ; #scope: 2
+    %19 = const i32 1  ; #loc: 0 12 70  ; #scope: 2
+    %20 = call @func.9(%3, %18, %19)  ; #loc: 0 12 39  ; #scope: 2
+    %21 = const i32 1  ; #loc: 0 12 97  ; #scope: 2
+    %22, %23 = add.overflow i32 %3, %21  ; #loc: 0 12 91  ; #scope: 2
+    %24 = const bool false  ; #loc: 0 12 91  ; #scope: 2
+    %25 = const bool true  ; #loc: 0 12 91  ; #scope: 2
+    %26 = select bool %23, %24, %25  ; #loc: 0 12 91  ; #scope: 2
+    assert %26, overflow add  ; #proof: no_overflow  ; #loc: 0 12 91  ; #scope: 2
+    br bb8(%22)  ; #loc: 0 12 8  ; #scope: 2
+bb7:
+    br bb5(%3)  ; #loc: 0 12 8  ; #scope: 2
+bb8(%5: i32):
+    br bb4(%5)  ; #loc: 0 12 8  ; #scope: 2
+}
+
+rustcc fn @"adv_for_each_dup::{closure#0}"(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %1="x"
+bb0(%0: ptr, %1: ptr):
+    %2 = load i32, ptr %1  ; #loc: 0 14 57
+    %3 = load (i32), ptr %0  ; #loc: 0 14 62
+    %4 = extractfield i32 %3, 0  ; #loc: 0 14 62
+    %5, %6 = add.overflow i32 %2, %4  ; #loc: 0 14 57
+    %7 = const bool false  ; #loc: 0 14 57
+    %8 = const bool true  ; #loc: 0 14 57
+    %9 = select bool %6, %7, %8  ; #loc: 0 14 57
+    assert %9, overflow add  ; #proof: no_overflow  ; #loc: 0 14 57
+    %10 = call @func.14(%5)  ; #loc: 0 14 47
+    ret  ; #loc: 0 14 67
+}
+
+rustcc fn @adv_strip_skip7(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 27 4
+    ; #scope: 2 parent=1 at 0 29 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 27 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 28 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 28 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 28 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 29 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 30 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 28 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 37 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 30 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 30 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 30 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = call @func.12(%0, %1)  ; #loc: 0 34 17  ; #scope: 2
+    %12 = const i32 127  ; #loc: 0 34 54  ; #scope: 2
+    call @func.13(%12)  ; #loc: 0 34 42  ; #scope: 2
+    unreachable  ; #loc: 0 34 42  ; #scope: 2
+bb6:
+    %13 = const i32 7  ; #loc: 0 31 21  ; #scope: 2
+    %14 = icmp ne i32 %2, %13  ; #loc: 0 31 15  ; #scope: 2
+    condbr %14, bb9, bb10  ; #loc: 0 31 12  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 30 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 30 8  ; #scope: 2
+bb9:
+    %15 = const i32 2  ; #loc: 0 31 50  ; #scope: 2
+    %16 = const i32 1  ; #loc: 0 31 65  ; #scope: 2
+    %17 = call @func.9(%2, %15, %16)  ; #loc: 0 31 34  ; #scope: 2
+    br bb11  ; #loc: 0 31 12  ; #scope: 2
+bb10:
+    br bb11  ; #loc: 0 31 12  ; #scope: 2
+bb11:
+    %18 = const i32 1  ; #loc: 0 32 18  ; #scope: 2
+    %19, %20 = add.overflow i32 %2, %18  ; #loc: 0 32 12  ; #scope: 2
+    %21 = const bool false  ; #loc: 0 32 12  ; #scope: 2
+    %22 = const bool true  ; #loc: 0 32 12  ; #scope: 2
+    %23 = select bool %20, %21, %22  ; #loc: 0 32 12  ; #scope: 2
+    assert %23, overflow add  ; #proof: no_overflow  ; #loc: 0 32 12  ; #scope: 2
+    br bb8(%19)  ; #loc: 0 30 8  ; #scope: 2
+}
+
+rustcc fn @adv_strip_le(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 41 4
+    ; #scope: 2 parent=1 at 0 43 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 41 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 42 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 42 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 42 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 43 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 44 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 42 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 48 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 44 20  ; #scope: 2
+    %10 = const i32 1  ; #loc: 0 44 31  ; #scope: 2
+    %11, %12 = sub.overflow i32 %9, %10  ; #loc: 0 44 20  ; #scope: 2
+    %13 = const bool false  ; #loc: 0 44 20  ; #scope: 2
+    %14 = const bool true  ; #loc: 0 44 20  ; #scope: 2
+    %15 = select bool %12, %13, %14  ; #loc: 0 44 20  ; #scope: 2
+    assert %15, overflow sub  ; #proof: no_overflow  ; #loc: 0 44 20  ; #scope: 2
+    %16 = icmp sle i32 %2, %11  ; #loc: 0 44 14  ; #scope: 2
+    condbr %16, bb6, bb7  ; #loc: 0 44 8  ; #scope: 2
+bb5(%3: i32):
+    %17 = call @func.12(%0, %1)  ; #loc: 0 45 17  ; #scope: 2
+    %18 = const i32 127  ; #loc: 0 45 54  ; #scope: 2
+    call @func.13(%18)  ; #loc: 0 45 42  ; #scope: 2
+    unreachable  ; #loc: 0 45 42  ; #scope: 2
+bb6:
+    %19 = const i32 2  ; #loc: 0 44 60  ; #scope: 2
+    %20 = const i32 1  ; #loc: 0 44 75  ; #scope: 2
+    %21 = call @func.9(%2, %19, %20)  ; #loc: 0 44 44  ; #scope: 2
+    %22 = const i32 1  ; #loc: 0 44 102  ; #scope: 2
+    %23, %24 = add.overflow i32 %2, %22  ; #loc: 0 44 96  ; #scope: 2
+    %25 = const bool false  ; #loc: 0 44 96  ; #scope: 2
+    %26 = const bool true  ; #loc: 0 44 96  ; #scope: 2
+    %27 = select bool %24, %25, %26  ; #loc: 0 44 96  ; #scope: 2
+    assert %27, overflow add  ; #proof: no_overflow  ; #loc: 0 44 96  ; #scope: 2
+    br bb8(%23)  ; #loc: 0 44 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 44 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 44 8  ; #scope: 2
+}
+
+rustcc fn @adv_close_then_place(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 53 4
+    ; #scope: 2 parent=1 at 0 55 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 53 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 54 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 54 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 54 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 55 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 56 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 54 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 61 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 56 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 56 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 56 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = const i32 1  ; #loc: 0 57 28  ; #scope: 2
+    %12 = const i32 3  ; #loc: 0 57 31  ; #scope: 2
+    %13 = call @func.16(%11, %12)  ; #loc: 0 57 17  ; #scope: 2
+    %14 = call @func.12(%0, %1)  ; #loc: 0 58 17  ; #scope: 2
+    %15 = const i32 127  ; #loc: 0 58 54  ; #scope: 2
+    call @func.13(%15)  ; #loc: 0 58 42  ; #scope: 2
+    unreachable  ; #loc: 0 58 42  ; #scope: 2
+bb6:
+    %16 = call @func.15(%2)  ; #loc: 0 56 39  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 56 64  ; #scope: 2
+    %18, %19 = add.overflow i32 %2, %17  ; #loc: 0 56 58  ; #scope: 2
+    %20 = const bool false  ; #loc: 0 56 58  ; #scope: 2
+    %21 = const bool true  ; #loc: 0 56 58  ; #scope: 2
+    %22 = select bool %19, %20, %21  ; #loc: 0 56 58  ; #scope: 2
+    assert %22, overflow add  ; #proof: no_overflow  ; #loc: 0 56 58  ; #scope: 2
+    br bb8(%18)  ; #loc: 0 56 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 56 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 56 8  ; #scope: 2
+}
+
+rustcc fn @adv_strip_step2(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 65 4
+    ; #scope: 2 parent=1 at 0 67 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 65 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 66 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 66 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 66 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 67 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 68 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 66 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 72 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 68 19  ; #scope: 2
+    %10 = const i32 1  ; #loc: 0 68 30  ; #scope: 2
+    %11, %12 = sub.overflow i32 %9, %10  ; #loc: 0 68 19  ; #scope: 2
+    %13 = const bool false  ; #loc: 0 68 19  ; #scope: 2
+    %14 = const bool true  ; #loc: 0 68 19  ; #scope: 2
+    %15 = select bool %12, %13, %14  ; #loc: 0 68 19  ; #scope: 2
+    assert %15, overflow sub  ; #proof: no_overflow  ; #loc: 0 68 19  ; #scope: 2
+    %16 = icmp slt i32 %2, %11  ; #loc: 0 68 14  ; #scope: 2
+    condbr %16, bb6, bb7  ; #loc: 0 68 8  ; #scope: 2
+bb5(%3: i32):
+    %17 = call @func.12(%0, %1)  ; #loc: 0 69 17  ; #scope: 2
+    %18 = const i32 127  ; #loc: 0 69 54  ; #scope: 2
+    call @func.13(%18)  ; #loc: 0 69 42  ; #scope: 2
+    unreachable  ; #loc: 0 69 42  ; #scope: 2
+bb6:
+    %19 = const i32 2  ; #loc: 0 68 59  ; #scope: 2
+    %20 = const i32 1  ; #loc: 0 68 74  ; #scope: 2
+    %21 = call @func.9(%2, %19, %20)  ; #loc: 0 68 43  ; #scope: 2
+    %22 = const i32 2  ; #loc: 0 68 101  ; #scope: 2
+    %23, %24 = add.overflow i32 %2, %22  ; #loc: 0 68 95  ; #scope: 2
+    %25 = const bool false  ; #loc: 0 68 95  ; #scope: 2
+    %26 = const bool true  ; #loc: 0 68 95  ; #scope: 2
+    %27 = select bool %24, %25, %26  ; #loc: 0 68 95  ; #scope: 2
+    assert %27, overflow add  ; #proof: no_overflow  ; #loc: 0 68 95  ; #scope: 2
+    br bb8(%23)  ; #loc: 0 68 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 68 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 68 8  ; #scope: 2
+}
+
+rustcc fn @adv_strip_until_hole(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 77 4
+    ; #scope: 2 parent=1 at 0 79 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 77 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 78 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 78 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 78 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 79 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 80 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 78 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 87 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 80 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 80 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 80 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = call @func.12(%0, %1)  ; #loc: 0 84 17  ; #scope: 2
+    %12 = const i32 127  ; #loc: 0 84 54  ; #scope: 2
+    call @func.13(%12)  ; #loc: 0 84 42  ; #scope: 2
+    unreachable  ; #loc: 0 84 42  ; #scope: 2
+bb6:
+    %13 = const i32 2  ; #loc: 0 81 40  ; #scope: 2
+    %14 = const i32 1  ; #loc: 0 81 55  ; #scope: 2
+    %15 = call @func.9(%2, %13, %14)  ; #loc: 0 81 24  ; #scope: 2
+    %16 = const i32 -1  ; #loc: 0 81 78  ; #scope: 2
+    %17 = icmp eq i32 %15, %16  ; #loc: 0 81 15  ; #scope: 2
+    condbr %17, bb9, bb10  ; #loc: 0 81 12  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 80 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 80 8  ; #scope: 2
+bb9:
+    br bb5(%2)  ; #loc: 0 81 83  ; #scope: 2
+bb10:
+    br bb11  ; #loc: 0 81 12  ; #scope: 2
+bb11:
+    %18 = const i32 1  ; #loc: 0 82 18  ; #scope: 2
+    %19, %20 = add.overflow i32 %2, %18  ; #loc: 0 82 12  ; #scope: 2
+    %21 = const bool false  ; #loc: 0 82 12  ; #scope: 2
+    %22 = const bool true  ; #loc: 0 82 12  ; #scope: 2
+    %23 = select bool %20, %21, %22  ; #loc: 0 82 12  ; #scope: 2
+    assert %23, overflow add  ; #proof: no_overflow  ; #loc: 0 82 12  ; #scope: 2
+    br bb8(%19)  ; #loc: 0 80 8  ; #scope: 2
+}
+
+rustcc fn @adv_exec_without_strip_if_nonzero(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 93 4
+    ; #scope: 2 parent=1 at 0 98 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.8()  ; #loc: 0 93 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 94 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 94 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 94 4  ; #scope: 1
+bb1:
+    %8 = const i32 0  ; #loc: 0 95 18  ; #scope: 1
+    %9 = icmp eq i32 %5, %8  ; #loc: 0 95 11  ; #scope: 1
+    condbr %9, bb4, bb5  ; #loc: 0 95 8  ; #scope: 1
+bb2:
+    br bb3  ; #loc: 0 94 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 103 1  ; #scope: 0
+bb4:
+    %10 = call @func.12(%0, %1)  ; #loc: 0 96 21  ; #scope: 1
+    br bb6  ; #loc: 0 95 8  ; #scope: 1
+bb5:
+    br bb6  ; #loc: 0 95 8  ; #scope: 1
+bb6:
+    %11 = const i32 3  ; #loc: 0 98 21  ; #scope: 1
+    br bb7(%11)  ; #loc: 0 99 8  ; #scope: 2
+bb7(%2: i32):
+    %12 = const i32 2147483647  ; #loc: 0 99 19  ; #scope: 2
+    %13 = icmp slt i32 %2, %12  ; #loc: 0 99 14  ; #scope: 2
+    condbr %13, bb9, bb10  ; #loc: 0 99 8  ; #scope: 2
+bb8(%3: i32):
+    %14 = call @func.12(%0, %1)  ; #loc: 0 100 17  ; #scope: 2
+    %15 = const i32 127  ; #loc: 0 100 54  ; #scope: 2
+    call @func.13(%15)  ; #loc: 0 100 42  ; #scope: 2
+    unreachable  ; #loc: 0 100 42  ; #scope: 2
+bb9:
+    %16 = const i32 2  ; #loc: 0 99 55  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 99 70  ; #scope: 2
+    %18 = call @func.9(%2, %16, %17)  ; #loc: 0 99 39  ; #scope: 2
+    %19 = const i32 1  ; #loc: 0 99 97  ; #scope: 2
+    %20, %21 = add.overflow i32 %2, %19  ; #loc: 0 99 91  ; #scope: 2
+    %22 = const bool false  ; #loc: 0 99 91  ; #scope: 2
+    %23 = const bool true  ; #loc: 0 99 91  ; #scope: 2
+    %24 = select bool %21, %22, %23  ; #loc: 0 99 91  ; #scope: 2
+    assert %24, overflow add  ; #proof: no_overflow  ; #loc: 0 99 91  ; #scope: 2
+    br bb11(%20)  ; #loc: 0 99 8  ; #scope: 2
+bb10:
+    br bb8(%2)  ; #loc: 0 99 8  ; #scope: 2
+bb11(%4: i32):
+    br bb7(%4)  ; #loc: 0 99 8  ; #scope: 2
+}
+
+fn @"libc::fork"(functy.3) {
+    ; #producer: trust
+}
+
+fn @"libc::fcntl"(functy.4) {
+    ; #producer: trust
+}
+
+rustcc fn @"core::slice::<impl [T]>::iter"(functy.5) {
+    ; #producer: trust
+}
+
+rustcc fn @"<std::slice::Iter<'a, T> as std::iter::Iterator>::for_each"(functy.6) {
+    ; #producer: trust
+}
+
+fn @"libc::execv"(functy.4) {
+    ; #producer: trust
+}
+
+fn @"libc::_exit"(functy.7) {
+    ; #producer: trust
+}
+
+fn @"libc::dup"(functy.8) {
+    ; #producer: trust
+}
+
+fn @"libc::close"(functy.8) {
+    ; #producer: trust
+}
+
+fn @"libc::dup2"(functy.9) {
+    ; #producer: trust
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L12C91 of `adv3::adv_for_each_dup`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_for_each_dup#L12C91#overflow#o0" range 0 12 91 12 98 site f0/bb6#8
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L14C57 of `adv3::adv_for_each_dup::{closure#0}`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_for_each_dup::{closure#0}#L14C57#overflow#o0" range 0 14 57 14 63 site f1/bb0#7
+
+obligation 2 arithmetic_safety pending "direct THIR Assert (overflow) at L32C12 of `adv3::adv_strip_skip7`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 2 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_skip7#L32C12#overflow#o0" range 0 32 12 32 19 site f2/bb11#5
+
+obligation 3 arithmetic_safety pending "direct THIR Assert (overflow) at L44C20 of `adv3::adv_strip_le`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 3 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_le#L44C20#overflow#o0" range 0 44 20 44 32 site f3/bb4#6
+
+obligation 4 arithmetic_safety pending "direct THIR Assert (overflow) at L44C96 of `adv3::adv_strip_le`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 3 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_le#L44C96#overflow#o0" range 0 44 96 44 103 site f3/bb6#8
+
+obligation 5 arithmetic_safety pending "direct THIR Assert (overflow) at L56C58 of `adv3::adv_close_then_place`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 4 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_close_then_place#L56C58#overflow#o0" range 0 56 58 56 65 site f4/bb6#6
+
+obligation 6 arithmetic_safety pending "direct THIR Assert (overflow) at L68C19 of `adv3::adv_strip_step2`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 5 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_step2#L68C19#overflow#o0" range 0 68 19 68 31 site f5/bb4#6
+
+obligation 7 arithmetic_safety pending "direct THIR Assert (overflow) at L68C95 of `adv3::adv_strip_step2`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 5 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_step2#L68C95#overflow#o0" range 0 68 95 68 102 site f5/bb6#8
+
+obligation 8 arithmetic_safety pending "direct THIR Assert (overflow) at L82C12 of `adv3::adv_strip_until_hole`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 6 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_strip_until_hole#L82C12#overflow#o0" range 0 82 12 82 19 site f6/bb11#5
+
+obligation 9 arithmetic_safety pending "direct THIR Assert (overflow) at L99C91 of `adv3::adv_exec_without_strip_if_nonzero`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 7 source "trust-thir-lower/direct-assert@1" assertion "adv3::adv_exec_without_strip_if_nonzero#L99C91#overflow#o0" range 0 99 91 99 98 site f7/bb9#8

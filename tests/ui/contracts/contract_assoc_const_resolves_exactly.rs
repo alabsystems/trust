@@ -3,6 +3,7 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
+//@ dont-require-annotations: NOTE
 //@ proc-macro: trust.rs
 //@ edition: 2021
 //! Trust D3 (associated-constant half). A contract clause that names a
@@ -34,6 +35,18 @@
 //! literal twin reported `0 proved, 0 failed, 1 unknown, 1 runtime-checked out
 //! of 2`. After the fix the associated-constant spelling reports exactly what
 //! the literal spelling reports.
+//!
+//! `main`'s PINS RE-MEASURED 2026-09-16. It carried two WARN annotations —
+//! `Trust Level 0 safety verification incomplete` and `Trust verification
+//! advisory` — recording that the harness body itself had an unproved row. It
+//! does not any more: `main` now reports `1 proved, 0 failed, 0 unknown, 0 timed
+//! out, 0 runtime-checked out of 1 obligation(s)` and emits no warning at all.
+//!
+//! The pins are REPLACED by that line rather than deleted. `main` exists here
+//! only to instantiate the functions above, so a silent `main` is indistinguishable
+//! from a `main` that was never verified; pinning the count keeps the harness
+//! itself measured. Every ERROR this file is actually about is unchanged and
+//! still covered by `dont-require-annotations: ERROR`.
 
 #![allow(dead_code)]
 
@@ -59,8 +72,7 @@ pub fn off_by_one(id: u32) -> u32 {
     id
 }
 
-fn main() { //~ WARN Trust Level 0 safety verification incomplete
-    //~| WARN Trust verification advisory
+fn main() { //~ NOTE Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
     let _ = ok(3);
     let _ = off_by_one(3);
 }

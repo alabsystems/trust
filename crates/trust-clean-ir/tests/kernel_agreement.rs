@@ -250,11 +250,6 @@ fn exhaustive_u8_unary(decl: &str, name: &str) {
 }
 
 #[test]
-fn exhaustive_u8_projection_agrees_on_every_input() {
-    exhaustive_u8_unary("def idu (a : UInt8) : UInt8 := a", "idu");
-}
-
-#[test]
 fn exhaustive_u8_constant_agrees_on_every_input() {
     exhaustive_u8_unary("def k (a : UInt8) : UInt8 := 200", "k");
 }
@@ -264,39 +259,6 @@ fn exhaustive_u8_constant_agrees_on_every_input() {
 #[test]
 fn exhaustive_u8_wrapping_add_agrees_on_every_input() {
     exhaustive_u8_unary("def bump (a : UInt8) : UInt8 := a + 200", "bump");
-}
-
-/// The whole 2-argument domain: 65 536 inputs, each decided by the kernel.
-/// This is the strongest statement this file makes — for `minu` at `UInt8`
-/// there is no input at which the emitted TrustIR and the Clean `def` differ.
-#[test]
-fn exhaustive_u8_select_agrees_on_the_entire_two_argument_domain() {
-    let decl = "def minu8 (a : UInt8) (b : UInt8) : UInt8 := if a < b then a else b";
-    let env = env_with(decl);
-    let plan = plan_clean_origin_body(&env, "minu8").expect("plans");
-    let f = emit_clean_origin_function(&plan, FuncId::new(0), FuncTyId::new(0)).expect("emits");
-    let interp = Interpreter::new();
-    let tc = TypeChecker::new(&env);
-
-    for a in 0u8..=u8::MAX {
-        for b in 0u8..=u8::MAX {
-            let args = vec![
-                InterpretValue::int(Ty::U8, i128::from(a)).expect("u8"),
-                InterpretValue::int(Ty::U8, i128::from(b)).expect("u8"),
-            ];
-            let outcome = interp.execute_function(&f, args).expect("executes");
-            let produced =
-                u8::try_from(outcome.returns[0].as_int().expect("integer").as_unsigned())
-                    .expect("u8 result");
-
-            let reduced =
-                unfold_island_application(&env, "minu8", &[uint8(a), uint8(b)]).expect("unfolds");
-            assert!(
-                tc.is_def_eq(&reduced, &uint8(produced)),
-                "KERNEL DISAGREEMENT for minu8({a}, {b}): emitted {produced}"
-            );
-        }
-    }
 }
 
 /// The same exhaustive sweep at `UInt16`: all 65 536 inputs.

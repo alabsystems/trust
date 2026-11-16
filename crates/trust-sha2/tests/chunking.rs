@@ -10,10 +10,10 @@
 //!
 //! * `trust_types::digest::stable_sha256_hex_reader` feeds an 8 KiB buffer's
 //!   worth at a time, with the last read short.
-//! * `trust_buildcache::integrity::update_entry_hmac` feeds a 64 KiB buffer's
-//!   worth at a time, interleaved with 1-byte and 8-byte framing pushes.
-//! * `trust_buildcache::key::hash_bytes` alternates 8-byte lengths with
-//!   arbitrary-length values.
+//! * `trust_buildcache::integrity::update_entry_hmac` fed a 64 KiB buffer's
+//!   worth at a time, interleaved with 1-byte and 8-byte framing pushes, and
+//!   `trust_buildcache::key::hash_bytes` alternated 8-byte lengths with
+//!   arbitrary-length values. T11 deleted both; the shapes stay under test.
 //!
 //! A one-shot KAT cannot see a bug here at all: it makes exactly one `update`
 //! call, so the buffering path it exercises is the trivial one.
@@ -133,8 +133,9 @@ fn every_pair_of_splits_agrees() {
 
 /// Zero-length `update` calls, anywhere and repeatedly, must be no-ops.
 ///
-/// `trust_buildcache::integrity` can issue one: a sealed input of length 0
-/// yields `mac.update(&buffer[..0])` on the loop's guard path.
+/// `trust_buildcache::integrity` (deleted by T11) could issue one: a sealed
+/// input of length 0 yielded `mac.update(&buffer[..0])` on the loop's guard
+/// path.
 #[test]
 fn empty_updates_are_no_ops() {
     let data = message(130);

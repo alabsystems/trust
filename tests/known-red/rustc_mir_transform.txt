@@ -6,29 +6,34 @@
 # passes; the gate fails on a stale row, because leaving one lets a re-break of
 # the same test be silently re-accepted.
 #
+# ROW FORMAT (2026-09-27): the FULL libtest path, exactly as the `failures:`
+# list prints it — `trust_verify::tests::some_test`, not `some_test`. The gate
+# reads that list; see the script's "WHERE THE NAMES COME FROM".
+#
 # History: 2 at e248b1a431 -> 8 on main (six regressions landed unseen, nothing
-# executed this suite) -> 4 (c187f1d942) -> 2 (this baseline).
+# executed this suite) -> 4 (c187f1d942) -> 2 (644726224e) -> 0.
 #
-# BOTH survivors are the SAME documented blocker, and neither is a stale fixture:
-# `DIRECT_TRUST_VC_LANE_IS_INERT` (task #42), whose full write-up is the doc
-# comment on that constant in trust_verify/tests.rs. Two stacked fail-closed
-# conditions, NO unsoundness:
-#   1. this build does not enable `trust-router/trust-vc-native`, so the direct
-#      TrustVC lane is compiled out and mints no receipt; and
-#   2. with the feature force-enabled the lane routes correctly, but trust-vc
-#      returns Unsupported under RequireReleaseAdmissibleCertificate — it
-#      verifies the unit and returns no per-assertion proof certificate.
+# THE SET IS EMPTY, and that is the measured state, not a waiver: 2026-09-27,
+# `x.py test compiler/rustc_mir_transform --stage 1 --no-fail-fast` on
+# origin/main 1505108872 plus the t-new-tests series (which touches no compiler
+# code): lib 600 passed / 0 failed / 11 ignored, doctests 10 / 0 / 20 and
+# 0 / 0 / 7, x.py exit 0.
 #
-# THAT CONSTANT'S DOC SAYS, AND IT IS RIGHT: "Do NOT 'fix' these by relaxing an
-# assertion: each one pins that a proved transport outcome requires a live
-# affine receipt, which is the seal 37e4acb125 added. Fixing them means making
-# the lane real (owner call: enable the feature in the compiler + close the
-# certificate gap), not making the test agree with an inert lane."
+# The two rows this file carried until 2026-09-27 —
+# `full_verification_compiler_input_defers_direct_trust_vc_proof_unit` and
+# `full_verification_compiler_input_classifies_missing_native_bundle_and_direct_acceptance`
+# — had been passing since 7d34f7c4dd (2026-08-26 21:08, "the last two go
+# green"), twelve hours after 644726224e recorded them. Nothing noticed for a
+# month: `slow.mir-transform-ratchet` had never been run to green, and the
+# push-tier `--selftest` REFUSED an empty baseline, so deleting both rows would
+# have turned a push lane red. Their stated reason, `DIRECT_TRUST_VC_LANE_IS_INERT`
+# (the lane compiled out and minting no receipt), was refuted by that same
+# commit: trust_verify/tests.rs replaced the constant with a note that the
+# feature is enabled and the lane mints a live, certificate-backed receipt. The
+# third test a reviewer found red beside them,
+# `direct_trust_vc_live_receipt_is_exact_ownership_authority_and_public_run_is_not`,
+# was fixed by f6cb9deea2 (the canonical `{OwnershipAnalysis, SmtBacked}`
+# transport evidence) and passes too.
 #
-# owner: needs the task #42 owner call (feature enable + certificate gap).
-# Both tests were ALSO carrying stale expectations from the 79558a8f2e trust-wp
-# retirement; those were repaired (containment-based request selection, and the
-# missing/insufficient-strength counter split) and each test now advances PAST
-# them to the inert-lane assertion. So the residue is exactly task #42.
-full_verification_compiler_input_defers_direct_trust_vc_proof_unit
-full_verification_compiler_input_classifies_missing_native_bundle_and_direct_acceptance
+# An empty set means the gate requires EVERY test to pass. Add a row only with
+# an owner and a reason, and the ratchet will fail the moment it passes again.

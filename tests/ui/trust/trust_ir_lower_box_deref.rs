@@ -1,6 +1,22 @@
 //@ dont-check-compiler-stderr
-//@ check-pass
-//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=off
+//@ check-fail
+//@ compile-flags: -Ztrust-ir-lower=strict -Ztrust-verify=on -Ztrust-policy=advisory
+//@ needs-trust-verify
+//@ dont-require-annotations: WARN
+//@ dont-require-annotations: NOTE
+// RE-PINNED 2026-09-16. This body used to lower "fully" under
+// `-Ztrust-ir-lower=strict`, but only because a `&mut` receiver whose borrow
+// could not become a pointer was carried into the call AS A VALUE. That edge
+// does not type-check — the callee's parameter is a pointer — and it was
+// invisible only while declarations wore the v41-outlawed unknown-signature
+// spelling, which made the argument/parameter comparison run zero times.
+//
+// The carrier is now refused for a reference-typed argument, so this body
+// honestly reports `Borrow(&mut slot missing)` instead. Carrying a value for a
+// `&mut` is the worse half of the bug: a write through it cannot propagate
+// back, so a body that lowered only by doing so was never faithfully lowered.
+// The fix that would restore full lowering is a real pointer for this borrow,
+// which needs the `&mut` slot the message names — not the carrier.
 //! Trust (wave-BX): a `Box<T>` is a heap pointer. The data pointer inside the
 //! registered `Box(Unique(NonNull(*const T), _), Global)` aggregate is a
 //! ledgered pointer, so `*b` is a `Load`, `*b = v` / `*b op= v` are `Store`s,
@@ -45,6 +61,7 @@ fn reborrow(b: &mut Box<i32>) -> i32 {
     *s
 }
 fn main() {
+    //~^ ERROR could not fully lower this body
     let mut x = Box::new(1u8);
     bump(&mut x);
     let mut y = Box::new(41);

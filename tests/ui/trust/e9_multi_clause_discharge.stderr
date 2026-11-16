@@ -26,7 +26,7 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL |     ensures x >= x by u64_ge_refl
    |                       ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 
 note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `two`, with a clean certification audit
   --> $DIR/e9_multi_clause_discharge.rs:19:23
@@ -34,5 +34,5 @@ note: citation `u64_ge_refl` kernel-discharges this postcondition statement: the
 LL |     ensures x <= x by u64_ge_refl
    |                       ^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

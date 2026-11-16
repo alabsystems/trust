@@ -63,7 +63,8 @@
 # as deleting the gate, and the file says so.
 #
 # Usage:
-#   scripts/check_revert_rationale.sh --pre-push        # reads git's pre-push stdin
+#   scripts/check_revert_rationale.sh --pre-push [--remote DESTINATION]
+#                                                     # reads git's pre-push stdin
 #   scripts/check_revert_rationale.sh --push-context    # --pre-push via $TRUST_PUSHED_REFS
 #   scripts/check_revert_rationale.sh <rev-range>...    # e.g. origin/main..HEAD
 #   scripts/check_revert_rationale.sh --history [<since-rev>]   # default: 90 days, --all
@@ -80,7 +81,7 @@ LEDGER_REL="scripts/revert-rationale-grandfathered.txt"
 
 # Paths whose change makes a revert a SOUNDNESS-GATE revert. Informational only:
 # it sharpens the refusal message, it never decides whether the rule applies.
-SOUNDNESS_PATH_RE='^(crates/trust-thir-lower/|crates/trust-ir|compiler/rustc_trust|scripts/check_|scripts/hooks|src/tools/trust|tests/trust-comprehensive/divergences.toml)'
+SOUNDNESS_PATH_RE='^(crates/trust-thir-lower/|crates/trust-ir|compiler/rustc_mir_transform/src/trust_|scripts/check_|scripts/hooks|src/tools/trust|tests/trust-comprehensive/divergences.toml)'
 
 die() { printf 'check_revert_rationale: %s\n' "$*" >&2; exit 2; }
 
@@ -97,35 +98,215 @@ if [ "${1:-}" = "--push-context" ]; then
   if [ -n "${TRUST_PUSHED_REFS+x}" ]; then
     refcount="$(printf '%s' "$TRUST_PUSHED_REFS" | grep -c . || true)"
     echo "SUBJECT: push ($refcount ref update(s))"
+    if [ -n "${TRUST_PUSH_REMOTE:-}" ]; then
+      exec bash "$self" --pre-push --remote "$TRUST_PUSH_REMOTE" "$@" <<< "$TRUST_PUSHED_REFS"
+    fi
     exec bash "$self" --pre-push "$@" <<< "$TRUST_PUSHED_REFS"
   fi
   echo "SUBJECT: history (no push in flight; TRUST_PUSHED_REFS unset)"
   exec bash "$self" --history "$@"
 fi
 
+# The destination's advertised refs are read by ONE helper shared with every
+# lane that narrows its subject to what a push introduces. It is resolved
+# beside THIS file, before the cd below, so a copy of the checker (the tests
+# run one inside a scratch repository) finds the copy of its reader.
+DESTINATION_LIB="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/lib/push_destination.sh"
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git worktree"
 cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
+
+# ------------------------------------------------- the ANCHORED waiver reading
+# WHERE THE GRANDFATHER ROWS COME FROM, when a push is in flight. Without push
+# context (TRUST_PUSHED_REFS unset) the ledger is the checkout's file, as it
+# always was. With it set, the checkout is not the push: reading the worktree
+# let an UNCOMMITTED row waive the pushed bare revert, and reading the pushed
+# tip instead would let a row committed IN THE SAME PUSH waive it — both
+# reproduced in docs/issues/2026-09-28-push-lanes-judge-the-checkout-not-the-push.md
+# (case R). So the waiver set is read only from git objects, as
+#
+#     rows(anchor) ∩ rows(pushed tip)       for every non-deletion ref line,
+#
+# intersected across the lines, where the ANCHOR is a tree this push cannot
+# author:
+#   * an update: the destination's current tip (the line's remote sha);
+#   * a new ref, or an update whose old tip this store does not hold: the
+#     merge-base of the pushed tip with the main the destination advertises;
+#   * neither: NO anchor, and the waiver set is EMPTY. An empty set only ever
+#     judges more commits, never fewer.
+# A row therefore waives a commit only once it is already on the destination
+# (or on main's shared history) AND the push keeps it. The worktree ledger is
+# never read in this reading. A malformed ref line is exit 2, not skipped.
+ANCHORED=0
+[ -n "${TRUST_PUSHED_REFS+x}" ] && ANCHORED=1
+ANCHOR_LINES=()
+DEST_ADVERTISED=""
+DEST_LOADED=0
+
+anchored_line_ok() {  # <local-ref> <local-sha> <remote-ref> <remote-sha>
+  [ -n "$1" ] && [ -n "$3" ] || return 1
+  [[ "$2" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 1
+  [[ "$4" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 1
+}
+
+# Sets ANCHOR (empty when there is none) and ANCHOR_WHY. Never a subshell, so
+# `die` ends the checker.
+resolve_anchor() {  # <local-sha> <remote-sha>
+  local local_sha="$1" remote_sha="$2" dest_main mb rc
+  ANCHOR=""; ANCHOR_WHY=""
+  if [ -n "${remote_sha//0/}" ] \
+     && ANCHOR="$(git --no-replace-objects rev-parse --verify --quiet "${remote_sha}^{commit}" 2>/dev/null)"; then
+    ANCHOR_WHY="the destination's tip"
+    return 0
+  fi
+  ANCHOR=""
+  if [ -z "$PUSH_REMOTE" ]; then
+    ANCHOR_WHY="NO ANCHOR: no destination tip here and no destination named"
+    return 0
+  fi
+  if [ "$DEST_LOADED" -eq 0 ]; then
+    # shellcheck source=lib/push_destination.sh
+    { [ -f "$DESTINATION_LIB" ] && . "$DESTINATION_LIB"; } \
+      || die "$DESTINATION_LIB is missing; refusing to guess the waiver anchor"
+    DEST_ADVERTISED="$(trust_push_destination_refs "$PUSH_REMOTE")" \
+      || die "cannot inspect push destination; refusing to guess the waiver anchor"
+    DEST_LOADED=1
+  fi
+  dest_main="$(printf '%s\n' "$DEST_ADVERTISED" | awk '$2 == "refs/heads/main" { print $1; exit }')"
+  if [ -z "$dest_main" ]; then
+    ANCHOR_WHY="NO ANCHOR: the destination advertises no main this store holds"
+    return 0
+  fi
+  mb="$(git --no-replace-objects merge-base "$local_sha" "$dest_main" 2>/dev/null)"; rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$mb" ]; then
+    ANCHOR="$mb"
+    ANCHOR_WHY="merge-base with the destination's main"
+  elif [ "$rc" -eq 1 ]; then
+    ANCHOR_WHY="NO ANCHOR: no history in common with the destination's main"
+  else
+    die "cannot compute the merge-base of $local_sha and the destination's main"
+  fi
+}
+
+# The full-sha rows of the ledger in one commit's tree, sorted: the same
+# reading the sweep gives a file (comment stripped, whitespace removed, a row is
+# exactly 40 hex). No ledger at that commit is no rows; an unreadable tree is
+# exit 2.
+ledger_rows() {  # <commit>
+  local entry _mode type oid
+  entry="$(git --no-replace-objects ls-tree "$1" -- "$LEDGER_REL" 2>/dev/null)" \
+    || die "cannot read the tree of $1 — refusing to guess its grandfather ledger"
+  [ -n "$entry" ] || return 0
+  read -r _mode type oid _ <<< "$entry"
+  [ "$type" = blob ] || return 0
+  { git --no-replace-objects cat-file blob "$oid" 2>/dev/null \
+      | awk '{ sub(/#.*/, ""); gsub(/[ \t\r\n]/, ""); if ($0 ~ /^[0-9a-f]{40}$/) print }' \
+      | LC_ALL=C sort -u; } \
+    || die "cannot read $LEDGER_REL at $1 — refusing to guess its grandfather ledger"
+}
+
+# Writes the anchored waiver set to <file> and reports where it came from.
+anchored_waivers() {  # <file>
+  local out="$1" work line local_sha remote_sha n_a n_t first=1 none=0
+  work="$(mktemp -d "${TMPDIR:-/tmp}/revert-waivers.XXXXXX")" || die "cannot create a scratch directory"
+  WAIVER_WORK="$work"
+  : >"$out"
+  local notes=()
+  for line in "${ANCHOR_LINES[@]}"; do
+    local_sha="${line% *}"; remote_sha="${line#* }"
+    resolve_anchor "$local_sha" "$remote_sha"
+    ledger_rows "$local_sha" >"$work/tip" || exit 2
+    n_t="$(grep -c . "$work/tip" || true)"
+    if [ -z "$ANCHOR" ]; then
+      none=1
+      notes+=("  ${local_sha:0:12}: ${ANCHOR_WHY}; ${n_t} row(s) at the pushed tip waive nothing")
+      continue
+    fi
+    ledger_rows "$ANCHOR" >"$work/anchor" || exit 2
+    n_a="$(grep -c . "$work/anchor" || true)"
+    LC_ALL=C comm -12 "$work/anchor" "$work/tip" >"$work/line"
+    if [ "$first" -eq 1 ]; then
+      cp "$work/line" "$out"
+      first=0
+    else
+      LC_ALL=C comm -12 "$out" "$work/line" >"$work/meet"
+      cp "$work/meet" "$out"
+    fi
+    notes+=("  ${local_sha:0:12}: anchor ${ANCHOR:0:12} (${ANCHOR_WHY}); ${n_a} row(s) there, ${n_t} at the pushed tip")
+  done
+  [ "$none" -eq 0 ] || : >"$out"
+  echo "WAIVERS: $(grep -c . "$out" || true) grandfather row(s) apply — rows(anchor) ∩ rows(pushed tip), never the checkout's ledger"
+  printf '%s\n' "${notes[@]}"
+}
 
 # ------------------------------------------------------------- rev enumeration
 REVS_ARGS=()
 MODE=""
+PUSH_REMOTE=""
+LEDGER_PATH="$LEDGER_REL"
+WAIVER_WORK=""
 case "${1:---help}" in
+  --waiver-anchors)
+    # INTERNAL, for scripts/tests/: the anchor each pushed ref line resolves to,
+    # one `ANCHOR <local-sha> <anchor-sha|NONE> <why>` line per non-deletion
+    # line, so the ledger ratchet in the tests uses THIS rule rather than a copy.
+    shift
+    if [ "$#" -ne 0 ]; then
+      [ "$#" -eq 2 ] && [ "$1" = "--remote" ] && [ -n "$2" ] \
+        || die "--waiver-anchors accepts only --remote DESTINATION"
+      PUSH_REMOTE="$2"
+    fi
+    while read -r _local_ref local_sha _remote_ref remote_sha || [ -n "${_local_ref:-}" ]; do
+      [ -n "${_local_ref:-}" ] || continue
+      anchored_line_ok "$_local_ref" "${local_sha:-}" "${_remote_ref:-}" "${remote_sha:-}" \
+        || die "malformed pushed-ref line '${_local_ref} ${local_sha:-} ${_remote_ref:-} ${remote_sha:-}'"
+      [ -n "${local_sha//0/}" ] || continue
+      resolve_anchor "$local_sha" "$remote_sha"
+      printf 'ANCHOR %s %s %s\n' "$local_sha" "${ANCHOR:-NONE}" "$ANCHOR_WHY"
+    done
+    exit 0
+    ;;
   --pre-push)
     MODE=pre-push
     shift
+    if [ "$#" -ne 0 ]; then
+      [ "$#" -eq 2 ] && [ "$1" = "--remote" ] && [ -n "$2" ] \
+        || die "--pre-push accepts only --remote DESTINATION"
+      PUSH_REMOTE="$2"
+    fi
     # pre-push is fed "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines.
     # Read every one of them: git must never see EPIPE on this fd.
-    while read -r _local_ref local_sha _remote_ref remote_sha; do
+    # Anchored, an unterminated last line is judged too, and a line that is not
+    # four fields with full shas is a refusal: a line skipped is a ref unjudged.
+    while read -r _local_ref local_sha _remote_ref remote_sha \
+          || { [ "$ANCHORED" -eq 1 ] && [ -n "${_local_ref:-}" ]; }; do
+      if [ "$ANCHORED" -eq 1 ] && [ -n "${_local_ref:-}" ]; then
+        anchored_line_ok "$_local_ref" "${local_sha:-}" "${_remote_ref:-}" "${remote_sha:-}" \
+          || die "malformed pushed-ref line '${_local_ref} ${local_sha:-} ${_remote_ref:-} ${remote_sha:-}'"
+      fi
       [ -n "${local_sha:-}" ] || continue
       # An all-zero local sha is a branch DELETION; there is nothing to judge.
       case "$local_sha" in
         *[!0]*) ;;
         *) continue ;;
       esac
-      if [ -z "${remote_sha:-}" ] || [ -z "${remote_sha//0/}" ]; then
-        # New ref on the remote: judge what this push introduces that no remote
-        # already holds, rather than the branch's whole ancestry.
-        REVS_ARGS+=("$local_sha" "--not" "--remotes")
+      ANCHOR_LINES+=("$local_sha ${remote_sha:-0}")
+      if [ -z "${remote_sha:-}" ] || [ -z "${remote_sha//0/}" ] \
+         || ! git --no-replace-objects cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        # A NEW ref, or an update whose old tip is not a commit in this object
+        # store — a force push (or `+refspec`, or `--mirror`) over a tip someone
+        # else pushed and this clone never fetched. The subject is the commits
+        # the push INTRODUCES, and every one of them is local; the old tip is
+        # only how `old..new` spells that set, never evidence the lane needs.
+        # Spelled `absent..new` the single `git log` below cannot even start,
+        # and this lane refused (exit 2) a push that introduced no revert at
+        # all. So an unreadable old tip supplies no evidence, exactly as an
+        # advertised object missing here does in scripts/lib/push_destination.sh,
+        # and the lane judges MORE, not less: the whole of local_sha's history,
+        # narrowed below only by what the destination itself advertises.
+        # --not persists and would negate later ref updates too. Tracking refs
+        # are local state; only the actual destination can identify old history.
+        REVS_ARGS+=("$local_sha")
       else
         REVS_ARGS+=("${remote_sha}..${local_sha}")
       fi
@@ -159,6 +340,47 @@ case "${1:---help}" in
     ;;
 esac
 
+# The subject of a push is the commits it INTRODUCES to its destination, for
+# every ref line alike. A new branch inherits history the destination already
+# holds, and so does an UPDATE whose range crosses a merge of that history:
+# `old..new` of a branch that merges main carries main's already-published
+# commits. Judging those refused an update over a revert it did not introduce,
+# while the same update beside any new ref in one push was judged correctly —
+# the exclusions below are global to the single `git log`, so a subject that
+# depended on whether a new ref happened to ride along was two subjects, and a
+# throwaway branch chose the lenient one. One subject now, decided here once,
+# the same selector check_measurement_provenance.sh applies.
+# Without a destination, conservatively examine every pushed range in full —
+# and a new ref, or an update over an old tip this clone never fetched, in the
+# full history of its new tip (the read loop above says why).
+# Explicit range/history audits always retain their original subject, including
+# commits previously published without a rationale. Never trust local tracking
+# refs: only what the destination itself advertises is excluded. What counts as
+# advertised — peeled tags, missing objects skipped, a malformed advertisement
+# refused — is scripts/lib/push_destination.sh's contract, not this file's, so
+# the caller-skew lane excludes on exactly the same evidence.
+if [ "$MODE" = pre-push ] && [ -n "$PUSH_REMOTE" ]; then
+  # shellcheck source=lib/push_destination.sh
+  { [ -f "$DESTINATION_LIB" ] && . "$DESTINATION_LIB"; } \
+    || die "$DESTINATION_LIB is missing; refusing to guess published history"
+  destination="$(trust_push_destination_refs "$PUSH_REMOTE")" \
+    || die "cannot inspect push destination; refusing to guess published history"
+  DEST_ADVERTISED="$destination"; DEST_LOADED=1
+  while read -r commit _ref; do
+    [ -n "${commit:-}" ] || continue
+    REVS_ARGS+=("^$commit")
+  done <<< "$destination"
+fi
+
+# Anchored (push context): the waiver set comes from git objects, never the
+# checkout. See "the ANCHORED waiver reading" above.
+if [ "$MODE" = pre-push ] && [ "$ANCHORED" -eq 1 ]; then
+  WAIVER_FILE="$(mktemp "${TMPDIR:-/tmp}/revert-waiver-set.XXXXXX")" || die "cannot create a scratch file"
+  trap 'rm -f "$WAIVER_FILE"; [ -z "$WAIVER_WORK" ] || rm -rf "$WAIVER_WORK"' EXIT
+  anchored_waivers "$WAIVER_FILE"
+  LEDGER_PATH="$WAIVER_FILE"
+fi
+
 # ------------------------------------------------------------------- the sweep
 # ONE `git log` for the whole range, not one per commit: a `git log -1` per
 # revision costs ~90s over this repository's 7,089 commits, which is how a gate
@@ -166,10 +388,10 @@ esac
 #
 # `%x1f` separates the three fields, `%x1e` separates records. A body is
 # multi-line by nature, so it must be the LAST field.
-LOG="$(git log --format='%H%x1f%s%x1f%b%x1e' "${REVS_ARGS[@]}" 2>/dev/null)" \
+LOG="$(git --no-replace-objects log --format='%H%x1f%s%x1f%b%x1e' "${REVS_ARGS[@]}" 2>/dev/null)" \
   || die "git log ${REVS_ARGS[*]} failed — refusing to report green on a range I cannot read"
 
-SWEEP="$(printf '%s' "$LOG" | awk -v ledger="$LEDGER_REL" -v min="$MIN_CHARS" '
+SWEEP="$(printf '%s' "$LOG" | awk -v ledger="$LEDGER_PATH" -v min="$MIN_CHARS" '
   BEGIN {
     # The ledger is read FIRST, while RS is still a newline. Setting RS to the
     # record separator before this loop swallows the whole file as one record

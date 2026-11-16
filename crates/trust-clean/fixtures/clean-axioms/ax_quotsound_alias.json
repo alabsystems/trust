@@ -1,0 +1,1 @@
+{"term": {"Const": "bad"}, "context": [{"name": "False", "entry": {"Axiom": {"ty": {"Sort": 0}}}}, {"name": "Quot.sound", "entry": {"Axiom": {"ty": {"Const": "False"}}}}, {"name": "bad", "entry": {"Definition": {"ty": {"Const": "False"}, "value": {"Const": "Quot.sound"}}}}]}

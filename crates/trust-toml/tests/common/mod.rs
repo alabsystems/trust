@@ -76,9 +76,7 @@ pub fn compare(
                 let left_set: BTreeSet<&str> = left_keys.iter().copied().collect();
                 let right_set: BTreeSet<&str> = right_keys.iter().copied().collect();
                 if left_set == right_set {
-                    out.push(format!(
-                        "{at}: key ORDER differs — {left_keys:?} vs {right_keys:?}"
-                    ));
+                    out.push(format!("{at}: key ORDER differs — {left_keys:?} vs {right_keys:?}"));
                 } else {
                     out.push(format!(
                         "{at}: keys differ — only incumbent {:?}, only trust-toml {:?}",
@@ -165,11 +163,8 @@ pub fn compare_incumbent(
             }
         }
         (left, right) if left == right => {}
-        (left, right) => out.push(format!(
-            "{at}: {} {left} vs {} {right}",
-            left.type_str(),
-            right.type_str()
-        )),
+        (left, right) => {
+            out.push(format!("{at}: {} {left} vs {} {right}", left.type_str(), right.type_str()))
+        }
     }
 }
-

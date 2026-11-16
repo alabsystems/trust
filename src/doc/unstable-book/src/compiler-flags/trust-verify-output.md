@@ -17,10 +17,10 @@ what this compiler invocation prints, never what gets proved or what code is
 emitted.
 
 `targo trust` owns this setting and always requests the structured transport.
-It is deliberately *not* settable through `TRUSTFLAGS`: authenticated coverage
-parsing depends on the JSON transport, so a last-wins `human` override would
-sever evidence collection and every run would fail closed with a confusing
-transport error rather than an honest policy error.
+No per-run channel sets it (`TRUSTFLAGS`, which refused it, is not read since
+2026-10-11): authenticated coverage parsing depends on the JSON transport, so a
+`human` override would sever evidence collection and every run would fail
+closed with a confusing transport error rather than an honest policy error.
 
 The retired `TRUST_VERIFY_OUTPUT` environment variable is rejected outright — a
 Trust-semantics compilation is a fatal error if it is set, rather than silently

@@ -1,7 +1,7 @@
 // We're testing x86 target specific features
 //@only-target: x86_64 i686
 //@compile-flags: -C target-feature=+avx512f,+avx512vl,+avx512bw,+avx512bitalg,+avx512vpopcntdq,+avx512vnni,+avx512vbmi
-//@run-native
+//@run-native: ignore-output
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -12,8 +12,8 @@ use std::mem::transmute;
 fn main() {
     if !is_x86_feature_detected!("avx512f") {
         // GH runners don't have this, but we still want to run this natively if
-        // the machine happens to have gfni. So we bail out dynamically.
-        println!("warning: skipping AVX512 tests");
+        // the machine happens to have AVX512. So we bail out dynamically.
+        println!("warning: skipping avx512 tests");
         return;
     }
 
@@ -545,6 +545,80 @@ unsafe fn test_avx512ternarylogic() {
         assert_eq_m128i(r, e);
     }
     test_mm_ternarylogic_epi32();
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn test_mm512_ternarylogic_epi64() {
+        let a = _mm512_set4_epi64(0b100, 0b110, 0b001, 0b101);
+        let b = _mm512_set4_epi64(0b010, 0b011, 0b001, 0b110);
+        let c = _mm512_set4_epi64(0b001, 0b000, 0b001, 0b111);
+
+        // Identity of A.
+        let r = _mm512_ternarylogic_epi64::<0b1111_0000>(a, b, c);
+        assert_eq_m512i(r, a);
+
+        // Bitwise xor.
+        let r = _mm512_ternarylogic_epi64::<0b10010110>(a, b, c);
+        let e = _mm512_set4_epi64(0b111, 0b101, 0b001, 0b100);
+        assert_eq_m512i(r, e);
+
+        // Majority (2 or more bits set).
+        let r = _mm512_ternarylogic_epi64::<0b1110_1000>(a, b, c);
+        let e = _mm512_set4_epi64(0b000, 0b010, 0b001, 0b111);
+        assert_eq_m512i(r, e);
+
+        // Every bit of every lane: with these inputs, bit `i` indexes the table with
+        // `i % 8`, so the result is the table repeated in every byte.
+        let a = _mm512_set1_epi64(0xF0F0_F0F0_F0F0_F0F0_u64 as i64);
+        let b = _mm512_set1_epi64(0xCCCC_CCCC_CCCC_CCCC_u64 as i64);
+        let c = _mm512_set1_epi64(0xAAAA_AAAA_AAAA_AAAA_u64 as i64);
+        let r = _mm512_ternarylogic_epi64::<0x6C>(a, b, c);
+        assert_eq_m512i(r, _mm512_set1_epi64(0x6C6C_6C6C_6C6C_6C6C));
+    }
+    test_mm512_ternarylogic_epi64();
+
+    #[target_feature(enable = "avx512f,avx512vl")]
+    unsafe fn test_mm256_ternarylogic_epi64() {
+        let a = _mm256_setr_epi64x(0b100, 0b110, 0b001, 0b101);
+        let b = _mm256_setr_epi64x(0b010, 0b011, 0b001, 0b110);
+        let c = _mm256_setr_epi64x(0b001, 0b000, 0b001, 0b111);
+
+        // Identity of A.
+        let r = _mm256_ternarylogic_epi64::<0b1111_0000>(a, b, c);
+        assert_eq_m256i(r, a);
+
+        // Bitwise xor.
+        let r = _mm256_ternarylogic_epi64::<0b10010110>(a, b, c);
+        let e = _mm256_setr_epi64x(0b111, 0b101, 0b001, 0b100);
+        assert_eq_m256i(r, e);
+
+        // Majority (2 or more bits set).
+        let r = _mm256_ternarylogic_epi64::<0b1110_1000>(a, b, c);
+        let e = _mm256_setr_epi64x(0b000, 0b010, 0b001, 0b111);
+        assert_eq_m256i(r, e);
+    }
+    test_mm256_ternarylogic_epi64();
+
+    #[target_feature(enable = "avx512f,avx512vl")]
+    unsafe fn test_mm_ternarylogic_epi64() {
+        let a = _mm_set_epi64x(0b100, 0b110);
+        let b = _mm_set_epi64x(0b010, 0b011);
+        let c = _mm_set_epi64x(0b001, 0b000);
+
+        // Identity of A.
+        let r = _mm_ternarylogic_epi64::<0b1111_0000>(a, b, c);
+        assert_eq_m128i(r, a);
+
+        // Bitwise xor.
+        let r = _mm_ternarylogic_epi64::<0b10010110>(a, b, c);
+        let e = _mm_set_epi64x(0b111, 0b101);
+        assert_eq_m128i(r, e);
+
+        // Majority (2 or more bits set).
+        let r = _mm_ternarylogic_epi64::<0b1110_1000>(a, b, c);
+        let e = _mm_set_epi64x(0b000, 0b010);
+        assert_eq_m128i(r, e);
+    }
+    test_mm_ternarylogic_epi64();
 }
 
 #[target_feature(enable = "avx512vnni")]
@@ -764,9 +838,57 @@ unsafe fn test_avx512bw() {
         assert_eq_m512i(_mm512_packus_epi32(a, b), dst);
     }
     test_mm512_packus_epi32();
+
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn test_mm512_avg_epu8() {
+        let a = _mm512_set1_epi8(1);
+        let b = _mm512_set1_epi8(1);
+        let r = _mm512_avg_epu8(a, b);
+        let e = _mm512_set1_epi8(1);
+        assert_eq_m512i(r, e);
+
+        // Intermediary sum can overflow, but the final result not.
+        let a = _mm512_set1_epi8(u8::MAX as i8);
+        let b = _mm512_set1_epi8((u8::MAX - 2) as i8);
+        let r = _mm512_avg_epu8(a, b);
+        let e = _mm512_set1_epi8((u8::MAX - 1) as i8);
+        assert_eq_m512i(r, e);
+
+        // Odd sums are rounded up.
+        let a = _mm512_set1_epi8(3);
+        let b = _mm512_set1_epi8(6);
+        let r = _mm512_avg_epu8(a, b);
+        let e = _mm512_set1_epi8(5);
+        assert_eq_m512i(r, e);
+    }
+    test_mm512_avg_epu8();
+
+    #[target_feature(enable = "avx512bw")]
+    unsafe fn test_mm512_avg_epu16() {
+        let a = _mm512_set1_epi16(1);
+        let b = _mm512_set1_epi16(1);
+        let r = _mm512_avg_epu16(a, b);
+        let e = _mm512_set1_epi16(1);
+        assert_eq_m512i(r, e);
+
+        // Intermediary sum can overflow, but the final result not.
+        let a = _mm512_set1_epi16(u16::MAX as i16);
+        let b = _mm512_set1_epi16((u16::MAX - 2) as i16);
+        let r = _mm512_avg_epu16(a, b);
+        let e = _mm512_set1_epi16((u16::MAX - 1) as i16);
+        assert_eq_m512i(r, e);
+
+        // Odd sums are rounded up.
+        let a = _mm512_set1_epi16(3);
+        let b = _mm512_set1_epi16(6);
+        let r = _mm512_avg_epu16(a, b);
+        let e = _mm512_set1_epi16(5);
+        assert_eq_m512i(r, e);
+    }
+    test_mm512_avg_epu16();
 }
 
-#[target_feature(enable = "avx512vbmi")]
+#[target_feature(enable = "avx512vbmi,avx512vl")]
 unsafe fn test_avx512vbmi() {
     #[target_feature(enable = "avx512vbmi")]
     unsafe fn test_mm512_permutex2var_epi8() {
@@ -872,6 +994,101 @@ unsafe fn test_avx512vbmi() {
         assert_eq_m512i(_mm512_permutex2var_epi8(a, idx, b), e);
     }
     test_mm512_permutex2var_epi8();
+
+    #[target_feature(enable = "avx512vbmi")]
+    unsafe fn test_mm512_permutexvar_epi8() {
+        // Only the lower 6 bits of the index are used, the rest is masked off.
+        #[rustfmt::skip]
+        let idx_arr: [u8; 64] = [
+            34, 58, 27, 72, 19, 38, 53,  0, 44, 15, 29, 81, 20, 35, 62,  6,
+            24, 49, 10, 68, 22, 57, 40, 13, 52,  1, 30, 95, 16, 33,  4, 55,
+            26, 47, 11, 74, 21, 59, 36,  8, 50,  3, 28, 99, 14, 45, 61,  2,
+            18, 39,  7, 64, 23, 54,  9,127, 12, 31, 88,  5, 42, 17,  0, u8::MAX,
+        ];
+
+        #[rustfmt::skip]
+        let a_arr: [i8; 64] = [
+             -93,  -94,  -95,  -96,  -97,  -98,  -99, -100,
+            -101, -102, -103, -104, -105, -106, -107, -108,
+            -109, -110, -111, -112, -113, -114, -115, -116,
+            -117, -118, -119, -120, -121, -122, -123, -124,
+            -125, -126, -127, -128,  127,  126,  125,  124,
+             123,  122,  121,  120,  119,  118,  117,  116,
+             115,  114,  113,  112,  111,  110,  109,  108,
+             107,  106,  105,  104,  103,  102,  101,  100,
+        ];
+
+        let idx = transmute(idx_arr);
+        let a = transmute(a_arr);
+
+        let r = _mm512_permutexvar_epi8(idx, a);
+
+        let e_arr = std::array::from_fn(|i| a_arr[(idx_arr[i] & 0b0011_1111) as usize]);
+        let e = transmute::<[i8; 64], _>(e_arr);
+
+        assert_eq_m512i(r, e);
+    }
+    test_mm512_permutexvar_epi8();
+
+    #[target_feature(enable = "avx512vbmi,avx512vl")]
+    unsafe fn test_mm256_permutexvar_epi8() {
+        // Only the lower 5 bits of the index are used, the rest is masked off.
+        #[rustfmt::skip]
+        let idx_arr: [u8; 32] = [
+            26, 47, 11, 42, 21, 59, 36,  8,
+            18,  3, 28, 31, 14, 45, 29,  2,
+            24, 17, 10, 30, 22, 25, 12, 13,
+            20,  1,  6, 15, 16,  9,  0, u8::MAX,
+        ];
+
+        #[rustfmt::skip]
+        let a_arr: [i8; 32] = [
+            -93, -94, -95, -96, -97, -98, -99, -100,
+            -101, -102, -103, -104, -105, -106, -107, -108,
+            -109, -110, -111, -112, -113, -114, -115, -116,
+            -117, -118, -119, -120, -121, -122, -123, -124,
+        ];
+
+        let idx = transmute(idx_arr);
+        let a = transmute(a_arr);
+        let r = _mm256_permutexvar_epi8(idx, a);
+
+        let e_arr = std::array::from_fn(|i| a_arr[(idx_arr[i] & 0b0001_1111) as usize]);
+        let e = transmute::<[i8; 32], _>(e_arr);
+
+        assert_eq_m256i(r, e);
+    }
+    test_mm256_permutexvar_epi8();
+
+    #[target_feature(enable = "avx512vbmi,avx512vl")]
+    unsafe fn test_mm_permutexvar_epi8() {
+        // Only the lower 4 bits of the index are used, the rest is masked off.
+        #[rustfmt::skip]
+        let idx_arr: [u8; 16] = [
+            14, 3, 12, 7,
+            8, 1, 10, 15,
+            4, 9, 2, 13,
+            6, 11, 0, u8::MAX,
+        ];
+
+        #[rustfmt::skip]
+        let a_arr: [i8; 16] = [
+            -93, -94, -95, -96,
+            -97, -98, -99, -100,
+            -101, -102, -103, -104,
+            -105, -106, -107, -108,
+        ];
+
+        let idx = transmute(idx_arr);
+        let a = transmute(a_arr);
+        let r = _mm_permutexvar_epi8(idx, a);
+
+        let e_arr = std::array::from_fn(|i| a_arr[(idx_arr[i] & 0b0000_1111) as usize]);
+        let e = transmute::<[i8; 16], _>(e_arr);
+
+        assert_eq_m128i(r, e);
+    }
+    test_mm_permutexvar_epi8();
 }
 
 #[track_caller]

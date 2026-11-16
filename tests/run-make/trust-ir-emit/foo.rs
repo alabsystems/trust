@@ -11,11 +11,17 @@ pub fn evens(n: u32) -> impl Iterator<Item = u32> {
     (0..n).filter(|x| x % 2 == 0)
 }
 
+/// The same ZST callable argument without an opaque declared return keeps
+/// that independent splice refusal observable after opaque provenance is kept.
+pub fn even_count(n: u32) -> usize {
+    (0..n).filter(|x| x % 2 == 0).count()
+}
+
 /// Outside the lowerable fragment: `dyn` dispatch has no static callee, so the
 /// direct THIR lowering records `Call(dyn dispatch)` and declines the body.
 ///
 /// This body exists to keep the coverage HISTOGRAMS under test. `evens` used to
-/// play that role, but the lowering improved and it now lowers (symbolically);
+/// play that role, but the lowering improved and it now lowers (its RPIT revealed by typeck);
 /// with every body in this crate lowering, the assertions that a DECLINED body
 /// publishes both its first-fail inventory and its collect-all leaf demand
 /// would have had no subject and would have passed vacuously.

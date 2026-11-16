@@ -243,6 +243,7 @@ fn call_abi_is_modeled(terminator: &Terminator) -> bool {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
             ..
         }
     )
@@ -682,7 +683,7 @@ pub fn sem_fold_launch_wrapper_of(
     // carry its field types (the wrong-denotation kill: a doctored aggregate
     // naming a different folder than the declared local type declines here).
     let folder_decl_fields: Vec<(String, Ty)> = match body.locals.get(folder_local).map(|l| &l.ty) {
-        Some(Ty::Adt { name: dn, fields, .. }) if dn == &folder_name => fields.clone(),
+        Some(Ty::Adt { name: dn, fields, .. }) if dn == &folder_name => fields.to_vec(),
         _ => {
             return Err(FoldWrapDecline::FolderMismatch(format!(
                 "folder local's declared type does not name {folder_name}"

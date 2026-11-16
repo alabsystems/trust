@@ -1,10 +1,10 @@
 use crate::command_prelude::*;
 
-use cargo::CargoResult;
-use cargo::core::compiler::future_incompat::OnDiskReports;
-use cargo::core::compiler::future_incompat::REPORT_PREAMBLE;
-use cargo::drop_println;
-use cargo::ops;
+use targo::CargoResult;
+use targo::compiler::future_incompat::OnDiskReports;
+use targo::compiler::future_incompat::REPORT_PREAMBLE;
+use targo::drop_println;
+use targo::ops;
 
 pub fn cli() -> Command {
     subcommand("report")
@@ -52,7 +52,27 @@ pub fn cli() -> Command {
             subcommand("rebuilds")
                 .about("Reports rebuild reasons from previous sessions (unstable)")
                 .arg_manifest_path()
-                .arg(opt("id", "Session ID to report on").value_name("ID")),
+                .arg(opt("id", "Session ID to report on").value_name("ID"))
+                .arg(flag(
+                    "json",
+                    "Print observed rebuild classifications as JSON",
+                )),
+        )
+        // Trust: metadata-only report; JSON costs require complete evidence.
+        .subcommand(
+            subcommand("cache-work")
+                .about("Reports build-script input capture work (unstable)")
+                .arg_manifest_path()
+                .arg(opt("id", "Session ID to report on").value_name("ID"))
+                .arg(flag("json", "Print a complete machine-readable report")),
+        )
+        // Trust: actual native queue outcomes, separate from input scan work.
+        .subcommand(
+            subcommand("execution")
+                .about("Reports compilation queue outcomes (unstable)")
+                .arg_manifest_path()
+                .arg(opt("id", "Session ID to report on").value_name("ID"))
+                .arg(flag("json", "Print a machine-readable execution report")),
         )
 }
 
@@ -68,7 +88,13 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
                 gctx.cli_unstable().build_analysis,
             )?;
             let opts = timings_opts(gctx, args)?;
-            let ws = args.workspace(gctx).ok();
+            // Trust: an invalid explicit manifest must remain an error rather
+            // than silently selecting a session outside the requested workspace.
+            let ws = if args.get_raw("manifest-path").is_some() {
+                Some(args.workspace(gctx)?)
+            } else {
+                args.workspace(gctx).ok()
+            };
             ops::report_timings(gctx, ws.as_ref(), opts)?;
             Ok(())
         }
@@ -93,9 +119,49 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
                 "build-analysis",
                 gctx.cli_unstable().build_analysis,
             )?;
-            let ws = args.workspace(gctx).ok();
+            // Trust: preserve an explicit workspace error instead of silently
+            // turning a failed manifest lookup into an unscoped log query.
+            let ws = if args.get_raw("manifest-path").is_some() {
+                Some(args.workspace(gctx)?)
+            } else {
+                args.workspace(gctx).ok()
+            };
             let opts = rebuilds_opts(args)?;
             ops::report_rebuilds(gctx, ws.as_ref(), opts)?;
+            Ok(())
+        }
+        Some((name @ ("cache-work" | "execution"), args)) => {
+            gctx.cli_unstable().fail_if_stable_command(
+                gctx,
+                &format!("report {name}"),
+                15844,
+                "build-analysis",
+                gctx.cli_unstable().build_analysis,
+            )?;
+            // Trust: an invalid explicit workspace must not become an unscoped
+            // session query. Outside a workspace, an ID can still be queried.
+            let ws = if args.get_raw("manifest-path").is_some() {
+                Some(args.workspace(gctx)?)
+            } else {
+                args.workspace(gctx).ok()
+            };
+            let id = args
+                .get_one::<String>("id")
+                .map(|id| id.parse())
+                .transpose()?;
+            if name == "execution" {
+                ops::report_execution(
+                    gctx,
+                    ws.as_ref(),
+                    ops::ReportExecutionOptions { id, json: args.get_flag("json") },
+                )?;
+            } else {
+                ops::report_cache_work(
+                    gctx,
+                    ws.as_ref(),
+                    ops::ReportCacheWorkOptions { id, json: args.get_flag("json") },
+                )?;
+            }
             Ok(())
         }
         Some((cmd, _)) => {
@@ -150,5 +216,8 @@ fn rebuilds_opts(args: &ArgMatches) -> CargoResult<ops::ReportRebuildsOptions> {
         .map(|s| s.parse())
         .transpose()?;
 
-    Ok(ops::ReportRebuildsOptions { id })
+    Ok(ops::ReportRebuildsOptions {
+        id,
+        json: args.get_flag("json"),
+    })
 }

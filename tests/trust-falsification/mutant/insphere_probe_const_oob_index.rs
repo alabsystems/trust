@@ -10,15 +10,19 @@
 // determinant over fixed `[i64; 3]` arrays, with the twelve relative-coordinate
 // `checked_sub`s INLINE in one body. The inlining is load-bearing, not style:
 // the hardened panic-boundary VC for a late statement carries the accumulated
-// body-definition conjunction, and that chain is what pushes the derived
-// typed-CHC contract past `MAX_CONTRACT_PREDICATE_JSON_DEPTH`. Helper functions
-// break the chain and the class is not reached.
+// body-definition conjunction, and that chain is what pushed the derived
+// typed-CHC contract past the public API's 128-level contract-predicate depth
+// bound, which declined it. T3 L4 C09d deleted that bound: the contract now meets
+// the bound its readers decode (`trust_types::json_depth::MAX_DEEP_NESTING`,
+// 4096 levels), and a chain this long is expected to stay under it and be minted
+// (the C09d audit run measures it). Helper functions break the chain and the
+// class is not reached.
 //
 // NOTE ON COVERAGE: the deep-contract class needs
 // `-Ztrust-verify-profile=unix_hardened` (a3d's own gate runs it; the
 // falsification gate does not pass it). Under the gate's default flags these
 // fixtures still exercise ordinary bounds refutation, which is why they belong
-// here; the hardened-profile battery is what pins the decline path itself.
+// here; the hardened-profile battery is what pins the deep-contract path itself.
 
 fn det3(r0: [i128; 3], r1: [i128; 3], r2: [i128; 3]) -> Option<i128> {
     let m0 = r1[1].checked_mul(r2[2])?.checked_sub(r1[2].checked_mul(r2[1])?)?;

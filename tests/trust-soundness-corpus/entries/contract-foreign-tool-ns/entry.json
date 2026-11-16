@@ -1,0 +1,41 @@
+{
+  "id": "contract-foreign-tool-ns",
+  "class": "CONTRACT-NS-1",
+  "title": "a #[clippy::requires] attribute carrying the compiler's lowering marker was assumed as a contract; f(300) returned the wrapped 4",
+  "origin": [
+    "DQ:1366, KH:14717 (CONTRACT-NS-1)",
+    "tests/ui/trust/contract_attr_foreign_tool_namespace{,_run}.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "f",
+    "obligation": {
+      "kind": "overflow",
+      "at": "x + 4_294_967_000"
+    }
+  },
+  "twin": {
+    "function": "f_guarded",
+    "obligation": {
+      "kind": "overflow",
+      "at": "x + 4_294_967_000"
+    }
+  },
+  "witness": {
+    "input": "x = 300",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "reproducer": "not-proved"
+    }
+  },
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "contract attribute must use parenthesized form, e.g. `#[ensures(expr)]`"
+    }
+  }
+}

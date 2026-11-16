@@ -23,10 +23,12 @@
 //! 65 switch arms share one target — one past `MAX_PATHS_PER_BLOCK`, so the
 //! target SATURATES — and that target holds three arithmetic statements, the
 //! last of which is a GENUINE unguarded `u32` multiply overflow. Multiplying
-//! that row by the block's in-degree demoted it from REFUTED to
-//! `Unknown{internal-error}`. A real violation silently turned into a decline is
-//! a bug that SHIPS, and buying a false-refutation fix with one is not a trade
-//! worth making.
+//! that row by the block's in-degree demoted it from REFUTED to an `Unknown`:
+//! ay's refusal of the mixed BV + nonlinear Int query, `incomplete`, phase
+//! `theory-combination`, with its executor refusal as the detail
+//! (`internal-error` before ay's AD1 fix). A real violation silently turned
+//! into a decline is a bug that SHIPS, and buying a false-refutation fix with
+//! one is not a trade worth making.
 //!
 //! The repair is SCOPED by `v2_violation_is_content_free`: only a row with no
 //! violation condition of its own — the one whose entire meaning IS the path
@@ -34,6 +36,9 @@
 //! keeps the size and the verdict it had before, which is what this file pins.
 
 use trust_types::{VcKind, VerifiableFunction, VerificationCondition, VerificationResult};
+
+#[path = "support/test_router.rs"]
+mod test_router;
 
 fn load() -> VerifiableFunction {
     let path = format!(
@@ -95,7 +100,7 @@ fn the_fixture_still_saturates_its_shared_target() {
 #[test]
 fn a_genuine_overflow_in_a_collapsed_block_is_still_refuted() {
     let vcs = trust_vcgen::generate_vcs(&load());
-    let router = trust_router::Router::deterministic_in_process_ay(60_000);
+    let router = test_router::deterministic_test_router();
     let results = router.verify_all(&vcs);
     let (vc, result) = results
         .iter()

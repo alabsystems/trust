@@ -3,6 +3,14 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
+//! ZERO-ROW-GATE AMENDMENT (2026-10-10, docs/DECISION_QUEUE.md ZERO-ROW-GATE): the NEGATIVE CONTROL `control`
+//! below is now refused by the zero-row gate (one annotated ERROR, its doc's "no
+//! annotation, deliberately" predates that). The C-FLOW poison it controls is still
+//! what is pinned: a zero-row refusal carries the "this function has no obligation of
+//! its own" note, which says the poison lane did NOT add an obligation there.
+//! `dyn_dispatch_reliance_recursive_field_carrier_discharges.rs` is now check-fail for
+//! the same reason; it still asserts the discharge, through that pinned NOTE.
+//!
 //! LIVENESS PIN for the C-FLOW poison lane, in both directions. It asserts
 //! nothing new about the compiler; its entire job is to hold up the evidence
 //! that a NEIGHBOURING fixture's central pin depends on.
@@ -111,6 +119,9 @@ pub struct Bundle<'a> {
 /// NEGATIVE CONTROL — no annotation, deliberately. A witnessed site with no
 /// unwitnessed carrier anywhere must still DISCHARGE. Fires only on the poison
 /// lane OVER-firing; see the header for why this pin is the weaker of the two.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `dyn_dispatch_reliance_poison_lane_liveness::control`
+//~v NOTE this function has no obligation of its own
 pub fn control() -> u32 {
     let mut g = Good;
     let local: &mut dyn Emit = &mut g;
@@ -127,6 +138,10 @@ pub fn control() -> u32 {
 /// which is why one poisoned trait refuses both.
 pub fn positive_control(b: &mut Bundle<'_>) -> u32 {
     //~^ ERROR Trust strict verification failed
+    //~| ERROR Trust Level 0 safety verification incomplete
+    // (OD-1 item 14 amendment, 2026-10-06: the caller-chosen vtable read through a
+    // field is also a class (c) Level-0 refutation, docs/DECISION_QUEUE.md
+    // "OD-1-RG-CONCRETE".)
     let mut g = Good;
     let local: &mut dyn Emit = &mut g;
     let a = local.emit(1);

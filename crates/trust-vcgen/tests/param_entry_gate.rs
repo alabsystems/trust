@@ -36,6 +36,9 @@
 
 use trust_types::{VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 const MIR_PARAM_FLAT: &str = r##"{"name":"param_flat","def_path":"param_flat::param_flat","span":{"file":"param_flat.rs","line_start":1,"col_start":0,"line_end":3,"col_end":22},"body":{"locals":[{"index":0,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":1,"ty":{"Ref":{"mutable":false,"inner":{"Array":{"elem":{"Int":{"width":8,"signed":false}},"len":6}}}},"name":"g"},{"index":2,"ty":{"Int":{"width":64,"signed":false}},"name":"i"},{"index":3,"ty":"Bool","name":"c"},{"index":4,"ty":{"Int":{"width":8,"signed":false}},"name":"s"},{"index":5,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":null},{"index":6,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":null},{"index":7,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":"iter"},{"index":8,"ty":{"Adt":{"name":"core::option::Option","fields":[["__tag",{"Int":{"width":64,"signed":true}}],["__v1_0",{"Int":{"width":64,"signed":false}}]],"variants":[{"name":"None","discriminant":0,"fields":[]},{"name":"Some","discriminant":1,"fields":[["0",{"Int":{"width":64,"signed":false}}]]}],"disc_index_safe":true,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Enum"}},"name":null},{"index":9,"ty":{"Ref":{"mutable":true,"inner":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}}}},"name":null},{"index":10,"ty":{"Int":{"width":64,"signed":true}},"name":null},{"index":11,"ty":{"Int":{"width":64,"signed":false}},"name":"y"},{"index":12,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":null},{"index":13,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":null},{"index":14,"ty":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}},"name":"iter"},{"index":15,"ty":{"Adt":{"name":"core::option::Option","fields":[["__tag",{"Int":{"width":64,"signed":true}}],["__v1_0",{"Int":{"width":64,"signed":false}}]],"variants":[{"name":"None","discriminant":0,"fields":[]},{"name":"Some","discriminant":1,"fields":[["0",{"Int":{"width":64,"signed":false}}]]}],"disc_index_safe":true,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Enum"}},"name":null},{"index":16,"ty":{"Ref":{"mutable":true,"inner":{"Adt":{"name":"core::ops::range::Range","fields":[["start",{"Int":{"width":64,"signed":false}}],["end",{"Int":{"width":64,"signed":false}}]],"variants":[],"disc_index_safe":false,"faithful_enum_repr":null,"layout":null,"enum_layout":null,"adt_kind":"Struct"}}}},"name":null},{"index":17,"ty":{"Int":{"width":64,"signed":true}},"name":null},{"index":18,"ty":{"Int":{"width":64,"signed":false}},"name":"x"},{"index":19,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":20,"ty":{"Tuple":[{"Int":{"width":64,"signed":false}},"Bool"]},"name":null},{"index":21,"ty":{"Tuple":[{"Int":{"width":64,"signed":false}},"Bool"]},"name":null},{"index":22,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":23,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":24,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":25,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":26,"ty":"Bool","name":null},{"index":27,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":28,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":29,"ty":"Bool","name":null}],"blocks":[{"id":0,"stmts":[{"Assign":{"place":{"local":4,"projections":[]},"rvalue":{"Use":{"Constant":{"Uint":[0,8]}}},"span":{"file":"param_flat.rs","line_start":1,"col_start":66,"line_end":1,"col_end":69}}}],"terminator":{"SwitchInt":{"discr":{"Copy":{"local":3,"projections":[]}},"targets":[[0,15]],"otherwise":1,"exhaustive_enum_unreachable":false,"span":{"file":"param_flat.rs","line_start":2,"col_start":5,"line_end":2,"col_end":6}}}},{"id":1,"stmts":[{"Assign":{"place":{"local":6,"projections":[]},"rvalue":{"Aggregate":[{"Adt":{"name":"core::ops::range::Range","variant":0,"active_field":null,"args":"core::ops::range::Range<usize>"}},[{"Constant":{"Uint":[0,64]}},{"Constant":{"Uint":[2,64]}}]]},"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22}}}],"terminator":{"Call":{"func":"<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter","args":[{"Move":{"local":6,"projections":[]}}],"dest":{"local":5,"projections":[]},"target":2,"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"unwind":"Continue"}}},{"id":2,"stmts":[{"Assign":{"place":{"local":7,"projections":[]},"rvalue":{"Use":{"Move":{"local":5,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22}}}],"terminator":{"Goto":3}},{"id":3,"stmts":[{"Assign":{"place":{"local":9,"projections":[]},"rvalue":{"Ref":{"mutable":true,"place":{"local":7,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22}}}],"terminator":{"Call":{"func":"<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next","args":[{"Copy":{"local":9,"projections":[]}}],"dest":{"local":8,"projections":[]},"target":4,"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"unwind":"Continue"}}},{"id":4,"stmts":[{"Assign":{"place":{"local":10,"projections":[]},"rvalue":{"Discriminant":{"local":8,"projections":[]}},"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22}}}],"terminator":{"SwitchInt":{"discr":{"Move":{"local":10,"projections":[]}},"targets":[[0,17],[1,6]],"otherwise":5,"exhaustive_enum_unreachable":true,"span":{"file":"param_flat.rs","line_start":2,"col_start":18,"line_end":2,"col_end":22}}}},{"id":5,"stmts":[],"terminator":"Unreachable"},{"id":6,"stmts":[{"Assign":{"place":{"local":11,"projections":[]},"rvalue":{"Use":{"Copy":{"local":8,"projections":[{"Downcast":1},{"Field":0}]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":13,"line_end":2,"col_end":14}}},{"Assign":{"place":{"local":13,"projections":[]},"rvalue":{"Aggregate":[{"Adt":{"name":"core::ops::range::Range","variant":0,"active_field":null,"args":"core::ops::range::Range<usize>"}},[{"Constant":{"Uint":[0,64]}},{"Constant":{"Uint":[3,64]}}]]},"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38}}}],"terminator":{"Call":{"func":"<core::ops::range::Range<usize> as core::iter::traits::collect::IntoIterator>::into_iter","args":[{"Move":{"local":13,"projections":[]}}],"dest":{"local":12,"projections":[]},"target":7,"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"unwind":"Continue"}}},{"id":7,"stmts":[{"Assign":{"place":{"local":14,"projections":[]},"rvalue":{"Use":{"Move":{"local":12,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38}}}],"terminator":{"Goto":8}},{"id":8,"stmts":[{"Assign":{"place":{"local":16,"projections":[]},"rvalue":{"Ref":{"mutable":true,"place":{"local":14,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38}}}],"terminator":{"Call":{"func":"<core::ops::range::Range<usize> as core::iter::traits::iterator::Iterator>::next","args":[{"Copy":{"local":16,"projections":[]}}],"dest":{"local":15,"projections":[]},"target":9,"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"unwind":"Continue"}}},{"id":9,"stmts":[{"Assign":{"place":{"local":17,"projections":[]},"rvalue":{"Discriminant":{"local":15,"projections":[]}},"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38}}}],"terminator":{"SwitchInt":{"discr":{"Move":{"local":17,"projections":[]}},"targets":[[0,3],[1,10]],"otherwise":5,"exhaustive_enum_unreachable":true,"span":{"file":"param_flat.rs","line_start":2,"col_start":34,"line_end":2,"col_end":38}}}},{"id":10,"stmts":[{"Assign":{"place":{"local":18,"projections":[]},"rvalue":{"Use":{"Copy":{"local":15,"projections":[{"Downcast":1},{"Field":0}]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":29,"line_end":2,"col_end":30}}},{"Assign":{"place":{"local":20,"projections":[]},"rvalue":{"CheckedBinaryOp":["Mul",{"Copy":{"local":11,"projections":[]}},{"Constant":{"Uint":[3,64]}}]},"span":{"file":"param_flat.rs","line_start":2,"col_start":45,"line_end":2,"col_end":48}}}],"terminator":{"Assert":{"cond":{"Move":{"local":20,"projections":[{"Field":1}]}},"expected":false,"msg":{"Overflow":"Mul"},"target":11,"span":{"file":"param_flat.rs","line_start":2,"col_start":45,"line_end":2,"col_end":48},"unwind":"Continue"}}},{"id":11,"stmts":[{"Assign":{"place":{"local":19,"projections":[]},"rvalue":{"Use":{"Move":{"local":20,"projections":[{"Field":0}]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":45,"line_end":2,"col_end":48}}},{"Assign":{"place":{"local":21,"projections":[]},"rvalue":{"CheckedBinaryOp":["Add",{"Copy":{"local":19,"projections":[]}},{"Copy":{"local":18,"projections":[]}}]},"span":{"file":"param_flat.rs","line_start":2,"col_start":45,"line_end":2,"col_end":50}}}],"terminator":{"Assert":{"cond":{"Move":{"local":21,"projections":[{"Field":1}]}},"expected":false,"msg":{"Overflow":"Add"},"target":12,"span":{"file":"param_flat.rs","line_start":2,"col_start":45,"line_end":2,"col_end":50},"unwind":"Continue"}}},{"id":12,"stmts":[{"Assign":{"place":{"local":2,"projections":[]},"rvalue":{"Use":{"Move":{"local":21,"projections":[{"Field":0}]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":41,"line_end":2,"col_end":50}}},{"Assign":{"place":{"local":23,"projections":[]},"rvalue":{"Use":{"Copy":{"local":4,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":54,"line_end":2,"col_end":55}}},{"Assign":{"place":{"local":25,"projections":[]},"rvalue":{"Use":{"Copy":{"local":2,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":71,"line_end":2,"col_end":72}}},{"Assign":{"place":{"local":26,"projections":[]},"rvalue":{"BinaryOp":["Lt",{"Copy":{"local":25,"projections":[]}},{"Constant":{"Uint":[6,64]}}]},"span":{"file":"param_flat.rs","line_start":2,"col_start":69,"line_end":2,"col_end":73}}}],"terminator":{"Assert":{"cond":{"Move":{"local":26,"projections":[]}},"expected":true,"msg":"BoundsCheck","target":13,"span":{"file":"param_flat.rs","line_start":2,"col_start":69,"line_end":2,"col_end":73},"unwind":"Continue"}}},{"id":13,"stmts":[{"Assign":{"place":{"local":24,"projections":[]},"rvalue":{"Use":{"Copy":{"local":1,"projections":["Deref",{"Index":25}]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":69,"line_end":2,"col_end":73}}}],"terminator":{"Call":{"func":"@trust-rustc-total-primitive-method::core::num::<impl u8>::wrapping_add","args":[{"Move":{"local":23,"projections":[]}},{"Move":{"local":24,"projections":[]}}],"dest":{"local":22,"projections":[]},"target":14,"span":{"file":"param_flat.rs","line_start":2,"col_start":54,"line_end":2,"col_end":74},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"unwind":"Continue"}}},{"id":14,"stmts":[{"Assign":{"place":{"local":4,"projections":[]},"rvalue":{"Use":{"Move":{"local":22,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":2,"col_start":52,"line_end":2,"col_end":74}}}],"terminator":{"Goto":8}},{"id":15,"stmts":[{"Assign":{"place":{"local":28,"projections":[]},"rvalue":{"Use":{"Copy":{"local":2,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":3,"col_start":13,"line_end":3,"col_end":14}}},{"Assign":{"place":{"local":29,"projections":[]},"rvalue":{"BinaryOp":["Lt",{"Copy":{"local":28,"projections":[]}},{"Constant":{"Uint":[6,64]}}]},"span":{"file":"param_flat.rs","line_start":3,"col_start":11,"line_end":3,"col_end":15}}}],"terminator":{"Assert":{"cond":{"Move":{"local":29,"projections":[]}},"expected":true,"msg":"BoundsCheck","target":16,"span":{"file":"param_flat.rs","line_start":3,"col_start":11,"line_end":3,"col_end":15},"unwind":"Continue"}}},{"id":16,"stmts":[{"Assign":{"place":{"local":27,"projections":[]},"rvalue":{"Use":{"Copy":{"local":1,"projections":["Deref",{"Index":28}]}}},"span":{"file":"param_flat.rs","line_start":3,"col_start":11,"line_end":3,"col_end":15}}},{"Assign":{"place":{"local":4,"projections":[]},"rvalue":{"Use":{"Move":{"local":27,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":3,"col_start":9,"line_end":3,"col_end":15}}}],"terminator":{"Goto":17}},{"id":17,"stmts":[{"Assign":{"place":{"local":0,"projections":[]},"rvalue":{"Use":{"Copy":{"local":4,"projections":[]}}},"span":{"file":"param_flat.rs","line_start":3,"col_start":19,"line_end":3,"col_end":20}}}],"terminator":"Return"}],"arg_count":3,"return_ty":{"Int":{"width":8,"signed":false}}},"contracts":[],"preconditions":[{"Or":[{"Eq":[{"Var":["_10","Int"]},{"Int":0}]},{"Eq":[{"Var":["_10","Int"]},{"Int":1}]}]},{"Or":[{"Eq":[{"Var":["_17","Int"]},{"Int":0}]},{"Eq":[{"Var":["_17","Int"]},{"Int":1}]}]},{"And":[{"Ge":[{"Var":["i","Int"]},{"Int":0}]},{"Le":[{"Var":["i","Int"]},{"Int":18446744073709551615}]}]}],"postconditions":[],"spec":{"requires":[],"ensures":[],"invariants":[]}}"##;
 
 const MIR_P05_MODULO: &str = r##"{"name":"p05_modulo","def_path":"p05_modulo::p05_modulo","span":{"file":"probes/p05_modulo.rs","line_start":1,"col_start":0,"line_end":3,"col_end":1},"body":{"locals":[{"index":0,"ty":{"Int":{"width":8,"signed":false}},"name":null},{"index":1,"ty":{"Int":{"width":64,"signed":false}},"name":"k"},{"index":2,"ty":"Bool","name":"c"},{"index":3,"ty":{"Int":{"width":64,"signed":false}},"name":"a"},{"index":4,"ty":{"Ref":{"mutable":false,"inner":{"Array":{"elem":{"Int":{"width":8,"signed":false}},"len":4}}}},"name":"arr"},{"index":5,"ty":"Bool","name":null},{"index":6,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":7,"ty":"Bool","name":null},{"index":8,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":9,"ty":"Bool","name":null}],"blocks":[{"id":0,"stmts":[],"terminator":{"SwitchInt":{"discr":{"Copy":{"local":2,"projections":[]}},"targets":[[0,4]],"otherwise":1,"exhaustive_enum_unreachable":false,"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":7,"line_end":2,"col_end":8}}}},{"id":1,"stmts":[{"Assign":{"place":{"local":5,"projections":[]},"rvalue":{"BinaryOp":["Eq",{"Constant":{"Uint":[4,64]}},{"Constant":{"Uint":[0,64]}}]},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":15,"line_end":2,"col_end":20}}}],"terminator":{"Assert":{"cond":{"Move":{"local":5,"projections":[]}},"expected":false,"msg":"RemainderByZero","target":2,"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":15,"line_end":2,"col_end":20},"unwind":"Continue"}}},{"id":2,"stmts":[{"Assign":{"place":{"local":1,"projections":[]},"rvalue":{"BinaryOp":["Rem",{"Copy":{"local":3,"projections":[]}},{"Constant":{"Uint":[4,64]}}]},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":11,"line_end":2,"col_end":20}}},{"Assign":{"place":{"local":6,"projections":[]},"rvalue":{"Use":{"Copy":{"local":1,"projections":[]}}},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":26,"line_end":2,"col_end":27}}},{"Assign":{"place":{"local":7,"projections":[]},"rvalue":{"BinaryOp":["Lt",{"Copy":{"local":6,"projections":[]}},{"Constant":{"Uint":[4,64]}}]},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":22,"line_end":2,"col_end":28}}}],"terminator":{"Assert":{"cond":{"Move":{"local":7,"projections":[]}},"expected":true,"msg":"BoundsCheck","target":3,"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":22,"line_end":2,"col_end":28},"unwind":"Continue"}}},{"id":3,"stmts":[{"Assign":{"place":{"local":0,"projections":[]},"rvalue":{"Use":{"Copy":{"local":4,"projections":["Deref",{"Index":6}]}}},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":22,"line_end":2,"col_end":28}}}],"terminator":{"Goto":6}},{"id":4,"stmts":[{"Assign":{"place":{"local":8,"projections":[]},"rvalue":{"Use":{"Copy":{"local":1,"projections":[]}}},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":42,"line_end":2,"col_end":43}}},{"Assign":{"place":{"local":9,"projections":[]},"rvalue":{"BinaryOp":["Lt",{"Copy":{"local":8,"projections":[]}},{"Constant":{"Uint":[4,64]}}]},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":38,"line_end":2,"col_end":44}}}],"terminator":{"Assert":{"cond":{"Move":{"local":9,"projections":[]}},"expected":true,"msg":"BoundsCheck","target":5,"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":38,"line_end":2,"col_end":44},"unwind":"Continue"}}},{"id":5,"stmts":[{"Assign":{"place":{"local":0,"projections":[]},"rvalue":{"Use":{"Copy":{"local":4,"projections":["Deref",{"Index":8}]}}},"span":{"file":"probes/p05_modulo.rs","line_start":2,"col_start":38,"line_end":2,"col_end":44}}}],"terminator":{"Goto":6}},{"id":6,"stmts":[],"terminator":"Return"}],"arg_count":4,"return_ty":{"Int":{"width":8,"signed":false}}},"contracts":[],"preconditions":[{"And":[{"Ge":[{"Var":["k","Int"]},{"Int":0}]},{"Le":[{"Var":["k","Int"]},{"Int":18446744073709551615}]}]},{"And":[{"Ge":[{"Var":["a","Int"]},{"Int":0}]},{"Le":[{"Var":["a","Int"]},{"Int":18446744073709551615}]}]}],"postconditions":[],"spec":{"requires":[],"ensures":[],"invariants":[]}}"##;
@@ -76,13 +79,36 @@ fn verdicts(mir: &str) -> Vec<(VcKind, VerificationResult, bool)> {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = test_router::deterministic_test_router();
             router
                 .verify_all(&vcs)
                 .into_iter()
                 .map(|(vc, r)| {
                     let certified = trust_certify::certify_vc(&vc).is_some();
                     (vc.kind, r, certified)
+                })
+                .collect::<Vec<_>>()
+        })
+        .expect("spawn solver thread")
+        .join()
+        .expect("solver thread must not panic")
+}
+
+/// [`verdicts`] with each row's start column, for fixtures whose rows share a line.
+fn verdicts_at(mir: &str) -> Vec<(VcKind, u32, VerificationResult, bool)> {
+    let func: VerifiableFunction =
+        serde_json::from_str(mir).expect("the captured MIR fixture must deserialize");
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let vcs = trust_vcgen::generate_vcs(&func);
+            let router = test_router::deterministic_test_router();
+            router
+                .verify_all(&vcs)
+                .into_iter()
+                .map(|(vc, r)| {
+                    let certified = trust_certify::certify_vc(&vc).is_some();
+                    (vc.kind.clone(), vc.location.col_start, r, certified)
                 })
                 .collect::<Vec<_>>()
         })
@@ -116,9 +142,10 @@ fn is_sub_overflow(k: &VcKind) -> bool {
 /// The vacuous row must carry a real COUNTEREXAMPLE (`Failed`), not merely go
 /// `Unknown`: "the solver gave up" would satisfy a `!is_proved` assert without
 /// showing the gate closed anything. `want_proved` pins how many rows of this kind
-/// still PROVE — 0 where the fix costs the safe row too (see
-/// `the_parameter_budget_costs_these_safe_rows`), so a future improvement that
-/// recovers one fails here and gets promoted rather than silently drifting.
+/// still PROVE — 0 where the fix costs the safe row too, so a future improvement
+/// that recovers one fails here and gets promoted rather than silently drifting
+/// (the budget's measured price list, and how each row on it was recovered, is
+/// `the_parameter_budget_no_longer_costs_the_modulo_safe_row`).
 fn assert_refutes(mir: &str, want: fn(&VcKind) -> bool, want_proved: usize, what: &str) {
     let rows = rows_of(mir, want);
     let proved = rows.iter().filter(|(r, _)| is_proved(r)).count();
@@ -152,9 +179,16 @@ fn assert_refutes(mir: &str, want: fn(&VcKind) -> bool, want_proved: usize, what
 /// 0 timed out, 0 runtime-checked out of 5", "of which 5 kernel-certified by the clean
 /// CIC kernel". Runtime oracle: 10/32 panicked (i in 0..16 x c in {false,true}) —
 /// every `c == false, i >= 6` input reads `g[i]` out of a `[u8; 6]`.
+///
+/// ONE row proves since 2026-09-29, and it is the SAFE one: the in-loop `g[i]` right
+/// after `i = y*3+x`, where the loop payloads' yield facts `0 <= y < 2`, `0 <= x < 3`
+/// now reach the block computing `y*3+x` through its checked temps
+/// (`iterator_yield::locals_derived_from`). The row that reads the ENTRY `i` still
+/// refutes with the real witness `c = false, i = 6`. Promoted rather than absorbed,
+/// as this helper asks.
 #[test]
 fn param_reassigned_once_flat_index_still_refutes() {
-    assert_refutes(MIR_PARAM_FLAT, is_bounds, 0, "param_flat");
+    assert_refutes(MIR_PARAM_FLAT, is_bounds, 1, "param_flat");
 }
 
 // ── D3: the census, re-run under the corrected predicate ────────────────────
@@ -165,9 +199,33 @@ fn param_reassigned_once_flat_index_still_refutes() {
 /// `build_modulo_bound_facts`, fact `(4 == 0) ∨ (k < 4)` on the bare param `k`.
 /// PRISTINE stage2: "2 proved, 0 failed ... out of 2", "of which 2 kernel-certified".
 /// Runtime oracle: 32/128 panicked (k in 0..8 x c in {false,true} x a in 0..8).
+///
+/// PROMOTED to `want_proved = 1` on 2026-11-07 by the procedure `assert_refutes`
+/// prescribes, the last of the budget's price list to be recovered. The fixture is
+/// `if c { k = a % 4; arr[k] } else { arr[k] }`, and every one of the 32 panics is on
+/// the `else` edge, where `k` is still the caller's argument. The VACUOUS row there
+/// still refutes on the real witness `c = false, k = 4`; the SAFE row is proved.
+///
+/// ROOT-CAUSED 2026-11-07 (VCGEN-PARAM-ENTRY-REDS-1). The safe row's query carries
+/// the reassignment's EXACT definition under its def-site version,
+/// `k#s2_0 = Rem(a, 4) ∧ _6 = k#s2_0 ∧ _6 >= 4`, and no fact keyed on the two-valued
+/// bare `k` at all (`build_modulo_bound_facts` still declines it: the parameter's
+/// ENTRY definition is live on the `else` edge). Before Trust `0322559adc` ("Advance
+/// the public AY IR CG Clean and MC development inputs", `first-party/ay`
+/// `40eb461a07` -> `d9d1bbb64a`) in-process ay found the refutation and then
+/// rejected its own proof: `unknown: (incomplete self-check-rejected) (1 conflicts)
+/// [stop-item:unverified-trust-rule]`. From that pin the remainder step is checked:
+/// ay `9695abae1` ("Check complete small remainder cases on the exact source") refutes
+/// every value of a source-entailed interval of a literal remainder
+/// (`small_remainder_cases_refute`, `crates/ay-proof/src/checker/bv_lia_query_interval/
+/// cases.rs`) and hands a plain Int `mod` query to it
+/// (`try_solve_via_bounded_scalar_mod`, `crates/ay-dpll/src/executor/theories/combined/
+/// bounded_bv_lia/mod.rs`), so the row is `Proved` and kernel-certified. Measured with
+/// this file's own router on `0322559adc` and its parent, and on `0322559adc` with
+/// `9695abae1`'s source changes reverted from its ay pin (the row is `Unknown` again).
 #[test]
 fn param_modulo_bound_still_refutes() {
-    assert_refutes(MIR_P05_MODULO, is_bounds, 0, "p05_modulo");
+    assert_refutes(MIR_P05_MODULO, is_bounds, 1, "p05_modulo");
 }
 
 /// `build_bitmask_bound_facts`, fact `k <= 3` on the bare param `k`.
@@ -175,7 +233,22 @@ fn param_modulo_bound_still_refutes() {
 /// Runtime oracle: 32/128 panicked (k in 0..8 x c in {false,true} x a in 0..8).
 #[test]
 fn param_bitmask_bound_still_refutes() {
-    assert_refutes(MIR_P09_BITMASK, is_bounds, 0, "p09_bitmask");
+    // PROMOTED 2026-09-13 by the procedure `assert_refutes` prescribes: the SAFE
+    // row is recovered, so `want_proved` is 1 and this fixture leaves the budget
+    // list -- the same move `p13c_castbound` made. `k = a & 3` indexes in range,
+    // and main advanced `ay` by 43 commits of constant-index/bitmask reasoning, so
+    // proving it is CORRECT. The vacuous row still refutes with a counterexample,
+    // which is what this test is for.
+    //
+    // ROOT-CAUSED 2026-09-19 (see `fresh_local_bitmask_bound_is_still_proved` for the
+    // full account). The SAFE row's query carries the masked definition
+    // `k#s1_0 = BvToInt(BvAnd(IntToBv(a, 64), IntToBv(3, 64)))`, which ay's
+    // `mk_bv2nat` rewrites to `(mod a 4)` at interning time; under the `QF_UFBVLIA`
+    // name in-process ay emits, that Int `mod` was fail-closed to
+    // `unknown (incomplete)`. Fixed in ay at `712f6b203`. The VACUOUS row is
+    // unaffected and keeps refuting: its query carries no mask at all and is named
+    // `QF_LIA`.
+    assert_refutes(MIR_P09_BITMASK, is_bounds, 1, "p09_bitmask");
 }
 
 /// `build_discriminant_variant_range_facts`, CAST-destination arm: the tag fact
@@ -213,9 +286,20 @@ fn param_checked_add_result_still_refutes() {
 /// `k * 2 == 4` on the bare param `k`.
 /// PRISTINE stage2: rc=0, "2 proved, 0 failed ... out of 2", "of which 2
 /// kernel-certified". Runtime oracle: 4/16 panicked (k in 0..8 x c in {false,true}).
+///
+/// PROMOTED to `want_proved = 1` on 2026-09-19, for the same reason `p13c_castbound`
+/// was and by a different mechanism again. The fixture is
+/// `if c { k = 4 / 2; arr[k] } else { arr[k] }`: two index sites, and the runtime
+/// oracle splits its 4 panics 0 / 4 across them — every one is on the `else` edge,
+/// where `k` is still the caller's argument. `k = 4 / 2` is a CLOSED CONSTANT
+/// EXPRESSION, so `guards::extract_block_definitions_until_impl` now defines `k` to
+/// the literal `2` it computes (the negation-lane fix) instead of leaving the value
+/// to the two-valued bare-`k` producers this file's price note is about. The safe row
+/// is therefore proved from the definition and not from any fact keyed on the
+/// parameter, and the vacuous row still refutes on the real witness `k = 4`.
 #[test]
 fn param_division_bound_still_refutes() {
-    assert_refutes(MIR_P07B_DIVLT, is_bounds, 0, "p07b_divlt");
+    assert_refutes(MIR_P07B_DIVLT, is_bounds, 1, "p07b_divlt");
 }
 
 /// `build_cast_bound_facts`, fact `k <= 3` on the bare param `k` (`k = a.clamp(0,3) as
@@ -300,6 +384,24 @@ fn fresh_local_modulo_bound_is_still_proved() {
 }
 
 /// `let k = a & 3; arr[k]` — `build_bitmask_bound_facts` on a non-parameter.
+///
+/// ROOT-CAUSED 2026-09-19. This row, `param_bitmask_bound_still_refutes` and
+/// `entry_def_structural::an_unconditionally_stored_parameter_keeps_its_bitmask_bound`
+/// are ONE defect, and it is not in `trust-vcgen`. The fact and the definition are
+/// both rendered in a form the deciding backend reads: a NUMERIC `Le(k, Int(3))`
+/// beside `Eq(k, BvToInt(BvAnd(IntToBv(a, 64), IntToBv(3, 64)), 64, false))`. ay's
+/// `TermStore::mk_bv2nat` rewrites that exact masked residue to `(mod a 4)` AT
+/// INTERNING TIME, so the query reaches the executor BV-free carrying an Int `mod`
+/// — and the closed admission predicate for `QF_UFBVLIA` (the name
+/// `native_lane_logic` gives it, and one of ay's fail-closed combined logics)
+/// listed `has_int_div_mod` as unconditionally out of slice. Admission was
+/// NON-MONOTONE in the declared logic name; the same assertions under `QF_LIA`
+/// answered `unsat`. Fixed in ay at `712f6b203`.
+///
+/// The defect is confined to `Router::deterministic_in_process_ay`. Measured on the
+/// deployed stage1 compiler, `-Ztrust-policy=certify` on
+/// `pub fn local_bitmask(a: usize, arr: &[u8; 4]) -> u8 { let k = a & 3; arr[k] }`
+/// reports "1 proved, 0 failed ... out of 1", "of which 1 kernel-certified".
 #[test]
 fn fresh_local_bitmask_bound_is_still_proved() {
     for (verdict, certified) in rows_of(MIR_LOCAL_BITMASK, is_bounds) {
@@ -336,8 +438,9 @@ fn fresh_local_cast_bound_is_still_proved() {
     }
 }
 
-/// The two index/value-tie producers key on `root_is_never_reseated` and on CALL
-/// destinations, which the corrected budget leaves untouched. All three rows of
+/// The index/value-tie producers key on the canonical place (the element-read
+/// congruence, VGAPS-G1) and on `root_is_never_reseated` CALL destinations (its Vec
+/// twin), which the corrected budget leaves untouched. All three rows of
 /// `if i < v.len() && t < 100 && v[i] < 100 { t + v[i] }` stay proved AND
 /// kernel-certified ("3 proved, 0 failed out of 3", "of which 3 kernel-certified" on
 /// the PRISTINE stage2).
@@ -376,24 +479,70 @@ fn immutable_index_and_value_ties_are_still_proved() {
 /// bind the bounded value to a NEW local and every one of them proves and
 /// kernel-certifies again.
 ///
-/// This test FAILS if a row is ever recovered — that is progress, and the row belongs
-/// in `assert_refutes(.., want_proved + 1, ..)` with this doc updated.
+/// Each row on this list was pinned NOT proved, so that recovering it failed here
+/// and was promoted into `assert_refutes(.., want_proved + 1, ..)` rather than
+/// absorbed. All of them are now recovered, and this test pins what took their place:
+/// the last one's SAFE row proves and kernel-certifies, and the row that proves is the
+/// SAFE one — a count alone (`assert_refutes`) would also accept the vacuous row
+/// proving while the safe one refuted.
 ///
 /// `p13c_castbound` HAS BEEN RECOVERED and left this list: see
 /// `param_cast_upper_bound_still_refutes`, which now pins one proved row and one
-/// refuted one. The three below still pay.
+/// refuted one. `p09_bitmask` followed it on 2026-09-13, after main advanced
+/// `ay` by 43 commits of constant-index/bitmask reasoning -- see
+/// `param_bitmask_bound_still_refutes`. `p07b_divlt` followed on 2026-09-19: its
+/// reassignment is `k = 4 / 2`, a CLOSED CONSTANT EXPRESSION, and the negation-lane
+/// fix defines such a local to the literal it computes — so the safe row is proved
+/// from the DEFINITION and never needs a fact keyed on the two-valued parameter at
+/// all. See `param_division_bound_still_refutes`, now one proved row and one refuted.
+/// That is the same shape of escape as the def-site versioned spelling, and it is
+/// available to any reassignment whose value is a closed constant. `p05_modulo`
+/// paid longest: `k = a % 4` has a VARIABLE in it, so nothing folds, and its safe row
+/// is proved from the def-site definition `k#s2_0 = Rem(a, 4)` only since ay could
+/// check the remainder step (2026-11-07; see `param_modulo_bound_still_refutes`).
 #[test]
-fn the_parameter_budget_costs_these_safe_rows() {
-    for (name, mir, want) in [
-        ("p05_modulo", MIR_P05_MODULO, is_bounds as fn(&VcKind) -> bool),
-        ("p09_bitmask", MIR_P09_BITMASK, is_bounds),
-        ("p07b_divlt", MIR_P07B_DIVLT, is_bounds),
-    ] {
-        let rows = rows_of(mir, want);
-        assert_eq!(rows.len(), 2, "{name}: the fixture has one safe and one vacuous row");
-        assert!(
-            rows.iter().all(|(r, _)| !is_proved(r)),
-            "{name}: the SAFE row is back — promote it (see this test's doc); got {rows:?}"
-        );
+fn the_parameter_budget_no_longer_costs_the_modulo_safe_row() {
+    // `if c { k = a % 4; arr[k] } else { arr[k] }` on line 2: the SAFE index is the
+    // `arr[k]` at columns 22..28 (after the reassignment), the VACUOUS one at
+    // columns 38..44 (the caller's `k`).
+    let rows: Vec<_> =
+        verdicts_at(MIR_P05_MODULO).into_iter().filter(|(kind, ..)| is_bounds(kind)).collect();
+    assert_eq!(rows.len(), 2, "p05_modulo: the fixture has one safe and one vacuous row");
+    for (_, col, verdict, certified) in &rows {
+        match col {
+            22 => assert!(
+                is_proved(verdict) && *certified,
+                "p05_modulo: the SAFE row (`k = a % 4` ran on this edge) must prove and \
+                 kernel-certify; got {verdict:?} certified={certified}"
+            ),
+            38 => {
+                let VerificationResult::Failed { counterexample: Some(cex), .. } = verdict else {
+                    panic!(
+                        "p05_modulo: the VACUOUS row reads the caller's `k` and must be \
+                         REFUTED with a counterexample; got {verdict:?}"
+                    );
+                };
+                assert!(!certified, "p05_modulo: a REFUTED row may not be kernel-certified");
+                let value = |name: &str| {
+                    cex.assignments.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+                };
+                assert_eq!(
+                    value("c"),
+                    Some(trust_types::CounterexampleValue::Bool(false)),
+                    "p05_modulo: the witness must take the `else` edge; got {cex:?}"
+                );
+                assert!(
+                    matches!(
+                        value("k#e"),
+                        Some(trust_types::CounterexampleValue::Int(k)) if k >= 4
+                    ) || matches!(
+                        value("k#e"),
+                        Some(trust_types::CounterexampleValue::Uint(k)) if k >= 4
+                    ),
+                    "p05_modulo: the witness's ENTRY `k` must index past a [u8; 4]; got {cex:?}"
+                );
+            }
+            other => panic!("p05_modulo: no index row is expected at column {other}: {rows:?}"),
+        }
     }
 }

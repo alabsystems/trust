@@ -74,6 +74,303 @@ fn direct_contradiction_vc_is_kernel_certified_end_to_end() {
     );
 }
 
+/// TINV-8 (2026-10-05): the same direct contradiction that certifies above is SKIPPED
+/// for a VC the kernel may not certify (`VerificationCondition::kernel_authority_refusal`),
+/// on every pipeline entry point, so this path cannot bypass trust-certify's gate.
+/// `ContractInvariant` is refused by kind. `TypeInvariant` is admitted by kind since TINV
+/// step 7.7 and refused here by the ROW gate: the row carries no obligation record, so it
+/// is unsituated (TINV-9(j)). The recorded twin is certified below
+/// (`a_recorded_situated_type_invariant_row_is_certified_by_the_pipeline`).
+#[test]
+fn refused_kinds_are_never_certified_by_the_pipeline() {
+    let pipeline = CertificationPipeline::new();
+    let p = Formula::Var("p".into(), Sort::Bool);
+    let solver_proof = simple_axiom_proof("contradiction", Formula::Bool(true));
+    for kind in [
+        VcKind::TypeInvariant {
+            ty: "c::S".into(),
+            point: TypeInvariantPoint::Return,
+            site: TypeInvariantSite { block: 1, statement_index: 0 },
+            conjunct: 0,
+            ordinal: 0,
+            edge: None,
+        },
+        VcKind::ContractInvariant { expression: "p".into() },
+    ] {
+        let vc = VerificationCondition {
+            kind,
+            function: "f".into(),
+            location: SourceSpan::default(),
+            formula: Formula::And(vec![p.clone(), Formula::Not(Box::new(p.clone()))]),
+            contract_metadata: None,
+            obligation: None,
+        };
+        let cert = pipeline.certify_from_solver_proof(&vc, &proved_result(), &solver_proof);
+        assert!(matches!(cert, CertificationResult::Skipped { .. }), "{cert:?}");
+        let (cert, _) = pipeline.certify_with_scope(&vc, &proved_result(), &solver_proof);
+        assert!(matches!(cert, CertificationResult::Skipped { .. }), "{cert:?}");
+        let cert = pipeline.certify(&vc, &proved_result(), vec![1]);
+        assert!(matches!(cert, CertificationResult::Skipped { .. }), "{cert:?}");
+    }
+}
+
+/// TINV-8 (2026-10-05, review of step 7.7): the FREE certificate functions apply the same
+/// gate as the pipeline wrappers, so no public entry mints or re-checks a certificate for a
+/// refused VC. For each refused row the kernel would otherwise accept the proof: the bytes
+/// are a genuine kernel-checked direct-contradiction proof of that row's own canonical
+/// statement (`kernel_certify_direct_contradiction` returns `Some`), and the hand-built
+/// certificate carries the row's own fingerprint and canonical bytes. The admitted
+/// `Assertion` twin with the SAME formula goes through all four entries, so the refusal
+/// is the gate and not the proof. MUTATION: drop `refuse_unauthorized(vc)?` from any of
+/// the three free functions and the matching assertion fails.
+#[test]
+fn refused_rows_are_refused_by_every_free_certificate_entry() {
+    use crate::certificate::{
+        TrustProofCertificate, generate_certificate, generate_certificate_unchecked,
+        verify_certificate,
+    };
+    use crate::fingerprint::compute_vc_fingerprint;
+
+    let pipeline = CertificationPipeline::new();
+    let p = Formula::Var("p".into(), Sort::Bool);
+    let formula = Formula::And(vec![p.clone(), Formula::Not(Box::new(p))]);
+    let row = |kind: VcKind| VerificationCondition {
+        kind,
+        function: "f".into(),
+        location: SourceSpan::default(),
+        formula: formula.clone(),
+        contract_metadata: None,
+        obligation: None,
+    };
+    let hand_cert = |vc: &VerificationCondition, proof_term: Vec<u8>| TrustProofCertificate {
+        prover: "clean".into(),
+        proof_term,
+        vc_fingerprint: compute_vc_fingerprint(vc),
+        canonical_vc: crate::canonical::canonical_vc_bytes(vc),
+        prover_version: "clean test".into(),
+    };
+    let refused = |r: Result<_, CertificateError>, what: &str| {
+        assert!(matches!(r, Err(CertificateError::AuthorityRefused { .. })), "{what}: {r:?}");
+    };
+
+    for kind in [
+        // Admitted by kind since step 7.7; refused by the ROW gate (no obligation record).
+        VcKind::TypeInvariant {
+            ty: "c::S".into(),
+            point: TypeInvariantPoint::Return,
+            site: TypeInvariantSite { block: 1, statement_index: 0 },
+            conjunct: 0,
+            ordinal: 0,
+            edge: None,
+        },
+        // Refused by kind.
+        VcKind::ContractInvariant { expression: "p".into() },
+        VcKind::TypeRefinementViolation { variable: "v".into(), predicate: "v > 0".into() },
+    ] {
+        let vc = row(kind);
+        let why = vc.kernel_authority_refusal();
+        assert!(why.is_some(), "{:?} must be refused", vc.kind);
+        let proof = crate::clean_bridge::kernel_certify_direct_contradiction(&vc.kind, &vc.formula)
+            .expect("the kernel accepts the proof of this row's own statement");
+        refused(
+            generate_certificate(&vc, &proved_result(), proof.clone(), "clean test").map(|_| ()),
+            "generate_certificate",
+        );
+        refused(
+            generate_certificate_unchecked(&vc, &proved_result(), proof.clone(), "clean test")
+                .map(|_| ()),
+            "generate_certificate_unchecked",
+        );
+        let cert = hand_cert(&vc, proof);
+        refused(verify_certificate(&vc, &cert), "verify_certificate");
+        refused(pipeline.verify_existing(&vc, &cert), "verify_existing");
+        let unchecked = pipeline.certify_unchecked(&vc, &proved_result(), vec![1]);
+        assert!(matches!(unchecked, CertificationResult::Skipped { .. }), "{unchecked:?}");
+    }
+
+    // The admitted twin: same formula, same kind of proof, every entry succeeds.
+    let vc = row(VcKind::Assertion { message: "direct contradiction".into() });
+    assert_eq!(vc.kernel_authority_refusal(), None);
+    let proof = crate::clean_bridge::kernel_certify_direct_contradiction(&vc.kind, &vc.formula)
+        .expect("admitted twin proof");
+    let cert = generate_certificate(&vc, &proved_result(), proof.clone(), "clean test")
+        .expect("generate_certificate admits the Assertion twin");
+    verify_certificate(&vc, &cert).expect("verify_certificate admits the Assertion twin");
+    pipeline.verify_existing(&vc, &cert).expect("verify_existing admits the Assertion twin");
+    verify_certificate(&vc, &hand_cert(&vc, proof.clone())).expect("hand-built twin verifies");
+    generate_certificate_unchecked(&vc, &proved_result(), proof, "clean test")
+        .expect("generate_certificate_unchecked admits the Assertion twin");
+    let unchecked = pipeline.certify_unchecked(&vc, &proved_result(), vec![1]);
+    assert!(matches!(unchecked, CertificationResult::Trusted { .. }), "{unchecked:?}");
+}
+
+/// TINV step 10.1 (TINV-23): a VC carrying a type-invariant assumption tag is refused by
+/// EVERY certificate entry, the free functions and the pipeline wrappers alike, although the
+/// kernel accepts the proof of its own statement: the tagged formula is the direct
+/// contradiction `tag ∧ ¬tag`, and its untagged twin `p ∧ ¬p` (the same formula with the
+/// tag renamed) goes through every entry. A tagged TINV row that is otherwise recorded and
+/// situated is skipped by the pipeline while its untagged twin is certified.
+#[test]
+fn tagged_vcs_are_refused_by_every_certificate_entry() {
+    use crate::certificate::{
+        TrustProofCertificate, generate_certificate, generate_certificate_unchecked,
+        verify_certificate,
+    };
+    use crate::fingerprint::compute_vc_fingerprint;
+
+    let pipeline = CertificationPipeline::new();
+    let solver_proof = simple_axiom_proof("contradiction", Formula::Bool(true));
+    let contradiction = |name: &str| {
+        let v = Formula::Var(name.to_string(), Sort::Bool);
+        Formula::And(vec![v.clone(), Formula::Not(Box::new(v))])
+    };
+    let assertion = |formula: Formula| VerificationCondition {
+        kind: VcKind::Assertion { message: "direct contradiction".into() },
+        function: "f".into(),
+        location: SourceSpan::default(),
+        formula,
+        contract_metadata: None,
+        obligation: None,
+    };
+    let hand_cert = |vc: &VerificationCondition, proof_term: Vec<u8>| TrustProofCertificate {
+        prover: "clean".into(),
+        proof_term,
+        vc_fingerprint: compute_vc_fingerprint(vc),
+        canonical_vc: crate::canonical::canonical_vc_bytes(vc),
+        prover_version: "clean test".into(),
+    };
+    let refused = |r: Result<_, CertificateError>, what: &str| {
+        assert!(matches!(r, Err(CertificateError::AuthorityRefused { .. })), "{what}: {r:?}");
+    };
+
+    let tag = type_invariant_assume_tag("c::S", 0);
+    let tagged = assertion(contradiction(&tag));
+    let twin = assertion(contradiction("p"));
+    assert!(tagged.kernel_authority_refusal().is_some());
+    assert_eq!(twin.kernel_authority_refusal(), None, "the untagged control");
+
+    // The kernel accepts the proof of the tagged row's own statement: only the gate refuses.
+    let proof =
+        crate::clean_bridge::kernel_certify_direct_contradiction(&tagged.kind, &tagged.formula)
+            .expect("the kernel accepts the proof of the tagged row's own statement");
+    refused(
+        generate_certificate(&tagged, &proved_result(), proof.clone(), "clean test").map(|_| ()),
+        "generate_certificate",
+    );
+    refused(
+        generate_certificate_unchecked(&tagged, &proved_result(), proof.clone(), "clean test")
+            .map(|_| ()),
+        "generate_certificate_unchecked",
+    );
+    let cert = hand_cert(&tagged, proof);
+    refused(verify_certificate(&tagged, &cert), "verify_certificate");
+    refused(pipeline.verify_existing(&tagged, &cert), "verify_existing");
+    let skipped = |c: &CertificationResult| matches!(c, CertificationResult::Skipped { .. });
+    let c = pipeline.certify_from_solver_proof(&tagged, &proved_result(), &solver_proof);
+    assert!(skipped(&c), "certify_from_solver_proof: {c:?}");
+    let (c, _) = pipeline.certify_with_scope(&tagged, &proved_result(), &solver_proof);
+    assert!(skipped(&c), "certify_with_scope: {c:?}");
+    let c = pipeline.certify(&tagged, &proved_result(), vec![1]);
+    assert!(skipped(&c), "certify: {c:?}");
+    let c = pipeline.certify_unchecked(&tagged, &proved_result(), vec![1]);
+    assert!(skipped(&c), "certify_unchecked: {c:?}");
+
+    // The untagged twin through the same entries.
+    let proof = crate::clean_bridge::kernel_certify_direct_contradiction(&twin.kind, &twin.formula)
+        .expect("twin proof");
+    let cert = generate_certificate(&twin, &proved_result(), proof.clone(), "clean test")
+        .expect("generate_certificate admits the untagged twin");
+    verify_certificate(&twin, &cert).expect("verify_certificate admits the untagged twin");
+    pipeline.verify_existing(&twin, &cert).expect("verify_existing admits the untagged twin");
+    generate_certificate_unchecked(&twin, &proved_result(), proof, "clean test")
+        .expect("generate_certificate_unchecked admits the untagged twin");
+    let c = pipeline.certify_from_solver_proof(&twin, &proved_result(), &solver_proof);
+    assert!(c.is_certified(), "{c:?}");
+    let c = pipeline.certify_unchecked(&twin, &proved_result(), vec![1]);
+    assert!(matches!(c, CertificationResult::Trusted { .. }), "{c:?}");
+
+    // A recorded, situated TINV row with a tagged use-site fact in its wrapper.
+    let p = Formula::Var("p".into(), Sort::Bool);
+    let body = Formula::And(vec![p.clone(), Formula::Not(Box::new(p.clone()))]);
+    let fact = Formula::And(vec![Formula::Var(tag, Sort::Bool), p]);
+    let row = |facts: Vec<Formula>| {
+        let formula = if facts.is_empty() {
+            body.clone()
+        } else {
+            Formula::And(facts.iter().cloned().chain([body.clone()]).collect())
+        };
+        let wrappers = if facts.is_empty() {
+            Vec::new()
+        } else {
+            vec![trust_types::ObligationWrapper::ConjoinFactsLast { facts }]
+        };
+        VerificationCondition {
+            kind: VcKind::TypeInvariant {
+                ty: "c::S".into(),
+                point: TypeInvariantPoint::Return,
+                site: TypeInvariantSite { block: 1, statement_index: 0 },
+                conjunct: 0,
+                ordinal: 0,
+                edge: None,
+            },
+            function: "f".into(),
+            location: SourceSpan::default(),
+            formula,
+            contract_metadata: None,
+            obligation: Some(trust_types::ObligationRecord {
+                body: body.clone(),
+                wrappers,
+                subject: None,
+                width: None,
+            }),
+        }
+    };
+    let tagged_row = row(vec![fact]);
+    assert_eq!(tagged_row.type_invariant_situatedness_refusal(), None, "situated");
+    assert!(tagged_row.kernel_authority_refusal().is_some());
+    let c = pipeline.certify_from_solver_proof(&tagged_row, &proved_result(), &solver_proof);
+    assert!(skipped(&c), "a tagged TINV row: {c:?}");
+    let c = pipeline.certify_from_solver_proof(&row(vec![]), &proved_result(), &solver_proof);
+    assert!(c.is_certified(), "the untagged TINV twin: {c:?}");
+}
+
+/// TINV step 7.7: the recorded, situated twin of the record-less TINV row above passes the
+/// row gate and is certified on all three entry points, so the refusal above is the row
+/// gate and not the kind. MUTATION: move `VcKind::TypeInvariant` back to the REFUSED arm of
+/// `kind_authority_refusal` and this test fails.
+#[test]
+fn a_recorded_situated_type_invariant_row_is_certified_by_the_pipeline() {
+    let pipeline = CertificationPipeline::new();
+    let p = Formula::Var("p".into(), Sort::Bool);
+    let solver_proof = simple_axiom_proof("contradiction", Formula::Bool(true));
+    let body = Formula::And(vec![p.clone(), Formula::Not(Box::new(p))]);
+    let vc = VerificationCondition {
+        kind: VcKind::TypeInvariant {
+            ty: "c::S".into(),
+            point: TypeInvariantPoint::Return,
+            site: TypeInvariantSite { block: 1, statement_index: 0 },
+            conjunct: 0,
+            ordinal: 0,
+            edge: None,
+        },
+        function: "f".into(),
+        location: SourceSpan::default(),
+        formula: body.clone(),
+        contract_metadata: None,
+        obligation: Some(trust_types::ObligationRecord {
+            body,
+            wrappers: Vec::new(),
+            subject: None,
+            width: None,
+        }),
+    };
+    assert_eq!(vc.kernel_authority_refusal(), None);
+    let cert = pipeline.certify_from_solver_proof(&vc, &proved_result(), &solver_proof);
+    assert!(cert.is_certified(), "{cert:?}");
+    let (cert, _) = pipeline.certify_with_scope(&vc, &proved_result(), &solver_proof);
+    assert!(!matches!(cert, CertificationResult::Skipped { .. }), "{cert:?}");
+}
+
 /// Live end-to-end Certified via the GENERAL propositional path: a multi-clause
 /// resolution VC `(p ∨ q) ∧ ¬p ∧ ¬q` — which the direct-contradiction path
 /// cannot handle — is certified by the clean kernel through exhaustive nested

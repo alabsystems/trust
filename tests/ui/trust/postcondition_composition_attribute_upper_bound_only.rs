@@ -1,5 +1,5 @@
 //@ needs-trust-verify
-//@ compile-flags: -Ztrust-verify=on --crate-type lib
+//@ compile-flags: -Ztrust-verify=on --crate-type lib -Ztrust-policy=certify
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: ERROR
 //@ dont-require-annotations: NOTE
@@ -22,6 +22,86 @@
 //! the obligation". That distinction is the whole content of this fix: the
 //! defect it repairs was invisible precisely because a dropped clause and a
 //! never-emitted obligation look identical from a summary line.
+//!
+//! POLICY RE-PINNED 2026-09-16 — HISTORICAL. Superseded by the 2026-09-17 block
+//! at the end of this comment: the row it describes is no longer runtime-checked.
+//! It is kept because it records why the file sits on the `certify` lane.
+//! This file measures whether the caller DISCHARGES
+//! its obligation, and it read that off the DEFAULT lane's exit code. That stopped
+//! being the same question on 2026-09-14, when policy B landed as ruled
+//! (docs/design/2026-07-25-completeness-gap-policy-ruling.md): an unproved
+//! arithmetic row that keeps rustc's runtime check is now REPORTED and the build
+//! SUCCEEDS. The row here is exactly that — `[overflow:mul] runtime-checked:
+//! compiler retained the existing overflow check because the proof is not yet
+//! static` — so the default lane stopped failing while the obligation stayed
+//! exactly as unproved as before.
+//!
+//! `-Ztrust-policy=certify` is the lane where full static discharge IS the
+//! contract, so that is where this question belongs and that is what the flag
+//! above now selects. Nothing about the property changed and nothing was blessed:
+//! the same row, still unproved, still named in the same two errors.
+//!
+//! The vacuity guard survives the move, which is the thing to check before
+//! trusting it. If the caller-side lane stopped EMITTING the obligation, the
+//! body would report zero obligations, certify would have nothing to refuse, and
+//! this file would go red on the missing errors — the same way it would have on
+//! the default lane. What the move gives up is detecting a row that silently
+//! becomes runtime-checked-and-tolerated, and the `NOTE` pin below is there so
+//! that is not given up either: it asserts the row EXISTS and is unproved,
+//! independently of which policy decides the exit code.
+//!
+//! RE-BLESSED 2026-09-17 — THE ROW BECAME A REFUTATION. `first-party/ay` moved to
+//! c187eb99d and the solver now DECIDES the query it used to decline. Measured on
+//! stage1 `trustc` with exactly the flags above, the row reads
+//!
+//!     [overflow:mul] FAILED (ay-in-process); counterexample:
+//!     _4 = true, _5 = -715827883, _6 = true, x = 1
+//!
+//! where it read `[overflow:mul] runtime-checked` before. The VC handed to the
+//! solver is byte-identical across the move — established by A/B in
+//! reports/2026-09-17-nine-ui-reds-follow-the-ay-pin-move.md — so what changed is
+//! the answer, not the obligation and not this file's property.
+//!
+//! THE MODEL IS ADMISSIBLE, which had to be CHECKED here rather than assumed,
+//! because this caller discharges a `requires` and a counterexample that violated
+//! it would be a verifier defect, not a stale pin. In this body `_4` is the
+//! `x > 0` guard, `_5` is what `positive_part` returns, `_6` is `y < 100`. The
+//! model TAKES the guard — `x = 1`, `_4 = true` — so the callee's `requires x > 0`
+//! is discharged at that call site, and the attribute `ensures` is therefore
+//! entitled to fire. Entitled, not measured-here: deleting the
+//! `#[core::contracts::ensures(..)]` attribute outright yields the IDENTICAL row
+//! and counterexample (measured 2026-09-17), because an upper-bound-only clause is
+//! satisfied vacuously by `-715827883`. Whether the attribute spelling actually
+//! injects is shown by the pair with
+//! `postcondition_composition_attribute_at_call_site.rs` — same shape, STRONG
+//! clause, `3 proved, 0 failed` — not by this file on its own.
+//! `-715827883 <= 1000000` satisfies that clause, precisely because the clause
+//! weakened here bounds the result only from ABOVE; `-715827883 * 3` is
+//! `-2147483649`, one past `i32::MIN`. The model therefore honours every fact the
+//! caller is entitled to and still underflows. It is not an execution of THIS
+//! file's concrete callee body, which returns a positive value — modular
+//! verification reads a callee as its contract, and reading it as its contract is
+//! the property under test.
+//!
+//! WHICH BOUNDARY THIS NOW DEMONSTRATES. The 2026-09-16 block moved the file to
+//! `certify` because an unproved-but-runtime-checked row let the DEFAULT lane
+//! succeed. A refutation is not that row: measured today, the default lane emits
+//! the same two errors as `certify`. `-Ztrust-policy=certify` is therefore no
+//! longer load-bearing here and is kept deliberately — if the solver ever weakens
+//! back to `runtime-checked`, `certify` keeps the build red while the pinned note
+//! below goes red on the changed text, so either direction of motion is visible.
+//! That pin now asserts the stronger fact: the row exists and is REFUTED.
+//!
+//! RE-PINNED 2026-09-28 (MEASURED on the Track B stage 1). The D5-A
+//! call-destination screen now lets a solver model over a same-crate call
+//! result stand only where an injected clause DETERMINES that result with no
+//! `requires` guard (`trust_vcgen::generate::summary_pins_result`). Here
+//! the guarded `x > 0 -> *ret <= 1000000` bounds `y` only from above, so the `[overflow:mul]` model picks a
+//! value the contract admits but no execution of `positive_part` returns (MEASURED
+//! shape: `p_falsefail::dead_else_s`). The row is therefore HELD — `UNKNOWN`
+//! naming `positive_part`, a fail-closed gap with no runtime-check tolerance — where it
+//! read `FAILED`. It still does not prove and the build still fails, which is
+//! the whole of what this file asks.
 #![feature(contracts)]
 #![allow(incomplete_features)]
 
@@ -35,6 +115,7 @@ pub fn positive_part(x: i32) -> i32
 pub fn triple(x: i32) -> i32 {
 //~^ ERROR Trust Level 0 safety verification incomplete for `postcondition_composition_attribute_upper_bound_only::triple`
 //~| ERROR Trust strict verification failed for `postcondition_composition_attribute_upper_bound_only::triple`
+//~| NOTE generic solver counterexample withheld: query depends on the unmodeled return of same-crate `postcondition_composition_attribute_upper_bound_only::positive_part`
     if x > 0 {
         let y = positive_part(x);
         if y < 100 { y * 3 } else { 0 }

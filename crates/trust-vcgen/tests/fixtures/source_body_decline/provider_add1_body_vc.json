@@ -1,0 +1,404 @@
+{
+  "kind": "Postcondition",
+  "function": "add1",
+  "location": {
+    "file": "src/lib.rs",
+    "line_start": 4,
+    "col_start": 4,
+    "line_end": 4,
+    "col_end": 9
+  },
+  "formula": {
+    "And": [
+      {
+        "Or": [
+          {
+            "BvULt": [
+              {
+                "BitVec": {
+                  "value": 4294967295,
+                  "width": 32
+                }
+              },
+              {
+                "BvAdd": [
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 1,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              },
+              32
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_0",
+                  {
+                    "BitVec": 32
+                  }
+                ]
+              },
+              {
+                "BvAdd": [
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 1,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "And": [
+          {
+            "And": [
+              {
+                "BvULe": [
+                  {
+                    "BitVec": {
+                      "value": 0,
+                      "width": 32
+                    }
+                  },
+                  {
+                    "BvAdd": [
+                      {
+                        "Var": [
+                          "x",
+                          {
+                            "BitVec": 32
+                          }
+                        ]
+                      },
+                      {
+                        "BitVec": {
+                          "value": 1,
+                          "width": 32
+                        }
+                      },
+                      32
+                    ]
+                  },
+                  32
+                ]
+              },
+              {
+                "BvULe": [
+                  {
+                    "BvAdd": [
+                      {
+                        "Var": [
+                          "x",
+                          {
+                            "BitVec": 32
+                          }
+                        ]
+                      },
+                      {
+                        "BitVec": {
+                          "value": 1,
+                          "width": 32
+                        }
+                      },
+                      32
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 4294967295,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              }
+            ]
+          },
+          {
+            "Eq": [
+              {
+                "Var": [
+                  "_3.0#s0_0",
+                  {
+                    "BitVec": 32
+                  }
+                ]
+              },
+              {
+                "BvAdd": [
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 1,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              }
+            ]
+          },
+          {
+            "And": [
+              {
+                "BvULe": [
+                  {
+                    "BitVec": {
+                      "value": 0,
+                      "width": 32
+                    }
+                  },
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  32
+                ]
+              },
+              {
+                "BvULe": [
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 4294967295,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              }
+            ]
+          },
+          {
+            "And": [
+              {
+                "BvULe": [
+                  {
+                    "BitVec": {
+                      "value": 0,
+                      "width": 32
+                    }
+                  },
+                  {
+                    "BitVec": {
+                      "value": 1,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              },
+              {
+                "BvULe": [
+                  {
+                    "BitVec": {
+                      "value": 1,
+                      "width": 32
+                    }
+                  },
+                  {
+                    "BitVec": {
+                      "value": 4294967295,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              }
+            ]
+          },
+          {
+            "And": [
+              {
+                "BvULt": [
+                  {
+                    "Var": [
+                      "x",
+                      {
+                        "BitVec": 32
+                      }
+                    ]
+                  },
+                  {
+                    "BitVec": {
+                      "value": 100,
+                      "width": 32
+                    }
+                  },
+                  32
+                ]
+              },
+              {
+                "And": [
+                  {
+                    "BvULe": [
+                      {
+                        "BitVec": {
+                          "value": 0,
+                          "width": 32
+                        }
+                      },
+                      {
+                        "Var": [
+                          "x",
+                          {
+                            "BitVec": 32
+                          }
+                        ]
+                      },
+                      32
+                    ]
+                  },
+                  {
+                    "BvULe": [
+                      {
+                        "Var": [
+                          "x",
+                          {
+                            "BitVec": 32
+                          }
+                        ]
+                      },
+                      {
+                        "BitVec": {
+                          "value": 4294967295,
+                          "width": 32
+                        }
+                      },
+                      32
+                    ]
+                  }
+                ]
+              },
+              {
+                "And": [
+                  {
+                    "Not": {
+                      "Var": [
+                        "_3.1#s0_0",
+                        "Bool"
+                      ]
+                    }
+                  },
+                  {
+                    "And": [
+                      {
+                        "Eq": [
+                          {
+                            "Var": [
+                              "_0",
+                              {
+                                "BitVec": 32
+                              }
+                            ]
+                          },
+                          {
+                            "Var": [
+                              "_3.0#s0_0",
+                              {
+                                "BitVec": 32
+                              }
+                            ]
+                          }
+                        ]
+                      },
+                      {
+                        "Not": {
+                          "Eq": [
+                            {
+                              "Var": [
+                                "_0",
+                                {
+                                  "BitVec": 32
+                                }
+                              ]
+                            },
+                            {
+                              "BvAdd": [
+                                {
+                                  "Var": [
+                                    "x",
+                                    {
+                                      "BitVec": 32
+                                    }
+                                  ]
+                                },
+                                {
+                                  "BitVec": {
+                                    "value": 1,
+                                    "width": 32
+                                  }
+                                },
+                                32
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "contract_metadata": {
+    "has_requires": true,
+    "has_ensures": true,
+    "has_invariant": false,
+    "has_variant": false,
+    "has_loop_invariant": false,
+    "has_type_refinement": false,
+    "has_modifies": false,
+    "source_contract_index": 1
+  },
+  "obligation": null
+}

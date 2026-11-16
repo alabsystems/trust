@@ -1,5 +1,5 @@
-use cargo::ops;
-use cargo::ops::RegistryOrIndex;
+use targo::ops;
+use targo::ops::RegistryOrIndex;
 
 use crate::command_prelude::*;
 

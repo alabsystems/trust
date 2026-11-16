@@ -48,8 +48,12 @@ fn make_binop_module(name: &str, op: BinOp) -> Module {
     let mut module = Module::new("test_module");
 
     // fn(i32, i32) -> i32
-    let func_ty =
-        FuncTy { params: vec![Ty::I32, Ty::I32], returns: vec![Ty::I32], is_vararg: false };
+    let func_ty = FuncTy {
+        params: vec![Ty::I32, Ty::I32],
+        returns: vec![Ty::I32],
+        is_vararg: false,
+        abi: None,
+    };
     module.func_types.push(func_ty);
     let func_ty_id = FuncTyId::new(0);
 

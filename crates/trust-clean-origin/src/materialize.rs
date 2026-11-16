@@ -112,11 +112,14 @@
 //! `Select` — the same fatals, on the same inputs, with the same shape labels.
 
 use trust_types::admissible_body::{
-    ArithBinOp, ArithExpr, ArithOperand, BeqOperand, PrimitiveCallee, RawBinOpKind, RecBodyExpr,
-    SelectCmp,
+    ArithBinOp, ArithExpr, ArithOperand, BeqOperand, BoolBinOp, PrimitiveCallee, RawBinOpKind,
+    RecBodyExpr, SelectCmp,
 };
 
-use crate::emit::{CleanOriginPlan, CleanOriginShape, WfLowering};
+use crate::emit::{
+    BoolExpr, CleanOriginPlan, CleanOriginShape, RustCallArg, RustCallLiteral, RustCallNode,
+    UIntConditional, WfLowering,
+};
 use crate::table::{CalleeSelector, MirShape, SelectionRow, UnwindDiscipline};
 
 /// The carrier POSITION a template local is typed at.
@@ -141,6 +144,16 @@ pub enum TemplateTy {
     /// `&<result carrier>` — the shared borrow the bignum runtime's
     /// by-reference methods take.
     ResultRef,
+    /// **W5 (Lean-calls-Rust)** — the RESULT carrier of the `index`-th entry
+    /// of the plan's Rust callee table ([`CleanOriginPlan::callees`]): the
+    /// type of the temporary a non-root call in a
+    /// [`MirShape::RustCallChain`] writes. A callee's result need not be the
+    /// declaration's result carrier (`def f (x : UInt32) : UInt64 := g (h x)`
+    /// with `h : u32 -> u32`), which is why this is not [`Self::Result`].
+    RustCalleeResult {
+        /// Index into the plan's callee table.
+        index: usize,
+    },
 }
 
 /// One local declaration.
@@ -201,6 +214,21 @@ pub enum TemplateOperand {
     /// scalar, so `required_consts` stays honestly empty and nothing can
     /// promote.
     BoolScalar(bool),
+    /// **W5 (Lean-calls-Rust)** — an inline evaluated scalar at an
+    /// EXPLICIT unsigned machine width: a numeral argument to a Rust callee,
+    /// at the width of the callee's PARAMETER carrier — which need be neither
+    /// the result carrier ([`Self::ResultScalar`]) nor `u64`
+    /// ([`Self::U64Scalar`]). The width is taken from the plan's callee table
+    /// and re-checked on the sealed plan; side B reads it back as the
+    /// scalar's ENCODED width and the kernel decides whether the callee
+    /// accepts a literal there. Inline and evaluated, so `required_consts`
+    /// stays honestly empty.
+    UIntScalar {
+        /// The value, already range-checked on the sealed plan.
+        value: u128,
+        /// The encoded width in bits (8/16/32/64).
+        width: u32,
+    },
 }
 
 /// The right-hand side of a template assignment.
@@ -227,7 +255,8 @@ pub enum TemplateRvalue {
         right: TemplateOperand,
     },
     /// **§6f LANDING 7** — `Rvalue::BinaryOp(<op>, (left, right))` at the
-    /// RESULT carrier: `&`, `|`, `/`, `%`.
+    /// RESULT carrier: `&`, `|`, `/`, `%`, and since 2026-09-23 `^` and `>>`
+    /// (the operators of `RawBinOpKind`, one per `uint.*` raw-binop row).
     ///
     /// # It is a NEW REALIZATION PRIMITIVE, and landing 4 made that a compile
     /// error on purpose
@@ -249,8 +278,12 @@ pub enum TemplateRvalue {
     ///
     /// # NO overflow check, NO div-by-zero assert
     ///
-    /// `BitAnd`/`BitOr` cannot fail. `Div`/`Rem` can, and the invariant that
-    /// they do not is upstream of this file: `recognise_raw_binop_expr`
+    /// `BitAnd`/`BitOr`/`BitXor` cannot fail, and neither can `Shr`: MIR's
+    /// `BinOp::Shr` takes its amount as `RHS.rem_euclid(LHS::BITS)`, which is
+    /// also the reduction Lean's `{C}.shiftRight` applies, so it has no
+    /// overflow case to check (unlike `ShrUnchecked`, which this vocabulary
+    /// cannot spell). `Div`/`Rem` can, and the invariant that they do not is
+    /// upstream of this file: `recognise_raw_binop_expr`
     /// refuses to plan a `Div`/`Rem` whose right operand is not a strictly
     /// positive numeral, and the FROZEN producer independently refuses to
     /// reflect one. See [`crate::table::MirShape::RawBinOp`] for the full
@@ -265,6 +298,22 @@ pub enum TemplateRvalue {
     },
     /// `Rvalue::Ref(re_erased, BorrowKind::Shared, Place::from(Local(index)))`.
     SharedRef(usize),
+    /// **W6 (Rust-calls-Clean)** — `Rvalue::UnaryOp(UnOp::Not, operand)` at the
+    /// `bool` result carrier: the whole body of `def f (b : Bool) : Bool :=
+    /// not b`. On a `bool` operand `UnOp::Not` is LOGICAL negation, which is
+    /// what `rustc_mir_build` emits for `!b`.
+    ///
+    /// # It is a NEW REALIZATION PRIMITIVE
+    ///
+    /// `rustc_mir_transform::clean_origin_mir::materialize` matches this enum
+    /// with no wildcard, so this variant does not build until the compiler side
+    /// is written — the same cost `TemplateOperand::BoolScalar` and
+    /// `TemplateRvalue::RawBin` carried, paid the same way. No existing rvalue
+    /// could spell it: every other one is a `Use`, a binary op, or a ref, and a
+    /// unary op is none of those. `&&`/`||` reuse [`Self::RawBin`]
+    /// (`BitAnd`/`BitOr`) at the `bool` carrier instead, so only negation needs
+    /// a new primitive.
+    BoolNot(TemplateOperand),
 }
 
 /// One statement: an assignment to a bare local.
@@ -293,6 +342,18 @@ pub enum TemplateCallee {
     /// recognizer matches it against `func.def_path` and the kernel re-decides
     /// the argument.
     SelfDef,
+    /// **W5 (Lean-calls-Rust)** — the `index`-th entry of the plan's Rust
+    /// callee table ([`CleanOriginPlan::callees`]). The emitter resolves the
+    /// REGISTERED `LocalDefId` for it (through `ResolverGlobalCtxt`, by the
+    /// rendering the table carries) and cross-checks `tcx.fn_sig` against the
+    /// table's carriers before emitting; it never resolves by name. Not a
+    /// primitive, so it has no authenticated identity: side B matches the
+    /// extractor's rendering of the emitted callee against the allow-list of
+    /// registered renderings, and the kernel re-decides every argument.
+    RustFn {
+        /// Index into the plan's callee table.
+        index: usize,
+    },
 }
 
 /// The unwind edge an emitted call carries.
@@ -663,6 +724,14 @@ pub fn body_template(
                 {
                     return Err(TemplateRefusal::PanickingDivisor);
                 }
+                // The SHIFT-AMOUNT rule is deliberately NOT re-asserted here,
+                // and the asymmetry with the divisor is the point: an emitted
+                // `Shr` at any amount computes the declared function (MIR and
+                // Lean both reduce the amount modulo the width), so there is no
+                // wrong binary to stop at this layer. The rule is a side-B
+                // capability rule, held by the planner and the sealed plan, and
+                // a violation that got past both would be refused at the gate
+                // because the frozen producer has nothing to mint.
                 let width = machine_width(plan, "RawBinOp")?;
                 Ok(BodyTemplate {
                     locals: signature_locals(plan),
@@ -683,6 +752,106 @@ pub fn body_template(
             _ => Err(TemplateRefusal::RealizationDisagrees),
         },
 
+        // ── the whole-body comparison value (W6, Rust-calls-Clean) ──────────
+        //
+        // `_0 = <cmp>(l, r); return` — ONE block, ONE statement, no call and no
+        // branch, `_0` at the result carrier `bool`. It is
+        // [`single_assignment_body`]'s skeleton with a `Compare` rvalue instead
+        // of a `Use`, and it is deliberately written through the SAME locals
+        // and terminator decision as the raw-binop and projection bodies so a
+        // second copy of them cannot drift. Both operands are source
+        // parameters — a numeral operand is outside this shape's side-A
+        // recognizer (the literal comparison's Decidable instance is
+        // Nat-reduced, not the carrier instance, so it is not def-eq to
+        // `admit_comparison_function`'s carrier-instance mint; measured).
+        MirShape::ComparisonValue(row_cmp) => match plan.shape() {
+            CleanOriginShape::DecideComparison { cmp, cmp_left, cmp_right } => {
+                if *cmp != row_cmp {
+                    return Err(TemplateRefusal::RealizationDisagrees);
+                }
+                Ok(BodyTemplate {
+                    locals: signature_locals(plan),
+                    blocks: vec![TemplateBlock {
+                        stmts: vec![TemplateStatement {
+                            place: 0,
+                            rvalue: TemplateRvalue::Compare {
+                                cmp: *cmp,
+                                left: TemplateOperand::Copy(arg(*cmp_left)),
+                                right: TemplateOperand::Copy(arg(*cmp_right)),
+                            },
+                        }],
+                        terminator: TemplateTerminator::Return,
+                    }],
+                    arg_count: plan.signature().arity(),
+                })
+            }
+            _ => Err(TemplateRefusal::RealizationDisagrees),
+        },
+
+        // ── the whole-body boolean connective (W6, Rust-calls-Clean) ────────
+        //
+        // `_0 = <BitAnd|BitOr>(l, r); return` at the `bool` carrier — the same
+        // single-assignment skeleton as the comparison value, with a `RawBin`
+        // rvalue reused at `bool` (a strict `&`/`|` on `bool` computes exactly
+        // the total `Bool.and`/`Bool.or` the island wrote). NO `machine_width`
+        // extraction: the operands and the result are all `bool`, so there is
+        // no width to read (that is exactly why this is not the `uint.and`/
+        // `uint.or` row).
+        MirShape::BoolConnValue(row_op) => match plan.shape() {
+            CleanOriginShape::BoolExpression { expr }
+                if matches!(
+                    (row_op, expr),
+                    (BoolBinOp::And, BoolExpr::And(..)) | (BoolBinOp::Or, BoolExpr::Or(..))
+                ) =>
+            {
+                Ok(bool_expression_body(plan, expr))
+            }
+            CleanOriginShape::BoolConnective { op, left, right } if *op == row_op => {
+                let raw_op = match op {
+                    BoolBinOp::And => RawBinOpKind::BitAnd,
+                    BoolBinOp::Or => RawBinOpKind::BitOr,
+                };
+                Ok(BodyTemplate {
+                    locals: signature_locals(plan),
+                    blocks: vec![TemplateBlock {
+                        stmts: vec![TemplateStatement {
+                            place: 0,
+                            rvalue: TemplateRvalue::RawBin {
+                                op: raw_op,
+                                left: TemplateOperand::Copy(arg(*left)),
+                                right: TemplateOperand::Copy(arg(*right)),
+                            },
+                        }],
+                        terminator: TemplateTerminator::Return,
+                    }],
+                    arg_count: plan.signature().arity(),
+                })
+            }
+            _ => Err(TemplateRefusal::RealizationDisagrees),
+        },
+
+        // ── the whole-body boolean negation (W6, Rust-calls-Clean) ──────────
+        //
+        // `_0 = UnaryOp(Not, param); return` at the `bool` carrier, via the new
+        // `TemplateRvalue::BoolNot` primitive. Same single-assignment skeleton.
+        MirShape::BoolNotValue => match plan.shape() {
+            CleanOriginShape::BoolExpression { expr: expr @ BoolExpr::Not(_) } => {
+                Ok(bool_expression_body(plan, expr))
+            }
+            CleanOriginShape::BoolNot { param } => Ok(BodyTemplate {
+                locals: signature_locals(plan),
+                blocks: vec![TemplateBlock {
+                    stmts: vec![TemplateStatement {
+                        place: 0,
+                        rvalue: TemplateRvalue::BoolNot(TemplateOperand::Copy(arg(*param))),
+                    }],
+                    terminator: TemplateTerminator::Return,
+                }],
+                arg_count: plan.signature().arity(),
+            }),
+            _ => Err(TemplateRefusal::RealizationDisagrees),
+        },
+
         // ── the comparison diamond ──────────────────────────────────────────
         //
         // ONE skeleton for THREE rungs. Landing 3 recorded the reflection-side
@@ -693,6 +862,9 @@ pub fn body_template(
         // builders differed in nothing but which of three operand vocabularies
         // filled four positions.
         MirShape::ComparisonBranch(row_cmp) => match plan.shape() {
+            CleanOriginShape::UnsignedConditional {
+                expr: expr @ UIntConditional::If { cmp, .. },
+            } if *cmp == row_cmp => unsigned_conditional_body(plan, expr),
             CleanOriginShape::Select { cmp, cmp_left, cmp_right, then_param, else_param } => {
                 if *cmp != row_cmp {
                     return Err(TemplateRefusal::RealizationDisagrees);
@@ -920,6 +1092,21 @@ pub fn body_template(
             Ok(zero_test_rec_template(zero_value, nonzero_value, rec_args, measure_index, unwind))
         }
 
+        // ── W5 (Lean-calls-Rust): the Rust-call chain ───────────────────────
+        //
+        // The skeleton is `call_chain_body`'s — one `Call` per node in
+        // post-order through fresh temporaries, the root writing `_0` — with
+        // two things the arithmetic chain never needed: the callee is a
+        // TABLE INDEX rather than a primitive identity, and each temporary is
+        // typed at ITS callee's result carrier rather than at the plan's.
+        MirShape::RustCallChain => match plan.shape() {
+            CleanOriginShape::RustCallChain { nodes } => {
+                let unwind = call_unwind(row)?;
+                rust_call_chain_body(plan, nodes, unwind)
+            }
+            _ => Err(TemplateRefusal::RealizationDisagrees),
+        },
+
         // These realizations belong to rows that are NODES inside a recursion
         // arm, framed by a scheme row — no whole-body plan may select one, and
         // a plan that did would be table/emitter drift. Fail closed rather than
@@ -930,11 +1117,191 @@ pub fn body_template(
     }
 }
 
+/// **W5 (Lean-calls-Rust)** — the Rust-call chain: one `Call` per
+/// [`RustCallNode`] in node order, each non-root node writing a fresh
+/// temporary typed at ITS CALLEE's result carrier, the root writing `_0`,
+/// then `Return`. For `def twice_inc (x : UInt64) : UInt64 := inc (inc x)`:
+///
+/// ```text
+/// bb0: _2 = Call(inc, [copy _1]) -> bb1
+/// bb1: _0 = Call(inc, [copy _2]) -> bb2
+/// bb2: Return
+/// ```
+///
+/// Temporary for non-root node `k` is local `arg_count + 1 + k`; the root
+/// (node `n - 1`) writes the return place and gets no temporary. The unwind
+/// edge is the row's (`Continue`: the callee is user code that may panic —
+/// the callee's panic-freedom is an ordinary obligation of that `fn`, never
+/// this body's).
+///
+/// **W5 increment 7 — the chain is a DAG, and this template is what makes a
+/// `let`-bound call a value temporary.** A node with
+/// [`RustCallNode::let_binding`] `Some` is read 0..n times through
+/// [`RustCallArg::Node`], and every read is `Copy(temp(j))` of the ONE local
+/// its ONE `Call` block wrote — so `let y := dbl x; sub2 y y` emits `dbl`
+/// once and copies `_2` twice, and a dead binding is a written, unread local
+/// whose `Call` still executes, in node order, before the root. Nothing here
+/// changed for it: the once-evaluation property is that this function emits
+/// exactly one `Call` per node, and `emit::check_rust_call_chain` pins the
+/// node list it emits from (`docs/TCB.md`, the let-temp ONCE-EVALUATION row).
+///
+/// # ONE CALL PER NODE — which is what makes a `let`-bound call single-evaluated
+///
+/// The loop below emits exactly one `Call` per node, and a
+/// [`RustCallArg::Node`] operand is a `Copy` of that node's temporary. A node
+/// read by SEVERAL later nodes is therefore called ONCE and copied many times,
+/// which is precisely the explicit value temporary `emit::walk_let_spine`
+/// plans for `def dup (x) := let y := dbl x; sub2 y y`:
+///
+/// ```text
+/// bb0: _2 = Call(dbl,  [copy _1]) -> bb1
+/// bb1: _0 = Call(sub2, [copy _2, copy _2]) -> bb2
+/// bb2: Return
+/// ```
+///
+/// Nothing here needs the callee to be pure for that to be right: the call
+/// site appears once, in the node's position in the chain, which is the
+/// source's evaluation order. (`clean_origin_mir::rust_callee_is_pure` is a
+/// separate guard on the callee itself.)
+///
+/// The invariants this relies on — every callee index in the table, every
+/// literal in range at the callee parameter's width, every ordinary node
+/// referenced exactly once by a later node and every `let`-bound one only by
+/// later nodes — are re-checked on the sealed plan
+/// (`emit::check_rust_call_chain`); a violation reaching here is
+/// table/emitter drift and fails closed as one. Sharing is deliberately NOT
+/// among them: a node read more than once is the `let` lane's normal output.
+/// What IS bounded about sharing is the chain's UNFOLDED size (the unfold
+/// rail in `emit::check_rust_call_chain`, capped at `named_calls::MAX_NODES`
+/// on the same sealed plan): the MIR below is linear in the node count
+/// whatever the sharing, but the term side B reflects from it and the kernel
+/// decides over is the unfolding, and that is what the plan refuses past the
+/// measured cap.
+fn rust_call_chain_body(
+    plan: &CleanOriginPlan,
+    nodes: &[RustCallNode],
+    unwind: TemplateUnwind,
+) -> Result<BodyTemplate, TemplateRefusal> {
+    let arg_count = plan.signature().arity();
+    let n_nodes = nodes.len();
+    let Some(root) = n_nodes.checked_sub(1) else {
+        return Err(TemplateRefusal::DegenerateComposedTree { steps: 0 });
+    };
+    let temp = |node: usize| arg_count + 1 + node;
+
+    let mut locals = signature_locals(plan);
+    for node in &nodes[..root] {
+        if node.callee >= plan.callees().len() {
+            return Err(TemplateRefusal::RealizationDisagrees);
+        }
+        locals.push(TemplateLocal {
+            ty: TemplateTy::RustCalleeResult { index: node.callee },
+            immutable: false,
+        });
+    }
+
+    let mut blocks: Vec<TemplateBlock> = Vec::with_capacity(n_nodes + 1);
+    for (k, node) in nodes.iter().enumerate() {
+        let Some(callee) = plan.callees().get(node.callee) else {
+            return Err(TemplateRefusal::RealizationDisagrees);
+        };
+        if node.args.len() != callee.params.len() {
+            return Err(TemplateRefusal::RealizationDisagrees);
+        }
+        let mut args = Vec::with_capacity(node.args.len());
+        for (arg, param_ty) in node.args.iter().zip(&callee.params) {
+            let operand = match arg {
+                RustCallArg::Param(index) => {
+                    if *index >= arg_count {
+                        return Err(TemplateRefusal::RealizationDisagrees);
+                    }
+                    TemplateOperand::Copy(self::arg(*index))
+                }
+                RustCallArg::Node(j) => {
+                    if *j >= k {
+                        return Err(TemplateRefusal::RealizationDisagrees);
+                    }
+                    TemplateOperand::Copy(temp(*j))
+                }
+                RustCallArg::Literal(RustCallLiteral::UInt(value)) => match param_ty {
+                    trust_types::Ty::Int { width, signed: false }
+                        if matches!(width, 8 | 16 | 32 | 64) =>
+                    {
+                        TemplateOperand::UIntScalar { value: *value, width: *width }
+                    }
+                    _ => return Err(TemplateRefusal::RealizationDisagrees),
+                },
+                RustCallArg::Literal(RustCallLiteral::Bool(value)) => {
+                    if *param_ty != trust_types::Ty::Bool {
+                        return Err(TemplateRefusal::RealizationDisagrees);
+                    }
+                    TemplateOperand::BoolScalar(*value)
+                }
+            };
+            args.push(operand);
+        }
+        let is_root = k == root;
+        blocks.push(TemplateBlock {
+            stmts: Vec::new(),
+            terminator: TemplateTerminator::Call {
+                callee: TemplateCallee::RustFn { index: node.callee },
+                args,
+                dest: if is_root { 0 } else { temp(k) },
+                target: k + 1,
+                unwind,
+            },
+        });
+    }
+    blocks.push(TemplateBlock { stmts: Vec::new(), terminator: TemplateTerminator::Return });
+
+    Ok(BodyTemplate { locals, blocks, arg_count })
+}
+
 // ═══════════════════════════ the skeletons ═════════════════════════════════
 
 /// `_0` is the return place; `_1 ..= _n` are the parameters, immutable exactly
 /// as `local_decls_for_sig` makes them for a shim. At arity 0 the chain is empty
 /// and the body is one local — a nullary `fn() -> uN`.
+fn bool_expression_body(plan: &CleanOriginPlan, expr: &BoolExpr) -> BodyTemplate {
+    fn emit(
+        expr: &BoolExpr,
+        locals: &mut Vec<TemplateLocal>,
+        stmts: &mut Vec<TemplateStatement>,
+    ) -> TemplateOperand {
+        let rvalue = match expr {
+            BoolExpr::Param(index) => return TemplateOperand::Copy(arg(*index)),
+            BoolExpr::Literal(value) => return TemplateOperand::BoolScalar(*value),
+            BoolExpr::Not(child) => TemplateRvalue::BoolNot(emit(child, locals, stmts)),
+            BoolExpr::And(left, right) | BoolExpr::Or(left, right) => {
+                let left = emit(left, locals, stmts);
+                let right = emit(right, locals, stmts);
+                TemplateRvalue::RawBin {
+                    op: if matches!(expr, BoolExpr::And(..)) {
+                        RawBinOpKind::BitAnd
+                    } else {
+                        RawBinOpKind::BitOr
+                    },
+                    left,
+                    right,
+                }
+            }
+        };
+        let place = locals.len();
+        locals.push(TemplateLocal { ty: TemplateTy::Bool, immutable: false });
+        stmts.push(TemplateStatement { place, rvalue });
+        TemplateOperand::Copy(place)
+    }
+    let mut locals = signature_locals(plan);
+    let mut stmts = Vec::new();
+    let result = emit(expr, &mut locals, &mut stmts);
+    stmts.push(TemplateStatement { place: 0, rvalue: TemplateRvalue::Use(result) });
+    BodyTemplate {
+        locals,
+        blocks: vec![TemplateBlock { stmts, terminator: TemplateTerminator::Return }],
+        arg_count: plan.signature().arity(),
+    }
+}
+
 fn signature_locals(plan: &CleanOriginPlan) -> Vec<TemplateLocal> {
     std::iter::once(TemplateLocal { ty: TemplateTy::Result, immutable: false })
         .chain(
@@ -1061,6 +1428,56 @@ fn call_chain_body(
 /// encodes. With one arm a parameter and the other a numeral the two arms are
 /// DIFFERENT INSTRUCTIONS, so a swapped `SwitchTargets` is a visibly different
 /// body rather than two indices exchanged — `control_10`'s `half_3` is its net.
+fn unsigned_conditional_body(
+    plan: &CleanOriginPlan,
+    expression: &UIntConditional,
+) -> Result<BodyTemplate, TemplateRefusal> {
+    fn emit(
+        expression: &UIntConditional,
+        width: u32,
+        locals: &mut Vec<TemplateLocal>,
+        blocks: &mut Vec<TemplateBlock>,
+    ) -> usize {
+        let block = blocks.len();
+        blocks.push(TemplateBlock { stmts: Vec::new(), terminator: TemplateTerminator::Return });
+        match expression {
+            UIntConditional::Operand(operand) => {
+                blocks[block].stmts.push(TemplateStatement {
+                    place: 0,
+                    rvalue: TemplateRvalue::Use(leaf(*operand, width)),
+                });
+            }
+            UIntConditional::If { cmp, left, right, then_branch, else_branch } => {
+                let comparison = locals.len();
+                locals.push(TemplateLocal { ty: TemplateTy::Bool, immutable: false });
+                let then_target = emit(then_branch, width, locals, blocks);
+                let else_target = emit(else_branch, width, locals, blocks);
+                blocks[block] = TemplateBlock {
+                    stmts: vec![TemplateStatement {
+                        place: comparison,
+                        rvalue: TemplateRvalue::Compare {
+                            cmp: *cmp,
+                            left: TemplateOperand::Copy(arg(*left)),
+                            right: leaf(*right, width),
+                        },
+                    }],
+                    terminator: TemplateTerminator::SwitchIntZero {
+                        discr: TemplateOperand::Copy(comparison),
+                        zero: else_target,
+                        otherwise: then_target,
+                    },
+                };
+            }
+        }
+        block
+    }
+    let width = machine_width(plan, "UnsignedConditional")?;
+    let mut locals = signature_locals(plan);
+    let mut blocks = Vec::new();
+    emit(expression, width, &mut locals, &mut blocks);
+    Ok(BodyTemplate { locals, blocks, arg_count: plan.signature().arity() })
+}
+
 fn diamond_body(
     plan: &CleanOriginPlan,
     cmp: SelectCmp,
@@ -1341,9 +1758,7 @@ pub fn zero_test_rec_template(
     // bool; arm temps are allocated behind them. At arity 1 that is
     // `_0, _1, _2, _3` — R2's numbering, byte for byte.
     let mut locals = vec![TemplateLocal { ty: TemplateTy::Result, immutable: false }];
-    locals.extend(
-        (0..arity).map(|_| TemplateLocal { ty: TemplateTy::Result, immutable: true }),
-    );
+    locals.extend((0..arity).map(|_| TemplateLocal { ty: TemplateTy::Result, immutable: true }));
     locals.push(TemplateLocal { ty: TemplateTy::ResultRef, immutable: false });
     locals.push(TemplateLocal { ty: TemplateTy::Bool, immutable: false });
     let mut blocks: Vec<TemplateBlock> = Vec::new();

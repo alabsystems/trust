@@ -6,21 +6,14 @@
 //! [`core::error`] module is marked as stable since 1.81.0, so we want to show
 //! [`core::error::Error`] as stable since 1.81.0 as well.
 
+use rustc_attr_ir::{Stability, StabilityLevel};
 use rustc_hir::def_id::CRATE_DEF_ID;
-use rustc_hir::{Stability, StabilityLevel};
 
 use crate::clean::{Crate, Item, ItemId, ItemKind};
 use crate::core::DocContext;
 use crate::fold::DocFolder;
-use crate::passes::Pass;
 
-pub(crate) const PROPAGATE_STABILITY: Pass = Pass {
-    name: "propagate-stability",
-    run: Some(propagate_stability),
-    description: "propagates stability to child items",
-};
-
-pub(crate) fn propagate_stability(cr: Crate, cx: &mut DocContext<'_>) -> Crate {
+pub(super) fn propagate_stability(cr: Crate, cx: &mut DocContext<'_>) -> Crate {
     let crate_stability = cx.tcx.lookup_stability(CRATE_DEF_ID);
     StabilityPropagator { parent_stability: crate_stability, cx }.fold_crate(cr)
 }
@@ -44,9 +37,9 @@ impl DocFolder for StabilityPropagator<'_, '_> {
                     matches!(
                         self.cx.tcx.hir_node(hir_id),
                         rustc_hir::Node::Item(rustc_hir::Item {
-                            kind: rustc_hir::ItemKind::Use(_, rustc_hir::UseKind::Glob),
+                            kind: rustc_hir::ItemKind::Use(tree),
                             ..
-                        })
+                        }) | rustc_hir::Node::NestedUseTree(tree) if matches!(tree.kind, rustc_hir::UseKind::Glob)
                     )
                 });
                 let own_stability = if let Some(item_stab) = item_stability
@@ -69,30 +62,26 @@ impl DocFolder for StabilityPropagator<'_, '_> {
                     item_stability
                 };
 
-                let kind = match &item.kind {
-                    ItemKind::StrippedItem(kind) => kind,
-                    kind => kind,
-                };
-                match kind {
-                    ItemKind::ExternCrateItem { .. }
-                    | ItemKind::ImportItem(..)
-                    | ItemKind::StructItem(..)
-                    | ItemKind::UnionItem(..)
-                    | ItemKind::EnumItem(..)
-                    | ItemKind::FunctionItem(..)
-                    | ItemKind::ModuleItem(..)
-                    | ItemKind::TypeAliasItem(..)
-                    | ItemKind::StaticItem(..)
-                    | ItemKind::TraitItem(..)
-                    | ItemKind::TraitAliasItem(..)
-                    | ItemKind::StructFieldItem(..)
-                    | ItemKind::VariantItem(..)
-                    | ItemKind::ForeignFunctionItem(..)
-                    | ItemKind::ForeignStaticItem(..)
-                    | ItemKind::ForeignTypeItem
-                    | ItemKind::MacroItem(..)
-                    | ItemKind::ProcMacroItem(..)
-                    | ItemKind::ConstantItem(..) => {
+                match item.kind.unstripped() {
+                    ItemKind::ExternCrate { .. }
+                    | ItemKind::Import(..)
+                    | ItemKind::Struct(..)
+                    | ItemKind::Union(..)
+                    | ItemKind::Enum(..)
+                    | ItemKind::Function(..)
+                    | ItemKind::Module(..)
+                    | ItemKind::TypeAlias(..)
+                    | ItemKind::Static(..)
+                    | ItemKind::Trait(..)
+                    | ItemKind::TraitAlias(..)
+                    | ItemKind::StructField(..)
+                    | ItemKind::Variant(..)
+                    | ItemKind::ForeignFunction(..)
+                    | ItemKind::ForeignStatic(..)
+                    | ItemKind::ForeignType
+                    | ItemKind::DeclMacro(..)
+                    | ItemKind::ProcMacro(..)
+                    | ItemKind::Constant(..) => {
                         // If any of the item's parents was stabilized later or is still unstable,
                         // then use the parent's stability instead.
                         merge_stability(own_stability, parent_stability)
@@ -100,20 +89,16 @@ impl DocFolder for StabilityPropagator<'_, '_> {
 
                     // Don't inherit the parent's stability for these items, because they
                     // are potentially accessible even if the parent is more unstable.
-                    ItemKind::ImplItem(..)
-                    | ItemKind::RequiredMethodItem(..)
-                    | ItemKind::MethodItem(..)
-                    | ItemKind::RequiredAssocConstItem(..)
-                    | ItemKind::ProvidedAssocConstItem(..)
-                    | ItemKind::ImplAssocConstItem(..)
-                    | ItemKind::RequiredAssocTypeItem(..)
-                    | ItemKind::AssocTypeItem(..)
-                    | ItemKind::PrimitiveItem(..)
-                    | ItemKind::KeywordItem
-                    | ItemKind::AttributeItem
-                    | ItemKind::PlaceholderImplItem => own_stability,
+                    ItemKind::Impl(..)
+                    | ItemKind::AssocFunction(..)
+                    | ItemKind::AssocConstant(..)
+                    | ItemKind::AssocType(..)
+                    | ItemKind::PrimitiveType(..)
+                    | ItemKind::Keyword
+                    | ItemKind::Attribute
+                    | ItemKind::PlaceholderImpl => own_stability,
 
-                    ItemKind::StrippedItem(..) => unreachable!(),
+                    ItemKind::Stripped(..) => unreachable!(),
                 }
             }
             ItemId::Auto { .. } | ItemId::Blanket { .. } => {

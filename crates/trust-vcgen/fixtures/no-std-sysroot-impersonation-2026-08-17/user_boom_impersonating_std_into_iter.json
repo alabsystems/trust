@@ -296,7 +296,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "<std::vec::Endless as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@8>",
+            "func": "<std::vec::Endless as core::iter::traits::iterator::Iterator>::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@1>",
             "args": [
               {
                 "Move": {

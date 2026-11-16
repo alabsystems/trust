@@ -1,0 +1,323 @@
+; SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+;
+; SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+; RUN: %tpde_test --run-until=analyzer --print-loops --print-layout %s | FileCheck %s --dump-input always
+
+; CHECK: Block Layout for single
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for single
+; CHECK-NEXT: 0: level 0, parent 0, 0->1
+; CHECK-NEXT: End Loops
+single() {
+entry:
+  terminate
+}
+
+
+; COM: Here we test that the original block order is respected for the ordering
+; COM: of successors
+
+; CHECK: Block Layout for loop1
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: loop_body
+; CHECK-NEXT: 3: cont
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for loop1
+; CHECK-NEXT: 0: level 0, parent 0, 0->4
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: End Loops
+loop1() {
+entry:
+  jump ^loop_head
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+cont:
+  terminate
+}
+
+; CHECK: Block Layout for loop2
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: loop_body
+; CHECK-NEXT: 3: cont
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for loop2
+; CHECK-NEXT: 0: level 0, parent 0, 0->4
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: End Loops
+loop2() {
+entry:
+  jump ^loop_head
+cont:
+  terminate
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+}
+
+; CHECK: Block Layout for loop3
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop_head
+; CHECK-NEXT: 2: loop_body
+; CHECK-NEXT: 3: cont
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for loop3
+; CHECK-NEXT: 0: level 0, parent 0, 0->4
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: End Loops
+loop3() {
+entry:
+  jump ^loop_head, ^cont
+cont:
+  terminate
+loop_head:
+  jump ^loop_body, ^cont
+loop_body:
+  jump ^loop_head
+}
+
+; CHECK: Block Layout for mixed_loop
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body
+; CHECK-NEXT: 3: cont1
+; CHECK-NEXT: 4: loop2_head
+; CHECK-NEXT: 5: loop2_body
+; CHECK-NEXT: 6: ret
+; CHECK: Loops for mixed_loop
+; CHECK-NEXT: 0: level 0, parent 0, 0->7
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: 2: level 1, parent 0, 4->6
+; CHECK-NEXT: End Loops
+mixed_loop() {
+entry:
+  jump ^loop1_head, ^cont1
+loop1_head:
+  jump ^loop1_body, ^cont1
+loop1_body:
+  jump ^loop1_head
+cont1:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+loop2_body:
+  jump ^loop2_head
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for mixed_loop2
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body
+; CHECK-NEXT: 3: cont1
+; COM: loop2_head comes first since it is first in RPO
+; CHECK-NEXT: 4: loop2_head
+; CHECK-NEXT: 5: loop2_body
+; CHECK-NEXT: 6: ret
+; CHECK: Loops for mixed_loop2
+; CHECK-NEXT: 0: level 0, parent 0, 0->7
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: 2: level 1, parent 0, 4->6
+; CHECK-NEXT: End Loops
+mixed_loop2() {
+entry:
+  jump ^loop1_head, ^cont1
+loop1_head:
+  jump ^loop1_body, ^cont1
+cont1:
+  jump ^loop2_head
+loop1_body:
+  jump ^loop1_head
+loop2_body:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for mixed_loop3
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body
+; CHECK-NEXT: 3: cont1
+; CHECK-NEXT: 4: loop2_head
+; CHECK-NEXT: 5: loop2_body
+; CHECK-NEXT: 6: ret
+; CHECK: Loops for mixed_loop3
+; CHECK-NEXT: 0: level 0, parent 0, 0->7
+; CHECK-NEXT: 1: level 1, parent 0, 1->3
+; CHECK-NEXT: 2: level 1, parent 0, 4->6
+; CHECK-NEXT: End Loops
+mixed_loop3() {
+entry:
+  jump ^loop1_head, ^cont1
+cont1:
+  jump ^loop2_head
+loop1_head:
+  jump ^loop1_body, ^cont1
+loop1_body:
+  jump ^loop1_head
+loop2_body:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for nested_loop1
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body1
+; CHECK-NEXT: 3: loop1_body2
+; CHECK-NEXT: 4: loop1_body3
+; CHECK-NEXT: 5: cont
+; CHECK-NEXT: 6: loop2_head
+; CHECK-NEXT: 7: loop2_body
+; CHECK-NEXT: 8: ret
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for nested_loop1
+; CHECK-NEXT: 0: level 0, parent 0, 0->9
+; CHECK-NEXT: 1: level 1, parent 0, 1->5
+; CHECK-NEXT: 2: level 2, parent 1, 2->4
+; CHECK-NEXT: 3: level 1, parent 0, 6->8
+; CHECK-NEXT: End Loops
+nested_loop1() {
+entry:
+  jump ^loop1_head, ^cont
+loop1_head:
+  jump ^loop1_body1, ^cont
+loop1_body1:
+  jump ^loop1_body2, ^loop1_body3
+loop1_body2:
+  jump ^loop1_body1
+loop1_body3:
+  jump ^loop1_head
+cont:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+loop2_body:
+  jump ^loop2_head
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for nested_loop2
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body1
+; CHECK-NEXT: 3: loop1_body2_head
+; CHECK-NEXT: 4: loop1_body2_body
+; CHECK-NEXT: 5: loop1_body3_head
+; CHECK-NEXT: 6: loop1_body3_body
+; CHECK-NEXT: 7: cont
+; CHECK-NEXT: 8: loop2_head
+; CHECK-NEXT: 9: loop2_body
+; CHECK-NEXT: 10: ret
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for nested_loop2
+; CHECK-NEXT: 0: level 0, parent 0, 0->11
+; CHECK-NEXT: 1: level 1, parent 0, 1->7
+; CHECK-NEXT: 2: level 2, parent 1, 3->5
+; CHECK-NEXT: 3: level 2, parent 1, 5->7
+; CHECK-NEXT: 4: level 1, parent 0, 8->10
+; CHECK-NEXT: End Loops
+nested_loop2() {
+entry:
+  jump ^loop1_head, ^cont
+loop1_head:
+  jump ^loop1_body1, ^cont
+loop1_body1:
+  jump ^loop1_body2_head, ^loop1_body3_head
+loop1_body2_head:
+  jump ^loop1_head, ^loop1_body2_body
+loop1_body2_body:
+  jump ^loop1_body2_head
+loop1_body3_head:
+  jump ^loop1_head, ^loop1_body3_body
+loop1_body3_body:
+  jump ^loop1_body3_head
+cont:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+loop2_body:
+  jump ^loop2_head
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for nested_loop3
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: loop1_head
+; CHECK-NEXT: 2: loop1_body1
+; CHECK-NEXT: 3: loop1_body3_head
+; CHECK-NEXT: 4: loop1_body3_body
+; CHECK-NEXT: 5: loop1_body2_head
+; CHECK-NEXT: 6: loop1_body2_body
+; CHECK-NEXT: 7: cont
+; CHECK-NEXT: 8: loop2_head
+; CHECK-NEXT: 9: loop2_body
+; CHECK-NEXT: 10: ret
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for nested_loop3
+; CHECK-NEXT: 0: level 0, parent 0, 0->11
+; CHECK-NEXT: 1: level 1, parent 0, 1->7
+; CHECK-NEXT: 2: level 2, parent 1, 3->5
+; CHECK-NEXT: 3: level 2, parent 1, 5->7
+; CHECK-NEXT: 4: level 1, parent 0, 8->10
+; CHECK-NEXT: End Loops
+nested_loop3() {
+entry:
+  jump ^loop1_head, ^cont
+loop1_head:
+  jump ^loop1_body1, ^cont
+loop1_body1:
+  jump ^loop1_body2_head, ^loop1_body3_head
+loop1_body3_head:
+  jump ^loop1_head, ^loop1_body3_body
+loop1_body3_body:
+  jump ^loop1_body3_head
+loop1_body2_head:
+  jump ^loop1_head, ^loop1_body2_body
+loop1_body2_body:
+  jump ^loop1_body2_head
+cont:
+  jump ^loop2_head
+loop2_head:
+  jump ^loop2_body, ^ret
+loop2_body:
+  jump ^loop2_head
+ret:
+  terminate
+}
+
+; CHECK: Block Layout for irreducible_loop
+; CHECK-NEXT: 0: entry
+; CHECK-NEXT: 1: ret
+; CHECK-NEXT: 2: loop1_body
+; CHECK-NEXT: 3: loop1_head
+; CHECK-NEXT: End Block Layout
+; CHECK: Loops for irreducible_loop
+; CHECK-NEXT: 0: level 0, parent 0, 0->4
+; CHECK-NEXT: 1: level 1, parent 0, 1->4
+; CHECK-NEXT: End Loops
+irreducible_loop() {
+entry:
+  jump ^loop1_head, ^ret
+loop1_head:
+  jump ^ret, ^loop1_body
+loop1_body:
+  jump ^loop1_head
+ret:
+  jump ^loop1_body
+}

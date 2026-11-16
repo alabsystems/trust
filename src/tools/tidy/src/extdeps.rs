@@ -9,16 +9,16 @@ use crate::diagnostics::TidyCtx;
 /// List of allowed sources for packages.
 const ALLOWED_SOURCES: &[&str] = &[
     r#""registry+https://github.com/rust-lang/crates.io-index""#,
-    // Carcara is no longer a git source: the pinned rev is vendored byte-identical
-    // at vendor/carcara_1_1_0 and patched in via [patch."https://github.com/ufmg-smite/carcara"],
-    // so full-verify seed caches stay registry-only. Any git source reappearing in a
+    // Carcara is no longer a git source: first-party/clean vendors its audited copy
+    // (third-party/carcara, UPSTREAM.json + DOWNSTREAM.md) as a path dependency, so
+    // full-verify seed caches stay registry-only. Any git source reappearing in a
     // lockfile now fails this check.
 ];
 
 /// Checks for external package sources. `root` is the path to the directory that contains the
 /// workspace `Cargo.toml`.
 pub fn check(root: &Path, tidy_ctx: TidyCtx) {
-    let mut check = tidy_ctx.start_check("extdeps");
+    let check = tidy_ctx.start_check("extdeps");
 
     for &WorkspaceInfo { path, submodules, .. } in crate::deps::WORKSPACES {
         if crate::deps::has_missing_submodule(root, submodules, tidy_ctx.is_running_on_ci()) {

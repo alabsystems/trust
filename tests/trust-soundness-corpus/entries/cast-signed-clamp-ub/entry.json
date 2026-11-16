@@ -1,0 +1,42 @@
+{
+  "id": "cast-signed-clamp-ub",
+  "class": "CAST-SIGNED-CLAMP-UB-1",
+  "title": "a signed min-clamp cast to usize kept the clamp's upper bound; arr[l as usize] certified",
+  "origin": [
+    "DQ:10148 (CAST-SIGNED-CLAMP-UB-1)",
+    "crates/trust-vcgen/tests/data/signed_clamp_cast.rs",
+    "tests/ui/trust/signed_clamp_cast_to_usize_keeps_bounds_check_run.rs",
+    "fix on main: trust_vcgen::generate::value_facts::unsigned_upper_bound"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "c2_index",
+    "obligation": {
+      "kind": "bounds",
+      "at": "arr[l as usize]"
+    }
+  },
+  "twin": {
+    "function": "ctl_u32",
+    "obligation": {
+      "kind": "bounds",
+      "at": "arr[l as usize]"
+    }
+  },
+  "witness": {
+    "input": "v = -1",
+    "observed": "index out of bounds: the len is 11 but the index is 18446744073709551615",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "known_twin_lost": {
+    "trustc-default": "store 9192 refuses the twin's bounds row at -O1 (`index out of bounds` failed; proved and kernel-certified at -O0). The twin is in bounds on every input, so this is a precision loss of that compiler at -O1, not a false proof; retire the marker when a measured trustc proves it at both levels",
+    "trustc-advisory": "store 9192 refuses the twin's bounds row at -O1 (`index out of bounds` failed; proved and kernel-certified at -O0). The twin is in bounds on every input, so this is a precision loss of that compiler at -O1, not a false proof; retire the marker when a measured trustc proves it at both levels",
+    "trustc-certify": "store 9192 refuses the twin's bounds row at -O1 (`index out of bounds` failed; proved and kernel-certified at -O0). The twin is in bounds on every input, so this is a precision loss of that compiler at -O1, not a false proof; retire the marker when a measured trustc proves it at both levels"
+  }
+}

@@ -1,31 +1,30 @@
 TRUST_R1_TRACE: init: incomplete=0 address_taken=0 callers_keys=4 recursive=0 hidden=0
-TRUST_R1_TRACE: u::helper: found Failed VC kind='division by zero' loc=21:8 formula=$FORMULA freevars=$FREEVARS
+TRUST_R1_TRACE: u::helper: found Failed VC kind='division by zero' loc=17:8 formula=$FORMULA freevars=$FREEVARS
 TRUST_R1_TRACE: u::helper: trying P = ¬V = Not(Eq(Var("d", Int), Int(0)))
 TRUST_R1_TRACE: u::helper: proposed P = Not(Eq(Var("d", Int), Int(0)))
 TRUST_R1_TRACE: u::helper: 1 recorded caller(s); params=["x", "d"]
 TRUST_R1_TRACE: u::helper: built 1 caller obligation(s) — minting sealed certificate
 TRUST_R1_TRACE: u::helper: ADMITTED FLIP (sealed $DIGEST)
-TRUST_R1_TRACE: stored flip key='t::u::helper' kind='division by zero' loc=21:8 file=Some("caller_closure_key_space_no_collision.rs")
+TRUST_R1_TRACE: stored flip key='t::u::helper' kind='division by zero' loc=17:8 file=Some("caller_closure_key_space_no_collision.rs")
 TRUST_R1_TRACE: u::call: no Failed VC among 0 obligation(s)
-TRUST_R1_TRACE: helper: found Failed VC kind='division by zero' loc=28:4 formula=$FORMULA freevars=$FREEVARS
+TRUST_R1_TRACE: helper: found Failed VC kind='division by zero' loc=24:4 formula=$FORMULA freevars=$FREEVARS
 TRUST_R1_TRACE: helper: trying P = ¬V = Not(Eq(Var("d", Int), Int(0)))
 TRUST_R1_TRACE: helper: proposed P = Not(Eq(Var("d", Int), Int(0)))
 TRUST_R1_TRACE: helper: 1 recorded caller(s); params=["x", "d"]
 TRUST_R1_TRACE: helper: built 1 caller obligation(s) — minting sealed certificate
 TRUST_R1_TRACE: helper: ADMITTED FLIP (sealed $DIGEST)
-TRUST_R1_TRACE: stored flip key='t::helper' kind='division by zero' loc=28:4 file=Some("caller_closure_key_space_no_collision.rs")
+TRUST_R1_TRACE: stored flip key='t::helper' kind='division by zero' loc=24:4 file=Some("caller_closure_key_space_no_collision.rs")
 TRUST_R1_TRACE: call2: no Failed VC among 0 obligation(s)
 TRUST_R1_TRACE: go: no Failed VC among 0 obligation(s)
-TRUST_R1_TRACE: init: generic-mono covered=0 caller-closure=0
 TRUST_R1_TRACE: apply_r1_flips: def_path='t::u::helper' has 1 flip(s); 1 result VC(s):
-TRUST_R1_TRACE:   result kind='division by zero' loc=21:8 file=Some("caller_closure_key_space_no_collision.rs") proved=false
-TRUST_R1_TRACE:     native key kind='division by zero' loc=21:8 file=Some("caller_closure_key_space_no_collision.rs")
-TRUST_R1_TRACE:   FLIP kind='division by zero' loc=21:8 file=Some("caller_closure_key_space_no_collision.rs")
+TRUST_R1_TRACE:   result kind='division by zero' loc=17:8 file=Some("caller_closure_key_space_no_collision.rs") proved=false
+TRUST_R1_TRACE:     native key kind='division by zero' loc=17:8 file=Some("caller_closure_key_space_no_collision.rs")
+TRUST_R1_TRACE:   FLIP kind='division by zero' loc=17:8 file=Some("caller_closure_key_space_no_collision.rs")
 
 === Trust Verification Report (t) ===
 
 note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> $DIR/caller_closure_key_space_no_collision.rs:20:5
+  --> $DIR/caller_closure_key_space_no_collision.rs:16:5
    |
 LL | /     pub(crate) fn helper(x: u32, d: u32) -> u32 {
 LL | |         x / d
@@ -33,12 +32,20 @@ LL | |     }
    | |_____^
 
 TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::u::call'; stored keys=["t::helper", "t::u::helper"]
-TRUST_R1_TRACE: apply_r1_flips: def_path='t::helper' has 1 flip(s); 1 result VC(s):
-TRUST_R1_TRACE:   result kind='division by zero' loc=28:4 file=Some("caller_closure_key_space_no_collision.rs") proved=false
-TRUST_R1_TRACE:     native key kind='division by zero' loc=28:4 file=Some("caller_closure_key_space_no_collision.rs")
-TRUST_R1_TRACE:   FLIP kind='division by zero' loc=28:4 file=Some("caller_closure_key_space_no_collision.rs")
 note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> $DIR/caller_closure_key_space_no_collision.rs:27:1
+  --> $DIR/caller_closure_key_space_no_collision.rs:19:5
+   |
+LL | /     pub(crate) fn call() -> u32 {
+LL | |         helper(10, 5)
+LL | |     }
+   | |_____^
+
+TRUST_R1_TRACE: apply_r1_flips: def_path='t::helper' has 1 flip(s); 1 result VC(s):
+TRUST_R1_TRACE:   result kind='division by zero' loc=24:4 file=Some("caller_closure_key_space_no_collision.rs") proved=false
+TRUST_R1_TRACE:     native key kind='division by zero' loc=24:4 file=Some("caller_closure_key_space_no_collision.rs")
+TRUST_R1_TRACE:   FLIP kind='division by zero' loc=24:4 file=Some("caller_closure_key_space_no_collision.rs")
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/caller_closure_key_space_no_collision.rs:23:1
    |
 LL | / fn helper(x: u32, d: u32) -> u32 {
 LL | |     x / d
@@ -46,4 +53,21 @@ LL | | }
    | |_^
 
 TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::call2'; stored keys=["t::helper", "t::u::helper"]
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/caller_closure_key_space_no_collision.rs:26:1
+   |
+LL | / fn call2() -> u32 {
+LL | |     helper(20, 4)
+LL | | }
+   | |_^
+
 TRUST_R1_TRACE: apply_r1_flips: NO flip for def_path='t::go'; stored keys=["t::helper", "t::u::helper"]
+note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
+  --> $DIR/caller_closure_key_space_no_collision.rs:29:1
+   |
+LL | / fn go() {
+LL | |     let _ = u::call();
+LL | |     let _ = call2();
+LL | | }
+   | |_^
+

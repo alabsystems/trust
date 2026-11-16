@@ -233,7 +233,8 @@ pub fn certify_body_bound_ensures_claim(
     let goal = prop_to_expr(&claim.body).ok_or(BodyBoundCertifyError::NoProofTerm)?;
     let proof = prove(&claim.body).ok_or(BodyBoundCertifyError::NoProofTerm)?;
 
-    if TypeChecker::with_context(&env, LocalContext::new()).check_type(&proof, &goal).is_err() {
+    let checker = TypeChecker::with_context(&env, LocalContext::new());
+    if crate::kernel_stop::check_type(checker, &proof, &goal).is_err() {
         return Err(BodyBoundCertifyError::KernelRejectedProof);
     }
     if !proof_axiom_closure_is_clean(&env, &proof, &claim.variables) {
@@ -682,7 +683,12 @@ fn payload_roundtrip_rechecks(
     let Some(goal) = prop_to_expr(&replayed.body) else {
         return false;
     };
-    TypeChecker::with_context(&env, LocalContext::new()).check_type(&term, &goal).is_ok()
+    crate::kernel_stop::check_type(
+        TypeChecker::with_context(&env, LocalContext::new()),
+        &term,
+        &goal,
+    )
+    .is_ok()
         && proof_axiom_closure_is_clean(&env, &term, &replayed.variables)
 }
 

@@ -1,7 +1,7 @@
 /// A trait implemented for all `X<'a>` types that can be safely and
 /// efficiently converted to `X<'tcx>` as long as they are part of the
 /// provided `TyCtxt<'tcx>`.
-/// This can be done, for example, for `Ty<'tcx>` or `GenericArgsRef<'tcx>`
+/// This can be done, for example, for `Ty<'tcx>` or `GenericArgs<'tcx>`
 /// by looking them up in their respective interners.
 ///
 /// However, this is still not the best implementation as it does

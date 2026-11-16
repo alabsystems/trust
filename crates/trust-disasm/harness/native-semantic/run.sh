@@ -54,7 +54,7 @@
 #   ./run.sh --accept      rerun the chosen tier and rewrite its baseline entry
 #
 # Wall clock on an idle host with a warm tree, builds included (they are no-ops
-# when nothing changed; a cold `cargo build` of the driver adds ~40 s). CPU cost:
+# when nothing changed; a cold driver build adds ~40 s). CPU cost:
 # the full tier is ~90 CPU-seconds — it saturates 8 cores for 20 seconds — and
 # the fast tier ~2. NOTHING HERE IS EXPENSIVE ENOUGH TO JUSTIFY SKIPPING IT,
 # which is the only reason the tiering exists at all: not to make the check
@@ -73,8 +73,9 @@
 #           It is a DISCOVERY check: it sees forms that a decoder or semantics
 #           change has newly admitted, which a frozen list never can.
 #
-# The fast tier is not a weaker check — same three stages, same seven mutations,
-# same 86 opcodes compared. It is a smaller population. Run it before every
+# The fast tier is not a weaker check — same three stages, the same mutation
+# battery, the same opcode families compared (each run prints both counts). It
+# is a smaller population. Run it before every
 # commit; run the default tier before landing anything that touches
 # `Aarch64Semantics` or the decoder, because only it can find a NEW form.
 #
@@ -99,7 +100,8 @@
 # known set is what makes a new one visible; baselining at zero would require
 # either fixing them first or lying.
 #
-# REQUIREMENTS: aarch64 macOS host; clang (Command Line Tools); cargo +beta.
+# REQUIREMENTS: aarch64 macOS host; clang (Command Line Tools); the Trust toolchain's
+# `targo` (see ../targo.sh).
 #
 # IT IS NOT PART OF `cargo test`, AND CANNOT BE. It assembles code, executes
 # arbitrary instruction encodings, and reads a trap ucontext; it needs an
@@ -108,6 +110,7 @@
 # ============================================================================
 set -e
 cd "$(dirname "$0")"
+. ../targo.sh
 HERE=$(pwd)
 
 CLANG=${CLANG:-/Library/Developer/CommandLineTools/usr/bin/clang}
@@ -146,7 +149,7 @@ echo "== building the native semantic executor =="
 
 echo "== building the differential driver =="
 CFG_RELEASE="1.99.0-dev" CFG_RELEASE_CHANNEL=dev RUSTC_BOOTSTRAP=1 \
-    cargo +beta build --release --quiet
+    "$TARGO" --unverified build --release --quiet
 
 DIFF=./target/release/natsem-diff
 
@@ -196,7 +199,8 @@ fi
 python3 - "$HERE" "$WORK" "$TIER" "$CAP" "$ACCEPT" <<'PY'
 import json, os, sys
 
-here, work, tier, cap, accept = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5] == '1'
+here, work, tier = sys.argv[1], sys.argv[2], sys.argv[3]
+cap, accept = int(sys.argv[4]), sys.argv[5] == '1'
 bpath = os.path.join(here, 'baseline.json')
 base = json.load(open(bpath))
 fail = []
@@ -280,7 +284,9 @@ if tier != 'selftest':
     print(f'   population {sw["population_words"]} words, digest {sw["population_digest"]}')
     print(f'   compared {sw["compared"]} across {sw["opcodes_compared"]} opcodes '
           f'in {sw["scan_s"]:.0f}s scan + {sw["sweep_s"]:.0f}s sweep')
-    print(f'   coverage  : {sw["compared"] + sw["excluded"]["platform_register_x18"] + sw["excluded"]["native_timeout"]} '
+    covered = (sw["compared"] + sw["excluded"]["platform_register_x18"]
+               + sw["excluded"]["native_timeout"])
+    print(f'   coverage  : {covered} '
           f'(compared + x18-excluded + timed-out; floor {tb["coverage_floor"]})')
     print('   families  : ' + (', '.join(f'{k}={v}' for k, v in sorted(fams.items())) or 'none'))
     print('   known-open: ' + (', '.join(sorted(known)) or 'none'))

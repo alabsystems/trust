@@ -7,13 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::FileType;
 use crate::core::build_steps::dist::distdir;
 use crate::core::builder::{Builder, Kind};
 use crate::core::config::BUILDER_CONFIG_FILENAME;
+use crate::core::session::FileType;
+use crate::utils::channel;
 use crate::utils::exec::BootstrapCommand;
-use crate::utils::helpers::{move_file, t};
-use crate::utils::{channel, helpers};
+use crate::utils::helpers::{self, move_file, t};
 
 #[derive(Copy, Clone)]
 pub(crate) enum OverlayKind {
@@ -27,6 +27,7 @@ pub(crate) enum OverlayKind {
     RustAnalyzer,
     LlvmBitcodeLinker,
     Enzyme,
+    Offload,
 }
 
 impl OverlayKind {
@@ -37,6 +38,9 @@ impl OverlayKind {
                 &["src/llvm-project/llvm/LICENSE.TXT", "src/llvm-project/llvm/README.txt"]
             }
             OverlayKind::Enzyme => &["src/tools/enzyme/LICENSE", "src/tools/enzyme/Readme.md"],
+            OverlayKind::Offload => {
+                &["src/llvm-project/openmp/LICENSE.TXT", "src/llvm-project/offload/README.md"]
+            }
             OverlayKind::Cargo => &[
                 "src/tools/targo/README.md",
                 "src/tools/targo/LICENSE-MIT",
@@ -98,6 +102,7 @@ impl OverlayKind {
                 .version(builder, &builder.release_num("rust-analyzer/crates/rust-analyzer")),
             OverlayKind::LlvmBitcodeLinker => builder.rust_version(),
             OverlayKind::Enzyme => builder.rust_version(),
+            OverlayKind::Offload => builder.rust_version(),
         }
     }
 }
@@ -249,7 +254,9 @@ impl<'a> Tarball<'a> {
             );
         }
 
-        self.run(|this, cmd| {
+        // Trust: retain the maintained component image as a typed producer output.
+        let image = self.image_dir.clone();
+        let mut generated = self.run(|this, cmd| {
             cmd.arg("generate")
                 .arg("--image-dir")
                 .arg(&this.image_dir)
@@ -265,7 +272,9 @@ impl<'a> Tarball<'a> {
             }
 
             this.non_bare_args(cmd);
-        })
+        });
+        generated.component_image = Some(image);
+        generated
     }
 
     pub(crate) fn combine(self, tarballs: &[GeneratedTarball]) -> GeneratedTarball {
@@ -430,6 +439,8 @@ impl<'a> Tarball<'a> {
             path: distdir(self.builder).join(format!("{package_name}.tar.{ext}")),
             decompressed_output,
             work: self.temp_dir,
+            // Trust: only generate(), not a combined/bare archive, owns a component image.
+            component_image: None,
         }
     }
 }
@@ -439,9 +450,15 @@ pub struct GeneratedTarball {
     path: PathBuf,
     decompressed_output: PathBuf,
     work: PathBuf,
+    // Trust: installation consumes the component owner's image, not a copied file inventory.
+    component_image: Option<PathBuf>,
 }
 
 impl GeneratedTarball {
+    pub(crate) fn component_image(&self) -> Option<&Path> {
+        self.component_image.as_deref()
+    }
+
     pub(crate) fn tarball(&self) -> &Path {
         &self.path
     }

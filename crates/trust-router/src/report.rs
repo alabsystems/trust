@@ -53,8 +53,6 @@ pub fn build_json_report_from_verifier_results(
             trust_version: ROUTER_REPORT_TRUST_VERSION.to_string(),
             timestamp: now_timestamp(),
             total_time_ms,
-            timeout_ms: None,
-            function_budget_ms: None,
         },
         crate_name: crate_name.to_string(),
         summary,
@@ -79,6 +77,7 @@ fn build_function_report(result: &VerifierFunctionResult) -> FunctionProofReport
         .map(|obligation_result| {
             let proof_evidence = obligation_result.evidence.as_ref().map(proof_evidence_report);
             ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: Some(obligation_result.obligation.id.to_string()),
                 description: obligation_result.obligation.kind.description(),
                 kind: result_kind_tag(
@@ -147,8 +146,11 @@ fn raw_result_to_outcome(result: &VerificationResult) -> ObligationOutcome {
         VerificationResult::Proved { strength, .. } => {
             ObligationOutcome::Proved { strength: strength.clone() }
         }
-        VerificationResult::Failed { counterexample, .. } => {
-            ObligationOutcome::Failed { counterexample: counterexample.as_ref().map(cex_to_report) }
+        VerificationResult::Failed { solver, counterexample, .. } => {
+            ObligationOutcome::failed_from_backend(
+                solver.as_str(),
+                counterexample.as_ref().map(cex_to_report),
+            )
         }
         VerificationResult::Unknown { reason, .. } => ObligationOutcome::Unknown {
             reason: result.release_blocking_proof_gap_reason().unwrap_or_else(|| reason.clone()),
@@ -169,6 +171,7 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
     let mut unknown = 0usize;
     let mut timed_out = 0usize;
     let mut design_requirements = 0usize;
+    let mut failed_unproved = 0usize;
     let mut total_time_ms = 0u64;
     let mut max_proof_level: Option<ProofLevel> = None;
 
@@ -176,7 +179,14 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
         match &obligation.outcome {
             ObligationOutcome::Proved { .. } => proved += 1,
             ObligationOutcome::RuntimeChecked { .. } => runtime_checked += 1,
-            ObligationOutcome::Failed { .. } => failed += 1,
+            // `failed_unproved` is a SUBSET of `failed` (display only); the
+            // verdict below reads `failed` exactly as before.
+            ObligationOutcome::Failed { basis, .. } => {
+                failed += 1;
+                if *basis == trust_types::FailureBasis::UnprovedFailClosed {
+                    failed_unproved += 1;
+                }
+            }
             ObligationOutcome::Unknown { .. } => unknown += 1,
             ObligationOutcome::Timeout { .. } => {
                 unknown += 1;
@@ -200,6 +210,7 @@ fn build_function_summary(obligations: &[ObligationReport]) -> FunctionSummary {
         unknown,
         timed_out,
         design_requirements,
+        failed_unproved,
         unattributed_failed: 0,
         unattributed_unknown: 0,
         unattributed_proved: 0,
@@ -227,6 +238,7 @@ fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSummary {
     let mut total_unknown = 0usize;
     let mut total_timed_out = 0usize;
     let mut total_design_requirements = 0usize;
+    let mut total_failed_unproved = 0usize;
     let mut total_unattributed_failed = 0usize;
     let mut total_unattributed_unknown = 0usize;
     let mut total_unattributed_proved = 0usize;
@@ -247,6 +259,7 @@ fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSummary {
         total_unknown += function.summary.unknown;
         total_timed_out += function.summary.timed_out;
         total_design_requirements += function.summary.design_requirements;
+        total_failed_unproved += function.summary.failed_unproved;
         total_unattributed_failed += function.summary.unattributed_failed;
         total_unattributed_unknown += function.summary.unattributed_unknown;
         total_unattributed_proved += function.summary.unattributed_proved;
@@ -285,6 +298,7 @@ fn build_crate_summary(functions: &[FunctionProofReport]) -> CrateSummary {
         total_unknown,
         total_timed_out,
         total_design_requirements,
+        total_failed_unproved,
         total_unattributed_failed,
         total_unattributed_unknown,
         total_unattributed_proved,
@@ -308,6 +322,9 @@ fn cex_to_report(cex: &Counterexample) -> CounterexampleReport {
                     CounterexampleValue::Int(value) => (value.to_string(), "int"),
                     CounterexampleValue::Uint(value) => (value.to_string(), "uint"),
                     CounterexampleValue::Float(value) => (value.to_string(), "float"),
+                    // The solver's own SMT-LIB spelling of a non-scalar value
+                    // (a datatype constructor application, a store chain…).
+                    CounterexampleValue::Term(term) => (term.clone(), "term"),
                     _ => ("unknown".to_string(), "unknown"),
                 };
                 CounterexampleVariable {
@@ -373,6 +390,7 @@ fn vc_kind_tag(kind: &VcKind) -> String {
             "aggregate_array_length_mismatch".to_string()
         }
         VcKind::UnsafeOperation { .. } => "unsafe_operation".to_string(),
+        VcKind::TypeInvariant { point, .. } => format!("type_invariant_{}", point.as_tag()),
         _ => "unknown".to_string(),
     }
 }
@@ -1120,5 +1138,75 @@ mod tests {
                     && reason.contains("Undef")
         ));
         assert!(obligation.proof_evidence.is_none());
+    }
+
+    /// A non-scalar witness keeps the solver's OWN spelling in the machine
+    /// report: `(succ zero)` under `value_type: "term"`, never the `"unknown"`
+    /// bucket that throws the witness away. trust-report's `cex_to_report` is
+    /// the duplicate of this renderer and carries the same test.
+    #[test]
+    fn cex_to_report_carries_the_solvers_spelling_of_a_non_scalar_witness() {
+        let cex = Counterexample::new(vec![
+            ("m".to_string(), CounterexampleValue::Term("(succ zero)".to_string())),
+            ("n".to_string(), CounterexampleValue::Int(-7)),
+        ]);
+        let report = cex_to_report(&cex);
+        let term = report
+            .variables
+            .iter()
+            .find(|variable| variable.name == "m")
+            .expect("the witness must bind `m`");
+        assert_eq!(term.value, "(succ zero)");
+        assert_eq!(term.value_type, "term");
+        assert_eq!(term.display, "(succ zero)");
+        let scalar = report
+            .variables
+            .iter()
+            .find(|variable| variable.name == "n")
+            .expect("the witness must bind `n`");
+        assert_eq!((scalar.value.as_str(), scalar.value_type.as_str()), ("-7", "int"));
+    }
+
+    /// A fail-closed `[unsafe…]` row is labelled unproved, not refuted, on the
+    /// router's report boundary too, and still counts in `failed`.
+    #[test]
+    fn fail_closed_unsafe_row_is_unproved_and_still_failed() {
+        let label = trust_types::UNSAFE_DEMAND_FAIL_CLOSED_SOLVER;
+        let failed = |solver: &str, cex: Option<trust_types::Counterexample>| {
+            VerificationResult::Failed { solver: solver.into(), time_ms: 0, counterexample: cex }
+        };
+        assert!(raw_result_to_outcome(&failed(label, None)).is_unproved_fail_closed());
+        assert_eq!(
+            raw_result_to_outcome(&failed("ay", None)).failure_basis(),
+            Some(trust_types::FailureBasis::Refuted)
+        );
+        let cex = trust_types::Counterexample::new(vec![(
+            "x".into(),
+            trust_types::CounterexampleValue::Uint(1),
+        )]);
+        assert_eq!(
+            raw_result_to_outcome(&failed(label, Some(cex))).failure_basis(),
+            Some(trust_types::FailureBasis::Refuted)
+        );
+        let row = |solver: &str| ObligationReport {
+            assumes: Vec::new(),
+            obligation_id: None,
+            description: "d".into(),
+            kind: "k".into(),
+            proof_level: trust_types::ProofLevel::L0Safety,
+            location: None,
+            outcome: raw_result_to_outcome(&failed(solver, None)),
+            solver: solver.into(),
+            time_ms: 0,
+            evidence: None,
+            proof_evidence: None,
+            transport_evidence: None,
+        };
+        let summary = build_function_summary(&[row(label), row("ay")]);
+        // CONTROL: the same two rows, both refuted.
+        let control = build_function_summary(&[row("ay"), row("ay")]);
+        assert_eq!((summary.failed, summary.failed_unproved), (2, 1));
+        assert_eq!((control.failed, control.failed_unproved), (2, 0));
+        assert_eq!(summary.verdict, control.verdict);
     }
 }

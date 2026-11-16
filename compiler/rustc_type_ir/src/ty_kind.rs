@@ -8,7 +8,7 @@ use rustc_ast_ir::Mutability;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableHash_NoContext};
 use rustc_type_ir::data_structures::{NoError, UnifyKey, UnifyValue};
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
@@ -18,16 +18,14 @@ use self::TyKind::*;
 pub use self::closure::*;
 use crate::inherent::*;
 use crate::ty::AliasTy;
-#[cfg(feature = "nightly")]
-use crate::visit::TypeVisitable;
 use crate::{
-    self as ty, BoundVarIndexKind, FloatTy, FreeAliasTy, InherentAliasTy, IntTy, Interner,
-    OpaqueAliasTy, ProjectionAliasTy, UintTy,
+    self as ty, BoundVarIndexKind, Const, FloatTy, FreeAliasTy, InherentAliasTy, IntTy, Interner,
+    OpaqueAliasTy, ProjectionAliasTy, Region, UintTy, Unnormalized,
 };
 
 mod closure;
 
-#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
+#[derive_where(Clone, Copy, Hash, PartialEq, Eq, Debug; I: Interner)]
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
@@ -114,6 +112,16 @@ impl<I: Interner> AliasTyKind<I> {
 /// with `IsRigid::Yes`. At this point we no longer have to try and renormalize this alias
 /// later on.
 ///
+/// Rigidness becomes outdated when the surrounding typing mode or param env changes,
+/// because further normalization might be possible.
+/// We should also note that rigidness can be shared within some typing mode groups
+/// if the param env is the same, e.g., `Typeck/PostTypeckThroughBorrowck` and
+/// `PostAnalysis/Codegen`.
+///
+/// We always reveal auto traits for rigid aliases and this can cause query cycle in
+/// `TypingMode::ErasedNotCoherence`. Thus we don't allow incorrectly marked rigid local
+/// opaques. We achieve this by immediately bailing out when normalizing local opaques.
+///
 /// FIXME(#155345): Alias handling is currently still in flux for the new trait
 /// solver and this is currently somewhat messy. Please reach out on
 /// #t-types/trait-system-refactor-initiative if you encounter this and it isn't
@@ -179,7 +187,7 @@ pub enum TyKind<I: Interner> {
     Str,
 
     /// An array with the given length. Written as `[T; N]`.
-    Array(I::Ty, I::Const),
+    Array(I::Ty, Const<I>),
 
     /// A pattern newtype.
     ///
@@ -198,7 +206,7 @@ pub enum TyKind<I: Interner> {
 
     /// A reference; a pointer with an associated lifetime. Written as
     /// `&'a mut T` or `&'a T`.
-    Ref(I::Region, I::Ty, Mutability),
+    Ref(Region<I>, I::Ty, Mutability),
 
     /// The anonymous type of a function declaration/definition.
     ///
@@ -212,7 +220,7 @@ pub enum TyKind<I: Interner> {
     /// fn foo() -> i32 { 1 }
     /// let bar = foo; // bar: fn() -> i32 {foo}
     /// ```
-    FnDef(I::FunctionId, I::GenericArgs),
+    FnDef(I::FunctionId, ty::Binder<I, I::GenericArgs>),
 
     /// A pointer to a function.
     ///
@@ -242,7 +250,7 @@ pub enum TyKind<I: Interner> {
     UnsafeBinder(UnsafeBinderInner<I>),
 
     /// A trait object. Written as `dyn for<'b> Trait<'b, Assoc = u32> + Send + 'a`.
-    Dynamic(I::BoundExistentialPredicates, I::Region),
+    Dynamic(I::BoundExistentialPredicates, Region<I>),
 
     /// The anonymous type of a closure. Used to represent the type of `|a| a`.
     ///
@@ -251,7 +259,9 @@ pub enum TyKind<I: Interner> {
     /// `ClosureArgs` for more details.
     Closure(I::ClosureId, I::GenericArgs),
 
-    /// The anonymous type of a closure. Used to represent the type of `async |a| a`.
+    /// The anonymous type of an async closure. Used to represent the type of `async |a| a`.
+    ///
+    /// This type itself is not a coroutine, it just represents a closure that returns one.
     ///
     /// Coroutine-closure args contain both the - potentially instantiated - generic
     /// parameters of its parent and some synthetic parameters. See the documentation
@@ -274,7 +284,7 @@ pub enum TyKind<I: Interner> {
     /// the type of the coroutine, we convert them to higher ranked
     /// lifetimes bound by the witness itself.
     ///
-    /// This contains the `DefId` and the `GenericArgsRef` of the coroutine.
+    /// This contains the `DefId` and the `GenericArg` of the coroutine.
     /// The actual witness types are computed on MIR by the `mir_coroutine_witnesses` query.
     ///
     /// Looking at the following example, the witness for this coroutine
@@ -352,14 +362,18 @@ impl<I: Interner> Eq for TyKind<I> {}
 
 impl<I: Interner> TyKind<I> {
     pub fn fn_sig(self, interner: I) -> ty::Binder<I, ty::FnSig<I>> {
+        self.unnormalized_fn_sig(interner).skip_normalization()
+    }
+
+    pub fn unnormalized_fn_sig(self, interner: I) -> Unnormalized<I, ty::Binder<I, ty::FnSig<I>>> {
         match self {
-            ty::FnPtr(sig_tys, hdr) => sig_tys.with(hdr),
+            ty::FnPtr(sig_tys, hdr) => Unnormalized::new_wip(sig_tys.with(hdr)),
             ty::FnDef(def_id, args) => {
-                interner.fn_sig(def_id).instantiate(interner, args).skip_norm_wip()
+                interner.fn_sig(def_id).instantiate(interner, args.no_bound_vars().unwrap())
             }
             ty::Error(_) => {
                 // ignore errors (#54954)
-                ty::Binder::dummy(ty::FnSig::dummy())
+                Unnormalized::dummy(ty::Binder::dummy(ty::FnSig::dummy()))
             }
             ty::Closure(..) => panic!(
                 "to get the signature of a closure, use `args.as_closure().sig()` not `fn_sig()`",
@@ -481,13 +495,7 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
 impl<I: Interner> AliasTy<I> {
     pub fn new_from_args(interner: I, kind: AliasTyKind<I>, args: I::GenericArgs) -> AliasTy<I> {
         if cfg!(debug_assertions) {
-            let def_id = match kind {
-                AliasTyKind::Projection { def_id } => def_id.into(),
-                AliasTyKind::Inherent { def_id } => def_id.into(),
-                AliasTyKind::Opaque { def_id } => def_id.into(),
-                AliasTyKind::Free { def_id } => def_id.into(),
-            };
-            interner.debug_assert_args_compatible(def_id, args);
+            interner.debug_assert_alias_term_args_compatible(kind.into(), args);
         }
         AliasTy { kind, args, _use_alias_new_instead: () }
     }
@@ -549,7 +557,10 @@ impl<I: Interner> ProjectionAliasTy<I> {
         kind: I::TraitAssocTyId,
         args: I::GenericArgs,
     ) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::ProjectionTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -595,10 +606,16 @@ impl<I: Interner> AliasTy<I> {
     /// For example, if this is a projection of `<T as StreamingIterator>::Item<'a>`,
     /// then this function would return a `T: StreamingIterator` trait reference and
     /// `['a]` as the own args.
-    pub fn trait_ref_and_own_args(self, interner: I) -> (ty::TraitRef<I>, I::GenericArgsSlice) {
+    pub fn trait_ref_and_own_args<'a>(
+        &'a self,
+        interner: I,
+    ) -> (ty::TraitRef<I>, I::GenericArgsSlice<'a>)
+    where
+        I: 'a,
+    {
         let AliasTyKind::Projection { def_id } = self.kind else { panic!("expected a projection") };
 
-        interner.trait_ref_and_own_args_for_alias(def_id.into(), self.args)
+        interner.trait_ref_and_own_args_for_alias(def_id.into(), &self.args)
     }
 
     /// Extracts the underlying trait reference from this projection.
@@ -620,7 +637,10 @@ impl<I: Interner> InherentAliasTy<I> {
         kind: I::InherentAssocTyId,
         args: I::GenericArgs,
     ) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::InherentTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -635,7 +655,10 @@ impl<I: Interner> InherentAliasTy<I> {
 
 impl<I: Interner> OpaqueAliasTy<I> {
     pub fn new_opaque_from_args(interner: I, kind: I::OpaqueTyId, args: I::GenericArgs) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::OpaqueTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -650,7 +673,10 @@ impl<I: Interner> OpaqueAliasTy<I> {
 
 impl<I: Interner> FreeAliasTy<I> {
     pub fn new_free_from_args(interner: I, kind: I::FreeTyAliasId, args: I::GenericArgs) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::FreeTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -837,12 +863,31 @@ impl UnifyKey for FloatVid {
 impl StableHash for InferTy {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         use InferTy::*;
-        std::mem::discriminant(self).stable_hash(hcx, hasher);
+
+        #[derive(StableHash)]
+        enum Tag {
+            FreshTy,
+            FreshIntTy,
+            FreshFloatTy,
+        }
+
         match self {
             TyVar(_) | IntVar(_) | FloatVar(_) => {
                 panic!("type variables should not be hashed: {self:?}")
             }
-            FreshTy(v) | FreshIntTy(v) | FreshFloatTy(v) => v.stable_hash(hcx, hasher),
+
+            FreshTy(v) => {
+                Tag::FreshTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
+            FreshIntTy(v) => {
+                Tag::FreshIntTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
+            FreshFloatTy(v) => {
+                Tag::FreshFloatTy.stable_hash(hcx, hasher);
+                v.stable_hash(hcx, hasher);
+            }
         }
     }
 }
@@ -1127,7 +1172,7 @@ impl<I: Interner> FnSig<I> {
     }
 
     pub fn is_fn_trait_compatible(self) -> bool {
-        !self.c_variadic() && self.safety().is_safe() && self.abi() == ExternAbi::Rust
+        !self.c_variadic() && self.safety().is_safe() && self.abi().is_fn_trait_compatible()
     }
 
     /// Set the safety flag.
@@ -1239,7 +1284,7 @@ impl<I: Interner> fmt::Debug for FnSig<I> {
                 write!(f, ", ")?;
             }
             if Some(i) == fn_sig_kind.splatted().map(usize::from) {
-                write!(f, "#[splat] ")?;
+                write!(f, "#[rustc_splat] ")?;
             }
             write!(f, "{ty:?}")?;
         }
@@ -1292,35 +1337,6 @@ impl<I: Interner> Deref for UnsafeBinderInner<I> {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl<I: Interner, E: rustc_serialize::Encoder> rustc_serialize::Encodable<E>
-    for UnsafeBinderInner<I>
-where
-    I::Ty: rustc_serialize::Encodable<E>,
-    I::BoundVarKinds: rustc_serialize::Encodable<E>,
-{
-    fn encode(&self, e: &mut E) {
-        self.bound_vars().encode(e);
-        self.as_ref().skip_binder().encode(e);
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl<I: Interner, D: rustc_serialize::Decoder> rustc_serialize::Decodable<D>
-    for UnsafeBinderInner<I>
-where
-    I::Ty: TypeVisitable<I> + rustc_serialize::Decodable<D>,
-    I::BoundVarKinds: rustc_serialize::Decodable<D>,
-{
-    fn decode(decoder: &mut D) -> Self {
-        let bound_vars = rustc_serialize::Decodable::decode(decoder);
-        UnsafeBinderInner(ty::Binder::bind_with_vars(
-            rustc_serialize::Decodable::decode(decoder),
-            bound_vars,
-        ))
     }
 }
 
@@ -1400,6 +1416,10 @@ impl<I: Interner> FnHeader<I> {
 
     pub fn abi(self) -> ExternAbi {
         self.fn_sig_kind.abi()
+    }
+
+    pub fn splatted(self) -> Option<u8> {
+        self.fn_sig_kind.splatted()
     }
 
     /// Create a new safe FnHeader with the `extern "Rust"` ABI, that isn't C-style variadic or splatted.

@@ -1,0 +1,41 @@
+- // MIR for `optional_pair` before RedundantBoundsCheckElim
++ // MIR for `optional_pair` after RedundantBoundsCheckElim
+  
+  fn optional_pair(_1: i32) -> (i32, i32) {
+      debug x => _1;
+      let mut _0: (i32, i32);
+      let mut _2: i32;
+      let mut _3: i32;
+      let mut _4: bool;
+      let mut _5: i32;
+      let mut _6: i32;
+      let mut _7: bool;
+  
+      bb0: {
+          StorageLive(_2);
+          StorageLive(_3);
+          _3 = copy _1;
+          _4 = Eq(copy _1, const i32::MIN);
+          assert(!copy _4, "attempt to negate `{}`, which would overflow", copy _1) -> [success: bb1, unwind continue];
+      }
+  
+      bb1: {
+          _2 = Neg(copy _1);
+          StorageDead(_3);
+          StorageLive(_5);
+          StorageLive(_6);
+          _6 = copy _1;
+          _7 = copy _4;
+          assert(!copy _4, "attempt to negate `{}`, which would overflow", copy _1) -> [success: bb2, unwind continue];
+      }
+  
+      bb2: {
+          _5 = copy _2;
+          StorageDead(_6);
+          _0 = (copy _2, copy _2);
+          StorageDead(_5);
+          StorageDead(_2);
+          return;
+      }
+  }
+  

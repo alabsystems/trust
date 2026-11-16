@@ -1,9 +1,10 @@
 // Trust: rust-lang#100914 — Detect functions with large estimated stack frames.
 // LLVM can miscompile very large stack allocations; this lint warns before that happens.
 
+// Upstream 1.101: builtin lint definitions live in `rustc_lint_defs`.
+use rustc_lint_defs::builtin::LARGE_STACK_FRAME;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, Instance, TyCtxt};
-use rustc_session::lint::builtin::LARGE_STACK_FRAME;
 use tracing::debug;
 
 use crate::diagnostics::LargeStackFrameLint;

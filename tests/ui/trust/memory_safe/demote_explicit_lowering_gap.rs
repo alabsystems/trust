@@ -67,7 +67,7 @@
 //!
 //! * (ii) is CONSTRUCTIBLE but INAPPLICABLE. The tree does hold exactly one per-row
 //!   "a check was emitted" oracle: `OverflowCheckOrigins` (trust_verify.rs), built from
-//!   `trust_vcgen::overflow_vc_block_origins` and re-confirmed against the LIVE
+//!   `trust_vcgen::OverflowOrigins` (T3 C05) and re-confirmed against the LIVE
 //!   `TerminatorKind::Assert` by `elide_kernel_certified_checks`. It is filtered to
 //!   `VcKind::ArithmeticOverflow { Add | Sub | Mul }`. Generalizing it to every
 //!   physical Assert still answers NO here, because this function HAS NO ASSERT.

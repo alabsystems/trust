@@ -1,0 +1,30 @@
+// Positives: the receiver's discriminant is established before the call.
+pub fn ref_is_some(x: &Option<u32>) -> u32 { if x.is_some() { x.unwrap() } else { 0 } }
+pub fn ref_match(x: &Option<u32>) -> u32 { match *x { Some(_) => x.unwrap(), None => 0 } }
+pub fn ref_if_let_expect(x: &Option<u32>) -> u32 { if let Some(_) = x { x.expect("x") } else { 0 } }
+pub fn ref_as_ref(x: &Option<String>) -> usize { if x.is_some() { x.as_ref().unwrap().len() } else { 0 } }
+pub fn tuple_field(s: &(Option<u32>, u32)) -> u32 { if s.0.is_some() { s.0.unwrap() } else { 0 } }
+pub struct T { pub r: Result<u32, u8> }
+pub fn struct_field_ok(t: &T) -> u32 { if t.r.is_ok() { t.r.unwrap() } else { 0 } }
+pub fn ok_or_result(x: Option<u32>) -> u32 { let r = x.ok_or(()); if r.is_ok() { r.unwrap() } else { 0 } }
+pub fn parse_is_err(v: &str) -> u8 { let r = v.parse::<u8>(); if r.is_err() { 0 } else { r.unwrap() } }
+pub fn ref_is_none_early(x: &Option<u32>) -> u32 { if x.is_none() { return 0; } x.unwrap() }
+// Controls: nothing establishes the variant at the call.
+pub fn ref_unchecked(x: &Option<u32>) -> u32 { x.unwrap() }
+pub fn ref_other(x: &Option<u32>, y: &Option<u32>) -> u32 { if x.is_some() { y.unwrap() } else { 0 } }
+pub fn ref_is_none_unwrap(x: &Option<u32>) -> u32 { if x.is_none() { x.unwrap() } else { 0 } }
+pub fn mut_between(x: &mut Option<u32>) -> u32 { if x.is_some() { *x = None; x.unwrap() } else { 0 } }
+pub fn mut_alias(x: &mut Option<u32>, f: fn(&mut Option<u32>)) -> u32 { if x.is_some() { f(x); x.unwrap() } else { 0 } }
+pub fn reseat<'a>(mut x: &'a Option<u32>, y: &'a Option<u32>) -> u32 { if x.is_some() { x = y; x.unwrap() } else { 0 } }
+pub fn call_redefined(v: &mut Vec<u32>) -> u32 { let mut r = v.pop(); if r.is_some() { r = v.pop(); r.unwrap() } else { 0 } }
+pub fn loop_stale(v: &mut Vec<u32>) -> u32 { let mut ok = false; loop { let r = v.pop(); if ok { return r.unwrap(); } ok = r.is_some(); } }
+pub fn ok_or_unchecked(x: Option<u32>) -> u32 { x.ok_or(()).unwrap() }
+pub struct W(pub Option<u32>);
+impl W { pub fn unwrap(&self) -> u32 { self.0.unwrap() } }
+pub fn user_unwrap(w: &W) -> u32 { if w.0.is_some() { w.unwrap() } else { 0 } }
+pub fn mut_reborrow(x: &mut Option<u32>) -> u32 { if x.is_some() { let y = &mut *x; *y = None; x.unwrap() } else { 0 } }
+pub fn ref_match_other(x: &Option<u32>, y: &Option<u32>) -> u32 { match *x { Some(_) => y.unwrap(), None => 0 } }
+pub fn mut_raw(x: &mut Option<u32>) -> u32 { if x.is_some() { let p: *mut Option<u32> = &mut *x; unsafe { *p = None; } x.unwrap() } else { 0 } }
+pub fn mut_ptr_read(x: &mut Option<u32>) -> u32 { if x.is_some() { let y: &mut Option<u32> = unsafe { std::ptr::read(&x) }; *y = None; x.unwrap() } else { 0 } }
+pub fn raw_const_call(x: Option<u32>) -> u32 { let mut r = x.ok_or(()); let p = &raw const r as *mut Result<u32, ()>; if r.is_ok() { unsafe { *p = Err(()); } r.unwrap() } else { 0 } }
+pub fn raw_const_param(mut x: Option<u32>) -> u32 { let p = &raw const x as *mut Option<u32>; if x.is_some() { unsafe { *p = None; } x.unwrap() } else { 0 } }

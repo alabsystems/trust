@@ -205,8 +205,6 @@ fn runtime_checked_report() -> JsonProofReport {
             trust_version: TRUST_VERSION.to_string(),
             timestamp: "0".to_string(),
             total_time_ms: 11,
-            timeout_ms: None,
-            function_budget_ms: None,
         },
         crate_name: "runtime_checked".to_string(),
         summary: CrateSummary {
@@ -223,6 +221,7 @@ fn runtime_checked_report() -> JsonProofReport {
             total_unknown: 0,
             total_timed_out: 0,
             total_design_requirements: 0,
+            total_failed_unproved: 0,
             total_unattributed_failed: 0,
             total_unattributed_unknown: 0,
             total_unattributed_proved: 0,
@@ -238,6 +237,7 @@ fn runtime_checked_report() -> JsonProofReport {
                 unknown: 0,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -246,6 +246,7 @@ fn runtime_checked_report() -> JsonProofReport {
                 verdict: FunctionVerdict::RuntimeChecked,
             },
             obligations: vec![ObligationReport {
+                assumes: Vec::new(),
                 obligation_id: None,
                 description: "runtime safety check".to_string(),
                 kind: "postcondition".to_string(),
@@ -361,10 +362,10 @@ fn test_json_report_obligation_detail() {
     assert_eq!(overflow.proof_level, ProofLevel::L0Safety);
     assert_eq!(overflow.solver, "ay");
     assert_eq!(overflow.time_ms, 3);
-    assert!(matches!(&overflow.outcome, ObligationOutcome::Failed { counterexample: Some(_) }));
+    assert!(matches!(&overflow.outcome, ObligationOutcome::Failed { counterexample: Some(_), .. }));
 
     // Check counterexample variables
-    if let ObligationOutcome::Failed { counterexample: Some(cex) } = &overflow.outcome {
+    if let ObligationOutcome::Failed { counterexample: Some(cex), .. } = &overflow.outcome {
         assert_eq!(cex.variables.len(), 2);
         assert_eq!(cex.variables[0].name, "a");
         assert_eq!(cex.variables[0].value, "18446744073709551615");
@@ -599,7 +600,7 @@ fn test_annotation_report_single_function() {
     ));
     assert!(matches!(
         function.obligations[1].outcome,
-        ObligationOutcome::Failed { counterexample: Some(_) }
+        ObligationOutcome::Failed { counterexample: Some(_), .. }
     ));
     assert_eq!(
         function.obligations[0].location.as_ref().map(|location| location.file.as_str()),
@@ -1296,9 +1297,18 @@ fn every_current_vc_kind_has_a_non_unknown_canonical_tag() {
         VcKind::LoopInvariantSufficiency { invariant: sample("i <= n"), header_block: 1 },
         VcKind::TypeRefinementViolation { variable: sample("n"), predicate: sample("n >= 0") },
         VcKind::FrameConditionViolation { variable: sample("state"), function: sample("update") },
+        VcKind::TypeInvariant {
+            ty: sample("c::S"),
+            point: TypeInvariantPoint::Return,
+            site: TypeInvariantSite { block: 2, statement_index: 0 },
+            conjunct: 0,
+            ordinal: 0,
+            edge: Some(1),
+        },
     ];
 
-    assert_eq!(kinds.len(), 53, "update the canonical-tag inventory when VcKind grows");
+    assert_eq!(kinds.len(), 54, "update the canonical-tag inventory when VcKind grows");
+    assert_eq!(vc_kind_tag(kinds.last().expect("non-empty")), "type_invariant_return");
     for kind in kinds {
         assert_ne!(vc_kind_tag(&kind), "unknown", "missing canonical tag for {kind:?}");
     }
@@ -2161,10 +2171,7 @@ fn caller_constructed_proof_shaped_result_cannot_mint_proof_credit() {
     assert!(obligation.transport_evidence.is_none());
     assert_eq!(
         obligation.evidence,
-        Some(ProofEvidence {
-            reasoning: ReasoningKind::Deductive,
-            assurance: AssuranceLevel::SmtBacked,
-        })
+        Some(ProofEvidence::new(ReasoningKind::Deductive, AssuranceLevel::SmtBacked))
     );
 
     let json = serde_json::to_value(&report).expect("serialize report");
@@ -2177,8 +2184,10 @@ fn saved_monitor_claim_cannot_reach_any_report_formatter_as_monitored_grade() {
     let mut live_report = build_json_report("monitor-forgery", &midpoint_results());
     let obligation = &mut live_report.functions[0].obligations[0];
     obligation.transport_evidence = Some(ObligationTransportEvidenceReport {
+        identity: None,
         obligation_id: obligation.obligation_id.clone(),
         claim_digest_sha256: None,
+        original_vc_snapshot: None,
         typed_kind: None,
         native_trust_ir: None,
         proof_evidence: None,
@@ -2217,4 +2226,29 @@ fn saved_monitor_claim_cannot_reach_any_report_formatter_as_monitored_grade() {
         );
         assert!(!output.contains("forged saved monitor claim"), "{format} leaked monitor data");
     }
+}
+
+/// Trust (TINV step 10.7): an obligation's `assumes` disclosure is rendered by EVERY
+/// renderer of the canonical report — the text summary, the terminal report, both HTML
+/// renderers, the JSON and the NDJSON stream — and round-trips through a saved report.
+#[test]
+fn type_invariant_assumes_render_on_every_report_surface() {
+    let premise = "assumes type_invariant(c::P)#2 `i <= len(b)` [certificate: test]";
+    let mut report = runtime_checked_report();
+    report.functions[0].obligations[0].assumes = vec![premise.to_string()];
+    let html_premise = crate::html_report::escape_html(premise);
+    assert!(format_json_summary(&report).contains(premise));
+    assert!(crate::terminal::format_terminal_report(&report).contains(premise));
+    assert!(crate::html::format_html_report(&report).contains(&html_premise));
+    assert!(crate::html_report::generate_html_report(&report).contains(&html_premise));
+    let json = serde_json::to_string(&report).expect("serialize");
+    assert!(json.contains("\"assumes\":[\"assumes type_invariant(c::P)#2"), "{json}");
+    let mut ndjson = Vec::new();
+    write_ndjson(&report, &mut ndjson).expect("ndjson");
+    assert!(String::from_utf8(ndjson).expect("utf8").contains("assumes type_invariant(c::P)#2"));
+    let saved: JsonProofReport = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(saved.functions[0].obligations[0].assumes, vec![premise.to_string()]);
+    // Absent when empty: a report without premises serializes exactly as before.
+    let plain = serde_json::to_string(&runtime_checked_report()).expect("serialize");
+    assert!(!plain.contains("\"assumes\""));
 }

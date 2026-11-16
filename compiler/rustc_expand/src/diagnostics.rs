@@ -1,13 +1,20 @@
 use std::borrow::Cow;
 
 use rustc_errors::codes::*;
-use rustc_hir::limit::Limit;
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Ident, MacroRulesNormalizedIdent, Span, Symbol};
+use rustc_structures::Limit;
 
 #[derive(Diagnostic)]
 #[diag("`#[cfg_attr]` does not expand to any attributes")]
 pub(crate) struct CfgAttrNoAttributes;
+
+#[derive(Diagnostic)]
+#[diag("`cfg` is not supported in this position")]
+pub(crate) struct CfgNotSupportedInPosition {
+    #[primary_span]
+    pub span: Span,
+}
 
 #[derive(Diagnostic)]
 #[diag(
@@ -125,14 +132,6 @@ pub(crate) struct UnknownMacroVariable {
 }
 
 #[derive(Diagnostic)]
-#[diag("cannot resolve relative path in non-file source `{$path}`")]
-pub(crate) struct ResolveRelativePath {
-    #[primary_span]
-    pub span: Span,
-    pub path: String,
-}
-
-#[derive(Diagnostic)]
 #[diag("macros cannot have body stability attributes")]
 pub(crate) struct MacroBodyStability {
     #[primary_span]
@@ -190,40 +189,6 @@ pub(crate) struct RemoveExprNotSupported {
 }
 
 #[derive(Diagnostic)]
-pub(crate) enum InvalidCfg {
-    #[diag("`cfg` is not followed by parentheses")]
-    NotFollowedByParens {
-        #[primary_span]
-        #[suggestion(
-            "expected syntax is",
-            code = "cfg(/* predicate */)",
-            applicability = "has-placeholders"
-        )]
-        span: Span,
-    },
-    #[diag("`cfg` predicate is not specified")]
-    NoPredicate {
-        #[primary_span]
-        #[suggestion(
-            "expected syntax is",
-            code = "cfg(/* predicate */)",
-            applicability = "has-placeholders"
-        )]
-        span: Span,
-    },
-    #[diag("multiple `cfg` predicates are specified")]
-    MultiplePredicates {
-        #[primary_span]
-        span: Span,
-    },
-    #[diag("`cfg` predicate key cannot be a literal")]
-    PredicateLiteral {
-        #[primary_span]
-        span: Span,
-    },
-}
-
-#[derive(Diagnostic)]
 #[diag("non-{$kind} macro in {$kind} position: {$name}")]
 pub(crate) struct WrongFragmentKind<'a> {
     #[primary_span]
@@ -260,14 +225,6 @@ pub(crate) struct IncompleteParse<'a> {
         applicability = "maybe-incorrect"
     )]
     pub add_semicolon: Option<Span>,
-}
-
-#[derive(Diagnostic)]
-#[diag("removing {$descr} is not supported in this position")]
-pub(crate) struct RemoveNodeNotSupported {
-    #[primary_span]
-    pub span: Span,
-    pub descr: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -373,6 +330,22 @@ pub(crate) struct CustomAttributePanickedHelp {
     pub message: String,
 }
 
+// Trust (D21): an isolated expansion that could not be completed. Never a
+// fallback to in-process expansion.
+#[derive(Diagnostic)]
+#[diag("the isolated proc-macro worker for `{$crate_name}` refused this expansion: {$reason}")]
+#[note("the worker was running `{$dylib}`")]
+#[note(
+    "`-Ztrust-proc-macro-isolation` expands every proc macro in a sandboxed worker process and never falls back to expanding in the compiler"
+)]
+pub(crate) struct IsolatedProcMacroRefused {
+    #[primary_span]
+    pub span: Span,
+    pub crate_name: String,
+    pub dylib: String,
+    pub reason: String,
+}
+
 #[derive(Diagnostic)]
 #[diag("proc-macro derive produced unparsable tokens")]
 pub(crate) struct ProcMacroDeriveTokens {
@@ -450,14 +423,14 @@ pub(crate) struct GlobDelegationOutsideImpls {
 }
 
 #[derive(Diagnostic)]
-#[diag("`crate_name` within an `#![cfg_attr]` attribute is forbidden")]
+#[diag("the `crate_name` attribute is forbidden within a `cfg_attr` attribute")]
 pub(crate) struct CrateNameInCfgAttr {
     #[primary_span]
     pub span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag("`crate_type` within an `#![cfg_attr]` attribute is forbidden")]
+#[diag("the `crate_type` attribute is forbidden within a `cfg_attr` attribute")]
 pub(crate) struct CrateTypeInCfgAttr {
     #[primary_span]
     pub span: Span,

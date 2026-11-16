@@ -34,23 +34,22 @@ fn unused_dep_normal() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -93,23 +92,22 @@ fn unused_dep_build() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [COMPILING] unused v0.1.0
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -146,20 +144,19 @@ fn unused_dep_build_no_build_rs() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
-[WARNING] unused dependency
+[WARNING] unused build dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -218,12 +215,11 @@ fn unused_dep_lib_bins() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] lib_used v0.1.0 (registry `dummy-registry`)
@@ -233,14 +229,14 @@ fn unused_dep_lib_bins() {
 [CHECKING] lib_used v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 
 "#]]
@@ -248,28 +244,205 @@ fn unused_dep_lib_bins() {
         )
         .run();
 
-    p.cargo("check -Zcargo-lints --lib")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --lib")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check -Zcargo-lints --bins")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --bins")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check -Zcargo-lints --bin foo")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --bin foo")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
+        .run();
+
+    p.cargo("check --all-targets")
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[WARNING] unused dependency `unused`
+ --> Cargo.toml:9:13
+  |
+9 |             unused = "0.1.0"
+  |             ^^^^^^^^^^^^^^^^
+  |
+  = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
+[HELP] consider removing the dependency on `unused`
+[WARNING] `foo` (manifest) generated 1 warning
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("test --no-run")
+        .with_stderr_data(
+            str![[r#"
+[COMPILING] bins_used v0.1.0
+[COMPILING] unused v0.1.0
+[COMPILING] lib_used v0.1.0
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[WARNING] unused dependency `unused`
+ --> Cargo.toml:9:13
+  |
+9 |             unused = "0.1.0"
+  |             ^^^^^^^^^^^^^^^^
+  |
+  = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
+[HELP] consider removing the dependency on `unused`
+[WARNING] `foo` (manifest) generated 1 warning
+[FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[EXECUTABLE] unittests src/bin/bar.rs (target/debug/build/foo/[HASH]/out/bar-[HASH][EXE])
+[EXECUTABLE] unittests src/bin/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+
+"#]]
+            .unordered(),
+        )
+        .run();
+}
+
+#[cargo_test]
+fn unused_dep_static_lib_only() {
+    // Make sure that dependency uses by both binaries and libraries
+    // are being registered as used
+    Package::new("unused", "0.1.0").publish();
+    Package::new("lib_used", "0.1.0").publish();
+    Package::new("bins_used", "0.1.0").publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            authors = []
+            edition = "2018"
+
+            [lib]
+            crate-type = ["staticlib"]
+
+            [dependencies]
+            unused = "0.1.0"
+            lib_used = "0.1.0"
+            bins_used = "0.1.0"
+
+            [lints.cargo]
+            default = { level = "allow", priority = -1 }
+            unused_dependencies = "warn"
+        "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+            use lib_used as _;
+            "#,
+        )
+        .file(
+            "src/bin/foo.rs",
+            r#"
+            use bins_used as _;
+            fn main() {}
+            "#,
+        )
+        .file(
+            "src/bin/bar.rs",
+            r#"
+            use bins_used as _;
+            fn main() {}
+            "#,
+        )
+        .build();
+
+    p.cargo("check")
+        .with_stderr_data(
+            str![[r#"
+[UPDATING] `dummy-registry` index
+[LOCKING] 3 packages to highest compatible versions
+[DOWNLOADING] crates ...
+[DOWNLOADED] bins_used v0.1.0 (registry `dummy-registry`)
+[DOWNLOADED] lib_used v0.1.0 (registry `dummy-registry`)
+[DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
+[CHECKING] bins_used v0.1.0
+[CHECKING] unused v0.1.0
+[CHECKING] lib_used v0.1.0
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[WARNING] unused dependency `unused`
+  --> Cargo.toml:12:13
+   |
+12 |             unused = "0.1.0"
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
+[HELP] consider removing the dependency on `unused`
+[WARNING] `foo` (manifest) generated 1 warning
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]]
+            .unordered(),
+        )
+        .run();
+
+    p.cargo("check --lib")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("check --bins")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("check --bin foo")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("check --all-targets")
+        .with_stderr_data(str![[r#"
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[WARNING] unused dependency `unused`
+  --> Cargo.toml:12:13
+   |
+12 |             unused = "0.1.0"
+   |             ^^^^^^^^^^^^^^^^
+   |
+   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
+[HELP] consider removing the dependency on `unused`
+[WARNING] `foo` (manifest) generated 1 warning
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    p.cargo("test --no-run")
+        .with_stderr_data(
+            str![[r#"
+[COMPILING] lib_used v0.1.0
+[COMPILING] bins_used v0.1.0
+[COMPILING] unused v0.1.0
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[EXECUTABLE] unittests src/bin/bar.rs (target/debug/build/foo/[HASH]/out/bar-[HASH][EXE])
+[EXECUTABLE] unittests src/bin/foo.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+
+"#]]
+            .unordered(),
+        )
         .run();
 }
 
@@ -314,23 +487,22 @@ fn unused_dep_build_with_used_dep_normal() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused_build v0.1.0 (registry `dummy-registry`)
 [COMPILING] unused_build v0.1.0
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused_build`
  --> Cargo.toml:9:13
   |
 9 |             unused_build = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused_build`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -376,41 +548,39 @@ fn unused_dep_normal_but_implicit_used_dep_dev() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] used_dev v0.1.0 (registry `dummy-registry`)
 [CHECKING] used_dev v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `used_dev`
  --> Cargo.toml:9:13
   |
 9 |             used_dev = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `used_dev`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check -Zcargo-lints --all-targets")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --all-targets")
         .with_stderr_data(str![[r#"
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `used_dev`
  --> Cargo.toml:9:13
   |
 9 |             used_dev = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `used_dev`
 [HELP] to still use for development builds, move to `dev-dependencies`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -460,23 +630,22 @@ fn unused_dep_normal_but_explicit_used_dep_dev() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] used_once v0.1.0 (registry `dummy-registry`)
 [CHECKING] used_once v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `used_once`
  --> Cargo.toml:9:13
   |
 9 |             used_once = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `used_once`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -528,11 +697,10 @@ fn unused_dep_dev_but_explicit_used_dep_normal() {
 
     // No warning because the dependency is used at test time by the unit tests and the two
     // dependencies are indistinguishable
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] used_once v0.1.0 (registry `dummy-registry`)
 [CHECKING] used_once v0.1.0
@@ -578,19 +746,17 @@ fn optional_dependency() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check -Zcargo-lints -F used,unused")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check -F used,unused")
         .with_stderr_data(
             str![[r#"
 [DOWNLOADING] crates ...
@@ -600,14 +766,14 @@ fn optional_dependency() {
 [CHECKING] used v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = { version = "0.1.0", optional = true }
   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 
 "#]]
@@ -649,12 +815,11 @@ fn unused_dep_renamed() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] baz v0.2.0 (registry `dummy-registry`)
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
@@ -662,14 +827,14 @@ fn unused_dep_renamed() {
 [CHECKING] bar v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[WARNING] unused dependency
+[WARNING] unused dependency `baz`
  --> Cargo.toml:9:13
   |
 9 |             baz = { package = "bar", version = "0.1.0" }
   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `baz`
 [WARNING] `foo` (manifest) generated 1 warning
 
 "#]]
@@ -708,40 +873,38 @@ fn warning_replay() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
         .run();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -785,12 +948,11 @@ fn unused_dep_target() {
         )
         .build();
 
-    p.cargo(&format!("check -Zcargo-lints --target {host}"))
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo(&format!("check --target {host}"))
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] used v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
@@ -798,14 +960,14 @@ fn unused_dep_target() {
 [CHECKING] used v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 
 "#]]
@@ -883,11 +1045,10 @@ fn unused_dev_deps() {
         .build();
 
     // doesn't check any tests, still no unused dev dep warnings
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 6 packages to latest compatible versions
+[LOCKING] 6 packages to highest compatible versions
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -895,8 +1056,7 @@ fn unused_dev_deps() {
         .run();
 
     // doesn't check doctests, still no unused dev dep warnings
-    p.cargo("check -Zcargo-lints --all-targets")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check --all-targets")
         .with_stderr_data(
             str![[r#"
 [DOWNLOADING] crates ...
@@ -921,8 +1081,7 @@ fn unused_dev_deps() {
         .run();
 
     // doesn't test doctests and benches and thus doesn't create unused dev dep warnings
-    p.cargo("test -Zcargo-lints --no-run")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("test --no-run")
         .with_stderr_data(
             str![[r#"
 [COMPILING] example_used v0.1.0
@@ -933,8 +1092,8 @@ fn unused_dev_deps() {
 [COMPILING] doctest_used v0.1.0
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
-[EXECUTABLE] tests/hello.rs (target/debug/deps/hello-[HASH][EXE])
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[EXECUTABLE] tests/hello.rs (target/debug/build/foo/[HASH]/out/hello-[HASH][EXE])
 
 "#]]
             .unordered(),
@@ -942,27 +1101,25 @@ fn unused_dev_deps() {
         .run();
 
     // doesn't test doctests, still no unused dev dep warnings
-    p.cargo("test -Zcargo-lints --no-run --all-targets")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("test --no-run --all-targets")
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[EXECUTABLE] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
-[EXECUTABLE] tests/hello.rs (target/debug/deps/hello-[HASH][EXE])
-[EXECUTABLE] benches/hello.rs (target/debug/deps/hello-[HASH][EXE])
-[EXECUTABLE] unittests examples/hello.rs (target/debug/examples/hello-[HASH][EXE])
+[EXECUTABLE] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[EXECUTABLE] tests/hello.rs (target/debug/build/foo/[HASH]/out/hello-[HASH][EXE])
+[EXECUTABLE] benches/hello.rs (target/debug/build/foo/[HASH]/out/hello-[HASH][EXE])
+[EXECUTABLE] unittests examples/hello.rs (target/debug/build/foo/[HASH]/out/hello-[HASH][EXE])
 
 "#]])
         .run();
 
     // tests everything including doctests, but not
     // the benches
-    p.cargo("test -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("test")
         .with_stderr_data(str![[r#"
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH][EXE])
-[RUNNING] tests/hello.rs (target/debug/deps/hello-[HASH][EXE])
+[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH][EXE])
+[RUNNING] tests/hello.rs (target/debug/build/foo/[HASH]/out/hello-[HASH][EXE])
 [DOCTEST] foo
 
 "#]])
@@ -1064,12 +1221,11 @@ fn package_selection() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 7 packages to latest compatible versions
+[LOCKING] 7 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused_bar v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] unused_external v0.1.0 (registry `dummy-registry`)
@@ -1086,36 +1242,36 @@ fn package_selection() {
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [CHECKING] external v0.1.0 ([ROOT]/foo/external)
 [CHECKING] foo v0.1.0 ([ROOT]/foo/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused_bar`
  --> bar/Cargo.toml:9:13
   |
 9 |             unused_bar = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused_bar`
   |
   |
-[WARNING] unused dependency
+[WARNING] unused dependency `bar`
   --> foo/Cargo.toml:11:13
    |
 11 |             bar.path = "../bar"
    |             ^^^
    |
    = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `bar`
    |
    |
-[WARNING] unused dependency
+[WARNING] unused dependency `external`
   --> foo/Cargo.toml:12:13
 12 |             external.path = "../external"
    |             ^^^^^^^^
-[HELP] consider removing the unused dependency
-[WARNING] unused dependency
+[HELP] consider removing the dependency on `external`
+[WARNING] unused dependency `unused_foo`
  --> foo/Cargo.toml:9:13
 9 |             unused_foo = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^^
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused_foo`
 [WARNING] `bar` (manifest) generated 1 warning
 [WARNING] `foo` (manifest) generated 3 warnings
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1125,32 +1281,31 @@ fn package_selection() {
         )
         .run();
 
-    p.cargo("check -Zcargo-lints -p foo")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check -p foo")
         .with_stderr_data(
             str![[r#"
-[WARNING] unused dependency
+[WARNING] unused dependency `bar`
   --> foo/Cargo.toml:11:13
    |
 11 |             bar.path = "../bar"
    |             ^^^
    |
    = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `bar`
    |
    |
-[WARNING] unused dependency
+[WARNING] unused dependency `external`
   --> foo/Cargo.toml:12:13
 12 |             external.path = "../external"
    |             ^^^^^^^^
-[HELP] consider removing the unused dependency
-[WARNING] unused dependency
+[HELP] consider removing the dependency on `external`
+[WARNING] unused dependency `unused_foo`
  --> foo/Cargo.toml:9:13
   |
 9 |             unused_foo = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^^
   |
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused_foo`
 [WARNING] `foo` (manifest) generated 3 warnings
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1159,18 +1314,17 @@ fn package_selection() {
         )
         .run();
 
-    p.cargo("check -Zcargo-lints -p bar")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check -p bar")
         .with_stderr_data(
             str![[r#"
-[WARNING] unused dependency
+[WARNING] unused dependency `unused_bar`
  --> bar/Cargo.toml:9:13
   |
 9 |             unused_bar = "0.1.0"
   |             ^^^^^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused_bar`
 [WARNING] `bar` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1222,12 +1376,11 @@ fn pinned_transitive_dep() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] intermediate v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] transitive v0.1.1 (registry `dummy-registry`)
@@ -1297,12 +1450,11 @@ pub fn fun() -> &'static str {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(
             str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] intermediate v0.1.0 (registry `dummy-registry`)
 [DOWNLOADED] transitive v0.1.1 (registry `dummy-registry`)
@@ -1347,24 +1499,23 @@ fn allow_rustflags() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("check")
         .env("RUSTFLAGS", "-Aunused_crate_dependencies")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1403,23 +1554,22 @@ fn allow_attribute() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1456,24 +1606,23 @@ fn deny_in_manifest() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[ERROR] unused dependency
+[ERROR] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `deny` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [ERROR] could not finalize `foo` (manifest) due to 1 previous error
 
 "#]])
@@ -1510,24 +1659,23 @@ fn deny_rustflags() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("check")
         .env("RUSTFLAGS", "-Dunused_crate_dependencies")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1566,23 +1714,22 @@ fn deny_attribute() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1620,24 +1767,23 @@ fn forbid_rustflags() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
+    p.cargo("check")
         .env("RUSTFLAGS", "-Funused_crate_dependencies")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -1676,23 +1822,22 @@ fn forbid_attribute() {
         )
         .build();
 
-    p.cargo("check -Zcargo-lints")
-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+    p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] unused v0.1.0 (registry `dummy-registry`)
 [CHECKING] unused v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
-[WARNING] unused dependency
+[WARNING] unused dependency `unused`
  --> Cargo.toml:9:13
   |
 9 |             unused = "0.1.0"
   |             ^^^^^^^^^^^^^^^^
   |
   = [NOTE] `cargo::unused_dependencies` is set to `warn` in `[lints]`
-[HELP] consider removing the unused dependency
+[HELP] consider removing the dependency on `unused`
 [WARNING] `foo` (manifest) generated 1 warning
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

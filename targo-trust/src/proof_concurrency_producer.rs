@@ -340,7 +340,7 @@ fn required_artifacts(repo_root: &Path, artifact_dir: &Path) -> Vec<RequiredArti
                 .map(|(role, suffix)| {
                     let path = artifact_dir.join(format!("{}.{}", obligation.id, suffix));
                     ArtifactFileReport {
-                        role: *role,
+                        role,
                         path: display_repo_path(repo_root, &path),
                         status: artifact_status(&path),
                     }
@@ -363,19 +363,50 @@ fn artifact_status(path: &Path) -> &'static str {
 
 fn repo_contained_path(repo_root: &Path, path: &Path) -> Result<PathBuf, String> {
     let path = if path.is_absolute() { path.to_path_buf() } else { repo_root.join(path) };
-    if !path.starts_with(repo_root)
-        || path.strip_prefix(repo_root).ok().is_none_or(|relative| {
-            relative.as_os_str().is_empty()
-                || !relative
-                    .components()
-                    .all(|component| matches!(component, std::path::Component::Normal(_)))
-        })
+    let relative = path.strip_prefix(repo_root).map_err(|_| {
+        format!(
+            "artifact directory {} must be a canonical path contained by repository root {}",
+            path.display(),
+            repo_root.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
     {
         return Err(format!(
             "artifact directory {} must be a canonical path contained by repository root {}",
             path.display(),
             repo_root.display()
         ));
+    }
+
+    let mut current = repo_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "artifact directory {} traverses a symbolic link",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "artifact directory {} traverses a non-directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "artifact directory {} cannot be inspected safely: {error}",
+                    current.display()
+                ));
+            }
+        }
     }
     Ok(path)
 }

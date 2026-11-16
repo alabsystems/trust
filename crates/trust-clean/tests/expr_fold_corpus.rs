@@ -47,7 +47,7 @@
 //     witness (IH at `d` instead of `dsucc d`) are KernelRejected.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test expr_fold_corpus -- --nocapture
 //
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT
@@ -871,10 +871,14 @@ fn app_child_type_mut(bodies: &mut DumpBodies) -> &mut trust_types::Ty {
     let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
         panic!("dispatch parameter pointee must be Expr")
     };
-    let kind =
-        fields.iter_mut().find(|(name, _)| name == "kind").map(|(_, ty)| ty).expect("Expr.kind");
+    let kind = fields
+        .make_mut()
+        .iter_mut()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, ty)| ty)
+        .expect("Expr.kind");
     let trust_types::Ty::Adt { variants, .. } = kind else { panic!("expanded ExprKind table") };
-    let app = variants.iter_mut().find(|variant| variant.name == "App").expect("App");
+    let app = variants.make_mut().iter_mut().find(|variant| variant.name == "App").expect("App");
     &mut app.fields[0].1
 }
 
@@ -894,6 +898,79 @@ fn rust_identifiers(source: &str) -> std::collections::BTreeSet<&str> {
         .collect()
 }
 
+/// The source text with every `#[cfg(test)]`-gated item, statement, field or
+/// arm removed, for the P-ACYC source tripwire: a node compiled only into the
+/// kernel's own unit tests is not part of the production `Expr` representation
+/// the tripwire guards (Clean 2b5d92d02 added a test-only `Cell<bool>` hook to
+/// `expr/fvar_bound.rs`). The cut is lexical and errs toward KEEPING text: the
+/// attribute must be spelled exactly and open its line, and a gated region that
+/// reaches a quote, a comment, a closure bar or an unmatched `>` before its
+/// terminator is kept whole, so a misparse can only scan more, never less.
+fn without_cfg_test_items(source: &str) -> String {
+    const GATE: &str = "#[cfg(test)]";
+    let mut out = String::with_capacity(source.len());
+    let mut kept_from = 0;
+    let mut cursor = 0;
+    while let Some(offset) = source[cursor..].find(GATE) {
+        let at = cursor + offset;
+        let line_start = source[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        let opens_line = source[line_start..at].chars().all(char::is_whitespace);
+        let body = at + GATE.len();
+        match opens_line.then(|| gated_region_len(&source[body..])).flatten() {
+            Some(len) => {
+                out.push_str(&source[kept_from..at]);
+                kept_from = body + len;
+                cursor = kept_from;
+            }
+            None => cursor = body,
+        }
+    }
+    out.push_str(&source[kept_from..]);
+    out
+}
+
+/// Length of the node an outer attribute gates, measured from just after the
+/// attribute: through the first `;` or `,` at bracket depth zero, through the
+/// `}` that returns to depth zero, or up to (not including) a closer of the
+/// enclosing bracket. `None` when the extent cannot be read without a lexer
+/// (string, char or lifetime quotes, comments, closure parameter bars, an
+/// unmatched depth-zero `>` that may close a generic parameter list) or the
+/// source ends first.
+fn gated_region_len(body: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut angle = 0usize;
+    let mut previous = ' ';
+    for (index, ch) in body.char_indices() {
+        let end = match ch {
+            '"' | '\'' | '/' | '|' => return None,
+            '(' | '[' | '{' => {
+                depth += 1;
+                None
+            }
+            ')' | ']' | '}' if depth == 0 => Some(index),
+            ')' | ']' | '}' => {
+                depth -= 1;
+                (depth == 0 && ch == '}').then_some(index + 1)
+            }
+            ';' | ',' if depth == 0 => Some(index + 1),
+            '<' if depth == 0 => {
+                angle += 1;
+                None
+            }
+            '>' if depth == 0 && !matches!(previous, '-' | '=') => {
+                angle = angle.checked_sub(1)?;
+                None
+            }
+            _ => None,
+        };
+        if end.is_some() {
+            return end;
+        }
+        previous = ch;
+    }
+    None
+}
+
 /// Executable P-ACYC gate: recursive Expr edges may only be direct
 /// `Arc<Expr>` children. Weak/interior-mutable/mutable-reference channels and
 /// recursion hidden inside another payload all decline by name.
@@ -907,10 +984,14 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 adt_kind: None,
                 layout: None,
                 name: "std::sync::Weak".into(),
-                fields: vec![("data".into(), expr_backref.clone())],
-                variants: vec![],
+                fields: vec![("data".into(), expr_backref.clone())].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
         (
             "UnsafeCell edge",
@@ -918,10 +999,14 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 adt_kind: None,
                 layout: None,
                 name: "std::cell::UnsafeCell".into(),
-                fields: vec![("value".into(), expr_backref.clone())],
-                variants: vec![],
+                fields: vec![("value".into(), expr_backref.clone())].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
         (
             "mutable ref edge",
@@ -933,10 +1018,14 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 adt_kind: None,
                 layout: None,
                 name: "std::option::Option".into(),
-                fields: vec![("payload".into(), expr_backref.clone())],
-                variants: vec![],
+                fields: vec![("payload".into(), expr_backref.clone())].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
         (
             "unknown opaque datatype",
@@ -954,14 +1043,23 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                         adt_kind: None,
                         layout: None,
                         name: "std::cell::Cell".into(),
-                        fields: vec![("value".into(), expr_backref.clone())],
-                        variants: vec![],
+                        fields: vec![("value".into(), expr_backref.clone())].into(),
+                        variants: vec![].into(),
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
-                )],
-                variants: vec![],
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                    },
+                )]
+                .into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
     ] {
         let mut bodies = all_bodies();
@@ -978,16 +1076,20 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
     let trust_types::Ty::Adt { fields, .. } = app_child_type_mut(&mut bodies) else {
         panic!("App child must be the expanded Arc layout")
     };
-    fields.push((
+    fields.make_mut().push((
         "hidden_cycle_channel".into(),
         trust_types::Ty::Adt {
             adt_kind: None,
             layout: None,
             name: "std::sync::Weak".into(),
-            fields: vec![("data".into(), expr_backref)],
-            variants: vec![],
+            fields: vec![("data".into(), expr_backref)].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        },
     ));
     let decline = sem_expr_fold_shape_of(&load(FVS_ROW), &bodies)
         .expect_err("an Arc-shaped type with an extra side channel must fail closed");
@@ -1052,8 +1154,11 @@ fn p_acyc_clean_kernel_source_tripwire() {
         .expect("Name definition suffix");
     let level_tree_sources =
         read_rust_tree(&repo.join("first-party/clean/crates/clean-kernel/src/level"));
-    let payload_sources =
-        [expr_tree_sources.as_str(), level_tree_sources.as_str(), name_defs].join("\n");
+    // Items gated `#[cfg(test)]` are not compiled into the kernel whose Expr
+    // representation this pins (see `without_cfg_test_items`).
+    let payload_sources = without_cfg_test_items(
+        &[expr_tree_sources.as_str(), level_tree_sources.as_str(), name_defs].join("\n"),
+    );
     let identifiers = rust_identifiers(&payload_sources);
     for forbidden in ["new_cyclic", "Weak", "UnsafeCell", "RefCell", "Cell"] {
         assert!(
@@ -1078,6 +1183,68 @@ fn p_acyc_source_identifier_scan_is_alias_and_whitespace_resistant() {
         assert!(rust_identifiers(source).contains(forbidden), "missed {forbidden}: {source}");
     }
     assert!(!rust_identifiers("#![forbid(unsafe_code)]").contains("unsafe"));
+}
+
+/// The tripwire's `#[cfg(test)]` excision drops exactly the gated node and
+/// keeps everything it cannot delimit. The first two cases are the shape of
+/// Clean's `expr/fvar_bound.rs` test hook; every other case must still be
+/// flagged, including the same storage once its gate is removed.
+#[test]
+fn p_acyc_source_scan_drops_only_cfg_test_items() {
+    let scanned = |source: &str| {
+        rust_identifiers(&without_cfg_test_items(source))
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let hook = "#[cfg(test)]\nthread_local! { static UNHINTED: std::cell::Cell<bool> = \
+                const { std::cell::Cell::new(false) }; }\n";
+    let branch = "fn may_contain(&self) -> bool {\n    #[cfg(test)]\n    if \
+                  UNHINTED.with(std::cell::Cell::get) {\n        return self.quick();\n    \
+                  }\n    self.quick() && self.bound\n}\n";
+    for (case, source) in [("thread_local hook", hook), ("gated if statement", branch)] {
+        let kept = scanned(source);
+        assert!(!kept.contains("Cell") && !kept.contains("UNHINTED"), "{case}: {kept:?}");
+        let ungated = source.replace("#[cfg(test)]", "");
+        assert!(scanned(&ungated).contains("Cell"), "{case}: the ungated control lost Cell");
+    }
+    let branch_kept = scanned(branch);
+    assert!(
+        ["quick", "bound", "may_contain"].iter().all(|id| branch_kept.contains(*id)),
+        "the ungated tail of the function must still be scanned: {branch_kept:?}"
+    );
+    for (case, source, forbidden) in [
+        ("ungated field", "struct E { hidden: Cell<u8> }", "Cell"),
+        ("cfg(not(test))", "#[cfg(not(test))]\nstatic C: Cell<u8> = Cell::new(0);", "Cell"),
+        ("cfg(any(test, ..))", "#[cfg(any(test, feature = \"x\"))]\nstruct B(Cell<u8>);", "Cell"),
+        (
+            "quote in region",
+            "mod m {\n    #[cfg(test)]\n    fn f() { g(\"{\"); }\n    struct Bad(Cell<u8>);\n}",
+            "Cell",
+        ),
+        ("gate not opening its line", "/// #[cfg(test)]\nstruct Bad(Cell<u8>);", "Cell"),
+        (
+            "next item after a gated one",
+            "#[cfg(test)]\nstatic T: u8 = 0;\nstruct Bad(Cell<u8>);",
+            "Cell",
+        ),
+        (
+            "sibling of a gated field",
+            "struct E {\n    #[cfg(test)]\n    probe: Cell<u8>,\n    real: RefCell<u8>,\n}",
+            "RefCell",
+        ),
+        ("unterminated gated module", "#[cfg(test)]\nmod t {\n    struct Bad(Cell<u8>);\n", "Cell"),
+        ("closure parameter list", "let f = |\n    #[cfg(test)] a: u8| Cell::new(a);", "Cell"),
+        ("generic parameter list", "struct S<\n    #[cfg(test)] T\n>(Weak<u8>);", "Weak"),
+    ] {
+        assert!(
+            scanned(source).contains(forbidden),
+            "{case} must still flag {forbidden}: {source}"
+        );
+    }
+    let field_kept =
+        scanned("struct E {\n    #[cfg(test)]\n    probe: Cell<u8>,\n    real: RefCell<u8>,\n}");
+    assert!(!field_kept.contains("probe") && !field_kept.contains("Cell"), "{field_kept:?}");
 }
 
 fn retarget_first_call(
@@ -1187,14 +1354,14 @@ fn replace_authenticated_paddr_scalar_with_raw(func: &mut VerifiableFunction) {
             let trust_types::Statement::Assign {
                 rvalue:
                     trust_types::Rvalue::Use(Operand::Constant(
-                        value @ ConstValue::OpaqueScalar { width: 64, signed: false },
+                        value @ ConstValue::OpaqueScalar { width: 64, signed: false, .. },
                     )),
                 ..
             } = statement
             else {
                 continue;
             };
-            *value = ConstValue::OpaqueConst;
+            *value = ConstValue::opaque_const();
             return;
         }
     }
@@ -1843,7 +2010,7 @@ fn instantiator_ord_leaf_identity_and_type_forgeries_decline() {
         panic!("_3 must be Ordering");
     };
     *name = "forged::Ordering".to_string();
-    variants[0].discriminant = -1;
+    variants.make_mut()[0].discriminant = -1;
     assert_instantiator_ord_doctor_declines("forged Ordering carrier/tag", &wrong_ordering);
 
     let mut wrong_outer = load(INST_ORD_LEAF);
@@ -1851,7 +2018,7 @@ fn instantiator_ord_leaf_identity_and_type_forgeries_decline() {
         panic!("return must be Option");
     };
     *name = "forged::Option".to_string();
-    variants[1].discriminant = 2;
+    variants.make_mut()[1].discriminant = 2;
     assert_instantiator_ord_doctor_declines("forged outer carrier/tag", &wrong_outer);
 
     for interior_name in ["std::cell::Cell", "std::cell::UnsafeCell"] {
@@ -1862,7 +2029,7 @@ fn instantiator_ord_leaf_identity_and_type_forgeries_decline() {
         let Ty::Adt { fields, .. } = inner.as_mut() else {
             panic!("self referent must be Instantiator");
         };
-        fields[1].1 = Ty::adt(
+        fields.make_mut()[1].1 = Ty::adt(
             interior_name,
             vec![("value".to_string(), Ty::Int { width: 32, signed: false })],
         );
@@ -1916,6 +2083,7 @@ fn instantiator_ord_leaf_alias_and_intervening_effects_decline() {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: None,
         },
     });
     assert_instantiator_ord_doctor_declines("intervening call", &intervening_call);
@@ -2289,7 +2457,7 @@ fn push_folder_field(func: &mut VerifiableFunction, name: &str, ty: trust_types:
     let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
         panic!("the folder is not a struct")
     };
-    fields.push((name.to_string(), ty));
+    fields.make_mut().push((name.to_string(), ty));
     fields.len() - 1
 }
 
@@ -2731,16 +2899,25 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
                 adt_kind: None,
                 layout: None,
                 name: "std::cell::Cell".into(),
-                fields: vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })],
-                variants: vec![],
+                fields: vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })]
+                    .into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
-        )],
-        variants: vec![],
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
+        )]
+        .into(),
+        variants: vec![].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-    let hidden_cell_ref =
-        trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
+    let hidden_cell_ref = trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
     // The alias must be COPIED OUT OF the folder for the detachment rule under
     // test to apply at all, so the folder has to declare a field of exactly
     // that type. Copying the real `FVarId` field into a
@@ -2810,13 +2987,13 @@ fn memo_probe_pinned_hashmap_fixed_state_drift_declines() {
         let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
             panic!("LevelParamSubst must be a struct");
         };
-        let trust_types::Ty::Ref { inner, .. } = &mut fields[0].1 else {
+        let trust_types::Ty::Ref { inner, .. } = &mut fields.make_mut()[0].1 else {
             panic!("LevelParamSubst::subst must be a shared reference");
         };
         let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
             panic!("subst pointee must be the extracted HashMap graph");
         };
-        fields.push(adversarial_cell.clone());
+        fields.make_mut().push(adversarial_cell.clone());
     }
     {
         let trust_types::Ty::Ref { mutable: false, inner } = &mut leaf.body.locals[9].ty else {
@@ -2825,7 +3002,7 @@ fn memo_probe_pinned_hashmap_fixed_state_drift_declines() {
         let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
             panic!("_9 pointee must be the extracted HashMap graph");
         };
-        fields.push(adversarial_cell);
+        fields.make_mut().push(adversarial_cell);
     }
     let decline = sem_expr_fold_shape_of(&load(row), &bodies)
         .expect_err("HashMap graph drift must invalidate the fixed-state pin");
@@ -2884,10 +3061,14 @@ fn memo_probe_interior_mutating_clone_declines() {
                 adt_kind: None,
                 layout: None,
                 name: "std::cell::Cell".into(),
-                fields: vec![],
-                variants: vec![],
+                fields: vec![].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
         (
             "opaque hidden Cell",
@@ -2899,10 +3080,14 @@ fn memo_probe_interior_mutating_clone_declines() {
                 adt_kind: None,
                 layout: None,
                 name: "user::LooksImmutableButCloneTouchesGlobal".into(),
-                fields: vec![],
-                variants: vec![],
+                fields: vec![].into(),
+                variants: vec![].into(),
                 disc_index_safe: false,
-                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
         ),
     ] {
         let mut bodies = all_bodies();
@@ -2919,7 +3104,7 @@ fn memo_probe_interior_mutating_clone_declines() {
             let trust_types::Ty::Adt { fields, .. } = inner.as_mut() else {
                 panic!("FVarSubst must be a struct")
             };
-            fields[0].1 = payload.clone();
+            fields.make_mut()[0].1 = payload.clone();
         }
         leaf.body.locals[5].ty = trust_types::Ty::Ref { mutable: false, inner: Box::new(payload) };
         let block = leaf

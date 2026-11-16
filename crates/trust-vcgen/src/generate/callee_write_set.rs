@@ -155,12 +155,20 @@ fn classify_write_place(
         match ty {
             // A plain `&mut T`: the write reaches the caller iff it goes THROUGH
             // the reference, i.e. the projection chain starts with `Deref`.
+            //
             // A write to the reference VARIABLE itself (`formal = &mut other`,
-            // projections empty) reseats the callee's own binding and is
-            // invisible to the caller.
+            // `p = q`, a `(p, q) = (q, p)` swap) is invisible to the caller, but it
+            // RESEATS the binding every later `(*formal)` write goes through, and
+            // this lane attributes those writes by the formal's local number. Trust
+            // (2026-09-29): it was classified caller-invisible and the derivation
+            // went on, so `fn g(mut p: &mut S, q: &mut S) { p = q; p.k = 100 }` was
+            // recorded as writing `a.k` at `g(a, b)`, the refinement dropped `b`
+            // with nothing put back, and a fact about `b.k` survived the call:
+            // `if b.k < 4 { g(a, b); buf[b.k] }` was PROVED (an adversarial audit;
+            // `tests/ui/trust/callee_reseats_its_formal_refused.rs`). Fail closed.
             Ty::Ref { mutable: true, inner } => {
                 if place.projections.is_empty() {
-                    return Some(None);
+                    return None;
                 }
                 if place.projections.first() != Some(&Projection::Deref) {
                     // A non-Deref-leading projection of a reference is not a
@@ -178,8 +186,12 @@ fn classify_write_place(
                 }
                 // Belt-and-braces: refuse when the pointee type itself carries a
                 // mutable/raw pointer, so a future widening of the fragment
-                // cannot silently admit the nested-pointer vector above.
-                if ty_contains_mut_pointer(inner) {
+                // cannot silently admit the nested-pointer vector above. Asked as
+                // the unretagged-pointer question (2026-09-30): a `&mut` or `Box`
+                // stored behind a `&` in the pointee is a second hop too — a nested
+                // pure-value call writes its target through a copy stashed before
+                // the call (`path_defs::ty_reaches_unretagged_pointer`).
+                if ty_reaches_unretagged_pointer(inner, true) {
                     return None;
                 }
                 // Only NAMED-FIELD / variant projections are admitted past the
@@ -242,16 +254,18 @@ fn classify_write_place(
 ///   * every written place classifies under [`classify_write_place`];
 ///   * only statement kinds with a known write effect appear.
 pub(crate) fn derive_callee_write_set(callee: &VerifiableFunction) -> Option<CalleeWriteSet> {
+    if callee.body.blocks.len() > WRITE_SET_MAX_BLOCKS {
+        return None;
+    }
     let expanded = callee.with_tail_calls_expanded();
     let callee = expanded.as_ref();
     if callee.body.blocks.len() > WRITE_SET_MAX_BLOCKS {
         return None;
     }
-    // Any laundering site anywhere in the body can smuggle a formal's address
-    // through an integer and write it back later, invisibly to the place scan.
-    if func_has_pointer_laundering(callee) {
-        return None;
-    }
+    // Note: pointer laundering (`Rvalue::AddressOf`, `Rvalue::Unsupported`, and
+    // `Rvalue::Cast(_, Ty::RawPtr { .. })`) is rejected directly inside the
+    // single-pass statement loop below without a separate pre-pass over
+    // `callee.body.blocks`.
 
     let mut paths: Vec<CalleeWritePath> = Vec::new();
     let record = |p: Option<CalleeWritePath>, paths: &mut Vec<CalleeWritePath>| {
@@ -339,8 +353,7 @@ pub(crate) fn build_callee_write_sets(
     if summaries.is_empty() {
         return map;
     }
-    for name in summaries.names() {
-        let Some(summary) = summaries.get(name) else { continue };
+    for (name, summary) in summaries.iter() {
         let Some(body) = summary.extracted_body.as_deref() else { continue };
         if let Some(ws) = derive_callee_write_set(body) {
             map.insert(name.to_string(), ws);
@@ -376,7 +389,8 @@ thread_local! {
 
 struct WriteSetFrame {
     id: u64,
-    map: std::rc::Rc<FxHashMap<String, CalleeWriteSet>>,
+    scope_id: u64,
+    map: Option<std::sync::Arc<FxHashMap<String, CalleeWriteSet>>>,
 }
 
 /// RAII scope for an installed write-set map. Removes exactly the frame it owns,
@@ -403,14 +417,24 @@ impl Drop for CalleeWriteSetGuard {
 pub(crate) fn enter_callee_write_sets(
     summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> CalleeWriteSetGuard {
-    let map = summaries.map(build_callee_write_sets).unwrap_or_default();
+    let (map, scope_id) = match summaries.filter(|s| !s.is_empty()) {
+        None => (None, 0),
+        Some(s) => {
+            let ws = s.callee_write_sets();
+            if ws.is_empty() {
+                (None, 0)
+            } else {
+                (Some(std::sync::Arc::clone(ws)), s.revision())
+            }
+        }
+    };
     let frame_id = CALLEE_WRITE_SET_NEXT_ID.with(|next| {
         let id = next.get();
         next.set(id.wrapping_add(1));
         id
     });
     CALLEE_WRITE_SET_STACK.with(|stack| {
-        stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) })
+        stack.borrow_mut().push(WriteSetFrame { id: frame_id, scope_id, map })
     });
     CalleeWriteSetGuard { frame_id, _thread_affine: std::marker::PhantomData }
 }
@@ -426,17 +450,45 @@ pub(crate) fn enter_test_callee_write_sets(
         next.set(id.wrapping_add(1));
         id
     });
+    let (map, scope_id) = if map.is_empty() {
+        (None, 0)
+    } else {
+        (Some(std::sync::Arc::new(map)), (1u64 << 63) | frame_id.saturating_add(1))
+    };
     CALLEE_WRITE_SET_STACK.with(|stack| {
-        stack.borrow_mut().push(WriteSetFrame { id: frame_id, map: std::rc::Rc::new(map) })
+        stack.borrow_mut().push(WriteSetFrame { id: frame_id, scope_id, map })
     });
     CalleeWriteSetGuard { frame_id, _thread_affine: std::marker::PhantomData }
 }
 
-/// The installed write-set for `callee`, or `None` (⇒ conservative havoc).
-fn installed_write_set(callee: &str) -> Option<CalleeWriteSet> {
+/// Identifier of the active non-empty [`CalleeWriteSetGuard`] frame (`0` when no
+/// scope is active or the active scope carries an empty map). Used to key caches
+/// whose values depend on the ambient callee write-set registry.
+pub(crate) fn current_scope_id() -> u64 {
+    CALLEE_WRITE_SET_STACK.with(|stack| stack.borrow().last().map_or(0, |f| f.scope_id))
+}
+
+/// The installed write-set map for the active scope when it contains `callee`,
+/// avoiding atomic `Arc` reference-count traffic on calls with no derived entry.
+/// `None` when no scope is active, when the innermost scope carries no map, or
+/// when that map has no entry for `callee` — every one of which the caller reads
+/// as "unknown" and answers with the conservative havoc.
+///
+/// The key is the name [`build_callee_write_sets`] took from the
+/// `SummaryDatabase`, and the entry is derived from that summary's own extracted
+/// body: no std spelling is recognized here (VCGEN-NINE-REDS-20261110, the
+/// forgeable-key census classifies it outside the unsafe-contract mint).
+fn installed_write_set_map_for(
+    callee: &str,
+) -> Option<std::sync::Arc<FxHashMap<String, CalleeWriteSet>>> {
     CALLEE_WRITE_SET_STACK.with(|stack| {
-        let stack = stack.borrow();
-        stack.last()?.map.get(callee).cloned()
+        stack
+            .borrow()
+            .last()?
+            .map
+            .as_ref()
+            .filter(|map| map.contains_key(callee))
+            .cloned()
     })
 }
 
@@ -452,10 +504,10 @@ fn installed_write_set(callee: &str) -> Option<CalleeWriteSet> {
 /// being a `&mut` (Rust's uniqueness rule covers `&mut`, not raw pointers), so
 /// havocing the argument's own spelling could leave an aliasing spelling stale.
 fn caller_admits_name_based_places(func: &VerifiableFunction) -> bool {
-    if func_has_pointer_laundering(func) {
+    if func.body.locals.iter().any(|decl| ty_contains_raw_ptr_local(&decl.ty)) {
         return false;
     }
-    !func.body.locals.iter().any(|decl| ty_contains_raw_ptr_local(&decl.ty))
+    !func_has_pointer_laundering(func)
 }
 
 /// Transitive raw-pointer occurrence in a type (the `ty_contains_mut_pointer`
@@ -497,10 +549,15 @@ fn caller_place_for_path(args: &[Operand], path: &CalleeWritePath) -> Option<Pla
     Some(Place { local: actual.local, projections })
 }
 
-/// Refine the conservative ALIAS havoc `conservative` for a call to `callee`
-/// with `args`, or return `None` to keep it unchanged.
+/// Refine the conservative ALIAS havoc (the whole-function list, whose membership
+/// `in_conservative` answers) for a call to `callee` with `args`, or return `None` to
+/// keep it unchanged. The refinement is returned as a DELTA over the list
+/// ([`CallHavocDelta`]): the refined list itself is `O(pointer locals)` per call, and
+/// building it for every call is what made the version oracle's gen-sets
+/// `O(calls x pointer locals)`. [`CallHavocDelta::apply`] builds it, byte for byte, for
+/// the consumers that need the `Vec`.
 ///
-/// `conservative` is the alias part only — `mutably_borrowed_local_names ∪
+/// The conservative list is the alias part only — `mutably_borrowed_local_names ∪
 /// mutable_pointer_local_names`. The call DESTINATION is never passed here and
 /// is always havoced by the caller of this function; the callee genuinely writes
 /// it and no write-set can excuse that.
@@ -518,27 +575,26 @@ fn caller_place_for_path(args: &[Operand], path: &CalleeWritePath) -> Option<Pla
 ///   * `caller_admits_name_based_places` has excluded raw-pointer aliasing and
 ///     address laundering in the caller, so within this body the only mutable
 ///     aliasing channel is `&mut`, which Rust guarantees is unique;
-///   * the pointee type carries no nested `&mut`/`*mut`, so there is no second
-///     hop out of the receiver's own tree;
+///   * the pointee type carries no nested `&mut`/`*mut`/`Box`, not even behind a
+///     `&` ([`ty_reaches_unretagged_pointer`]), so there is no second hop out of the
+///     receiver's own tree;
 ///   * the derivation enumerated EVERY write in the callee and failed closed on
 ///     anything it could not classify, so the mapped paths are its complete
 ///     caller-visible effect through this argument.
 ///
 /// A root the write-set does not mention is therefore dropped with NOTHING
 /// added — which is the "pure helper" case and the point of the whole lane.
-pub(crate) fn refine_call_havoc_names(
+pub(crate) fn refine_call_havoc_delta(
     func: &VerifiableFunction,
     callee: &str,
     args: &[Operand],
-    conservative: &[String],
-) -> Option<Vec<String>> {
-    let write_set = installed_write_set(callee)?;
-    if !caller_admits_name_based_places(func) {
-        return None;
-    }
+    in_conservative: &dyn Fn(&str) -> bool,
+) -> Option<CallHavocDelta> {
+    let write_set_map = installed_write_set_map_for(callee)?;
+    let write_set = write_set_map.get(callee)?;
 
     // Replaceable roots, indexed by FORMAL position (`args[k-1]` ⇒ formal `k`).
-    let mut roots: Vec<(usize, usize, String)> = Vec::new(); // (formal, local, base name)
+    let mut roots: Vec<(usize, usize)> = Vec::new(); // (formal, local)
     for (i, arg) in args.iter().enumerate() {
         let place = match arg {
             Operand::Copy(p) | Operand::Move(p) => p,
@@ -555,56 +611,330 @@ pub(crate) fn refine_call_havoc_names(
         }
         let Some(ty) = crate::local_ty_ref(func, place.local) else { continue };
         let Ty::Ref { mutable: true, inner } = ty else { continue };
-        if ty_contains_mut_pointer(inner) {
+        // No second hop out of the receiver's tree: no `&mut`, raw pointer or `Box`
+        // in the pointee — not even behind a `&` there, whose stored `&mut`/`Box`
+        // target any code holding a copy stashed before the call can write
+        // (`path_defs::ty_reaches_unretagged_pointer`, 2026-09-30).
+        if ty_reaches_unretagged_pointer(inner, true) {
             continue;
         }
-        roots.push((
-            i + 1,
-            place.local,
-            crate::place_to_var_name(func, &Place { local: place.local, projections: Vec::new() }),
-        ));
+        roots.push((i + 1, place.local));
     }
-    if roots.is_empty() {
+    if roots.is_empty()
+        || !write_set
+            .paths
+            .iter()
+            .all(|path| roots.iter().any(|(formal, _)| *formal == path.formal))
+    {
         return None;
     }
 
-    // Every write path must land inside a REPLACEABLE root, otherwise the
-    // refinement would be dropping a havoc it does not reinstate.
-    let mut refined_paths: Vec<String> = Vec::new();
-    for path in &write_set.paths {
-        if !roots.iter().any(|(formal, _, _)| *formal == path.formal) {
-            return None;
-        }
-        let place = caller_place_for_path(args, path)?;
-        if !roots.iter().any(|(_, local, _)| *local == place.local) {
-            return None;
-        }
-        refined_paths.push(crate::place_to_var_name(func, &place));
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let mut replaced_any = false;
-    for name in conservative {
-        if roots.iter().any(|(_, _, base)| base == name) {
-            replaced_any = true;
-            continue;
-        }
-        if !out.contains(name) {
-            out.push(name.clone());
-        }
-    }
-    if !replaced_any {
+    let root_bases: Vec<String> = roots
+        .iter()
+        .map(|(_, local)| crate::place_to_var_name(func, &Place::local(*local)))
+        .collect();
+    if !root_bases.iter().any(|base| in_conservative(base)) {
         // The conservative set never mentioned a replaceable root, so the
         // refinement would be a no-op. Return `None` so the caller keeps its
         // original vector (and ordering) byte-identically.
         return None;
     }
-    for name in refined_paths {
-        if !out.contains(&name) {
-            out.push(name);
+    if !caller_admits_name_based_places(func) {
+        return None;
+    }
+
+    // Every write path must land inside a REPLACEABLE root, otherwise the
+    // refinement would be dropping a havoc it does not reinstate.
+    let mut refined_paths: Vec<String> = Vec::with_capacity(write_set.paths.len() * 2);
+    for path in &write_set.paths {
+        let place = caller_place_for_path(args, path)?;
+        if !roots.iter().any(|(_, local)| *local == place.local) {
+            return None;
+        }
+        // Trust (2026-09-29): a write path is a written PLACE, and one holding a fat
+        // pointer carries its length with it: `*s = t` of an `s: &mut &[u8]` reseats
+        // `s*`, and `s*__slice_len` is a different name that no overlap reaches (`_`
+        // is not a projection separator). Every other havoc source mints that twin
+        // (`push_derived_slice_len` for a call destination, `mutably_borrowed_havoc_names`
+        // for a borrowed root); without it here the call re-versioned `s*` but not its
+        // length, and `if i <= s.len() { sset(s, t); &s[..i] }` was PROVED and
+        // panicked (audit of `3b4293d06cb`, 2026-09-29; the twin also re-versions the
+        // length for the version gen-sets, which read `block_written_names`). Since the
+        // merge with upstream's plain-relation havoc kill (`KillSet::havoc`,
+        // `TerminatorKill::survives_havoc_plain`) this twin is the ONLY channel that
+        // kills the length: a refined path sits in the havoc list, which the plain
+        // relation judges without the derived-length disjunct.
+        let path_name = crate::place_to_var_name(func, &place);
+        refined_paths.push(path_name.clone());
+        push_derived_slice_len(&mut refined_paths, &path_name);
+        // Trust: 2026-10-12 (UNION-SIBLING-WRITE-2) — a callee write through a union
+        // field (`(*r).b = v` for a root `r: &mut U`) rewrites every overlapping
+        // sibling: the caller-side cover (`r*`) rebinds them, where the path's own name
+        // (`r*.1`) rebinds none. The root's base name `r`, which covered them, is the
+        // name this refinement drops. A destination's cover, as every write oracle
+        // carries it ([`union_write_cover_name`]).
+        if let Some(cover) = union_write_cover_name(func, &place) {
+            push_derived_slice_len(&mut refined_paths, &cover);
+            refined_paths.push(cover);
         }
     }
-    Some(out)
+
+    Some(CallHavocDelta {
+        roots: root_bases,
+        paths: refined_paths,
+    })
+}
+
+/// A call-write-set refinement of the conservative havoc list, as a delta (see
+/// [`refine_call_havoc_delta`]): every conservative name EQUAL to one of `roots` is
+/// dropped (the list is deduplicated on the way, keeping first occurrences), and
+/// `paths` — the caller-side spellings of the callee's writes — are appended, each
+/// once.
+#[derive(Clone, Debug)]
+pub(crate) struct CallHavocDelta {
+    pub(crate) roots: Vec<String>,
+    pub(crate) paths: Vec<String>,
+}
+
+impl CallHavocDelta {
+    /// The refined list, in the order the refinement has always produced it.
+    pub(crate) fn apply(&self, conservative: &[String]) -> Vec<String> {
+        let cap = conservative.len() + self.paths.len();
+        let mut out: Vec<String> = Vec::with_capacity(cap);
+        let mut seen: trust_types::fx::FxHashSet<&str> =
+            trust_types::fx::FxHashSet::with_capacity_and_hasher(cap, Default::default());
+        for name in conservative {
+            if self.roots.iter().any(|base| base == name) {
+                continue;
+            }
+            if seen.insert(name.as_str()) {
+                out.push(name.clone());
+            }
+        }
+        for name in &self.paths {
+            if seen.insert(name.as_str()) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+}
+
+// ======================================================================
+// Frozen leaves under a shared-reference ARGUMENT
+// ======================================================================
+
+/// Trust (2026-09-24, TRUST-10): narrow the conservative havoc of a `&mut` local `p`
+/// at a call that receives a SHARED reborrow of `*p` — `self.check()` inside a
+/// `&mut self` method — so the scalar fields that call cannot write keep their facts.
+///
+/// # What was wrong
+///
+/// bit-vec 0.9.1's
+///
+/// ```text
+/// pub fn remove(&mut self, at: usize) -> bool {
+///     assert!(at < self.nbits, ..);
+///     self.ensure_invariant();          // fn ensure_invariant(&self)
+///     self.nbits -= 1;
+///     ..
+/// ```
+///
+/// was reported `[overflow:sub] FAILED` with `self*.1 = 1` before the call and
+/// `self*.1 = 0` after it: `mutable_pointer_local_names` puts the base name `self` in
+/// every call's havoc list, so the call re-versioned `self.nbits` although it received
+/// only `&*self`. No execution does that — the counterexample is not one.
+///
+/// # Why the narrowing is sound
+///
+/// A reference passed as a function ARGUMENT is protected for the duration of the
+/// call, in Stacked Borrows and in Tree Borrows alike: while the callee runs, a write
+/// to any byte the shared reference covers, through ANY pointer, is undefined
+/// behaviour — unless the byte lies inside an `UnsafeCell`. It is the premise rustc
+/// states to LLVM as `noalias readonly` on a `&Freeze` argument, and the premise
+/// `contracts::safe_shared_collection_call_preserves_local` already relies on ("the
+/// callee cannot mutate them in a well-defined execution"). So a scalar field of
+/// `*p` reached from the covered place through struct fields alone, with no
+/// `UnsafeCell` on the way, holds the same value after the call as before it.
+///
+/// That is the ONLY thing this refinement claims. It keeps every other conservative
+/// name verbatim, and replaces `p`'s base name with the names of everything else
+/// under `*p`:
+///
+///  * every field NOT on the covered path (the reborrow may cover one field only);
+///  * under the covered place, every subtree that is not such a frozen scalar — an
+///    `UnsafeCell` (`Cell`, atomics), an enum, a union, a `Seq`/slice/array, a
+///    pointer (memory BEHIND a pointer in `*p` is not covered by the argument's
+///    protection: a `Vec`'s buffer can be written through its raw pointer), a
+///    generic or compacted type, a hand-built ADT with no recorded kind;
+///  * with each such name, its derived `__slice_len` twin — the base name `p` killed
+///    `p*.f__slice_len` as a projection descendant, and the field name alone does not.
+///
+/// The pointer `p` itself cannot change: `local_defs::pointer_is_pinned` — one value,
+/// no call-destination, partial or unlocatable write, and no alias of `p`'s OWN
+/// storage (a `&mut p` a callee could reseat it through). A borrow THROUGH `p`
+/// (`&mut (*p).storage`, which every `&mut self` method that mutates a field takes)
+/// does not disqualify: it cannot change the pointer. The shared reborrow must be the argument's ONE value
+/// (`local_defs::unique_value_def`), passed whole and directly (a reference nested in
+/// an aggregate or a closure tuple is not a protected argument), to a callee that is
+/// neither foreign nor `unsafe` (the sibling lane's conservatism) and carries no
+/// atomic write of its own. Anything else keeps the full conservative list.
+///
+/// One step of a shared-reborrow refinement: a narrowed argument's base name and the
+/// names that replace it in the havoc list.
+pub(crate) type ReborrowStep = (String, Vec<String>);
+
+/// The refinement is returned as its STEPS — `(p's base name, its replacement)` per
+/// narrowed argument, in argument order — not as the refined list, for the reason
+/// [`refine_call_havoc_delta`] gives. `in_current(name, steps)` answers whether
+/// `name` is in the list as refined by `steps` (and by the call-write-set step that
+/// may precede them); `path_defs::HavocDelta::flatten` builds the refined list.
+pub(crate) fn refine_shared_reborrow_havoc(
+    func: &VerifiableFunction,
+    args: &[Operand],
+    is_foreign: bool,
+    is_unsafe_sig: bool,
+    has_atomic_write: bool,
+    in_current: &dyn Fn(&str, &[ReborrowStep]) -> bool,
+) -> Option<Vec<ReborrowStep>> {
+    if is_foreign || is_unsafe_sig || has_atomic_write {
+        return None;
+    }
+    let mut steps: Vec<ReborrowStep> = Vec::new();
+    for arg in args {
+        let (Operand::Copy(r) | Operand::Move(r)) = arg else { continue };
+        if !r.projections.is_empty() {
+            continue;
+        }
+        if !matches!(crate::local_ty_ref(func, r.local), Some(Ty::Ref { mutable: false, .. })) {
+            continue;
+        }
+        let Some(Rvalue::Ref { mutable: false, place: referent }) =
+            crate::local_defs::unique_value_def(func, r.local)
+        else {
+            continue;
+        };
+        let Some((Projection::Deref, covered)) = referent.projections.split_first() else {
+            continue;
+        };
+        if !covered.iter().all(|p| matches!(p, Projection::Field(_))) {
+            continue;
+        }
+        let p = referent.local;
+        let Some(Ty::Ref { mutable: true, inner }) = crate::local_ty_ref(func, p) else {
+            continue;
+        };
+        if !crate::local_defs::pointer_is_pinned(func, p) {
+            continue;
+        }
+        let base = crate::place_to_var_name(func, &Place::local(p));
+        if !in_current(&base, &steps) {
+            continue;
+        }
+        let Some(replacement) = names_outside_frozen_leaves(func, p, inner, covered) else {
+            continue;
+        };
+        steps.push((base, replacement));
+    }
+    (!steps.is_empty()).then_some(steps)
+}
+
+/// A struct the walk may descend into field by field: extracted from a rustc `AdtDef`
+/// as a struct (`adt_kind`), no variant structure, a non-empty field list, not the
+/// `UnsafeCell` type itself (`Cell`, `RefCell`, the atomics and `Mutex` all reach
+/// their mutable bytes through one, so refusing it at any depth refuses them), and
+/// not `Box`. Since 2026-10-14 (INTERIOR-MUT-CHANNEL-1) a cell is refused by the one
+/// name list, `type_name_is_interior_mutable` (a superset of `contains("UnsafeCell")`:
+/// a wrapper rendered without its fields is havocked whole too), on top of the
+/// structural refusal of `UnsafeCell` at any depth.
+///
+/// `Box` is the one ADT MIR dereferences as a PLACE (`(*p).b*`), and the heap it owns
+/// is not covered by the argument's protection; the pointee name `p*.b*` is a
+/// descendant of `p*.b` only, so a `Box` field must be havoced WHOLE, never by its
+/// `Unique`/`NonNull` leaves. An empty field list is a struct whose fields the
+/// extractor did not record (or a zero-sized one): it is havoced whole too, which
+/// costs nothing when there is nothing under it and is the fail-closed reading when
+/// there is.
+fn frozen_struct_fields(ty: &Ty) -> Option<&[(String, Ty)]> {
+    match ty {
+        Ty::Adt {
+            name, fields, variants, adt_kind: Some(trust_types::AdtKind::Struct), ..
+        } if variants.is_empty()
+            && !fields.is_empty()
+            && !type_name_is_interior_mutable(name)
+            && !matches!(name.split('<').next(), Some("alloc::boxed::Box" | "std::boxed::Box")) =>
+        {
+            Some(fields)
+        }
+        _ => None,
+    }
+}
+
+/// A scalar with no interior: its bytes are all the value there is.
+fn is_frozen_scalar(ty: &Ty) -> bool {
+    matches!(ty, Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Bool | Ty::Char)
+}
+
+/// The replacement for `p`'s base name — see [`refine_shared_reborrow_havoc`] — or
+/// `None` when the covered path cannot be walked or no frozen scalar is under it (the
+/// refinement would then exempt nothing).
+fn names_outside_frozen_leaves(
+    func: &VerifiableFunction,
+    p: usize,
+    pointee: &Ty,
+    covered: &[Projection],
+) -> Option<Vec<String>> {
+    fn push_opaque(func: &VerifiableFunction, place: &Place, out: &mut Vec<String>) {
+        let name = crate::place_to_var_name(func, place);
+        push_derived_slice_len(out, &name);
+        out.push(name);
+    }
+    fn cover(
+        func: &VerifiableFunction,
+        place: &mut Place,
+        ty: &Ty,
+        out: &mut Vec<String>,
+        exempt: &mut usize,
+    ) {
+        if is_frozen_scalar(ty) {
+            *exempt += 1;
+            return;
+        }
+        let Some(fields) = frozen_struct_fields(ty) else {
+            push_opaque(func, place, out);
+            return;
+        };
+        for (i, (_, field_ty)) in fields.iter().enumerate() {
+            place.projections.push(Projection::Field(i));
+            cover(func, place, field_ty, out, exempt);
+            place.projections.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut place = Place { local: p, projections: vec![Projection::Deref] };
+    // Compute the pointee root name while `place.projections == [Projection::Deref]`
+    // so we do not allocate a second `vec![Projection::Deref]` after the covered walk.
+    let root = crate::place_to_var_name(func, &place);
+    let mut ty = pointee;
+    // Down the covered path: every sibling off it is outside the argument's reach.
+    for step in covered {
+        let Projection::Field(k) = step else { return None };
+        let fields = frozen_struct_fields(ty)?;
+        let (_, next) = fields.get(*k)?;
+        for i in (0..fields.len()).filter(|i| i != k) {
+            place.projections.push(Projection::Field(i));
+            push_opaque(func, &place, &mut out);
+            place.projections.pop();
+        }
+        place.projections.push(Projection::Field(*k));
+        ty = next;
+    }
+    // A derived name of the pointee itself (`p*__slice_len`) was a descendant of `p`.
+    push_derived_slice_len(&mut out, &root);
+    let mut exempt = 0usize;
+    cover(func, &mut place, ty, &mut out, &mut exempt);
+    (exempt > 0).then_some(out)
 }
 
 #[cfg(test)]

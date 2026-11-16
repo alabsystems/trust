@@ -15,7 +15,7 @@
 //! refuses to emit it (`if !grounded { continue; }`) rather than refute on an
 //! unconstrained variable. So
 //!
-//! ```ignore
+//! ```ignore (illustrative)
 //! pub fn f(n: u8) -> u8 {
 //!     let mut t = 0u8; let mut i = 0u8;
 //!     while i < 4 { assert!(n != i); t ^= i; i += 1; }
@@ -86,7 +86,7 @@
 /// what keeps that assumption on the refutation side of the verifier.
 mod std_iter;
 
-use trust_types::fx::FxHashMap;
+use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, Formula, Operand, Place, Projection,
     RefuteOnlyProvenance, RefuteOnlyVc, Rvalue, Sort, Statement, Terminator, Ty, UnOp, VcKind,
@@ -121,18 +121,23 @@ enum SymValue {
     /// A two-field tuple `(value, flag)` — a `CheckedBinaryOp` result or a
     /// 2-tuple aggregate of scalars.
     Pair(Formula, Formula),
-    /// A SHARED reference to a `[T; N]` whose element values are exactly
-    /// `elems` (index `i` ↦ `elems[i]`), each an `Int`-sorted free input.
+    /// A SHARED reference to the `[T; len]` PARAMETER `param`, whose element
+    /// `k` is the free input [`array_elem_symbol`]`(param, k)`, an `Int`-sorted
+    /// symbol minted the first time a path READS lane `k` (with its type-range
+    /// fact). A lane no path reads never enters a formula, so the value is the
+    /// same few words for every `len`: nothing here is sized by the array.
     ///
-    /// Created ONLY for a `&[T; N]` PARAMETER, where the `N` element symbols are
+    /// Created ONLY for a `&[T; N]` PARAMETER, where the element symbols are
     /// genuinely free: for any in-range assignment there is a caller that passes
     /// such an array, so no model is invented. `T` is a scalar integer, which
     /// has no interior mutability, so a shared borrow fixes the values for the
-    /// whole body — nothing in the function can change them.
-    ArrayRef { elem_ty: Ty, elems: Vec<Formula> },
-    /// A `core::slice::iter::Iter<'_, T>` positioned at `cursor` over `elems`.
-    /// `cursor == elems.len()` is the exhausted iterator.
-    SliceIter { elem_ty: Ty, elems: Vec<Formula>, cursor: usize },
+    /// whole body — nothing in the function can change them, and two reads of
+    /// one lane name one symbol.
+    ArrayRef { elem_ty: Ty, param: usize, len: u64 },
+    /// A `core::slice::iter::Iter<'_, T>` over the `len` lanes of the modeled
+    /// array parameter `param`, positioned at `cursor`. `cursor == len` is the
+    /// exhausted iterator.
+    SliceIter { elem_ty: Ty, param: usize, len: u64, cursor: u64 },
     /// A reference to the WHOLE of local `k`. Created only by `Rvalue::Ref` of a
     /// local that already holds a [`SymValue::SliceIter`], so the only thing it
     /// can be handed to is the summarized `next` — which writes the advanced
@@ -160,6 +165,7 @@ impl SymValue {
 }
 
 /// Symbolic state threaded along ONE path.
+#[derive(Clone)]
 struct PathState {
     /// local -> its value after the writes seen so far on this path. A local
     /// ABSENT here has no known value; reading it drops the path.
@@ -169,12 +175,15 @@ struct PathState {
     constraints: Vec<Formula>,
     /// Running node budget across `env` values and `constraints`.
     nodes: usize,
+    /// The `(array parameter, lane)` pairs this path has read, each of whose
+    /// range fact is already in `constraints` (see [`read_array_lane`]).
+    read_lanes: FxHashSet<(usize, u64)>,
 }
 
 /// Total node count of a formula (budget accounting only).
 fn formula_nodes(f: &Formula) -> usize {
     let mut n = 0usize;
-    f.visit(&mut |_| n = n.saturating_add(1));
+    trust_types::visit_formula_nodes(f, &mut |_| n = n.saturating_add(1));
     n
 }
 
@@ -191,6 +200,10 @@ struct Ctx<'f> {
     block_at: FxHashMap<BlockId, usize>,
     /// LocalDecl.index -> position in `func.body.locals`.
     local_at: FxHashMap<usize, usize>,
+    /// Every local's source name, for the element-symbol collision check.
+    local_names: FxHashSet<&'f str>,
+    /// Source names shared by more than one local in `func.body.locals`.
+    duplicated_local_names: FxHashSet<&'f str>,
 }
 
 impl<'f> Ctx<'f> {
@@ -198,19 +211,40 @@ impl<'f> Ctx<'f> {
     /// declines the whole function in that case, because a duplicated key makes
     /// every lookup below ambiguous.
     fn build(func: &'f VerifiableFunction) -> Option<Self> {
-        let mut block_at = FxHashMap::default();
+        let mut block_at =
+            FxHashMap::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
         for (position, block) in func.body.blocks.iter().enumerate() {
             if block_at.insert(block.id, position).is_some() {
                 return None;
             }
         }
-        let mut local_at = FxHashMap::default();
+        let mut local_at =
+            FxHashMap::with_capacity_and_hasher(func.body.locals.len(), Default::default());
+        let mut local_names =
+            FxHashSet::with_capacity_and_hasher(func.body.locals.len(), Default::default());
+        let mut duplicated_local_names = FxHashSet::default();
         for (position, decl) in func.body.locals.iter().enumerate() {
             if local_at.insert(decl.index, position).is_some() {
                 return None;
             }
+            if let Some(name) = decl.name.as_deref()
+                && !local_names.insert(name)
+            {
+                duplicated_local_names.insert(name);
+            }
         }
-        Some(Ctx { func, block_at, local_at })
+        Some(Ctx { func, block_at, local_at, local_names, duplicated_local_names })
+    }
+
+    /// Whether `name` is some local's source name or some local's `_<index>`
+    /// fallback spelling — the two ways a minted symbol could alias a
+    /// parameter symbol ([`param_var_name`]).
+    fn names_a_local(&self, name: &str) -> bool {
+        self.local_names.contains(name)
+            || name
+                .strip_prefix('_')
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .is_some_and(|index| self.local_at.contains_key(&index))
     }
 
     fn block(&self, id: BlockId) -> Option<&'f BasicBlock> {
@@ -220,6 +254,28 @@ impl<'f> Ctx<'f> {
     /// The declared type of a whole local.
     fn local_ty(&self, local: usize) -> Option<&'f Ty> {
         self.func.body.locals.get(*self.local_at.get(&local)?).map(|d| &d.ty)
+    }
+
+    fn param_var_name(&self, index: usize) -> String {
+        let Some(&pos) = self.local_at.get(&index) else {
+            return format!("_{index}");
+        };
+        let Some(decl) = self.func.body.locals.get(pos) else {
+            return format!("_{index}");
+        };
+        let Some(name) = decl.name.as_deref() else {
+            return format!("_{index}");
+        };
+        if name.is_empty() {
+            return format!("_{index}");
+        }
+        let shared = self.duplicated_local_names.contains(name);
+        let looks_like_a_fallback = name
+            .strip_prefix('_')
+            .filter(|rest| !rest.is_empty() && (*rest == "0" || !rest.starts_with('0')))
+            .and_then(|rest| rest.parse::<usize>().ok())
+            .is_some_and(|idx| self.local_at.contains_key(&idx));
+        if shared || looks_like_a_fallback { format!("_{index}") } else { name.to_string() }
     }
 }
 
@@ -232,21 +288,33 @@ impl<'f> Ctx<'f> {
 /// `_<index>` fallback. Otherwise every parameter falls back to `_<index>`,
 /// which is injective because local indices are unique — `Ctx::build` rejects the
 /// function outright when they are not, and it runs before every call here.
+#[cfg(test)]
 fn param_var_name(func: &VerifiableFunction, index: usize) -> String {
-    let fallback = format!("_{index}");
-    let Some(decl) = func.body.locals.iter().find(|d| d.index == index) else {
-        return fallback;
+    let Some(decl) = func
+        .body
+        .locals
+        .get(index)
+        .filter(|d| d.index == index)
+        .or_else(|| func.body.locals.iter().find(|d| d.index == index))
+    else {
+        return format!("_{index}");
     };
     let Some(name) = decl.name.as_deref() else {
-        return fallback;
+        return format!("_{index}");
     };
     if name.is_empty() {
-        return fallback;
+        return format!("_{index}");
     }
     let shared = func.body.locals.iter().filter(|d| d.name.as_deref() == Some(name)).count() > 1;
-    let looks_like_a_fallback =
-        func.body.locals.iter().any(|d| name == format!("_{}", d.index).as_str());
-    if shared || looks_like_a_fallback { fallback } else { name.to_string() }
+    let looks_like_a_fallback = name
+        .strip_prefix('_')
+        .filter(|rest| !rest.is_empty() && (*rest == "0" || !rest.starts_with('0')))
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .is_some_and(|idx| {
+            func.body.locals.get(idx).is_some_and(|d| d.index == idx)
+                || func.body.locals.iter().any(|d| d.index == idx)
+        });
+    if shared || looks_like_a_fallback { format!("_{index}") } else { name.to_string() }
 }
 
 /// The `(width, signed)` of a scalar integer type, or `None` for anything else.
@@ -267,12 +335,17 @@ fn int_shape(ty: &Ty) -> Option<(u32, bool)> {
 /// could not produce.
 fn entry_state(ctx: &Ctx<'_>) -> PathState {
     let func = ctx.func;
-    let mut st = PathState { env: FxHashMap::default(), constraints: Vec::new(), nodes: 0 };
+    let mut st = PathState {
+        env: FxHashMap::default(),
+        constraints: Vec::new(),
+        nodes: 0,
+        read_lanes: FxHashSet::default(),
+    };
     for decl in &func.body.locals {
         if decl.index < 1 || decl.index > func.body.arg_count {
             continue; // local 0 is the return slot; beyond arg_count are temps
         }
-        let name = param_var_name(func, decl.index);
+        let name = ctx.param_var_name(decl.index);
         match &decl.ty {
             Ty::Bool => {
                 st.env.insert(decl.index, SymValue::Scalar(Formula::var(&name, Sort::Bool)));
@@ -283,17 +356,13 @@ fn entry_state(ctx: &Ctx<'_>) -> PathState {
                 st.env.insert(decl.index, SymValue::Scalar(v));
             }
             // A SHARED `&[T; N]` parameter with scalar-integer elements is
-            // symbolized ELEMENT-WISE — see `array_param_element_symbols` for
-            // why that is an exact model rather than an over-approximation.
+            // symbolized ELEMENT-WISE, one lane at a time as paths read them —
+            // see `array_param_model` for why that is an exact model rather
+            // than an over-approximation.
             Ty::Ref { .. } => {
-                if let Some((elem_ty, elems)) = array_param_element_symbols(func, decl.index)
-                    && let Some((width, signed)) = int_shape(&elem_ty)
-                {
-                    for elem in &elems {
-                        st.constraints
-                            .push(crate::range::input_range_constraint(elem, width, signed));
-                    }
-                    st.env.insert(decl.index, SymValue::ArrayRef { elem_ty, elems });
+                if let Some((elem_ty, len)) = array_param_model(func, decl.index) {
+                    st.env
+                        .insert(decl.index, SymValue::ArrayRef { elem_ty, param: decl.index, len });
                 }
             }
             // Any other non-scalar parameter gets NO symbol. Any read of it
@@ -307,14 +376,14 @@ fn entry_state(ctx: &Ctx<'_>) -> PathState {
     st
 }
 
-/// The free element symbols of a `&[T; N]` PARAMETER, or `None` if this
-/// parameter is not one this lane symbolizes.
+/// The element type and length of a `&[T; N]` PARAMETER this lane models, or
+/// `None` if it is not one.
 ///
 /// # Why element symbols are an EXACT model, not an over-approximation
 ///
 /// The lane's governing invariant is "never leave a read unconstrained". A whole
 /// aggregate handed an opaque symbol would violate it (two reads of the same
-/// storage could decorrelate). `N` INDEPENDENT symbols do not: the observable
+/// storage could decorrelate). One symbol PER LANE does not: the observable
 /// content of a `&[T; N]` with `T` a scalar integer IS exactly `N` independent
 /// values, and
 ///
@@ -325,44 +394,59 @@ fn entry_state(ctx: &Ctx<'_>) -> PathState {
 ///   `UnsafeCell`, so a SHARED borrow forbids every mutation channel for the
 ///   whole body. `&mut [T; N]` is therefore NOT admitted here.
 ///
+/// A lane's symbol and its range fact enter a path's formula when the path
+/// READS that lane ([`read_array_lane`]), so an unread lane costs nothing and
+/// is still free: any value in its range completes the model to a real
+/// argument. This replaces minting all `N` symbols up front, which was sized by
+/// the array's LENGTH (a value) and so was capped at 64 lanes.
+///
 /// # Naming
 ///
-/// `{ELEM_VAR_PREFIX}{local}_{k}`, and the whole parameter is DECLINED if any
-/// minted name collides with a source local name or with a `_<index>` fallback
-/// spelling — a collision would merge an element symbol with an unrelated
-/// parameter, and a model over a merged symbol is not an execution.
-fn array_param_element_symbols(
-    func: &VerifiableFunction,
-    index: usize,
-) -> Option<(Ty, Vec<Formula>)> {
-    let decl = func.body.locals.iter().find(|d| d.index == index)?;
-    let Ty::Ref { mutable: false, inner } = &decl.ty else {
+/// Lane `k` is [`array_elem_symbol`]`(param, k)` =
+/// `{ELEM_VAR_PREFIX}{param}_{k}`, and a READ whose minted name collides with a
+/// source local name or with a `_<index>` fallback spelling drops the path — a
+/// collision would merge an element symbol with an unrelated parameter, and a
+/// model over a merged symbol is not an execution.
+fn array_param_model(func: &VerifiableFunction, index: usize) -> Option<(Ty, u64)> {
+    let Ty::Ref { mutable: false, inner } = crate::local_ty_ref(func, index)? else {
         return None;
     };
     let Ty::Array { elem, len } = inner.as_ref() else {
         return None;
     };
-    if !matches!(elem.as_ref(), Ty::Int { .. })
-        || *len == 0
-        || *len > std_iter::MAX_MODELED_ARRAY_LEN
-    {
+    if !matches!(elem.as_ref(), Ty::Int { .. }) {
         return None;
     }
-    let len = usize::try_from(*len).ok()?;
-    let mut elems = Vec::with_capacity(len);
-    for k in 0..len {
-        let name = format!("{}{index}_{k}", std_iter::ELEM_VAR_PREFIX);
-        // Fail-closed on any chance of aliasing a parameter symbol.
-        let collides =
-            func.body.locals.iter().any(|d| {
-                d.name.as_deref() == Some(name.as_str()) || name == format!("_{}", d.index)
-            });
-        if collides {
-            return None;
-        }
-        elems.push(Formula::var_owned(name, Sort::Int));
+    Some((elem.as_ref().clone(), *len))
+}
+
+/// The SMT symbol for lane `lane` of the modeled array parameter `param`.
+fn array_elem_symbol(param: usize, lane: u64) -> String {
+    format!("{}{param}_{lane}", std_iter::ELEM_VAR_PREFIX)
+}
+
+/// READ lane `lane` of the modeled array parameter `param`: the lane's free
+/// symbol, with its element-type range fact conjoined to the path the first
+/// time this path reads it. `None` drops the path (a name collision, or an
+/// element type this lane does not model).
+fn read_array_lane(
+    ctx: &Ctx<'_>,
+    st: &mut PathState,
+    elem_ty: &Ty,
+    param: usize,
+    lane: u64,
+) -> Option<Formula> {
+    let (width, signed) = int_shape(elem_ty)?;
+    let name = array_elem_symbol(param, lane);
+    // Fail-closed on any chance of aliasing a parameter symbol.
+    if ctx.names_a_local(&name) {
+        return None;
     }
-    Some((elem.as_ref().clone(), elems))
+    let elem = Formula::var_owned(name, Sort::Int);
+    if st.read_lanes.insert((param, lane)) {
+        st.constraints.push(crate::range::input_range_constraint(&elem, width, signed));
+    }
+    Some(elem)
 }
 
 /// Evaluate an operand in the current state. `None` = drop the path.
@@ -691,16 +775,14 @@ fn value_matches_ty(ctx: &Ctx<'_>, ty: &Ty, value: &SymValue) -> bool {
         }
         // The element count and element type must agree with the DECLARED array,
         // so a value built for one array can never be stored as another.
-        SymValue::ArrayRef { elem_ty, elems } => {
+        SymValue::ArrayRef { elem_ty, len: value_len, .. } => {
             let Ty::Ref { mutable: false, inner } = ty else {
                 return false;
             };
             let Ty::Array { elem, len } = inner.as_ref() else {
                 return false;
             };
-            elem.as_ref() == elem_ty
-                && usize::try_from(*len).is_ok_and(|n| n == elems.len())
-                && elems.iter().all(|f| crate::formula_sort(f) == Some(Sort::Int))
+            elem.as_ref() == elem_ty && len == value_len
         }
         // Only the ADT identity is checked here, not the iterator's element
         // type: `slice::Iter`'s fields are raw pointers whose spelling is a
@@ -710,10 +792,8 @@ fn value_matches_ty(ctx: &Ctx<'_>, ty: &Ty, value: &SymValue) -> bool {
         // destination to be `Option<&elem_ty>` for the SAME `elem_ty` this value
         // carries, so an iterator stored under a mismatched element type can
         // never yield anything.
-        SymValue::SliceIter { elems, cursor, .. } => {
-            matches!(ty, Ty::Adt { name, .. } if std_iter::is_slice_iter_adt(name))
-                && *cursor <= elems.len()
-                && elems.iter().all(|f| crate::formula_sort(f) == Some(Sort::Int))
+        SymValue::SliceIter { len, cursor, .. } => {
+            matches!(ty, Ty::Adt { name, .. } if std_iter::is_slice_iter_adt(name)) && cursor <= len
         }
         // A `LocalRef` is only sound while the declared pointee type is the
         // referent local's own type — otherwise a deref would read storage as
@@ -831,7 +911,7 @@ fn apply_std_iter_call(ctx: &Ctx<'_>, st: &mut PathState, term: &Terminator) -> 
         // symbolized element-wise), and the destination's declared type must
         // really be `core`/`std`'s slice iterator.
         std_iter::StdIterCall::IntoIterArrayRef => {
-            let Some(SymValue::ArrayRef { elem_ty, elems }) = eval_operand(st, arg) else {
+            let Some(SymValue::ArrayRef { elem_ty, param, len }) = eval_operand(st, arg) else {
                 return false;
             };
             if !matches!(ctx.local_ty(dest.local), Some(Ty::Adt { name, .. })
@@ -839,9 +919,9 @@ fn apply_std_iter_call(ctx: &Ctx<'_>, st: &mut PathState, term: &Terminator) -> 
             {
                 return false;
             }
-            SymValue::SliceIter { elem_ty, elems, cursor: 0 }
+            SymValue::SliceIter { elem_ty, param, len, cursor: 0 }
         }
-        // `next(&mut it) -> Option<&T>`: `Some(&elems[cursor])` while the cursor
+        // `next(&mut it) -> Option<&T>`: `Some(&a[cursor])` while the cursor
         // is in range, `None` once it is not, and the cursor advances (an
         // exhausted slice iterator keeps returning `None`, so it saturates).
         //
@@ -858,7 +938,7 @@ fn apply_std_iter_call(ctx: &Ctx<'_>, st: &mut PathState, term: &Terminator) -> 
             if receiver == dest.local {
                 return false;
             }
-            let Some(SymValue::SliceIter { elem_ty, elems, cursor }) =
+            let Some(SymValue::SliceIter { elem_ty, param, len, cursor }) =
                 st.env.get(&receiver).cloned()
             else {
                 return false;
@@ -868,17 +948,22 @@ fn apply_std_iter_call(ctx: &Ctx<'_>, st: &mut PathState, term: &Terminator) -> 
             else {
                 return false;
             };
-            let yielded = match elems.get(cursor) {
-                Some(elem) => SymValue::Variant {
+            let yielded = if cursor < len {
+                let Some(elem) = read_array_lane(ctx, st, &elem_ty, param, cursor) else {
+                    return false;
+                };
+                SymValue::Variant {
                     index: shape.some_index,
-                    payload: Some(Box::new(SymValue::ElemRef(elem.clone()))),
-                },
-                None => SymValue::Variant { index: shape.none_index, payload: None },
+                    payload: Some(Box::new(SymValue::ElemRef(elem))),
+                }
+            } else {
+                SymValue::Variant { index: shape.none_index, payload: None }
             };
             let advanced = SymValue::SliceIter {
                 elem_ty,
-                cursor: cursor.saturating_add(1).min(elems.len()),
-                elems,
+                param,
+                len,
+                cursor: cursor.saturating_add(1).min(len),
             };
             if !store_local(ctx, st, receiver, advanced) {
                 return false;
@@ -919,13 +1004,13 @@ fn edge_condition(
             let d = eval_operand(st, discr)?.scalar()?;
             // A value may label several arms; the edge is taken when the
             // discriminant equals ANY of the values labelling it.
-            let matching: Vec<u128> =
-                targets.iter().filter(|(_, t)| *t == next).map(|(v, _)| *v).collect();
-            if !matching.is_empty() {
-                let mut arms = Vec::with_capacity(matching.len());
-                for v in matching {
-                    arms.push(switch_value_eq(&d, &kind, discr_ty, v)?);
+            let mut arms = Vec::new();
+            for (v, t) in targets {
+                if *t == next {
+                    arms.push(switch_value_eq(&d, &kind, discr_ty, *v)?);
                 }
+            }
+            if !arms.is_empty() {
                 return Some(if arms.len() == 1 {
                     arms.pop().unwrap_or(Formula::Bool(false))
                 } else {
@@ -999,8 +1084,8 @@ fn switch_value_eq(d: &Formula, kind: &Sort, ty: Option<&Ty>, value: u128) -> Op
 /// statements are NOT executed: its terminator is the diverging panic call, and
 /// nothing between the block entry and that call can branch away, so reaching
 /// the block entry already means the panic happens.
-fn execute_path(ctx: &Ctx<'_>, path: &[BlockId]) -> Option<Formula> {
-    let mut st = entry_state(ctx);
+fn execute_path(ctx: &Ctx<'_>, entry: &PathState, path: &[BlockId]) -> Option<Formula> {
+    let mut st = entry.clone();
     for window in path.windows(2) {
         let (here, next) = (window[0], window[1]);
         let block = ctx.block(here)?;
@@ -1042,9 +1127,8 @@ fn sym_value_nodes(v: &SymValue) -> usize {
     match v {
         SymValue::Scalar(f) | SymValue::ElemRef(f) => formula_nodes(f),
         SymValue::Pair(a, b) => formula_nodes(a).saturating_add(formula_nodes(b)),
-        SymValue::ArrayRef { elems, .. } | SymValue::SliceIter { elems, .. } => {
-            elems.iter().map(formula_nodes).fold(0usize, usize::saturating_add)
-        }
+        // Constant size: a lane enters the path's formula only when it is read.
+        SymValue::ArrayRef { .. } | SymValue::SliceIter { .. } => 1,
         SymValue::LocalRef(_) => 1,
         SymValue::Variant { payload, .. } => {
             1usize.saturating_add(payload.as_deref().map_or(0, sym_value_nodes))
@@ -1066,21 +1150,27 @@ fn sym_value_nodes(v: &SymValue) -> usize {
 /// the call site's types do not match the summary. Recognition is by name only
 /// here, which is fine: naming a successor traversable does not by itself put
 /// anything into a formula.
-fn traversable_successors(term: &Terminator) -> Vec<BlockId> {
+fn traversable_successor_at(term: &Terminator, idx: usize) -> Option<(BlockId, bool)> {
     match term {
-        Terminator::Goto(t) => vec![*t],
+        Terminator::Goto(t) | Terminator::Assert { target: t, .. } => {
+            (idx == 0).then_some((*t, false))
+        }
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut out: Vec<BlockId> = targets.iter().map(|(_, t)| *t).collect();
-            out.push(*otherwise);
-            out
+            let total = targets.len() + 1;
+            if idx < targets.len() {
+                Some((targets[idx].1, idx + 1 < total))
+            } else if idx == targets.len() {
+                Some((*otherwise, false))
+            } else {
+                None
+            }
         }
-        Terminator::Assert { target, .. } => vec![*target],
         Terminator::Call { func: callee, target: Some(t), is_foreign: false, .. }
-            if std_iter::recognize(callee).is_some() =>
+            if idx == 0 && std_iter::recognize(callee).is_some() =>
         {
-            vec![*t]
+            Some((*t, false))
         }
-        _ => Vec::new(),
+        _ => None,
     }
 }
 
@@ -1120,15 +1210,18 @@ fn acyclic_paths_to(ctx: &Ctx<'_>, target: BlockId) -> Vec<Vec<BlockId>> {
         let Some(block) = ctx.block(here) else {
             continue;
         };
-        let succs = traversable_successors(&block.terminator);
-        if idx >= succs.len() {
+        let Some((next, has_more)) = traversable_successor_at(&block.terminator, idx) else {
             continue;
+        };
+        if path.contains(&next) {
+            if has_more {
+                stack.push((path, idx + 1));
+            }
+            continue; // back edge — the path would stop being acyclic
         }
         // Resume this frame at the next successor, then descend into this one.
-        stack.push((path.clone(), idx + 1));
-        let next = succs[idx];
-        if path.contains(&next) {
-            continue; // back edge — the path would stop being acyclic
+        if has_more {
+            stack.push((path.clone(), idx + 1));
         }
         let mut extended = path;
         extended.push(next);
@@ -1145,7 +1238,8 @@ fn is_assert_panic_block(block: &BasicBlock) -> bool {
     let Terminator::Call { func: callee, args, .. } = &block.terminator else {
         return false;
     };
-    (super::v2_is_assertion_panic_call(callee) || callee.ends_with("::panic"))
+    (super::v2_is_assertion_panic_call(callee)
+        || trust_types::terminator_obligations::is_bare_panic_call(callee))
         && !super::v2_is_unreachable_sentinel_panic(callee, args)
 }
 
@@ -1170,6 +1264,11 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
     // input cannot be repaired by the projection.
     let tail_call_expanded = func.with_tail_calls_expanded();
     let func = tail_call_expanded.as_ref();
+    if super::cached_terminator_presence_for_body(&func.body).is_some_and(|tp| !tp.has_call)
+        || !func.body.blocks.iter().any(is_assert_panic_block)
+    {
+        return Vec::new();
+    }
     // The same whole-function work gate the bidirectional lane uses; an
     // over-budget function emits no claims at all.
     if super::func_exceeds_vcgen_budget(func) {
@@ -1216,7 +1315,7 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
         let every_param_binds =
             func.body.locals.iter().filter(|d| d.index >= 1 && d.index <= func.body.arg_count).all(
                 |d| match d.name.as_deref() {
-                    Some(name) => param_var_name(func, d.index) == name,
+                    Some(name) => ctx.param_var_name(d.index) == name,
                     None => true,
                 },
             );
@@ -1232,23 +1331,19 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
         // above exists to prevent, so if any precondition so much as MENTIONS a
         // symbol spelled like a modeled array parameter, decline the function.
         // Conservative on purpose: a declined function costs completeness only.
-        let mut precondition_symbols: Vec<String> = Vec::new();
-        for pre in &func.preconditions {
-            pre.visit(&mut |node| {
-                if let Some(name) = node.var_name() {
-                    precondition_symbols.push(name.to_string());
-                }
-            });
-        }
         let mentions_a_modeled_array = func
             .body
             .locals
             .iter()
             .filter(|d| d.index >= 1 && d.index <= func.body.arg_count)
-            .filter(|d| array_param_element_symbols(func, d.index).is_some())
+            .filter(|d| array_param_model(func, d.index).is_some())
             .any(|d| {
-                let base = param_var_name(func, d.index);
-                precondition_symbols.iter().any(|name| name.starts_with(&base))
+                let base = ctx.param_var_name(d.index);
+                func.preconditions.iter().any(|pre| {
+                    trust_types::any_formula_node(pre, &mut |node| {
+                        node.var_name().is_some_and(|name| name.starts_with(&base))
+                    })
+                })
             });
         if mentions_a_modeled_array {
             return Vec::new();
@@ -1260,13 +1355,21 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
         return Vec::new();
     }
 
+    let fn_sym: trust_types::Symbol = func.name.as_str().into();
+    let mut entry: Option<PathState> = None;
     let mut out = Vec::new();
     for block in panic_blocks {
         let Terminator::Call { func: callee, args, span, .. } = &block.terminator else {
             continue;
         };
-        for path in acyclic_paths_to(&ctx, block.id) {
-            let Some(mut formula) = execute_path(&ctx, &path) else {
+        let paths = acyclic_paths_to(&ctx, block.id);
+        if paths.is_empty() {
+            continue;
+        }
+        let entry = entry.get_or_insert_with(|| entry_state(&ctx));
+        let message = super::v2_panic_call_vc_message(func, callee, args);
+        for path in paths {
+            let Some(mut formula) = execute_path(&ctx, entry, &path) else {
                 continue;
             };
             if !safe_preconditions.is_empty() {
@@ -1275,10 +1378,8 @@ pub fn generate_per_path_assert_refutation_vcs(func: &VerifiableFunction) -> Vec
                 formula = Formula::And(conjuncts);
             }
             let query = VerificationCondition {
-                kind: VcKind::Assertion {
-                    message: super::v2_panic_call_vc_message(func, callee, args),
-                },
-                function: func.name.clone().into(),
+                kind: VcKind::Assertion { message: message.clone() },
+                function: fn_sym,
                 location: span.clone(),
                 formula,
                 contract_metadata: None,
@@ -1307,7 +1408,6 @@ pub fn generate_per_path_assert_refutation_vcs_with_context(
 
 #[cfg(test)]
 mod tests {
-    use trust_types::fx::FxHashSet;
     use trust_types::{RefuteOnlyOutcome, Symbol, VerificationResult};
 
     use super::*;
@@ -1331,7 +1431,7 @@ mod tests {
     /// `assert!` is UNREACHABLE because the iteration is already `continue`d for
     /// the only value that could fail it:
     ///
-    /// ```ignore
+    /// ```ignore (illustrative)
     /// for &x in a { if x == 200 { continue; } assert!(x != 200); t ^= x; }
     /// ```
     ///
@@ -1359,10 +1459,11 @@ mod tests {
     }
 
     /// Solve one refute-only query with the same in-process ay backend the
-    /// compiler's refute lane uses.
+    /// compiler's refute lane uses, at the per-query clock `targo trust` gives
+    /// it (`Backstop::BUILTIN.vc_clock_ms()`, VCGEN-TEST-BACKSTOP-1).
     fn refute(vc: RefuteOnlyVc) -> RefuteOnlyOutcome {
         vc.refute_with(Symbol::intern("trust-perpath-refute"), |query| {
-            trust_router::Router::deterministic_in_process_ay(5_000)
+            crate::test_router::shipped_vc_clock_router()
                 .verify_all(std::slice::from_ref(query))
                 .into_iter()
                 .next()
@@ -1541,6 +1642,7 @@ mod tests {
                     is_foreign: false,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key("some::helper"),
                     unwind: trust_types::UnwindEdge::default(),
                 };
             }
@@ -1585,6 +1687,7 @@ mod tests {
             is_foreign,
             is_unsafe_sig,
             callee_identity,
+            callee_key,
             ..
         } = panic.terminator.clone()
         else {
@@ -1598,6 +1701,7 @@ mod tests {
             is_foreign,
             is_unsafe_sig,
             callee_identity,
+            callee_key,
         };
 
         let vcs = generate_per_path_assert_refutation_vcs(&func);
@@ -1628,7 +1732,7 @@ mod tests {
             }
             let _location = candidate.location().clone();
             let outcome = candidate.refute_with(Symbol::intern("trust-perpath-refute"), |query| {
-                trust_router::Router::deterministic_in_process_ay(5_000)
+                crate::test_router::shipped_vc_clock_router()
                     .verify_all(std::slice::from_ref(query))
                     .into_iter()
                     .next()
@@ -1963,7 +2067,7 @@ mod tests {
         let mut func = foreach_assert_fn();
         let option_ref_u16 = Ty::Adt {
             name: "core::option::Option".into(),
-            fields: Vec::new(),
+            fields: Vec::new().into(),
             variants: vec![
                 trust_types::VariantDef {
                     name: "None".into(),
@@ -1981,13 +2085,15 @@ mod tests {
                         },
                     )],
                 },
-            ],
+            ]
+            .into(),
             disc_index_safe: false,
             faithful_enum_repr: None,
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
             arbitrary_precision: None,
+            validity_wrapper: None,
         };
         retype_local(&mut func, 5, option_ref_u16);
         assert!(
@@ -2020,27 +2126,72 @@ mod tests {
                 }),
             },
         );
-        assert!(array_param_element_symbols(&func, 1).is_none());
+        assert!(array_param_model(&func, 1).is_none());
         assert!(generate_per_path_assert_refutation_vcs(&func).is_empty());
     }
 
-    /// The element symbols must never alias a source name. A local spelled
-    /// exactly like one of them declines the whole parameter rather than
-    /// merging two independent inputs onto one symbol.
+    /// The element symbols must never alias a source name. A READ whose minted
+    /// lane symbol is spelled exactly like a local drops the path rather than
+    /// merging two independent inputs onto one symbol. The only path of the
+    /// foreach fixture reads lane 0, so a collision on lane 0 drops it, and a
+    /// collision on a lane no path reads (lane 2) cannot alias anything: that
+    /// name never enters a formula.
     #[test]
-    fn element_symbol_collision_declines_the_parameter() {
-        let mut func = foreach_assert_fn();
-        assert!(array_param_element_symbols(&func, 1).is_some(), "baseline: modeled");
-        for decl in &mut func.body.locals {
-            if decl.index == 2 {
-                decl.name = Some(foreach_elem(2));
+    fn element_symbol_collision_drops_the_path_that_reads_it() {
+        let rename_local_2 = |name: String| {
+            let mut func = foreach_assert_fn();
+            for decl in &mut func.body.locals {
+                if decl.index == 2 {
+                    decl.name = Some(name.clone());
+                }
             }
-        }
+            func
+        };
+        let base = foreach_assert_fn();
+        assert!(array_param_model(&base, 1).is_some(), "baseline: modeled");
+        assert_eq!(generate_per_path_assert_refutation_vcs(&base).len(), 1, "baseline: one path");
         assert!(
-            array_param_element_symbols(&func, 1).is_none(),
-            "a colliding source name must decline the parameter"
+            generate_per_path_assert_refutation_vcs(&rename_local_2(foreach_elem(0))).is_empty(),
+            "a colliding name on the READ lane must drop the path"
         );
-        assert!(generate_per_path_assert_refutation_vcs(&func).is_empty());
+        assert_eq!(
+            generate_per_path_assert_refutation_vcs(&rename_local_2(foreach_elem(2))).len(),
+            1,
+            "a collision on an unread lane names nothing in the formula"
+        );
+    }
+
+    /// The model's size does not depend on the array's length: the same loop
+    /// over `&[u8; N]` builds the same query, node for node, at every `N` whose
+    /// first iteration is the refuted path (the retired element-wise model
+    /// minted all `N` symbols and was capped at 64). Small lengths past the old
+    /// cap on purpose: equal queries across them already show nothing grows per
+    /// lane, and a regression then fails as a cheap assertion.
+    #[test]
+    fn query_size_is_independent_of_the_array_length() {
+        let with_len = |len: u64| {
+            let mut func = foreach_assert_fn();
+            retype_local(
+                &mut func,
+                1,
+                Ty::Ref {
+                    mutable: false,
+                    inner: Box::new(Ty::Array {
+                        elem: Box::new(Ty::Int { width: 8, signed: false }),
+                        len,
+                    }),
+                },
+            );
+            let vcs = generate_per_path_assert_refutation_vcs(&func);
+            assert_eq!(vcs.len(), 1, "one refutable path at len {len}");
+            let formula = format!("{:?}", vcs[0]);
+            (formula.len(), formula.matches(std_iter::ELEM_VAR_PREFIX).count())
+        };
+        let four = with_len(4);
+        assert_eq!(with_len(65), four, "past the retired 64-lane cap");
+        assert_eq!(with_len(1024), four);
+        assert_eq!(with_len(4097), four);
+        assert!(four.1 > 0, "the refuted path reads a lane");
     }
 
     /// CONTRACT CONSUMPTION for an array parameter. A `#[trust::requires]` that
@@ -2082,7 +2233,7 @@ mod tests {
                 let _location = candidate.location().clone();
                 let outcome =
                     candidate.refute_with(Symbol::intern("trust-perpath-refute"), |query| {
-                        trust_router::Router::deterministic_in_process_ay(5_000)
+                        crate::test_router::shipped_vc_clock_router()
                             .verify_all(std::slice::from_ref(query))
                             .into_iter()
                             .next()

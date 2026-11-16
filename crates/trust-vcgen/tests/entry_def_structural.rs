@@ -19,6 +19,9 @@
 
 use trust_types::{VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 const MIR_PARAM_MOD_DIVISOR_GUARDED: &str = r##"{
   "name": "param_mod_divisor_guarded",
   "def_path": "w::param_mod_divisor_guarded",
@@ -6766,6 +6769,66 @@ const MIR_DEADENTRY_PRE: &str = r##"{"name":"deadentry_pre","def_path":"pre1::de
 /// One `(kind, verdict, kernel-certified)` row per VC, from the REAL in-process ay
 /// backend, on a big stack (VC generation and the solver search both overflow
 /// libtest's default stack).
+/// Like [`verdicts`], but keeps each row's source LINE, so two rows of the SAME
+/// `VcKind` can be told apart.
+///
+/// `deadentry_pre` emits two `IndexOutOfBounds` rows: `b[y]` at line 6, which is a
+/// genuine out-of-bounds read for every `y >= 4`, and `arr[k]` at line 8, where
+/// `k = a & 3` on a `[u8;4]` is provably in range. A guard that ranges over BOTH
+/// cannot say which one it is about, and once `ay` learned constant-index/bitmask
+/// reasoning the harmless row began to prove and took the guard down with it.
+fn verdicts_with_line(mir: &str) -> Vec<(VcKind, u32, VerificationResult, bool)> {
+    let func: VerifiableFunction =
+        serde_json::from_str(mir).expect("the captured MIR fixture must deserialize");
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let vcs = trust_vcgen::generate_vcs(&func);
+            let router = test_router::deterministic_test_router();
+            router
+                .verify_all(&vcs)
+                .into_iter()
+                .map(|(vc, r)| {
+                    let certified = trust_certify::certify_vc(&vc).is_some();
+                    let line = vc.location.line_start;
+                    (vc.kind, line, r, certified)
+                })
+                .collect::<Vec<_>>()
+        })
+        .expect("spawn solver thread")
+        .join()
+        .expect("solver thread must not panic")
+}
+
+/// The named row must REFUTE with a counterexample, and must not be certified.
+///
+/// STRICTER than asserting "no row of this kind proves": it names WHICH row the
+/// guard is about, so a sibling row becoming provable — a solver getting better at
+/// a genuinely safe index — can never silently disarm it.
+fn assert_row_at_line_refutes(mir: &str, want: fn(&VcKind) -> bool, line: u32, what: &str) {
+    let all = verdicts_with_line(mir);
+    let rows: Vec<_> = all.iter().filter(|(k, l, _, _)| want(k) && *l == line).collect();
+    assert!(!rows.is_empty(), "{what}: no row of that kind at line {line}; got {all:?}");
+    assert!(
+        rows.iter().all(|(_, _, r, _)| !is_proved(r)),
+        "{what}: the vacuous row at line {line} is PROVED again; got {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(_, _, r, _)| matches!(
+            r,
+            VerificationResult::Failed { counterexample: Some(_), .. }
+        )),
+        "{what}: the row at line {line} must be REFUTED with a counterexample, not merely \
+         undecided; got {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .filter(|(_, _, r, _)| matches!(r, VerificationResult::Failed { .. }))
+            .all(|(_, _, _, c)| !*c),
+        "{what}: a REFUTED row may not also be kernel-certified; got {rows:?}"
+    );
+}
+
 fn verdicts(mir: &str) -> Vec<(VcKind, VerificationResult, bool)> {
     let func: VerifiableFunction =
         serde_json::from_str(mir).expect("the captured MIR fixture must deserialize");
@@ -6773,7 +6836,7 @@ fn verdicts(mir: &str) -> Vec<(VcKind, VerificationResult, bool)> {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = test_router::deterministic_test_router();
             router
                 .verify_all(&vcs)
                 .into_iter()
@@ -6835,6 +6898,10 @@ fn assert_refutes(mir: &str, want: fn(&VcKind) -> bool, what: &str) {
 
 /// The honest DECLINE: nothing proves and nothing carries a counterexample. Distinct
 /// from [`assert_false_refutation`] on purpose — the two are different prices.
+///
+/// No row pays this price since 2026-11-07 (`u_mod` was the last, and was promoted);
+/// it stays for the next decline this file records.
+#[allow(dead_code)]
 fn assert_undecided(mir: &str, want: fn(&VcKind) -> bool, what: &str) {
     let rows = rows_of(mir, want);
     assert!(rows.iter().all(|(r, _)| !is_proved(r)), "{what}: still proves; got {rows:?}");
@@ -6849,6 +6916,10 @@ fn assert_undecided(mir: &str, want: fn(&VcKind) -> bool, what: &str) {
 /// A REFUTATION of a program the runtime oracle never panics on. The counterexample is
 /// spurious — it names a value of the parameter's ENTRY version that no execution
 /// reads. Recorded so that recovering the proof shows up as a failure to promote.
+///
+/// No row pays this price since 2026-09-29 (`u_flat` was the last, and was promoted);
+/// it stays for the next false refutation this file records.
+#[allow(dead_code)]
 fn assert_false_refutation(mir: &str, want: fn(&VcKind) -> bool, what: &str) {
     let rows = rows_of(mir, want);
     assert!(rows.iter().all(|(r, _)| !is_proved(r)), "{what}: still proves; got {rows:?}");
@@ -6978,7 +7049,18 @@ fn the_non_parameter_accumulator_still_proves() {
 /// of those inputs is a legal call.
 #[test]
 fn a_requires_contract_on_a_stored_parameter_still_refutes() {
-    assert_refutes(MIR_DEADENTRY_PRE, is_bounds, "deadentry_pre");
+    // Line 6 is `let t = b[y]` — out of bounds for every `y >= 4`, and `requires(k >= 10)`
+    // admits all of them (the runtime oracle panicked 128/256). THAT is the row this
+    // guard exists for, and it still refutes with the witness `y = 4`.
+    //
+    // RE-AIMED 2026-09-13. It used to assert that NO `is_bounds` row proves, which also
+    // covered `arr[k]` at line 8 — where `k = a & 3` on a `[u8;4]` is provably in range.
+    // When main advanced `ay` by 43 commits (constant-index/bitmask reasoning) that
+    // harmless row began to prove, correctly, and failed this test. Naming the row makes
+    // the guard STRICTER, not weaker: a sibling becoming provable can no longer disarm it,
+    // and a regression on `b[y]` is still caught. Verified pre-existing by A/B against the
+    // merge base, so this is main's to re-aim, not any one branch's.
+    assert_row_at_line_refutes(MIR_DEADENTRY_PRE, is_bounds, 6, "deadentry_pre b[y]");
 }
 
 // ── THE PRICE, MEASURED ────────────────────────────────────────────────────
@@ -7001,34 +7083,102 @@ fn a_requires_contract_on_a_stored_parameter_still_refutes() {
 
 /// `pub fn u_mod(mut k: usize, a: usize, arr: &[u8;4]) -> u8 { k = a % 4; arr[k] }`
 /// Runtime oracle: 0/96 panicked (k x a in 0..16).
-/// LOST TO A DECLINE: the `IndexOutOfBounds` row is `Unknown`. ay reached a model and
-/// its own soundness gate rejected it as invalid, so the row fails closed rather than
-/// refuting; either way it no longer proves.
+///
+/// KEPT, as of 2026-11-07 — renamed from `..._loses_its_modulo_bound`, the move
+/// `u_mask` made on 2026-09-13. `a % 4` is in `0..=3` and the array has 4 elements,
+/// so proving this index is the CORRECT answer; the old `assert_undecided` pinned a
+/// solver limitation. It was recorded as a DECLINE: ay found the refutation of
+/// `k#s1_0 = Rem(a, 4) ∧ _5 = k#s1_0 ∧ _5 >= 4` and then rejected its own proof
+/// (`unknown: (incomplete self-check-rejected) (1 conflicts)
+/// [stop-item:unverified-trust-rule]`). Trust `0322559adc` ("Advance the public AY
+/// IR CG Clean and MC development inputs", `first-party/ay` `40eb461a07` ->
+/// `d9d1bbb64a`) moved ay past the commit that checks the remainder step, ay
+/// `9695abae1` ("Check complete small remainder cases on the exact source"; see
+/// `param_entry_gate.rs`, `param_modulo_bound_still_refutes`, for the sites and the
+/// revert measurement), and the row is now `Proved` and kernel-certified. It is
+/// proved from the def-site definition of `k`, not from a fact keyed on the bare
+/// parameter, so the entry-def budget this section measures is not what changed.
 #[test]
-fn an_unconditionally_stored_parameter_loses_its_modulo_bound() {
-    assert_undecided(MIR_U_MOD, is_bounds, "u_mod");
+fn an_unconditionally_stored_parameter_keeps_its_modulo_bound() {
+    let rows = rows_of(MIR_U_MOD, is_bounds);
+    assert!(
+        rows.iter().all(|(r, certified)| is_proved(r) && *certified),
+        "u_mod: `a % 4` indexes a [u8;4] in range — this row must PROVE and \
+         kernel-certify; got {rows:?}"
+    );
+    assert_all_proved_and_certified(MIR_U_MOD, "u_mod");
 }
 
 /// `pub fn u_mask(mut k: usize, a: usize, arr: &[u8;4]) -> u8 { k = a & 3; arr[k] }`
 /// Runtime oracle: 0/96 panicked (k x a in 0..16).
-/// LOST TO A DECLINE, same shape as the modulo twin.
+///
+/// KEPT, as of 2026-09-13 — and the rename is the point. `a & 3` is in `0..=3` and the
+/// array has 4 elements, so this index is genuinely in range: proving it is the CORRECT
+/// answer, and the old `assert_undecided` pinned a SOLVER LIMITATION rather than a
+/// safety property. Main advanced `ay` by 43 commits (constant-index/bitmask reasoning)
+/// and the limitation lifted. The modulo twin `u_mod` still declined then (recovered
+/// 2026-11-07 by a different ay change), so the gain was specific rather than a blanket
+/// strengthening. A test that pins an incapacity fails the
+/// day the compiler improves; this one now asserts the fact instead.
+///
+/// ROOT-CAUSED 2026-09-19, after two rounds had recorded it only as "a red row
+/// attributed to an ay incompleteness on bitmask bounds". It is one, and it is
+/// SPECIFIC. `trust_vcgen` renders the masked definition as
+/// `Eq(k#s0_0, BvToInt(BvAnd(IntToBv(a, 64), IntToBv(3, 64)), 64, false))`, and ay's
+/// `TermStore::mk_bv2nat` rewrites that exact masked residue to `(mod a 4)` AT
+/// INTERNING TIME — so the query reaches the executor with NO BITVECTOR IN IT and an
+/// Int `mod`. `native_lane_logic` names the query `QF_UFBVLIA`, one of ay's
+/// fail-closed combined logics, whose closed admission predicate listed
+/// `has_int_div_mod` as unconditionally out of slice; the residue therefore forced
+/// `LogicCategory::Other` and a fail-closed `unknown (incomplete)`. Admission was
+/// NON-MONOTONE in the declared logic name: the same three assertions under
+/// `QF_LIA` answered `unsat`.
+///
+/// Fixed in ay at `712f6b203` ("admission was non-monotone in the declared logic
+/// name"), which fences `has_int_div_mod` only while a bitvector is actually live.
+///
+/// NOT A PRODUCT DEFECT AT THE COMPILER SURFACE — measured, not assumed. The
+/// deployed stage1 compiler proves and kernel-certifies this program today:
+/// `trustc --edition 2021 --crate-type lib -Ztrust-policy=certify` on
+/// `pub fn u_mask(mut k: usize, a: usize, arr: &[u8; 4]) -> u8 { k = a & 3; arr[k] }`
+/// reports "1 proved, 0 failed ... out of 1", "of which 1 kernel-certified". The
+/// loss is confined to `Router::deterministic_in_process_ay`, the single-backend
+/// seam router this test uses, which is strictly weaker than the compiler's
+/// deployed set.
 #[test]
-fn an_unconditionally_stored_parameter_loses_its_bitmask_bound() {
-    assert_undecided(MIR_U_MASK, is_bounds, "u_mask");
+fn an_unconditionally_stored_parameter_keeps_its_bitmask_bound() {
+    let rows = rows_of(MIR_U_MASK, is_bounds);
+    assert!(
+        rows.iter().all(|(r, _)| is_proved(r)),
+        "u_mask: `a & 3` indexes a [u8;4] in range — this row must PROVE; got {rows:?}"
+    );
 }
 
 /// `pub fn u_div(mut k: usize, arr: &[u8;4]) -> u8 { k = 4 / 2; arr[k] }`
 /// Runtime oracle: 0/6 panicked (k).
-/// KEPT AS A PROOF, LOST AS A CERTIFICATE: the row still proves, and the clean-kernel
-/// re-check no longer certifies it.
+///
+/// KEPT WHOLE as of 2026-09-19 — proof AND kernel certificate. It had been "kept as a
+/// proof, lost as a certificate": the row proved, and the clean-kernel re-check no
+/// longer certified it, which this test pinned as part of the measured price with a
+/// note that recovering it was an improvement to promote rather than absorb.
+///
+/// PROMOTED, and the mechanism is specific. `k = 4 / 2` is a CLOSED CONSTANT
+/// EXPRESSION, so `guards::extract_block_definitions_until_impl` now defines `k` to
+/// the literal `2` the machine computes (the negation-lane spelling fix) instead of
+/// rendering a division whose operands the certificate lane then has to re-derive.
+/// The bound `k < 4` on a `[u8; 4]` follows from `k == 2` by evaluation, which is what
+/// the kernel re-check can carry. The price note's other rows are untouched: a
+/// reassignment with a VARIABLE in it (`k = a % 4`, `k = a & 3`) folds to nothing and
+/// still pays.
 #[test]
-fn an_unconditionally_stored_parameter_keeps_its_division_proof_without_the_certificate() {
+fn an_unconditionally_stored_parameter_keeps_its_division_proof_and_certificate() {
     let rows = rows_of(MIR_U_DIV, is_bounds);
     assert!(rows.iter().all(|(r, _)| is_proved(r)), "u_div must still prove; got {rows:?}");
     assert!(
-        rows.iter().all(|(_, certified)| !certified),
-        "u_div's kernel certificate is part of the measured price; recovering it is an \
-         improvement to promote, not to absorb silently. Got {rows:?}"
+        rows.iter().all(|(_, certified)| *certified),
+        "u_div's kernel certificate came back with the closed-constant definition of \
+         `k`; losing it again is a precision regression, not a neutral change. Got \
+         {rows:?}"
     );
 }
 
@@ -7041,11 +7191,29 @@ fn an_unconditionally_stored_parameter_keeps_its_division_proof_without_the_cert
 /// `Proved` and kernel-certified, because the fact reaches the row under a def-site
 /// version instead of the two-valued bare `k`. `assert_false_refutation` exists to make
 /// exactly this show up as a failure to promote, so it is promoted here rather than
-/// absorbed; `an_unconditionally_stored_parameter_loses_its_modulo_bound` and its
-/// bitmask twin are the rows that still pay.
+/// absorbed. Its modulo and bitmask twins were recovered later
+/// (`an_unconditionally_stored_parameter_keeps_its_modulo_bound`,
+/// `an_unconditionally_stored_parameter_keeps_its_bitmask_bound`).
+///
+/// Since 2026-10-02 the literal `a.clamp(0, 3)` also mints its DECIDED `Ord::clamp: min >
+/// max` row (KNOWN_HAZARDS "`certify` exits 0 on a literal `clamp`"); before, it minted
+/// nothing. That row must PROVE; it is not kernel-certified because an `Assertion` row is
+/// refused kernel authority by kind (`VcKind::kernel_authority_refusal`), exactly as the
+/// guarded `clamp` row already was. Every other row keeps the proof AND the certificate.
 #[test]
 fn an_unconditionally_stored_parameter_falsely_refutes_its_cast_bound() {
-    assert_all_proved_and_certified(MIR_U_CLAMPCAST, "u_clampcast");
+    let mut saw_clamp_row = false;
+    for (kind, verdict, certified) in verdicts(MIR_U_CLAMPCAST) {
+        let decided_clamp = matches!(&kind,
+            VcKind::Assertion { message } if message == "Ord::clamp: min > max");
+        saw_clamp_row |= decided_clamp;
+        assert!(is_proved(&verdict), "u_clampcast: {kind:?} got {verdict:?}");
+        assert!(
+            certified || decided_clamp,
+            "u_clampcast: {kind:?} lost its certificate: {verdict:?}"
+        );
+    }
+    assert!(saw_clamp_row, "u_clampcast: the literal clamp must mint its decided row");
 }
 
 /// `pub fn u_enumtag(mut k: usize, e: E, arr: &[u8;4]) -> u8 { k = e as usize; arr[k] }`
@@ -7061,18 +7229,24 @@ fn an_unconditionally_stored_parameter_keeps_its_enum_tag_bound() {
 /// `pub fn u_flat(mut i: usize, g: &[u8;6]) -> u8 { let mut s = 0u8;
 ///      for y in 0..2 { for x in 0..3 { i = y*3+x; s = s.wrapping_add(g[i]); } } s }`
 /// Runtime oracle: 0/6 panicked (i).
-/// FALSE REFUTATION on the `IndexOutOfBounds` row. The two overflow rows and the
-/// `Unreachable` row still prove and stay certified — `flat_index_merge_keeps_the_mul_
-/// result_proof` is the control that says the loss is confined to the index fact.
+/// RECOVERED 2026-09-29. This row was recorded as a FALSE REFUTATION on the
+/// `IndexOutOfBounds` row: the loop payloads' yield facts `0 <= y < 2` and `0 <= x < 3`
+/// reached only blocks that name `y` or `x`, not the block computing `y*3+x` through
+/// its checked temps. They now also reach blocks naming a single-assignment local
+/// computed from a payload (`iterator_yield::locals_derived_from`), so the row is
+/// `Proved` and kernel-certified. Measured: without that change this row still
+/// refutes. `assert_false_refutation` exists to make exactly this show up as a failure
+/// to promote, so it is promoted here rather than absorbed.
 #[test]
 fn a_loop_body_stored_parameter_falsely_refutes_its_flattened_index_bound() {
-    assert_false_refutation(MIR_U_FLAT, is_bounds, "u_flat");
+    assert_all_proved_and_certified(MIR_U_FLAT, "u_flat");
 }
 
 /// The `[overflow:mul]` / `[overflow:add]` control for `u_flat`: the mul and add
 /// results are BODY TEMPS, so their proofs must survive the PARAMETER budget
-/// untouched — which they do; the parameter budget never reached them, and this row is
-/// what says the loss above is confined to the index fact.
+/// untouched — which they do; the parameter budget never reached them. (This row
+/// said the loss above was confined to the index fact; since 2026-09-29 there is no
+/// loss above.)
 #[test]
 fn flat_index_merge_keeps_the_mul_result_proof() {
     for (kind, verdict, certified) in verdicts(MIR_U_FLAT) {
@@ -7158,7 +7332,7 @@ fn located_rows(mir: &str, want: fn(&VcKind) -> bool) -> Vec<(u32, u32, Verifica
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let vcs = trust_vcgen::generate_vcs(&func);
-            let router = trust_router::Router::deterministic_in_process_ay(30_000);
+            let router = test_router::deterministic_test_router();
             router
                 .verify_all(&vcs)
                 .into_iter()

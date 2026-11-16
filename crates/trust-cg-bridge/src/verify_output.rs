@@ -49,7 +49,7 @@ use trust_types::{
     Statement, Terminator, Ty, UnOp, VerifiableFunction,
 };
 
-use crate::codegen_backend::{TrustCgCodegenBackend, TrustCgTargetArch};
+use crate::codegen_backend::{FunctionLinkage, TrustCgCodegenBackend, TrustCgTargetArch};
 
 // ===========================================================================
 // PUBLIC GATE API
@@ -196,7 +196,7 @@ pub enum ProvenEvidence {
     /// SUCCEEDS with empty axiom closure. The `theorem` field records the discharging
     /// lemma/label.
     ///
-    /// TWO discharge mechanisms carry this grade with DIFFERENT kernel work (the `theorem`
+    /// Three discharge mechanisms carry this grade with DIFFERENT kernel work (the `theorem`
     /// label distinguishes them — do NOT read them as equivalent):
     ///   (a) SEMANTIC re-derivation — `reflect_formula` into `Clean.BVC.BvF` + a
     ///       `bvfEval`-headed congruence (`bvf_*_cong`) or a NAMED bridge theorem
@@ -207,7 +207,7 @@ pub enum ProvenEvidence {
     ///       semantic relation. Unsigned rem takes this path (rem is DEFINED as its
     ///       composite, so refl is the ceiling — the inner udiv's correctness is div's).
     ///
-    /// In BOTH paths the per-operand identity IS kernel-forced (divergent operands key to
+    /// In the first two paths the per-operand identity IS kernel-forced (divergent operands key to
     /// distinct opaque bit-lists -> `check_type` REJECTS). HONEST RESIDUAL (shared by all
     /// value discharges; larger for (b), which is refl-only): the readout/coercion WRAPPER
     /// faithfulness is MATCHER-trusted (the `div_peel_to_ite`/`rem_to_val` wrapper strip +
@@ -216,13 +216,83 @@ pub enum ProvenEvidence {
     /// already-ay-proven obligation, never fabricate a [PROVED]. So "ay out of the TCB" holds
     /// for the kernel-verified RELATION, but the wrapper/reconstruction step is ay-backed, not
     /// ay-free. This is the FAST path: O(1) instantiation, no per-instance SAT reflection.
+    ///   (c) ORIGINAL MIXED CONJUNCTION — the bounded typed scalar/byte-memory
+    ///       reflector retains every original term and combines actual equality
+    ///       proofs by And.intro. One kernel check accepts the whole goal; no AY
+    ///       premise or per-item verdict composes this proof. The label binds
+    ///       ordered input, unreduced goal and proof SHA256. Its Rust Formula-to-CIC
+    ///       translation remains trusted; execution coverage/freshness/frame
+    ///       authority must be supplied separately by the consumer.
     KernelInstantiated {
         /// The clean lemma(s) the discharge rests on (for the report / audit).
         theorem: String,
+        /// Present only for the original conjunction path; never reconstructed from a label.
+        original: Option<std::sync::Arc<crate::original_conjunction_certificate::CheckedOriginalConjunction>>,
+    },
+    /// **[PROVED] with kernel-proved MODELING CONDITIONS:** the value equality
+    /// carries its own kernel evidence (`value`) AND every modeling condition the
+    /// value proof rests on was kernel-proved as the unconditional 1-bit equality
+    /// `ite(condition, 1, 0) == 1`, in obligation order. Built only by
+    /// [`ProvenEvidence::with_side_conditions`], which refuses any part that is
+    /// not kernel evidence (a wide multiply's `StructuralCitation` among them), so
+    /// the wrapper never reads as kernel-proved over a part the kernel did not
+    /// check.
+    ///
+    /// Two producers. The trust-ir value lane: a spec-side condition the gate
+    /// needed to render the IR faithfully (a narrow shift's `amount < width`).
+    /// The call-event gate's closed-branch retry (`call_event/closed_branch.rs`,
+    /// DECISION_QUEUE AGG-SSA-2): the condition of each ground-condition `Ite`
+    /// (on either side of a conjunction item) that the value proof replaced by
+    /// the arm the condition selects, and each instance `rewritten == original`
+    /// of the two identities that retry applies afterwards (`x - 0` is `x`,
+    /// `ite(p, 1, 0) != 0` is `p`).
+    ///
+    /// Without the conditions the value proof would be about the gate's own
+    /// mod-width shift convention, which trust-ir leaves undefined out of range,
+    /// or about the folded and rewritten goal rather than the original one, so
+    /// they are load-bearing: one that lacks kernel evidence leaves the function
+    /// [VALIDATED], exactly as before this variant existed.
+    KernelRecheckableWithSideConditions {
+        /// Kernel evidence for `machine_value == spec_value`.
+        value: Box<ProvenEvidence>,
+        /// Kernel evidence for each modeling condition, one per condition.
+        side_conditions: Vec<ProvenEvidence>,
     },
 }
 
 impl ProvenEvidence {
+    /// True iff the Clean kernel checked this evidence: a bit-blast certificate
+    /// (one, or the two halves of a register pair), an O(1) instantiation, or a
+    /// side-conditioned proof every part of which is itself kernel evidence.
+    #[must_use]
+    pub fn is_kernel(&self) -> bool {
+        match self {
+            ProvenEvidence::KernelRecheckable(_)
+            | ProvenEvidence::KernelRecheckablePair { .. }
+            | ProvenEvidence::KernelInstantiated { .. } => true,
+            ProvenEvidence::KernelRecheckableWithSideConditions { value, side_conditions } => {
+                value.is_kernel() && side_conditions.iter().all(ProvenEvidence::is_kernel)
+            }
+            ProvenEvidence::StructuralCitation { .. } | ProvenEvidence::AyValidated => false,
+        }
+    }
+
+    /// The only constructor of
+    /// [`ProvenEvidence::KernelRecheckableWithSideConditions`]: `None` unless
+    /// the value and every side condition are kernel evidence.
+    #[must_use]
+    pub(crate) fn with_side_conditions(
+        value: ProvenEvidence,
+        side_conditions: Vec<ProvenEvidence>,
+    ) -> Option<ProvenEvidence> {
+        (value.is_kernel() && side_conditions.iter().all(ProvenEvidence::is_kernel)).then(|| {
+            ProvenEvidence::KernelRecheckableWithSideConditions {
+                value: Box::new(value),
+                side_conditions,
+            }
+        })
+    }
+
     /// The typed §7 [`GradeRecord`] this evidence CARRIES, if the R-U grade
     /// migration has threaded one through this variant.
     ///
@@ -295,6 +365,18 @@ impl OutputVerdict {
             OutputVerdict::Proven {
                 evidence: ProvenEvidence::KernelRecheckablePair { high, low },
             } => vec![high.as_ref(), low.as_ref()],
+            OutputVerdict::Proven {
+                evidence: ProvenEvidence::KernelRecheckableWithSideConditions { value, side_conditions },
+            } => std::iter::once(value.as_ref())
+                .chain(side_conditions)
+                .flat_map(|part| match part {
+                    ProvenEvidence::KernelRecheckable(p) => vec![p],
+                    ProvenEvidence::KernelRecheckablePair { high, low } => {
+                        vec![high.as_ref(), low.as_ref()]
+                    }
+                    _ => Vec::new(),
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -302,19 +384,14 @@ impl OutputVerdict {
     /// True iff this verdict is **[PROVED]** by the clean KERNEL — the slow
     /// SAT-reflection path (`KernelRecheckable`), the 128-bit register-pair form
     /// of that same path (`KernelRecheckablePair`, two kernel-accepted halves),
-    /// or the O(1) structured instantiation path (`KernelInstantiated`). This is
-    /// the [PROVED]-vs-[VALIDATED] discriminator (ay is not the authority for any
-    /// kernel grade).
+    /// the O(1) structured instantiation path (`KernelInstantiated`), or a
+    /// side-conditioned proof (`KernelRecheckableWithSideConditions`) every part
+    /// of which is one of these: the answer is [`ProvenEvidence::is_kernel`]. This
+    /// is the [PROVED]-vs-[VALIDATED] discriminator (ay is not the authority for
+    /// any kernel grade).
     #[must_use]
     pub fn is_kernel_proved(&self) -> bool {
-        matches!(
-            self,
-            OutputVerdict::Proven {
-                evidence: ProvenEvidence::KernelRecheckable(_)
-                    | ProvenEvidence::KernelRecheckablePair { .. }
-                    | ProvenEvidence::KernelInstantiated { .. }
-            }
-        )
+        matches!(self, OutputVerdict::Proven { evidence } if evidence.is_kernel())
     }
 }
 
@@ -354,15 +431,15 @@ pub fn verify_output_preserved_with_backend(
 
 /// Trust (RUNG 2 — shipped == verified): the capturing core of
 /// [`verify_output_preserved`]. Returns the verdict AND the FULL object bytes of
-/// the single emission the verdict was computed over (when emission succeeded).
+/// the single emission the verdict was computed over (when its target header is valid).
 ///
 /// The build gate ([`emit_objects_verified`]) SHIPS exactly these returned bytes
 /// — there is no second emission for a gated function, so the bytes the gate
-/// VERIFIED are byte-for-byte the bytes that ship. `bytes` is `Some` whenever the
-/// emission step succeeded (covering both `Proven` and an emittable `Unknown`),
-/// and `None` only when emission/lowering itself failed (so there is nothing to
-/// ship). This makes the verified-bytes the single source of truth for the
-/// artifact, closing the emit-time TOCTOU by construction.
+/// VERIFIED are byte-for-byte the bytes that ship. `bytes` is `Some` after a
+/// successful target-matched emission (covering both `Proven` and an emittable
+/// `Unknown`), and `None` on emission/lowering or object-header failure. This
+/// makes the verified-bytes the single source of truth for the artifact,
+/// closing the emit-time TOCTOU by construction.
 fn verify_output_preserved_capturing_with_backend(
     func: &VerifiableFunction,
     backend: &TrustCgCodegenBackend,
@@ -409,6 +486,16 @@ fn verify_output_preserved_capturing_env_with_backend(
         Ok(obj) => obj,
         Err(reason) => return (OutputVerdict::Unknown { reason }, None),
     };
+    // A foreign or malformed object is not an AllowUnknown artifact.
+    if let Err(reason) = backend.require_object_target(&obj) {
+        return (OutputVerdict::Unknown { reason }, None);
+    }
+    if let Err(reason) = require_exact_elf_function_bindings(
+        &obj,
+        &[(func.name.as_str(), FunctionLinkage::External)],
+    ) {
+        return (OutputVerdict::Unknown { reason }, None);
+    }
 
     // (1) intended semantics — Err => Unknown (unsupported shape), while
     // retaining the already-emitted bytes for AllowUnknown.
@@ -430,15 +517,24 @@ fn verify_output_preserved_capturing_env_with_backend(
     // (2)+(3) byte-derived machine output from that SAME emission. Decoder or
     // semantic-execution failure is Unknown, but the bytes remain shippable
     // under AllowUnknown and visibly count as uncertified.
-    let machine_out =
-        match decode_emitted_object_env(func, &obj, out_width, env, backend.target_arch()) {
-            Ok(f) => f,
+    let (machine_out, abi_residue) =
+        match decode_emitted_object_env(func, &obj, out_width, env, backend) {
+            Ok(decoded) => decoded,
             Err(reason) => return (OutputVerdict::Unknown { reason }, Some(obj)),
         };
     let captured = Some(obj);
 
+    // (3b) O0 — the ABI guarantee the caller relies on. A refutation is a
+    // miscompile whatever the value obligation says, so it ends the gate here.
+    // `pre` (the divisor-nonzero assumption) deliberately does NOT condition it:
+    // the bytes owe their caller the callee-saved state on every input.
+    let abi = discharge_abi_guarantee(&func.name, &abi_residue, &[]);
+    if let AbiDischarge::Verdict(refuted @ OutputVerdict::Refuted { .. }) = abi {
+        return (refuted, None);
+    }
+
     // (4) discharge equality.
-    let verdict = match discharge_equal_pre(&machine_out, &auto, pre.as_ref()) {
+    let value_verdict = match discharge_equal_pre(&machine_out, &auto, pre.as_ref()) {
         Discharge::Proven => OutputVerdict::Proven {
             // [PROVED] PROMOTION: ay said UNSAT. Try to lower BOTH sides of the
             // obligation into the self-contained `BvExpr` add-leaf fragment and
@@ -448,8 +544,17 @@ fn verify_output_preserved_capturing_env_with_backend(
             // outside the fragment, width mismatch, no surfaceable refutation,
             // proof fails to validate) falls back to [VALIDATED] (ay-only).
             // NEVER [PROVED] without a validating proof.
-            evidence: try_kernel_recheckable_proof(&machine_out, &auto, pre.as_ref())
-                .unwrap_or(ProvenEvidence::AyValidated),
+            //
+            // O0 discharged by ay rather than structurally caps the WHOLE
+            // function at [VALIDATED]: the kernel certificate covers the value
+            // equation only, so attaching it would claim kernel authority for
+            // the ABI conjuncts too.
+            evidence: if matches!(abi, AbiDischarge::Structural) {
+                try_kernel_recheckable_proof(&machine_out, &auto, pre.as_ref())
+                    .unwrap_or(ProvenEvidence::AyValidated)
+            } else {
+                ProvenEvidence::AyValidated
+            },
         },
         Discharge::CounterExample => OutputVerdict::Refuted {
             detail: format!(
@@ -459,6 +564,13 @@ fn verify_output_preserved_capturing_env_with_backend(
             ),
         },
         Discharge::Unknown(reason) => OutputVerdict::Unknown { reason },
+    };
+    // A value refutation stands; otherwise an undecided O0 makes the function
+    // undecided, never Proven.
+    let verdict = match (abi, value_verdict) {
+        (_, refuted @ OutputVerdict::Refuted { .. }) => refuted,
+        (AbiDischarge::Verdict(undecided), _) => undecided,
+        (_, verdict) => verdict,
     };
 
     // Trust (RUNG 2): carry the verified bytes for an emittable verdict so the
@@ -475,7 +587,13 @@ fn verify_output_preserved_capturing_env_with_backend(
 /// both sides into the self-contained `BvExpr` add-leaf fragment and exporting a
 /// zero-trust bit-blast certificate.
 ///
-/// Returns `Some(ProvenEvidence::KernelRecheckable(proof))` ONLY when:
+/// Conditional division first attempts a bounded kernel theorem whose premise
+/// is reflected from the exact supplied 32-bit nonzero predicate; unrelated
+/// assumptions cannot borrow that theorem. The separate remainder path proves
+/// an unconditional reconstructed equality. Their existing outer-wrapper
+/// reflection limitation remains disclosed by `KernelInstantiated`.
+///
+/// The bit-blast path returns `Some(ProvenEvidence::KernelRecheckable(proof))` ONLY when:
 ///   * there is NO precondition — `export_bv_blast_proof_expr` proves
 ///     UNCONDITIONAL equality, so a conditional obligation (e.g. divisor != 0)
 ///     would be a different, weaker claim; we fall back to [VALIDATED] there;
@@ -508,10 +626,12 @@ pub(crate) fn try_kernel_recheckable_proof(
     if pre.is_some() {
         #[cfg(feature = "kernel-recheck")]
         {
-            if let Some(theorem) =
-                crate::verify_output_instantiate::try_div_conditional_discharge(machine_out, auto)
-            {
-                return Some(ProvenEvidence::KernelInstantiated { theorem });
+            if let Some(theorem) = crate::verify_output_instantiate::try_div_conditional_discharge(
+                machine_out,
+                auto,
+                pre?,
+            ) {
+                return Some(ProvenEvidence::KernelInstantiated { theorem, original: None });
             }
             // REM: machine and auto are the identical a-(a/b)*b composite (modulo wrappers);
             // reconstruct both and discharge by reflexivity (operand-tied). Unconditional, so
@@ -519,7 +639,7 @@ pub(crate) fn try_kernel_recheckable_proof(
             if let Some(theorem) =
                 crate::verify_output_instantiate::try_rem_conditional_discharge(machine_out, auto)
             {
-                return Some(ProvenEvidence::KernelInstantiated { theorem });
+                return Some(ProvenEvidence::KernelInstantiated { theorem, original: None });
             }
         }
         return None;
@@ -543,12 +663,14 @@ pub(crate) fn try_kernel_recheckable_proof(
         if let Some(theorem) =
             crate::verify_output_instantiate::try_mem_store_load_discharge(machine_out, auto)
         {
-            return Some(ProvenEvidence::KernelInstantiated { theorem });
+            return Some(ProvenEvidence::KernelInstantiated { theorem, original: None });
         }
-        if let Some(theorem) =
-            crate::verify_output_instantiate::try_o1_instantiation_discharge(machine_out, auto)
+        if !crate::verify_output_instantiate::formula_contains_select(machine_out)
+            && !crate::verify_output_instantiate::formula_contains_select(auto)
+            && let Some(theorem) =
+                crate::verify_output_instantiate::try_o1_instantiation_discharge(machine_out, auto)
         {
-            return Some(ProvenEvidence::KernelInstantiated { theorem });
+            return Some(ProvenEvidence::KernelInstantiated { theorem, original: None });
         }
         // else: fall through to the slow path (no early return).
     }
@@ -587,6 +709,87 @@ pub(crate) fn try_kernel_recheckable_proof(
         }
     }
     None
+}
+
+/// Trust (increment 5, step 5.2): the CONJUNCTION FORM of the [PROVED] route,
+/// for the call-event gate (`call_event`).
+///
+/// The call-event obligation of one function is a conjunction of
+/// UNCONDITIONAL (ITE-merged) bit-vector equations `lhs_i == rhs_i` — O0's
+/// residue, O3's reach and argument equalities, O4's return equality — with no
+/// uninterpreted function and no world token. That is the form AY 0.27.0
+/// certifies (design fact V2; trust-cg LIMITATIONS.md): "the conjunction of
+/// the per-item equations against `true`". Exactly that is exported here as
+/// ONE certificate, `And_i Eq(lhs_i, rhs_i) == 1`, through the identical
+/// export / validation / frontier / clean-kernel route every other [PROVED]
+/// grade takes. A 128-bit item is split at bit 64 first (exact; see
+/// [`split_register_pair_128`]).
+///
+/// One item is the plain equation and takes [`try_kernel_recheckable_proof`]
+/// unchanged (its O(1) instantiation paths included). `None` on any failure:
+/// an item outside the `BvExpr` fragment, a width mismatch, a multiply past
+/// the re-checkable width, an over-frontier refutation, or a kernel decline —
+/// the caller then grades [VALIDATED]. Never [PROVED] without the kernel's
+/// `KernelAccepted`.
+#[cfg(feature = "ay-proofs")]
+pub(crate) fn try_kernel_recheckable_conjunction(
+    items: &[(Formula, Formula)],
+) -> Option<ProvenEvidence> {
+    use ay_proof::BvExpr;
+    let mut split: Vec<(Formula, Formula)> = Vec::with_capacity(items.len());
+    for (l, r) in items {
+        match (split_register_pair_128(l), split_register_pair_128(r)) {
+            (Some((lh, ll)), Some((rh, rl))) => {
+                split.push((lh, rh));
+                split.push((ll, rl));
+            }
+            _ => split.push((l.clone(), r.clone())),
+        }
+    }
+    match split.as_slice() {
+        [] => None,
+        [(l, r)] if items.len() == 1 => try_kernel_recheckable_proof(l, r, None),
+        _ => {
+            let mut acc: Option<BvExpr> = None;
+            for (l, r) in &split {
+                let le = formula_to_bvexpr(l).ok()?;
+                let re = formula_to_bvexpr(r).ok()?;
+                let (Some(lw), Some(rw)) = (bvexpr_width(&le), bvexpr_width(&re)) else {
+                    return None;
+                };
+                if lw != rw
+                    || mul_wider_than(&le, MAX_RECHECKABLE_MUL_WIDTH)
+                    || mul_wider_than(&re, MAX_RECHECKABLE_MUL_WIDTH)
+                {
+                    return None;
+                }
+                let eq = BvExpr::eq(le, re);
+                acc = Some(match acc {
+                    None => eq,
+                    Some(a) => BvExpr::and(a, eq),
+                });
+            }
+            kernel_recheckable_bitblast_exprs(acc?, BvExpr::const_val(1, 1))
+                .map(ProvenEvidence::KernelRecheckable)
+        }
+    }
+}
+
+/// Independently check one conjunction of exact original scalar/byte-memory
+/// equations. Unsupported or false members decline the whole proof. The checked
+/// goal/proof and ordered original inputs are SHA256-bound in the evidence.
+/// This grants no execution coverage, query freshness or memory-frame premise.
+#[cfg(feature = "ay-proofs")]
+pub(crate) fn try_kernel_recheckable_original_conjunction(
+    items: &[(Formula, Formula)],
+) -> Option<ProvenEvidence> {
+    #[cfg(feature = "kernel-recheck")]
+    { crate::verify_output_instantiate::try_original_conjunction_discharge(items)
+        .map(|checked| ProvenEvidence::KernelInstantiated {
+            theorem: checked.label().to_string(), original: Some(std::sync::Arc::new(checked)),
+        }) }
+    #[cfg(not(feature = "kernel-recheck"))]
+    { let _ = items; None }
 }
 
 /// The ONLY constructor of [`ProvenEvidence::StructuralCitation`] — the mint
@@ -637,8 +840,10 @@ fn kernel_recheckable_bitblast(
     machine_out: &Formula,
     auto: &Formula,
 ) -> Option<ay_proof::BvBlastProof> {
-    // TEMPORARY MEASUREMENT INSTRUMENTATION (not for commit): TRUST_GATE_TRACE=1
-    // reports exactly which stage of the [PROVED] route declines.
+    // DIAGNOSTIC TRACE: with `TRUST_GATE_TRACE` set (to any value), every
+    // decline below also prints to stderr which stage of the [PROVED] route
+    // declined. The variable only adds `eprintln!` output; it never changes a
+    // return value, so it cannot change the grade this function awards.
     let trace = std::env::var_os("TRUST_GATE_TRACE").is_some();
     let lhs = match formula_to_bvexpr(machine_out) {
         Ok(v) => v,
@@ -661,6 +866,19 @@ fn kernel_recheckable_bitblast(
     if trace {
         eprintln!("[trace] both sides lowered to BvExpr OK");
     }
+    kernel_recheckable_bitblast_exprs(lhs, rhs)
+}
+
+/// The export / producer-validation / frontier / clean-kernel half of
+/// [`kernel_recheckable_bitblast`], over already-lowered `BvExpr` sides.
+/// Factored out UNCHANGED so the call-event gate's conjunction form
+/// ([`try_kernel_recheckable_conjunction`]) takes the identical route.
+#[cfg(feature = "ay-proofs")]
+fn kernel_recheckable_bitblast_exprs(
+    lhs: ay_proof::BvExpr,
+    rhs: ay_proof::BvExpr,
+) -> Option<ay_proof::BvBlastProof> {
+    let trace = std::env::var_os("TRUST_GATE_TRACE").is_some();
     // TRACTABILITY GUARD (HONESTY): a `bvmul` bit-blasts to a shift-and-add array
     // multiplier whose refutation step-count grows ~16× per +2 operand-width
     // (measured: width 2→234 steps, 4→5 210, 6→88 250, 8→~2.0M).
@@ -844,7 +1062,7 @@ const PAIR_HALF_WIDTH: u32 = 64;
 /// `WidthMismatch` / `UnsupportedWidth` — see the pin's comment for which does
 /// what, since only one of the two is actually load-bearing for soundness.
 #[cfg(feature = "ay-proofs")]
-fn split_register_pair_128(f: &Formula) -> Option<(Formula, Formula)> {
+pub(crate) fn split_register_pair_128(f: &Formula) -> Option<(Formula, Formula)> {
     match f {
         // The register pair as the gate builds it. Widths are NOT trusted from
         // this shape — they are pinned after lowering by the caller.
@@ -894,7 +1112,7 @@ fn split_register_pair_128(f: &Formula) -> Option<(Formula, Formula)> {
 /// `pair_128_high_half_corruption_refuses_the_kernel_grade` pins that it does
 /// notice.
 #[cfg(feature = "ay-proofs")]
-fn try_kernel_recheckable_pair_128(
+pub(crate) fn try_kernel_recheckable_pair_128(
     machine_out: &Formula,
     auto: &Formula,
 ) -> Option<ProvenEvidence> {
@@ -1219,35 +1437,8 @@ pub fn emit_objects_verified_reported_with_backend(
         }
     }
 
-    // PHASE 0 — BUILD THE LOCAL-PURE-CALLEE ENVIRONMENT. A callee is admitted for
-    // composition ONLY if it (a) is a single-register-ABI pure scalar function
-    // (`derive_callee_pure`) AND (b) independently clears the gate as `Proven`
-    // under an EMPTY env (so its OWN bytes are proven == its IR semantics — the
-    // linchpin that lets us stand its IR-derived output in for "what the resolved
-    // `bl` executes"). A callee that is Refuted/Unknown, or non-pure, is NOT
-    // admitted — calls to it then fail closed. This is fail-closed by
-    // construction: the env only ever grows the set of calls we can SOUNDLY model.
-    let mut env = CalleeEnv::empty();
-    // A derivably-pure callee is call-free, so its empty-env result is identical
-    // to its Phase-1 result. Retain and MOVE that result into Phase 1 to avoid a
-    // redundant full emission/proof while still doing the Phase-2 determinism
-    // re-emission over the exact accepted bytes.
-    let mut phase0_results = vec![None; funcs.len()];
-    for (index, func) in funcs.iter().enumerate() {
-        if let Some(pure) = derive_callee_pure(func) {
-            // Verify the callee itself with an empty env (it is call-free by
-            // `derive_callee_pure`, so an empty env suffices and cannot recurse).
-            let result = verify_output_preserved_capturing_env_with_backend(
-                func,
-                &CalleeEnv::empty(),
-                backend,
-            );
-            if result.0.is_proven() {
-                env.callees.insert(func.name.clone(), pure);
-            }
-            phase0_results[index] = Some(result);
-        }
-    }
+    // PHASE 0 — BUILD THE LOCAL-PURE-CALLEE ENVIRONMENT (see `build_callee_env`).
+    let (env, mut phase0_results) = build_callee_env(funcs, backend);
 
     // PHASE 1 — GATE + CAPTURE. Verify EVERY function first, CAPTURING the exact
     // object bytes the gate's verdict was computed over. Refuted => Err
@@ -1267,7 +1458,10 @@ pub fn emit_objects_verified_reported_with_backend(
                 // instantiation). Ships under every (non-Off) policy.
                 ProvenEvidence::KernelRecheckable(_)
                 | ProvenEvidence::KernelRecheckablePair { .. }
-                | ProvenEvidence::KernelInstantiated { .. } => report.proved += 1,
+                | ProvenEvidence::KernelInstantiated { .. }
+                | ProvenEvidence::KernelRecheckableWithSideConditions { .. } => {
+                    report.proved += 1
+                }
                 // [CITED] — a wide `Mul` discharged by CITING the
                 // kernel-checked structured theorem. Counted with the
                 // [VALIDATED] surface and NOT with `proved`, deliberately: the
@@ -1342,9 +1536,76 @@ pub fn emit_objects_verified_reported_with_backend(
     Ok((verified, report))
 }
 
+/// One function's gate result: the verdict and the exact bytes it was computed over.
+type GateResult = (OutputVerdict, Option<Vec<u8>>);
+
+/// PHASE 0 of the bundle gate — BUILD THE LOCAL-PURE-CALLEE ENVIRONMENT.
+///
+/// A callee is admitted for composition ONLY if it (a) is a single-register-ABI
+/// pure scalar function (`derive_callee_pure`) AND (b) independently clears the
+/// gate as `Proven` under an EMPTY env (so its OWN bytes are proven == its IR
+/// semantics — the linchpin that lets us stand its IR-derived output in for
+/// "what the resolved `bl` executes"). A callee that is Refuted/Unknown, or
+/// non-pure, is NOT admitted — calls to it then fail closed. This is
+/// fail-closed by construction: the env only ever grows the set of calls we
+/// can SOUNDLY model.
+///
+/// Trust (O0, increment-5 step 5.0): "Proven" now INCLUDES the ABI guarantee
+/// over the callee's own bytes, so admission requires O0. That is what
+/// discharges the callee-saved preservation `model_local_call` assumes at every
+/// composed `bl`; before it, a callee whose bytes clobbered X19 was admitted on
+/// value equality alone (design fact V1).
+///
+/// Returns the environment and, per input function, the empty-env result of
+/// every derivably-pure function. Such a callee is call-free, so that result is
+/// identical to its PHASE-1 result; PHASE 1 MOVES it instead of repeating the
+/// full emission/proof, while PHASE 2 still re-emits over the exact accepted
+/// bytes.
+fn build_callee_env(
+    funcs: &[VerifiableFunction],
+    backend: &TrustCgCodegenBackend,
+) -> (CalleeEnv, Vec<Option<GateResult>>) {
+    let mut env = CalleeEnv::empty();
+    let mut phase0_results = vec![None; funcs.len()];
+    for (index, func) in funcs.iter().enumerate() {
+        if let Some(pure) = derive_callee_pure(func) {
+            // Verify the callee itself with an empty env (it is call-free by
+            // `derive_callee_pure`, so an empty env suffices and cannot recurse).
+            let result = verify_output_preserved_capturing_env_with_backend(
+                func,
+                &CalleeEnv::empty(),
+                backend,
+            );
+            if result.0.is_proven() {
+                env.callees.insert(func.name.clone(), pure);
+            }
+            phase0_results[index] = Some(result);
+        }
+    }
+    (env, phase0_results)
+}
+
+/// TEST HOOK (`test-hooks` only): the names PHASE 0 admits to the composition
+/// environment for `funcs`, sorted. It runs the production [`build_callee_env`]
+/// unchanged and grants nothing; it exists so an integration test can observe
+/// WHY a caller fails closed (its callee was excluded) rather than only THAT it
+/// did.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn bundle_gate_admitted_callees(
+    funcs: &[VerifiableFunction],
+    backend: &TrustCgCodegenBackend,
+) -> Vec<String> {
+    let (env, _) = build_callee_env(funcs, backend);
+    let mut names: Vec<String> = env.callees.into_keys().collect();
+    names.sort();
+    names
+}
+
 /// Where one verified function's machine code was found inside the merged
 /// module object, byte-identical to the bytes the gate verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreservedFunction {
     /// The function's name.
     pub name: String,
@@ -1430,6 +1691,16 @@ pub fn emit_module_object_verified_reported_with_backend(
     let emitted = backend.emit_module_object(&module).map_err(|e| {
         VerifyError::ModuleEmitFailed { reason: format!("emit_module_object failed: {e:?}") }
     })?;
+    backend
+        .require_object_target(&emitted.bytes)
+        .map_err(|reason| VerifyError::ModuleEmitFailed { reason })?;
+    let expected = funcs
+        .iter()
+        .enumerate()
+        .map(|(index, func)| (func.name.as_str(), linkage.get(index).copied().unwrap_or_default()))
+        .collect::<Vec<_>>();
+    require_exact_elf_function_bindings(&emitted.bytes, &expected)
+        .map_err(|reason| VerifyError::ModuleEmitFailed { reason })?;
 
     // PHASE 3b — DISCHARGE THE BYTE-PRESERVATION OBLIGATION. A failure here is a
     // REFUSAL, never a warning: shipping a merged object whose bytes are not the
@@ -1605,12 +1876,147 @@ pub(crate) fn assert_merged_object_preserves_verified_text(
 /// keys match the IR-level function names. Any malformed/truncated field yields
 /// `None` (=> refusal), never a panic inside the compiler.
 fn object_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
-    macho_text_symbol_offsets(obj, text_base).or_else(|| elf64_text_symbol_offsets(obj, text_base))
+    // Preserve the original streaming, last-writer lookup semantics. Do not
+    // first allocate all duplicate rows merely to construct this old map.
+    let mut offsets = HashMap::new();
+    let mut emit = |_, _: &str, name: &str, offset| {
+        offsets.insert(name.to_owned(), offset);
+        Some(())
+    };
+    macho_text_symbol_offsets(obj, text_base, &mut emit)
+        .or_else(|| elf64_text_symbol_offsets(obj, text_base, false, &mut emit))?;
+    Some(offsets)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TextSymbolFormat {
+    MachO,
+    Elf64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawTextSymbol {
+    pub(crate) format: TextSymbolFormat,
+    pub(crate) raw_name: String,
+    pub(crate) name: String,
+    pub(crate) offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ElfTextSymbolAttributes {
+    binding: u8,
+    symbol_type: u8,
+    other: u8,
+}
+
+/// Bind every ELF text-function definition to the caller's emitter/linkage contract.
+/// The retained raw-symbol roster is diagnostic and omits these attributes.
+pub(crate) fn require_exact_elf_function_bindings(
+    obj: &[u8],
+    expected: &[(&str, FunctionLinkage)],
+) -> Result<(), String> {
+    use trust_cg_codegen::elf::constants::{
+        STB_GLOBAL, STB_LOCAL, STT_FUNC, STT_SECTION, STV_DEFAULT, STV_HIDDEN,
+    };
+
+    if obj.get(..4) != Some(b"\x7fELF") {
+        return Ok(());
+    }
+    let (_, text_base) = extract_text_from_object(obj)?;
+    let mut actual = Vec::with_capacity(expected.len());
+    let mut overflow = false;
+    let mut emit =
+        |_: TextSymbolFormat, _: &str, name: &str, _: u64, attributes: ElfTextSymbolAttributes| {
+            if !name.is_empty() && attributes.symbol_type != STT_SECTION {
+                if actual.len() >= expected.len() {
+                    overflow = true;
+                    return None;
+                }
+                actual.push((name.to_owned(), attributes));
+            }
+            Some(())
+        };
+    if elf64_text_symbol_offsets_with_attrs(obj, text_base, true, &mut emit).is_none() {
+        return Err(if overflow {
+            "ELF function symbol inventory has extra definitions".into()
+        } else {
+            "ELF function symbol inventory is unreadable".into()
+        });
+    }
+    if actual.len() != expected.len() {
+        return Err("ELF function symbol inventory does not match emitted functions".into());
+    }
+    for (name, linkage) in expected {
+        let mut matches = actual.iter().filter(|(actual_name, _)| actual_name == name);
+        let Some((_, attributes)) = matches.next() else {
+            return Err(format!("ELF function symbol inventory is missing `{name}`"));
+        };
+        if matches.next().is_some() {
+            return Err(format!("ELF function symbol inventory duplicates `{name}`"));
+        }
+        let (binding, other) = match linkage {
+            FunctionLinkage::External => (STB_GLOBAL, STV_DEFAULT),
+            FunctionLinkage::Internal => (STB_LOCAL, STV_DEFAULT),
+            FunctionLinkage::Hidden => (STB_GLOBAL, STV_HIDDEN),
+        };
+        if attributes.symbol_type != STT_FUNC
+            || attributes.binding != binding
+            || attributes.other != other
+        {
+            return Err(format!(
+                "ELF function symbol `{name}` binding/visibility differs from linkage"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Complete defined-text symbol rows, BEFORE name-map insertion. This is
+/// diagnostic data; the pre-existing emission gate retains its own policy.
+pub(crate) fn object_text_symbols(
+    obj: &[u8],
+    text_base: u64,
+    max_rows: usize,
+    max_name_bytes: usize,
+) -> Result<Vec<RawTextSymbol>, String> {
+    let mut rows = Vec::new();
+    let mut name_bytes = 0usize;
+    let mut refusal = None;
+    let mut emit = |format, raw_name: &str, name: &str, offset| {
+        if rows.len() >= max_rows {
+            refusal = Some("raw text symbol row budget exceeded");
+            return None;
+        }
+        let total = name_bytes.checked_add(raw_name.len())?.checked_add(name.len())?;
+        if total > max_name_bytes {
+            refusal = Some("raw text symbol name-byte budget exceeded");
+            return None;
+        }
+        // Borrowed string-table views reach this point without allocation.
+        // Charge both retained strings before copying a shared input name.
+        name_bytes = total;
+        rows.push(RawTextSymbol {
+            format,
+            raw_name: raw_name.to_owned(),
+            name: name.to_owned(),
+            offset,
+        });
+        Some(())
+    };
+    let parsed = macho_text_symbol_offsets(obj, text_base, &mut emit)
+        .or_else(|| elf64_text_symbol_offsets(obj, text_base, true, &mut emit));
+    parsed.ok_or_else(|| refusal.unwrap_or("unreadable raw text symbol roster").to_owned())?;
+    Ok(rows)
 }
 
 /// Mach-O `LC_SYMTAB` reader: collect `N_SECT` symbols whose section is
 /// `__text`.
-fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
+fn macho_text_symbol_offsets(
+    obj: &[u8],
+    text_base: u64,
+    emit: &mut impl FnMut(TextSymbolFormat, &str, &str, u64) -> Option<()>,
+) -> Option<()> {
     const N_TYPE: u8 = 0x0e;
     const N_SECT: u8 = 0x0e;
     const NLIST_64_SIZE: usize = 16;
@@ -1626,6 +2032,9 @@ fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
     // Locate `__text`'s 1-based section ordinal by walking the segment load
     // commands in the order the section table numbers them.
     let ncmds = rd_u32(16)?;
+    if ncmds as usize > obj.len().checked_sub(32)? / 8 {
+        return None;
+    }
     let mut text_ordinal: Option<u8> = None;
     let mut symtab: Option<(usize, usize, usize, usize)> = None;
     let mut ordinal: u32 = 0;
@@ -1633,13 +2042,20 @@ fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
     for _ in 0..ncmds {
         let cmd = rd_u32(cmd_off)?;
         let cmdsize = rd_u32(cmd_off + 4)? as usize;
-        if cmdsize == 0 {
+        let cmd_end = cmd_off.checked_add(cmdsize)?;
+        if cmdsize < 8 || cmd_end > obj.len() {
             return None;
         }
         if cmd == 0x19 {
             // LC_SEGMENT_64
+            if cmdsize < 72 {
+                return None;
+            }
             let nsects = rd_u32(cmd_off + 64)?;
             let mut sec = cmd_off + 72;
+            if sec.checked_add((nsects as usize).checked_mul(80)?)? > cmd_end {
+                return None;
+            }
             for _ in 0..nsects {
                 ordinal = ordinal.checked_add(1)?;
                 let name = obj.get(sec..sec + 16)?;
@@ -1650,6 +2066,9 @@ fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
             }
         } else if cmd == 0x02 {
             // LC_SYMTAB: symoff, nsyms, stroff, strsize
+            if cmdsize < 24 {
+                return None;
+            }
             symtab = Some((
                 rd_u32(cmd_off + 8)? as usize,
                 rd_u32(cmd_off + 12)? as usize,
@@ -1663,8 +2082,8 @@ fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
     let text_ordinal = text_ordinal?;
     let (symoff, nsyms, stroff, strsize) = symtab?;
     let strings = obj.get(stroff..stroff.checked_add(strsize)?)?;
+    obj.get(symoff..symoff.checked_add(nsyms.checked_mul(NLIST_64_SIZE)?)?)?;
 
-    let mut offsets = HashMap::new();
     for index in 0..nsyms {
         let entry = symoff.checked_add(index.checked_mul(NLIST_64_SIZE)?)?;
         let n_strx = rd_u32(entry)? as usize;
@@ -1678,16 +2097,35 @@ fn macho_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
         }
         let tail = strings.get(n_strx..)?;
         let end = tail.iter().position(|byte| *byte == 0)?;
-        let name = std::str::from_utf8(&tail[..end]).ok()?;
+        let raw_name = std::str::from_utf8(&tail[..end]).ok()?;
         // Mach-O prefixes every symbol with `_`; the IR-level name does not.
-        let name = name.strip_prefix('_').unwrap_or(name);
-        offsets.insert(name.to_string(), n_value.checked_sub(text_base)?);
+        let name = raw_name.strip_prefix('_').unwrap_or(raw_name);
+        emit(TextSymbolFormat::MachO, raw_name, name, n_value.checked_sub(text_base)?)?;
     }
-    Some(offsets)
+    Some(())
 }
 
 /// ELF64 `.symtab` reader: collect symbols defined in the `.text` section.
-fn elf64_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<String, u64>> {
+fn elf64_text_symbol_offsets(
+    obj: &[u8],
+    text_base: u64,
+    retain_unnamed: bool,
+    emit: &mut impl FnMut(TextSymbolFormat, &str, &str, u64) -> Option<()>,
+) -> Option<()> {
+    elf64_text_symbol_offsets_with_attrs(
+        obj,
+        text_base,
+        retain_unnamed,
+        &mut |format, raw_name, name, offset, _| emit(format, raw_name, name, offset),
+    )
+}
+
+fn elf64_text_symbol_offsets_with_attrs(
+    obj: &[u8],
+    text_base: u64,
+    retain_unnamed: bool,
+    emit: &mut impl FnMut(TextSymbolFormat, &str, &str, u64, ElfTextSymbolAttributes) -> Option<()>,
+) -> Option<()> {
     const SHT_SYMTAB: u32 = 2;
     const SYM_SIZE: usize = 24;
 
@@ -1708,6 +2146,7 @@ fn elf64_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
     if section_size < 64 || names_index >= section_count {
         return None;
     }
+    obj.get(section_table..section_table.checked_add(section_count.checked_mul(section_size)?)?)?;
     let header_at = |index: usize| -> Option<usize> {
         (index < section_count)
             .then_some(section_table.checked_add(index.checked_mul(section_size)?)?)
@@ -1744,11 +2183,16 @@ fn elf64_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
     let str_offset = usize::try_from(rd_u64(strtab_header + 24)?).ok()?;
     let str_size = usize::try_from(rd_u64(strtab_header + 32)?).ok()?;
     let strings = obj.get(str_offset..str_offset.checked_add(str_size)?)?;
+    if symsize % SYM_SIZE != 0 {
+        return None;
+    }
+    obj.get(symoff..symoff.checked_add(symsize)?)?;
 
-    let mut offsets = HashMap::new();
     for index in 0..(symsize / SYM_SIZE) {
         let entry = symoff.checked_add(index.checked_mul(SYM_SIZE)?)?;
         let st_name = usize::try_from(rd_u32(entry)?).ok()?;
+        let st_info = *obj.get(entry + 4)?;
+        let st_other = *obj.get(entry + 5)?;
         let st_shndx = rd_u16(entry + 6)?;
         let st_value = rd_u64(entry + 8)?;
         if st_shndx != text_index {
@@ -1756,13 +2200,23 @@ fn elf64_text_symbol_offsets(obj: &[u8], text_base: u64) -> Option<HashMap<Strin
         }
         let tail = strings.get(st_name..)?;
         let end = tail.iter().position(|byte| *byte == 0)?;
-        if end == 0 {
+        if end == 0 && !retain_unnamed {
             continue;
         }
         let name = std::str::from_utf8(&tail[..end]).ok()?;
-        offsets.insert(name.to_string(), st_value.checked_sub(text_base)?);
+        emit(
+            TextSymbolFormat::Elf64,
+            name,
+            name,
+            st_value.checked_sub(text_base)?,
+            ElfTextSymbolAttributes {
+                binding: st_info >> 4,
+                symbol_type: st_info & 0x0f,
+                other: st_other,
+            },
+        )?;
     }
-    Some(offsets)
+    Some(())
 }
 
 /// VERIFIED single-function emission — convenience over [`emit_objects_verified`]
@@ -2527,6 +2981,13 @@ pub fn trust_ir_semantics(func: &VerifiableFunction) -> Result<Formula, String> 
 /// `env` is composed (the callee's pure output substituted at the call site).
 /// With an EMPTY env this is byte-for-byte the original single-function behavior.
 fn trust_ir_semantics_env(func: &VerifiableFunction, env: &CalleeEnv) -> Result<Formula, String> {
+    // The evaluator only visits reachable blocks. Refuse unsupported image
+    // carriers in the complete source before that partial traversal begins.
+    if func.body.contains_memory_image() {
+        return Err(
+            "ConstValue::MemoryImage has no modeled allocation/provenance value semantics".into()
+        );
+    }
     let expanded = func.with_tail_calls_expanded();
     let func = expanded.as_ref();
     let body = &func.body;
@@ -2793,7 +3254,7 @@ fn clone_state(state: &SymState) -> SymState {
 /// Store the low `width_bytes` bytes of `value` into the `memory` array in
 /// little-endian order — mirrors `trust_machine_sem::state::store_bytes_le`
 /// exactly so the two MEM formulas are syntactically reducible by array theory.
-fn store_bytes_le_formula(
+pub(crate) fn store_bytes_le_formula(
     memory: Formula,
     address: &Formula,
     value: &Formula,
@@ -2981,14 +3442,24 @@ fn default_verification_backend() -> TrustCgCodegenBackend {
 // against the (correct, IR-derived) auto-spec. This exercises the FULL public
 // `emit_objects_verified` path against a genuine miscompile: the gate must
 // return `Err(Refuted)` and produce NO object bytes. Never set outside tests.
-#[cfg(test)]
+//
+// Trust (O0): also compiled under the non-default `test-hooks` feature, so the
+// integration tests in `tests/abi_guarantee.rs` can splice an ABI violation
+// (an X19 clobber, an unbalanced SP, a lost LR) into real emitted bytes. Like
+// the lowering hook it changes ONLY the machine side; nothing in the compiler
+// path enables the feature.
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static TEXT_CORRUPTOR: std::cell::RefCell<Option<Box<dyn Fn(&mut Vec<u8>, u64)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-fn with_text_corruptor<R>(
+/// TEST HOOK: run `body` with every text section the gate extracts on THIS
+/// thread first rewritten by `corruptor(code, base)`. Test-only (`test-hooks`);
+/// it changes only the machine side the gate reads, never the spec.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn with_text_corruptor<R>(
     corruptor: impl Fn(&mut Vec<u8>, u64) + 'static,
     body: impl FnOnce() -> R,
 ) -> R {
@@ -2998,7 +3469,7 @@ fn with_text_corruptor<R>(
     r
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn apply_text_corruptor(code: &mut Vec<u8>, base: u64) {
     TEXT_CORRUPTOR.with(|c| {
         if let Some(f) = c.borrow().as_ref() {
@@ -3128,13 +3599,13 @@ pub(crate) fn extract_text_from_object(obj: &[u8]) -> Result<(Vec<u8>, u64), Str
     let (code, base) = macho_text(obj)
         .or_else(|| elf64_text(obj))
         .ok_or_else(|| "could not extract the text section from emitted object".to_string())?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     {
         let mut code = code;
         apply_text_corruptor(&mut code, base);
         return Ok((code, base));
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-hooks")))]
     Ok((code, base))
 }
 
@@ -3164,6 +3635,9 @@ fn elf64_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
     if section_size < 64 || names_index >= section_count {
         return None;
     }
+    // Validate every declared header before calculating any field offset or
+    // returning an early .text match that would hide a truncated sibling.
+    obj.get(section_table..section_table.checked_add(section_count.checked_mul(section_size)?)?)?;
 
     let header_at = |index: usize| -> Option<usize> {
         (index < section_count)
@@ -3199,25 +3673,38 @@ fn macho_text(obj: &[u8]) -> Option<(Vec<u8>, u64)> {
         return None;
     }
     let ncmds = rd_u32(16)?;
+    if ncmds as usize > obj.len().checked_sub(32)? / 8 {
+        return None;
+    }
     let mut cmd_off = 32usize;
     for _ in 0..ncmds {
         let cmd = rd_u32(cmd_off)?;
         let cmdsize = rd_u32(cmd_off + 4)? as usize;
+        let cmd_end = cmd_off.checked_add(cmdsize)?;
+        if cmdsize < 8 || cmd_end > obj.len() {
+            return None;
+        }
         if cmd == 0x19 {
+            if cmdsize < 72 {
+                return None;
+            }
             let nsects = rd_u32(cmd_off + 64)?;
             let mut sec = cmd_off + 72;
+            if sec.checked_add((nsects as usize).checked_mul(80)?)? > cmd_end {
+                return None;
+            }
             for _ in 0..nsects {
-                let name = &obj[sec..sec + 16];
+                let name = obj.get(sec..sec.checked_add(16)?)?;
                 if name.starts_with(b"__text\0") {
                     let addr = rd_u64(sec + 32)?;
-                    let size = rd_u64(sec + 40)? as usize;
+                    let size = usize::try_from(rd_u64(sec + 40)?).ok()?;
                     let offset = rd_u32(sec + 48)? as usize;
-                    return Some((obj.get(offset..offset + size)?.to_vec(), addr));
+                    return Some((obj.get(offset..offset.checked_add(size)?)?.to_vec(), addr));
                 }
-                sec += 80;
+                sec = sec.checked_add(80)?;
             }
         }
-        cmd_off += cmdsize;
+        cmd_off = cmd_end;
     }
     None
 }
@@ -3257,6 +3744,767 @@ pub(crate) struct PathOutcome {
     /// Predicate: under which inputs does control reach a `RET` at all?
     /// `Bool(true)` when nothing on any path diverges.
     pub(crate) reach: Formula,
+    /// Trust (O0, increment-5 step 5.0): every location AAPCS64 obliges this
+    /// function to hand back to its caller, read at the reachable exit(s) and
+    /// merged exactly like `value`. A DIVERGENT path (`reach = false`) carries
+    /// the entry values: it never returns, so it owes its caller nothing.
+    pub(crate) abi: AbiExit,
+    /// Trust (O0): Bool — does this path WRITE X18 anywhere, including a
+    /// divergent trap tail? Only consulted where the platform reserves X18
+    /// (Darwin); see [`platform_reserves_x18`].
+    pub(crate) x18_written: Formula,
+    /// CUT-POINT ARRIVALS (WS7.14): the claimed loop-header addresses this
+    /// segment stopped at, each with the predicate under which it is reached
+    /// and the full GPR file at that moment. Empty for every executor without
+    /// a cut set, so every pre-existing caller's outcome is unchanged.
+    pub(crate) arrivals: Vec<MachineArrival>,
+}
+
+// ===========================================================================
+// O0 — THE ABI GUARANTEE (increment-5 step 5.0)
+// ===========================================================================
+//
+// THE HOLE THIS CLOSES (design fact V1). The executor used to read ONLY the
+// return register at a `RET`. Nothing checked that the bytes hand back what the
+// AAPCS64 caller relies on — and on F1 every caller of a gated function is
+// LLVM-built code that relies on it. Bytes that clobbered X19, left SP
+// unbalanced, or returned through a lost LR were certified as long as X0 was
+// right. The composition gate then ASSUMED those same guarantees of every
+// PHASE-0-admitted callee (`model_local_call` preserves X19-X29 and SP), so the
+// assumption was never discharged anywhere.
+//
+// THE OBLIGATION (O0). At every reachable `RET`, and at every relocated tail
+// `b`: X19-X28, X29, SP and the low 64 bits of V8-V15 (D8-D15) equal their entry
+// values; the address control transfers to equals the entry X30; and, where the
+// platform reserves it (Darwin), X18 is never written on any path.
+//
+// HOW IT IS DISCHARGED. Each location is read at each exit, merged across paths
+// with the same `Ite` the return value uses, and then reduced by `abi_fold` — a
+// set of EXACT identities (stack-pointer offset arithmetic mod 2^64, array
+// select-over-store at SP-relative constant addresses, little-endian byte
+// reassembly, extract-of-zero-extend). A location that reduces to its own entry
+// variable is discharged by that structural reading, which is part of the
+// executor's trusted reading of the bytes (the same class as the decoder and the
+// effect semantics, and NOT a kernel re-check). Anything left over is a
+// residual conjunct handed to ay: Proven caps the function at [VALIDATED]
+// (ay-only authority); a counterexample is `Refuted` unless the claim reads
+// memory (a frame slot may then be modeled as aliasing a non-frame store, which
+// O5 rules out only later), in which case it is `Unknown`.
+
+/// AAPCS64 callee-saved general registers X19..=X28 plus the frame pointer X29.
+const ABI_SAVED_GPRS: std::ops::RangeInclusive<u8> = 19..=29;
+/// SIMD/FP registers whose LOW 64 bits (D8..=D15) AAPCS64 makes callee-saved.
+const ABI_SAVED_DREGS: std::ops::RangeInclusive<u8> = 8..=15;
+
+/// The O0 locations at ONE exit (or the `Ite`-merge of several).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AbiExit {
+    /// X19..=X29, in register order.
+    gpr: Vec<Formula>,
+    /// The stack pointer.
+    sp: Formula,
+    /// The low 64 bits of V8..=V15, in register order.
+    dregs: Vec<Formula>,
+    /// Where control goes: the `RET`'s target register, or X30 at a relocated
+    /// tail `b` (the callee returns through it straight to our caller).
+    return_target: Formula,
+}
+
+impl AbiExit {
+    /// Read the O0 locations out of `state` at an exit transferring to
+    /// `return_target`.
+    pub(crate) fn at(state: &MachineState, return_target: Formula) -> Self {
+        AbiExit {
+            gpr: ABI_SAVED_GPRS.map(|r| state.read_gpr(r, 64)).collect(),
+            sp: state.read_sp(64),
+            dregs: ABI_SAVED_DREGS.map(|r| state.read_fpr(r, 64)).collect(),
+            return_target,
+        }
+    }
+
+    /// The entry values — `MachineState::symbolic()`'s own variables, with the
+    /// return target the entry link register X30.
+    pub(crate) fn entry() -> Self {
+        let state = MachineState::symbolic();
+        let lr = state.read_gpr(30, 64);
+        AbiExit::at(&state, lr)
+    }
+
+    /// Merge two paths under the machine branch condition `cond`, slot by slot.
+    pub(crate) fn merge(cond: &Formula, taken: Self, fall: Self) -> Self {
+        let pick = |a: Formula, c: Formula| ite_unless_same(cond, a, c);
+        AbiExit {
+            gpr: taken.gpr.into_iter().zip(fall.gpr).map(|(a, c)| pick(a, c)).collect(),
+            sp: pick(taken.sp, fall.sp),
+            dregs: taken.dregs.into_iter().zip(fall.dregs).map(|(a, c)| pick(a, c)).collect(),
+            return_target: pick(taken.return_target, fall.return_target),
+        }
+    }
+
+    /// Read-only ORIGINAL O0 equations. Unlike `abi_guarantee_residue`, this
+    /// retains every actual exit expression and never calls `abi_fold`.
+    pub(crate) fn original_equations(&self) -> Vec<(String, Formula, Formula)> {
+        let entry = Self::entry();
+        self.slots().into_iter().zip(entry.slots()).map(|((name, end), (_, start))|
+            (name, end.clone(), start.clone())).collect()
+    }
+
+    /// Every location with its human-readable name, in a fixed order.
+    fn slots(&self) -> Vec<(String, &Formula)> {
+        let mut slots: Vec<(String, &Formula)> =
+            ABI_SAVED_GPRS.zip(&self.gpr).map(|(r, f)| (format!("X{r}"), f)).collect();
+        slots.push(("SP".to_string(), &self.sp));
+        slots.extend(ABI_SAVED_DREGS.zip(&self.dregs).map(|(r, f)| (format!("D{r}"), f)));
+        slots.push((ABI_RETURN_TARGET_SLOT.to_string(), &self.return_target));
+        slots
+    }
+}
+
+/// The slot name of the return-target conjunct.
+const ABI_RETURN_TARGET_SLOT: &str = "return target (entry X30/LR)";
+/// The slot name of the Darwin X18 conjunct.
+const ABI_X18_SLOT: &str = "X18 (Darwin platform register)";
+
+/// `Ite(cond, a, c)`, or `a` itself when both arms are the same term (an exact
+/// identity, and the reason an untouched register stays syntactically its entry
+/// variable through every fork).
+pub(crate) fn ite_unless_same(cond: &Formula, a: Formula, c: Formula) -> Formula {
+    if a == c { a } else { Formula::Ite(b(cond.clone()), b(a), b(c)) }
+}
+
+/// Whether the platform the object targets RESERVES X18, so that O0 forbids
+/// writing it at all.
+///
+/// Apple's AArch64 ABI reserves X18 (the OS may change it at any time); the
+/// generic AAPCS64 Linux platform treats it as an ordinary temporary. The gate
+/// reads the platform off the object it was handed: Mach-O is only produced for
+/// Apple targets, and ELF is the generic platform. Any other container is given
+/// the STRICTER reading.
+pub(crate) fn platform_reserves_x18(obj: &[u8]) -> bool {
+    !obj.starts_with(b"\x7fELF")
+}
+
+/// One O0 conjunct the structural reading could NOT reduce to its entry value.
+///
+/// `claim` must be VALID. It is either `exit == entry` for a guaranteed
+/// location, or `NOT x18_written` for the Darwin platform register.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct AbiConjunct {
+    /// The guaranteed location (`X19`, `SP`, `D8`, the return target, X18).
+    pub slot: String,
+    /// The predicate that must hold for every input.
+    pub claim: Formula,
+}
+
+/// Build O0's residue for one executed function: every guaranteed location
+/// whose exit value does not reduce (by [`abi_fold`]) to its entry variable,
+/// plus the X18 conjunct where `x18_reserved` and the write flag is not
+/// syntactically `false`. EMPTY means O0 was discharged structurally.
+pub(crate) fn abi_guarantee_residue(outcome: &PathOutcome, x18_reserved: bool) -> Vec<AbiConjunct> {
+    let entry = AbiExit::entry();
+    let mut residue = Vec::new();
+    for ((slot, exit), (_, start)) in outcome.abi.slots().into_iter().zip(entry.slots()) {
+        let exit = abi_fold(exit);
+        if exit != *start {
+            residue.push(AbiConjunct { slot, claim: Formula::Eq(b(exit), b(start.clone())) });
+        }
+    }
+    if x18_reserved {
+        let written = abi_fold(&outcome.x18_written);
+        if written != Formula::Bool(false) {
+            residue
+                .push(AbiConjunct { slot: ABI_X18_SLOT.to_string(), claim: Formula::Not(b(written)) });
+        }
+    }
+    residue
+}
+
+/// The result of discharging O0's residue.
+#[derive(Debug)]
+pub(crate) enum AbiDischarge {
+    /// Nothing was left for a solver: every location read back as its entry
+    /// value under the executor's structural reading.
+    Structural,
+    /// ay proved every residual conjunct valid. ay is the SOLE authority for
+    /// them, so the function's grade is capped at [VALIDATED].
+    SolverValidated,
+    /// O0 ended in a non-Proven verdict (`Refuted` or `Unknown`).
+    Verdict(OutputVerdict),
+}
+
+/// Discharge O0's `residue` for `symbol`, conditioned on the `ambient`
+/// machine-environment assumptions the value obligation also carries.
+///
+/// A `Refuted` verdict returns at once (it dominates); an `Unknown` conjunct is
+/// remembered while the rest are still checked, so a later refutation is never
+/// masked by an earlier undecided one.
+pub(crate) fn discharge_abi_guarantee(
+    symbol: &str,
+    residue: &[AbiConjunct],
+    ambient: &[Formula],
+) -> AbiDischarge {
+    if residue.is_empty() {
+        return AbiDischarge::Structural;
+    }
+    let mut undecided: Option<String> = None;
+    for conjunct in residue {
+        let claim = if ambient.is_empty() {
+            conjunct.claim.clone()
+        } else {
+            let mut disjuncts: Vec<Formula> =
+                ambient.iter().map(|a| Formula::Not(b(a.clone()))).collect();
+            disjuncts.push(conjunct.claim.clone());
+            Formula::Or(disjuncts)
+        };
+        match discharge_valid(&claim) {
+            Discharge::Proven => {}
+            Discharge::CounterExample if !formula_reads_memory(&conjunct.claim) => {
+                return AbiDischarge::Verdict(OutputVerdict::Refuted {
+                    detail: abi_refutation_detail(symbol, &conjunct.slot),
+                });
+            }
+            Discharge::CounterExample => {
+                undecided.get_or_insert_with(|| {
+                    format!(
+                        "ABI guarantee (O0) for fn `{symbol}`: {} has a counterexample only \
+                         through memory — the bytes reload it from a frame slot the model lets a \
+                         non-frame store alias, which frame confinement (O5) does not yet rule \
+                         out; refusing to call that a miscompile or a proof (fail-closed)",
+                        conjunct.slot
+                    )
+                });
+            }
+            Discharge::Unknown(reason) => {
+                undecided.get_or_insert_with(|| {
+                    format!(
+                        "ABI guarantee (O0) for fn `{symbol}`: {} did not conclude: {reason} \
+                         (fail-closed)",
+                        conjunct.slot
+                    )
+                });
+            }
+        }
+    }
+    match undecided {
+        Some(reason) => AbiDischarge::Verdict(OutputVerdict::Unknown { reason }),
+        None => AbiDischarge::SolverValidated,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O0 ACROSS A LOOP CUT (WS7.14 x increment-5 step 5.0)
+// ---------------------------------------------------------------------------
+//
+// A header segment starts from a HAVOC machine state, so its `RET` could not
+// be held to O0 at all: every callee-saved location would read a havoc
+// variable and the residue `havoc == entry` has a counterexample by
+// construction. The cut-point induction is therefore extended by ONE
+// invariant, chosen here and proved, never assumed:
+//
+//   at every loop header, each O0 location (X19-X29, SP, D8-D15 and the link
+//   register X30) holds its ENTRY value — except a callee-saved register the
+//   cut-point map locates a live-in in, which is left to the live-in seed.
+//
+// A header segment is SEEDED with exactly that (`seed_abi_entry_invariant`);
+// every machine arrival at a located header must carry it back
+// (`abi_arrival_invariant`). Only the LOW 64 bits of V8-V15 are seeded (the
+// upper halves stay havoc), because only those are checked at an arrival.
+// The invariant is a CHOICE: a correct function may violate it (a frame
+// pushed before the loop moves SP), so a failure to prove it, or an O0
+// residue of a header segment that does not discharge, is `Unknown` — never
+// `Refuted` (`discharge_abi_loop_conjuncts`). The entry segment starts from
+// the true entry state and keeps O0's ordinary verdicts.
+
+/// Seed the O0 locations of a header segment's cut state with their ENTRY
+/// values (the WS7.14 ABI invariant), leaving the registers in `live_in`
+/// (located live-ins) as the caller seeded them. `tag` names the havoc upper
+/// halves of D8-D15; it must mark them havoc (`_HAVOC`).
+pub(crate) fn seed_abi_entry_invariant(state: &mut MachineState, tag: &str, live_in: &[u8]) {
+    let entry = MachineState::symbolic();
+    for r in ABI_SAVED_GPRS.chain(std::iter::once(30u8)) {
+        if !live_in.contains(&r) {
+            state.gpr[r as usize] = entry.gpr[r as usize].clone();
+        }
+    }
+    state.sp = entry.sp.clone();
+    for r in ABI_SAVED_DREGS {
+        state.fpr[r as usize] = Formula::BvConcat(
+            b(Formula::Var(format!("{tag}_HAVOC_HI_V{r}"), Sort::BitVec(64))),
+            b(entry.read_fpr(r, 64)),
+        );
+    }
+}
+
+/// The inductive step of the WS7.14 ABI invariant at ONE machine arrival:
+/// every O0 location (except a GPR in `live_in`, the target header's located
+/// live-ins) that the structural reading cannot reduce to its entry value,
+/// as the claim `reach => location == entry`. EMPTY means the arrival carries
+/// the invariant structurally.
+pub(crate) fn abi_arrival_invariant(arrival: &MachineArrival, live_in: &[u8]) -> Vec<AbiConjunct> {
+    let reach = abi_fold(&arrival.reach);
+    if reach == Formula::Bool(false) {
+        return Vec::new();
+    }
+    let skipped: Vec<String> = live_in.iter().map(|r| format!("X{r}")).collect();
+    let entry = AbiExit::entry();
+    let mut out = Vec::new();
+    for ((slot, at), (_, start)) in arrival.abi.slots().into_iter().zip(entry.slots()) {
+        if skipped.contains(&slot) {
+            continue;
+        }
+        let at = abi_fold(at);
+        if at == *start {
+            continue;
+        }
+        let eq = Formula::Eq(b(at), b(start.clone()));
+        let claim = if reach == Formula::Bool(true) {
+            eq
+        } else {
+            Formula::Or(vec![Formula::Not(b(reach.clone())), eq])
+        };
+        out.push(AbiConjunct {
+            slot: format!("{slot} at the arrival at {:#x}", arrival.addr),
+            claim,
+        });
+    }
+    out
+}
+
+/// Discharge O0 conjuncts that rest on the WS7.14 ABI invariant — a header
+/// segment's `RET` residue, or an arrival's inductive step. `Ok(true)` when
+/// ay was needed (the grade is capped, as for any solver-discharged O0),
+/// `Ok(false)` when there was nothing to discharge. Every counterexample and
+/// every undecided conjunct is an `Err` reason for `Unknown`: the invariant is
+/// a choice the bytes need not satisfy, so a failure of it indicts the
+/// invariant, never the bytes.
+pub(crate) fn discharge_abi_loop_conjuncts(
+    symbol: &str,
+    where_: &str,
+    conjuncts: &[AbiConjunct],
+) -> Result<bool, String> {
+    for conjunct in conjuncts {
+        match discharge_valid(&conjunct.claim) {
+            Discharge::Proven => {}
+            Discharge::CounterExample => {
+                return Err(format!(
+                    "ABI guarantee (O0) for fn `{symbol}` in {where_}: {} is not shown to hold \
+                     across the loop cut — the cut-point induction carries O0 only as the \
+                     invariant `every O0 location is its entry value at each loop header`, and \
+                     these bytes do not keep it (e.g. a frame pushed before the loop); refusing \
+                     to call that a miscompile or a proof (fail-closed)",
+                    conjunct.slot
+                ));
+            }
+            Discharge::Unknown(reason) => {
+                return Err(format!(
+                    "ABI guarantee (O0) for fn `{symbol}` in {where_}: {} did not conclude: \
+                     {reason} (fail-closed)",
+                    conjunct.slot
+                ));
+            }
+        }
+    }
+    Ok(!conjuncts.is_empty())
+}
+
+/// The `Refuted` detail naming exactly which O0 location the bytes violate.
+fn abi_refutation_detail(symbol: &str, slot: &str) -> String {
+    let what = if slot == ABI_X18_SLOT {
+        "write X18, which the Darwin platform reserves and AAPCS64 code must never write"
+            .to_string()
+    } else if slot == ABI_RETURN_TARGET_SLOT {
+        "return to an address other than the entry X30 (LR) — the caller's return address \
+         is lost"
+            .to_string()
+    } else {
+        format!(
+            "do not hand {slot} back unchanged: at a reachable return it differs from its \
+             entry value, and the caller relies on AAPCS64 preserving it"
+        )
+    };
+    format!(
+        "emitted bytes for fn `{symbol}` violate the ABI guarantee (O0) at {slot}: they {what} \
+         (ay found a counterexample input)"
+    )
+}
+
+/// Does `f` read or write the memory array anywhere?
+pub(crate) fn formula_reads_memory(f: &Formula) -> bool {
+    let mut found = false;
+    f.visit(&mut |node| {
+        if matches!(node, Formula::Select(..) | Formula::Store(..))
+            || matches!(node, Formula::Var(_, Sort::Array(..)))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// `Some(offset mod 2^64)` when `f` is EXACTLY the symbolic entry stack pointer
+/// `SP` plus a constant, folded through `BvAdd`/`BvSub` chains whose second
+/// operand is a 64-bit literal, and through the AArch64 register-copy alias
+/// `mov xD, xN` = `orr xD, xzr, xN`, which the semantics renders as
+/// `BvOr(BitVec{0,64}, xN, 64)` (`0 | x = x` for every 64-bit `x`; DECISION_QUEUE
+/// AGG-SSA-1). No other `BvOr`, constant or width.
+pub(crate) fn sp_offset(f: &Formula) -> Option<u64> {
+    match f {
+        Formula::Var(name, _) if name == "SP" => Some(0),
+        Formula::BvOr(l, r, 64) => match (&**l, &**r) {
+            (Formula::BitVec { value: 0, width: 64 }, x)
+            | (x, Formula::BitVec { value: 0, width: 64 }) => sp_offset(x),
+            _ => None,
+        },
+        Formula::BvAdd(a, c, 64) => match (&**a, &**c) {
+            (base, Formula::BitVec { value, width: 64 }) => {
+                sp_offset(base).map(|b| b.wrapping_add(*value as u64))
+            }
+            _ => None,
+        },
+        Formula::BvSub(a, c, 64) => match (&**a, &**c) {
+            (base, Formula::BitVec { value, width: 64 }) => {
+                sp_offset(base).map(|b| b.wrapping_sub(*value as u64))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "ay-proofs"))]
+mod side_condition_evidence_tests {
+    use super::*;
+
+    fn instantiated() -> ProvenEvidence {
+        ProvenEvidence::KernelInstantiated { theorem: "test".into(), original: None }
+    }
+
+    /// A side-conditioned proof is kernel evidence only when every part is.
+    #[test]
+    fn a_citation_never_hides_inside_side_conditions() {
+        let cited = || structural_citation_evidence(64);
+        assert!(ProvenEvidence::with_side_conditions(cited(), vec![instantiated()]).is_none());
+        assert!(ProvenEvidence::with_side_conditions(instantiated(), vec![cited()]).is_none());
+        assert!(
+            ProvenEvidence::with_side_conditions(instantiated(), vec![ProvenEvidence::AyValidated])
+                .is_none()
+        );
+        let ok = ProvenEvidence::with_side_conditions(instantiated(), vec![instantiated()]).unwrap();
+        assert!(OutputVerdict::Proven { evidence: ok }.is_kernel_proved());
+        let forged = ProvenEvidence::KernelRecheckableWithSideConditions {
+            value: Box::new(cited()),
+            side_conditions: vec![instantiated()],
+        };
+        assert!(!OutputVerdict::Proven { evidence: forged }.is_kernel_proved());
+    }
+}
+
+#[cfg(test)]
+mod sp_offset_mov_tests {
+    use super::*;
+
+    fn sp_minus(c: i128) -> Formula {
+        Formula::BvSub(
+            b(Formula::Var("SP".into(), Sort::BitVec(64))),
+            b(Formula::BitVec { value: c, width: 64 }),
+            64,
+        )
+    }
+    fn lit(v: i128, w: u32) -> Formula {
+        Formula::BitVec { value: v, width: w }
+    }
+
+    /// `mov xD, xN` (`BvOr(0, xN, 64)`, either operand order) is its operand's address; any
+    /// other `BvOr` is not an SP offset.
+    #[test]
+    fn sp_offset_sees_through_or_zero_only() {
+        let minus16 = Some(16u64.wrapping_neg());
+        assert_eq!(sp_offset(&Formula::BvOr(b(lit(0, 64)), b(sp_minus(16)), 64)), minus16);
+        assert_eq!(sp_offset(&Formula::BvOr(b(sp_minus(16)), b(lit(0, 64)), 64)), minus16);
+        let nested = Formula::BvOr(b(lit(0, 64)), b(Formula::BvOr(b(lit(0, 64)), b(sp_minus(16)), 64)), 64);
+        assert_eq!(sp_offset(&nested), minus16);
+        let sp = Formula::Var("SP".into(), Sort::BitVec(64));
+        for other in [
+            Formula::BvOr(b(lit(1, 64)), b(sp.clone()), 64),
+            Formula::BvOr(b(sp.clone()), b(lit(8, 64)), 64),
+            Formula::BvOr(b(Formula::Var("X1".into(), Sort::BitVec(64))), b(sp.clone()), 64),
+            Formula::BvOr(b(lit(0, 32)), b(sp.clone()), 64),
+            Formula::BvOr(b(lit(0, 64)), b(sp.clone()), 32),
+            Formula::BvAnd(b(lit(0, 64)), b(sp.clone()), 64),
+        ] {
+            assert_eq!(sp_offset(&other), None, "{other:?}");
+        }
+        let mem = Formula::Var(
+            "MEM".into(),
+            Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
+        );
+        let stored = Formula::Store(
+            b(mem),
+            b(Formula::BvOr(b(lit(0, 64)), b(sp_minus(8)), 64)),
+            b(lit(42, 8)),
+        );
+        let read = Formula::Select(b(stored), b(sp_minus(8)));
+        assert_eq!(normalize_sp_selects(&read), lit(42, 8));
+    }
+}
+
+/// STACK-ADDRESS SELECT NORMALIZER. Resolve `Select(Store(m, A1, v), A2)`
+/// STRUCTURALLY whenever both addresses are the symbolic entry stack pointer
+/// plus a constant (folded through `BvAdd`/`BvSub` chains): equal constants
+/// make the read the stored byte, differing constants make the store
+/// irrelevant. SOUNDNESS is pure modular arithmetic, no environmental
+/// assumption: `SP + c1 == SP + c2 (mod 2^64)  <=>  c1 == c2 (mod 2^64)`,
+/// because adding a shared base is a bijection on the bit-vector domain. Any
+/// address NOT of that shape stops the peel and is left for the solver, so a
+/// shape outside the argument stays exactly as hard — and as sound — as
+/// before. (Measured motivation: ay's QF_ABV lane does not converge on the
+/// raw per-byte store chains a frame prologue leaves in front of an
+/// incoming-stack-argument read — Unknown at 120s and 480s; after this
+/// rewrite the residue is trivial.)
+///
+/// Trust: moved here from `verify_output_trust_ir` unchanged so the O0 reading
+/// ([`abi_fold`]) shares the one implementation with the F1 value obligation.
+pub(crate) fn normalize_sp_selects(f: &Formula) -> Formula {
+    f.clone().map(&mut |node| {
+        let Formula::Select(arr, idx) = node else {
+            return node;
+        };
+        let Some(read_off) = sp_offset(&idx) else {
+            return Formula::Select(arr, idx);
+        };
+        let mut cur = *arr;
+        loop {
+            match cur {
+                Formula::Store(m, a, v) => match sp_offset(&a) {
+                    Some(store_off) if store_off == read_off => return *v,
+                    Some(_distinct) => cur = *m,
+                    None => {
+                        cur = Formula::Store(m, a, v);
+                        break;
+                    }
+                },
+                other => {
+                    cur = other;
+                    break;
+                }
+            }
+        }
+        Formula::Select(Box::new(cur), idx)
+    })
+}
+
+/// The O0 STRUCTURAL READING of one exit value: [`normalize_sp_selects`], then
+/// a bottom-up pass of [`abi_fold_step`] to a fixpoint at every node.
+///
+/// Every rewrite is an EXACT identity over bit-vectors and arrays, so the
+/// result denotes the same value for every input. Each rule strictly shrinks
+/// the term it fires on, so the per-node loop terminates.
+pub(crate) fn abi_fold(f: &Formula) -> Formula {
+    normalize_sp_selects(f).map(&mut |node| {
+        let mut cur = node;
+        while let Some(next) = abi_fold_step(&cur) {
+            cur = next;
+        }
+        cur
+    })
+}
+
+/// One O0 rewrite at the root of `f`, or `None`. The rules:
+///
+/// * `Ite(c, a, a) -> a`;
+/// * a non-variable term that is `SP + 0 (mod 2^64)` by [`sp_offset`] -> `SP`;
+/// * the 8-byte little-endian reassembly `load_le_bytes` builds, whose byte `i`
+///   is `v[8i+7:8i]` for ONE `v` -> `v[63:0]`;
+/// * `zero_extend(x, k)[w-1:0] -> x` and `concat(h, x)[w-1:0] -> x` when `x`
+///   is `w` bits wide (the low part of a widened or re-paired register);
+/// * `x[w-1:0] -> x` when `x` is `w` bits wide.
+fn abi_fold_step(f: &Formula) -> Option<Formula> {
+    match f {
+        Formula::Ite(_, a, c) if a == c => Some((**a).clone()),
+        Formula::Var(..) => None,
+        Formula::BvExtract { inner, high, low: 0 } => {
+            let width = high.checked_add(1)?;
+            match &**inner {
+                Formula::BvZeroExt(x, _) | Formula::BvConcat(_, x)
+                    if bv_width(x) == Some(width) =>
+                {
+                    return Some((**x).clone());
+                }
+                _ => {}
+            }
+            (bv_width(inner) == Some(width)).then(|| (**inner).clone())
+        }
+        _ if sp_offset(f) == Some(0) => Some(Formula::Var("SP".into(), Sort::BitVec(64))),
+        _ => le_bytes_reassembled(f)
+            .map(|v| Formula::BvExtract { inner: b(v.clone()), high: 63, low: 0 }),
+    }
+}
+
+/// `Some(v)` when `f` is EXACTLY `zext(b0) | zext(b1) << 8 | ... | zext(b7) << 56`
+/// at width 64 (the left-nested shape `trust-machine-sem`'s `load_le_bytes`
+/// builds) and every byte `b_i` is `v[8i+7:8i]` for one and the same `v`. Then
+/// `f == v[63:0]` bit for bit.
+fn le_bytes_reassembled(f: &Formula) -> Option<&Formula> {
+    let bytes = le_byte_chain(f)?;
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut source: Option<&Formula> = None;
+    for (i, byte) in (0u32..).zip(&bytes) {
+        let Formula::BvExtract { inner, high, low } = byte else {
+            return None;
+        };
+        if *low != 8 * i || *high != 8 * i + 7 {
+            return None;
+        }
+        match source {
+            None => source = Some(&**inner),
+            Some(seen) if seen == &**inner => {}
+            Some(_) => return None,
+        }
+    }
+    source
+}
+
+/// The bytes of a `load_le_bytes`-shaped little-endian chain, low byte first.
+fn le_byte_chain(f: &Formula) -> Option<Vec<&Formula>> {
+    match f {
+        Formula::BvZeroExt(byte, 56) => Some(vec![&**byte]),
+        Formula::BvOr(rest, shifted, 64) => {
+            let Formula::BvShl(extended, amount, 64) = &**shifted else {
+                return None;
+            };
+            let Formula::BvZeroExt(byte, 56) = &**extended else {
+                return None;
+            };
+            let mut bytes = le_byte_chain(rest)?;
+            let expected = Formula::BitVec { value: 8 * bytes.len() as i128, width: 64 };
+            if **amount != expected {
+                return None;
+            }
+            bytes.push(&**byte);
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
+/// The bit width of a bit-vector term, where it is structurally evident.
+/// `None` means "not known", never a guess.
+fn bv_width(f: &Formula) -> Option<u32> {
+    match f {
+        Formula::Var(_, Sort::BitVec(w)) => Some(*w),
+        Formula::BitVec { width, .. } => Some(*width),
+        Formula::BvExtract { high, low, .. } => high.checked_sub(*low).map(|d| d + 1),
+        Formula::BvZeroExt(x, k) | Formula::BvSignExt(x, k) => bv_width(x)?.checked_add(*k),
+        Formula::BvConcat(a, c) => bv_width(a)?.checked_add(bv_width(c)?),
+        Formula::BvAdd(_, _, w)
+        | Formula::BvSub(_, _, w)
+        | Formula::BvMul(_, _, w)
+        | Formula::BvUDiv(_, _, w)
+        | Formula::BvSDiv(_, _, w)
+        | Formula::BvURem(_, _, w)
+        | Formula::BvSRem(_, _, w)
+        | Formula::BvAnd(_, _, w)
+        | Formula::BvOr(_, _, w)
+        | Formula::BvXor(_, _, w)
+        | Formula::BvNot(_, w)
+        | Formula::BvShl(_, _, w)
+        | Formula::BvLShr(_, _, w)
+        | Formula::BvAShr(_, _, w) => Some(*w),
+        Formula::Ite(_, a, c) => {
+            let (wa, wc) = (bv_width(a)?, bv_width(c)?);
+            (wa == wc).then_some(wa)
+        }
+        _ => None,
+    }
+}
+
+/// One arrival of a machine SEGMENT at a claimed cut-point address (WS7.14).
+///
+/// The register file is captured WHOLE, not projected through the cut-point
+/// map, so the spec side can locate a live-in in it without the executor
+/// knowing which spec header this address is claimed for.
+#[derive(Clone)]
+pub(crate) struct MachineArrival {
+    /// The cut address control stopped at.
+    pub(crate) addr: u64,
+    /// Under which inputs this arrival happens (`Bool(true)` when every path
+    /// of the segment ends here).
+    pub(crate) reach: Formula,
+    /// `X0..=X30`, each the full 64-bit Formula at the arrival.
+    pub(crate) gpr: Vec<Formula>,
+    /// O0 x WS7.14: the AAPCS64-guaranteed locations (X19-X29, SP, D8-D15 and
+    /// the link register X30 as the return target) at the arrival. A header
+    /// segment is SEEDED with their entry values (`seed_abi_entry_invariant`),
+    /// so every arrival must be shown to carry them back — that is the
+    /// inductive step of the ABI half of the cut-point induction, and the
+    /// reason a loop's `RET` can be held to O0 at all.
+    pub(crate) abi: AbiExit,
+}
+
+/// Merge two arms' arrival lists under `cond` (taken when `cond` holds).
+///
+/// An address only one arm reaches keeps that arm's registers and gets the
+/// other arm's `reach` as `false`; the registers are irrelevant there because
+/// every obligation over an arrival is conditioned on its `reach`.
+fn merge_arrivals(
+    cond: &Formula,
+    taken: Vec<MachineArrival>,
+    fall: Vec<MachineArrival>,
+) -> Vec<MachineArrival> {
+    let mut merged: Vec<MachineArrival> = Vec::new();
+    let mut fall: Vec<Option<MachineArrival>> = fall.into_iter().map(Some).collect();
+    for t in taken {
+        let partner = fall
+            .iter_mut()
+            .find(|f| f.as_ref().is_some_and(|f| f.addr == t.addr))
+            .and_then(Option::take);
+        merged.push(match partner {
+            Some(f) => MachineArrival {
+                addr: t.addr,
+                reach: Formula::Ite(Box::new(cond.clone()), Box::new(t.reach), Box::new(f.reach)),
+                gpr: t
+                    .gpr
+                    .into_iter()
+                    .zip(f.gpr)
+                    .map(|(a, b)| {
+                        if a == b {
+                            a
+                        } else {
+                            Formula::Ite(Box::new(cond.clone()), Box::new(a), Box::new(b))
+                        }
+                    })
+                    .collect(),
+                abi: AbiExit::merge(cond, t.abi, f.abi),
+            },
+            None => MachineArrival {
+                addr: t.addr,
+                reach: Formula::Ite(
+                    Box::new(cond.clone()),
+                    Box::new(t.reach),
+                    Box::new(Formula::Bool(false)),
+                ),
+                gpr: t.gpr,
+                abi: t.abi,
+            },
+        });
+    }
+    for f in fall.into_iter().flatten() {
+        merged.push(MachineArrival {
+            addr: f.addr,
+            reach: Formula::Ite(
+                Box::new(cond.clone()),
+                Box::new(Formula::Bool(false)),
+                Box::new(f.reach),
+            ),
+            gpr: f.gpr,
+            abi: f.abi,
+        });
+    }
+    merged
 }
 
 /// Every AArch64 opcode that ENDS straight-line flow: reaching one means the
@@ -3350,6 +4598,14 @@ struct PathMergingExecutor<'a> {
     /// instead of running into it. `false` for every pre-existing caller: the
     /// MIR-path gate keeps failing closed on a trap exactly as before.
     model_traps: bool,
+    /// CLAIMED CUT-POINT ADDRESSES (WS7.14). Reaching one of these after at
+    /// least one instruction of the segment has executed ENDS the path with a
+    /// [`MachineArrival`] instead of continuing — which is what turns a loop
+    /// into a set of acyclic segments. The set is UNTRUSTED input: a wrong
+    /// address makes the segment stop somewhere the spec did not predict (an
+    /// arrival the obligation cannot match) or run into its own backedge
+    /// (`Err`), never a proof. EMPTY for every pre-existing caller.
+    cut_addrs: HashSet<u64>,
 }
 
 impl<'a> PathMergingExecutor<'a> {
@@ -3370,6 +4626,7 @@ impl<'a> PathMergingExecutor<'a> {
             call_counter: 0,
             divergent: HashSet::new(),
             model_traps: false,
+            cut_addrs: HashSet::new(),
         }
     }
 
@@ -3393,6 +4650,7 @@ impl<'a> PathMergingExecutor<'a> {
             call_counter: 0,
             divergent: HashSet::new(),
             model_traps: false,
+            cut_addrs: HashSet::new(),
         }
     }
 
@@ -3421,6 +4679,7 @@ impl<'a> PathMergingExecutor<'a> {
             call_counter: 0,
             divergent: divergent_pcs(code, base),
             model_traps: true,
+            cut_addrs: HashSet::new(),
         }
     }
 
@@ -3434,7 +4693,24 @@ impl<'a> PathMergingExecutor<'a> {
         let bytes: [u8; 4] = self.code[off..off + 4]
             .try_into()
             .map_err(|_| "short instruction slice".to_string())?;
-        decode_aarch64(&bytes, pc).map_err(|e| format!("decode_aarch64 failed at {pc:#x}: {e:?}"))
+        let instruction = decode_aarch64(&bytes, pc)
+            .map_err(|e| format!("decode_aarch64 failed at {pc:#x}: {e:?}"))?;
+        // Relocation identity is usable only with its supported raw operand.
+        // This shared decode reader covers ordinary, trap and loop segments.
+        if matches!(self.bl_targets.get(&(off as u64)), Some(BranchReloc::Call(_)))
+            && !crate::compiled_object::macho_branch26_operand_is_canonical(u32::from_le_bytes(bytes))
+        {
+            return Err(format!("ARM64_RELOC_BRANCH26 operand at {pc:#x} is not the canonical zero-displacement B/BL placeholder"));
+        }
+        // Every path and trap-tail reader uses object coordinates here. They
+        // authenticate control locations, but cannot supply loaded data addresses.
+        if crate::pc_object_model::requires_runtime_placement(&instruction) {
+            return Err(format!(
+                "runtime placement witness is absent for object-relative address data at {pc:#x}: {:?}",
+                instruction.opcode
+            ));
+        }
+        Ok(instruction)
     }
 
     /// The INTEGER return value the bytes leave behind at a `RET`, read out of
@@ -3473,29 +4749,94 @@ impl<'a> PathMergingExecutor<'a> {
         }
     }
 
+    /// The O0 X18 scan of a DIVERGENT trap tail the executor does not run:
+    /// walk it straight-line from `start` to its `BRK` and report whether any
+    /// instruction writes X18.
+    ///
+    /// Only register INDICES are read from the effects, so evaluating them
+    /// against the state at the tail's entry is exact for this purpose. An
+    /// instruction the decoder or the semantics cannot account for fails
+    /// closed: the gate cannot say it does not write X18.
+    fn trap_tail_writes_x18(&self, start: u64, state: &MachineState) -> Result<bool, String> {
+        let mut pc = start;
+        loop {
+            let insn = self.decode_at(pc)?;
+            if insn.opcode == Opcode::Brk {
+                return Ok(false);
+            }
+            let effects = self.sem.effects(state, &insn).map_err(|e| {
+                format!("Aarch64Semantics::effects failed in the trap tail at {pc:#x}: {e:?}")
+            })?;
+            if effects.iter().any(|e| matches!(e, Effect::RegWrite { index: 18, .. })) {
+                return Ok(true);
+            }
+            pc += 4;
+        }
+    }
+
     /// Execute from `pc` carrying `state` and the `visited` PCs on THIS path,
     /// returning the merged return-register Formula at the reachable RET(s).
+    ///
+    /// `x18_written` says whether this path has already written X18 (O0).
     fn run(
         &mut self,
         mut pc: u64,
         mut state: MachineState,
         mut visited: Vec<u64>,
         depth: u32,
+        mut x18_written: bool,
     ) -> Result<PathOutcome, String> {
         if depth > MAX_DEPTH {
             return Err("fork-depth budget exceeded (fail-closed)".into());
         }
         loop {
+            // CUT-POINT ARRIVAL (WS7.14). A claimed cut address reached after
+            // the segment's first instruction ends this path: the register
+            // file is handed back whole, and the path contributes no return
+            // value (`reach = false` for the RET obligation). Checked BEFORE
+            // the backedge test, because a loop's latch legitimately jumps
+            // back to the header that started this very segment.
+            //
+            // O0: the path does not RETURN here, so like a divergent path it
+            // carries the ENTRY values in `abi` (it owes nothing at a `RET`
+            // in THIS segment); the locations it does hold are captured in
+            // the arrival, where the cut-point induction must show they are
+            // still the entry values. Its X18 writes count as they stand.
+            if !visited.is_empty() && self.cut_addrs.contains(&pc) {
+                let link = state.read_gpr(30, 64);
+                return Ok(PathOutcome {
+                    value: Formula::BitVec { value: 0, width: self.out_width },
+                    reach: Formula::Bool(false),
+                    abi: AbiExit::entry(),
+                    x18_written: Formula::Bool(x18_written),
+                    arrivals: vec![MachineArrival {
+                        addr: pc,
+                        reach: Formula::Bool(true),
+                        gpr: state.gpr.to_vec(),
+                        abi: AbiExit::at(&state, link),
+                    }],
+                });
+            }
+
             // TRAP TAIL (F1 gate only). This PC provably cannot reach a `RET`
             // without taking a branch — it is the `bl <panic>; brk` tail the
             // trust-cg `Trap` lowering emits for a failed `Inst::Assert`. Such a
             // path yields NO return value, so we record `reach = false` and a
             // placeholder value that the discharge is never allowed to use (the
             // obligation is conditioned on `reach`). Off for every other caller.
+            //
+            // O0: a path that never returns owes its caller no callee-saved
+            // register, so it carries the ENTRY values (vacuous for every
+            // equality). X18 is different — "never written" covers this path
+            // too — so the tail the executor does not run is scanned for it.
             if self.model_traps && self.divergent.contains(&pc) {
+                let tail_writes_x18 = self.trap_tail_writes_x18(pc, &state)?;
                 return Ok(PathOutcome {
                     value: Formula::BitVec { value: 0, width: self.out_width },
                     reach: Formula::Bool(false),
+                    abi: AbiExit::entry(),
+                    x18_written: Formula::Bool(x18_written || tail_writes_x18),
+                    arrivals: Vec::new(),
                 });
             }
 
@@ -3513,23 +4854,49 @@ impl<'a> PathMergingExecutor<'a> {
             let insn = self.decode_at(pc)?;
             let opcode = insn.opcode;
 
+            let effects = self
+                .sem
+                .effects(&state, &insn)
+                .map_err(|e| format!("Aarch64Semantics::effects failed at {pc:#x}: {e:?}"))?;
+
+            // O0: any write of X18 on this path (W18 included — it is the same
+            // register index). Checked before the effects are partitioned, so no
+            // instruction class can carry such a write past the scan.
+            if effects.iter().any(|e| matches!(e, Effect::RegWrite { index: 18, .. })) {
+                x18_written = true;
+            }
+
             // A RET ends this path; read the return register now. A scalar float
             // result is returned in V0's low D-lane (`read_fpr(0, out_width)` =
             // `BvExtract(V0)[out_width-1:0]`), matching the IR-semantics side's
             // `vn_d_lane`. Integer/pointer results are in X0/W0.
+            //
+            // O0: the RET's own target register (X30 unless `ret xN` names
+            // another) is where control goes; it must equal the entry X30. The
+            // callee-saved locations are read from the state as it stands here.
             if opcode == Opcode::Ret {
                 let value = if self.out_is_float {
                     state.read_fpr(0, self.out_width)
                 } else {
                     self.read_int_return(&state)?
                 };
-                return Ok(PathOutcome { value, reach: Formula::Bool(true) });
+                let target = effects
+                    .iter()
+                    .find_map(|e| match e {
+                        Effect::Return { target } => Some(target.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!("RET at {pc:#x} produced no Return effect (fail-closed)")
+                    })?;
+                return Ok(PathOutcome {
+                    value,
+                    reach: Formula::Bool(true),
+                    abi: AbiExit::at(&state, target),
+                    x18_written: Formula::Bool(x18_written),
+                    arrivals: Vec::new(),
+                });
             }
-
-            let effects = self
-                .sem
-                .effects(&state, &insn)
-                .map_err(|e| format!("Aarch64Semantics::effects failed at {pc:#x}: {e:?}"))?;
 
             // Separate control-flow effects from the data-plane effects.
             let mut cond_branch: Option<(Condition, Formula, Formula)> = None;
@@ -3577,10 +4944,12 @@ impl<'a> PathMergingExecutor<'a> {
                     Effect::PcUpdate { value } => pc_update = Some(value.clone()),
                     Effect::Return { .. } => saw_return = true,
                     // A `bl` to a LOCAL PURE callee is COMPOSED below (see
-                    // `model_local_call`). We do NOT thread the Call's own
-                    // link-register write here; the call modeling sets the post-call
-                    // architectural state explicitly. Any non-composable call fails
-                    // closed in `model_local_call`.
+                    // `model_local_call`). The Call's own link-register write
+                    // (X30 := pc+4) is not threaded here because the call
+                    // modeling sets the whole post-call architectural state
+                    // explicitly — including X30, which it never leaves equal to
+                    // the entry LR (O0). Any non-composable call fails closed in
+                    // `model_local_call`.
                     Effect::Call { .. } => {
                         is_call = true;
                     }
@@ -3597,7 +4966,7 @@ impl<'a> PathMergingExecutor<'a> {
                 // (result in x0, caller-saved registers + flags havoced), and
                 // returns control to pc+4 (the AAPCS64 return address in x30).
                 self.model_local_call(pc, &mut state)?;
-                if visited.contains(&(pc + 4)) {
+                if visited.contains(&(pc + 4)) && !self.cut_addrs.contains(&(pc + 4)) {
                     return Err(format!("backedge after call at {pc:#x} (fail-closed)"));
                 }
                 pc += 4;
@@ -3660,7 +5029,7 @@ impl<'a> PathMergingExecutor<'a> {
                         let Some(target_pc) = const_addr(&other) else {
                             return Err(format!("unmodeled pc-update at {pc:#x} (fail-closed)"));
                         };
-                        if visited.contains(&target_pc) {
+                        if visited.contains(&target_pc) && !self.cut_addrs.contains(&target_pc) {
                             return Err(format!("backedge at pc-update {pc:#x} (fail-closed)"));
                         }
                         pc = target_pc;
@@ -3674,15 +5043,20 @@ impl<'a> PathMergingExecutor<'a> {
             if let Some((path_cond, target_pc)) = fork {
                 let fall_pc = pc + 4;
 
-                // LOOP SAFETY: a branch target already on this path is a backedge.
-                if visited.contains(&target_pc) || visited.contains(&fall_pc) {
+                // LOOP SAFETY: a branch target already on this path is a backedge
+                // — unless it is a claimed cut address, where the loop top
+                // ends the path with an arrival instead (WS7.14).
+                let revisits = |a: u64| visited.contains(&a) && !self.cut_addrs.contains(&a);
+                if revisits(target_pc) || revisits(fall_pc) {
                     return Err(format!(
                         "loop/backedge at conditional branch {pc:#x} (fail-closed)"
                     ));
                 }
 
-                let taken = self.run(target_pc, state.clone(), visited.clone(), depth + 1)?;
-                let fall = self.run(fall_pc, state.clone(), visited.clone(), depth + 1)?;
+                let taken =
+                    self.run(target_pc, state.clone(), visited.clone(), depth + 1, x18_written)?;
+                let fall =
+                    self.run(fall_pc, state.clone(), visited.clone(), depth + 1, x18_written)?;
 
                 // MERGE. The Ite condition IS the real machine branch condition, so a
                 // wrong path assignment makes ay find a counterexample (teeth).
@@ -3698,6 +5072,15 @@ impl<'a> PathMergingExecutor<'a> {
                         Box::new(fall.reach),
                     ),
                 };
+                // O0 merges slot by slot under the SAME machine condition; a
+                // location both paths leave alone stays syntactically itself.
+                let abi = AbiExit::merge(&path_cond, taken.abi, fall.abi);
+                let x18_written = ite_unless_same(&path_cond, taken.x18_written, fall.x18_written);
+                let arrivals = if taken.arrivals.is_empty() && fall.arrivals.is_empty() {
+                    Vec::new()
+                } else {
+                    merge_arrivals(&path_cond, taken.arrivals, fall.arrivals)
+                };
                 return Ok(PathOutcome {
                     value: Formula::Ite(
                         Box::new(path_cond),
@@ -3705,13 +5088,51 @@ impl<'a> PathMergingExecutor<'a> {
                         Box::new(fall.value),
                     ),
                     reach,
+                    abi,
+                    x18_written,
+                    arrivals,
                 });
             }
 
             if let Some(target) = uncond_target {
+                // TAIL CALL. A `b` carrying a relocation does not branch where
+                // its encoded offset says: an unresolved external BRANCH26 leaves
+                // imm26 = 0, which read literally is a branch to itself and used
+                // to be refused below as a "backedge" (a fail-closed false
+                // positive on every relocated tail call, seen at `-O3`). The
+                // callee returns straight to this function's caller, so the path
+                // is `bl callee; ret`: compose the call exactly as a `bl`
+                // (unknown callee, unmodeled relocation: fail closed there) and
+                // return its result. A float result would come back in V0, which
+                // call composition does not model, so that fails closed too.
+                let relocated = pc
+                    .checked_sub(self.base)
+                    .is_some_and(|off| self.bl_targets.contains_key(&off));
+                if relocated {
+                    if self.out_is_float {
+                        return Err(format!(
+                            "tail call at {pc:#x} returns a float; call composition models \
+                             X0 only (fail-closed)"
+                        ));
+                    }
+                    // O0 AT THE TAIL `b`. The callee returns through X30 straight
+                    // to OUR caller and hands back the callee-saved state it was
+                    // given, so what our caller sees is this state as it stands at
+                    // the `b` — snapshot it BEFORE the call's havoc.
+                    let abi = AbiExit::at(&state, state.read_gpr(30, 64));
+                    self.model_local_call(pc, &mut state)?;
+                    let value = self.read_int_return(&state)?;
+                    return Ok(PathOutcome {
+                        value,
+                        reach: Formula::Bool(true),
+                        abi,
+                        x18_written: Formula::Bool(x18_written),
+                        arrivals: Vec::new(),
+                    });
+                }
                 let target_pc = const_addr(&target)
                     .ok_or_else(|| format!("indirect branch at {pc:#x} (fail-closed)"))?;
-                if visited.contains(&target_pc) {
+                if visited.contains(&target_pc) && !self.cut_addrs.contains(&target_pc) {
                     return Err(format!("backedge at unconditional branch {pc:#x} (fail-closed)"));
                 }
                 pc = target_pc;
@@ -3741,10 +5162,18 @@ impl<'a> PathMergingExecutor<'a> {
     ///     because the callee may clobber them — so any post-call read of a
     ///     caller-saved register the bytes wrongly assume survives becomes a fresh
     ///     variable that ay will refute against the (clobber-free) IR auto-spec;
-    ///   * callee-saved registers X19..X28, FP/LR (X29/X30) and SP are preserved
-    ///     (the AAPCS64 callee-save contract). X30 (the link register) holds the
-    ///     return address but is not read by our straight-line return paths; we
-    ///     leave it symbolic, which is sound (a read would just be a fresh value).
+    ///   * callee-saved registers X19..X28, FP (X29), SP and the low 64 bits of
+    ///     V8..V15 are preserved (the AAPCS64 callee-save contract). That is an
+    ///     ASSUMPTION about the callee, and it is discharged: PHASE 0 admits a
+    ///     callee only when its own verdict is Proven, and a Proven verdict now
+    ///     includes O0 over the callee's bytes (see [`abi_guarantee_residue`]);
+    ///   * the link register X30 is HAVOCED. The `bl` writes X30 := pc+4 for the
+    ///     callee to return through, and AAPCS64 does not oblige the callee to
+    ///     hand it back, so after the call X30 is a fresh value — in particular
+    ///     never the entry LR, which is exactly what makes a caller that forgets
+    ///     to save and restore LR fail O0 at its own `RET` (design fact V1);
+    ///   * V0..V7 and V16..V31 are havoced, and so are the UPPER 64 bits of
+    ///     V8..V15 (AAPCS64 preserves only their low halves).
     fn model_local_call(&mut self, pc: u64, state: &mut MachineState) -> Result<(), String> {
         let off = pc
             .checked_sub(self.base)
@@ -3793,6 +5222,24 @@ impl<'a> PathMergingExecutor<'a> {
             c: Formula::Var(format!("CALLCLOBBER_{tag}_C"), Sort::Bool),
             v: Formula::Var(format!("CALLCLOBBER_{tag}_V"), Sort::Bool),
         };
+        // O0 / V1: the `bl` wrote X30 := pc+4 and the callee owes us nothing
+        // back in it, so the post-call link register is a FRESH value.
+        state.gpr[30] = Formula::Var(format!("CALLCLOBBER_{tag}_X30"), Sort::BitVec(64));
+        // The SIMD/FP file: everything is caller-saved except the low 64 bits
+        // of V8..V15, which keep their pre-call value under a fresh upper half.
+        for i in 0..32usize {
+            let fresh = |bits: u32| {
+                Formula::Var(format!("CALLCLOBBER_{tag}_V{i}_{bits}"), Sort::BitVec(bits))
+            };
+            state.fpr[i] = if (8..=15).contains(&i) {
+                Formula::BvConcat(
+                    b(fresh(64)),
+                    b(Formula::BvExtract { inner: b(state.fpr[i].clone()), high: 63, low: 0 }),
+                )
+            } else {
+                fresh(128)
+            };
+        }
         // Install the result. A 32-bit (W) return zero-extends into X0 (AArch64
         // W-write semantics); `result` already has the callee's return width, so
         // widen to the 64-bit slot exactly as `read_gpr` will re-extract it.
@@ -3813,6 +5260,10 @@ fn const_addr(f: &Formula) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "verify_output/placement_tests.rs"]
+mod placement_tests;
+
+#[cfg(test)]
 fn symbolic_machine_output(
     code: &[u8],
     base: u64,
@@ -3821,13 +5272,12 @@ fn symbolic_machine_output(
 ) -> Result<Formula, String> {
     let mut exec = PathMergingExecutor::new(code, base, out_width, out_is_float);
     let state = MachineState::symbolic();
-    exec.run(base, state, Vec::new(), 0).map(|outcome| outcome.value)
+    exec.run(base, state, Vec::new(), 0, false).map(|outcome| outcome.value)
 }
 
-/// Bundle-aware [`symbolic_machine_output`]: the executor consults `env` +
-/// `bl_targets` so a `bl` to a LOCAL PURE Proven callee is composed (its derived
-/// output substituted at the call) and all OTHER calls fail closed. Identical to
-/// [`symbolic_machine_output`] when `env`/`bl_targets` are empty.
+/// The return-value half of [`symbolic_machine_outcome_env`], for unit tests
+/// that compare machine-side value formulas.
+#[cfg(test)]
 fn symbolic_machine_output_env(
     code: &[u8],
     base: u64,
@@ -3836,16 +5286,33 @@ fn symbolic_machine_output_env(
     env: &CalleeEnv,
     bl_targets: &HashMap<u64, BranchReloc>,
 ) -> Result<Formula, String> {
+    symbolic_machine_outcome_env(code, base, out_width, out_is_float, env, bl_targets)
+        .map(|outcome| outcome.value)
+}
+
+/// Bundle-aware [`symbolic_machine_output`]: the executor consults `env` +
+/// `bl_targets` so a `bl` to a LOCAL PURE Proven callee is composed (its derived
+/// output substituted at the call) and all OTHER calls fail closed. Identical to
+/// [`symbolic_machine_output`] when `env`/`bl_targets` are empty, except that it
+/// returns the whole [`PathOutcome`] so the caller can discharge O0 as well.
+fn symbolic_machine_outcome_env(
+    code: &[u8],
+    base: u64,
+    out_width: u32,
+    out_is_float: bool,
+    env: &CalleeEnv,
+    bl_targets: &HashMap<u64, BranchReloc>,
+) -> Result<PathOutcome, String> {
     let mut exec =
         PathMergingExecutor::new_env(code, base, out_width, out_is_float, env, bl_targets);
     let state = MachineState::symbolic();
-    exec.run(base, state, Vec::new(), 0).map(|outcome| outcome.value)
+    exec.run(base, state, Vec::new(), 0, false)
 }
 
 /// Trust (F1 gate): the byte-derived machine side WITH trap modeling, returning
 /// both the return-value Formula and the `reach` predicate.
 ///
-/// This is [`symbolic_machine_output_env`] with `model_traps` on. It is the ONLY
+/// This is [`symbolic_machine_outcome_env`] with `model_traps` on. It is the ONLY
 /// caller that gets a non-trivial `reach`, and it exists so the trust-ir gate can
 /// discharge the assert-guarded obligation instead of failing closed on every
 /// function whose `Inst::Assert` lowered to a `Trap` block.
@@ -3862,27 +5329,108 @@ pub(crate) fn symbolic_machine_outcome_traps(
     let relocs = EMPTY_RELOCS.get_or_init(HashMap::new);
     let mut exec = PathMergingExecutor::new_traps(code, base, out_width, out_is_float, env, relocs);
     let state = MachineState::symbolic();
-    exec.run(base, state, Vec::new(), 0)
+    exec.run(base, state, Vec::new(), 0, false)
+}
+
+/// Trust (F1 gate, WS7.14): ONE ACYCLIC SEGMENT of the emitted bytes, with
+/// trap modeling on, from `start_pc` in `state`, stopping at every address in
+/// `cut_addrs` (after the first instruction) with a [`MachineArrival`].
+///
+/// With an empty `cut_addrs` and the symbolic entry state at `base` this is
+/// byte-for-byte [`symbolic_machine_outcome_traps`].
+pub(crate) fn symbolic_machine_segment(
+    code: &[u8],
+    base: u64,
+    out_width: u32,
+    start_pc: u64,
+    state: MachineState,
+    cut_addrs: &HashSet<u64>,
+) -> Result<PathOutcome, String> {
+    static EMPTY_ENV: std::sync::OnceLock<CalleeEnv> = std::sync::OnceLock::new();
+    static EMPTY_RELOCS: std::sync::OnceLock<HashMap<u64, BranchReloc>> =
+        std::sync::OnceLock::new();
+    let env = EMPTY_ENV.get_or_init(CalleeEnv::empty);
+    let relocs = EMPTY_RELOCS.get_or_init(HashMap::new);
+    let mut exec = PathMergingExecutor::new_traps(code, base, out_width, false, env, relocs);
+    exec.cut_addrs = cut_addrs.clone();
+    exec.run(start_pc, state, Vec::new(), 0, false)
+}
+
+/// The targets of every BACKWARD direct branch in `code` (a `b`, `b.cond`,
+/// `cbz`/`cbnz` or `tbz`/`tbnz` whose constant target is at or before the
+/// branch itself), in ascending address order (WS7.14).
+///
+/// These are the machine-side loop-header CANDIDATES. Nothing is trusted
+/// about them: the cut-point map they seed is checked by the segment
+/// obligations, and a candidate that is not a header the spec predicts is an
+/// arrival nothing matches. A `bl` is a call, not a loop, and is skipped; an
+/// undecodable word contributes nothing (the executor refuses it if control
+/// reaches it).
+pub(crate) fn backward_branch_targets(code: &[u8], base: u64) -> Vec<u64> {
+    let sem = Aarch64Semantics;
+    let probe = MachineState::symbolic();
+    let mut targets: Vec<u64> = Vec::new();
+    for i in 0..code.len() / 4 {
+        let pc = base + (i as u64) * 4;
+        let Some(bytes) = code.get(i * 4..i * 4 + 4).and_then(|s| <[u8; 4]>::try_from(s).ok())
+        else {
+            continue;
+        };
+        let Ok(insn) = decode_aarch64(&bytes, pc) else { continue };
+        let Ok(effects) = sem.effects(&probe, &insn) else { continue };
+        if effects.iter().any(|e| matches!(e, Effect::Call { .. })) {
+            continue;
+        }
+        let pc_advance = Formula::BvAdd(
+            Box::new(probe.pc.clone()),
+            Box::new(Formula::BitVec { value: 4, width: 64 }),
+            64,
+        );
+        for e in &effects {
+            let target = match e {
+                Effect::Branch { target } => const_addr(target),
+                Effect::ConditionalBranch { target, .. } => const_addr(target),
+                Effect::PcUpdate { value } if *value != pc_advance => match value {
+                    Formula::Ite(_, taken, _) => const_addr(taken),
+                    other => const_addr(other),
+                },
+                _ => None,
+            };
+            if let Some(t) = target
+                && t <= pc
+                && !targets.contains(&t)
+            {
+                targets.push(t);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets
 }
 
 /// Derive the machine-side Formula from an already-emitted object. Keeping this
 /// separate from emission is what lets the build gate retain exact production
 /// bytes when the AArch64/Mach-O decoder does not support their target or shape.
 ///
-/// `emitted_arch` is the ISA the object was emitted for. The executor below is
+/// The backend names the requested ISA and object format. The executor below is
 /// hard-wired to `decode_aarch64` + [`Aarch64Semantics`], and an instruction
 /// decoder handed the wrong ISA does not reliably error — it can mis-read a
 /// foreign encoding as a plausible A64 word and hand the discharge a machine
 /// side that never existed. The claim this gate awards is "these BYTES compute
 /// the IR semantics", so bytes whose ISA the gate cannot name are refused here
 /// rather than interpreted on a guess.
+///
+/// Returns the machine-side return value AND O0's residue (see
+/// [`abi_guarantee_residue`]) read off the same execution of the same bytes.
 fn decode_emitted_object_env(
     func: &VerifiableFunction,
     obj: &[u8],
     out_width: u32,
     env: &CalleeEnv,
-    emitted_arch: TrustCgTargetArch,
-) -> Result<Formula, String> {
+    backend: &TrustCgCodegenBackend,
+) -> Result<(Formula, Vec<AbiConjunct>), String> {
+    backend.require_object_target(obj)?;
+    let emitted_arch = backend.target_arch();
     if emitted_arch != TrustCgTargetArch::AArch64 {
         return Err(format!(
             "byte-level output preservation is wired for AArch64 machine semantics only; \
@@ -3900,9 +5448,10 @@ fn decode_emitted_object_env(
     // A scalar float return lives in V0's D-lane, not X0 — tell the executor which
     // register the RET reads.
     let out_is_float = func.body.return_ty.is_float();
-    let machine_out =
-        symbolic_machine_output_env(&code, base, out_width, out_is_float, env, &bl_targets)?;
-    Ok(machine_out)
+    let outcome =
+        symbolic_machine_outcome_env(&code, base, out_width, out_is_float, env, &bl_targets)?;
+    let abi_residue = abi_guarantee_residue(&outcome, platform_reserves_x18(obj));
+    Ok((outcome.value, abi_residue))
 }
 
 /// Parse the `__text` section's `ARM64_RELOC_BRANCH26` (type 2) relocations from a
@@ -4002,12 +5551,14 @@ fn parse_text_branch26_relocs(obj: &[u8]) -> Result<HashMap<u64, BranchReloc>, S
         if r_type == 2 && r_extern == 1 && r_pcrel == 1 && r_length == 2 {
             match sym_name(r_symbolnum) {
                 Ok(name) => {
-                    map.insert(r_address, BranchReloc::Call(name));
+                    map.entry(r_address).and_modify(|value| *value=BranchReloc::Unmodeled)
+                        .or_insert(BranchReloc::Call(name));
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            map.insert(r_address, BranchReloc::Unmodeled);
+            map.entry(r_address).and_modify(|value| *value=BranchReloc::Unmodeled)
+                .or_insert(BranchReloc::Unmodeled);
         }
     }
     Ok(map)
@@ -4027,19 +5578,38 @@ enum BranchReloc {
 // PART 3 — Formula -> ay::Term translation + discharge.
 // ===========================================================================
 
-fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Term {
-    match sort {
-        Sort::BitVec(w) => solver.bv_var(name, *w),
-        Sort::Bool => solver.bool_var(name),
+/// A solver error, rendered for [`Discharge::Unknown`].
+///
+/// Every `try_*` below used to be `.expect()`, i.e. a panic inside the
+/// verifier's trusted core that aborts the compiler mid-proof rather than
+/// reporting that the obligation could not be discharged. `discharge_valid`
+/// already fail-closes exactly this way for `try_not`/`try_assert_term`; this
+/// extends the same treatment to the whole translation.
+fn solver_err(op: &str, e: &ay::SolverError) -> String {
+    format!("ay {op} failed: {e:?}")
+}
+
+/// Declare (or re-use, when the exact declaration repeats) the ay constant for
+/// `Var(name, sort)`.
+///
+/// Uses `try_declare_const`, never the `bv_var`/`bool_var`/`declare_const`
+/// wrappers: those PANIC on a name ay reserves (a theory-operator spelling such
+/// as `select`) or on one name declared at two sorts. The gate's own names are
+/// generated, but this is the translation for every discharge, so either case
+/// must be an undischarged obligation, not an aborted compile.
+fn var_term(solver: &mut Solver, name: &str, sort: &Sort) -> Result<Term, String> {
+    let ay_sort = match sort {
+        Sort::BitVec(w) => ay::Sort::bitvec(*w),
+        Sort::Bool => ay::Sort::Bool,
         Sort::Array(idx, elem) => {
             let (Sort::BitVec(iw), Sort::BitVec(ew)) = (idx.as_ref(), elem.as_ref()) else {
-                panic!("unsupported array sort for Var {name}: {sort:?}");
+                return Err(format!("unsupported array sort for Var {name}: {sort:?}"));
             };
-            solver
-                .declare_const(name, ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew)))
+            ay::Sort::array(ay::Sort::bitvec(*iw), ay::Sort::bitvec(*ew))
         }
-        other => panic!("unexpected Var sort for {name}: {other:?}"),
-    }
+        other => return Err(format!("unexpected Var sort for {name}: {other:?}")),
+    };
+    solver.try_declare_const(name, ay_sort).map_err(|e| solver_err("declare_const", &e))
 }
 
 fn bin2(
@@ -4047,20 +5617,22 @@ fn bin2(
     a: &Formula,
     c: &Formula,
     op: fn(&mut Solver, Term, Term) -> Result<Term, ay::SolverError>,
-) -> Term {
-    let a = formula_to_term(solver, a);
-    let c = formula_to_term(solver, c);
-    op(solver, a, c).expect("binary op")
+) -> Result<Term, String> {
+    let a = formula_to_term(solver, a)?;
+    let c = formula_to_term(solver, c)?;
+    op(solver, a, c).map_err(|e| solver_err("binary op", &e))
 }
 
-/// Translate a trust-types `Formula` into an `ay::Term` on `solver`.
-fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
+/// Translate a trust-types `Formula` into an `ay::Term` on `solver`, or report
+/// why it could not be translated. An `Err` here is an UNDISCHARGED obligation,
+/// never a proof: every caller turns it into [`Discharge::Unknown`].
+pub(crate) fn formula_to_term(solver: &mut Solver, f: &Formula) -> Result<Term, String> {
     match f {
         Formula::Var(name, sort) => var_term(solver, name, sort),
-        Formula::Bool(v) => solver.bool_const(*v),
-        Formula::BitVec { value, width } => {
-            solver.try_bv_const_bigint(&BigInt::from(*value), *width).expect("bv const")
-        }
+        Formula::Bool(v) => Ok(solver.bool_const(*v)),
+        Formula::BitVec { value, width } => solver
+            .try_bv_const_bigint(&BigInt::from(*value), *width)
+            .map_err(|e| solver_err("bv const", &e)),
         Formula::BvAdd(a, c, _) => bin2(solver, a, c, Solver::try_bvadd),
         Formula::BvSub(a, c, _) => bin2(solver, a, c, Solver::try_bvsub),
         Formula::BvMul(a, c, _) => bin2(solver, a, c, Solver::try_bvmul),
@@ -4076,20 +5648,20 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
         Formula::BvURem(a, c, _) => bin2(solver, a, c, Solver::try_bvurem),
         Formula::BvSRem(a, c, _) => bin2(solver, a, c, Solver::try_bvsrem),
         Formula::BvNot(a, _) => {
-            let a = formula_to_term(solver, a);
-            solver.try_bvnot(a).expect("bvnot")
+            let a = formula_to_term(solver, a)?;
+            solver.try_bvnot(a).map_err(|e| solver_err("bvnot", &e))
         }
         Formula::BvZeroExt(a, bits) => {
-            let a = formula_to_term(solver, a);
-            solver.try_bvzeroext(a, *bits).expect("bvzeroext")
+            let a = formula_to_term(solver, a)?;
+            solver.try_bvzeroext(a, *bits).map_err(|e| solver_err("bvzeroext", &e))
         }
         Formula::BvSignExt(a, bits) => {
-            let a = formula_to_term(solver, a);
-            solver.try_bvsignext(a, *bits).expect("bvsignext")
+            let a = formula_to_term(solver, a)?;
+            solver.try_bvsignext(a, *bits).map_err(|e| solver_err("bvsignext", &e))
         }
         Formula::BvExtract { inner, high, low } => {
-            let inner = formula_to_term(solver, inner);
-            solver.try_bvextract(inner, *high, *low).expect("bvextract")
+            let inner = formula_to_term(solver, inner)?;
+            solver.try_bvextract(inner, *high, *low).map_err(|e| solver_err("bvextract", &e))
         }
         Formula::BvULt(a, c, _) => bin2(solver, a, c, Solver::try_bvult),
         Formula::BvULe(a, c, _) => bin2(solver, a, c, Solver::try_bvule),
@@ -4097,34 +5669,40 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
         Formula::BvSLe(a, c, _) => bin2(solver, a, c, Solver::try_bvsle),
         Formula::Eq(a, c) => bin2(solver, a, c, Solver::try_eq),
         Formula::Not(a) => {
-            let a = formula_to_term(solver, a);
-            solver.try_not(a).expect("not")
+            let a = formula_to_term(solver, a)?;
+            solver.try_not(a).map_err(|e| solver_err("not", &e))
         }
         Formula::And(terms) => {
-            let ts: Vec<Term> = terms.iter().map(|t| formula_to_term(solver, t)).collect();
-            solver.try_and_many(&ts).expect("and")
+            let ts = terms
+                .iter()
+                .map(|t| formula_to_term(solver, t))
+                .collect::<Result<Vec<Term>, String>>()?;
+            solver.try_and_many(&ts).map_err(|e| solver_err("and", &e))
         }
         Formula::Or(terms) => {
-            let ts: Vec<Term> = terms.iter().map(|t| formula_to_term(solver, t)).collect();
-            solver.try_or_many(&ts).expect("or")
+            let ts = terms
+                .iter()
+                .map(|t| formula_to_term(solver, t))
+                .collect::<Result<Vec<Term>, String>>()?;
+            solver.try_or_many(&ts).map_err(|e| solver_err("or", &e))
         }
         Formula::Ite(cond, then_v, else_v) => {
-            let c = formula_to_term(solver, cond);
-            let t = formula_to_term(solver, then_v);
-            let e = formula_to_term(solver, else_v);
-            solver.try_ite(c, t, e).expect("ite")
+            let c = formula_to_term(solver, cond)?;
+            let t = formula_to_term(solver, then_v)?;
+            let e = formula_to_term(solver, else_v)?;
+            solver.try_ite(c, t, e).map_err(|e| solver_err("ite", &e))
         }
         // ---- Arrays (Ldr / Str — memory store/load) ----
         Formula::Select(arr, idx) => {
-            let a = formula_to_term(solver, arr);
-            let i = formula_to_term(solver, idx);
-            solver.try_select(a, i).expect("select")
+            let a = formula_to_term(solver, arr)?;
+            let i = formula_to_term(solver, idx)?;
+            solver.try_select(a, i).map_err(|e| solver_err("select", &e))
         }
         Formula::Store(arr, idx, val) => {
-            let a = formula_to_term(solver, arr);
-            let i = formula_to_term(solver, idx);
-            let v = formula_to_term(solver, val);
-            solver.try_store(a, i, v).expect("store")
+            let a = formula_to_term(solver, arr)?;
+            let i = formula_to_term(solver, idx)?;
+            let v = formula_to_term(solver, val)?;
+            solver.try_store(a, i, v).map_err(|e| solver_err("store", &e))
         }
         // ---- IEEE-754 floating point (the f64 FADD shape) ----
         // A rounding-mode literal term (rm arg of `fp.add`).
@@ -4136,59 +5714,66 @@ fn formula_to_term(solver: &mut Solver, f: &Formula) -> Term {
                 RoundingMode::RTN => "RTN",
                 RoundingMode::RTZ => "RTZ",
             };
-            solver.try_fp_rounding_mode(name).expect("fp rounding mode")
+            solver.try_fp_rounding_mode(name).map_err(|e| solver_err("fp rounding mode", &e))
         }
         // `(fp sign exp sig)` — reinterpret a `(eb+sb)`-wide BV as a float by
         // extracting the IEEE fields (mirrors ay_bridge::fp_from_bv_expr and the
         // hardware register-lane reinterpret). Bit-preserving.
         Formula::FpFromBits { bits, eb, sb } => {
-            let bv = formula_to_term(solver, bits);
+            let bv = formula_to_term(solver, bits)?;
             let sig_w = sb - 1;
             let total = eb + sb;
-            let sign = solver.try_bvextract(bv.clone(), total - 1, total - 1).expect("fp sign");
-            let exp = solver.try_bvextract(bv.clone(), total - 2, sig_w).expect("fp exp");
-            let sig = solver.try_bvextract(bv, sig_w - 1, 0).expect("fp sig");
-            solver.try_fp_from_bvs(sign, exp, sig, *eb, *sb).expect("fp_from_bvs")
+            let sign = solver
+                .try_bvextract(bv.clone(), total - 1, total - 1)
+                .map_err(|e| solver_err("fp sign", &e))?;
+            let exp = solver
+                .try_bvextract(bv.clone(), total - 2, sig_w)
+                .map_err(|e| solver_err("fp exp", &e))?;
+            let sig =
+                solver.try_bvextract(bv, sig_w - 1, 0).map_err(|e| solver_err("fp sig", &e))?;
+            solver
+                .try_fp_from_bvs(sign, exp, sig, *eb, *sb)
+                .map_err(|e| solver_err("fp_from_bvs", &e))
         }
         // `(fp.to_ieee_bv <fp>)` — the exact inverse: FP -> its IEEE bit pattern.
         Formula::FpToIeeeBv(a) => {
-            let x = formula_to_term(solver, a);
-            solver.try_fp_to_ieee_bv(x).expect("fp_to_ieee_bv")
+            let x = formula_to_term(solver, a)?;
+            solver.try_fp_to_ieee_bv(x).map_err(|e| solver_err("fp_to_ieee_bv", &e))
         }
         // `(fp.add rm a b)`.
         Formula::FpAdd(rm, a, c) => {
-            let rm = formula_to_term(solver, rm);
-            let a = formula_to_term(solver, a);
-            let c = formula_to_term(solver, c);
-            solver.try_fp_add(rm, a, c).expect("fp_add")
+            let rm = formula_to_term(solver, rm)?;
+            let a = formula_to_term(solver, a)?;
+            let c = formula_to_term(solver, c)?;
+            solver.try_fp_add(rm, a, c).map_err(|e| solver_err("fp_add", &e))
         }
         // `(fp.sub rm a b)`.
         Formula::FpSub(rm, a, c) => {
-            let rm = formula_to_term(solver, rm);
-            let a = formula_to_term(solver, a);
-            let c = formula_to_term(solver, c);
-            solver.try_fp_sub(rm, a, c).expect("fp_sub")
+            let rm = formula_to_term(solver, rm)?;
+            let a = formula_to_term(solver, a)?;
+            let c = formula_to_term(solver, c)?;
+            solver.try_fp_sub(rm, a, c).map_err(|e| solver_err("fp_sub", &e))
         }
         // `(fp.mul rm a b)`.
         Formula::FpMul(rm, a, c) => {
-            let rm = formula_to_term(solver, rm);
-            let a = formula_to_term(solver, a);
-            let c = formula_to_term(solver, c);
-            solver.try_fp_mul(rm, a, c).expect("fp_mul")
+            let rm = formula_to_term(solver, rm)?;
+            let a = formula_to_term(solver, a)?;
+            let c = formula_to_term(solver, c)?;
+            solver.try_fp_mul(rm, a, c).map_err(|e| solver_err("fp_mul", &e))
         }
         // `(fp.div rm a b)` — TOTAL: x/0.0 = ±inf, 0.0/0.0 = NaN (no trap).
         Formula::FpDiv(rm, a, c) => {
-            let rm = formula_to_term(solver, rm);
-            let a = formula_to_term(solver, a);
-            let c = formula_to_term(solver, c);
-            solver.try_fp_div(rm, a, c).expect("fp_div")
+            let rm = formula_to_term(solver, rm)?;
+            let a = formula_to_term(solver, a)?;
+            let c = formula_to_term(solver, c)?;
+            solver.try_fp_div(rm, a, c).map_err(|e| solver_err("fp_div", &e))
         }
         // `(fp.isNaN a)` — NaN classification (for the 1.0 + NaN value-diff).
         Formula::FpIsNaN(a) => {
-            let a = formula_to_term(solver, a);
-            solver.try_fp_is_nan(a).expect("fp_is_nan")
+            let a = formula_to_term(solver, a)?;
+            solver.try_fp_is_nan(a).map_err(|e| solver_err("fp_is_nan", &e))
         }
-        other => panic!("formula_to_term: unhandled Formula variant: {other:?}"),
+        other => Err(format!("formula_to_term: unhandled Formula variant: {other:?}")),
     }
 }
 
@@ -4257,15 +5842,62 @@ fn formula_has_fp(f: &Formula) -> bool {
 /// the same posture as the verifier's own `-Ztrust-verify-function-budget-ms`.
 ///
 /// `TCG_TRUST_IR_GATE_TIMEOUT_MS` overrides; `0` disables the budget. Read
-/// fresh per solver construction (no OnceLock) so tests can vary it.
+/// fresh per solver construction (no OnceLock). A test varies the budget
+/// through `with_gate_budget_ms` (test builds only) instead, which takes
+/// precedence over both on its own thread.
 fn gate_solver_config() -> ay::SolverConfig {
     const DEFAULT_MS: u64 = 120_000;
-    let ms = std::env::var("TCG_TRUST_IR_GATE_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MS);
+    let ms = gate_budget_set_by_test().unwrap_or_else(|| {
+        std::env::var("TCG_TRUST_IR_GATE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MS)
+    });
     let config = ay::SolverConfig::default();
     if ms == 0 { config } else { config.with_timeout(std::time::Duration::from_millis(ms)) }
+}
+
+// TEST-ONLY BUDGET SEAM. `Some(ms)` replaces the per-query budget above for
+// every gate solver built on THIS thread (`0` = no budget). Thread-local, never
+// the process environment: every test running beside it reads
+// `TCG_TRUST_IR_GATE_TIMEOUT_MS`, and `set_var` races those reads. Never set
+// outside tests.
+#[cfg(test)]
+thread_local! {
+    static GATE_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The per-query budget a test set on this thread through `with_gate_budget_ms`,
+/// if any. A function rather than a `let` bound to a cfg'd literal, so the
+/// non-test build's `None` is not a literal the `unwrap_or_else` above reads
+/// through (`unnecessary_literal_unwrap`).
+#[cfg(not(test))]
+fn gate_budget_set_by_test() -> Option<u64> {
+    None
+}
+
+/// The per-query budget a test set on this thread through `with_gate_budget_ms`,
+/// if any.
+#[cfg(test)]
+fn gate_budget_set_by_test() -> Option<u64> {
+    GATE_BUDGET_MS.get()
+}
+
+/// TEST HOOK: run `body` with every gate solver built on THIS thread under a
+/// per-query budget of `ms` milliseconds (`0` = none). The gate's discharges
+/// run on the calling thread, so this covers every solver one gate call builds.
+/// The budget in force before the call is restored when `body` returns or
+/// unwinds, so a nested or panicking use leaves the thread as it found it.
+#[cfg(test)]
+fn with_gate_budget_ms<R>(ms: u64, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GATE_BUDGET_MS.set(self.0);
+        }
+    }
+    let _restore = Restore(GATE_BUDGET_MS.replace(Some(ms)));
+    body()
 }
 
 /// Construct the gate's solver with the per-query budget applied.
@@ -4280,16 +5912,23 @@ fn gate_solver(logic: Logic) -> Result<Solver, String> {
 /// production by the trust-ir gate's VACUITY check and its `spec_reach =>
 /// machine_reach` obligation, which are predicates rather than equalities.
 pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
+    #[cfg(test)]
+    crate::original_conjunction_certificate::require_production_allowed();
     let logic = if formula_has_fp(f) { Logic::QfAbvfp } else { Logic::QfAbv };
     let mut solver = match gate_solver(logic) {
         Ok(s) => s,
         Err(e) => return Discharge::Unknown(e),
     };
-    let term = formula_to_term(&mut solver, f);
     // Fail CLOSED to Unknown on a solver error, exactly as `Solver::try_new`
     // above already does. These were `.expect()` — a panic inside the verifier's
     // trusted core, aborting the compiler mid-proof rather than reporting that
-    // the obligation could not be discharged.
+    // the obligation could not be discharged. The translation itself now reports
+    // the same way, so an untranslatable formula is an undischarged obligation
+    // rather than an aborted compile.
+    let term = match formula_to_term(&mut solver, f) {
+        Ok(t) => t,
+        Err(e) => return Discharge::Unknown(e),
+    };
     let neg = match solver.try_not(term) {
         Ok(t) => t,
         Err(e) => return Discharge::Unknown(format!("ay try_not failed: {e:?}")),
@@ -4310,6 +5949,8 @@ pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
 /// Discharge `(pre AND NOT(a == b))`: UNSAT => Proven, SAT => CounterExample,
 /// unknown => Unknown (fail-closed). Solver-construction failure is also Unknown.
 pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula>) -> Discharge {
+    #[cfg(test)]
+    crate::original_conjunction_certificate::require_production_allowed();
     // QF_ABV: quantifier-free bitvectors + array theory (Select/Store), so
     // store->load roundtrips through MEM discharge via the array axiom.
     //
@@ -4326,17 +5967,30 @@ pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula
         Ok(s) => s,
         Err(e) => return Discharge::Unknown(e),
     };
-    let lhs = formula_to_term(&mut solver, a);
-    let rhs = formula_to_term(&mut solver, c);
-    let eq = solver.try_eq(lhs, rhs).expect("eq");
-    let differ = solver.try_not(eq).expect("not");
+    // Every step below fails CLOSED to Unknown, matching `gate_solver` above and
+    // `discharge_valid`. These were `.expect()`: a solver error aborted the
+    // compiler mid-proof instead of reporting an undischarged obligation.
+    macro_rules! unknown_on_err {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(err) => return Discharge::Unknown(err),
+            }
+        };
+    }
+    let lhs = unknown_on_err!(formula_to_term(&mut solver, a));
+    let rhs = unknown_on_err!(formula_to_term(&mut solver, c));
+    let eq = unknown_on_err!(solver.try_eq(lhs, rhs).map_err(|e| solver_err("eq", &e)));
+    let differ = unknown_on_err!(solver.try_not(eq).map_err(|e| solver_err("not", &e)));
     let goal = if let Some(p) = pre {
-        let p = formula_to_term(&mut solver, p);
-        solver.try_and(p, differ).expect("and")
+        let p = unknown_on_err!(formula_to_term(&mut solver, p));
+        unknown_on_err!(solver.try_and(p, differ).map_err(|e| solver_err("and", &e)))
     } else {
         differ
     };
-    solver.try_assert_term(goal).expect("assert");
+    if let Err(e) = solver.try_assert_term(goal) {
+        return Discharge::Unknown(solver_err("assert", &e));
+    }
     let result = solver.check_sat();
     if result.is_unsat() {
         Discharge::Proven
@@ -4663,8 +6317,8 @@ mod cite_policy_tests {
 /// per-function on every routine compile, so the DEFAULT stays low (the fast
 /// shallow ops). 2048 covers the by-default-fast ops (and/or/xor @934,
 /// sext @164) with margin.
-#[cfg(feature = "kernel-recheck")]
-const MAX_RECHECKABLE_REFUTATION_STEPS: usize = 2048;
+#[cfg(feature = "ay-proofs")]
+pub(crate) const MAX_RECHECKABLE_REFUTATION_STEPS: usize = 2048;
 
 /// Bit width of a lowered [`ay_proof::BvExpr`], or `None` if a sub-shape makes
 /// the width ill-defined (which the blaster would also reject downstream).
@@ -4679,6 +6333,8 @@ fn bvexpr_width(e: &ay_proof::BvExpr) -> Option<u32> {
         | BvExpr::And(l, _)
         | BvExpr::Xor(l, _)
         | BvExpr::Mul(l, _)
+        | BvExpr::UDiv(l, _)
+        | BvExpr::URem(l, _)
         | BvExpr::Shl(l, _)
         | BvExpr::Lshr(l, _)
         | BvExpr::Ashr(l, _) => bvexpr_width(l),
@@ -4687,8 +6343,9 @@ fn bvexpr_width(e: &ay_proof::BvExpr) -> Option<u32> {
         }
         BvExpr::Extract { high, low, .. } => Some(*high - *low + 1),
         BvExpr::Not(inner) => bvexpr_width(inner),
-        // 1-bit predicates.
-        BvExpr::Eq(..) | BvExpr::CarryOut { .. } => Some(1),
+        // 1-bit predicates. `Ult` (unsigned less-than) joins them: it is a
+        // comparison, so its RESULT is one bit whatever its operands' width.
+        BvExpr::Eq(..) | BvExpr::Ult(..) | BvExpr::CarryOut { .. } => Some(1),
     }
 }
 
@@ -4710,6 +6367,18 @@ fn mul_width(e: &ay_proof::BvExpr) -> u32 {
         | BvExpr::And(l, r)
         | BvExpr::Xor(l, r)
         | BvExpr::Eq(l, r)
+        // `Ult`'s operands are ordinary bitvectors and may contain a `Mul`, so
+        // it recurses on both sides exactly as `Eq` does. Omitting it would let
+        // a wide multiply hide under a comparison and take a kernel certificate
+        // the re-checker cannot actually verify.
+        | BvExpr::Ult(l, r)
+        // A divider is not a `Mul`: it never cites the multiply theorem. Its
+        // operands may still hold a `Mul`, so it recurses like `Ult`.
+        // `formula_to_bvexpr` refuses `BvUDiv`/`BvURem` today (pinned by
+        // `formula_to_bvexpr_refuses_dividers`), so no divider reaches the live
+        // gate; lowering one needs its own tractability guard first.
+        | BvExpr::UDiv(l, r)
+        | BvExpr::URem(l, r)
         | BvExpr::Shl(l, r)
         | BvExpr::Lshr(l, r)
         | BvExpr::Ashr(l, r) => mul_width(l).max(mul_width(r)),
@@ -4736,6 +6405,11 @@ fn mul_wider_than(e: &ay_proof::BvExpr, max: u32) -> bool {
         | BvExpr::And(l, r)
         | BvExpr::Xor(l, r)
         | BvExpr::Eq(l, r)
+        // Same reason as in `mul_width`, and these two traversals MUST agree:
+        // the width a citation records is the width this guard measured.
+        | BvExpr::Ult(l, r)
+        | BvExpr::UDiv(l, r)
+        | BvExpr::URem(l, r)
         | BvExpr::Shl(l, r)
         | BvExpr::Lshr(l, r)
         | BvExpr::Ashr(l, r) => mul_wider_than(l, max) || mul_wider_than(r, max),
@@ -4745,6 +6419,74 @@ fn mul_wider_than(e: &ay_proof::BvExpr, max: u32) -> bool {
         | BvExpr::Not(inner)
         | BvExpr::Extract { inner, .. } => mul_wider_than(inner, max),
         BvExpr::Leaf { .. } | BvExpr::Const { .. } => false,
+    }
+}
+
+// Trust: predicate result width must not hide work in either operand.
+#[cfg(all(test, feature = "ay-proofs"))]
+mod unsigned_comparison_resource_tests {
+    use ay_proof::BvExpr;
+
+    use super::{bvexpr_width, mul_wider_than, mul_width};
+
+    #[test]
+    fn unsigned_comparison_preserves_multiply_resource_accounting() {
+        for width in [1, 8, 32, 64, 128] {
+            let leaf = || BvExpr::leaf("value", width);
+            let multiply = || BvExpr::Mul(Box::new(leaf()), Box::new(leaf()));
+            let plain = BvExpr::Ult(Box::new(leaf()), Box::new(leaf()));
+            assert_eq!(bvexpr_width(&plain), Some(1));
+            assert_eq!(mul_width(&plain), 0);
+            assert!(!mul_wider_than(&plain, 0));
+            for comparison in [
+                BvExpr::Ult(Box::new(multiply()), Box::new(leaf())),
+                BvExpr::Ult(Box::new(leaf()), Box::new(multiply())),
+            ] {
+                assert_eq!(bvexpr_width(&comparison), Some(1));
+                assert_eq!(mul_width(&comparison), width);
+                assert!(mul_wider_than(&comparison, width - 1));
+                assert!(!mul_wider_than(&comparison, width));
+                let nested = BvExpr::ZeroExt(Box::new(comparison), 31);
+                assert_eq!(bvexpr_width(&nested), Some(32));
+                assert_eq!(mul_width(&nested), width);
+                assert!(mul_wider_than(&nested, width - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_divider_keeps_its_dividend_width_and_cannot_hide_a_multiply() {
+        for width in [1, 8, 32, 64, 128] {
+            let leaf = || BvExpr::leaf("value", width);
+            let multiply = || BvExpr::Mul(Box::new(leaf()), Box::new(leaf()));
+            for divide in [BvExpr::UDiv as fn(_, _) -> _, BvExpr::URem as fn(_, _) -> _] {
+                let plain = divide(Box::new(leaf()), Box::new(leaf()));
+                assert_eq!(bvexpr_width(&plain), Some(width));
+                assert_eq!(mul_width(&plain), 0, "a divider is not a multiply");
+                assert!(!mul_wider_than(&plain, 0));
+                for hidden in [
+                    divide(Box::new(multiply()), Box::new(leaf())),
+                    divide(Box::new(leaf()), Box::new(multiply())),
+                ] {
+                    assert_eq!(bvexpr_width(&hidden), Some(width));
+                    assert_eq!(mul_width(&hidden), width);
+                    assert!(mul_wider_than(&hidden, width - 1));
+                    assert!(!mul_wider_than(&hidden, width));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn formula_to_bvexpr_refuses_dividers() {
+        use trust_types::{Formula, Sort};
+        let v = |name: &str| Box::new(Formula::Var(name.into(), Sort::BitVec(32)));
+        for divider in [Formula::BvUDiv(v("a"), v("b"), 32), Formula::BvURem(v("a"), v("b"), 32)] {
+            assert!(
+                super::formula_to_bvexpr(&divider).is_err(),
+                "a divider now lowers: give it a tractability guard before the live gate sees it"
+            );
+        }
     }
 }
 
@@ -5084,17 +6826,34 @@ mod tests_pair_128_split {
     fn pair_128_constant_return_is_kernel_proved() {
         let machine = pair(0, 1234);
         let spec = lit128(1234);
+        // Since 4ca6047f3b the router checks every concatenation through its
+        // original terms first; the register-pair split is the route it falls
+        // back to (`the_router_falls_back_to_the_pair_split_when_the_original_terms_decline`),
+        // and keeps its own two-certificate grade.
         let evidence = try_kernel_recheckable_proof(&machine, &spec, None)
             .expect("128-bit constant return must reach the kernel grade");
         assert!(
-            matches!(evidence, ProvenEvidence::KernelRecheckablePair { .. }),
-            "expected a two-certificate pair grade, got {evidence:?}"
+            matches!(&evidence, ProvenEvidence::KernelInstantiated { theorem, original: None }
+                if theorem == ORIGINAL_CONCAT_THEOREM),
+            "expected the original-term concatenation grade, got {evidence:?}"
         );
         assert!(
             OutputVerdict::Proven { evidence }.is_kernel_proved(),
+            "the routed grade must satisfy the [PROVED]-vs-[VALIDATED] discriminator"
+        );
+        let pair_evidence = try_kernel_recheckable_pair_128(&machine, &spec)
+            .expect("the register-pair split must reach the kernel grade on its own");
+        assert!(
+            matches!(pair_evidence, ProvenEvidence::KernelRecheckablePair { .. }),
+            "expected a two-certificate pair grade, got {pair_evidence:?}"
+        );
+        assert!(
+            OutputVerdict::Proven { evidence: pair_evidence }.is_kernel_proved(),
             "the pair grade must satisfy the [PROVED]-vs-[VALIDATED] discriminator"
         );
     }
+
+    const ORIGINAL_CONCAT_THEOREM: &str = "Clean.BVC.bvf_concat_cong+selectAddrCong/read-over-write (original memory terms)";
 
     /// THE LOAD-BEARING MUTATION. Corrupt the HIGH half ONLY — the low half is
     /// still exactly right — and the kernel grade must be refused.
@@ -5113,6 +6872,10 @@ mod tests_pair_128_split {
         assert!(
             try_kernel_recheckable_proof(&machine, &spec, None).is_none(),
             "a WRONG HIGH half must not be awarded the kernel grade"
+        );
+        assert!(
+            try_kernel_recheckable_pair_128(&machine, &spec).is_none(),
+            "a WRONG HIGH half must not be awarded the pair grade"
         );
         // ATTRIBUTION: the refusal above must be caused by the high half, not by
         // some blanket refusal of this shape. The LOW half of the very same
@@ -5140,6 +6903,10 @@ mod tests_pair_128_split {
             try_kernel_recheckable_proof(&machine, &spec, None).is_none(),
             "a WRONG LOW half must not be awarded the kernel grade"
         );
+        assert!(
+            try_kernel_recheckable_pair_128(&machine, &spec).is_none(),
+            "a WRONG LOW half must not be awarded the pair grade"
+        );
     }
 
     /// The pair-vs-pair shape (a carried 128-bit parameter returned unchanged),
@@ -5155,6 +6922,14 @@ mod tests_pair_128_split {
         assert!(
             matches!(
                 try_kernel_recheckable_proof(&machine, &spec, None),
+                Some(ProvenEvidence::KernelInstantiated { theorem, original: None })
+                    if theorem == ORIGINAL_CONCAT_THEOREM
+            ),
+            "the 128-bit identity must be kernel-[PROVED] through its original terms"
+        );
+        assert!(
+            matches!(
+                try_kernel_recheckable_pair_128(&machine, &spec),
                 Some(ProvenEvidence::KernelRecheckablePair { .. })
             ),
             "the 128-bit identity must be kernel-[PROVED] as a pair"
@@ -5167,12 +6942,57 @@ mod tests_pair_128_split {
             try_kernel_recheckable_proof(&swapped, &spec, None).is_none(),
             "swapping X0/X1 must not be awarded the kernel grade"
         );
+        assert!(
+            try_kernel_recheckable_pair_128(&swapped, &spec).is_none(),
+            "swapping X0/X1 must not be awarded the pair grade"
+        );
         // And the pure high-half corruption: LOW half untouched and correct.
         let high_wrong = Formula::BvConcat(b(xn(2)), b(xn(0)));
         assert!(
             try_kernel_recheckable_proof(&high_wrong, &spec, None).is_none(),
             "reading the HIGH half from the wrong register must not be awarded \
              the kernel grade"
+        );
+        assert!(
+            try_kernel_recheckable_pair_128(&high_wrong, &spec).is_none(),
+            "reading the HIGH half from the wrong register must not be awarded \
+             the pair grade"
+        );
+    }
+
+    /// THE ROUTER'S FALLBACK. A pair whose high half is a shift: the
+    /// original-term route has no shift arm and declines, so the router must
+    /// fall back to the register-pair split and award its two-certificate
+    /// grade. The other tests here call the split directly, and every 128-bit
+    /// shape they route goes through the original terms, so without this test
+    /// deleting the fallback from `try_kernel_recheckable_proof` leaves the
+    /// module green (measured 2026-11-06 by its hostile review). If the
+    /// original-term route gains a shift arm, the precondition below fails:
+    /// pick another shape it declines.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn the_router_falls_back_to_the_pair_split_when_the_original_terms_decline() {
+        let shl = |f: Formula, by: i128| {
+            Formula::BvShl(b(f), b(Formula::BitVec { value: by, width: 64 }), 64)
+        };
+        let spec = Formula::BvConcat(b(shl(xn(1), 1)), b(xn(0)));
+        let machine = spec.clone();
+        assert!(
+            crate::verify_output_instantiate::try_o1_instantiation_discharge(&machine, &spec)
+                .is_none(),
+            "precondition: the original-term route must decline this shape"
+        );
+        let routed = try_kernel_recheckable_proof(&machine, &spec, None);
+        assert!(
+            matches!(routed, Some(ProvenEvidence::KernelRecheckablePair { .. })),
+            "the router must fall back to the register-pair split; got {routed:?}"
+        );
+        // The fallback still checks both halves: shifting by 2 on the machine
+        // side corrupts only the high half.
+        let high_wrong = Formula::BvConcat(b(shl(xn(1), 2)), b(xn(0)));
+        assert!(
+            try_kernel_recheckable_proof(&high_wrong, &spec, None).is_none(),
+            "a WRONG HIGH half must not be awarded the kernel grade through the fallback"
         );
     }
 }
@@ -5202,6 +7022,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -6401,6 +8222,67 @@ mod tests {
     }
 
     #[test]
+    fn mir_byte_gate_refuses_object_relabelled_for_another_cpu() {
+        let f = binop_fn("header_bound_add", BinOp::Add, Ty::i32());
+        let backend = TrustCgCodegenBackend::new_for_triple(
+            TrustCgTargetArch::AArch64,
+            "aarch64-apple-darwin",
+        );
+        let favorable = verify_output_preserved_with_backend(&f, &backend);
+        assert!(favorable.is_proven(), "baseline must be favorable: {favorable:?}");
+        let object = emit_object_with_backend(&f, &backend).expect("actual Mach-O emission");
+        let baseline = decode_emitted_object_env(&f, &object, 32, &CalleeEnv::empty(), &backend);
+        assert!(baseline.is_ok(), "actual object must decode: {baseline:?}");
+        let mut relabelled = object.clone();
+        relabelled[4..8]
+            .copy_from_slice(&trust_cg_codegen::macho::constants::CPU_TYPE_X86_64.to_le_bytes());
+        assert_eq!(
+            extract_text_from_object(&object).unwrap().0,
+            extract_text_from_object(&relabelled).unwrap().0,
+            "only the CPU header changed"
+        );
+        assert!(
+            decode_emitted_object_env(&f, &relabelled, 32, &CalleeEnv::empty(), &backend).is_err(),
+            "requested AArch64 must not bless an x86-64 object carrying identical text"
+        );
+    }
+
+    #[test]
+    fn mir_byte_gate_refuses_aarch64_elf_abi_header_mutations() {
+        let f = binop_fn("elf_abi_bound_add", BinOp::Add, Ty::i32());
+        let backend = TrustCgCodegenBackend::new_for_triple(
+            TrustCgTargetArch::AArch64,
+            "aarch64-unknown-linux-gnu",
+        );
+        let favorable = verify_output_preserved_with_backend(&f, &backend);
+        assert!(favorable.is_proven(), "baseline must be favorable: {favorable:?}");
+        let object = emit_object_with_backend(&f, &backend).expect("actual ELF emission");
+        let baseline = decode_emitted_object_env(&f, &object, 32, &CalleeEnv::empty(), &backend);
+        assert!(baseline.is_ok(), "actual object must decode: {baseline:?}");
+        for (offset, field) in [
+            (8, "EI_ABIVERSION"),
+            (48, "e_flags[0]"),
+            (49, "e_flags[1]"),
+            (50, "e_flags[2]"),
+            (51, "e_flags[3]"),
+        ] {
+            assert_eq!(object[offset], 0, "emitter default for {field}");
+            let mut mutated = object.clone();
+            mutated[offset] = 1;
+            assert_eq!(
+                extract_text_from_object(&object).unwrap().0,
+                extract_text_from_object(&mutated).unwrap().0,
+                "{field} mutation must leave machine text unchanged"
+            );
+            let result = decode_emitted_object_env(&f, &mutated, 32, &CalleeEnv::empty(), &backend);
+            assert!(
+                matches!(result, Err(ref reason) if reason.contains("header")),
+                "{field} must refuse at the MIR target boundary: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gate_refuses_wrong_spec_mismatch() {
         // Directly exercise the discharge with a deliberate mismatch: emitted
         // `add` bytes vs the `sub` auto-spec. SAT => Refuted. This is the same
@@ -6942,17 +8824,13 @@ mod tests {
             "the real caller-memory read must be KERNEL-discharged via selectAddrCong; got {d:?}"
         );
 
-        // ── the multi-byte load: still out, and out at `BvConcat` ─────────────
+        // Multi-byte assembly now reflects every original byte Select through
+        // the actual Concat constructor. The full machine readout still needs
+        // its separate correspondence proof below.
         let f64 = make_ptr_ro_u64();
         let auto64 = trust_ir_semantics(&f64).expect("auto");
-        let err = ts::reflect_formula_for(&auto64, &auto64, &auto64)
-            .err()
-            .expect("a multi-byte load is not in the fragment");
-        assert!(
-            err.contains("BvConcat"),
-            "the u64 load must fall out at the multi-byte ASSEMBLY, not at the memory \
-             model — that distinction is the whole point of this test; got: {err}"
-        );
+        assert!(ts::reflect_formula_for(&auto64, &auto64, &auto64).is_ok());
+        assert!(crate::verify_output_instantiate::try_o1_instantiation_discharge(&auto64, &auto64).is_some());
 
         // ── the whole functions: ay-proven, not yet kernel-[PROVED] ───────────
         for f in [&f8, &f64] {
@@ -7022,20 +8900,75 @@ mod tests {
     }
 
     /// HONEST CHARACTERIZATION. `make_ptr_rw_u8` (a REAL emitted function) is ay-`is_proven()`
-    /// and its store-load MODEL is kernel-[PROVED] (see gate_mem_store_load_discharge_is_kernel_checked),
-    /// but the whole function is not YET kernel-promoted: the emitted codegen SPILLS the value `v`
-    /// through the stack frame, so the byte actually stored is a MULTI-BYTE `BvOr`/`Shl` reassembly
-    /// of frame-slot `Select`s (an 8-byte spill-reload), not a bare `Extract(X1)`. Reflecting that
-    /// needs the multi-byte load-assembly path (general `BvOr`/`Shl` + per-byte `selectStoreDiff`
-    /// discharged by `bvBeqConsFalse` for byte-adjacency — the keystones are landed). Until that is
-    /// wired the gate fail-closes to [VALIDATED] — never a false [PROVED].
+    /// and, in a `kernel-recheck` build, kernel-[PROVED]: its store-load discharges in the kernel
+    /// via `selectStoreSame` (see gate_mem_store_load_discharge_is_kernel_checked).
+    ///
+    /// Until 2026-09-29 this test pinned the function at [VALIDATED]: the emitted code stored
+    /// through an 8-byte frame spill-reload (a MULTI-BYTE `BvOr`/`Shl` reassembly of frame-slot
+    /// `Select`s) that the reflection does not assemble, and the gate correctly fail-closed. That
+    /// spill was the MIR bridge's lazily materialized slot for the POINTER `p` (it spilled `p` to
+    /// store through it), not the value `v`. The bridge now addresses `*p` through `p`'s value
+    /// (`lower::place_addr_starts_at_pointer_value`; see docs/issues/2026-09-29-trust-cg-mir-
+    /// address-taken-locals-across-sibling-blocks.md), so no frame slot is left to reassemble.
+    /// After that change no function the gate models keeps a frame spill: a local lives in a
+    /// slot only when its address is taken (`&x`, `&raw x`) or it is an aggregate, and the gate
+    /// refuses both before it reaches the slot (see
+    /// gate_mem_u8_store_load_through_frame_spilled_pointer_is_unknown).
     #[test]
-    fn gate_mem_u8_is_validated_pending_multibyte_spill_assembly() {
-        let v = verify_output_preserved(&make_ptr_rw_u8());
+    fn gate_mem_u8_store_load_through_pointer_value() {
+        let func = make_ptr_rw_u8();
+        let lir = crate::lower_to_lir(&func).expect("the u8 store-load lowers");
+        assert!(lir.stack_slots.is_empty(), "storing through the pointer argument spills nothing");
+        let v = verify_output_preserved(&func);
         assert!(v.is_proven(), "u8 store-load must be ay-proven");
+        // Kernel-[PROVED] is earned only by the Clean kernel re-check, which only the
+        // `kernel-recheck` build carries; without it the same proof stays ay-[VALIDATED].
+        assert_eq!(
+            v.is_kernel_proved(),
+            cfg!(feature = "kernel-recheck"),
+            "u8 store-load through the pointer value: kernel-[PROVED] exactly when the kernel \
+             re-check is built in; got {v:?}"
+        );
+    }
+
+    /// `make_ptr_rw_u8` with the pointer's address taken (`_3 = &_1`): the pointer argument is
+    /// then memory-backed, so it is stored to a frame slot at entry and RELOADED from that slot
+    /// both for the store through it and for the read back.
+    fn make_ptr_rw_u8_spilled() -> VerifiableFunction {
+        let ptr_ty = Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u8()) };
+        let mut func = make_ptr_rw_u8();
+        func.name = "mem_ptr_rw_u8_spilled".to_string();
+        func.body.locals.push(LocalDecl {
+            index: 3,
+            ty: Ty::Ref { mutable: false, inner: Box::new(ptr_ty) },
+            name: None,
+        });
+        func.body.blocks[0].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Ref { mutable: false, place: Place::local(1) },
+                span: sp(),
+            },
+        );
+        func
+    }
+
+    /// HONEST CHARACTERIZATION, the frame-spill half of the test above. The lowering keeps a
+    /// real frame spill here (a store through a pointer that is itself reloaded from its slot,
+    /// a multi-byte reassembly the reflection does not assemble), but the gate never reaches
+    /// it: it refuses the `&p` that put `p` in memory, as `Unknown`. So nothing today measures
+    /// the gate on a frame spill; if the gate ever models `Ref`, this test fails and the spill
+    /// must then be shown to stay below kernel-[PROVED].
+    #[test]
+    fn gate_mem_u8_store_load_through_frame_spilled_pointer_is_unknown() {
+        let func = make_ptr_rw_u8_spilled();
+        let lir = crate::lower_to_lir(&func).expect("the spilled-pointer store-load lowers");
+        assert_eq!(lir.stack_slots.len(), 1, "the address-taken pointer lives in one frame slot");
+        let v = verify_output_preserved(&func);
         assert!(
-            !v.is_kernel_proved(),
-            "honest: real u8 fn [PROVED] awaits the multi-byte frame-spill assembly reflection"
+            matches!(&v, OutputVerdict::Unknown { reason } if reason.contains("unsupported rvalue: Ref")),
+            "the gate refuses the address-taking `Ref` before it reaches the spill; got {v:?}"
         );
     }
 
@@ -7083,9 +9016,67 @@ mod tests {
         assert!(verify_output_preserved(&author_clamp()).is_proven());
     }
 
+    /// How long one gate run in a test may go on before the test calls it hung.
+    ///
+    /// A HANG DETECTOR, not a latency budget. `gate_accepts_mem_store_load_roundtrip`
+    /// runs past 60 s at load average 25-60 (docs/VALIDATION_LADDER.md). Under the
+    /// gate's own 120 s per-query budget the machine's load could decide its verdict: a
+    /// proof slowed past the budget comes back `Unknown`, and the test fails for the
+    /// load, not for the gate. Ten minutes is five times that budget and far past the
+    /// recorded slow runs, so a run still going then is a hang whatever the load. Raise
+    /// it only for a measured run that finished; never tighten it into a speed claim.
+    const GATE_HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// The output gate on `func` with the per-query wall-clock budget LIFTED, so the
+    /// solver decides the verdict and the clock never does, run on a worker thread that
+    /// the test waits on for at most [`GATE_HANG_DETECTOR`].
+    ///
+    /// For a test asserting a verdict the gate must reach. With no budget, a solver that
+    /// never answers would hang the test binary rather than fail a test, so the worker
+    /// is watched: past the detector this panics naming the function, and the worker,
+    /// which nothing can stop, ends with the test process. A panic on the worker is
+    /// re-raised here, so it fails the test exactly as it would have inline.
+    fn verify_output_preserved_hang_detected(func: &VerifiableFunction) -> OutputVerdict {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let name = func.name.clone();
+        let func = func.clone();
+        let (verdict_tx, verdict_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name(format!("output-gate-{name}"))
+            .spawn(move || {
+                // A send fails only once the detector has fired and dropped the receiver.
+                let _ = verdict_tx.send(with_gate_budget_ms(0, || verify_output_preserved(&func)));
+            })
+            .expect("spawn the output-gate worker");
+        match verdict_rx.recv_timeout(GATE_HANG_DETECTOR) {
+            Ok(verdict) => {
+                if let Err(payload) = worker.join() {
+                    std::panic::resume_unwind(payload);
+                }
+                verdict
+            }
+            // The worker dropped its sender without sending: it panicked.
+            Err(RecvTimeoutError::Disconnected) => match worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("the output-gate worker for `{name}` ended without a verdict"),
+            },
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "HANG: the output gate gave no verdict on `{name}` within {GATE_HANG_DETECTOR:?} \
+                 with its per-query budget lifted. This is a hang detector, not a latency \
+                 budget: look for a discharge or kernel re-check that does not terminate on \
+                 this obligation"
+            ),
+        }
+    }
+
+    /// `*p = v; *p` is proven: the store-load roundtrip through MEM discharges by the
+    /// array axiom. Decided by the solver, never by the clock: see
+    /// [`verify_output_preserved_hang_detected`].
     #[test]
     fn gate_accepts_mem_store_load_roundtrip() {
-        assert!(verify_output_preserved(&make_ptr_rw()).is_proven());
+        let verdict = verify_output_preserved_hang_detected(&make_ptr_rw());
+        assert!(verdict.is_proven(), "the i32 store-load roundtrip is proven; got {verdict:?}");
     }
 
     #[test]
@@ -8572,6 +10563,7 @@ mod tests {
                             is_foreign,
                             is_unsafe_sig: false,
                             callee_identity: None,
+                            callee_key: None,
                         },
                     },
                     BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
@@ -8615,6 +10607,256 @@ mod tests {
         env.callees.insert("add".into(), derive_callee_pure(&add).expect("add is pure"));
         let v = verify_output_preserved_capturing_env(&caller, &env).0;
         assert!(v.is_proven(), "composed caller verdict is Proven; got {v:?}");
+    }
+
+    /// A relocated tail call `b <callee>` (imm26 = 0 plus a BRANCH26) is the
+    /// call `bl <callee>; ret`, not a branch to itself. Before the fix the
+    /// executor refused it as a "backedge at unconditional branch". Pinned as a
+    /// differential: both encodings yield the identical machine-side formula.
+    /// Every other relocated-`b` shape still fails closed.
+    #[test]
+    fn a_relocated_tail_call_is_composed_as_bl_then_ret() {
+        const B_ZERO: u32 = 0x1400_0000; // b #0
+        const BL_ZERO: u32 = 0x9400_0000; // bl #0
+        const RET: u32 = 0xd65f_03c0;
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let base = 0x1000;
+        let add = binop_fn("add", BinOp::Add, Ty::i32());
+        let mut env = CalleeEnv::empty();
+        env.callees.insert("add".into(), derive_callee_pure(&add).expect("add is pure"));
+        let call_add: HashMap<u64, BranchReloc> =
+            [(0, BranchReloc::Call("add".into()))].into_iter().collect();
+
+        let tail = symbolic_machine_output_env(&code(&[B_ZERO]), base, 32, false, &env, &call_add)
+            .expect("a relocated tail call to a local pure callee is composed");
+        let called =
+            symbolic_machine_output_env(&code(&[BL_ZERO, RET]), base, 32, false, &env, &call_add)
+                .expect("bl; ret composes");
+        assert_eq!(tail, called, "`b add` must mean exactly `bl add; ret`");
+
+        // Fail-closed shapes: a callee outside the env, an unmodeled relocation,
+        // a float return, and an unrelocated self-branch (a real loop).
+        let call_other: HashMap<u64, BranchReloc> =
+            [(0, BranchReloc::Call("other".into()))].into_iter().collect();
+        let err = symbolic_machine_output_env(&code(&[B_ZERO]), base, 32, false, &env, &call_other)
+            .unwrap_err();
+        assert!(err.contains("not a known local pure Proven callee"), "{err}");
+        let unmodeled: HashMap<u64, BranchReloc> =
+            [(0, BranchReloc::Unmodeled)].into_iter().collect();
+        let err = symbolic_machine_output_env(&code(&[B_ZERO]), base, 32, false, &env, &unmodeled)
+            .unwrap_err();
+        assert!(err.contains("relocation the gate does not model"), "{err}");
+        let err = symbolic_machine_output_env(&code(&[B_ZERO]), base, 32, true, &env, &call_add)
+            .unwrap_err();
+        assert!(err.contains("returns a float"), "{err}");
+        let err =
+            symbolic_machine_output_env(&code(&[B_ZERO]), base, 32, false, &env, &HashMap::new())
+                .unwrap_err();
+        assert!(err.contains("backedge"), "{err}");
+    }
+
+    // =======================================================================
+    // O0 — THE ABI GUARANTEE, AT THE EXECUTOR (increment-5 step 5.0).
+    //
+    // Hand-assembled words, so each test names exactly the instruction shape it
+    // pins. The end-to-end tests over REAL emitted bytes are in
+    // `tests/abi_guarantee.rs`.
+    // =======================================================================
+
+    /// Assembler-derived AArch64 words for the O0 tests.
+    mod o0_words {
+        pub(super) const RET: u32 = 0xD65F_03C0;
+        pub(super) const ADD_W0_W0_W1: u32 = 0x0B01_0000;
+        /// `stp x29, x30, [sp, #-16]!` / `mov x29, sp` / `ldp x29, x30, [sp], #16`.
+        pub(super) const STP_FP_LR_PRE: u32 = 0xA9BF_7BFD;
+        pub(super) const MOV_FP_SP: u32 = 0x9100_03FD;
+        pub(super) const LDP_FP_LR_POST: u32 = 0xA8C1_7BFD;
+        /// `str x19, [sp, #-16]!` / `ldr x19, [sp], #16`.
+        pub(super) const SAVE_X19: u32 = 0xF81F_0FF3;
+        pub(super) const RESTORE_X19: u32 = 0xF841_07F3;
+        pub(super) const MOV_X19_X0: u32 = 0xAA00_03F3;
+        pub(super) const ADD_X0_X19_1: u32 = 0x9100_0660;
+        pub(super) const MOVZ_X19: u32 = 0xD282_4693;
+        pub(super) const SUB_SP_16: u32 = 0xD100_43FF;
+        pub(super) const MOV_X30_X0: u32 = 0xAA00_03FE;
+        pub(super) const FMOV_D8_X0: u32 = 0x9E67_0008;
+        pub(super) const MOVZ_X18: u32 = 0xD280_0032;
+        pub(super) const MOVZ_X9: u32 = 0xD280_0029;
+        /// `str x0, [x1]` — a store through a pointer argument.
+        pub(super) const STR_X0_AT_X1: u32 = 0xF900_0020;
+        /// `cbz x0, #+8`.
+        pub(super) const CBZ_X0_SKIP1: u32 = 0xB400_0040;
+        pub(super) const BL_ZERO: u32 = 0x9400_0000;
+        pub(super) const B_ZERO: u32 = 0x1400_0000;
+        pub(super) const BRK_1: u32 = 0xD420_0020;
+    }
+
+    fn o0_code(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// O0's residue for straight-line or forking code with no call.
+    fn o0_residue(ws: &[u32], x18_reserved: bool) -> Vec<AbiConjunct> {
+        let outcome = symbolic_machine_outcome_traps(&o0_code(ws), 0x1000, 64, false)
+            .expect("the O0 fixture executes");
+        abi_guarantee_residue(&outcome, x18_reserved)
+    }
+
+    fn o0_slots(residue: &[AbiConjunct]) -> Vec<&str> {
+        residue.iter().map(|c| c.slot.as_str()).collect()
+    }
+
+    /// An untouched leaf owes a solver nothing: every location is syntactically
+    /// its entry variable, so the residue is empty.
+    #[test]
+    fn o0_an_untouched_leaf_has_no_residue() {
+        use o0_words::*;
+        assert!(o0_residue(&[ADD_W0_W0_W1, RET], true).is_empty());
+    }
+
+    /// The idioms a real frame uses — a frame record saved and reloaded through
+    /// SP-relative slots, and a callee-saved register spilled and reloaded —
+    /// reduce STRUCTURALLY to the entry values. Without that, every function
+    /// with a frame would depend on the solver for O0 and lose its kernel grade.
+    #[test]
+    fn o0_frame_record_and_spill_reloads_discharge_structurally() {
+        use o0_words::*;
+        let frame = [STP_FP_LR_PRE, MOV_FP_SP, ADD_W0_W0_W1, LDP_FP_LR_POST, RET];
+        assert!(o0_residue(&frame, true).is_empty(), "{:?}", o0_residue(&frame, true));
+        let spill = [SAVE_X19, MOV_X19_X0, ADD_X0_X19_1, RESTORE_X19, RET];
+        assert!(o0_residue(&spill, true).is_empty(), "{:?}", o0_residue(&spill, true));
+    }
+
+    /// Each violation is exactly ONE named residual conjunct, and ay refutes it.
+    #[test]
+    fn o0_each_violation_is_one_named_conjunct_and_refuted() {
+        use o0_words::*;
+        for (word, slot) in [
+            (MOVZ_X19, "X19"),
+            (SUB_SP_16, "SP"),
+            (MOV_X30_X0, ABI_RETURN_TARGET_SLOT),
+            (FMOV_D8_X0, "D8"),
+            (MOVZ_X18, ABI_X18_SLOT),
+        ] {
+            let residue = o0_residue(&[ADD_W0_W0_W1, word, RET], true);
+            assert_eq!(o0_slots(&residue), vec![slot], "{word:#010x}");
+            match discharge_abi_guarantee("o0", &residue, &[]) {
+                AbiDischarge::Verdict(OutputVerdict::Refuted { detail }) => {
+                    assert!(detail.contains(slot), "{detail}");
+                }
+                other => panic!("{slot}: expected Refuted, got {other:?}"),
+            }
+        }
+    }
+
+    /// X18 is an O0 location only where the platform reserves it, and the
+    /// platform is read off the object container.
+    #[test]
+    fn o0_x18_is_reserved_only_off_elf() {
+        use o0_words::*;
+        assert!(o0_residue(&[MOVZ_X18, RET], false).is_empty());
+        assert!(!platform_reserves_x18(b"\x7fELF\x02\x01\x01\x00"));
+        assert!(platform_reserves_x18(&0xfeed_facf_u32.to_le_bytes()));
+    }
+
+    /// A clobber on ONE branch is merged under the real branch condition and
+    /// refuted (the other branch is clean, so the conjunct is not syntactically
+    /// false); a fork that leaves X19 alone on both sides stays structural.
+    #[test]
+    fn o0_merges_across_forks() {
+        use o0_words::*;
+        let one_side = o0_residue(&[CBZ_X0_SKIP1, MOVZ_X19, RET], true);
+        assert_eq!(o0_slots(&one_side), vec!["X19"]);
+        assert!(matches!(
+            discharge_abi_guarantee("o0", &one_side, &[]),
+            AbiDischarge::Verdict(OutputVerdict::Refuted { .. })
+        ));
+        assert!(o0_residue(&[CBZ_X0_SKIP1, MOVZ_X9, RET], true).is_empty());
+    }
+
+    /// "Never written" covers a divergent trap tail the executor does not run.
+    #[test]
+    fn o0_x18_written_in_a_trap_tail_is_refuted() {
+        use o0_words::*;
+        let dirty = o0_residue(&[CBZ_X0_SKIP1, RET, MOVZ_X18, BL_ZERO, BRK_1], true);
+        assert_eq!(o0_slots(&dirty), vec![ABI_X18_SLOT]);
+        assert!(matches!(
+            discharge_abi_guarantee("o0", &dirty, &[]),
+            AbiDischarge::Verdict(OutputVerdict::Refuted { .. })
+        ));
+        assert!(o0_residue(&[CBZ_X0_SKIP1, RET, MOVZ_X9, BL_ZERO, BRK_1], true).is_empty());
+    }
+
+    /// A frame slot reloaded after a store through a POINTER ARGUMENT cannot be
+    /// resolved structurally (the pointer may alias the slot in the model), and
+    /// ay's counterexample is exactly that aliasing — which a valid caller never
+    /// produces. That is `Unknown`, never a fabricated `Refuted`.
+    #[test]
+    fn o0_a_memory_dependent_counterexample_is_unknown_not_refuted() {
+        use o0_words::*;
+        let residue = o0_residue(&[SAVE_X19, STR_X0_AT_X1, RESTORE_X19, RET], true);
+        assert_eq!(o0_slots(&residue), vec!["X19"]);
+        match discharge_abi_guarantee("o0", &residue, &[]) {
+            AbiDischarge::Verdict(OutputVerdict::Unknown { reason }) => {
+                assert!(reason.contains("X19"), "{reason}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// The composed `bl` writes X30 and the callee need not hand it back, so a
+    /// `bl; ret` with no LR save loses the return target, while a frame record
+    /// around the call keeps it. A relocated tail `b` keeps the entry LR (the
+    /// callee returns through it straight to our caller).
+    #[test]
+    fn o0_lr_across_a_composed_call() {
+        use o0_words::*;
+        let add = binop_fn("add", BinOp::Add, Ty::i32());
+        let mut env = CalleeEnv::empty();
+        env.callees.insert("add".into(), derive_callee_pure(&add).expect("add is pure"));
+        let reloc_at = |off: u64| -> HashMap<u64, BranchReloc> {
+            [(off, BranchReloc::Call("add".into()))].into_iter().collect()
+        };
+        let residue = |ws: &[u32], relocs: &HashMap<u64, BranchReloc>| {
+            let outcome = symbolic_machine_outcome_env(&o0_code(ws), 0x1000, 32, false, &env, relocs)
+                .expect("composes");
+            abi_guarantee_residue(&outcome, true)
+        };
+        assert_eq!(
+            o0_slots(&residue(&[BL_ZERO, RET], &reloc_at(0))),
+            vec![ABI_RETURN_TARGET_SLOT]
+        );
+        assert!(residue(&[B_ZERO], &reloc_at(0)).is_empty());
+        let framed = [STP_FP_LR_PRE, MOV_FP_SP, BL_ZERO, LDP_FP_LR_POST, RET];
+        assert!(residue(&framed, &reloc_at(8)).is_empty());
+    }
+
+    /// The call RELY: X30 and the caller-saved SIMD state are havoced; the low
+    /// halves of V8-V15 survive under a fresh upper half.
+    #[test]
+    fn o0_call_rely_havocs_lr_and_caller_saved_simd() {
+        let add = binop_fn("add", BinOp::Add, Ty::i32());
+        let mut env = CalleeEnv::empty();
+        env.callees.insert("add".into(), derive_callee_pure(&add).expect("add is pure"));
+        let relocs: HashMap<u64, BranchReloc> =
+            [(0, BranchReloc::Call("add".into()))].into_iter().collect();
+        let code = o0_code(&[o0_words::BL_ZERO]);
+        let mut exec = PathMergingExecutor::new_env(&code, 0, 32, false, &env, &relocs);
+        let entry = MachineState::symbolic();
+        let mut state = MachineState::symbolic();
+        exec.model_local_call(0, &mut state).expect("composes");
+        assert_ne!(state.gpr[30], entry.gpr[30], "X30 must not survive the call");
+        for v in [0usize, 7, 16, 31] {
+            assert_ne!(state.fpr[v], entry.fpr[v], "V{v} is caller-saved");
+        }
+        for d in 8..=15usize {
+            let low = Formula::BvExtract { inner: b(state.fpr[d].clone()), high: 63, low: 0 };
+            assert_eq!(abi_fold(&low), entry.read_fpr(d as u8, 64), "D{d} survives");
+            assert_ne!(state.fpr[d], entry.fpr[d], "V{d}'s upper half is caller-saved");
+        }
+        for r in ABI_SAVED_GPRS {
+            assert_eq!(state.gpr[r as usize], entry.gpr[r as usize], "X{r} is callee-saved");
+        }
     }
 
     /// A caller of an EXTERNAL/unmodelable callee still FAILS CLOSED: the callee
@@ -8794,32 +11036,34 @@ mod tests {
         let mut env = CalleeEnv::empty();
         env.callees.insert("add".into(), derive_callee_pure(&add).expect("add pure"));
 
-        // Corrupt the LAST `Orr` that sets up an argument register BEFORE the bl:
-        // change `Orr W1, WZR, W3` (move b into the 2nd arg reg) to read a
-        // different source register, so the callee receives a wrong second arg.
+        // Corrupt the caller's argument setup: the instruction right before the
+        // `bl` becomes `mov w1, w0` (`orr w1, wzr, w0`), so `add` receives `a`
+        // as its second argument and the caller returns `a + a`. Isel today
+        // passes `a, b` in place (no move before the `bl`; the word there is
+        // the frame setup), so an earlier version that flipped the source of
+        // the last `orr` before the `bl` found none and changed no byte; the
+        // corruptor now asserts that it changed the code.
         let corruptor = |code: &mut Vec<u8>, base: u64| {
+            const MOV_W1_W0: u32 = 0x2A00_03E1;
             let mut pc = base;
-            let mut off = 0usize;
-            let mut last_orr: Option<usize> = None;
-            while off + 4 <= code.len() {
-                let bytes: [u8; 4] = code[off..off + 4].try_into().unwrap();
-                let insn = decode_aarch64(&bytes, pc).expect("decode");
-                if matches!(insn.opcode, Opcode::Bl) {
-                    break; // corrupt the arg-setup Orr that is closest BEFORE the bl
-                }
-                if matches!(insn.opcode, Opcode::Orr) {
-                    last_orr = Some(off);
+            let mut bl_at = None;
+            for (off, w) in code.chunks_exact(4).enumerate().map(|(i, w)| (i * 4, w)) {
+                let bytes: [u8; 4] = w.try_into().unwrap();
+                if matches!(decode_aarch64(&bytes, pc).expect("decode").opcode, Opcode::Bl) {
+                    bl_at = Some(off);
+                    break;
                 }
                 pc += 4;
-                off += 4;
             }
-            if let Some(o) = last_orr {
-                // Flip a bit in the Rm field (bits 16..20) so the source register
-                // differs — the call now reads a different value as its 2nd arg.
-                let mut word = u32::from_le_bytes(code[o..o + 4].try_into().unwrap());
-                word ^= 1 << 16;
-                code[o..o + 4].copy_from_slice(&word.to_le_bytes());
-            }
+            let bl = bl_at.expect("the caller calls `add` with one bl");
+            assert!(bl >= 4, "an instruction precedes the bl");
+            let before = &mut code[bl - 4..bl];
+            assert_ne!(
+                u32::from_le_bytes((&*before).try_into().unwrap()),
+                MOV_W1_W0,
+                "the corruption changes the code"
+            );
+            before.copy_from_slice(&MOV_W1_W0.to_le_bytes());
         };
 
         let verdict = with_text_corruptor(corruptor, || {
@@ -8955,6 +11199,27 @@ mod tests {
         )
         .expect("binding a function Internal must not disturb its verified bytes");
         assert_eq!(module_object.preserved.len(), 2);
+    }
+
+    #[test]
+    fn emitted_elf_function_bindings_match_linkage_contract() {
+        let backend = TrustCgCodegenBackend::new_for_triple(
+            TrustCgTargetArch::AArch64,
+            "aarch64-unknown-linux-gnu",
+        );
+        let funcs = merge_module();
+        for linkage in [vec![], vec![FunctionLinkage::Internal, FunctionLinkage::Hidden]] {
+            let module = build_merged_module(&funcs, &linkage, &[], &backend).unwrap();
+            let emitted = backend.emit_module_object(&module).unwrap();
+            let expected = funcs
+                .iter()
+                .enumerate()
+                .map(|(index, func)| {
+                    (func.name.as_str(), linkage.get(index).copied().unwrap_or_default())
+                })
+                .collect::<Vec<_>>();
+            require_exact_elf_function_bindings(&emitted.bytes, &expected).unwrap();
+        }
     }
 
     /// TEETH. Hand the obligation a merged object that does NOT contain one of
@@ -9593,46 +11858,27 @@ mod tests {
     #[test]
     fn a_bare_memory_read_is_outside_the_fragment_but_a_roundtrip_is_not() {
         let addr = Formula::Var("P".to_string(), Sort::BitVec(64));
-        let val = Formula::Var("V".to_string(), Sort::BitVec(64));
-        let mem = Formula::Var("MEM".to_string(), Sort::BitVec(64));
-
-        // (1) `*p` where `p` is a parameter: Select over a BARE memory. Under the
-        //     FAIL-CLOSED default policy this is still outside the fragment.
+        let val = Formula::Var("V".to_string(), Sort::BitVec(8));
+        let mem = Formula::Var("MEM".to_string(),
+            Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))));
         let bare = Formula::Select(Box::new(mem.clone()), Box::new(addr.clone()));
-        let bare_err = reflect_formula(&bare)
-            .err()
-            .expect("a bare memory read must be REFUSED under the fail-closed policy");
-        assert!(
-            bare_err.contains("bare memory read outside fragment"),
-            "expected the bare-read refusal, got: {bare_err}"
-        );
-
-        // (2) store-then-load at the SAME address: inside the fragment today.
+        let bare_err = reflect_formula(&bare).err()
+            .expect("the closed scalar policy still refuses bare reads");
+        assert!(bare_err.contains("bare memory read outside fragment"));
         let roundtrip = Formula::Select(
-            Box::new(Formula::Store(Box::new(mem.clone()), Box::new(addr.clone()), Box::new(val))),
-            Box::new(addr.clone()),
-        );
-        assert!(
-            reflect_formula(&roundtrip).is_ok(),
-            "the store-then-load roundtrip must still reflect"
-        );
-
-        // (3) load at a DIFFERENT address than the covering store: also out,
-        //     and by a DIFFERENT reason — aliasing, not bare-read. Pins that the
-        //     two exclusions are distinct rather than one catch-all.
+            Box::new(Formula::Store(Box::new(mem.clone()), Box::new(addr.clone()), Box::new(val.clone()))),
+            Box::new(addr.clone()));
+        assert!(reflect_formula(&roundtrip).err().unwrap().contains("original-term memory path"));
+        assert!(crate::verify_output_instantiate::try_mem_store_load_discharge(&roundtrip, &val).is_some(),
+            "the actual typed original-memory roundtrip is kernel checked");
         let aliased = Formula::Select(
-            Box::new(Formula::Store(
-                Box::new(mem),
-                Box::new(addr),
-                Box::new(Formula::BitVec { value: 0, width: 64 }),
-            )),
-            Box::new(Formula::Var("Q".to_string(), Sort::BitVec(64))),
-        );
-        let alias_err = reflect_formula(&aliased).err().expect("an aliased read must be refused");
-        assert!(
-            alias_err.contains("address mismatch") || alias_err.contains("aliasing"),
-            "expected the aliasing refusal, got: {alias_err}"
-        );
+            Box::new(Formula::Store(Box::new(mem), Box::new(addr),
+                Box::new(Formula::BitVec { value: 0, width: 8 }))),
+            Box::new(Formula::Var("Q".to_string(), Sort::BitVec(64))));
+        assert!(reflect_formula(&aliased).err().unwrap().contains("original-term memory path"));
+        assert!(crate::verify_output_instantiate::try_mem_store_load_discharge(
+            &aliased, &Formula::BitVec { value: 0, width: 8 }).is_none(),
+            "a different symbolic query is not an unconditional read-over-write");
     }
 
     /// THE `&T` PARAMETER FRAGMENT — a bare read of CALLER-PROVIDED memory is in,
@@ -10053,10 +12299,178 @@ mod tests {
         );
     }
 
-    /// (retired shape) the OLD wide-mul [VALIDATED] expectation, kept here only as a
-    /// guard that a CONDITIONAL obligation (signed div) still declines [PROVED] — the
-    /// real residual that remains uncertified at the gate. (Pre-#59 this tested mul;
-    /// mul now promotes — see `gate_mul_is_proved_via_o1_instantiation`.)
+    /// The theorem may not borrow a divisor premise absent from the supplied
+    /// obligation. This test failed on the pre-fix helper for `pre = true`.
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn conditional_div_binds_the_actual_supplied_precondition() {
+        for signed in [false, true] {
+            let divide = |lhs: Formula, rhs: Formula| {
+                if signed {
+                    Formula::BvSDiv(b(lhs), b(rhs), 32)
+                } else {
+                    Formula::BvUDiv(b(lhs), b(rhs), 32)
+                }
+            };
+            let zero = Formula::BitVec { value: 0, width: 32 };
+            let auto = divide(wn(0), wn(1));
+            let guard = Formula::Eq(b(wn(1)), b(zero.clone()));
+            let machine = Formula::Ite(b(guard.clone()), b(zero.clone()), b(auto.clone()));
+            let exact = Formula::Not(b(guard.clone()));
+            assert!(
+                matches!(
+                    try_kernel_recheckable_proof(&machine, &auto, Some(&exact)),
+                    Some(ProvenEvidence::KernelInstantiated { .. })
+                ),
+                "the actual divisor-nonzero positive must exercise the conditional kernel route"
+            );
+            let reversed = Formula::Not(b(Formula::Eq(b(zero.clone()), b(wn(1)))));
+            assert!(try_kernel_recheckable_proof(&machine, &auto, Some(&reversed)).is_some());
+
+            let unrelated = Formula::Not(b(Formula::Eq(b(wn(2)), b(zero.clone()))));
+            let wide =
+                Formula::Not(b(Formula::Eq(b(xn(1)), b(Formula::BitVec { value: 0, width: 64 }))));
+            for (label, pre) in [
+                ("true", Formula::Bool(true)),
+                ("different divisor", unrelated),
+                ("wrong slice width", wide),
+                ("opposite predicate", guard),
+                ("weakened disjunction", Formula::Or(vec![exact.clone(), Formula::Bool(true)])),
+                ("unmodeled conjunction", Formula::And(vec![exact.clone(), Formula::Bool(true)])),
+                ("unmodeled double negation", Formula::Not(b(Formula::Not(b(exact))))),
+            ] {
+                assert!(
+                    try_kernel_recheckable_proof(&machine, &auto, Some(&pre)).is_none(),
+                    "signed={signed}: {label} cannot borrow the theorem's divisor-nonzero premise"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn conditional_div_keeps_formula_names_distinct_after_kernel_name_parsing() {
+        let operand = |name: &str| Formula::BvExtract {
+            inner: b(Formula::Var(name.into(), Sort::BitVec(64))),
+            high: 31,
+            low: 0,
+        };
+        let zero = Formula::BitVec { value: 0, width: 32 };
+        for (actual_name, different_name) in [
+            ("X.1.tail", "X.01.tail"),
+            ("X.1.tail", "X.+1.tail"),
+            ("X..tail", "X.tail"),
+            ("X.λ.tail", "X.Λ.tail"),
+        ] {
+            let divisor = operand(actual_name);
+            let auto = Formula::BvUDiv(b(wn(0)), b(divisor.clone()), 32);
+            let guard = Formula::Eq(b(divisor), b(zero.clone()));
+            let machine = Formula::Ite(b(guard.clone()), b(zero.clone()), b(auto.clone()));
+            let exact = Formula::Not(b(guard));
+            assert!(try_kernel_recheckable_proof(&machine, &auto, Some(&exact)).is_some());
+            let different =
+                Formula::Not(b(Formula::Eq(b(operand(different_name)), b(zero.clone()))));
+            assert!(
+                try_kernel_recheckable_proof(&machine, &auto, Some(&different)).is_none(),
+                "different Formula vars {actual_name:?}/{different_name:?} cannot share a kernel premise"
+            );
+        }
+    }
+
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn conditional_div_rejects_truncating_operand_aliases_and_malformed_widths() {
+        let zero = Formula::BitVec { value: 0, width: 32 };
+        let pre = Formula::Not(b(Formula::Eq(b(wn(1)), b(zero.clone()))));
+        let truncated = Formula::BvExtract {
+            inner: b(Formula::BvZeroExt(
+                b(Formula::BvExtract { inner: b(xn(1)), high: 15, low: 0 }),
+                16,
+            )),
+            high: 31,
+            low: 0,
+        };
+        // W(X1) is 65536 while its truncated divisor is zero: the old register
+        // key erased that difference and could borrow a stronger assumption.
+        for divisor in [
+            truncated,
+            Formula::BvOr(b(zero.clone()), b(wn(1)), 64),
+            Formula::BvExtract {
+                inner: b(Formula::BvZeroExt(b(wn(1)), u32::MAX)),
+                high: 31,
+                low: 0,
+            },
+            Formula::BvExtract {
+                inner: b(Formula::Var("X1".into(), Sort::Bool)),
+                high: 31,
+                low: 0,
+            },
+        ] {
+            let auto = Formula::BvUDiv(b(wn(0)), b(divisor.clone()), 32);
+            let machine = Formula::Ite(
+                b(Formula::Eq(b(divisor.clone()), b(zero.clone()))),
+                b(zero.clone()),
+                b(auto.clone()),
+            );
+            assert!(try_kernel_recheckable_proof(&machine, &auto, Some(&pre)).is_none());
+            let plain = Formula::BvUDiv(b(wn(0)), b(wn(1)), 32);
+            let wrong_guard = Formula::Ite(
+                b(Formula::Eq(b(divisor), b(zero.clone()))),
+                b(zero.clone()),
+                b(plain.clone()),
+            );
+            assert!(try_kernel_recheckable_proof(&wrong_guard, &plain, Some(&pre)).is_none());
+        }
+        let auto = Formula::BvUDiv(b(wn(0)), b(wn(1)), 32);
+        for width in [16, 64] {
+            let wrong_zero = Formula::BitVec { value: 0, width };
+            let machine = Formula::Ite(
+                b(Formula::Eq(b(wn(1)), b(wrong_zero.clone()))),
+                b(zero.clone()),
+                b(auto.clone()),
+            );
+            assert!(try_kernel_recheckable_proof(&machine, &auto, Some(&pre)).is_none());
+            let machine = Formula::Ite(
+                b(Formula::Eq(b(wn(1)), b(zero.clone()))),
+                b(wrong_zero),
+                b(auto.clone()),
+            );
+            assert!(try_kernel_recheckable_proof(&machine, &auto, Some(&pre)).is_none());
+            let wrong_op = Formula::BvUDiv(b(wn(0)), b(wn(1)), width);
+            let machine = Formula::Ite(
+                b(Formula::Eq(b(wn(1)), b(zero.clone()))),
+                b(zero.clone()),
+                b(wrong_op.clone()),
+            );
+            assert!(try_kernel_recheckable_proof(&machine, &wrong_op, Some(&pre)).is_none());
+        }
+    }
+
+    #[cfg(feature = "kernel-recheck")]
+    #[test]
+    fn conditional_div_accepts_only_typed_identity_operand_wrappers() {
+        let wrapped = |n| Formula::BvExtract {
+            inner: b(Formula::BvZeroExt(
+                b(Formula::BvOr(b(Formula::BitVec { value: 0, width: 32 }), b(wn(n)), 32)),
+                32,
+            )),
+            high: 31,
+            low: 0,
+        };
+        let zero = Formula::BitVec { value: 0, width: 32 };
+        let auto = Formula::BvUDiv(b(wn(0)), b(wn(1)), 32);
+        let machine = Formula::Ite(
+            b(Formula::Eq(b(wrapped(1)), b(zero.clone()))),
+            b(zero.clone()),
+            b(Formula::BvUDiv(b(wrapped(0)), b(wrapped(1)), 32)),
+        );
+        let pre = Formula::Not(b(Formula::Eq(b(wn(1)), b(zero))));
+        assert!(matches!(
+            try_kernel_recheckable_proof(&machine, &auto, Some(&pre)),
+            Some(ProvenEvidence::KernelInstantiated { .. })
+        ));
+    }
+
     #[cfg(feature = "kernel-recheck")]
     #[test]
     fn gate_signed_div_is_proved_via_o1_conditional_discharge() {
@@ -10119,7 +12533,9 @@ mod tests {
             low: 0,
         };
         let r = crate::verify_output_instantiate::try_div_conditional_discharge_for_test(
-            &machine, &auto,
+            &machine,
+            &auto,
+            &Formula::Not(b(Formula::Eq(b(opwrap(2)), b(Formula::BitVec { value: 0, width: 32 })))),
         );
         assert!(
             r.is_none(),
@@ -10156,7 +12572,9 @@ mod tests {
             low: 0,
         };
         let r = crate::verify_output_instantiate::try_div_conditional_discharge_for_test(
-            &machine, &auto,
+            &machine,
+            &auto,
+            &Formula::Not(b(Formula::Eq(b(opwrap(1)), b(Formula::BitVec { value: 0, width: 32 })))),
         );
         assert!(
             r.is_none(),
@@ -10194,7 +12612,9 @@ mod tests {
             low: 0,
         };
         let r = crate::verify_output_instantiate::try_div_conditional_discharge_for_test(
-            &machine, &auto,
+            &machine,
+            &auto,
+            &Formula::Not(b(Formula::Eq(b(opwrap(2)), b(Formula::BitVec { value: 0, width: 32 })))),
         );
         assert!(
             r.is_none(),
@@ -10486,12 +12906,6 @@ mod tests {
     // "kernel-recheck")]`. Gate the imports to MATCH, so an `ay-proofs`-only build
     // (kernel-recheck off) compiles instead of failing on an unresolved
     // `crate::verify_output_instantiate`.
-    #[cfg(feature = "kernel-recheck")]
-    #[allow(unused_imports)]
-    use Reflected as _ReflectedUsed;
-
-    #[cfg(feature = "kernel-recheck")]
-    use crate::verify_output_instantiate::Reflected;
     #[cfg(feature = "kernel-recheck")]
     use crate::verify_output_instantiate::kx;
     #[cfg(feature = "kernel-recheck")]
@@ -11592,6 +14006,7 @@ mod reg_width_fail_closed_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         for ty in
@@ -11609,3 +14024,69 @@ mod reg_width_fail_closed_tests {
         );
     }
 }
+
+/// TRUST-12: `var_term` declared every `Formula::Var` through ay's PANICKING
+/// convenience wrappers (`bv_var`, `bool_var`, `declare_const`). The gate's own
+/// variable names are generated, but `formula_to_term` is the translation for
+/// every discharge, and a reserved spelling or one name at two sorts must
+/// surface as an undischarged obligation (`Discharge::Unknown`), never as a
+/// panic that aborts the compiler mid-proof.
+#[cfg(test)]
+mod var_term_fail_closed_tests {
+    use super::*;
+
+    fn discharge_without_panic(f: &Formula) -> Discharge {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| discharge_valid(f)))
+            .unwrap_or_else(|_| panic!("discharge_valid panicked on {f:?}"))
+    }
+
+    fn assert_unknown_mentioning(d: Discharge, needle: &str) {
+        match d {
+            Discharge::Unknown(msg) => {
+                assert!(msg.contains(needle), "Unknown reason must mention {needle:?}: {msg}")
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reserved_variable_name_is_unknown_not_a_panic() {
+        let array = Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8)));
+        for sort in [Sort::BitVec(8), Sort::Bool, array] {
+            let x = Formula::Var("select".into(), sort);
+            let f = Formula::Eq(Box::new(x.clone()), Box::new(x));
+            assert_unknown_mentioning(discharge_without_panic(&f), "reserved");
+        }
+    }
+
+    #[test]
+    fn variable_rebound_at_another_sort_is_unknown_not_a_panic() {
+        let narrow = Formula::Var("x".into(), Sort::BitVec(8));
+        let wide = Formula::Var("x".into(), Sort::BitVec(16));
+        let f = Formula::And(vec![
+            Formula::Eq(Box::new(narrow.clone()), Box::new(narrow)),
+            Formula::Eq(Box::new(wide.clone()), Box::new(wide)),
+        ]);
+        assert_unknown_mentioning(discharge_without_panic(&f), "already declared");
+    }
+
+    /// The fail-closed change must not cost a proof: the same name at the
+    /// same sort is still one variable, and a valid obligation over it proves.
+    #[test]
+    fn repeated_same_sort_variable_still_proves() {
+        let x = Formula::Var("x".into(), Sort::BitVec(8));
+        let f = Formula::Eq(
+            Box::new(Formula::BvAdd(Box::new(x.clone()), Box::new(x.clone()), 8)),
+            Box::new(Formula::BvShl(
+                Box::new(x),
+                Box::new(Formula::BitVec { value: 1, width: 8 }),
+                8,
+            )),
+        );
+        assert!(matches!(discharge_without_panic(&f), Discharge::Proven));
+    }
+}
+
+#[cfg(all(test,feature="kernel-recheck"))]
+#[path="verify_output_branch26_tests.rs"]
+mod branch26_operand_tests;

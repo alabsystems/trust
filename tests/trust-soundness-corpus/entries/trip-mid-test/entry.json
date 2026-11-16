@@ -1,0 +1,36 @@
+{
+  "id": "trip-mid-test",
+  "class": "TRIP-MID-TEST-1",
+  "title": "code above a loop's exit test ran once more than the trip count said; the final c + 1 was certified",
+  "origin": [
+    "DQ:10127 (TRIP-MID-TEST-1)",
+    "tests/ui/trust/mid_tested_loop_counts_the_pre_test_block{,_run}.rs"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "mid_wrap",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c + 1"
+    }
+  },
+  "twin": {
+    "function": "mid_ok",
+    "obligation": {
+      "kind": "overflow",
+      "at": "c + 1"
+    }
+  },
+  "witness": {
+    "input": "(none: c is 255 after the loop)",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  }
+}

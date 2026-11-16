@@ -40,7 +40,7 @@ use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, DerefAdjustKind,
     PatAdjust, PatAdjustment, PointerCoercion,
 };
-use rustc_middle::ty::{self, GenericArg, GenericArgsRef, Ty, TyCtxt};
+use rustc_middle::ty::{self, GenericArg, GenericArgs, Ty, TyCtxt};
 use rustc_span::Symbol;
 
 /// `ty::IntTy as u8` inverse (rustc_ast_ir declaration order).
@@ -135,7 +135,7 @@ fn build_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     c: &mut Cursor<'_>,
     tys: &[Ty<'tcx>],
-) -> Option<GenericArgsRef<'tcx>> {
+) -> Option<GenericArgs<'tcx>> {
     let n = c.u8()? as usize;
     let mut v: Vec<GenericArg<'tcx>> = Vec::with_capacity(n);
     for _ in 0..n {
@@ -215,7 +215,7 @@ fn build_ty<'tcx>(tcx: TyCtxt<'tcx>, entry: &[u8], tys: &[Ty<'tcx>]) -> Option<T
             if !tcx.check_args_compatible(did, args) {
                 return None;
             }
-            Ty::new_fn_def(tcx, did, args)
+            Ty::new_fn_def(tcx, did, ty::Binder::dummy(args))
         }
         14 => {
             let unsafe_ = c.u8()?;

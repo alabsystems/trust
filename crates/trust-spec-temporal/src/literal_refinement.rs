@@ -16,7 +16,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::OnceLock;
 
 use clean_elab::FileContext;
 use clean_kernel::env::Environment;
@@ -41,7 +40,9 @@ pub const LITERAL_REFINEMENT_SCHEMA_V1: &str = "trust.literal-evalir-refinement/
 /// Current wire schema for exact literal EvalIR refinement evidence.
 pub const LITERAL_REFINEMENT_SCHEMA_V2: &str = "trust.literal-evalir-refinement/v2";
 
-const MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
+/// Module-byte policy for this literal temporal lane, before any decode or
+/// proof preparation. This is not a global limit of the TrustIR codec.
+pub const MAX_LITERAL_MODULE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OPERATIONAL_ITEMS: usize = 65_536;
 const MAX_GENERATED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -297,6 +298,8 @@ fn int_width(ty: &Ty, path: &str) -> Result<u32, LiteralRefinementError> {
 
 fn ty_expr(ty: &Ty, path: &str) -> Result<String, LiteralRefinementError> {
     Ok(match ty {
+        // trust-ir v57 (amendment S): `Ty` is `TyG<NoExt>`, and `NoExt` is uninhabited.
+        Ty::Ext(e) => e.unreachable(),
         Ty::I8 => "IRTy.int_ 8".to_owned(),
         Ty::I16 => "IRTy.int_ 16".to_owned(),
         Ty::I32 => "IRTy.int_ 32".to_owned(),
@@ -332,7 +335,21 @@ fn ty_expr(ty: &Ty, path: &str) -> Result<String, LiteralRefinementError> {
         | Ty::Set(_, _)
         | Ty::Sequence(_)
         | Ty::Record(_)
-        | Ty::Closure(_) => {
+        | Ty::Closure(_)
+        // v43 carriers. `Dialect` is a nominal semantic value with NO implicit
+        // scalar representation and `Handle` is an opaque runtime word that is
+        // explicitly not pointer-like, so neither has an exact EvalIR scalar
+        // image. They join the refusal arm rather than acquiring a default
+        // lowering: guessing one would publish an adequacy claim this crate
+        // has no theorem for.
+        | Ty::Dialect(_)
+        | Ty::Handle(_)
+        // Storage describes possibly uninitialized addressable bytes, never
+        // an initialized scalar value. Geometry supplies no EvalIR image.
+        | Ty::Storage(_)
+        // trust-ir v67: a tensor is a run-time-shaped array value with no
+        // layout and no EvalIR carrier, so it is refused like `Storage`.
+        | Ty::Tensor(_, _) => {
             return Err(unsupported(
                 path,
                 format!("type outside the exact scalar operational fragment: {ty:?}"),
@@ -424,6 +441,9 @@ fn constant_expr(ty: &Ty, value: &Constant, path: &str) -> Result<String, Litera
 fn binop_expr(op: BinOp) -> Option<&'static str> {
     match op {
         BinOp::BAnd | BinOp::BOr | BinOp::BXor => return None,
+        // trust-ir v46 rotates and float copy-sign: EvalIR's `IRBinOp` has no
+        // arm for them, so they are unmodelled here, never approximated.
+        BinOp::RotL | BinOp::RotR | BinOp::FCopySign => return None,
         BinOp::Add => Some("IRBinOp.add"),
         BinOp::Sub => Some("IRBinOp.sub"),
         BinOp::Mul => Some("IRBinOp.mul"),
@@ -447,17 +467,20 @@ fn binop_expr(op: BinOp) -> Option<&'static str> {
     }
 }
 
-fn unop_expr(op: UnOp) -> &'static str {
+/// `None` for operators EvalIR's `IRUnOp` does not model (trust-ir v46's
+/// leading/trailing-zero count, byte swap and bit reverse).
+fn unop_expr(op: UnOp) -> Option<&'static str> {
     match op {
-        UnOp::Neg => "IRUnOp.neg",
-        UnOp::FNeg => "IRUnOp.fneg",
-        UnOp::FAbs => "IRUnOp.fabs",
-        UnOp::FSqrt => "IRUnOp.fsqrt",
-        UnOp::FFloor => "IRUnOp.ffloor",
-        UnOp::FCeil => "IRUnOp.fceil",
-        UnOp::FTrunc => "IRUnOp.ftrunc",
-        UnOp::Not => "IRUnOp.not_",
-        UnOp::CtPop => "IRUnOp.ctpop",
+        UnOp::Neg => Some("IRUnOp.neg"),
+        UnOp::FNeg => Some("IRUnOp.fneg"),
+        UnOp::FAbs => Some("IRUnOp.fabs"),
+        UnOp::FSqrt => Some("IRUnOp.fsqrt"),
+        UnOp::FFloor => Some("IRUnOp.ffloor"),
+        UnOp::FCeil => Some("IRUnOp.fceil"),
+        UnOp::FTrunc => Some("IRUnOp.ftrunc"),
+        UnOp::Not => Some("IRUnOp.not_"),
+        UnOp::CtPop => Some("IRUnOp.ctpop"),
+        UnOp::CtLz | UnOp::CtTz | UnOp::BSwap | UnOp::BitReverse => None,
     }
 }
 
@@ -511,11 +534,19 @@ fn inst_expr(_module: &Module, inst: &Inst, path: &str) -> Result<String, Litera
                     | BinOp::FRem
                     | BinOp::FMin
                     | BinOp::FMax
+                    | BinOp::FCopySign
             ) {
                 return Err(unsupported(
                     path,
                     format!("floating binary operation {op:?}"),
                     "supply a checked floating-point adequacy theorem before admitting this operation",
+                ));
+            }
+            if matches!(op, BinOp::RotL | BinOp::RotR) {
+                return Err(unsupported(
+                    path,
+                    format!("bit-rotate binary operation {op:?} with no EvalIR model"),
+                    "extend EvalIR's IRBinOp with rotl/rotr and their modular semantics (with refinement lemmas) before admitting this operation",
                 ));
             }
             let Some(op_expr) = binop_expr(*op) else {
@@ -544,7 +575,14 @@ fn inst_expr(_module: &Module, inst: &Inst, path: &str) -> Result<String, Litera
                     "supply a checked floating-point adequacy theorem before admitting this operation",
                 ));
             }
-            format!("IRInst.unop {} ({}) {}", unop_expr(*op), ty(value_ty, "ty")?, operand.index())
+            let Some(op_expr) = unop_expr(*op) else {
+                return Err(unsupported(
+                    path,
+                    format!("bit-intrinsic unary operation {op:?} with no EvalIR model"),
+                    "extend EvalIR's IRUnOp with ctlz/cttz/bswap/bitreverse and their semantics (with refinement lemmas) before admitting this operation",
+                ));
+            };
+            format!("IRInst.unop {} ({}) {}", op_expr, ty(value_ty, "ty")?, operand.index())
         }
         Inst::Overflow { .. } => {
             return Err(unsupported(
@@ -971,15 +1009,19 @@ fn prepare(
     function_id: u32,
     invocation: &LiteralInvocation,
 ) -> Result<PreparedLiteral, LiteralRefinementError> {
-    if module_bytes.len() > MAX_MODULE_BYTES {
+    if module_bytes.len() > MAX_LITERAL_MODULE_BYTES {
         return Err(LiteralRefinementError::ModuleTooLarge {
             bytes: module_bytes.len(),
-            maximum: MAX_MODULE_BYTES,
+            maximum: MAX_LITERAL_MODULE_BYTES,
         });
     }
     let module = trust_ir::binary::deserialize_module(module_bytes)
         .map_err(|error| LiteralRefinementError::ModuleDecode(error.to_string()))?;
-    if trust_ir::binary::serialize_module(&module) != module_bytes {
+    // A decoded module the writer refuses to re-encode (trust-ir D1b) is no
+    // canonical image either: refused with the decoder's channel.
+    let canonical = trust_ir::binary::serialize_module(&module)
+        .map_err(|error| LiteralRefinementError::ModuleDecode(error.to_string()))?;
+    if canonical != module_bytes {
         return Err(LiteralRefinementError::NonCanonicalModule);
     }
 
@@ -1150,31 +1192,30 @@ end Trust
     Ok(PreparedLiteral { source })
 }
 
-fn encode_expression(expression: &Expr) -> Result<Vec<u8>, LiteralRefinementError> {
+pub(super) fn encode_expression(expression: &Expr) -> Result<Vec<u8>, LiteralRefinementError> {
     serde_json::to_vec(expression)
         .map_err(|error| LiteralRefinementError::MalformedArtifact(error.to_string()))
 }
 
-fn run_on_large_stack<T, F>(operation: F) -> Result<T, LiteralRefinementError>
+pub(super) fn run_on_large_stack<T, F>(operation: F) -> Result<T, LiteralRefinementError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, LiteralRefinementError> + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name("trust-literal-refinement".to_owned())
-        .stack_size(64 * 1024 * 1024)
-        .spawn(operation)
-        .map_err(|error| {
+    // A persistent worker, so `fresh_literal_context`'s per-thread cache
+    // survives from one call to the next (see `crate::kernel_worker`).
+    crate::kernel_worker::run_on_kernel_worker(operation).map_err(|error| match error {
+        crate::kernel_worker::KernelWorkerError::Spawn(error) => {
             LiteralRefinementError::CleanSpecBuild(format!(
                 "cannot spawn large-stack proof thread: {error}"
             ))
-        })?
-        .join()
-        .map_err(|_| {
+        }
+        crate::kernel_worker::KernelWorkerError::Panicked => {
             LiteralRefinementError::CleanSpecBuild(
                 "large-stack literal-refinement thread panicked".to_owned(),
             )
-        })?
+        }
+    })?
 }
 
 /// Return isolated owned clones of the authoritative EvalIR + temporal context.
@@ -1183,25 +1224,45 @@ where
 /// context are persistent/cloneable. The cached pair is never exposed for
 /// mutation, so every certification and replay still starts from the exact same
 /// declaration and notation frontier with no certificate-authored state.
-fn fresh_literal_context() -> Result<(Environment, FileContext), LiteralRefinementError> {
-    static LITERAL_PRELUDE: OnceLock<Result<(Environment, FileContext), LiteralRefinementError>> =
-        OnceLock::new();
-    let cached = LITERAL_PRELUDE.get_or_init(|| {
-        let spec = clean_verify::eval_ir::build_prelude_spec_with_stack()
-            .map_err(|error| LiteralRefinementError::CleanSpecBuild(error.to_string()))?;
-        let mut environment = spec.env().clone();
-        let mut context = FileContext::new();
-        context.disable_external_import_search();
-        elaborate_unit(
-            &mut environment,
-            &mut context,
-            CLEAN_TEMPORAL_PRELUDE,
-            "temporal prelude in EvalIR environment",
-            None,
-        )?;
-        Ok((environment, context))
-    });
-    cached.clone()
+///
+/// Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+/// context goes out as a `FileContext::fork_run` copy, a new elaboration run to
+/// which the temporal prelude's declarations are imported, so a source checked
+/// over it cannot bind one with an `attribute [implemented_by]` / `[extern]`
+/// command (Lean refuses it as imported). A plain clone keeps the prelude's run.
+pub(super) fn fresh_literal_context() -> Result<(Environment, FileContext), LiteralRefinementError>
+{
+    // Keep the current worker-local cache policy. Pinned Clean's FileContext
+    // and Environment are Send + Sync; global sharing is a separate change.
+    // This build uses only compile-time EvalIR/temporal sources with external
+    // import search disabled. Each worker builds the same frontier and callers
+    // receive owned, isolated run forks.
+    thread_local! {
+        static LITERAL_PRELUDE: std::cell::OnceCell<
+            Result<(Environment, FileContext), LiteralRefinementError>,
+        > = const { std::cell::OnceCell::new() };
+    }
+    LITERAL_PRELUDE.with(|cache| {
+        cache
+            .get_or_init(|| {
+                let spec = clean_verify::eval_ir::build_prelude_spec_with_stack()
+                    .map_err(|error| LiteralRefinementError::CleanSpecBuild(error.to_string()))?;
+                let mut environment = spec.env().clone();
+                let mut context = FileContext::new();
+                context.disable_external_import_search();
+                elaborate_unit(
+                    &mut environment,
+                    &mut context,
+                    CLEAN_TEMPORAL_PRELUDE,
+                    "temporal prelude in EvalIR environment",
+                    None,
+                )?;
+                Ok((environment, context))
+            })
+            .as_ref()
+            .map(|(environment, context)| (environment.clone(), context.fork_run()))
+            .map_err(Clone::clone)
+    })
 }
 
 fn check_source(source: String) -> Result<Vec<LiteralRefinementTheorem>, LiteralRefinementError> {
@@ -1351,9 +1412,23 @@ mod tests {
 
     use super::*;
 
+    /// Mutation control for the per-thread EvalIR + temporal cache: the lane
+    /// must run on persistent workers, or every call rebuilds the context.
+    #[test]
+    fn literal_lane_runs_on_reused_workers() {
+        assert!(crate::kernel_worker::lane_reuses_a_worker(|| run_on_large_stack(|| Ok(
+            crate::kernel_worker::probe_ran_on_this_thread_before()
+        ))));
+    }
+
     fn fixture_bytes() -> Vec<u8> {
         let mut module = Module::new("literal_refinement_fixture");
-        module.func_types.push(FuncTy { params: vec![], returns: vec![Ty::U8], is_vararg: false });
+        module.func_types.push(FuncTy {
+            params: vec![],
+            returns: vec![Ty::U8],
+            is_vararg: false,
+            abi: None,
+        });
         let mut function =
             Function::new(FuncId::new(0), "answer", FuncTyId::new(0), trust_ir::BlockId::new(0));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -1364,7 +1439,7 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
         function.blocks.push(block);
         module.functions.push(function);
-        trust_ir::binary::serialize_module(&module)
+        trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture")
     }
 
     fn one_parameter_fixture(ty: Ty) -> Vec<u8> {
@@ -1373,6 +1448,7 @@ mod tests {
             params: vec![ty.clone()],
             returns: vec![],
             is_vararg: false,
+            abi: None,
         });
         let mut function =
             Function::new(FuncId::new(0), "parameter", FuncTyId::new(0), trust_ir::BlockId::new(0));
@@ -1380,7 +1456,7 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         function.blocks.push(block);
         module.functions.push(function);
-        trust_ir::binary::serialize_module(&module)
+        trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture")
     }
 
     #[test]
@@ -1527,6 +1603,7 @@ mod tests {
             params: vec![Ty::U8],
             returns: vec![Ty::U8],
             is_vararg: false,
+            abi: None,
         });
         let mut function =
             Function::new(FuncId::new(0), "copy", FuncTyId::new(0), trust_ir::BlockId::new(0));
@@ -1538,7 +1615,8 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }));
         function.blocks.push(block);
         module.functions.push(function);
-        let bytes = trust_ir::binary::serialize_module(&module);
+        let bytes =
+            trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture");
         let invocation = LiteralInvocation::closed(vec![LiteralScalar::Int { raw: 7 }], 0);
         let error = certify_literal_refinement(&bytes, 0, &invocation)
             .expect_err("Copy is outside the exact EvalIR core");
@@ -1593,6 +1671,72 @@ mod tests {
         ));
     }
 
+    /// The two v43 carriers must be REFUSED by name, not lowered by guess.
+    /// Before trust-ir added them this match was exhaustive over the older
+    /// `Ty`; the crate then stopped compiling (E0004) rather than silently
+    /// mis-lowering, and the repair must keep the refusal, not restore
+    /// compilation with a wildcard. A wildcard here would make any FUTURE
+    /// carrier lower as "outside the fragment" silently; these two are named,
+    /// so the next appended variant breaks the build again on purpose.
+    #[test]
+    fn the_v43_dialect_and_handle_carriers_are_refused_by_name() {
+        let dialect = Ty::Dialect(Box::new(trust_ir::DialectTy::new("trust", "Widget", 1)));
+        assert!(matches!(
+            ty_expr(&dialect, "dialect parameter"),
+            Err(LiteralRefinementError::Unsupported { construct, .. })
+                if construct.contains("exact scalar operational fragment")
+                    && construct.contains("Dialect")
+        ));
+
+        let handle = Ty::Handle(Box::new(trust_ir::HandleTy::new("Nat", "trust_bignum::Nat")));
+        assert!(matches!(
+            ty_expr(&handle, "handle parameter"),
+            Err(LiteralRefinementError::Unsupported { construct, .. })
+                if construct.contains("exact scalar operational fragment")
+                    && construct.contains("Handle")
+        ));
+
+        // int_width's own `other` arm must refuse them too: a handle is one
+        // pointer word, which is exactly the shape a width guess would invent.
+        assert!(matches!(
+            int_width(&handle, "handle parameter"),
+            Err(LiteralRefinementError::Unsupported { construct, .. })
+                if construct.contains("non-integer type")
+        ));
+    }
+
+    #[test]
+    fn storage_geometry_does_not_acquire_a_scalar_interpretation() {
+        let layout = trust_ir::StorageLayout::new(8, 8);
+        assert!(layout.is_well_formed(64));
+        assert!(matches!(
+            ty_expr(&Ty::Storage(layout), "storage parameter"),
+            Err(LiteralRefinementError::Unsupported { path, construct, .. })
+                if path == "storage parameter"
+                    && construct.contains("exact scalar operational fragment")
+                    && construct.contains("Storage")
+        ));
+    }
+
+    /// trust-ir v67's `Tensor` carrier has no layout and no EvalIR image: it
+    /// is refused by name, and `int_width` does not read it as an integer.
+    #[test]
+    fn the_v67_tensor_carrier_is_refused_by_name() {
+        let tensor = Ty::Tensor(Box::new(Ty::I32), 2);
+        assert!(matches!(
+            ty_expr(&tensor, "tensor parameter"),
+            Err(LiteralRefinementError::Unsupported { path, construct, .. })
+                if path == "tensor parameter"
+                    && construct.contains("exact scalar operational fragment")
+                    && construct.contains("Tensor")
+        ));
+        assert!(matches!(
+            int_width(&tensor, "tensor parameter"),
+            Err(LiteralRefinementError::Unsupported { construct, .. })
+                if construct.contains("non-integer type")
+        ));
+    }
+
     #[test]
     fn undefined_and_target_sized_invocations_decline() {
         let bytes = one_parameter_fixture(Ty::U8);
@@ -1622,6 +1766,7 @@ mod tests {
             params: vec![Ty::Usize],
             returns: vec![],
             is_vararg: false,
+            abi: None,
         });
         let mut function = Function::new(
             FuncId::new(0),
@@ -1634,7 +1779,8 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         function.blocks.push(block);
         module.functions.push(function);
-        let bytes = trust_ir::binary::serialize_module(&module);
+        let bytes =
+            trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture");
         assert!(matches!(
             prepare(
                 &bytes,
@@ -1654,8 +1800,14 @@ mod tests {
             params: vec![Ty::Func(FuncTyId::new(1))],
             returns: vec![],
             is_vararg: false,
+            abi: None,
         });
-        module.func_types.push(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        module.func_types.push(FuncTy {
+            params: vec![],
+            returns: vec![],
+            is_vararg: false,
+            abi: None,
+        });
         let mut function = Function::new(
             FuncId::new(0),
             "takes_function",
@@ -1667,7 +1819,8 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         function.blocks.push(block);
         module.functions.push(function);
-        let bytes = trust_ir::binary::serialize_module(&module);
+        let bytes =
+            trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture");
         let invocation = LiteralInvocation::closed(vec![LiteralScalar::Function { id: 99 }], 0);
         assert!(matches!(
             prepare(&bytes, 0, &invocation),
@@ -1687,6 +1840,7 @@ mod tests {
                 params: vec![],
                 returns: vec![Ty::U8],
                 is_vararg: false,
+                abi: None,
             });
             let mut function = Function::new(
                 FuncId::new(0),
@@ -1699,11 +1853,13 @@ mod tests {
             function.blocks.push(block);
             module.functions.push(function);
 
-            let bytes = trust_ir::binary::serialize_module(&module);
+            let bytes = trust_ir::binary::serialize_module(&module)
+                .expect("serialize_module: test fixture");
             assert_eq!(
                 trust_ir::binary::serialize_module(
                     &trust_ir::binary::deserialize_module(&bytes).expect("canonical fixture")
-                ),
+                )
+                .expect("serialize_module: test fixture"),
                 bytes,
                 "{name} fixture must be canonical"
             );
@@ -1825,7 +1981,11 @@ mod tests {
         assert!(matches!(
             inst_expr(
                 &module,
-                &Inst::Assert { cond: ValueId::new(0) },
+                &Inst::Assert {
+                    cond: ValueId::new(0),
+                    kind: trust_ir::AssertKind::Unspecified,
+                    site: None,
+                },
                 "assertion outcome",
             ),
             Err(LiteralRefinementError::Unsupported { construct, .. })
@@ -1845,5 +2005,49 @@ mod tests {
             Err(LiteralRefinementError::Unsupported { construct, .. })
                 if construct.contains("Unicode-scalar range proof")
         ));
+    }
+
+    /// Trust (Clean R80 item 2; `docs/DECISION_QUEUE.md` R80-CONSUMERS-1): the
+    /// generated literal source is a NEW elaboration run over the cached EvalIR +
+    /// temporal context, so the command form of `[implemented_by]` on a prelude
+    /// declaration is refused with Lean's text. Before the fix the cache handed out
+    /// a plain `FileContext` clone, which stays in the prelude's run, and the
+    /// command bound `Trust.Temporal.drop` (the source then failed for want of the
+    /// refinement theorems).
+    #[test]
+    fn literal_context_consumer_cannot_rebind_a_prelude_declaration() {
+        const SOURCE: &str = "def myDrop {State : Type} (b : Trust.Temporal.Behavior State) \
+                              (n : Nat) : Trust.Temporal.Behavior State := b\n\
+                              attribute [implemented_by myDrop] Trust.Temporal.drop\n";
+        assert_eq!(
+            check_source(SOURCE.to_owned()).map(|_| ()),
+            Err(LiteralRefinementError::Clean(CleanTemporalCertificateError::Elaborate {
+                unit: "generated literal refinement",
+                detail: "Cannot add attribute `[implemented_by]` to declaration \
+                         `Trust.Temporal.drop` because it is in an imported module"
+                    .to_owned(),
+            }))
+        );
+    }
+
+    /// The control: the consumer's own declarations are its run's, so the same
+    /// command on one of them binds.
+    #[test]
+    fn literal_context_consumer_may_bind_its_own_declaration() {
+        const SOURCE: &str = "def mySlow (n : Nat) : Nat := n + 2\n\
+                              def myFast (n : Nat) : Nat := n + 1\n\
+                              attribute [implemented_by myFast] mySlow\n";
+        let bound = run_on_large_stack(|| {
+            let (mut environment, mut context) = fresh_literal_context()?;
+            elaborate_suffix_with_parser_prelude(
+                &mut environment,
+                &mut context,
+                CLEAN_TEMPORAL_PRELUDE,
+                SOURCE,
+                "generated literal refinement",
+            )?;
+            Ok(environment.get_implemented_by(&Name::from_string("mySlow")).cloned())
+        });
+        assert_eq!(bound, Ok(Some(Name::from_string("myFast"))));
     }
 }

@@ -1,6 +1,10 @@
 use rustc_index::IndexVec;
-use rustc_middle::mir::visit::{PlaceContext, Visitor};
-use rustc_middle::mir::{Body, Local, Location};
+use rustc_index::bit_set::DenseBitSet;
+use rustc_middle::mir::visit::{PlaceContext, TyContext, Visitor};
+use rustc_middle::mir::{
+    Body, ConstOperand, Local, LocalDecl, Location, SourceInfo, VarDebugInfo,
+};
+use rustc_middle::ty::Ty;
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use crate::def_use::{self, DefUse};
@@ -81,10 +85,19 @@ impl<'a> Iterator for AppearancesIter<'a> {
 
 impl LocalUseMap {
     pub(crate) fn build(
-        live_locals: &[Local],
+        mut live_locals: impl Iterator<Item = Local>,
         location_map: &DenseLocationMap,
         body: &Body<'_>,
     ) -> Self {
+        let Some(head) = live_locals.next() else {
+            return LocalUseMap {
+                first_def_at: IndexVec::new(),
+                first_use_at: IndexVec::new(),
+                first_drop_at: IndexVec::new(),
+                appearances: IndexVec::new(),
+            };
+        };
+
         let nones = IndexVec::from_elem(None, &body.local_decls);
         let mut local_use_map = LocalUseMap {
             first_def_at: nones.clone(),
@@ -93,13 +106,11 @@ impl LocalUseMap {
             appearances: IndexVec::new(),
         };
 
-        if live_locals.is_empty() {
-            return local_use_map;
-        }
-
-        let mut locals_with_use_data: IndexVec<Local, bool> =
-            IndexVec::from_elem(false, &body.local_decls);
-        live_locals.iter().for_each(|&local| locals_with_use_data[local] = true);
+        let mut locals_with_use_data = DenseBitSet::new_empty(body.local_decls.len());
+        locals_with_use_data.insert(head);
+        live_locals.for_each(|local| {
+            locals_with_use_data.insert(local);
+        });
 
         LocalUseMapBuild { local_use_map: &mut local_use_map, location_map, locals_with_use_data }
             .visit_body(body);
@@ -108,17 +119,17 @@ impl LocalUseMap {
     }
 
     pub(crate) fn defs(&self, local: Local) -> impl Iterator<Item = PointIndex> {
-        appearances_iter(self.first_def_at[local], &self.appearances)
+        appearances_iter(self.first_def_at.get(local).copied().flatten(), &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 
     pub(crate) fn uses(&self, local: Local) -> impl Iterator<Item = PointIndex> {
-        appearances_iter(self.first_use_at[local], &self.appearances)
+        appearances_iter(self.first_use_at.get(local).copied().flatten(), &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 
     pub(crate) fn drops(&self, local: Local) -> impl Iterator<Item = PointIndex> {
-        appearances_iter(self.first_drop_at[local], &self.appearances)
+        appearances_iter(self.first_drop_at.get(local).copied().flatten(), &self.appearances)
             .map(move |aa| self.appearances[aa].point_index)
     }
 }
@@ -134,12 +145,12 @@ struct LocalUseMapBuild<'me> {
     // obtained the same information from `live_locals` but we want to
     // avoid repeatedly calling `Vec::contains()` (see `LocalUseMap` for
     // the rationale on the time-memory trade-off we're favoring here).
-    locals_with_use_data: IndexVec<Local, bool>,
+    locals_with_use_data: DenseBitSet<Local>,
 }
 
 impl Visitor<'_> for LocalUseMapBuild<'_> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
-        if self.locals_with_use_data[local]
+        if self.locals_with_use_data.contains(local)
             && let Some(def_use) = def_use::categorize(context)
         {
             let first_appearance = match def_use {
@@ -155,4 +166,14 @@ impl Visitor<'_> for LocalUseMapBuild<'_> {
             *first_appearance = Some(appearance_index);
         }
     }
+
+    fn visit_local_decl(&mut self, _: Local, _: &LocalDecl<'_>) {}
+
+    fn visit_var_debug_info(&mut self, _: &VarDebugInfo<'_>) {}
+
+    fn visit_source_info(&mut self, _: &SourceInfo) {}
+
+    fn visit_ty(&mut self, _: Ty<'_>, _: TyContext) {}
+
+    fn visit_const_operand(&mut self, _: &ConstOperand<'_>, _: Location) {}
 }

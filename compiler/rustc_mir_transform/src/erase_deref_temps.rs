@@ -5,6 +5,8 @@ use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 
+use crate::PassPolicy;
+
 struct EraseDerefTempsVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
 }
@@ -28,6 +30,14 @@ impl<'tcx> MutVisitor<'tcx> for EraseDerefTempsVisitor<'tcx> {
             **info = LocalInfo::Boring;
         }
     }
+
+    fn visit_place(&mut self, _: &mut Place<'tcx>, _: visit::PlaceContext, _: Location) {}
+
+    fn visit_terminator(&mut self, _: &mut Terminator<'tcx>, _: Location) {}
+
+    fn visit_source_info(&mut self, _: &mut SourceInfo) {}
+
+    fn visit_var_debug_info(&mut self, _: &mut VarDebugInfo<'tcx>) {}
 }
 
 pub(super) struct EraseDerefTemps;
@@ -45,7 +55,8 @@ impl<'tcx> crate::MirPass<'tcx> for EraseDerefTemps {
         EraseDerefTempsVisitor { tcx }.visit_body_preserves_cfg(body);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Later MIR stages assume that CopyForDeref is gone.
+        PassPolicy::Required
     }
 }

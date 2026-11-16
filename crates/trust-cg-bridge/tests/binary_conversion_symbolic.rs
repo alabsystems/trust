@@ -61,6 +61,7 @@ fn symbolic_binary_trust_ir(formula: Formula) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -88,6 +89,7 @@ fn scalar_bool_true_binary_trust_ir() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

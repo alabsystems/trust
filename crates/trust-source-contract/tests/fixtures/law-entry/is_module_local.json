@@ -1,0 +1,356 @@
+{
+  "name": "is_module_local",
+  "def_path": "trust_ir::Linkage::is_module_local",
+  "span": {
+    "file": "crates/trust-ir/src/lib.rs",
+    "line_start": 624,
+    "col_start": 4,
+    "line_end": 626,
+    "col_end": 5
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Adt": {
+            "name": "trust_ir::Linkage",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "External",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Internal",
+                "discriminant": 1,
+                "fields": []
+              },
+              {
+                "name": "Private",
+                "discriminant": 2,
+                "fields": []
+              },
+              {
+                "name": "Weak",
+                "discriminant": 3,
+                "fields": []
+              },
+              {
+                "name": "LinkOnce",
+                "discriminant": 4,
+                "fields": []
+              },
+              {
+                "name": "AvailableExternally",
+                "discriminant": 5,
+                "fields": []
+              },
+              {
+                "name": "ExternalWeak",
+                "discriminant": 6,
+                "fields": []
+              },
+              {
+                "name": "WeakOdr",
+                "discriminant": 7,
+                "fields": []
+              },
+              {
+                "name": "LinkOnceOdr",
+                "discriminant": 8,
+                "fields": []
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "self"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 2,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "crates/trust-ir/src/lib.rs",
+                "line_start": 625,
+                "col_start": 17,
+                "line_end": 625,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                1,
+                2
+              ],
+              [
+                2,
+                2
+              ]
+            ],
+            "otherwise": 1,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<home>/trust-adt-boolean-contracts/library/core/src/macros/mod.rs",
+              "line_start": 434,
+              "col_start": 8,
+              "line_end": 434,
+              "col_end": 25
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-adt-boolean-contracts/library/core/src/macros/mod.rs",
+                "line_start": 436,
+                "col_start": 17,
+                "line_end": 436,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<home>/trust-adt-boolean-contracts/library/core/src/macros/mod.rs",
+                "line_start": 435,
+                "col_start": 38,
+                "line_end": 435,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 3
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": "Bool"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 3
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 6
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 7
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_2",
+                "Int"
+              ]
+            },
+            {
+              "Int": 8
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

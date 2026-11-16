@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // Pipeline test module. Tests reach into multiple submodules — sibling-module
 // helpers are imported explicitly; mod.rs re-exports cover the public surface.
 //
@@ -20,7 +20,10 @@ use super::hardened::{
     GateDecision, GateLane, OutcomeCounts, aggregate_coverage, apply_coverage_gate,
     compiler_verification_success, evaluate_run_gate, evaluate_verification_gate,
     hardened_proof_gate_failure_for_results, memory_safe_gate_counts, partition_outcome_counts,
+    strict_gate_counts,
 };
+#[cfg(target_os = "macos")]
+use super::probe::runtime_closure_fixture::RuntimeClosureFixture;
 use super::probe::{
     apply_native_runtime_env, apply_trustd_runtime_closure, inspect_trustd_runtime_closure,
     native_runtime_library_paths, trusted_runtime_search_path_value,
@@ -257,9 +260,12 @@ fn hardened_native_proof_result() -> VerificationResult {
         }],
     );
     let transport = trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
         obligation_id: Some(owner.into()),
         claim_digest_sha256: Some("b".repeat(64)),
         kind: "hardened_byte_loss".into(),
+        original_vc_snapshot: None,
         typed_kind: None,
         description: "hardened boundary (byte_loss): byte-exact path rendering".into(),
         location: None,
@@ -294,8 +300,9 @@ fn hardened_native_proof_result() -> VerificationResult {
             diagnostics: Vec::new(),
         }),
         monitor: None,
+        grade: None,
     };
-    crate::types::transport_to_verification_result("crate::paths::render", &transport)
+    crate::types::transport_to_verification_result("crate::paths::render", &transport, None, None)
 }
 
 #[test]
@@ -354,14 +361,17 @@ fn hardened_proof_gate_for_results_rejects_inventory_only_native_hardened_result
     let config = TrustConfig::default();
 
     let failure = hardened_proof_gate_failure_for_results(
-        &[result],
-        &[],
-        "hardened-gate-test",
-        &[],
-        None,
-        &config,
-        true,
-        Some("unix_hardened"),
+        crate::pipeline::hardened::HardenedProofGateInput {
+            results: &[result],
+            compiler_diagnostics: &[],
+            report_subject: "hardened-gate-test",
+            zero_obligation_functions: &[],
+            test_harness_exclusions: &[],
+            live_transport_authority: None,
+            config: &config,
+            hardened: true,
+            trust_profile: Some("unix_hardened"),
+        },
     )
     .expect("inventory-only hardened results must fail in every native workflow");
 
@@ -381,37 +391,44 @@ fn hardened_rewrite_gate_accepts_authenticated_native_proof_evidence() {
     let authority = crate::report::LiveTransportAuthority::capture_authenticated_projection(
         subject,
         &session,
-        &authenticated_results,
+        authenticated_results,
         &publication_results,
         None,
+        crate::test_target_panics::TestTargetPanicPolicy::Strict,
     )
     .expect("valid native proof projection must mint rewrite authority");
     let config = TrustConfig::default();
 
     assert!(
         hardened_proof_gate_failure_for_results(
-            &publication_results,
-            &[],
-            subject,
-            &[],
-            None,
-            &config,
-            true,
-            Some("unix_hardened"),
+            crate::pipeline::hardened::HardenedProofGateInput {
+                results: &publication_results,
+                compiler_diagnostics: &[],
+                report_subject: subject,
+                zero_obligation_functions: &[],
+                test_harness_exclusions: &[],
+                live_transport_authority: None,
+                config: &config,
+                hardened: true,
+                trust_profile: Some("unix_hardened")
+            }
         )
         .is_some(),
         "the same DTO without live compiler authority must fail closed"
     );
     assert!(
         hardened_proof_gate_failure_for_results(
-            &publication_results,
-            &[],
-            subject,
-            &[],
-            Some(&authority),
-            &config,
-            true,
-            Some("unix_hardened"),
+            crate::pipeline::hardened::HardenedProofGateInput {
+                results: &publication_results,
+                compiler_diagnostics: &[],
+                report_subject: subject,
+                zero_obligation_functions: &[],
+                test_harness_exclusions: &[],
+                live_transport_authority: Some(&authority),
+                config: &config,
+                hardened: true,
+                trust_profile: Some("unix_hardened")
+            }
         )
         .is_none(),
         "authenticated native proof evidence must satisfy the rewrite hardened gate"
@@ -456,30 +473,25 @@ fn rewrite_iteration_success_matches_hardened_success_contract() {
         0,
         std::slice::from_ref(&proved),
         &[],
+        &[],
         Some(&complete_coverage),
         &[],
         true,
     ));
     assert!(!rewrite_iteration_success(
         1,
-        &[proved.clone()],
+        std::slice::from_ref(&proved),
+        &[],
         &[],
         Some(&complete_coverage),
         &[],
         true,
     ));
-    assert!(!rewrite_iteration_success(0, &[], &[], Some(&complete_coverage), &[], true,));
+    assert!(!rewrite_iteration_success(0, &[], &[], &[], Some(&complete_coverage), &[], true,));
     assert!(!rewrite_iteration_success(
         0,
-        &[failed.clone()],
+        std::slice::from_ref(&failed),
         &[],
-        Some(&complete_coverage),
-        &[],
-        true,
-    ));
-    assert!(!rewrite_iteration_success(
-        0,
-        &[unknown.clone()],
         &[],
         Some(&complete_coverage),
         &[],
@@ -487,7 +499,17 @@ fn rewrite_iteration_success_matches_hardened_success_contract() {
     ));
     assert!(!rewrite_iteration_success(
         0,
-        &[runtime_checked.clone()],
+        std::slice::from_ref(&unknown),
+        &[],
+        &[],
+        Some(&complete_coverage),
+        &[],
+        true,
+    ));
+    assert!(!rewrite_iteration_success(
+        0,
+        std::slice::from_ref(&runtime_checked),
+        &[],
         &[],
         Some(&complete_coverage),
         &[],
@@ -517,12 +539,12 @@ fn rewrite_iteration_success_requires_exact_zero_obligation_inventory_coverage()
         semantics_sha256: "a".repeat(64),
     };
 
-    assert!(rewrite_iteration_success(0, &[], &inventory, Some(&exact), &[], true));
-    assert!(!rewrite_iteration_success(0, &[], &[], Some(&exact), &[], true));
-    assert!(!rewrite_iteration_success(0, &[], &inventory, Some(&larger), &[], true));
-    assert!(!rewrite_iteration_success(0, &[], &inventory, Some(&incomplete), &[], true));
-    assert!(!rewrite_iteration_success(0, &[], &inventory, Some(&exact), &[target], true));
-    assert!(!rewrite_iteration_success(1, &[], &inventory, Some(&exact), &[], true));
+    assert!(rewrite_iteration_success(0, &[], &inventory, &[], Some(&exact), &[], true));
+    assert!(!rewrite_iteration_success(0, &[], &[], &[], Some(&exact), &[], true));
+    assert!(!rewrite_iteration_success(0, &[], &inventory, &[], Some(&larger), &[], true));
+    assert!(!rewrite_iteration_success(0, &[], &inventory, &[], Some(&incomplete), &[], true));
+    assert!(!rewrite_iteration_success(0, &[], &inventory, &[], Some(&exact), &[target], true));
+    assert!(!rewrite_iteration_success(1, &[], &inventory, &[], Some(&exact), &[], true));
 }
 
 #[test]
@@ -532,19 +554,335 @@ fn evaluate_run_gate_requires_authenticated_zero_inventory_not_coverage_alone() 
     let complete = trust_types::VerificationCoverage::from_counts(2, 2);
     let empty = OutcomeCounts::default();
     assert_eq!(
-        evaluate_run_gate(GateLane::Strict, 0, empty, Some(&complete), false, true, 2),
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero_inventory(2),
+            &[]
+        ),
         Pass
     );
     assert_eq!(
-        evaluate_run_gate(GateLane::Strict, 0, empty, Some(&complete), false, true, 0),
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero_inventory(0),
+            &[]
+        ),
         Inconclusive
     );
     assert_eq!(
-        evaluate_run_gate(GateLane::Strict, 0, empty, Some(&complete), false, true, 1),
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero_inventory(1),
+            &[]
+        ),
         Inconclusive
     );
     assert_eq!(
-        evaluate_run_gate(GateLane::Strict, 0, empty, Some(&complete), true, true, 2),
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            true,
+            true,
+            &zero_inventory(2),
+            &[]
+        ),
+        Inconclusive
+    );
+}
+
+/// `n` distinct function identities for a zero-obligation inventory.
+fn zero_inventory(n: usize) -> Vec<String> {
+    (0..n).map(|index| format!("fixture::f{index}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Trust (CB4): bodies rustc's libtest harness synthesizes are EXCLUDED from the
+// proof inventory — counted, never proof, never inside `total`.
+// ---------------------------------------------------------------------------
+
+/// The Cargo unit identity the transport mints for a unit compiled in `mode`.
+fn cb4_unit(mode: &str) -> CargoTargetIdentity {
+    CargoTargetIdentity {
+        package_id: "path+file:///w/fixture#0.1.0".to_string(),
+        package_name: "fixture".to_string(),
+        target_name: "fixture".to_string(),
+        target_kinds: vec!["lib".to_string()],
+        compile_target: "aarch64-apple-darwin".to_string(),
+        compile_mode: mode.to_string(),
+        compile_kind: "host".to_string(),
+        unit_identity_sha256: "a".repeat(64),
+        compile_target_spec_sha256: None,
+        proof_unit_index: 3,
+        proof_unit_mode: mode.to_string(),
+        proof_unit_role: "primary".to_string(),
+        semantics_sha256: "b".repeat(64),
+    }
+}
+
+/// The exact exclusion row the compiler writes, scoped the way the transport
+/// scopes it.
+fn cb4_exclusion_row(
+    unit: &CargoTargetIdentity,
+    function: &str,
+    item: trust_types::exclusion::TestHarnessExclusionItem,
+    test_function: Option<&str>,
+) -> VerificationResult {
+    VerificationResult {
+        function: format!("{}::{function}", unit.report_label()),
+        kind: trust_types::exclusion::TEST_HARNESS_ROW_KIND.into(),
+        message: trust_types::exclusion::TEST_HARNESS_ROW_DESCRIPTION.into(),
+        outcome: VerificationOutcome::Unknown,
+        backend: trust_types::exclusion::TEST_HARNESS_ROW_SOLVER.into(),
+        time_ms: Some(0),
+        location: None,
+        counterexample: None,
+        reason: trust_types::exclusion::test_harness_exclusion_reason(item, test_function),
+        raw_line: String::new(),
+    }
+}
+
+fn cb4_closure_row(mode: &str) -> VerificationResult {
+    cb4_exclusion_row(
+        &cb4_unit(mode),
+        "tests::empty::{closure#0}",
+        trust_types::exclusion::TestHarnessExclusionItem::TestRunnerClosure,
+        Some("fixture::tests::empty#1"),
+    )
+}
+
+fn cb4_main_row(mode: &str) -> VerificationResult {
+    cb4_exclusion_row(
+        &cb4_unit(mode),
+        "main",
+        trust_types::exclusion::TestHarnessExclusionItem::HarnessMain,
+        None,
+    )
+}
+
+#[test]
+fn cb4_partition_counts_exact_exclusions_outside_total_in_every_harness_mode() {
+    // MUST-FIX 1: `targo trust test` binds rows to `test`, `targo trust check
+    // --tests` to `check-test`; both are harness compiles.
+    for mode in ["test", "check-test"] {
+        let mut proved = gate_row("postcondition", VerificationOutcome::Proved, "");
+        proved.function = format!("{}::add1", cb4_unit(mode).report_label());
+        let rows = [cb4_closure_row(mode), cb4_main_row(mode), proved];
+        let (counts, defects) = partition_outcome_counts(&rows);
+        assert!(defects.is_empty(), "{mode}: {defects:?}");
+        assert_eq!(counts.excluded, 2, "{mode}");
+        assert_eq!(counts.total, 1, "{mode}: an exclusion is never an obligation");
+        assert_eq!(counts.proved, 1, "{mode}");
+        assert_eq!(counts.unknown, 0, "{mode}");
+        let exclusions = crate::types::authenticated_test_harness_exclusions(&rows);
+        assert_eq!(exclusions.len(), 2, "{mode}");
+        assert!(exclusions.iter().all(|exclusion| exclusion.reason == "test-harness-synthesized"));
+        let closure = exclusions
+            .iter()
+            .find(|exclusion| exclusion.item == "test-runner-closure")
+            .expect("closure exclusion");
+        assert_eq!(closure.test_function.as_deref(), Some("fixture::tests::empty#1"));
+    }
+}
+
+#[test]
+fn cb4_partition_fails_closed_on_every_malformed_or_misbound_exclusion_row() {
+    let mut cases: Vec<(&str, VerificationResult)> = Vec::new();
+    for outcome in [
+        VerificationOutcome::Proved,
+        VerificationOutcome::RuntimeChecked,
+        VerificationOutcome::Failed,
+        VerificationOutcome::Timeout,
+    ] {
+        let mut row = cb4_closure_row("test");
+        row.outcome = outcome;
+        cases.push(("claims an outcome other than skipped", row));
+    }
+    let mut row = cb4_closure_row("test");
+    row.backend = "trust-policy".into();
+    cases.push(("wrong solver", row));
+    let mut row = cb4_closure_row("test");
+    row.message = "rustc libtest harness code".into();
+    cases.push(("wrong description", row));
+    let mut row = cb4_closure_row("test");
+    row.reason = None;
+    cases.push(("no reason", row));
+    let mut row = cb4_closure_row("test");
+    row.time_ms = Some(3);
+    cases.push(("a solver time", row));
+    let mut row = cb4_main_row("test");
+    row.location = Some(trust_types::SourceSpan::default());
+    cases.push(("main with a location", row));
+    // Unit binding: only a harness compile may exclude anything.
+    for mode in ["build", "check", "doctest"] {
+        cases.push(("non-harness unit", cb4_closure_row(mode)));
+    }
+    let mut row = cb4_closure_row("test");
+    row.function = "fixture::tests::empty::{closure#0}".into();
+    cases.push(("unscoped raw row", row));
+    let mut split = cb4_unit("test");
+    split.compile_mode = "build".into();
+    let mut row = cb4_closure_row("test");
+    row.function = format!("{}::main", split.report_label());
+    cases.push(("unit modes disagree", row));
+
+    for (label, row) in cases {
+        let (counts, defects) = partition_outcome_counts(std::slice::from_ref(&row));
+        assert_eq!(counts.excluded, 0, "{label}");
+        assert_eq!(counts.total, 1, "{label}");
+        assert_eq!(counts.proved, 0, "{label}: never proof");
+        assert_eq!(counts.unknown, 1, "{label}: a genuine unknown");
+        assert_eq!(defects.len(), 1, "{label}: {defects:?}");
+        assert!(defects[0].contains("transport defect"), "{label}: {defects:?}");
+        assert!(crate::types::authenticated_test_harness_exclusions(&[row]).is_empty(), "{label}");
+    }
+}
+
+#[test]
+fn cb4_publication_elides_only_exact_exclusion_rows() {
+    let mut malformed = cb4_closure_row("build");
+    malformed.function =
+        format!("{}::tests::other::{{closure#0}}", cb4_unit("build").report_label());
+    let mut rows = vec![cb4_closure_row("test"), cb4_main_row("test"), malformed.clone()];
+    let boundary = crate::types::normalize_authenticated_results_for_publication(&mut rows, None);
+    assert_eq!(boundary.harness_exclusions_elided, 2);
+    assert_eq!(rows.len(), 1, "the misbound lookalike stays and fails closed");
+    assert_eq!(rows[0].function, malformed.function);
+}
+
+#[test]
+fn cb4_excluded_rows_neither_prove_nor_condition_a_pass() {
+    use GateDecision::{Inconclusive, Pass};
+    // Only exclusions: nothing was proved, in any lane.
+    let only_excluded = OutcomeCounts { excluded: 4, ..OutcomeCounts::default() };
+    for lane in [GateLane::Advisory, GateLane::MemorySafe, GateLane::Strict, GateLane::Certify] {
+        assert_eq!(evaluate_verification_gate(lane, 0, only_excluded), Inconclusive, "{lane:?}");
+    }
+    // Proved rows beside exclusions: a bare PASS, even in certify — an exclusion
+    // is not a condition (nothing about any user body rests on it).
+    let proved_beside_excluded = OutcomeCounts { excluded: 4, ..oc(2, 0, 0, 0, 0, 0) };
+    for lane in [GateLane::Advisory, GateLane::MemorySafe, GateLane::Strict, GateLane::Certify] {
+        assert_eq!(evaluate_verification_gate(lane, 0, proved_beside_excluded), Pass, "{lane:?}");
+    }
+}
+
+/// MUST-FIX 2: a test crate whose USER bodies have no obligations passes when
+/// the zero-obligation inventory plus the exclusions account for every eligible
+/// body — the MEASURED `unit` repro: eligible 4 = `id`, `tests::empty#1` (zero
+/// obligations) + the runner closure and `main` (excluded).
+#[test]
+fn cb4_zero_obligation_rule_counts_excluded_identities() {
+    use GateDecision::{Inconclusive, Pass};
+    let empty = OutcomeCounts::default();
+    let complete = trust_types::VerificationCoverage::from_counts(4, 4);
+    let zero = vec!["unit::id".to_string(), "unit::tests::empty#1".to_string()];
+    let excluded = vec!["unit::main".to_string(), "unit::tests::empty::{closure#0}".to_string()];
+    for lane in [GateLane::Strict, GateLane::Certify] {
+        assert_eq!(
+            evaluate_run_gate(lane, 0, empty, Some(&complete), false, true, &zero, &excluded),
+            Pass,
+            "{lane:?}"
+        );
+        // Before CB4 the rule compared eligible with the zero-obligation count
+        // alone: 4 != 2, so the unit crate fell through to `T == 0`.
+        assert_eq!(
+            evaluate_run_gate(lane, 0, empty, Some(&complete), false, true, &zero, &[]),
+            Inconclusive,
+            "{lane:?}"
+        );
+    }
+    // Overlapping identity sets: one function cannot be both.
+    let overlapping = vec!["unit::main".to_string(), "unit::id".to_string()];
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero,
+            &overlapping
+        ),
+        Inconclusive
+    );
+    // A duplicated identity is not two bodies.
+    let duplicated = vec!["unit::main".to_string(), "unit::main".to_string()];
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero,
+            &duplicated
+        ),
+        Inconclusive
+    );
+    // Only exclusions account for the crate: no user body at all, no pass.
+    let four_excluded = zero_inventory(4);
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &[],
+            &four_excluded
+        ),
+        Inconclusive
+    );
+    // One eligible body unaccounted: still inconclusive.
+    let five = trust_types::VerificationCoverage::from_counts(5, 5);
+    assert_eq!(
+        evaluate_run_gate(GateLane::Strict, 0, empty, Some(&five), false, true, &zero, &excluded),
+        Inconclusive
+    );
+    // A nonzero compiler exit or a missing target coverage row still fails closed.
+    assert_ne!(
+        evaluate_run_gate(
+            GateLane::Strict,
+            1,
+            empty,
+            Some(&complete),
+            false,
+            true,
+            &zero,
+            &excluded
+        ),
+        Pass
+    );
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Strict,
+            0,
+            empty,
+            Some(&complete),
+            true,
+            true,
+            &zero,
+            &excluded
+        ),
         Inconclusive
     );
 }
@@ -581,29 +919,55 @@ fn rewrite_iteration_success_requires_complete_authenticated_target_coverage() {
         semantics_sha256: "a".repeat(64),
     };
 
-    assert!(!rewrite_iteration_success(0, &[proved.clone()], &[], None, &[], true));
-    assert!(!rewrite_iteration_success(0, &[proved.clone()], &[], Some(&incomplete), &[], true,));
     assert!(!rewrite_iteration_success(
         0,
-        &[proved.clone()],
+        std::slice::from_ref(&proved),
+        &[],
+        &[],
+        None,
+        &[],
+        true
+    ));
+    assert!(!rewrite_iteration_success(
+        0,
+        std::slice::from_ref(&proved),
+        &[],
+        &[],
+        Some(&incomplete),
+        &[],
+        true,
+    ));
+    assert!(!rewrite_iteration_success(
+        0,
+        std::slice::from_ref(&proved),
+        &[],
         &[],
         Some(&complete),
-        &[target.clone()],
+        std::slice::from_ref(&target),
         true,
     ));
 
     // Advisory compatibility permits unknown/legacy coverage, but never an
     // authenticated row that explicitly reports incomplete accounting.
-    assert!(rewrite_iteration_success(0, &[proved.clone()], &[], None, &[], false));
     assert!(rewrite_iteration_success(
         0,
-        &[proved.clone()],
+        std::slice::from_ref(&proved),
+        &[],
+        &[],
+        None,
+        &[],
+        false
+    ));
+    assert!(rewrite_iteration_success(
+        0,
+        std::slice::from_ref(&proved),
+        &[],
         &[],
         Some(&complete),
         &[target],
         false,
     ));
-    assert!(!rewrite_iteration_success(0, &[proved], &[], Some(&incomplete), &[], false,));
+    assert!(!rewrite_iteration_success(0, &[proved], &[], &[], Some(&incomplete), &[], false,));
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +992,7 @@ fn oc(
         assumed,
         mandated,
         contract_panics: 0,
+        excluded: 0,
     }
 }
 
@@ -652,6 +1017,46 @@ fn gate_row(kind: &str, outcome: VerificationOutcome, raw_line: &str) -> Verific
     }
 }
 
+/// A transport row carrying the ADDITIVE typed payload that every real compiler
+/// row has. A compact tag whose VC has semantic fields the tag alone cannot
+/// recover (`compact_vc_tag_requires_typed_kind`: every overflow/shift/deep
+/// kind) classifies as `UnsupportedMir` WITHOUT this payload, and an
+/// unsupported-MIR row may not carry proof or runtime-check credit — see
+/// `an_unsupported_mir_row_claiming_proof_gets_no_gate_proof_credit`. A fixture
+/// that means "an ordinary proved row" must therefore be typed, or it is
+/// asserting the behavior of a malformed row instead.
+fn typed_gate_row(kind: trust_types::VcKind, outcome: VerificationOutcome) -> VerificationResult {
+    let evidence = crate::types::StructuredTransportEvidence {
+        assumes: Vec::new(),
+        obligation_id: None,
+        claim_digest_sha256: None,
+        original_vc_snapshot: None,
+        typed_kind: Some(Box::new(kind.clone())),
+        design_mandate: false,
+        runtime_checks: None,
+        native_trust_ir: None,
+        proof_evidence: None,
+        monitor: None,
+        identity: None,
+        grade: None,
+    };
+    VerificationResult {
+        function: "crate::f".into(),
+        kind: kind.transport_tag(),
+        message: kind.description(),
+        outcome,
+        backend: "ay".into(),
+        time_ms: Some(1),
+        location: None,
+        counterexample: None,
+        reason: None,
+        raw_line: format!(
+            "targo-trust-structured-transport-evidence:{}",
+            serde_json::to_string(&evidence).expect("structured transport evidence serializes"),
+        ),
+    }
+}
+
 /// A raw transport line carrying the compiler's `design_mandate` bit.
 fn mandate_raw_line() -> String {
     // Mirrors `StructuredTransportEvidence` serialized under the private
@@ -667,10 +1072,18 @@ fn gate_advisory_lane_matches_contract_table() {
     assert_eq!(evaluate_verification_gate(GateLane::Advisory, 101, oc(3, 0, 0, 0, 0, 0)), Fail);
     // Row 3: F > 0 -> Fail.
     assert_eq!(evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 1, 0, 0, 0, 0)), Fail);
-    // Row 4: U > 0 -> Inconclusive.
+    // Row 4 (ramp, 2026-09-07): U > 0 -> ConditionalPass with the unknown
+    // count carried. This row used to be `Inconclusive`, which made
+    // `--allow-l0-gaps` fail on the gaps it exists to allow.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 0, 1, 0, 0, 0)),
-        Inconclusive
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 1,
+        }
     );
     // Row 5: T == 0 -> Inconclusive.
     assert_eq!(
@@ -680,22 +1093,46 @@ fn gate_advisory_lane_matches_contract_table() {
     // Row 7a: all-assumed (P = 0), the async-lib case -> ConditionalPass.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 2, 0)),
-        ConditionalPass { assumed: 2, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 2,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
     // Row 7b: mandated = 1 (F1 fix) -> ConditionalPass in the advisory lane.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 0, 1)),
-        ConditionalPass { assumed: 0, mandated: 1, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 0,
+            mandated: 1,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
     // Row 7c: runtime-checked (F6) -> ConditionalPass.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 1, 0, 0)),
-        ConditionalPass { assumed: 0, mandated: 0, runtime_checked: 1, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 1,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
     // Row 7d: mixed proved + assumed (hello / greet) -> ConditionalPass.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 0, 0, 0, 1, 0)),
-        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
     // Row 8: all proved -> Pass.
     assert_eq!(evaluate_verification_gate(GateLane::Advisory, 0, oc(2, 0, 0, 0, 0, 0)), Pass);
@@ -704,7 +1141,8 @@ fn gate_advisory_lane_matches_contract_table() {
     assert!(evaluate_verification_gate(GateLane::Advisory, 0, oc(2, 0, 0, 0, 0, 0)).is_success());
     assert!(evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 0, 1)).is_success());
     assert!(evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 2, 0)).is_success());
-    assert!(!evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 0, 1, 0, 0, 0)).is_success());
+    // Ramp: a genuine unknown is a condition of an advisory pass, so it exits 0.
+    assert!(evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 0, 1, 0, 0, 0)).is_success());
     assert!(!evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 0, 0)).is_success());
     assert!(!evaluate_verification_gate(GateLane::Advisory, 1, oc(1, 0, 0, 0, 0, 0)).is_success());
 }
@@ -774,7 +1212,13 @@ fn memory_safe_lane_only_conditionally_accepts_compiler_marked_safe_assumptions(
     assert!(defects.is_empty());
     assert_eq!(
         evaluate_verification_gate(GateLane::MemorySafe, 0, marked_counts),
-        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
 
     for counts in [oc(0, 0, 0, 1, 0, 0), oc(0, 0, 0, 0, 0, 1), oc_cp(oc(0, 0, 0, 0, 0, 0), 1)] {
@@ -795,10 +1239,37 @@ fn coroutine_protocol_premise_is_visible_and_cannot_pass_strict_or_memory_safe_g
     assert_eq!(counts.assumed, 1);
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, counts),
-        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
-    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, counts), Inconclusive);
+    // Trust (2026-09-16): the default lane grades a disclosed ledger row a
+    // CONDITIONAL pass (see `gate_strict_lane_passes_runtime_checked_only`);
+    // `--certify` still refuses it.
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, counts),
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
     assert_eq!(evaluate_verification_gate(GateLane::Strict, 1, counts), Fail);
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, counts), Inconclusive);
+    // ...but a real strict run never grades that count: the strict compiler
+    // aborts on the coroutine premise instead of recording it, so the row can
+    // reach the strict lane only from a nonfatal policy, and the strict lane's
+    // provenance check counts it unknown (`strict_gate_counts`).
+    let (strict_counts, defects) = strict_gate_counts(&results, counts);
+    assert_eq!((strict_counts.assumed, strict_counts.unknown), (0, 1));
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict_counts), Inconclusive);
 
     let (memory_safe_counts, defects) = memory_safe_gate_counts(&results, counts);
     assert_eq!(memory_safe_counts.assumed, 0);
@@ -809,6 +1280,708 @@ fn coroutine_protocol_premise_is_visible_and_cannot_pass_strict_or_memory_safe_g
         Inconclusive
     );
     assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 1, memory_safe_counts), Fail);
+}
+
+/// THE STRICT LANE'S PROVENANCE CHECK. The default lane conditional-passes an
+/// `assumed` row only in the shapes the compiler's strict policy publishes: the
+/// definition-entry `requires`, `#[trust::assume_total]` (both producers), the
+/// b59 `fmt::format` leg, and the discharged global-alloc contract. Every other
+/// row the partition counts `assumed` is a genuine unknown on the strict lane.
+/// These are rows advisory or memory-safe policy records, which reached this
+/// lane through a `TRUSTFLAGS -Ztrust-policy` override until that override was
+/// refused (2026-10-01) and TRUSTFLAGS deleted (T7a); the grader stays the
+/// second layer for any other route. Before `strict_gate_counts` each refused
+/// row below graded the strict lane CONDITIONAL-PASS, exit 0.
+#[test]
+fn strict_lane_only_conditionally_accepts_rows_the_strict_policy_publishes() {
+    use GateDecision::*;
+
+    let row = |kind: &str, backend: &str, message: &str| {
+        let mut row = gate_row(kind, VerificationOutcome::Unknown, "");
+        row.backend = backend.to_string();
+        row.message = message.to_string();
+        row
+    };
+    let memory_safe = trust_types::assumption::MEMORY_SAFE_ASSUMPTION_ROW_SOURCE;
+    let fmt_format = "unverified assumption: extern print/format/write dispatch \
+                      `alloc::fmt::format` runs a user Display/Debug impl that may panic";
+    let print = "unverified assumption: extern print/format/write dispatch \
+                 `std::io::_print` runs a user Display/Debug impl that may panic";
+    let mut global_alloc = row(
+        trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_KIND,
+        trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_SOLVER,
+        "dealloc",
+    );
+    global_alloc.reason =
+        Some(trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_DISCHARGED_REASON.to_string());
+
+    let admitted = [
+        row("assumption:requires", "trust-entry-assumption", "requires"),
+        row("assumption:assumed-total", "trust-policy", "unverified assumption: f"),
+        row("assumption:assumed-total-callee", "trust-assumed-total", "call"),
+        row("assumption:assumed-total-callee", "trust-bridge", "unverified assumption: w"),
+        row("assumption:extern-call", memory_safe, fmt_format),
+        global_alloc,
+    ];
+    let (counts, _) = partition_outcome_counts(&admitted);
+    assert_eq!(counts.assumed, admitted.len(), "every admitted row is in the assumed bucket");
+    let (strict, defects) = strict_gate_counts(&admitted, counts);
+    assert!(defects.is_empty(), "the strict policy publishes every one of these: {defects:?}");
+    assert_eq!(strict, counts, "an admitted row keeps its bucket");
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, strict),
+        ConditionalPass {
+            assumed: admitted.len(),
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
+
+    let mut coroutine_contract = row(
+        trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_KIND,
+        trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_SOLVER,
+        &trust_types::assumption::coroutine_resume_contract_row_description(&[0, 3]),
+    );
+    coroutine_contract.reason =
+        Some(trust_types::assumption::COROUTINE_RESUME_CONTRACT_ROW_REASON.to_string());
+    let refused = [
+        // Advisory: `#[trust::skip]`, a classifier gap, an unreachable start, an
+        // expected-absent callee, the coroutine premise and its contract row.
+        row("assumption:user-opt-out", "trust-policy", "unverified assumption: f"),
+        row("assumption:unsupported-inline-asm", "trust-classifier", "unverified assumption: f"),
+        row("assumption:unreachable-start", "trust-policy", "unverified assumption: f"),
+        row("assumption:expected-absent-callee", "trust-bridge", "unverified assumption: f"),
+        row("assumption:coroutine", "trust-classifier", "unverified assumption: f"),
+        coroutine_contract,
+        row(
+            &trust_types::assumption::coroutine_resume_conditional_row_kind("assert"),
+            "trust-mc",
+            "assertion",
+        ),
+        // Memory-safe demotions, including the `println!` leg of an extern call.
+        row("assumption:memory-safe-panic", memory_safe, "unverified assumption: f"),
+        row("assumption:native-lowering", memory_safe, "unverified assumption: f"),
+        row("assumption:drop-glue", memory_safe, "unverified assumption: f"),
+        row("assumption:absent-callee", memory_safe, "unverified assumption: f"),
+        row("assumption:extern-call", memory_safe, print),
+        // A strict tag the strict compiler never stamps with this source, and an
+        // invented tag.
+        row("assumption:assumed-total-callee", "test", "w"),
+        row("assumption:test", "test", "test"),
+    ];
+    for refused_row in &refused {
+        let one = std::slice::from_ref(refused_row);
+        let (counts, _) = partition_outcome_counts(one);
+        assert_eq!(counts.assumed, 1, "{}: the partition counts it assumed", refused_row.kind);
+        assert!(
+            evaluate_verification_gate(GateLane::Strict, 0, counts).is_success(),
+            "{}: without the provenance check the strict lane passes it",
+            refused_row.kind
+        );
+        let (strict, defects) = strict_gate_counts(one, counts);
+        assert_eq!((strict.assumed, strict.unknown), (0, 1), "{}", refused_row.kind);
+        assert_eq!(strict.total, 1, "{}: the demotion keeps the row count", refused_row.kind);
+        assert!(
+            defects.len() == 1 && defects[0].contains("strict policy rejected assumption"),
+            "{}: {defects:?}",
+            refused_row.kind
+        );
+        assert_eq!(
+            evaluate_verification_gate(GateLane::Strict, 0, strict),
+            Inconclusive,
+            "{}: a row the strict policy never publishes is an unknown on the strict lane",
+            refused_row.kind
+        );
+    }
+
+    // Mixed: one refused row among admitted ones sinks the whole run, and only
+    // that row moves.
+    let mut mixed = admitted.to_vec();
+    mixed.push(row("assumption:user-opt-out", "trust-policy", "unverified assumption: f"));
+    let (counts, _) = partition_outcome_counts(&mixed);
+    let (strict, defects) = strict_gate_counts(&mixed, counts);
+    assert_eq!((strict.assumed, strict.unknown), (admitted.len(), 1));
+    assert_eq!(defects.len(), 1);
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+}
+
+/// Trust (TINV step 10.7, DECISION_QUEUE TINV-29): a row the compiler proved under a
+/// certified type invariant carries `assumes type_invariant(S)#k ...` on its transport row.
+/// The gate counts it as conditional evidence (`assumed`, never `proved`), the strict lane
+/// withholds it as an unknown with a named defect, `--certify` fails on it, and the
+/// disclosure reaches the report row and the assumption ledger. Control: the same row
+/// without `assumes` is ordinary.
+#[test]
+fn a_type_invariant_composed_row_is_conditional_evidence_and_strict_withholds_it() {
+    use GateDecision::*;
+    let premise = "assumes type_invariant(c::P)#2 `i <= len(b)` [certificate: test]".to_string();
+    let wire = |assumes: Vec<String>| trust_types::TransportObligationResult {
+        assumes,
+        gap_class: None,
+        monitor: None,
+        obligation_id: None,
+        claim_digest_sha256: None,
+        kind: "bounds".to_string(),
+        original_vc_snapshot: None,
+        typed_kind: None,
+        description: "index out of bounds".to_string(),
+        location: None,
+        outcome: trust_types::Outcome::Proved,
+        solver: "ay".to_string(),
+        time_ms: 0,
+        counterexample: None,
+        counterexample_model: None,
+        reason: None,
+        design_mandate: false,
+        native_trust_ir: None,
+        proof_evidence: None,
+        grade: None,
+    };
+    let composed = crate::types::transport_to_verification_result(
+        "c::P::rest",
+        &wire(vec![premise.clone()]),
+        None,
+        None,
+    );
+    assert_eq!(crate::report::transport_assumes(&composed), vec![premise.clone()]);
+    let results = [composed.clone()];
+    let (counts, defects) = partition_outcome_counts(&results);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.total, counts.proved, counts.assumed), (1, 0, 1));
+    // Advisory: a conditional pass that names the bucket.
+    assert!(evaluate_verification_gate(GateLane::Advisory, 0, counts).is_success());
+    // Strict: withheld, with a defect naming the premise.
+    let (strict, defects) = strict_gate_counts(&results, counts);
+    assert_eq!((strict.assumed, strict.unknown), (0, 1));
+    assert!(
+        defects.len() == 1 && defects[0].contains("TINV-29") && defects[0].contains(&premise),
+        "{defects:?}"
+    );
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+    // Certify: never.
+    assert!(!evaluate_verification_gate(GateLane::Certify, 0, counts).is_success());
+    // The ledger lists the premise under its own tag.
+    let ledger = crate::report::type_invariant_assumption_entries(&composed);
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].tag, crate::report::TYPE_INVARIANT_ASSUMPTION_TAG);
+    assert_eq!(ledger[0].detail, premise);
+    assert_eq!(ledger[0].subject, "c::P::rest");
+    // Control: the same row without a premise is an ordinary proved row.
+    let plain =
+        [crate::types::transport_to_verification_result("c::P::rest", &wire(vec![]), None, None)];
+    let (counts, _) = partition_outcome_counts(&plain);
+    assert_eq!((counts.proved, counts.assumed), (1, 0));
+    assert!(crate::report::type_invariant_assumption_entries(&plain[0]).is_empty());
+}
+
+/// Trust (OD-1 phase 1, ruled 2026-10-03; docs/DECISION_QUEUE.md "OD-1"): the
+/// compiler's instance-hypothesis rows. The per-site `assumption:instance-hypothesis`
+/// row (and the crate's `…:inventory-incomplete` row) is CONDITIONAL on the strict
+/// lane and never passes `--certify`; memory-safe does not admit it (the compiler's
+/// memory-safe gate refuses it too). An instance-DISCHARGE row reports the resolved
+/// callee's verdict: `proved` is conditional evidence (never proof credit), `failed`
+/// fails the gate, and a lookalike from another source is a genuine unknown.
+#[test]
+fn instance_hypothesis_rows_are_conditional_and_discharges_carry_their_verdict() {
+    use GateDecision::*;
+    let wire = |kind: &str, solver: &str, outcome: trust_types::Outcome| {
+        trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
+            monitor: None,
+            obligation_id: None,
+            claim_digest_sha256: None,
+            kind: kind.to_string(),
+            original_vc_snapshot: None,
+            typed_kind: None,
+            description:
+                "unverified assumption: [trust-instance-hypothesis] call to `<T as c::Tr>::m`"
+                    .to_string(),
+            location: None,
+            outcome,
+            solver: solver.to_string(),
+            time_ms: 0,
+            counterexample: None,
+            counterexample_model: None,
+            reason: Some("instance hypothesis".to_string()),
+            design_mandate: false,
+            native_trust_ir: None,
+            proof_evidence: None,
+            grade: None,
+        }
+    };
+    let solver = trust_types::assumption::INSTANCE_HYPOTHESIS_ROW_SOLVER;
+    let hypothesis = crate::types::transport_to_verification_result(
+        "c::f",
+        &wire("assumption:instance-hypothesis", solver, trust_types::Outcome::Skipped),
+        None,
+        None,
+    );
+    let results = [hypothesis];
+    let (counts, defects) = partition_outcome_counts(&results);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.total, counts.assumed), (1, 1));
+    let (strict, defects) = strict_gate_counts(&results, counts);
+    assert!(defects.is_empty(), "strict must admit the hypothesis row: {defects:?}");
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, strict),
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0
+        }
+    );
+    assert!(!evaluate_verification_gate(GateLane::Certify, 0, counts).is_success());
+    let (memory_safe, _) = memory_safe_gate_counts(&results, counts);
+    assert_eq!((memory_safe.assumed, memory_safe.unknown), (0, 1));
+
+    let discharge = |outcome, solver: &str| {
+        let mut row =
+            wire(trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND, solver, outcome);
+        row.description =
+            "instance discharge: site `<T as c::Tr>::m` of `c::f::<c::Good>`".to_string();
+        crate::types::transport_to_verification_result("c::use_good", &row, None, None)
+    };
+    // A clean instance: conditional evidence, never proof credit.
+    let clean = [discharge(trust_types::Outcome::Proved, solver)];
+    let (counts, defects) = partition_outcome_counts(&clean);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.proved, counts.assumed), (0, 1));
+    let (strict, defects) = strict_gate_counts(&clean, counts);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!(strict.assumed, 1);
+    // Memory-safe: an unmarked conditional row is a genuine unknown, never assumed
+    // (review 2026-10-04: it stayed `assumed` without the memory-safe stamp).
+    let (memory_safe, defects) = memory_safe_gate_counts(&clean, counts);
+    assert_eq!((memory_safe.assumed, memory_safe.unknown), (0, 1));
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    // The report keeps the row's own text and claims no runtime fallback
+    // (review 2026-10-04: it fell through to `Assertion { message: kind }`).
+    match crate::report::report_vc_kind(&clean[0]) {
+        trust_types::VcKind::UnsupportedMir { kind, detail } => {
+            assert_eq!(kind, trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND);
+            assert!(detail.contains("c::f::<c::Good>"), "{detail}");
+        }
+        other => panic!("discharge row reported as {other:?}"),
+    }
+    assert!(!crate::report::report_vc_kind(&clean[0]).has_runtime_fallback(true));
+    // The assumptions ledger lists the `proved` discharge the gate counts `assumed`
+    // (review 2026-10-04: gate said N assumed, ledger listed N-1); a failed one is an
+    // outcome, not a condition.
+    let entry = crate::report::assumption_entry_from_result(&clean[0])
+        .expect("a proved discharge row is a ledger entry");
+    assert_eq!(entry.tag, trust_types::assumption::INSTANCE_HYPOTHESIS_DISCHARGE_ROW_KIND);
+    assert!(
+        crate::report::assumption_entry_from_result(&discharge(
+            trust_types::Outcome::Failed,
+            solver
+        ))
+        .is_none()
+    );
+    assert!(
+        crate::report::assumption_entry_from_result(&discharge(
+            trust_types::Outcome::Proved,
+            "trust-full-verifier"
+        ))
+        .is_none(),
+        "a lookalike is no ledger entry"
+    );
+    // A panicking instance fails the gate on every lane.
+    let bad = [discharge(trust_types::Outcome::Failed, solver)];
+    let (counts, _) = partition_outcome_counts(&bad);
+    assert_eq!(counts.failed, 1);
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, counts), Fail);
+    // A lookalike from another source claims nothing.
+    let forged = [discharge(trust_types::Outcome::Proved, "trust-full-verifier")];
+    let (counts, defects) = partition_outcome_counts(&forged);
+    assert_eq!((counts.proved, counts.assumed, counts.unknown), (0, 0, 1));
+    assert_eq!(defects.len(), 1);
+}
+
+/// Trust (D9, ruled 2026-09-27; docs/DECISION_QUEUE.md "D9"): the compiler's
+/// `assumption:termination-unmeasured` charge — a direct self call no `decreases`
+/// measure covers — is CONDITIONAL on the default (strict) lane AND on the
+/// memory-safe lane, and never passes `--certify`. Before the memory-safe gate
+/// read `is_termination_unmeasured_assumption_row`, it counted the charge as an
+/// unmarked assumption (a genuine unknown), so `targo trust … --memory-safe`
+/// refused every charged function although the raw compiler under memory-safe
+/// policy passed it: the capability loss the ruling does not make. The same kind
+/// from any other solver stays a genuine unknown on both lanes.
+#[test]
+fn termination_unmeasured_charge_is_conditional_on_strict_and_memory_safe_never_certify() {
+    use GateDecision::*;
+
+    // The wire row in the shape the compiler seam mints it
+    // (`trust_verify/termination_unmeasured.rs`, `termination_unmeasured_row`):
+    // outcome `skipped`, its own solver, no typed kind, no evidence.
+    let wire = |solver: &str| trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
+        monitor: None,
+        obligation_id: None,
+        claim_digest_sha256: None,
+        kind: format!(
+            "assumption:{}",
+            trust_types::assumption::TERMINATION_UNMEASURED_ASSUMPTION_TAG
+        ),
+        original_vc_snapshot: None,
+        typed_kind: None,
+        description: "unverified assumption: termination of `crate::f`: this self call binds no \
+                      `decreases` measure, and the direct-self termination lane made no claim \
+                      for it"
+            .to_string(),
+        location: None,
+        outcome: trust_types::Outcome::Skipped,
+        solver: solver.to_string(),
+        time_ms: 0,
+        counterexample: None,
+        counterexample_model: None,
+        reason: Some(
+            "termination assumption `termination-unmeasured`: no `decreases` measure binds at 1 \
+             self call(s)"
+                .to_string(),
+        ),
+        design_mandate: false,
+        native_trust_ir: None,
+        proof_evidence: None,
+        grade: None,
+    };
+    let one_assumed = ConditionalPass {
+        assumed: 1,
+        mandated: 0,
+        runtime_checked: 0,
+        contract_panics: 0,
+        unknown: 0,
+    };
+
+    let charged = crate::types::transport_to_verification_result(
+        "crate::f",
+        &wire(trust_types::assumption::TERMINATION_UNMEASURED_ROW_SOLVER),
+        None,
+        None,
+    );
+    // The wire `skipped` projects onto `Unknown`, and the solver survives as the
+    // row's backend: the pair both gates read.
+    assert_eq!(charged.outcome, VerificationOutcome::Unknown);
+    assert_eq!(charged.backend, trust_types::assumption::TERMINATION_UNMEASURED_ROW_SOLVER);
+    assert!(trust_types::assumption::is_termination_unmeasured_assumption_row(
+        &charged.kind,
+        &charged.backend,
+    ));
+    let results = [charged.clone()];
+    let (counts, defects) = partition_outcome_counts(&results);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.total, counts.assumed, counts.unknown), (1, 1, 0));
+
+    // Memory-safe: admitted, CONDITIONAL-PASS with the assumption carried.
+    let (memory_safe, defects) = memory_safe_gate_counts(&results, counts);
+    assert!(defects.is_empty(), "memory-safe must admit the D9 charge: {defects:?}");
+    assert_eq!(memory_safe, counts, "an admitted row keeps its bucket");
+    assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 0, memory_safe), one_assumed);
+
+    // Strict (the default lane): the strict compiler publishes the row and does
+    // not abort, so the provenance check admits it.
+    let (strict, defects) = strict_gate_counts(&results, counts);
+    assert!(defects.is_empty(), "strict must admit the D9 charge: {defects:?}");
+    assert_eq!(strict, counts, "an admitted row keeps its bucket");
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), one_assumed);
+
+    // Certify: never passes. Even if the compiler's certify abort were missing
+    // (exit 0), the assumed row keeps the gate Inconclusive; with the abort it
+    // is a Fail.
+    let certify = evaluate_verification_gate(GateLane::Certify, 0, counts);
+    assert_eq!(certify, Inconclusive);
+    assert!(!certify.is_success());
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 1, counts), Fail);
+
+    // Beside a proved row the result is still conditional, never a clean Pass.
+    // (Typed, so it stands for an ordinary proved row; see `typed_gate_row`.)
+    let signed32 = trust_types::Ty::Int { width: 32, signed: true };
+    let proved = typed_gate_row(
+        trust_types::VcKind::ArithmeticOverflow {
+            op: trust_types::BinOp::Add,
+            operand_tys: (signed32.clone(), signed32),
+        },
+        VerificationOutcome::Proved,
+    );
+    let mixed = [proved, charged.clone()];
+    let (counts, defects) = partition_outcome_counts(&mixed);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.proved, counts.assumed), (1, 1));
+    let (memory_safe, _) = memory_safe_gate_counts(&mixed, counts);
+    assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 0, memory_safe), one_assumed);
+    let (strict, _) = strict_gate_counts(&mixed, counts);
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), one_assumed);
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, counts), Inconclusive);
+
+    // The same kind from another solver is NOT the charge: a genuine unknown on
+    // both lanes, each with its named defect.
+    let forged = crate::types::transport_to_verification_result(
+        "crate::f",
+        &wire("trust-classifier"),
+        None,
+        None,
+    );
+    let forged = [forged];
+    let (counts, defects) = partition_outcome_counts(&forged);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!(counts.assumed, 1, "the partition alone counts any `assumption:*` row assumed");
+    let (memory_safe, defects) = memory_safe_gate_counts(&forged, counts);
+    assert_eq!((memory_safe.assumed, memory_safe.unknown), (0, 1));
+    assert!(
+        defects.len() == 1
+            && defects[0].contains("memory-safe policy rejected unmarked assumption"),
+        "{defects:?}"
+    );
+    assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 0, memory_safe), Inconclusive);
+    let (strict, defects) = strict_gate_counts(&forged, counts);
+    assert_eq!((strict.assumed, strict.unknown), (0, 1));
+    assert!(
+        defects.len() == 1 && defects[0].contains("strict policy rejected assumption"),
+        "{defects:?}"
+    );
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+
+    // A charge row that CLAIMS proof is a transport defect, not an admitted
+    // assumption, on every lane.
+    let mut claims_proof = charged;
+    claims_proof.outcome = VerificationOutcome::Proved;
+    let claims_proof = [claims_proof];
+    let (counts, defects) = partition_outcome_counts(&claims_proof);
+    assert_eq!((counts.assumed, counts.unknown, counts.proved), (0, 1, 0));
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    let (memory_safe, _) = memory_safe_gate_counts(&claims_proof, counts);
+    assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 0, memory_safe), Inconclusive);
+    let (strict, _) = strict_gate_counts(&claims_proof, counts);
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+}
+
+/// Trust (SAFETY-ASSUME-1, ruled 2026-10-17; docs/DECISION_QUEUE.md
+/// "SAFETY-ASSUME-1"): the compiler's `assumption:safety-comment` charge — a user
+/// `unsafe { }` block whose clippy-placed `// SAFETY:` comment declares it, and whose
+/// unmodeled unsafe-operation rows it replaced — is CONDITIONAL on the advisory
+/// (`--allow-l0-gaps`), default (strict) and memory-safe lanes, is never counted
+/// proved, and never passes `--certify`. The same kind from any other solver stays
+/// a genuine unknown on the fail-closed lanes, and a charge row that claims proof is
+/// a transport defect.
+#[test]
+fn safety_comment_charge_is_assumed_on_every_lane_and_never_passes_certify() {
+    use GateDecision::*;
+
+    // The wire row in the shape the compiler seam mints it
+    // (`trust_verify/safety_comment_assumption.rs`, `safety_comment_row`).
+    let wire = |solver: &str| trust_types::TransportObligationResult {
+        assumes: Vec::new(),
+        gap_class: None,
+        monitor: None,
+        obligation_id: None,
+        claim_digest_sha256: None,
+        kind: format!("assumption:{}", trust_types::assumption::SAFETY_COMMENT_ASSUMPTION_TAG),
+        original_vc_snapshot: None,
+        typed_kind: None,
+        description: "unverified assumption: the unsafe block at src/main.rs:167:28 in \
+                      `crate::f` is declared sound by its `// SAFETY:` comment at \
+                      src/main.rs:163:12; the unsafe operations in it that Trust does not \
+                      model are assumed, not proved"
+            .to_string(),
+        location: None,
+        outcome: trust_types::Outcome::Skipped,
+        solver: solver.to_string(),
+        time_ms: 0,
+        counterexample: None,
+        counterexample_model: None,
+        reason: Some("declared assumption `safety-comment`".to_string()),
+        design_mandate: false,
+        native_trust_ir: None,
+        proof_evidence: None,
+        grade: None,
+    };
+    let one_assumed = ConditionalPass {
+        assumed: 1,
+        mandated: 0,
+        runtime_checked: 0,
+        contract_panics: 0,
+        unknown: 0,
+    };
+
+    let charged = crate::types::transport_to_verification_result(
+        "crate::f",
+        &wire(trust_types::assumption::SAFETY_COMMENT_ROW_SOLVER),
+        None,
+        None,
+    );
+    assert_eq!(charged.outcome, VerificationOutcome::Unknown);
+    assert_eq!(charged.backend, trust_types::assumption::SAFETY_COMMENT_ROW_SOLVER);
+    assert!(trust_types::assumption::is_safety_comment_assumption_row(
+        &charged.kind,
+        &charged.backend,
+    ));
+    let results = [charged.clone()];
+    let (counts, defects) = partition_outcome_counts(&results);
+    assert!(defects.is_empty(), "{defects:?}");
+    assert_eq!((counts.total, counts.proved, counts.assumed, counts.unknown), (1, 0, 1, 0));
+
+    // Advisory (`--allow-l0-gaps`, the aterm release lane): assumed, never failed.
+    assert_eq!(evaluate_verification_gate(GateLane::Advisory, 0, counts), one_assumed);
+
+    // Memory-safe: admitted, CONDITIONAL-PASS with the assumption carried.
+    let (memory_safe, defects) = memory_safe_gate_counts(&results, counts);
+    assert!(defects.is_empty(), "memory-safe must admit the charge: {defects:?}");
+    assert_eq!(memory_safe, counts, "an admitted row keeps its bucket");
+    assert_eq!(evaluate_verification_gate(GateLane::MemorySafe, 0, memory_safe), one_assumed);
+
+    // Strict (the default lane): the strict compiler publishes the row and does not
+    // abort, so the provenance check admits it.
+    let (strict, defects) = strict_gate_counts(&results, counts);
+    assert!(defects.is_empty(), "strict must admit the charge: {defects:?}");
+    assert_eq!(strict, counts, "an admitted row keeps its bucket");
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), one_assumed);
+
+    // Certify: never passes (Inconclusive on the row alone, Fail with the
+    // compiler's certify abort).
+    let certify = evaluate_verification_gate(GateLane::Certify, 0, counts);
+    assert_eq!(certify, Inconclusive);
+    assert!(!certify.is_success());
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 1, counts), Fail);
+
+    // The same kind from another solver is NOT the charge: a genuine unknown on the
+    // fail-closed lanes, each with its named defect.
+    let forged = [crate::types::transport_to_verification_result(
+        "crate::f",
+        &wire("trust-classifier"),
+        None,
+        None,
+    )];
+    let (counts, defects) = partition_outcome_counts(&forged);
+    assert!(defects.is_empty(), "{defects:?}");
+    let (memory_safe, defects) = memory_safe_gate_counts(&forged, counts);
+    assert_eq!((memory_safe.assumed, memory_safe.unknown), (0, 1));
+    assert!(
+        defects.len() == 1
+            && defects[0].contains("memory-safe policy rejected unmarked assumption"),
+        "{defects:?}"
+    );
+    let (strict, defects) = strict_gate_counts(&forged, counts);
+    assert_eq!((strict.assumed, strict.unknown), (0, 1));
+    assert!(
+        defects.len() == 1 && defects[0].contains("strict policy rejected assumption"),
+        "{defects:?}"
+    );
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+
+    // A charge row that CLAIMS proof is a transport defect, never proof credit.
+    let mut claims_proof = charged;
+    claims_proof.outcome = VerificationOutcome::Proved;
+    let claims_proof = [claims_proof];
+    let (counts, defects) = partition_outcome_counts(&claims_proof);
+    assert_eq!((counts.assumed, counts.unknown, counts.proved), (0, 1, 0));
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    let (strict, _) = strict_gate_counts(&claims_proof, counts);
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+}
+
+/// Trust (skip taxonomy, RECORD-THEN-RULE, 2026-09-27): a STRICT compiler now
+/// records the premise of every skip it refuses — `#[trust::skip]` as
+/// `assumption:user-opt-out` from `trust-policy` — beside the build-failing
+/// error. That row must still grade nothing on the strict lane: the compiler
+/// exit fails the run by itself, and the row alone is a genuine unknown, never
+/// conditional evidence. The defect must also not claim the row can only have
+/// come from a nonfatal policy, because a strict run now produces it too.
+#[test]
+fn strict_recorded_skip_row_beside_a_compile_error_still_fails_the_strict_lane() {
+    use GateDecision::*;
+    let mut opt_out = gate_row("assumption:user-opt-out", VerificationOutcome::Unknown, "");
+    opt_out.backend = "trust-policy".to_string();
+    opt_out.message = "unverified assumption: function is excluded by #[trust::skip]; its \
+                       behavior is an explicit user assumption"
+        .to_string();
+    let rows = [opt_out];
+    let (counts, _) = partition_outcome_counts(&rows);
+    assert_eq!(counts.assumed, 1, "the partition counts the recorded skip assumed");
+    let (strict, defects) = strict_gate_counts(&rows, counts);
+    assert_eq!((strict.assumed, strict.unknown), (0, 1), "it is a genuine unknown on strict");
+    assert_eq!(defects.len(), 1, "{defects:?}");
+    assert!(
+        defects[0].starts_with(
+            "strict policy rejected assumption `assumption:user-opt-out` (source `trust-policy`)"
+        ),
+        "{defects:?}"
+    );
+    assert!(
+        defects[0].contains("only beside the build-failing error that refuses the skip"),
+        "the defect must name the strict-run provenance, not only a nonfatal policy: {defects:?}"
+    );
+    // The strict compiler that wrote it exited non-zero: Fail, whatever the rows say.
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 1, strict), Fail);
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 1, counts), Fail);
+    // And even if the exit code were lost, the row alone never passes strict.
+    assert_eq!(evaluate_verification_gate(GateLane::Strict, 0, strict), Inconclusive);
+}
+
+// Trust (global-alloc dealloc contract, 2026-09-16): the compiler-published
+// DISCHARGED `contract:global-alloc-dealloc-panic-free` row is conditional
+// evidence — counted with the assumption ledger, never proof credit — and every
+// defect direction fails closed: a favorable-outcome claim, a shape mismatch
+// (wrong solver or reason), and the REFUSED spelling all count as genuine unknowns.
+#[test]
+fn global_alloc_dealloc_discharged_contract_row_counts_as_conditional_evidence_never_proof() {
+    use GateDecision::*;
+
+    let well_formed = || {
+        let mut row = gate_row(
+            trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_KIND,
+            VerificationOutcome::Unknown,
+            "",
+        );
+        row.backend = trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_ROW_SOLVER.to_string();
+        row.reason = Some(
+            trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_DISCHARGED_REASON.to_string(),
+        );
+        row
+    };
+
+    let (counts, defects) = partition_outcome_counts(&[well_formed()]);
+    assert!(defects.is_empty(), "well-formed discharged row is not a defect: {defects:?}");
+    assert_eq!((counts.assumed, counts.unknown, counts.proved), (1, 0, 0));
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, counts),
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
+    assert_eq!(evaluate_verification_gate(GateLane::Certify, 0, counts), Inconclusive);
+
+    let mut favorable = well_formed();
+    favorable.outcome = VerificationOutcome::Proved;
+    let (counts, defects) = partition_outcome_counts(&[favorable]);
+    assert_eq!((counts.assumed, counts.unknown, counts.proved), (0, 1, 0));
+    assert_eq!(defects.len(), 1, "a contract row claiming proof is a transport defect");
+
+    let mut wrong_reason = well_formed();
+    wrong_reason.reason = Some("global-alloc dealloc contract discharged (trust me)".to_string());
+    let (counts, defects) = partition_outcome_counts(&[wrong_reason]);
+    assert_eq!((counts.assumed, counts.unknown), (0, 1));
+    assert_eq!(defects.len(), 1, "a looser reason is not the compiler's discharge");
+
+    let refused = gate_row(
+        trust_types::assumption::GLOBAL_ALLOC_DEALLOC_CONTRACT_REFUSED_ROW_KIND,
+        VerificationOutcome::Unknown,
+        "",
+    );
+    let (counts, _) = partition_outcome_counts(&[refused]);
+    assert_eq!(
+        (counts.assumed, counts.unknown),
+        (0, 1),
+        "the refused spelling is an unproved premise"
+    );
 }
 
 // Trust (coroutine resume-state contract): the published exported-contract row
@@ -843,7 +2016,13 @@ fn coroutine_resume_contract_row_counts_as_conditional_evidence_never_proof() {
     assert_eq!(counts.proved, 0, "a published contract must never mint proof credit");
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, counts),
-        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 }
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
     );
     assert!(
         !matches!(evaluate_verification_gate(GateLane::Strict, 0, counts), GateDecision::Pass),
@@ -897,7 +2076,10 @@ fn coverage_row(
         verification_session: "pipeline-test-session".to_string(),
         eligible,
         processed,
+        noted_stops: Vec::new(),
+        degraded_anchors: 0,
         function_identities: None,
+        memory: trust_types::MemorySummary::default(),
     }
 }
 
@@ -910,7 +2092,8 @@ fn coverage_gate_caps_passing_decisions_on_shortfall() {
         Some(trust_types::VerificationCoverage {
             eligible: 10,
             processed: 7,
-            coverage_complete: false
+            coverage_complete: false,
+            excluded: 0,
         })
     );
     // Pass and ConditionalPass are demoted to Inconclusive — never a passing
@@ -918,7 +2101,13 @@ fn coverage_gate_caps_passing_decisions_on_shortfall() {
     assert_eq!(apply_coverage_gate(Pass, shortfall.as_ref(), true), Inconclusive);
     assert_eq!(
         apply_coverage_gate(
-            ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 0 },
+            ConditionalPass {
+                assumed: 1,
+                mandated: 0,
+                runtime_checked: 0,
+                contract_panics: 0,
+                unknown: 0,
+            },
             shortfall.as_ref(),
             true
         ),
@@ -940,11 +2129,17 @@ fn coverage_gate_leaves_complete_and_unknown_coverage_alone() {
         Some(trust_types::VerificationCoverage {
             eligible: 10,
             processed: 10,
-            coverage_complete: true
+            coverage_complete: true,
+            excluded: 0,
         })
     );
-    let conditional =
-        ConditionalPass { assumed: 0, mandated: 1, runtime_checked: 0, contract_panics: 0 };
+    let conditional = ConditionalPass {
+        assumed: 0,
+        mandated: 1,
+        runtime_checked: 0,
+        contract_panics: 0,
+        unknown: 0,
+    };
     for decision in [Pass, conditional, Inconclusive, Fail] {
         assert_eq!(apply_coverage_gate(decision, complete.as_ref(), true), decision);
     }
@@ -1021,11 +2216,16 @@ fn parse_compiler_stderr_without_coverage_row_reports_coverage_unknown() {
     // Back-compat: an OLD compiler emits function rows but no coverage row —
     // parsing must not break, and the absence must surface as coverage-unknown.
     let func = trust_types::FunctionTransportResult {
+        stable_ids: Vec::new(),
+        source_sha256: None,
+        expanded_function_identity: None,
+        modeled_facts: Vec::new(),
         function: "crate::f".into(),
         package_name: None,
         crate_name: None,
         primary_package: false,
         verification_session: String::new(),
+        runtime_checks: None,
         results: vec![],
         proved: 0,
         failed: 0,
@@ -1035,6 +2235,7 @@ fn parse_compiler_stderr_without_coverage_row_reports_coverage_unknown() {
         runtime_checked: 0,
         cached: 0,
         total: 0,
+        transport_budget: None,
     };
     let parsed = parse_transport_message(trust_types::TransportMessage::FunctionResult(func));
     assert!(parsed.coverage_rows.is_empty());
@@ -1042,18 +2243,22 @@ fn parse_compiler_stderr_without_coverage_row_reports_coverage_unknown() {
 }
 
 #[test]
-fn gate_strict_tolerates_runtime_checked_but_nothing_else() {
-    // The completeness-gap ruling (Andrew, 2026-07-25) in one test.
+fn gate_strict_conditionally_passes_the_ledger_buckets_and_nothing_else() {
+    // The completeness-gap ruling (Andrew, 2026-07-25) and the 2026-09-16
+    // reconciliation (`f2a47900ec`) in one test.
     //
     // A `runtime_checked` row is an obligation the compiler could not prove
     // statically but whose operation KEEPS the check rustc already emits — the
     // shipped program has vanilla Rust semantics, so the default lane reports it
-    // and passes. EVERY other non-proved bucket stays fatal, and `--certify`
-    // restores the historical all-buckets-fatal predicate.
+    // and passes. Since 2026-09-16 the two LEDGER buckets, `assumed` and
+    // `mandated`, are conditional passes on the default lane too (pinned
+    // below, with the counts named in the decision). A refutation, a genuine
+    // unknown, a contract-panic row and an empty inventory stay fatal, and
+    // `--certify` restores the historical all-buckets-fatal predicate.
     //
     // This is the assertion that would catch a regression in either direction:
-    // silently re-failing the ratified case, or silently widening tolerance to a
-    // bucket with no runtime fallback.
+    // silently re-failing a ratified bucket, or silently widening tolerance to
+    // a bucket that carries no disclosed condition (a genuine unknown).
     let rc_only = oc(1, 0, 0, 1, 0, 0);
     assert!(
         evaluate_verification_gate(GateLane::Strict, 0, rc_only).is_success(),
@@ -1064,20 +2269,48 @@ fn gate_strict_tolerates_runtime_checked_but_nothing_else() {
         "--certify must still FAIL on it: shipping requires full static discharge"
     );
 
-    // Every other bucket stays fatal under BOTH lanes.
-    for (label, counts) in [
-        ("failed", oc(1, 1, 0, 0, 0, 0)),
-        ("unknown", oc(1, 0, 1, 0, 0, 0)),
-        ("assumed", oc(1, 0, 0, 0, 1, 0)),
-        ("mandated", oc(1, 0, 0, 0, 0, 1)),
-    ] {
+    // A refutation and a genuine unknown stay fatal under BOTH lanes.
+    for (label, counts) in [("failed", oc(1, 1, 0, 0, 0, 0)), ("unknown", oc(1, 0, 1, 0, 0, 0))] {
         assert!(
             !evaluate_verification_gate(GateLane::Strict, 0, counts).is_success(),
-            "default lane must still fail on `{label}` — it has no runtime fallback"
+            "default lane must still fail on `{label}`"
         );
         assert!(
             !evaluate_verification_gate(GateLane::Certify, 0, counts).is_success(),
             "certify lane must fail on `{label}`"
+        );
+    }
+    // Trust (2026-09-16): the two LEDGER buckets — `assumed` (a compiler-published,
+    // disclosed conditional discharge such as the vacuous `GlobalAlloc::dealloc`
+    // contract, or a user-declared `#[trust::assume_total]` axiom) and `mandated`
+    // (a hardened profile's opaque design requirement) — are CONDITIONAL passes
+    // on the default lane, exactly as the canonical report's `report.success`
+    // already graded them, and stay fatal under `--certify`. The decision names
+    // every bucket, so nothing unestablished is claimed.
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, oc(1, 0, 0, 0, 1, 0)),
+        GateDecision::ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Strict, 0, oc(1, 0, 0, 0, 0, 1)),
+        GateDecision::ConditionalPass {
+            assumed: 0,
+            mandated: 1,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
+    for (label, counts) in [("assumed", oc(1, 0, 0, 0, 1, 0)), ("mandated", oc(1, 0, 0, 0, 0, 1))] {
+        assert!(
+            !evaluate_verification_gate(GateLane::Certify, 0, counts).is_success(),
+            "certify lane must fail on `{label}`: shipping requires full static discharge"
         );
     }
 
@@ -1146,10 +2379,19 @@ fn gate_certify_pins_historical_predicate_rows() {
 
 #[test]
 fn partition_three_way_splits_inconclusive_rows_disjointly() {
+    let signed32 = trust_types::Ty::Int { width: 32, signed: true };
+    let overflow_add = trust_types::VcKind::ArithmeticOverflow {
+        op: trust_types::BinOp::Add,
+        operand_tys: (signed32.clone(), signed32),
+    };
     let rows = vec![
-        gate_row("overflow:add", VerificationOutcome::Proved, ""),
+        // Typed: `overflow:add` is a compact tag that cannot recover its operand
+        // types, so an UNTYPED row of this kind is unsupported MIR and carries
+        // no proof credit. The proved/runtime-checked rows here stand for
+        // ORDINARY well-formed rows, so they must look like ones.
+        typed_gate_row(overflow_add, VerificationOutcome::Proved),
         gate_row("div_by_zero", VerificationOutcome::Failed, ""),
-        gate_row("bounds", VerificationOutcome::RuntimeChecked, ""),
+        typed_gate_row(trust_types::VcKind::IndexOutOfBounds, VerificationOutcome::RuntimeChecked),
         gate_row("postcondition", VerificationOutcome::Unknown, ""),
         gate_row("assumption:coroutine", VerificationOutcome::Unknown, ""),
         gate_row("hardened_process_semantics", VerificationOutcome::Unknown, &mandate_raw_line()),
@@ -1207,8 +2449,17 @@ fn partition_counts_contract_panic_rows_into_their_own_bucket() {
     // NOT failed, NOT assumed, NOT proof credit — while everything else keeps
     // its bucket. The `contract-panic-unused` kind (dash, not colon) must fall
     // through as a genuine FAILURE.
+    let signed32 = trust_types::Ty::Int { width: 32, signed: true };
     let rows = vec![
-        gate_row("overflow:add", VerificationOutcome::Proved, ""),
+        // Typed, so this stands for an ordinary proved row rather than an
+        // untyped `overflow:add` — which is unsupported MIR and gets no credit.
+        typed_gate_row(
+            trust_types::VcKind::ArithmeticOverflow {
+                op: trust_types::BinOp::Add,
+                operand_tys: (signed32.clone(), signed32),
+            },
+            VerificationOutcome::Proved,
+        ),
         gate_row("contract-panic:matched", VerificationOutcome::Failed, ""),
         gate_row("contract-panic-unused", VerificationOutcome::Failed, ""),
     ];
@@ -1263,22 +2514,41 @@ fn gate_advisory_lane_contract_panics_conditional_pass() {
     // (exit 0), with the count visible in the decision.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc_cp(oc(1, 0, 0, 0, 0, 0), 1)),
-        ConditionalPass { assumed: 0, mandated: 0, runtime_checked: 0, contract_panics: 1 }
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 1,
+            unknown: 0,
+        }
     );
     // Mixed with an assumption: both counts carried.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc_cp(oc(0, 0, 0, 0, 1, 0), 2)),
-        ConditionalPass { assumed: 1, mandated: 0, runtime_checked: 0, contract_panics: 2 }
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 2,
+            unknown: 0,
+        }
     );
     // A genuine failure alongside a contract panic still FAILS (cannot-mask).
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc_cp(oc(1, 1, 0, 0, 0, 0), 1)),
         Fail
     );
-    // A genuine unknown alongside a contract panic stays Inconclusive.
+    // A genuine unknown alongside a contract panic: both carried as conditions
+    // (ramp); neither is proof credit and neither hides the other.
     assert_eq!(
         evaluate_verification_gate(GateLane::Advisory, 0, oc_cp(oc(1, 0, 1, 0, 0, 0), 1)),
-        Inconclusive
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 1,
+            unknown: 1,
+        }
     );
 }
 
@@ -1337,14 +2607,17 @@ fn run_compiler_reports_artifact_gate_failure() {
         survey: false,
         hardened: false,
         trust_profile: None,
-        ay_path: None,
         spec_emit_dir: None,
+        dump_verifier_inputs: None,
         format: OutputFormat::Terminal,
         report_dir: Some(report_dir),
         unsafe_memory_report: None,
         live_report_consumer: None,
-        render_output: true,
+        diagnostic_observer: None,
+        render_output: true.into(),
         ephemeral_single_file_output: false,
+        test_target_panics: crate::test_target_panics::TestTargetPanicPolicy::Strict,
+        agent_delta: None,
     });
 
     assert_eq!(
@@ -1383,19 +2656,19 @@ fn live_report_consumer_rejects_an_active_cargo_exclusion_before_proof_reduction
         excluded_active_units: vec![excluded],
     };
     let empty = std::collections::BTreeSet::new();
-    let reason = live_report_consumer_rejection(
-        true,
-        0,
-        None,
-        Some(&inventory),
-        None,
-        &[],
-        false,
-        &empty,
-        &empty,
-        &empty,
-        &empty,
-    )
+    let reason = live_report_consumer_rejection(crate::pipeline::run::LiveReportConsumerInput {
+        crate_mode: true,
+        compiler_exit: 0,
+        compiler_signal_exit: None,
+        cargo_proof_inventory: Some(&inventory),
+        coverage: None,
+        missing_target_coverage: &[],
+        raw_terminal_inventory_complete: false,
+        compiled_targets: &empty,
+        observed_proof_targets: &empty,
+        completed_proof_targets: &empty,
+        coverage_proof_targets: &empty,
+    })
     .expect("active Cargo exclusion must withhold every live proof consumer");
 
     assert!(reason.contains("excluded 1 active Unit(s)"), "{reason}");
@@ -1429,35 +2702,39 @@ fn live_report_consumer_cannot_override_early_proof_followed_by_ice() {
     fs::write(&source, "fn main() {}\n").expect("write source fixture");
     let cmd_args = vec![fake_compiler.display().to_string(), source.display().to_string()];
     let mut consumer_called = false;
-    let mut consumer = |_live: &crate::report::LiveCanonicalReport| {
-        consumer_called = true;
-        Ok(())
-    };
+    let status = {
+        let mut consumer = |_live: &crate::report::LiveCanonicalReport| {
+            consumer_called = true;
+            Ok(())
+        };
 
-    let status = run_compiler(CompilerRun {
-        cmd_args: &cmd_args,
-        rustc_path: &fake_compiler,
-        config: &TrustConfig::default(),
-        selected_codegen_backend: None,
-        supports_json_transport: true,
-        strict_artifact_policy: false,
-        strict_result_gate: false,
-        certify_gate: false,
-        allow_l0_gaps: false,
-        memory_safe_policy: false,
-        survey: false,
-        hardened: false,
-        trust_profile: None,
-        ay_path: None,
-        spec_emit_dir: None,
-        format: OutputFormat::Terminal,
-        report_dir: None,
-        unsafe_memory_report: None,
-        live_report_consumer: Some(&mut consumer),
-        render_output: false,
-        ephemeral_single_file_output: false,
-    });
-    drop(consumer);
+        run_compiler(CompilerRun {
+            cmd_args: &cmd_args,
+            rustc_path: &fake_compiler,
+            config: &TrustConfig::default(),
+            selected_codegen_backend: None,
+            supports_json_transport: true,
+            strict_artifact_policy: false,
+            strict_result_gate: false,
+            certify_gate: false,
+            allow_l0_gaps: false,
+            memory_safe_policy: false,
+            survey: false,
+            hardened: false,
+            trust_profile: None,
+            spec_emit_dir: None,
+            dump_verifier_inputs: None,
+            format: OutputFormat::Terminal,
+            report_dir: None,
+            unsafe_memory_report: None,
+            live_report_consumer: Some(&mut consumer),
+            diagnostic_observer: None,
+            render_output: false.into(),
+            ephemeral_single_file_output: false,
+            test_target_panics: crate::test_target_panics::TestTargetPanicPolicy::Strict,
+            agent_delta: None,
+        })
+    };
 
     assert_eq!(status, ExitCode::from(101), "the compiler ICE status must be preserved");
     assert!(!consumer_called, "an early proof prefix must not reach a live proof consumer");
@@ -1486,35 +2763,39 @@ fn live_report_consumer_cannot_override_early_proof_followed_by_signal() {
     fs::write(&source, "fn main() {}\n").expect("write source fixture");
     let cmd_args = vec![fake_compiler.display().to_string(), source.display().to_string()];
     let mut consumer_called = false;
-    let mut consumer = |_live: &crate::report::LiveCanonicalReport| {
-        consumer_called = true;
-        Ok(())
-    };
+    let status = {
+        let mut consumer = |_live: &crate::report::LiveCanonicalReport| {
+            consumer_called = true;
+            Ok(())
+        };
 
-    let status = run_compiler(CompilerRun {
-        cmd_args: &cmd_args,
-        rustc_path: &fake_compiler,
-        config: &TrustConfig::default(),
-        selected_codegen_backend: None,
-        supports_json_transport: true,
-        strict_artifact_policy: false,
-        strict_result_gate: false,
-        certify_gate: false,
-        allow_l0_gaps: false,
-        memory_safe_policy: false,
-        survey: false,
-        hardened: false,
-        trust_profile: None,
-        ay_path: None,
-        spec_emit_dir: None,
-        format: OutputFormat::Terminal,
-        report_dir: None,
-        unsafe_memory_report: None,
-        live_report_consumer: Some(&mut consumer),
-        render_output: false,
-        ephemeral_single_file_output: false,
-    });
-    drop(consumer);
+        run_compiler(CompilerRun {
+            cmd_args: &cmd_args,
+            rustc_path: &fake_compiler,
+            config: &TrustConfig::default(),
+            selected_codegen_backend: None,
+            supports_json_transport: true,
+            strict_artifact_policy: false,
+            strict_result_gate: false,
+            certify_gate: false,
+            allow_l0_gaps: false,
+            memory_safe_policy: false,
+            survey: false,
+            hardened: false,
+            trust_profile: None,
+            spec_emit_dir: None,
+            dump_verifier_inputs: None,
+            format: OutputFormat::Terminal,
+            report_dir: None,
+            unsafe_memory_report: None,
+            live_report_consumer: Some(&mut consumer),
+            diagnostic_observer: None,
+            render_output: false.into(),
+            ephemeral_single_file_output: false,
+            test_target_panics: crate::test_target_panics::TestTargetPanicPolicy::Strict,
+            agent_delta: None,
+        })
+    };
 
     assert_eq!(status, ExitCode::from(128 + 15), "the signal shell status must be preserved");
     assert!(!consumer_called, "a signalled proof prefix must not reach a live proof consumer");
@@ -1706,6 +2987,15 @@ fn single_file_report_subject_rejects_lossy_non_utf8_canonical_identity() {
 #[test]
 #[cfg(unix)]
 fn test_run_compiler_crate_mode_without_trust_json_rows_is_hard_error() {
+    // Crate-mode run_compiler reads RUSTC and the other compiler-override
+    // variables, which env-locked tests set: serialize with them.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Bootstrap supplies compiler overrides and construction flags. Keep this
+    // fixture focused on missing JSON; the guards restore the caller's
+    // environment before the lock is released.
+    let _compiler_env = crate::tests::unset_compiler_overrides_for_command_fixture();
+    let _rustflags_env =
+        ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"].map(crate::tests::TestEnvVar::unset);
     let root = temp_test_dir("crate-mode-missing-json");
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin dir");
@@ -1776,14 +3066,17 @@ fn test_run_compiler_crate_mode_without_trust_json_rows_is_hard_error() {
             survey: false,
             hardened: false,
             trust_profile: None,
-            ay_path: None,
             spec_emit_dir: None,
+            dump_verifier_inputs: None,
             format: OutputFormat::Terminal,
             report_dir: Some(report_dir_str),
             unsafe_memory_report: None,
             live_report_consumer: None,
-            render_output: true,
+            diagnostic_observer: None,
+            render_output: true.into(),
             ephemeral_single_file_output: false,
+            test_target_panics: crate::test_target_panics::TestTargetPanicPolicy::Strict,
+            agent_delta: None,
         })
     });
 
@@ -1801,6 +3094,114 @@ fn test_run_compiler_crate_mode_without_trust_json_rows_is_hard_error() {
         serde_json::json!(2),
         "the authenticated report gate must record the exact process setup-error exit"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// S9 repair: `[host]` rustflags are the one rustflags channel `targo trust`
+/// cannot override. Under `-Zhost-config` Cargo gives host artifacts and its
+/// host target-info query ONLY `[host]` flags, ignoring the exported
+/// RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS (measured on targo 45dc60873,
+/// 2026-09-12), so an external `-Zcodegen-backend` there must refuse the run
+/// before any Cargo process — the package-selection probe included — starts.
+#[test]
+#[cfg(unix)]
+fn run_compiler_refuses_an_external_backend_in_host_rustflags_before_any_cargo_process() {
+    // Serialize with tests that set RUSTFLAGS/RUSTC_WRAPPER: an inherited
+    // wrapper would also exit 2 before targo and make this test vacuous.
+    let _lock = crate::TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Bootstrap's ambient overrides must not prevent the harmless host-flag
+    // control from reaching Cargo; the guards restore them before unlocking.
+    let _compiler_env = crate::tests::unset_compiler_overrides_for_command_fixture();
+    let _rustflags_env =
+        ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"].map(crate::tests::TestEnvVar::unset);
+    let root = temp_test_dir("host-rustflags-external-backend");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let fake_trustc = bin_dir.join("trustc");
+    write_executable_marker(&fake_trustc);
+    let fake_targo = bin_dir.join("targo");
+    let marker = root.join("targo-was-invoked");
+    fs::write(&fake_targo, format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()))
+        .expect("write fake targo");
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(&fake_targo).expect("fake targo metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_targo, perms).expect("chmod fake targo");
+    }
+
+    // S9 re-review: the same backend one Cargo `include` away.
+    let included_host = root.join("included-host.toml");
+    fs::write(
+        &included_host,
+        "[host]\nrustflags = ['-Zcodegen-backend=/abs/librustc_codegen_trust_mc.dylib']\n",
+    )
+    .expect("write included host config");
+
+    // (host config, whether the run may reach a Cargo process). The harmless
+    // control proves the fixture does reach the selection probe, so the
+    // refusal, not unrelated setup, is what keeps targo from running.
+    for (host_config, reaches_cargo) in [
+        ("host.rustflags=['--cfg=kani', '-Zcodegen-backend=llvm']".to_string(), true),
+        (
+            "host.rustflags=['-Zcodegen-backend=/abs/librustc_codegen_trust_mc.dylib']".to_string(),
+            false,
+        ),
+        (
+            "host.aarch64-apple-darwin.rustflags=['-Z', 'codegen_backend=trust_mc']".to_string(),
+            false,
+        ),
+        ("host.rustflags=['-Zllvm-plugins=/abs/libforge.dylib']".to_string(), false),
+        (format!("include=['{}']", included_host.display()), false),
+    ] {
+        let _ = fs::remove_file(&marker);
+        let cmd_args = vec![
+            fake_targo.display().to_string(),
+            "build".to_string(),
+            "-Zhost-config".to_string(),
+            "-Ztarget-applies-to-host".to_string(),
+            "--config".to_string(),
+            host_config.clone(),
+        ];
+        let status = with_test_memory_coordinator_ready(|| {
+            run_compiler(CompilerRun {
+                cmd_args: &cmd_args,
+                rustc_path: &fake_trustc,
+                config: &TrustConfig::default(),
+                selected_codegen_backend: None,
+                supports_json_transport: true,
+                strict_artifact_policy: false,
+                strict_result_gate: false,
+                certify_gate: false,
+                allow_l0_gaps: false,
+                memory_safe_policy: false,
+                survey: false,
+                hardened: false,
+                trust_profile: None,
+                spec_emit_dir: None,
+                dump_verifier_inputs: None,
+                format: OutputFormat::Terminal,
+                report_dir: None,
+                unsafe_memory_report: None,
+                live_report_consumer: None,
+                diagnostic_observer: None,
+                render_output: true.into(),
+                ephemeral_single_file_output: false,
+                test_target_panics: crate::test_target_panics::TestTargetPanicPolicy::Strict,
+                agent_delta: None,
+            })
+        });
+        // The control fails later (the fake targo prints no metadata), so every
+        // case exits 2; only the marker tells the refusal apart.
+        assert_eq!(status, ExitCode::from(2), "`{host_config}` must be a setup error");
+        assert_eq!(
+            marker.exists(),
+            reaches_cargo,
+            "`{host_config}`: a Cargo process ran = {} (the selection probe loads [host] rustflags)",
+            marker.exists()
+        );
+    }
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1937,17 +3338,25 @@ fn surface_tool<'a>(
 fn parse_compiler_stderr_preserves_native_notes_but_fails_closed_without_typed_kind() {
     let transport =
         trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::checked_contract".into(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             timed_out: 0,
             skipped: 0,
             results: vec![trust_types::TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
                 obligation_id: Some("trust_ir-native-trust_wp-request-req-7-proof-42".into()),
                 claim_digest_sha256: None,
                 kind: "unknown".into(),
+                original_vc_snapshot: None,
                 typed_kind: None,
                 description: "unsupported MIR `FullVerification::Contract`: contract_id=requires:0"
                     .into(),
@@ -1997,6 +3406,7 @@ fn parse_compiler_stderr_preserves_native_notes_but_fails_closed_without_typed_k
                     diagnostics: Vec::new(),
                 }),
                 monitor: None,
+                grade: None,
             }],
             proved: 1,
             failed: 0,
@@ -2004,6 +3414,7 @@ fn parse_compiler_stderr_preserves_native_notes_but_fails_closed_without_typed_k
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         });
     let transport_json = serde_json::to_string(&transport).expect("serialize transport");
     let stderr = concat!(
@@ -2059,17 +3470,25 @@ fn full_verifier_transport_with_nested_proved(
     outcome: trust_types::Outcome,
 ) -> trust_types::TransportMessage {
     trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+        stable_ids: Vec::new(),
+        source_sha256: None,
+        expanded_function_identity: None,
+        modeled_facts: Vec::new(),
         function: "crate::cached_contract".into(),
         package_name: None,
         crate_name: None,
         primary_package: false,
         verification_session: String::new(),
+        runtime_checks: None,
         timed_out: 0,
         skipped: 0,
         results: vec![trust_types::TransportObligationResult {
+            assumes: Vec::new(),
+            gap_class: None,
             obligation_id: Some("obl-cache".into()),
             claim_digest_sha256: None,
             kind: "postcondition".into(),
+            original_vc_snapshot: None,
             typed_kind: None,
             description: "cached proof-looking row".into(),
             location: None,
@@ -2096,6 +3515,7 @@ fn full_verifier_transport_with_nested_proved(
                 diagnostics: Vec::new(),
             }),
             monitor: None,
+            grade: None,
         }],
         proved: 0,
         failed: 0,
@@ -2103,6 +3523,7 @@ fn full_verifier_transport_with_nested_proved(
         runtime_checked: 0,
         cached: 0,
         total: 1,
+        transport_budget: None,
     })
 }
 
@@ -2137,11 +3558,16 @@ fn parse_compiler_stderr_accumulates_cache_replays() {
     // surface in ParsedCompilerOutput so the report can show a cache hit-rate.
     // Informational only — the per-obligation rows stay conservatively `unknown`.
     let func = trust_types::FunctionTransportResult {
+        stable_ids: Vec::new(),
+        source_sha256: None,
+        expanded_function_identity: None,
+        modeled_facts: Vec::new(),
         function: "crate::replayed".into(),
         package_name: None,
         crate_name: None,
         primary_package: false,
         verification_session: String::new(),
+        runtime_checks: None,
         results: vec![],
         proved: 0,
         failed: 0,
@@ -2151,6 +3577,7 @@ fn parse_compiler_stderr_accumulates_cache_replays() {
         runtime_checked: 0,
         cached: 2,
         total: 2,
+        transport_budget: None,
     };
     let parsed = parse_transport_message(trust_types::TransportMessage::FunctionResult(func));
     assert_eq!(parsed.cached_obligations, 2);
@@ -2185,17 +3612,25 @@ fn parse_compiler_stderr_keeps_unsupported_full_verifier_inconclusive() {
     };
     let transport =
         trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
             function: "crate::main".into(),
             package_name: None,
             crate_name: None,
             primary_package: false,
             verification_session: String::new(),
+            runtime_checks: None,
             timed_out: 0,
             skipped: 0,
             results: vec![trust_types::TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
                 obligation_id: Some("vc:main:assertion:0".into()),
                 claim_digest_sha256: None,
                 kind: "assertion".into(),
+                original_vc_snapshot: None,
                 typed_kind: None,
                 description: "unsupported MIR `FullVerification::Assertion`".into(),
                 location: None,
@@ -2228,6 +3663,7 @@ fn parse_compiler_stderr_keeps_unsupported_full_verifier_inconclusive() {
                     diagnostics: vec![diagnostic],
                 }),
                 monitor: None,
+                grade: None,
             }],
             proved: 0,
             failed: 0,
@@ -2235,6 +3671,7 @@ fn parse_compiler_stderr_keeps_unsupported_full_verifier_inconclusive() {
             runtime_checked: 0,
             cached: 0,
             total: 1,
+            transport_budget: None,
         });
     let transport_json = serde_json::to_string(&transport).expect("serialize transport");
     let stderr = format!("{}{}\n", trust_types::TRANSPORT_PREFIX, transport_json);
@@ -2250,6 +3687,187 @@ fn parse_compiler_stderr_keeps_unsupported_full_verifier_inconclusive() {
             reason.contains("typed TrustIr native evidence is unavailable")
         })
     );
+}
+
+#[test]
+/// Trust (2026-09-14, policy-B ruling): a TYPED full-verifier row the compiler
+/// dispositioned `RuntimeChecked` keeps that label across an `Unsupported`
+/// native status. This is the exact wire shape of the `std::io::_print`
+/// absent-callee row on `fn main() { println!("hello"); }` — runtime check
+/// retained, vanilla broken-pipe semantics, "B reports rather than fails".
+/// It is not proof credit (the gate counts it conditional, never `pass`), so
+/// there is nothing to launder; demoting it to `Unknown` is what made
+/// `targo trust build` refuse hello-world while bare `trustc` built it.
+fn parse_compiler_stderr_keeps_runtime_checked_on_a_typed_row_over_undecided_evidence() {
+    let typed = trust_types::VcKind::Assertion {
+        message: "[trust-absent-callee-assumption] call to absent callee `std::io::stdio::_print` (body not in the lowered bundle) may panic".into(),
+    };
+    let diagnostic = trust_types::TransportEvidenceDiagnostic {
+        code: "full_verifier_evidence".into(),
+        severity: trust_types::TransportEvidenceDiagnosticSeverity::Error,
+        message: "typed TrustIr native evidence is unavailable".into(),
+        detail: Some("native full verifier rejected unsupported lowering".into()),
+    };
+    let transport =
+        trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
+            function: "crate::main".into(),
+            package_name: None,
+            crate_name: None,
+            primary_package: false,
+            verification_session: String::new(),
+            runtime_checks: None,
+            timed_out: 0,
+            skipped: 0,
+            results: vec![trust_types::TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
+                obligation_id: Some("vc:main:assertion:0".into()),
+                claim_digest_sha256: None,
+                kind: "assert".into(),
+                original_vc_snapshot: None,
+                typed_kind: Some(Box::new(typed.clone())),
+                description: typed.description(),
+                location: None,
+                outcome: trust_types::Outcome::RuntimeChecked,
+                solver: "trust-full-verifier".into(),
+                time_ms: 0,
+                counterexample: None,
+                counterexample_model: None,
+                reason: None,
+                design_mandate: false,
+                native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
+                    suite: "trust-mc".into(),
+                    backend: "trust-full-verifier".into(),
+                    request_id: None,
+                    native_id: None,
+                    present: false,
+                    artifacts: Vec::new(),
+                    diagnostics: vec![diagnostic.clone()],
+                }),
+                proof_evidence: Some(trust_types::TransportProofEvidence {
+                    suite: "trust-mc".into(),
+                    backend: "trust-full-verifier".into(),
+                    request_id: None,
+                    proof_id: None,
+                    native_id: None,
+                    status: trust_types::TransportProofStatus::Unsupported,
+                    strength: None,
+                    evidence: None,
+                    artifacts: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                }),
+                monitor: None,
+                grade: None,
+            }],
+            proved: 0,
+            failed: 0,
+            unknown: 0,
+            runtime_checked: 1,
+            cached: 0,
+            total: 1,
+            transport_budget: None,
+        });
+    let transport_json = serde_json::to_string(&transport).expect("serialize transport");
+    let stderr = format!("{}{}\n", trust_types::TRANSPORT_PREFIX, transport_json);
+
+    let parsed = parse_compiler_stderr(std::io::Cursor::new(stderr), false);
+
+    assert_eq!(parsed.verification_results.len(), 1);
+    let result = &parsed.verification_results[0];
+    assert_eq!(result.outcome, VerificationOutcome::RuntimeChecked);
+    assert_eq!(result.backend, "trust-full-verifier");
+}
+
+#[test]
+/// Trust (2026-09-14): the fail-closed half, unchanged — a `Proved` label over
+/// `Unsupported` native evidence is a laundered false PROVE on ANY row, typed or
+/// not, and stays `Unknown`. Twin of the test above with one field flipped.
+fn parse_compiler_stderr_still_demotes_proved_over_unsupported_evidence_on_a_typed_row() {
+    let typed = trust_types::VcKind::Assertion {
+        message: "[trust-absent-callee-assumption] call to absent callee `std::io::stdio::_print` (body not in the lowered bundle) may panic".into(),
+    };
+    let diagnostic = trust_types::TransportEvidenceDiagnostic {
+        code: "full_verifier_evidence".into(),
+        severity: trust_types::TransportEvidenceDiagnosticSeverity::Error,
+        message: "typed TrustIr native evidence is unavailable".into(),
+        detail: Some("native full verifier rejected unsupported lowering".into()),
+    };
+    let transport =
+        trust_types::TransportMessage::FunctionResult(trust_types::FunctionTransportResult {
+            stable_ids: Vec::new(),
+            source_sha256: None,
+            expanded_function_identity: None,
+            modeled_facts: Vec::new(),
+            function: "crate::main".into(),
+            package_name: None,
+            crate_name: None,
+            primary_package: false,
+            verification_session: String::new(),
+            runtime_checks: None,
+            timed_out: 0,
+            skipped: 0,
+            results: vec![trust_types::TransportObligationResult {
+                assumes: Vec::new(),
+                gap_class: None,
+                obligation_id: Some("vc:main:assertion:0".into()),
+                claim_digest_sha256: None,
+                kind: "assert".into(),
+                original_vc_snapshot: None,
+                typed_kind: Some(Box::new(typed.clone())),
+                description: typed.description(),
+                location: None,
+                outcome: trust_types::Outcome::Proved,
+                solver: "trust-full-verifier".into(),
+                time_ms: 0,
+                counterexample: None,
+                counterexample_model: None,
+                reason: None,
+                design_mandate: false,
+                native_trust_ir: Some(trust_types::TransportNativeTrustIrEvidence {
+                    suite: "trust-mc".into(),
+                    backend: "trust-full-verifier".into(),
+                    request_id: None,
+                    native_id: None,
+                    present: false,
+                    artifacts: Vec::new(),
+                    diagnostics: vec![diagnostic.clone()],
+                }),
+                proof_evidence: Some(trust_types::TransportProofEvidence {
+                    suite: "trust-mc".into(),
+                    backend: "trust-full-verifier".into(),
+                    request_id: None,
+                    proof_id: None,
+                    native_id: None,
+                    status: trust_types::TransportProofStatus::Unsupported,
+                    strength: None,
+                    evidence: None,
+                    artifacts: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                }),
+                monitor: None,
+                grade: None,
+            }],
+            proved: 0,
+            failed: 0,
+            unknown: 1,
+            runtime_checked: 0,
+            cached: 0,
+            total: 1,
+            transport_budget: None,
+        });
+    let transport_json = serde_json::to_string(&transport).expect("serialize transport");
+    let stderr = format!("{}{}\n", trust_types::TRANSPORT_PREFIX, transport_json);
+
+    let parsed = parse_compiler_stderr(std::io::Cursor::new(stderr), false);
+
+    assert_eq!(parsed.verification_results.len(), 1);
+    let result = &parsed.verification_results[0];
+    assert_eq!(result.outcome, VerificationOutcome::Unknown);
+    assert_eq!(result.backend, "trust-full-verifier");
 }
 
 #[test]
@@ -3243,6 +4861,37 @@ fn test_repo_local_rustc_candidates_skip_redirected_compilers() {
     fs::remove_dir_all(root).expect("remove redirected compiler fixture");
 }
 
+/// Under the Spotlight layout (`build -> build.noindex`, docs/BUILD_AND_INSTALL.md)
+/// with bootstrap's `host` alias, repo-local discovery still finds the stage2
+/// trustc, and names it by its canonical `build.noindex/...` path.
+#[cfg(unix)]
+#[test]
+fn test_repo_local_rustc_candidates_see_through_the_build_noindex_link() {
+    let root = temp_test_dir("repo-local-build-noindex");
+    fs::create_dir_all(&root).expect("create fixture root");
+    let root = root.canonicalize().expect("canonical fixture root");
+    let bin_dir = root.join("build.noindex/test-triple/stage2/bin");
+    fs::create_dir_all(&bin_dir).expect("create stage2 bin");
+    let trustc = bin_dir.join("trustc");
+    write_executable_marker(&trustc);
+    std::os::unix::fs::symlink("build.noindex", root.join("build")).expect("link build");
+    std::os::unix::fs::symlink(root.join("build/test-triple"), root.join("build.noindex/host"))
+        .expect("bootstrap host alias");
+
+    let candidates = repo_local_rustc_candidates(&root);
+    assert_eq!(
+        candidates.first().map(|candidate| (candidate.rustc.clone(), candidate.source)),
+        Some((trustc.clone(), NativeRustcDiscoverySource::RepoLocalStage2)),
+        "stage2 trustc behind the build.noindex link: {candidates:?}"
+    );
+    assert_eq!(
+        select_native_rustc_discovery(None, candidates).map(|selected| selected.rustc),
+        Some(trustc)
+    );
+
+    fs::remove_dir_all(root).expect("remove build.noindex fixture");
+}
+
 #[test]
 fn test_native_runtime_library_paths_include_sysroot_rustlib_and_stage_rustc_deps() {
     let root = temp_test_dir("runtime-paths");
@@ -3326,9 +4975,10 @@ fn native_runtime_environment_does_not_forge_build_time_release_identity() {
 #[cfg(target_os = "macos")]
 #[test]
 fn trustd_runtime_closure_is_canonical_empty_and_clears_ambient_authority() {
-    let candidate = std::env::current_exe().expect("current test executable");
-    let closure =
-        inspect_trustd_runtime_closure(&candidate).expect("inspect test executable closure");
+    let fixture = RuntimeClosureFixture::new();
+    let candidate = fixture.candidate();
+    let closure = inspect_trustd_runtime_closure(candidate)
+        .expect("inspect real thin native fixture closure");
     closure.validate().expect("canonical trustd runtime closure");
     assert_eq!(closure.loader_environment, "none");
     assert!(closure.loader_variable.is_none());
@@ -3341,13 +4991,13 @@ fn trustd_runtime_closure_is_canonical_empty_and_clears_ambient_authority() {
         dependency.starts_with("/usr/lib/") || dependency.starts_with("/System/Library/")
     }));
 
-    let mut command = std::process::Command::new(&candidate);
+    let mut command = std::process::Command::new(candidate);
     command
         .env("PATH", "/attacker/bin")
         .env("LD_PRELOAD", "/ignored/libattacker.so")
         .env("DYLD_INSERT_LIBRARIES", "/ignored/libattacker.dylib")
         .env("RUSTC_WORKSPACE_WRAPPER", "/attacker/wrapper");
-    apply_trustd_runtime_closure(&mut command, &candidate, &closure)
+    apply_trustd_runtime_closure(&mut command, candidate, &closure)
         .expect("apply canonical trustd runtime closure");
     assert_eq!(command.get_envs().count(), 0, "env_clear must remove explicit authority too");
 }
@@ -3362,9 +5012,9 @@ fn trustd_runtime_closure_rejects_mutation_addition_symlink_and_path_ordering() 
     let symlink = root.join("libredirect.dylib");
     std::os::unix::fs::symlink(&dylib, &symlink).expect("create hostile dylib symlink");
 
-    let canonical =
-        inspect_trustd_runtime_closure(&std::env::current_exe().expect("current test executable"))
-            .expect("inspect test executable closure");
+    let fixture = RuntimeClosureFixture::new();
+    let canonical = inspect_trustd_runtime_closure(fixture.candidate())
+        .expect("inspect real thin native fixture closure");
     let mut added_file = canonical.clone();
     added_file.directory_entries.push(dylib.display().to_string());
     assert!(added_file.validate().is_err(), "an ignored dylib entered the empty closure");
@@ -3382,14 +5032,13 @@ fn trustd_runtime_closure_rejects_mutation_addition_symlink_and_path_ordering() 
         assert!(reordered.validate().is_err(), "any loader ordering must fail closed");
     }
 
-    if canonical.system_dependencies.len() >= 2 {
-        let mut reordered_dependencies = canonical.clone();
-        reordered_dependencies.system_dependencies.swap(0, 1);
-        assert!(
-            reordered_dependencies.validate().is_err(),
-            "native dependency ordering escaped the closure digest"
-        );
-    }
+    assert!(canonical.system_dependencies.len() >= 2, "fixture must exercise dependency ordering");
+    let mut reordered_dependencies = canonical.clone();
+    reordered_dependencies.system_dependencies.swap(0, 1);
+    assert!(
+        reordered_dependencies.validate().is_err(),
+        "native dependency ordering escaped the closure digest"
+    );
 
     let mut forged_digest = canonical;
     forged_digest.closure_sha256 = "0".repeat(64);
@@ -4821,4 +6470,332 @@ fn test_trusted_runtime_search_path_excludes_inherited_directories() {
     );
 
     std::fs::remove_dir_all(&root).expect("should remove temp dir");
+}
+
+// Ramp, fail-open closed (2026-09-22): the advisory lane is the ONE lane that
+// makes the coverage row optional, so `apply_coverage_gate`'s `None if required`
+// arm never fires for it. Before the ramp that was harmless — `unknown > 0` was
+// already Inconclusive. After it, a proof unit that legally ends with no
+// `coverage_summary` would exit 0 reporting `0 proved … N unknown` and
+// `Coverage: unknown`: a pass over an unknown denominator. A pass that rests on
+// unproved rows must be able to say what fraction of the crate it looked at.
+#[test]
+fn the_ramp_cannot_pass_on_unproved_rows_whose_coverage_is_unknown() {
+    use GateDecision::*;
+    let unproved = oc(0, 0, 3, 0, 0, 0);
+    let complete = trust_types::VerificationCoverage {
+        eligible: 10,
+        processed: 10,
+        coverage_complete: true,
+        excluded: 0,
+    };
+
+    // The hole: advisory, unknowns carried, and NO coverage row at all.
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            unproved,
+            None,
+            true,
+            false,
+            &zero_inventory(0),
+            &[]
+        ),
+        Inconclusive,
+        "a ramp pass resting on unproved rows may not survive an absent coverage row"
+    );
+    // Same, via the other route to `coverage == None`: a row exists but some
+    // completed target never reported one, so `missing_target_coverage` discards it.
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            unproved,
+            Some(&complete),
+            true,
+            false,
+            &zero_inventory(0),
+            &[]
+        ),
+        Inconclusive,
+        "a discarded aggregate is still an unknown denominator"
+    );
+
+    // Scope: with coverage present and complete the ramp still passes, carrying
+    // its unknowns as conditions — the fix does not close the ramp itself.
+    let passed = evaluate_run_gate(
+        GateLane::Advisory,
+        0,
+        unproved,
+        Some(&complete),
+        false,
+        false,
+        &zero_inventory(0),
+        &[],
+    );
+    assert!(passed.is_success(), "a scoped ramp pass is untouched: {passed:?}");
+    assert_eq!(
+        passed,
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 3
+        }
+    );
+
+    // Scope: a decision that does NOT rest on unproved rows keeps its pre-ramp
+    // behaviour, absent coverage and all — this commit tightens nothing else.
+    let proved_only = oc(2, 0, 0, 0, 0, 0);
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            proved_only,
+            None,
+            true,
+            false,
+            &zero_inventory(0),
+            &[]
+        ),
+        Pass,
+        "a pass that rests on nothing unproved is unchanged by the coverage rule"
+    );
+    let assumed_only = oc(0, 0, 0, 0, 1, 0);
+    assert!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            assumed_only,
+            None,
+            true,
+            false,
+            &zero_inventory(0),
+            &[]
+        )
+        .is_success(),
+        "an assumption-conditioned pass is not an unproved-row pass"
+    );
+}
+
+// Ramp (2026-09-07): `--allow-l0-gaps` must allow L0 gaps. A genuine unknown
+// is a carried CONDITION of an advisory pass, and stays fatal in every other
+// lane — the destination does not move because the ramp opened.
+#[test]
+fn gate_advisory_lane_reports_unknowns_as_conditions_every_other_lane_keeps_them_fatal() {
+    use GateDecision::*;
+    let one_unknown = oc(1, 0, 1, 0, 0, 0);
+    let advisory = evaluate_verification_gate(GateLane::Advisory, 0, one_unknown);
+    assert_eq!(
+        advisory,
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 1,
+        }
+    );
+    assert!(advisory.is_success(), "the ramp exits 0 on an unproved obligation");
+    // Every count is carried together: nothing about the pass is silent.
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 0, 2, 1, 1, 1)),
+        ConditionalPass {
+            assumed: 1,
+            mandated: 1,
+            runtime_checked: 1,
+            contract_panics: 0,
+            unknown: 2,
+        }
+    );
+    // The destination lanes are untouched: an unknown is still inconclusive.
+    for lane in [GateLane::Strict, GateLane::Certify, GateLane::MemorySafe] {
+        let decision = evaluate_verification_gate(lane, 0, one_unknown);
+        assert_eq!(decision, Inconclusive, "{lane:?} must keep an unknown fatal");
+        assert!(!decision.is_success());
+    }
+    // What the ramp does NOT forgive: a refutation, a nonzero compiler exit,
+    // and a run with no obligations at all.
+    assert_eq!(evaluate_verification_gate(GateLane::Advisory, 0, oc(1, 1, 1, 0, 0, 0)), Fail);
+    assert_eq!(evaluate_verification_gate(GateLane::Advisory, 101, one_unknown), Fail);
+    assert_eq!(
+        evaluate_verification_gate(GateLane::Advisory, 0, oc(0, 0, 0, 0, 0, 0)),
+        Inconclusive
+    );
+    // Nor incomplete coverage: a function that was never verified is not a gap
+    // the lane reports, it is verification not having happened.
+    let partial = trust_types::VerificationCoverage::from_counts(2, 1);
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            one_unknown,
+            Some(&partial),
+            false,
+            false,
+            &zero_inventory(0),
+            &[]
+        ),
+        Inconclusive
+    );
+    let complete = trust_types::VerificationCoverage::from_counts(2, 2);
+    assert_eq!(
+        evaluate_run_gate(
+            GateLane::Advisory,
+            0,
+            one_unknown,
+            Some(&complete),
+            false,
+            false,
+            &zero_inventory(0),
+            &[]
+        ),
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 1,
+        }
+    );
+}
+
+/// Replay captured compiler `TRUST_JSON:` transport through the exit-code gate the
+/// way `run.rs` does: rows from every `function_result`, the zero-obligation
+/// inventory read before the publication normalization, the lane's count transform,
+/// then `evaluate_run_gate` over the captured `coverage_summary`.
+fn replay_zero_obligation_transport_gate(transport: &str, lane: GateLane) -> GateDecision {
+    let mut authenticated = Vec::new();
+    let mut coverage = None;
+    for line in transport.lines() {
+        match trust_types::parse_transport_line(line) {
+            Some(trust_types::TransportMessage::FunctionResult(function)) => {
+                let identities = crate::types::envelope_identities(&function);
+                for (row, identity) in function.results.iter().zip(identities) {
+                    authenticated.push(crate::types::transport_to_verification_result(
+                        &function.function,
+                        row,
+                        function.runtime_checks,
+                        identity,
+                    ));
+                }
+            }
+            Some(trust_types::TransportMessage::CoverageSummary(summary)) => {
+                coverage = Some(trust_types::VerificationCoverage::from_counts(
+                    summary.eligible,
+                    summary.processed,
+                ));
+            }
+            _ => {}
+        }
+    }
+    let zero_obligation = crate::types::authenticated_zero_obligation_inventory(&authenticated);
+    let mut results = authenticated;
+    crate::types::normalize_authenticated_results_for_publication(&mut results, None);
+    let (counts, _defects) = partition_outcome_counts(&results);
+    let counts = match lane {
+        GateLane::Strict => strict_gate_counts(&results, counts).0,
+        GateLane::MemorySafe => memory_safe_gate_counts(&results, counts).0,
+        GateLane::Advisory | GateLane::Certify => counts,
+    };
+    evaluate_run_gate(lane, 0, counts, coverage.as_ref(), false, true, &zero_obligation, &[])
+}
+
+/// Trust (2026-10-03): the gate grades exactly the rows the compiler's
+/// zero-obligation branch publishes, so a row that branch drops is a verdict lost.
+///
+/// `*_before.jsonl` is verbatim stage-1 `6011b74bad` transport (raw trustc,
+/// `--edition 2021 -Ztrust-verify=on -Ztrust-verify-output=json --error-format=human
+/// -Copt-level=0`), each compile rc 0:
+/// * `box.rs`, `fn main() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }`:
+///   `[no_obligations: proved]`, although the compiler's own `=both` warning says the
+///   policy-B entry-`Termination` row "is counted CONDITIONAL";
+/// * `q5.rs` (rlib), `o.unwrap_or_else(AssertUnwindSafe(Instant::now))`: the
+///   discharged global-alloc premise row alone, although the body's zero-obligation
+///   run was not vacuously clean (its uncharged twin publishes the gap row).
+///
+/// `*_after.jsonl` is the wire the compiler fix (`trust_verify/
+/// zero_obligation_disposition.rs`) publishes for the same sources, assembled from
+/// rows the SAME compiler emitted: the entry row of a `main` with obligations of its
+/// own (same return type), and the `native-verification-gap` row of an uncharged
+/// unclean body, with the counts recomputed. Assembled, not captured: the fixed
+/// compiler was not built when this was written. Checked 2026-10-03 against the
+/// built fix (stage 1 of `1ab78ed8e8`): for the same sources it publishes both
+/// `*_after.jsonl` files byte for byte, apart from the `file` path. T3 L4 C09w added
+/// the coverage row's required `memory` summary to all four by hand (schema
+/// `trust-memory-summary/v1`, no counters). The `*_before` wire is a past compiler's and
+/// keeps it. `zero_obligation_entry_termination_after.jsonl`'s is the summary the stage 1 of
+/// the T3 L4 merge `fd4cee44ece` publishes for `box.rs` (captured 2026-10-21, the flags
+/// above); `zero_obligation_global_alloc_premise_after.jsonl` keeps the hand edit, since
+/// `q5.rs` is not in the tree.
+#[test]
+fn zero_obligation_rows_the_compiler_dropped_now_reach_the_gate() {
+    use GateDecision::*;
+
+    let entry_before = include_str!("../fixtures/zero_obligation_entry_termination_before.jsonl");
+    let entry_after = include_str!("../fixtures/zero_obligation_entry_termination_after.jsonl");
+    let premise_before =
+        include_str!("../fixtures/zero_obligation_global_alloc_premise_before.jsonl");
+    let premise_after =
+        include_str!("../fixtures/zero_obligation_global_alloc_premise_after.jsonl");
+    assert!(entry_before.contains("\"kind\":\"no_obligations\""), "control: the pre-fix wire");
+    assert!(!entry_after.contains("\"kind\":\"no_obligations\""));
+    assert!(entry_after.contains("entry `Termination::report` dispatch: reported gap (policy B)"));
+    assert!(!premise_before.contains("native-verification-gap"), "control: the pre-fix wire");
+    assert!(premise_after.contains("native-verification-gap"));
+
+    // The entry row. Before: the strict gate PASSES on the synthetic inventory row —
+    // the green the compiler's warning contradicts. After: the runtime-checked row is
+    // graded, so the strict lane owes CONDITIONAL-PASS and certify refuses.
+    assert_eq!(replay_zero_obligation_transport_gate(entry_before, GateLane::Strict), Pass);
+    assert_eq!(
+        replay_zero_obligation_transport_gate(entry_after, GateLane::Strict),
+        ConditionalPass {
+            assumed: 0,
+            mandated: 0,
+            runtime_checked: 1,
+            contract_panics: 0,
+            unknown: 0,
+        }
+    );
+    assert_eq!(replay_zero_obligation_transport_gate(entry_after, GateLane::Certify), Inconclusive);
+
+    // The gap row. Before: the lone premise row is `assumed`, which the strict and
+    // memory-safe lanes grade CONDITIONAL-PASS. After: the unknown gap row makes
+    // both INCONCLUSIVE.
+    for lane in [GateLane::Strict, GateLane::MemorySafe] {
+        assert_eq!(
+            replay_zero_obligation_transport_gate(premise_before, lane),
+            ConditionalPass {
+                assumed: 1,
+                mandated: 0,
+                runtime_checked: 0,
+                contract_panics: 0,
+                unknown: 0,
+            },
+            "{lane:?}"
+        );
+        assert_eq!(
+            replay_zero_obligation_transport_gate(premise_after, lane),
+            Inconclusive,
+            "{lane:?}"
+        );
+    }
+    // Certify refuses both wires: it counts every non-proved bucket.
+    for wire in [premise_before, premise_after] {
+        assert_eq!(replay_zero_obligation_transport_gate(wire, GateLane::Certify), Inconclusive);
+    }
+    // The advisory ramp carries the unknown as a condition rather than failing.
+    assert_eq!(
+        replay_zero_obligation_transport_gate(premise_after, GateLane::Advisory),
+        ConditionalPass {
+            assumed: 1,
+            mandated: 0,
+            runtime_checked: 0,
+            contract_panics: 0,
+            unknown: 1,
+        }
+    );
 }

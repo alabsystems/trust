@@ -8,11 +8,46 @@
 
 use crate::{Operand, Place};
 
+/// Strip generic parameters from a Rust path for matching, borrowing `path`
+/// when it contains no angle brackets.
+#[must_use]
+pub fn strip_generics_cow(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains(['<', '>']) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(strip_generics(path))
+}
+
+/// Compare `strip_generics(path)` against `expected` without allocating when
+/// `path` has no angle brackets or its leading non-generic prefix already
+/// mismatches `expected`.
+#[must_use]
+pub fn strip_generics_eq(path: &str, expected: &str) -> bool {
+    let Some(lt_idx) = path.find('<') else {
+        return if path.contains('>') {
+            strip_generics(path) == expected
+        } else {
+            path == expected
+        };
+    };
+    let prefix = &path[..lt_idx];
+    if !prefix.contains('>') && !prefix.contains(":::") {
+        let stable_prefix = &prefix[..prefix.len().saturating_sub(1)];
+        if !expected.starts_with(stable_prefix) {
+            return false;
+        }
+    }
+    strip_generics(path) == expected
+}
+
 /// Strip generic parameters from a Rust path for matching.
 ///
 /// Converts `std::sync::Mutex::<T>::lock` to `std::sync::Mutex::lock`.
 /// Handles nested generics like `HashMap::<K, V>::get`.
 pub fn strip_generics(path: &str) -> String {
+    if !path.contains(['<', '>']) {
+        return path.to_string();
+    }
     let mut result = String::with_capacity(path.len());
     let mut depth = 0u32;
 
@@ -23,13 +58,12 @@ pub fn strip_generics(path: &str) -> String {
                 depth = depth.saturating_sub(1);
             }
             _ if depth > 0 => { /* skip content inside generics */ }
+            ':' if result.ends_with(":::") => {
+                // Collapse runs of `::::` (from `Mutex::<T>::`) into `::` in-place.
+                result.pop();
+            }
             _ => result.push(ch),
         }
-    }
-
-    // Collapse runs of `::::` (from `Mutex::<T>::`) into `::`.
-    while result.contains("::::") {
-        result = result.replace("::::", "::");
     }
 
     result

@@ -3,7 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //! The COST GUARD on the field walk: a RECURSIVE type in the bundle must not
 //! take the whole bundle's C-FLOW discharge down with it.
 //!
@@ -53,6 +53,9 @@ pub struct Pair {
     pub b: Option<Box<List>>,
 }
 
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `dyn_dispatch_reliance_recursive_field_carrier_discharges::drive`
+//~v NOTE this function has no obligation of its own
 pub fn drive(_l: &List, _p: &Pair) -> u32 {
     let mut g = Good;
     let local: &mut dyn Emit = &mut g;

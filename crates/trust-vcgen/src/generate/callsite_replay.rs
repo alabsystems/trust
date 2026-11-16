@@ -105,7 +105,7 @@ fn callee_temps_are_def_pinned(
     let conjuncts = flatten_and_conjuncts(violation);
     let mut resolved: FxHashSet<String> = FxHashSet::default();
     let rhs_grounded = |rhs: &Formula, resolved: &FxHashSet<String>| {
-        rhs.free_variables().iter().all(|v| {
+        trust_types::all_free_variable_names(rhs, &mut |v| {
             in_domain(v)
                 || resolved.contains(v)
                 || matches!(split_projection_base(v), Some((base, _)) if in_domain(base))
@@ -128,6 +128,9 @@ fn callee_temps_are_def_pinned(
                     && rhs_grounded(def_side, &resolved)
                 {
                     resolved.insert(name.to_string());
+                    if resolved.len() == temps.len() {
+                        return true;
+                    }
                     progressed = true;
                 }
             }
@@ -140,16 +143,10 @@ fn callee_temps_are_def_pinned(
     // see. Applied AFTER the fixpoint so it can only ever add, and its results
     // are deliberately not fed back into the fixpoint — a repaired temp never
     // grounds another temp's def.
-    let repairable: Vec<String> = temps
-        .iter()
-        .filter(|t| !resolved.contains(*t))
-        .filter(|t| {
-            temp_is_repairable_under_one_disjunctive_pin(t, &conjuncts, &resolved, &rhs_grounded)
-        })
-        .cloned()
-        .collect();
-    resolved.extend(repairable);
-    temps.iter().all(|t| resolved.contains(t))
+    temps.iter().all(|t| {
+        resolved.contains(t)
+            || temp_is_repairable_under_one_disjunctive_pin(t, &conjuncts, &resolved, &rhs_grounded)
+    })
 }
 
 /// Flatten the `And` spine of `formula` into its semantic conjunct list.
@@ -200,7 +197,7 @@ fn temp_is_repairable_under_one_disjunctive_pin(
     resolved: &FxHashSet<String>,
     rhs_grounded: &dyn Fn(&Formula, &FxHashSet<String>) -> bool,
 ) -> bool {
-    let mentions = |f: &Formula| f.free_variables().contains(temp);
+    let mentions = |f: &Formula| trust_types::any_free_variable_name(f, &mut |v| v == temp);
     let mut occurrences = conjuncts.iter().copied().filter(|c| mentions(c));
     let Some(only) = occurrences.next() else {
         return false;
@@ -214,15 +211,13 @@ fn temp_is_repairable_under_one_disjunctive_pin(
     let mut carries_pin = false;
     for disjunct in disjuncts {
         let is_pin = match disjunct {
-            Formula::Eq(lhs, rhs) => {
-                [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())].iter().any(
-                    |(var_side, def_side)| {
-                        var_side.var_name() == Some(temp)
-                            && !mentions(def_side)
-                            && rhs_grounded(def_side, resolved)
-                    },
-                )
-            }
+            Formula::Eq(lhs, rhs) => [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())]
+                .iter()
+                .any(|(var_side, def_side)| {
+                    var_side.var_name() == Some(temp)
+                        && !mentions(def_side)
+                        && rhs_grounded(def_side, resolved)
+                }),
             _ => false,
         };
         if is_pin {
@@ -286,17 +281,11 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
         // Resolve the base to EXACTLY ONE declared local by the canonical
         // emitter spelling (`place_to_var_name` owns demotion/uniqueness);
         // ambiguity fails closed.
-        let mut named = func.body.locals.iter().filter(|decl| {
-            crate::place_to_var_name(func, &Place { local: decl.index, projections: Vec::new() })
-                == base
-        });
-        let Some(decl) = named.next() else {
+        let Some(local) = crate::fn_memo::whole_local_index_by_base(func, base, |l| {
+            crate::place_to_var_name(func, &Place::local(l))
+        }) else {
             return false;
         };
-        if named.next().is_some() {
-            return false;
-        }
-        let local = decl.index;
         // Parameters only: a never-written non-parameter has no defined value
         // at all, and a written one must earn admission through a def pin.
         (1..=func.body.arg_count).contains(&local) && local_versions_collapse_to_bare(func, local)
@@ -313,18 +302,20 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
     };
     let mut temps: FxHashSet<String> = FxHashSet::default();
     let mut r1occ_reject: Option<String> = None;
-    for name in formula.free_variables() {
+    let _ = trust_types::all_free_variable_names(formula, &mut |name| {
         // A per-occurrence opaque alias is unclassifiable BY CONSTRUCTION —
         // reject by name even if some Eq conjunct would appear to pin it.
         if name.contains("__r1occ") {
-            r1occ_reject = Some(name);
-            break;
+            r1occ_reject = Some(name.to_string());
+            return false;
         }
-        if !in_domain(&name) {
-            temps.insert(name);
+        if !in_domain(name) && !temps.contains(name) {
+            temps.insert(name.to_string());
         }
-    }
-    let verdict = r1occ_reject.is_none() && callee_temps_are_def_pinned(formula, &temps, &in_domain);
+        true
+    });
+    let verdict =
+        r1occ_reject.is_none() && callee_temps_are_def_pinned(formula, &temps, &in_domain);
     // `TRUST_GROUND_DEBUG=1` prints one line per gate decision: the function,
     // its parameters and their stability, the formula's free variables, which
     // of them this gate could not classify, and the verdict. A dropped
@@ -337,10 +328,7 @@ pub(super) fn composed_formula_is_caller_entry_grounded(
             if (1..=func.body.arg_count).contains(&decl.index) {
                 params.push(format!(
                     "{}({}{})",
-                    crate::place_to_var_name(
-                        func,
-                        &Place { local: decl.index, projections: Vec::new() }
-                    ),
+                    crate::place_to_var_name(func, &Place::local(decl.index)),
                     decl.index,
                     if local_versions_collapse_to_bare(func, decl.index) {
                         ",stable"
@@ -410,19 +398,24 @@ pub(crate) fn replay_substituted_callee_violation(
     // these shapes) versus callee temps.
     let in_domain = |name: &str| replacements.iter().any(|(formal, _)| formal == name);
     let mut temps: FxHashSet<String> = FxHashSet::default();
-    for name in violation.free_variables() {
-        if in_domain(&name) {
-            continue;
+    if !trust_types::all_free_variable_names(violation, &mut |name| {
+        if in_domain(name) {
+            return true;
         }
-        match split_projection_base(&name) {
-            Some((base, _)) if in_domain(base) => {}
+        match split_projection_base(name) {
+            Some((base, _)) if in_domain(base) => true,
             // A PROJECTED non-σ name (`_3.0`) is not a whole-name temp the
             // def-pin check can reason about — fail closed.
-            Some(_) => return None,
+            Some(_) => false,
             None => {
-                temps.insert(name);
+                if !temps.contains(name) {
+                    temps.insert(name.to_string());
+                }
+                true
             }
         }
+    }) {
+        return None;
     }
     if !callee_temps_are_def_pinned(violation, &temps, &in_domain) {
         return None;
@@ -436,39 +429,46 @@ pub(crate) fn replay_substituted_callee_violation(
     let renamed = if temps.is_empty() {
         violation.clone()
     } else {
-        let mut sorts: FxHashMap<String, Sort> = FxHashMap::default();
-        collect_var_sorts(violation, &mut sorts);
+        let mut sorts: FxHashMap<&str, Sort> =
+            FxHashMap::with_capacity_and_hasher(temps.len(), Default::default());
+        collect_var_sorts(violation, &temps, &mut sorts);
         let rename: Vec<(String, Formula)> = temps
             .iter()
             .map(|t| {
-                let sort = sorts.get(t).cloned().unwrap_or(Sort::Int);
+                let sort = sorts.get(t.as_str()).cloned().unwrap_or(Sort::Int);
                 (t.clone(), Formula::var_owned(format!("{REPLAY_TEMP_VAR_PREFIX}{t}"), sort))
             })
             .collect();
         substitute_summary_params(violation, &rename)
     };
-    let substituted = substitute_summary_params(&renamed, replacements);
+    let substituted = substitute_summary_params_owned(renamed, replacements);
     // Post-substitution: no deliberately-free σ var may remain (see the
     // prefix doc above).
-    if substituted.free_variables().iter().any(|v| v.starts_with(SIGMA_FRESH_VAR_PREFIX)) {
+    if trust_types::any_free_variable_name(&substituted, &mut |v| {
+        v.starts_with(SIGMA_FRESH_VAR_PREFIX)
+    }) {
         return None;
     }
     Some(substituted)
 }
 
-/// First-seen sort of every `Var` node (bound or free — over-collection only
-/// affects rename-sort selection for names that ARE free temps, where the
+/// First-seen sort of every `Var` node in `temps` (bound or free — over-collection
+/// only affects rename-sort selection for names that ARE free temps, where the
 /// occurrences agree).
-fn collect_var_sorts(formula: &Formula, out: &mut FxHashMap<String, Sort>) {
-    if let Some(name) = formula.var_name()
-        && let Some(sort) = formula.var_sort()
-        && !out.contains_key(name)
-    {
-        out.insert(name.to_string(), sort.clone());
-    }
-    for child in formula.children() {
-        collect_var_sorts(child, out);
-    }
+fn collect_var_sorts<'a>(
+    formula: &'a Formula,
+    temps: &FxHashSet<String>,
+    out: &mut FxHashMap<&'a str, Sort>,
+) {
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        if let Some(name) = node.var_name()
+            && temps.contains(name)
+            && let Some(sort) = node.var_sort()
+            && !out.contains_key(name)
+        {
+            out.insert(name, sort.clone());
+        }
+    });
 }
 
 /// Refutation-only candidates for the call-site L0 replay lane: the callee's
@@ -533,6 +533,18 @@ pub fn generate_callsite_l0_replay_candidates(
     if func_exceeds_vcgen_budget(extracted_body) {
         return Vec::new();
     }
+    if !func.body.blocks.iter().any(|block| {
+        matches!(
+            &block.terminator,
+            Terminator::Call { func: block_callee, args, span, .. }
+                | Terminator::TailCall { func: block_callee, args, span, .. }
+                if block_callee == callee_name
+                    && span == call_location
+                    && summary.param_names.len() == args.len()
+        )
+    }) {
+        return Vec::new();
+    }
 
     // Regenerate the callee's body VCs WITHOUT its contract hypotheses. The
     // callee proved green by ASSUMING `#[requires]` at entry
@@ -547,7 +559,17 @@ pub fn generate_callsite_l0_replay_candidates(
     callee_without_requires.preconditions.clear();
     callee_without_requires.spec.requires.clear();
     callee_without_requires.contracts.retain(|c| c.kind != ContractKind::Requires);
-    let callee_vcs = generate_vcs(&callee_without_requires);
+    // Generated as cleared: the generator does not restate the callee's parameter type
+    // ranges into the emptied hypothesis (`without_stated_param_ranges`); the caller's
+    // own entry state is re-imposed below.
+    let callee_vcs = without_stated_param_ranges(|| generate_vcs(&callee_without_requires));
+    if !callee_vcs.iter().any(|vc| {
+        vc.kind.proof_level() == trust_types::ProofLevel::L0Safety
+            && !matches!(vc.kind, VcKind::UnsupportedMir { .. })
+            && !matches!(vc.formula, Formula::Bool(_))
+    }) {
+        return Vec::new();
+    }
 
     // The same per-caller assembly the callsite PRECONDITION producer builds —
     // deliberately identical (same sanitized view, same guard/def/fact maps),
@@ -558,18 +580,38 @@ pub fn generate_callsite_l0_replay_candidates(
     // the inputs the caller can actually be entered with.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func_view = arithmetic_safe_func.as_ref();
-    let guard_paths_map = super::guard_map_for(func_view);
-    let semantic_guards = build_semantic_guard_map(func_view);
-    let path_definition_map = v2_build_path_definition_map(func_view);
-    let sv = super::stmt_versions_for(func_view);
-    let global_facts = build_global_invariant_facts(func_view);
-    let own_preconditions = stable_caller_preconditions(func_view);
+    // The memo scopes, on the caller view the assembly reads (`EntryScope`), opened only
+    // now: `generate_vcs` above is a metered entry and must stay outside them.
+    let _entry_scope = super::EntryScope::enter(func_view);
+    let guard_paths_map: std::cell::OnceCell<std::rc::Rc<super::PathGuardMap>> =
+        std::cell::OnceCell::new();
+    let semantic_guards: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let path_definition_map: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let sv: std::cell::OnceCell<std::rc::Rc<super::StmtVersionCtx>> = std::cell::OnceCell::new();
+    // Filtered per candidate as the production producer filters (`RowGlobalFacts::for_row`).
+    let global_facts: std::cell::OnceCell<std::rc::Rc<super::RowGlobalFacts>> =
+        std::cell::OnceCell::new();
+    let own_preconditions: std::cell::OnceCell<Vec<Formula>> = std::cell::OnceCell::new();
+
+    enum KeptReplaySlot {
+        One(usize),
+        Many(Vec<usize>),
+    }
+    fn replay_candidate_hash(kind: &VcKind, formula: &Formula) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = trust_types::fx::FxHasher::default();
+        std::mem::discriminant(kind).hash(&mut hasher);
+        formula.hash(&mut hasher);
+        hasher.finish()
+    }
 
     let mut candidates: Vec<VerificationCondition> = Vec::new();
     // Duplicate suppression: two callee VCs can substitute to the same
     // composed formula (e.g. twin bounds checks over one index). Emitting the
     // duplicate would double-count one violation in the L0 failed summary.
-    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut seen: FxHashMap<u64, KeptReplaySlot> = FxHashMap::default();
 
     for block in &func_view.body.blocks {
         let (block_callee, args, span) = match &block.terminator {
@@ -593,15 +635,11 @@ pub fn generate_callsite_l0_replay_candidates(
         // The SAME σ as the P[σ] construction: per-formal actual rendering
         // (stable copy-chain rooting, opaque-constant freshening) plus the
         // `<formal>__slice_len` length replacements.
-        let mut replacements: Vec<(String, Formula)> = summary
-            .param_names
-            .iter()
-            .zip(args.iter())
-            .map(|(formal, actual)| {
-                (formal.clone(), sigma_actual_formula(func_view, formal, actual))
-            })
-            .collect();
-        append_length_replacements(func_view, summary, args, &mut replacements);
+        let replacements = build_callsite_sigma_replacements(func_view, summary, args);
+        let block_live_path_defs: std::cell::OnceCell<Vec<Formula>> =
+            std::cell::OnceCell::new();
+        let block_sem_guards: std::cell::OnceCell<Vec<Formula>> =
+            std::cell::OnceCell::new();
 
         for callee_vc in &callee_vcs {
             // Strict-L0 kinds only: the replay claim is "the caller can drive
@@ -621,6 +659,18 @@ pub fn generate_callsite_l0_replay_candidates(
                 continue;
             };
 
+            let guard_paths_map =
+                guard_paths_map.get_or_init(|| super::guard_map_for(func_view));
+            let semantic_guards =
+                semantic_guards.get_or_init(|| super::semantic_guard_map_for(func_view, None));
+            let path_definition_map =
+                path_definition_map.get_or_init(|| super::path_definition_map_for(func_view));
+            let sv = sv.get_or_init(|| super::stmt_versions_for(func_view));
+            let global_facts =
+                global_facts.get_or_init(|| build_global_invariant_facts(func_view));
+            let own_preconditions =
+                own_preconditions.get_or_init(|| stable_caller_preconditions(func_view));
+
             // Caller-side composition — mirrors `generate_callsite_precondition_vcs`
             // conjunct-for-conjunct, with the σ-substituted callee VIOLATION in
             // the structural position of ¬P[σ]. Every splice keeps the violation
@@ -628,43 +678,33 @@ pub fn generate_callsite_l0_replay_candidates(
             // like the precondition lane.
             let mut formula = v2_formula_with_block_defs(func_view, block, substituted);
 
-            if let Some(path_defs) = path_definition_map.get(&block.id)
-                && !path_defs.is_empty()
-            {
-                let mut live = v2_live_path_defs(func_view, block, path_defs);
-                let term_defs: FxHashSet<String> =
-                    terminator_def_names(func_view, block).into_iter().collect();
-                if !term_defs.is_empty() {
-                    live.retain(|f| formula_survives_redefs(f, &term_defs));
-                }
-                if !live.is_empty() {
-                    match formula {
-                        Formula::And(inner) => live.extend(inner),
-                        other => live.push(other),
-                    }
-                    formula = Formula::And(live);
-                }
+            let live = block_live_path_defs.get_or_init(|| {
+                block_live_callsite_path_defs(func_view, block, sv, path_definition_map)
+            });
+            if !live.is_empty() {
+                formula = splice_flat_prefix(live, formula);
             }
 
             if let Some(block_guard_paths) = guard_paths_map.get(&block.id) {
-                formula = v2_formula_with_path_guards(func_view, &sv, block_guard_paths, formula);
+                formula = v2_formula_with_path_guards(
+                    func_view,
+                    sv,
+                    block.id,
+                    block_guard_paths,
+                    formula,
+                );
             }
 
-            if let Some(sem_guards) = semantic_guards.get(&block.id)
-                && !sem_guards.is_empty()
-            {
-                let mut conjuncts = sem_guards.clone();
-                conjuncts
-                    .extend(sem_guards.iter().filter_map(|g| bare_ssa_guard_variant(func_view, g)));
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
+            let sem_with_bare = block_sem_guards.get_or_init(|| {
+                block_sem_guards_with_bare_variants(func_view, block.id, semantic_guards)
+            });
+            if !sem_with_bare.is_empty() {
+                formula = splice_flat_prefix(sem_with_bare, formula);
             }
 
-            if !global_facts.is_empty() {
-                let mut conjuncts = global_facts.clone();
+            let row_facts = global_facts.for_row(&formula);
+            if !row_facts.is_empty() {
+                let mut conjuncts = row_facts;
                 match formula {
                     Formula::And(inner) => conjuncts.extend(inner),
                     other => conjuncts.push(other),
@@ -673,22 +713,19 @@ pub fn generate_callsite_l0_replay_candidates(
             }
 
             if !own_preconditions.is_empty() {
-                let mut conjuncts = own_preconditions.clone();
-                match formula {
-                    Formula::And(inner) => conjuncts.extend(inner),
-                    other => conjuncts.push(other),
-                }
-                formula = Formula::And(conjuncts);
+                formula = splice_flat_prefix(own_preconditions, formula);
             }
 
             let occ = std::cell::Cell::new(0u32);
-            let formula = freshen_aliasing_opaque_occurrences(&formula, &occ);
-            let formula = normalize_ssa_version_tokens(func_view, &formula);
+            let formula = freshen_aliasing_opaque_occurrences_owned(formula, &occ);
+            let formula = normalize_ssa_version_tokens_owned(func_view, formula);
 
             // Belt-and-braces σ re-check: the caller-side conjuncts never mint
             // σ-fresh names, but the composed formula is what the driver hands
             // to the solver, so re-check the invariant at the emission seam.
-            if formula.free_variables().iter().any(|v| v.starts_with(SIGMA_FRESH_VAR_PREFIX)) {
+            if trust_types::any_free_variable_name(&formula, &mut |v| {
+                v.starts_with(SIGMA_FRESH_VAR_PREFIX)
+            }) {
                 continue;
             }
             // THE caller-side soundness gate: every free var of the composed
@@ -700,9 +737,32 @@ pub fn generate_callsite_l0_replay_candidates(
                 continue;
             }
 
-            let dedup_key = format!("{:?}|{formula:?}", callee_vc.kind);
-            if !seen.insert(dedup_key) {
-                continue;
+            let hash = replay_candidate_hash(&callee_vc.kind, &formula);
+            let next_idx = candidates.len();
+            match seen.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(KeptReplaySlot::One(next_idx));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => match slot.get_mut() {
+                    KeptReplaySlot::One(prev) => {
+                        let prev = *prev;
+                        if candidates[prev].kind == callee_vc.kind
+                            && candidates[prev].formula == formula
+                        {
+                            continue;
+                        }
+                        *slot.get_mut() = KeptReplaySlot::Many(vec![prev, next_idx]);
+                    }
+                    KeptReplaySlot::Many(indices) => {
+                        if indices.iter().any(|&idx| {
+                            candidates[idx].kind == callee_vc.kind
+                                && candidates[idx].formula == formula
+                        }) {
+                            continue;
+                        }
+                        indices.push(next_idx);
+                    }
+                },
             }
             candidates.push(VerificationCondition {
                 // The callee's REAL L0 kind — the composed row IS the entailed
@@ -716,5 +776,21 @@ pub fn generate_callsite_l0_replay_candidates(
             });
         }
     }
+    candidates
+}
+
+/// [`generate_callsite_l0_replay_candidates`] into the caller's context `rows`, the body's
+/// (T3 C07p, design D-VC-1): every candidate is interned through the row oracle and the
+/// candidates are returned as generated.
+pub fn generate_callsite_l0_replay_candidates_rows(
+    func: &VerifiableFunction,
+    summaries: &crate::modular::SummaryDatabase,
+    callee_name: &str,
+    call_location: &SourceSpan,
+    rows: &mut trust_types::vc_context::VcContext,
+) -> Vec<VerificationCondition> {
+    let candidates =
+        generate_callsite_l0_replay_candidates(func, summaries, callee_name, call_location);
+    intern_eager_rows(rows, &candidates);
     candidates
 }

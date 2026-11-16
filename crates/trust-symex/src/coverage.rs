@@ -170,11 +170,9 @@ pub fn coverage_percentage(map: &CoverageMap) -> f64 {
 /// Return all branch points that have at least one unexplored direction.
 #[must_use]
 pub fn uncovered_branches(map: &CoverageMap) -> Vec<BranchPoint> {
-    let mut result: Vec<BranchPoint> =
-        map.branches.values().filter(|bp| !bp.is_fully_covered()).cloned().collect();
-    // Sort by location for deterministic output.
-    result.sort_by_key(|bp| bp.location);
-    result
+    // `map.branches` is a `BTreeMap<usize, BranchPoint>` keyed by `bp.location`,
+    // so iterating `.values()` already yields branch points in location order.
+    map.branches.values().filter(|bp| !bp.is_fully_covered()).cloned().collect()
 }
 
 /// Suggest a sequence of branch decisions that would maximize coverage.
@@ -184,20 +182,16 @@ pub fn uncovered_branches(map: &CoverageMap) -> Vec<BranchPoint> {
 /// order) that targets the first unexplored direction at each branch.
 #[must_use]
 pub fn suggest_next_path(map: &CoverageMap) -> Option<Vec<bool>> {
-    let uncovered = uncovered_branches(map);
-    if uncovered.is_empty() {
+    if map.branches.values().all(BranchPoint::is_fully_covered) {
         return None;
     }
 
-    // Build a suggested path: for each branch (sorted by location),
+    // Build a suggested path: for each branch (in BTreeMap location order),
     // pick the unexplored direction. If both are explored, default to true.
-    let mut locations: Vec<usize> = map.branches.keys().copied().collect();
-    locations.sort_unstable();
-
-    let decisions: Vec<bool> = locations
-        .iter()
-        .map(|loc| {
-            let bp = &map.branches[loc];
+    let decisions: Vec<bool> = map
+        .branches
+        .values()
+        .map(|bp| {
             if !bp.true_explored {
                 true
             } else if !bp.false_explored {

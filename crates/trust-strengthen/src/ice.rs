@@ -373,26 +373,26 @@ impl IceLearner {
 
     /// Collect all variable names from all example sets.
     fn collect_variables(&self) -> Vec<String> {
-        let mut vars = BTreeSet::<String>::new();
+        let mut vars = BTreeSet::<&str>::new();
         for state in &self.positive {
             for (name, _) in &state.assignments {
-                vars.insert(name.clone());
+                vars.insert(name.as_str());
             }
         }
         for state in &self.negative {
             for (name, _) in &state.assignments {
-                vars.insert(name.clone());
+                vars.insert(name.as_str());
             }
         }
         for imp in &self.implications {
             for (name, _) in &imp.pre.assignments {
-                vars.insert(name.clone());
+                vars.insert(name.as_str());
             }
             for (name, _) in &imp.post.assignments {
-                vars.insert(name.clone());
+                vars.insert(name.as_str());
             }
         }
-        vars.into_iter().collect()
+        vars.into_iter().map(str::to_owned).collect()
     }
 
     // -----------------------------------------------------------------------
@@ -484,18 +484,22 @@ impl IceLearner {
                 let threshold = window[0] + (window[1] - window[0]) / 2;
                 let predicate = SplitPredicate { var: var.clone(), threshold };
 
-                let (pos_true, pos_false) = partition(pos, &predicate);
-                let (neg_true, neg_false) = partition(neg, &predicate);
+                let pos_true_len =
+                    pos.iter().filter(|s| !matches!(predicate.evaluate(s), Some(false))).count();
+                let pos_false_len = pos.len() - pos_true_len;
+                let neg_true_len =
+                    neg.iter().filter(|s| !matches!(predicate.evaluate(s), Some(false))).count();
+                let neg_false_len = neg.len() - neg_true_len;
 
-                let left_total = pos_true.len() + neg_true.len();
-                let right_total = pos_false.len() + neg_false.len();
+                let left_total = pos_true_len + neg_true_len;
+                let right_total = pos_false_len + neg_false_len;
 
                 if left_total == 0 || right_total == 0 {
                     continue;
                 }
 
-                let left_impurity = gini(pos_true.len(), neg_true.len());
-                let right_impurity = gini(pos_false.len(), neg_false.len());
+                let left_impurity = gini(pos_true_len, neg_true_len);
+                let right_impurity = gini(pos_false_len, neg_false_len);
 
                 let weighted_impurity = (left_total as f64 * left_impurity
                     + right_total as f64 * right_impurity)

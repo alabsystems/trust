@@ -1,12 +1,18 @@
 //! Trust (IR-1): one file, two languages, ONE trust-ir Module.
 //! The island def is the Clean producer's row; the Rust fn is the THIR
-//! producer's row. `cleanWsum` is also the bounded W2 carrier-gate target:
-//! actual TrustIR Add over UInt64, independently reflected and kernel-checked.
+//! producer's row. `cleanWsum`, `cleanSnd` and `cleanK32` are the bounded W2
+//! carrier-gate targets (wrapping-binop, projection, constant-uint): the actual
+//! TrustIR bodies, independently reflected and kernel-checked at the carrier.
 //! See ../trust-ir-emit for the base artifact-lane contract.
 
 mod m {
     clean {
         def cleanWsum (a : UInt64) (b : UInt64) : UInt64 := a + b
+
+        -- W2 gate widening: the other two carrier-gate targets, at the exact UInt
+        -- carriers the reflector admits; both must publish at tier gate.
+        def cleanSnd (a : UInt64) (b : UInt64) : UInt64 := b
+        def cleanK32 (a : UInt32) : UInt32 := 300
 
         inductive Tri where
           | one : Tri

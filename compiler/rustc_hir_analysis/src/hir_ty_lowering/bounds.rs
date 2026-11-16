@@ -1,18 +1,19 @@
 use std::ops::ControlFlow;
 
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_errors::codes::*;
 use rustc_errors::struct_span_code_err;
 use rustc_hir as hir;
+use rustc_hir::PolyTraitRef;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{PolyTraitRef, find_attr};
-use rustc_middle::bug;
 use rustc_middle::ty::{
-    self as ty, IsSuggestable, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
-    TypeVisitor, Upcast,
+    self as ty, IncludeSizedImplicitBounds, IsSuggestable, Ty, TyCtxt, TypeSuperVisitable,
+    TypeVisitable, TypeVisitableExt, TypeVisitor, Upcast,
 };
-use rustc_span::{ErrorGuaranteed, Ident, Span, kw};
+use rustc_span::{ErrorGuaranteed, Ident, Span, bug, kw};
 use rustc_trait_selection::traits;
 use tracing::{debug, instrument};
 
@@ -106,17 +107,17 @@ fn collect_bounds<'a, 'tcx>(
 
 fn collect_sizedness_bounds<'tcx>(
     tcx: TyCtxt<'tcx>,
-    hir_bounds: &'tcx [hir::GenericBound<'tcx>],
+    hir_bounds: &[hir::GenericBound<'_>],
     context: ImpliedBoundsContext<'tcx>,
     span: Span,
 ) -> CollectedSizednessBounds {
-    let sized_did = tcx.require_lang_item(hir::LangItem::Sized, span);
+    let sized_did = tcx.require_lang_item(LangItem::Sized, span);
     let sized = collect_bounds(hir_bounds, context, sized_did);
 
-    let meta_sized_did = tcx.require_lang_item(hir::LangItem::MetaSized, span);
+    let meta_sized_did = tcx.require_lang_item(LangItem::MetaSized, span);
     let meta_sized = collect_bounds(hir_bounds, context, meta_sized_did);
 
-    let pointee_sized_did = tcx.require_lang_item(hir::LangItem::PointeeSized, span);
+    let pointee_sized_did = tcx.require_lang_item(LangItem::PointeeSized, span);
     let pointee_sized = collect_bounds(hir_bounds, context, pointee_sized_did);
 
     CollectedSizednessBounds { sized, meta_sized, pointee_sized }
@@ -137,6 +138,29 @@ fn add_trait_bound<'tcx>(
 }
 
 impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
+    /// Adds implicit sizedness, and in the future `Move` and `Forget`, and default trait bounds.
+    pub(crate) fn add_implicit_bounds(
+        &self,
+        bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
+        self_ty: Ty<'tcx>,
+        hir_bounds: &[hir::GenericBound<'_>],
+        context: ImpliedBoundsContext<'tcx>,
+        span: Span,
+        // Sized is treated slightly more specially than the other implicit bounds.
+        include_sized: IncludeSizedImplicitBounds,
+    ) {
+        // Skip adding any default bounds if `#![rustc_no_implicit_bounds]`
+        if find_attr!(self.tcx(), crate, RustcNoImplicitBounds) {
+            return;
+        }
+
+        self.add_default_traits(bounds, self_ty, hir_bounds, context, span);
+
+        if let IncludeSizedImplicitBounds::Yes = include_sized {
+            self.add_implicit_sizedness_bounds(bounds, self_ty, hir_bounds, context, span);
+        }
+    }
+
     /// Adds sizedness bounds to a trait, trait alias, parameter, opaque type or associated type.
     ///
     /// - On parameters, opaque type and associated types, add default `Sized` bound if no explicit
@@ -145,23 +169,18 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     ///   bounds are present.
     /// - On parameters, opaque type, associated types and trait aliases, add a `MetaSized` bound if
     ///   a `?Sized` bound is present.
-    pub(crate) fn add_implicit_sizedness_bounds(
+    fn add_implicit_sizedness_bounds(
         &self,
         bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         self_ty: Ty<'tcx>,
-        hir_bounds: &'tcx [hir::GenericBound<'tcx>],
+        hir_bounds: &[hir::GenericBound<'_>],
         context: ImpliedBoundsContext<'tcx>,
         span: Span,
     ) {
         let tcx = self.tcx();
 
-        // Skip adding any default bounds if `#![rustc_no_implicit_bounds]`
-        if find_attr!(tcx, crate, RustcNoImplicitBounds) {
-            return;
-        }
-
-        let meta_sized_did = tcx.require_lang_item(hir::LangItem::MetaSized, span);
-        let pointee_sized_did = tcx.require_lang_item(hir::LangItem::PointeeSized, span);
+        let meta_sized_did = tcx.require_lang_item(LangItem::MetaSized, span);
+        let pointee_sized_did = tcx.require_lang_item(LangItem::PointeeSized, span);
 
         // If adding sizedness bounds to a trait, then there are some relevant early exits
         match context {
@@ -200,18 +219,18 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 | ImpliedBoundsContext::AssociatedTypeOrImplTrait => {
                     // If there are no explicit sizedness bounds on a parameter then add a default
                     // `Sized` bound.
-                    let sized_did = tcx.require_lang_item(hir::LangItem::Sized, span);
+                    let sized_did = tcx.require_lang_item(LangItem::Sized, span);
                     add_trait_bound(tcx, bounds, self_ty, sized_did, span);
                 }
             }
         }
     }
 
-    pub(crate) fn add_default_traits(
+    fn add_default_traits(
         &self,
         bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         self_ty: Ty<'tcx>,
-        hir_bounds: &[hir::GenericBound<'tcx>],
+        hir_bounds: &[hir::GenericBound<'_>],
         context: ImpliedBoundsContext<'tcx>,
         span: Span,
     ) {
@@ -223,12 +242,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// Add a `experimental_default_bounds` bound to the `bounds` if appropriate.
     ///
     /// Doesn't add the bound if the HIR bounds contain any of `Trait`, `?Trait` or `!Trait`.
-    pub(crate) fn add_default_trait(
+    fn add_default_trait(
         &self,
-        trait_: hir::LangItem,
+        trait_: LangItem,
         bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         self_ty: Ty<'tcx>,
-        hir_bounds: &[hir::GenericBound<'tcx>],
+        hir_bounds: &[hir::GenericBound<'_>],
         context: ImpliedBoundsContext<'tcx>,
         span: Span,
     ) {
@@ -243,21 +262,10 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
 
         if let Some(trait_did) = tcx.lang_items().get(trait_)
-            && self.should_add_default_traits(trait_did, hir_bounds, context)
+            && !collect_bounds(hir_bounds, context, trait_did).any()
         {
             add_trait_bound(tcx, bounds, self_ty, trait_did, span);
         }
-    }
-
-    /// Returns `true` if default trait bound should be added.
-    fn should_add_default_traits<'a>(
-        &self,
-        trait_def_id: DefId,
-        hir_bounds: &'a [hir::GenericBound<'tcx>],
-        context: ImpliedBoundsContext<'tcx>,
-    ) -> bool {
-        let collected = collect_bounds(hir_bounds, context, trait_def_id);
-        !find_attr!(self.tcx(), crate, RustcNoImplicitBounds) && !collected.any()
     }
 
     pub(crate) fn require_bound_to_relax_default_trait(
@@ -268,7 +276,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         let tcx = self.tcx();
 
         if let Res::Def(DefKind::Trait, def_id) = trait_ref.path.res
-            && (tcx.is_lang_item(def_id, hir::LangItem::Sized) || tcx.is_default_trait(def_id))
+            && (tcx.is_lang_item(def_id, LangItem::Sized)
+                || tcx.is_implicit_trait(def_id, IncludeSizedImplicitBounds::No))
         {
             return;
         }
@@ -307,7 +316,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     /// There is an implied binder around `param_ty` and `hir_bounds`.
     /// See `lower_poly_trait_ref` for more details.
     #[instrument(level = "debug", skip(self, hir_bounds, bounds))]
-    pub(crate) fn lower_bounds<'hir, I: IntoIterator<Item = &'hir hir::GenericBound<'tcx>>>(
+    pub(crate) fn lower_bounds<'a, I: IntoIterator<Item = &'a hir::GenericBound<'a>>>(
         &self,
         param_ty: Ty<'tcx>,
         hir_bounds: I,
@@ -315,9 +324,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         bound_vars: &'tcx ty::List<ty::BoundVariableKind<'tcx>>,
         predicate_filter: PredicateFilter,
         overlapping_assoc_constraints: OverlappingAsssocItemConstraints,
-    ) where
-        'tcx: 'hir,
-    {
+    ) {
         for hir_bound in hir_bounds {
             // In order to avoid cycles, when we're lowering `SelfTraitThatDefines`,
             // we skip over any traits that don't define the given associated type.
@@ -353,7 +360,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
                     let region = self.lower_lifetime(lifetime, RegionInferReason::OutlivesBound);
                     let bound = ty::Binder::bind_with_vars(
-                        ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(param_ty, region)),
+                        ty::ClauseKind::TypeOutlives(ty::OutlivesClause(param_ty, region)),
                         bound_vars,
                     );
                     bounds.push((bound.upcast(self.tcx()), lifetime.ident.span));
@@ -378,7 +385,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         &self,
         hir_ref_id: hir::HirId,
         trait_ref: ty::PolyTraitRef<'tcx>,
-        constraint: &hir::AssocItemConstraint<'tcx>,
+        constraint: &hir::AssocItemConstraint<'_>,
         bounds: &mut Vec<(ty::Clause<'tcx>, Span)>,
         duplicates: Option<&mut FxIndexMap<DefId, Span>>,
         path_span: Span,
@@ -478,7 +485,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 );
                 debug!(?alias_args);
 
-                ty::AliasTerm::new_from_def_id(tcx, assoc_item.def_id, alias_args)
+                let kind = if let ty::AssocTag::Const = assoc_tag {
+                    ty::AliasTermKind::ProjectionConst { def_id: assoc_item.def_id }
+                } else {
+                    ty::AliasTermKind::ProjectionTy { def_id: assoc_item.def_id }
+                };
+                ty::AliasTerm::new_from_args(tcx, kind, alias_args)
             })
         };
 
@@ -546,32 +558,32 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     | PredicateFilter::SelfOnly
                     | PredicateFilter::SelfAndAssociatedTypeBounds => {
                         let bound = projection_term.map_bound(|projection_term| {
-                            ty::ClauseKind::Projection(ty::ProjectionPredicate {
+                            ty::ClauseKind::Projection(ty::ProjectionClause {
                                 projection_term,
                                 term,
                             })
                         });
 
                         if let ty::AssocTag::Const = assoc_tag
-                            && !self.tcx().is_type_const(assoc_item.def_id)
+                            && !self.tcx().is_direct_const(assoc_item.def_id)
+                            && !tcx.features().gca_const_items()
                         {
-                            if tcx.features().min_generic_const_args() {
-                                let mut err = self.dcx().struct_span_err(
+                            if tcx.features().gca_min_const_items() {
+                                let err = self.dcx().struct_span_err(
                                     constraint.span,
-                                    "use of trait associated const not defined as `type const`",
+                                    "use of trait associated const not defined as `#[rustc_always_gca]`",
                                 );
-                                err.note("the declaration in the trait must begin with `type const` not just `const` alone");
-                                return Err(err.emit());
+                                return Err(err.emit_err());
                             } else {
                                 let err = self.dcx().span_delayed_bug(
                                     constraint.span,
-                                    "use of trait associated const defined as `type const`",
+                                    "use of trait associated const defined as `#[rustc_always_gca]`",
                                 );
                                 return Err(err);
                             }
-                        } else {
-                            bounds.push((bound.upcast(tcx), constraint.span));
                         }
+
+                        bounds.push((bound.upcast(tcx), constraint.span));
                     }
                     // SelfTraitThatDefines is only interested in trait predicates.
                     PredicateFilter::SelfTraitThatDefines(_) => {}
@@ -612,7 +624,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
     /// Lower a type, possibly specially handling the type if it's a return type notation
     /// which we otherwise deny in other positions.
-    pub fn lower_ty_maybe_return_type_notation(&self, hir_ty: &hir::Ty<'tcx>) -> Ty<'tcx> {
+    pub fn lower_ty_maybe_return_type_notation(&self, hir_ty: &hir::Ty<'_>) -> Ty<'tcx> {
         let hir::TyKind::Path(qpath) = hir_ty.kind else {
             return self.lower_ty(hir_ty);
         };

@@ -1,8 +1,9 @@
 #![feature(rustc_private)]
-// warn on lints, that are included in `rust-lang/rust`s bootstrap
-#![warn(rust_2018_idioms, unused_lifetimes)]
-// warn on rustc internal lints
-#![warn(rustc::internal)]
+#![warn(
+    // warn on lints, that are included in `rust-lang/rust`s bootstrap
+    rust_2018_idioms, unused_lifetimes,
+    // and on rustc internal lints
+    rustc::internal)]
 // FIXME: switch to something more ergonomic here, once available.
 // (Currently there is no way to opt into sysroot crates without `extern crate`.)
 // Blessed env_mutation (2026-07-20): vendored upstream tool code, compiled by
@@ -12,6 +13,7 @@
 // them under stock rustc, so unknown_lints keeps that path green too.
 #![allow(unknown_lints)]
 #![allow(env_mutation)]
+extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_interface;
 extern crate rustc_session;
@@ -19,17 +21,13 @@ extern crate rustc_span;
 
 mod arg_protocol;
 mod frontend_args;
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/path_identity.rs"]
 mod path_identity;
+#[path = "../../targo/crates/targo-core/src/util/lint_frontend/overlay.rs"]
 mod rustc_private_overlay;
 
-/// See docs in <https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc/src/main.rs>
-/// and <https://github.com/rust-lang/rust/pull/146627> for why we need this.
-///
-/// FIXME(madsmtm): This is loaded from the sysroot that was built with the other `rustc` crates
-/// above, instead of via Cargo as you'd normally do. This is currently needed for LTO due to
-/// <https://github.com/rust-lang/cc-rs/issues/1613>.
-#[cfg(feature = "jemalloc")]
-extern crate tikv_jemalloc_sys as _;
+// Override the C allocator in the same way that the `rustc` binary would do.
+rustc_driver::override_c_allocator_in_binary!();
 
 use clippy_utils::sym;
 use declare_clippy_lint::LintListBuilder;
@@ -174,8 +172,53 @@ fn merge_and_match_internal_compiler_args(
     compiler_matches(execution_args)
 }
 
-fn same_directory(left: &Path, right: &Path) -> bool {
-    left == right
+/// The driver's `bin` and the compiler's `bin` must be the SAME directory: equal as
+/// written, or — when the driver was launched through a linked toolchain path such as
+/// rustup's `~/.rustup/toolchains/<name>` symlink while Targo names the compiler by the
+/// sealed directory it canonicalized — the driver's directory resolves to the compiler's
+/// directory and the compiler's directory is its own canonical form. A lexical alias
+/// (`bin/../bin`) is never canonical and stays refused; a resolved directory is the same
+/// files, not a lookalike. Measured 2026-09-08: `targo tippy --fix` under
+/// `rustup run trust-<seal>` failed every unit with "is not a sibling of driver" while
+/// the plain lint pass (no compiler-wrapper mode) ran through the same link.
+fn same_directory(driver_bin: &Path, compiler_bin: &Path) -> bool {
+    // The alias refusal above is a property of BOTH sides, so it is applied to the
+    // driver first, before equality or resolution. `bin/../bin` names `bin` only
+    // while `bin` is the real directory: the sysroot this guard protects is taken
+    // from `driver_bin.parent()`, a lexical pop that turns that spelling into
+    // `<sealed>/bin/..` rather than `<sealed>`, and re-resolves through whatever
+    // `bin` is at use time. A LINKED directory is resolved by the filesystem and
+    // stays admitted below; a `..` is not resolved at all.
+    if !is_lexically_canonical(driver_bin) {
+        return false;
+    }
+    if driver_bin == compiler_bin {
+        return true;
+    }
+    let Ok(compiler_canonical) = fs::canonicalize(compiler_bin) else {
+        return false;
+    };
+    if compiler_canonical != compiler_bin {
+        return false;
+    }
+    fs::canonicalize(driver_bin).is_ok_and(|driver_canonical| driver_canonical == compiler_canonical)
+}
+
+// The lexical half of what `fs::canonicalize` returns: every component is a platform
+// prefix, a root, or a name. `Path::components` normalizes an interior or trailing
+// `.` away — and `Path` equality compares components, not bytes — so what this refuses
+// is exactly the spellings that survive to change what a later `parent()` or
+// resolution means: a `..` anywhere, or a leading `.`. The match is an allowlist, so
+// a component variant this code has never seen fails closed.
+fn is_lexically_canonical(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.components().all(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+        )
+    })
 }
 
 fn invocation_executable_path() -> Option<PathBuf> {
@@ -771,6 +814,22 @@ fn branded_driver_derives_only_its_own_toolchain_sysroot() {
             .contains("not a sibling")
     );
 
+    // The same alias on the DRIVER side, named against the compiler's canonical
+    // sibling: the guarantee is symmetric, and `<bin>/..` is not the sealed sysroot.
+    let canonical_bin = fs::canonicalize(&bin).expect("canonical selected toolchain bin");
+    let aliased_driver = bin.join("../bin/tippy-driver");
+    let driver_lexical_alias = vec![
+        aliased_driver.to_string_lossy().into_owned(),
+        canonical_bin.join("trustc").to_string_lossy().into_owned(),
+        "--crate-name".into(),
+        "demo".into(),
+    ];
+    assert!(
+        branded_driver_sysroot(&driver_lexical_alias, Some(&aliased_driver))
+            .expect_err("the driver must use the exact sibling directory")
+            .contains("not a sibling")
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -787,6 +846,37 @@ fn branded_driver_derives_only_its_own_toolchain_sysroot() {
             branded_driver_sysroot(&symlinked, Some(&current_exe))
                 .expect_err("a branded compiler symlink must fail closed")
                 .contains("not a plain regular file")
+        );
+
+        // A driver launched through a LINKED toolchain directory (rustup's
+        // `~/.rustup/toolchains/<name>` symlink) with the compiler named by the sealed
+        // directory Targo canonicalized: the same files, admitted.
+        let link = root.join("linked");
+        symlink(&sysroot, &link).expect("create linked toolchain fixture");
+        let linked_driver = link.join("bin/tippy-driver");
+        let canonical_compiler = fs::canonicalize(&compiler).expect("canonical compiler path");
+        let via_link = vec![
+            linked_driver.to_string_lossy().into_owned(),
+            canonical_compiler.to_string_lossy().into_owned(),
+            "--crate-name".into(),
+            "demo".into(),
+        ];
+        assert_eq!(
+            branded_driver_sysroot(&via_link, Some(&linked_driver)),
+            Ok(Some(link.to_string_lossy().into_owned()))
+        );
+        // The converse — the compiler named THROUGH the link — is not the compiler's
+        // canonical form and stays refused, like every other alias.
+        let converse = vec![
+            current_exe.to_string_lossy().into_owned(),
+            link.join("bin/trustc").to_string_lossy().into_owned(),
+            "--crate-name".into(),
+            "demo".into(),
+        ];
+        assert!(
+            branded_driver_sysroot(&converse, Some(&current_exe))
+                .expect_err("a compiler path that is not its own canonical form is not a sibling")
+                .contains("not a sibling")
         );
     }
 
@@ -1262,7 +1352,6 @@ struct ClippyCallbacks {
 impl rustc_driver::Callbacks for ClippyCallbacks {
     #[expect(rustc::bad_opt_access, reason = "necessary in clippy driver to set `mir_opt_level`")]
     fn config(&mut self, config: &mut interface::Config) {
-        let conf_path = clippy_config::lookup_conf_file();
         let previous = config.register_lints.take();
         let clippy_args_var = self.clippy_args_var.take();
         let tippy_encoded_args_var = self.tippy_encoded_args_var.take();
@@ -1288,7 +1377,7 @@ impl rustc_driver::Callbacks for ClippyCallbacks {
             list_builder.insert(clippy_lints::declared_lints::LINTS);
             list_builder.register(lint_store);
 
-            let conf = clippy_config::Conf::read(sess, &conf_path);
+            let conf = clippy_config::Conf::load(sess);
             clippy_lints::register_lint_passes(lint_store, conf);
 
             #[cfg(feature = "internal")]
@@ -1306,7 +1395,24 @@ impl rustc_driver::Callbacks for ClippyCallbacks {
 
         // Disable flattening and inlining of format_args!(), so the HIR matches with the AST.
         config.opts.unstable_opts.flatten_format_args = false;
+
+        serial_lint_frontend(&mut config.opts);
     }
+}
+
+/// Trust (T14b, DECISION_QUEUE T14-TIPPY-1): a lint compile runs one front-end
+/// thread. Since `targo tippy` resolves the `[target.'cfg(trust_verify)']`
+/// table as the build lanes do, a project's `-Zthreads=N` reaches lint units;
+/// a lint verdict must not depend on the parallel front end, which nobody has
+/// audited for Clippy's passes. The request is replaced, not refused, as the
+/// proof session's pin does (FRONTEND-THREADS-1). Units compiled through
+/// `RustcCallbacks` (dependencies) keep the request.
+#[expect(
+    rustc::bad_opt_access,
+    reason = "the lint compile's thread request is set before the session"
+)]
+fn serial_lint_frontend(opts: &mut rustc_session::config::Options) {
+    opts.unstable_opts.threads = None;
 }
 
 fn run_compiler_args(args: &[String], callbacks: &mut (dyn rustc_driver::Callbacks + Send)) {
@@ -1328,7 +1434,7 @@ fn strip_overlay_process_environment() {
     }
 }
 
-fn display_help() -> ExitCode {
+fn print_help() -> ExitCode {
     if writeln!(&mut anstream::stdout().lock(), "{}", help_message_for_display()).is_err() {
         ExitCode::FAILURE
     } else {
@@ -1342,7 +1448,15 @@ const BUG_REPORT_URL: &str = concat!(
 );
 
 fn main() -> ExitCode {
-    let overlay_environment = OverlayEnvironment::capture();
+    // Trust: FIRST native-main operation, before overlay files, logging or callbacks.
+    // SAFETY: no descriptor-opening operation has run in this native main.
+    if let Err(error) = unsafe { rustc_data_structures::jobserver::capture_early() } {
+        eprintln!("error: inherited compiler resource custody unavailable: {error}");
+        return ExitCode::from(75);
+    }
+
+    let overlay_environment = OverlayEnvironment::capture_with(|name| env::var_os(name))
+        .with_compiler_host(std::ffi::OsStr::new(rustc_session::config::host_tuple()));
     strip_overlay_process_environment();
     let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
@@ -1353,7 +1467,7 @@ fn main() -> ExitCode {
         // as simple as moving the call from the hook to main, because `install_ice_hook` doesn't
         // accept a generic closure.
         let version_info = clippy_version_info_for_display();
-        dcx.handle().note(format!("Tippy version: {version_info}"));
+        dcx.note(format!("Tippy version: {version_info}"));
     });
 
     let current_exe = invocation_executable_path();
@@ -1451,7 +1565,7 @@ fn main() -> ExitCode {
             }
 
             if !wrapper_mode && (matches.opt_present("h") || matches.opt_present("help") || inspected_args.len() == 1) {
-                return display_help();
+                return print_help();
             }
 
             let mut args = inspected_args.clone();
@@ -1570,7 +1684,9 @@ fn main() -> ExitCode {
 fn help_message() -> &'static str {
     color_print::cstr!(
         "Checks a file to catch common mistakes and improve your Rust code.
-Run <cyan>tippy-driver</> with the same arguments you use for <cyan>trustc</>
+Run <cyan>tippy-driver</> with compiler options and an input file.
+With the Trust toolchain, <cyan>--sysroot</> overrides are refused.
+This linting command emits no Trust proof evidence.
 
 <green,bold>Usage</>:
     <cyan,bold>tippy-driver</> <cyan>[OPTIONS] INPUT</>
@@ -1601,4 +1717,21 @@ fn clippy_version_info_for_display() -> String {
 
 fn help_message_for_display() -> String {
     help_message().replace("tippy-driver", &display_binary_name("tippy-driver"))
+}
+
+#[cfg(test)]
+#[test]
+fn a_lint_compile_runs_one_front_end_thread_whatever_the_profile_asks() {
+    #[expect(rustc::bad_opt_access, reason = "the test sets the request -Zthreads=4 makes")]
+    fn request(opts: &mut rustc_session::config::Options, threads: Option<String>) {
+        opts.unstable_opts.threads = threads;
+    }
+    #[expect(rustc::bad_opt_access, reason = "the test reads the field the pin writes")]
+    fn threads(opts: &rustc_session::config::Options) -> Option<String> {
+        opts.unstable_opts.threads.clone()
+    }
+    let mut opts = rustc_session::config::Options::default();
+    request(&mut opts, Some("4".to_owned()));
+    serial_lint_frontend(&mut opts);
+    assert_eq!(threads(&opts), None);
 }

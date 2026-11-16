@@ -1,7 +1,7 @@
 use rustc_ast::tokenstream::Spacing;
 use rustc_ast::{
     self as ast, AttrVec, DUMMY_NODE_ID, GenericBounds, GenericParam, GenericParamKind, TyKind,
-    WhereClause, token,
+    WhereClause, WherePredicate, token,
 };
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Applicability, Diag, PResult};
@@ -9,7 +9,7 @@ use rustc_span::{Ident, Span, Symbol, kw, sym};
 use thin_vec::ThinVec;
 
 use super::{ForceCollect, Parser, Trailing, UsePreAttrPos};
-use crate::errors::{
+use crate::diagnostics::{
     self, MultipleWhereClauses, UnexpectedDefaultValueForLifetimeInGenericParameters,
     UnexpectedSelfInGenericParameters, WhereClauseBeforeTupleStructBody,
     WhereClauseBeforeTupleStructBodySugg,
@@ -27,7 +27,7 @@ impl<'a> Parser<'a> {
     /// ```text
     /// BOUND = LT_BOUND (e.g., `'a`)
     /// ```
-    fn parse_lt_param_bounds(&mut self) -> GenericBounds {
+    pub(crate) fn parse_lt_param_bounds(&mut self) -> GenericBounds {
         let mut lifetimes = ThinVec::new();
         while self.check_lifetime() {
             lifetimes.push(ast::GenericBound::Outlives(self.expect_lifetime()));
@@ -121,7 +121,7 @@ impl<'a> Parser<'a> {
                     ": /* Type */".to_string(),
                     Applicability::HasPlaceholders,
                 );
-                let kind = TyKind::Err(err.emit());
+                let kind = TyKind::Err(err.emit_err());
                 let ty = self.mk_ty(span, kind);
                 Ok(GenericParam {
                     ident,
@@ -262,7 +262,7 @@ impl<'a> Parser<'a> {
                     let lo = this.token.span;
                     match this.parse_ty_where_predicate_kind() {
                         Ok(_) => {
-                            this.dcx().emit_err(errors::BadAssocTypeBounds {
+                            this.dcx().emit_err(diagnostics::BadAssocTypeBounds {
                                 span: lo.to(this.prev_token.span),
                             });
                             // FIXME - try to continue parsing other generics?
@@ -278,10 +278,11 @@ impl<'a> Parser<'a> {
                     // Check for trailing attributes and stop parsing.
                     if !attrs.is_empty() {
                         if !params.is_empty() {
-                            this.dcx().emit_err(errors::AttrAfterGeneric { span: attrs[0].span });
+                            this.dcx()
+                                .emit_err(diagnostics::AttrAfterGeneric { span: attrs[0].span });
                         } else {
                             this.dcx()
-                                .emit_err(errors::AttrWithoutGenerics { span: attrs[0].span });
+                                .emit_err(diagnostics::AttrWithoutGenerics { span: attrs[0].span });
                         }
                     }
                     return Ok((None, Trailing::No, UsePreAttrPos::No));
@@ -322,7 +323,7 @@ impl<'a> Parser<'a> {
         // for example `fn invalid_path_separator::<T>() {}`
         if self.eat_noexpect(&token::PathSep) {
             self.dcx()
-                .emit_err(errors::InvalidPathSepInFnDefinition { span: self.prev_token.span });
+                .emit_err(diagnostics::InvalidPathSepInFnDefinition { span: self.prev_token.span });
         }
 
         let span_lo = self.token.span;
@@ -841,9 +842,7 @@ impl<'a> Parser<'a> {
             // Empty payload (`fn f() requires { .. }` parses `{` as the
             // terminator): an authored clause with no predicate is an error,
             // not a silent skip (design §1.2-6).
-            return Err(self
-                .dcx()
-                .struct_span_err(payload_lo, TRUST_EMPTY_CLAUSE_PAYLOAD_MSG));
+            return Err(self.dcx().struct_span_err(payload_lo, TRUST_EMPTY_CLAUSE_PAYLOAD_MSG));
         }
 
         // Consume exactly the payload walked by the lookahead. The query owns
@@ -867,6 +866,30 @@ impl<'a> Parser<'a> {
         let citation = if self.token.is_non_raw_ident_where(|id| id.name == sym::by) {
             let by_span = self.token.span;
             self.bump();
+            // Trust (ruling R1): a LEADING `::` is the same spelling mistake as
+            // an interior one, so it gets the same named refusal rather than
+            // the generic "expected a theorem name" — the widened suffix probe
+            // claims it, and a refusal that changes wording with the position
+            // of the separator teaches the rule twice.
+            if self.token.kind == token::PathSep {
+                return Err(self
+                    .dcx()
+                    .struct_span_err(
+                        by_span.to(self.token.span),
+                        "a contract clause citation is spelled with `.`, not `::`",
+                    )
+                    .with_note(
+                        "a citation names a CLEAN declaration, and a Clean name has no leading \
+                         separator: write `by <theorem>`, or `by <crate>.<theorem>` for a \
+                         dependency's (ruling R1, 2026-09-19)",
+                    )
+                    .with_span_suggestion(
+                        self.token.span,
+                        "options: remove the leading separator",
+                        "",
+                        Applicability::MachineApplicable,
+                    ));
+            }
             let Some(first_segment) = Self::trust_native_citation_segment(&self.token) else {
                 return Err(self.dcx().struct_span_err(
                     by_span,
@@ -899,6 +922,43 @@ impl<'a> Parser<'a> {
                 canonical_name.push_str(segment.name.as_str());
                 cite_hi = self.token.span;
                 self.bump();
+            }
+            // Trust (cross-crate proof citation, ruling R1 — decided
+            // 2026-09-19): the citation grammar takes the DOTTED Clean
+            // spelling, and that includes the crate-qualified form for a
+            // dependency's theorem (`by <crate>.<theorem>`). The Rust path
+            // separator is refused here, by name, instead of falling into the
+            // generic "expected `.` or the end of the citation" below: `::`
+            // is what a Rust programmer reaches for first, and the reason it
+            // is not accepted is a decision about the surface rather than a
+            // parse accident. The probe
+            // (`trust_native_citation_suffix_starts_here`) claims `::` for
+            // exactly this diagnostic.
+            if self.token.kind == token::PathSep {
+                let sep_span = self.token.span;
+                return Err(self
+                    .dcx()
+                    .struct_span_err(
+                        cite_lo.to(sep_span),
+                        "a contract clause citation is spelled with `.`, not `::`",
+                    )
+                    .with_note(
+                        "a citation names a CLEAN declaration, and Clean name segments are \
+                         separated by `.`. That is also how a dependency's theorem is cited: \
+                         `by <crate>.<theorem>`, the dependency's crate name, a `.`, then the \
+                         declaration's own Clean name",
+                    )
+                    .with_note(
+                        "both spellings are not accepted, because one theorem with two \
+                         spellings is two names for one obligation in every diagnostic, \
+                         ledger and published row that mentions it (ruling R1, 2026-09-19)",
+                    )
+                    .with_span_suggestion(
+                        sep_span,
+                        "options: write the Clean segment separator",
+                        ".",
+                        Applicability::MachineApplicable,
+                    ));
             }
             if !Self::trust_native_clause_terminator(&self.token, context) {
                 return Err(self.dcx().struct_span_err(
@@ -959,7 +1019,21 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 if later.token.ident().is_some()
-                    || matches!(later.token.kind, token::Dot | token::DotDot | token::DotDotDot)
+                    || matches!(
+                        later.token.kind,
+                        // Trust (ruling R1): `::` is claimed as path-shaped so
+                        // a misspelled citation reaches the citation parser's
+                        // named refusal. Before this it was left in the
+                        // predicate payload, and MEASURED (2026-09-19, pack
+                        // `ddafc55ba72`) that is worse than a late refusal:
+                        // under `-Ztrust-verify=off` the clause compiles with
+                        // NO diagnostic at all and the citation the author
+                        // wrote is silently dropped; under `=on` it
+                        // fail-closes as an "unsupported contract predicate
+                        // expression", naming the whole clause and never the
+                        // spelling.
+                        token::Dot | token::DotDot | token::DotDotDot | token::PathSep
+                    )
                 {
                     later_saw_path_token = true;
                     later.bump();
@@ -980,7 +1054,13 @@ impl<'a> Parser<'a> {
                 return saw_path_token;
             }
             if probe.token.ident().is_some()
-                || matches!(probe.token.kind, token::Dot | token::DotDot | token::DotDotDot)
+                || matches!(
+                    probe.token.kind,
+                    // Trust (ruling R1): see the sibling loop above — `::` is
+                    // path-shaped here so that `by krate::thm` is claimed and
+                    // refused by name.
+                    token::Dot | token::DotDot | token::DotDotDot | token::PathSep
+                )
             {
                 saw_path_token = true;
                 probe.bump();
@@ -992,7 +1072,7 @@ impl<'a> Parser<'a> {
 
     fn trust_native_citation_segment(tok: &token::Token) -> Option<Ident> {
         match tok.ident() {
-            Some((id, token::IdentIsRaw::No)) if !id.is_reserved() => Some(id),
+            Some((id, token::IdentKind::Normal)) if !id.is_reserved() => Some(id),
             _ => None,
         }
     }
@@ -1104,15 +1184,15 @@ impl<'a> Parser<'a> {
         &mut self,
         struct_: Option<(Ident, Span)>,
     ) -> PResult<'a, (WhereClause, Option<ThinVec<ast::FieldDef>>)> {
-        let mut where_clause = WhereClause {
-            has_where_token: false,
-            predicates: ThinVec::new(),
-            span: self.prev_token.span.shrink_to_hi(),
-        };
-        let mut tuple_struct_body = None;
-
         if !self.eat_keyword(exp!(Where)) {
-            return Ok((where_clause, None));
+            return Ok((
+                WhereClause {
+                    has_where_token: false,
+                    predicates: ThinVec::new(),
+                    span: self.prev_token.span.shrink_to_hi(),
+                },
+                None,
+            ));
         }
 
         if self.eat_noexpect(&token::Colon) {
@@ -1128,7 +1208,6 @@ impl<'a> Parser<'a> {
                 .emit();
         }
 
-        where_clause.has_where_token = true;
         let where_lo = self.prev_token.span;
 
         // We are considering adding generics to the `where` keyword as an alternative higher-rank
@@ -1136,8 +1215,26 @@ impl<'a> Parser<'a> {
         // change we parse those generics now, but report an error.
         if self.choose_generics_over_qpath(0) {
             let generics = self.parse_generics()?;
-            self.dcx().emit_err(errors::WhereOnGenerics { span: generics.span });
+            self.dcx().emit_err(diagnostics::WhereOnGenerics { span: generics.span });
         }
+
+        let (predicates, tuple_struct_body) =
+            self.parse_where_clause_predicates(struct_, where_lo)?;
+        let where_clause = WhereClause {
+            has_where_token: true,
+            predicates,
+            span: where_lo.to(self.prev_token.span),
+        };
+        Ok((where_clause, tuple_struct_body))
+    }
+
+    pub(super) fn parse_where_clause_predicates(
+        &mut self,
+        struct_: Option<(Ident, Span)>,
+        where_lo: Span,
+    ) -> PResult<'a, (ThinVec<WherePredicate>, Option<ThinVec<ast::FieldDef>>)> {
+        let mut predicates = ThinVec::new();
+        let mut tuple_struct_body = None;
 
         loop {
             let where_sp = where_lo.to(self.prev_token.span);
@@ -1169,13 +1266,14 @@ impl<'a> Parser<'a> {
                 } else {
                     if let [.., last] = &attrs[..] {
                         if last.is_doc_comment() {
-                            this.dcx().emit_err(errors::DocCommentDoesNotDocumentAnything {
+                            this.dcx().emit_err(diagnostics::DocCommentDoesNotDocumentAnything {
                                 span: last.span,
                                 missing_comma: None,
                             });
                         } else {
-                            this.dcx()
-                                .emit_err(errors::AttrWithoutWherePredicates { span: last.span });
+                            this.dcx().emit_err(diagnostics::AttrWithoutWherePredicates {
+                                span: last.span,
+                            });
                         }
                     }
                     None
@@ -1190,7 +1288,7 @@ impl<'a> Parser<'a> {
                 Ok((predicate, Trailing::No, UsePreAttrPos::No))
             })?;
             match predicate {
-                Some(predicate) => where_clause.predicates.push(predicate),
+                Some(predicate) => predicates.push(predicate),
                 None => break,
             }
 
@@ -1208,8 +1306,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        where_clause.span = where_lo.to(self.prev_token.span);
-        Ok((where_clause, tuple_struct_body))
+        Ok((predicates, tuple_struct_body))
     }
 
     fn parse_ty_where_predicate_kind_or_recover_tuple_struct_body(
@@ -1228,7 +1325,9 @@ impl<'a> Parser<'a> {
         };
 
         match self.parse_ty_where_predicate_kind() {
-            Ok(pred) => Ok(PredicateKindOrStructBody::PredicateKind(pred)),
+            Ok(pred) => Ok(PredicateKindOrStructBody::PredicateKind(
+                ast::WherePredicateKind::BoundPredicate(pred),
+            )),
             Err(type_err) => {
                 let Some(((struct_name, body_insertion_point), mut snapshot)) = snapshot else {
                     return Err(type_err);
@@ -1276,7 +1375,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_ty_where_predicate_kind(&mut self) -> PResult<'a, ast::WherePredicateKind> {
+    pub(crate) fn parse_ty_where_predicate_kind(
+        &mut self,
+    ) -> PResult<'a, ast::WhereBoundPredicate> {
         // Parse optional `for<'a, 'b>`.
         // This `for` is parsed greedily and applies to the whole predicate,
         // the bounded type can have its own `for` applying only to it.
@@ -1292,11 +1393,11 @@ impl<'a> Parser<'a> {
             // The bounds may be empty; we intentionally accept predicates like  `Ty:`.
             let bounds = self.parse_generic_bounds()?;
 
-            return Ok(ast::WherePredicateKind::BoundPredicate(ast::WhereBoundPredicate {
+            return Ok(ast::WhereBoundPredicate {
                 bound_generic_params: bound_vars,
                 bounded_ty: ty,
                 bounds,
-            }));
+            });
         }
 
         // NOTE: If we ever end up impl'ing and stabilizing equality predicates (#20041),
@@ -1491,9 +1592,7 @@ enum TrustContractClause {
 /// citation grammar (shared with the first-class signature surface) and decides
 /// whether this `by` actually starts a citation. A payload that fails it takes
 /// the pre-existing typed/opaque path with no behavior change whatsoever.
-fn trust_attribute_payload_has_depth_zero_by(
-    stream: &rustc_ast::tokenstream::TokenStream,
-) -> bool {
+fn trust_attribute_payload_has_depth_zero_by(stream: &rustc_ast::tokenstream::TokenStream) -> bool {
     use rustc_ast::tokenstream::TokenTree;
 
     stream.iter().any(|tt| match tt {

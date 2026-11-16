@@ -25,6 +25,7 @@ use cargo_test_support::basic_manifest;
 use cargo_test_support::paths;
 use cargo_test_support::project;
 use cargo_test_support::rustc_host;
+use cargo_test_support::snapbox::assert_data_eq;
 use cargo_test_support::str;
 use cargo_test_support::target_spec_json;
 use cargo_test_support::{Project, prelude::*};
@@ -168,9 +169,9 @@ fn basic() {
 [COMPILING] [..]
 ...
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/[HOST_TARGET]/debug/deps/foo-[HASH])
-[RUNNING] unittests src/main.rs (target/[HOST_TARGET]/debug/deps/foo-[HASH])
-[RUNNING] tests/smoke.rs (target/[HOST_TARGET]/debug/deps/smoke-[HASH])
+[RUNNING] unittests src/lib.rs (target/[HOST_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH])
+[RUNNING] unittests src/main.rs (target/[HOST_TARGET]/debug/build/foo/[HASH]/out/foo-[HASH])
+[RUNNING] tests/smoke.rs (target/[HOST_TARGET]/debug/build/foo/[HASH]/out/smoke-[HASH])
 [DOCTEST] foo
 
 "#]])
@@ -180,9 +181,9 @@ fn basic() {
     let deps_dir = Path::new("target")
         .join(rustc_host())
         .join("debug")
-        .join("deps");
-    assert!(p.glob(deps_dir.join("*.rlib")).count() > 0);
-    assert_eq!(p.glob(deps_dir.join("*.dylib")).count(), 0);
+        .join("build");
+    assert!(p.glob(deps_dir.join("**/*.rlib")).count() > 0);
+    assert_eq!(p.glob(deps_dir.join("**/*.dylib")).count(), 0);
 }
 
 #[cargo_test(build_std_real)]
@@ -312,7 +313,8 @@ fn cross_custom() {
         .file("custom-target.json", target_spec_json())
         .build();
 
-    p.cargo("build --target custom-target.json -v -Zjson-target-spec")
+    p.cargo("build --target custom-target.json -v")
+        .arg("-Zjson-target-spec")
         .masquerade_as_nightly_cargo(&["json_target_spec"])
         .build_std_arg("core")
         .run();
@@ -353,7 +355,8 @@ fn custom_test_framework() {
     paths.insert(0, sysroot_bin);
     let new_path = env::join_paths(paths).unwrap();
 
-    p.cargo("test --target target.json --no-run -v -Zjson-target-spec")
+    p.cargo("test --target target.json --no-run -v")
+        .arg("-Zjson-target-spec")
         .masquerade_as_nightly_cargo(&["json_target_spec"])
         .env("PATH", new_path)
         .build_std_arg("core")
@@ -380,12 +383,12 @@ fn remap_path_scope() {
             "
                 [profile.release]
                 debug = \"line-tables-only\"
+                trim-paths = \"object\"
             ",
         )
         .build();
 
-    p.cargo("run --release -Ztrim-paths")
-        .masquerade_as_nightly_cargo(&["-Ztrim-paths"])
+    p.cargo("run --release")
         .env("RUST_BACKTRACE", "1")
         .build_std()
         .target_host()
@@ -432,7 +435,7 @@ fn test_proc_macro() {
 ...
 [COMPILING] foo v0.0.0 ([ROOT]/foo)
 [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] unittests src/lib.rs (target/debug/deps/foo-[HASH])
+[RUNNING] unittests src/lib.rs (target/debug/build/foo/[HASH]/out/foo-[HASH])
 
 "#]])
         .run();
@@ -445,7 +448,7 @@ fn build_std_does_not_warn_about_implicit_std_deps() {
             "Cargo.toml",
             r#"
                 [package]
-                name = "buildstd_test"
+                name = "buildstd-test"
                 version = "0.1.0"
                 edition = "2021"
 
@@ -466,19 +469,16 @@ fn build_std_does_not_warn_about_implicit_std_deps() {
         .file("bar/src/lib.rs", "")
         .build();
 
-    p.cargo("build")
-        .build_std()
-        .target_host()
-        .env("RUSTFLAGS", "-W unused-crate-dependencies")
-        .with_stderr_data(
-            str![[r#"
-[WARNING] extern crate `bar` is unused in crate `buildstd_test`
-[WARNING] `buildstd_test` (bin "buildstd_test") generated 1 warning
-...
-"#]]
-            .unordered(),
-        )
-        .run();
+    let output = p.cargo("build").build_std().target_host().run();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    println!("{stderr}");
+    let mut unused_warnings = stderr
+        .lines()
+        .filter(|l| l.contains("unused dependency"))
+        .collect::<Vec<_>>();
+    unused_warnings.sort();
+    let unused_warnings = unused_warnings.join("\n");
+    assert_data_eq!(unused_warnings, str!["warning: unused dependency `bar`"]);
 }
 
 #[cargo_test(build_std_real)]
@@ -531,7 +531,9 @@ impl CargoProjectExt for Project {
     }
 }
 
-/// Path to the cargo binary
+/// Path to the cargo binary: the `cargo` compatibility entry point of the
+/// `targo` executable this package builds (see
+/// [`cargo_test_support::cargo_compat_alias`]).
 pub fn cargo_exe() -> PathBuf {
-    snapbox::cmd::cargo_bin!("cargo").to_path_buf()
+    cargo_test_support::cargo_compat_alias(snapbox::cmd::cargo_bin!("targo"))
 }

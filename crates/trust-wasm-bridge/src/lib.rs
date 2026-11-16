@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 //! trust-wasm-bridge: trust-types/trust-ir → WebAssembly.
 //!
 //! Two paths live here:
@@ -21,7 +22,10 @@
 pub mod binary;
 use std::collections::HashMap;
 
-pub use binary::{WasmCompileError, compile_functions_to_wasm, compile_trust_ir_module_to_wasm};
+pub use binary::{
+    WasmCompileError, compile_functions_to_wasm, compile_trust_ir_module_to_wasm,
+    compile_trust_ir_module_to_wasm_with_license,
+};
 use thiserror::Error;
 use trust_ir::Module as TrustIrModule;
 use trust_ir::dialect::{AttrValue, DialectInst};
@@ -362,6 +366,9 @@ pub enum WasmBridgeError {
     /// A statement outside the constant-return subset was encountered.
     #[error("unsupported statement: {0}")]
     UnsupportedStatement(String),
+    /// Diagnostic allocation observations have no executable Wasm value semantics.
+    #[error("unsupported ConstValue::MemoryImage: diagnostic storage has no Wasm value semantics")]
+    UnsupportedMemoryImage,
     /// Canonical TrustIr text could not be parsed.
     #[error("invalid canonical TrustIr: {0}")]
     InvalidCanonicalTrustIr(String),
@@ -666,6 +673,11 @@ struct WasmParam {
 }
 
 fn lower_function(function: &VerifiableFunction) -> Result<LoweredFunction, WasmBridgeError> {
+    // Refuse the complete input before CFG or unit-return shortcuts can ignore
+    // an unsupported operand, including one nested in a constant or dead block.
+    if function.body.contains_memory_image() {
+        return Err(WasmBridgeError::UnsupportedMemoryImage);
+    }
     let block = match function.body.blocks.as_slice() {
         [block] if matches!(block.terminator, Terminator::Return) => block,
         [] => {

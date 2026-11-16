@@ -1,0 +1,23 @@
+{
+  "id": "wp-d237-shadowed-namesake",
+  "class": "trust-wp D-237 (rs1)",
+  "title": "a clone fact about one binding of `r` was read as a fact about the shadowing binding",
+  "origin": [
+    "trust-wp aee6e8f2 (D-237), tests/adversarial/cases/v25_shadowed_binding_read_as_its_namesake.rs (rs1)",
+    "trust-wp aee6e8f2 (D-237), tests/adversarial/cases/v25_shadowed_binding_control.rs (va2)"
+  ],
+  "lang": "creusot",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "rs1"
+  },
+  "twin": {
+    "function": "va2"
+  },
+  "witness": {
+    "input": "(none)",
+    "observed": "proof_assert!(r == r2) is false",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

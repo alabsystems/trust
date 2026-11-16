@@ -614,7 +614,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "std::ops::Index::index",
+            "func": "<alloc::vec::Vec<alloc::vec::Vec<u32>> as core::ops::index::Index<usize>>::index",
             "args": [
               {
                 "Copy": {
@@ -744,7 +744,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "std::ops::Index::index",
+            "func": "<alloc::vec::Vec<alloc::vec::Vec<u32>> as core::ops::index::Index<usize>>::index",
             "args": [
               {
                 "Copy": {
@@ -781,7 +781,7 @@
         "stmts": [],
         "terminator": {
           "Call": {
-            "func": "std::ops::Index::index",
+            "func": "<alloc::vec::Vec<u32> as core::ops::index::Index<usize>>::index",
             "args": [
               {
                 "Copy": {

@@ -270,37 +270,52 @@ fn decompilation_artifact_from_lifted_internal(
         ));
     }
     let mut conversion_rejected = false;
-    if options.outputs.contains(&DecompileOutputKind::TrustCgText) {
+    let trust_cg_conversion = if options.outputs.contains(&DecompileOutputKind::TrustCgText) {
         let conversion = trust_cg_conversion_for_functions(&binary, &functions)?;
         conversion_rejected |= conversion_is_rejected(
             conversion.validation,
             conversion.trust_level,
             &conversion.unsupported,
         );
-        unsupported.records.extend(conversion.unsupported.records);
-    }
-    if options.outputs.contains(&DecompileOutputKind::WasmText) {
+        unsupported.records.extend(conversion.unsupported.records.iter().cloned());
+        Some(conversion)
+    } else {
+        None
+    };
+    let wasm_conversion = if options.outputs.contains(&DecompileOutputKind::WasmText) {
         let conversion = wasm_conversion_for_functions(&binary, &functions);
         conversion_rejected |= conversion_is_rejected(
             conversion.validation,
             conversion.trust_level,
             &conversion.unsupported,
         );
-        unsupported.records.extend(conversion.unsupported.records);
-    }
+        unsupported.records.extend(conversion.unsupported.records.iter().cloned());
+        Some(conversion)
+    } else {
+        None
+    };
 
     let target = reconstruction_target(&options.outputs);
-    let outputs = build_outputs(BuildOutputsInput {
-        metadata: &binary,
-        functions: &functions,
-        call_graph: &call_graph,
-        memory_facts: &memory_facts,
-        unsupported: &unsupported,
-        source_provenance: &source_provenance,
-        requested: &options.outputs,
-        source_assumptions: &source_assumptions,
-        source_diagnostics: &source_diagnostics,
-    })?;
+    let mut precomputed = PrecomputedBuildOutputs {
+        trust_cg: trust_cg_conversion,
+        wasm: wasm_conversion,
+        defer_trust_ir_json_text: true,
+        trust_ir_module_value: None,
+    };
+    let outputs = build_outputs_with_precomputed(
+        BuildOutputsInput {
+            metadata: &binary,
+            functions: &functions,
+            call_graph: &call_graph,
+            memory_facts: &memory_facts,
+            unsupported: &unsupported,
+            source_provenance: &source_provenance,
+            requested: &options.outputs,
+            source_assumptions: &source_assumptions,
+            source_diagnostics: &source_diagnostics,
+        },
+        &mut precomputed,
+    )?;
     let output_rejected = outputs.iter().any(output_is_rejected);
     let trust_level = if rejected_output_requested || conversion_rejected || output_rejected {
         TrustLevel::Rejected
@@ -309,7 +324,12 @@ fn decompilation_artifact_from_lifted_internal(
     } else {
         TrustLevel::Partial
     };
-    let validated_rust = rust_requested.then(|| validated_rust_reconstruction(&functions));
+    let validated_rust = rust_requested.then(|| {
+        outputs
+            .iter()
+            .find_map(|output| output.validated_rust.clone())
+            .unwrap_or_else(|| validated_rust_reconstruction(&functions))
+    });
     let reconstruction_validation =
         reconstruction_validation_status(&target, &outputs, validated_rust.as_ref());
     let reconstruction = ReconstructionSummary {
@@ -339,7 +359,10 @@ fn decompilation_artifact_from_lifted_internal(
         trust_level,
         ..Default::default()
     };
-    refresh_trust_ir_json_outputs(&mut artifact);
+    refresh_trust_ir_json_outputs_with_module_value(
+        &mut artifact,
+        precomputed.trust_ir_module_value,
+    );
     Ok(artifact)
 }
 
@@ -3099,6 +3122,13 @@ fn aggregate_checked_certificate_status(
 }
 
 fn refresh_trust_ir_json_outputs(artifact: &mut DecompilationArtifact) {
+    refresh_trust_ir_json_outputs_with_module_value(artifact, None);
+}
+
+fn refresh_trust_ir_json_outputs_with_module_value(
+    artifact: &mut DecompilationArtifact,
+    mut cached_module_value: Option<serde_json::Value>,
+) {
     refresh_source_backpropagation_authority(artifact);
     let trust_ir_output_indices: Vec<_> = artifact
         .reconstruction
@@ -3112,16 +3142,35 @@ fn refresh_trust_ir_json_outputs(artifact: &mut DecompilationArtifact) {
         })
         .collect();
 
-    for index in trust_ir_output_indices {
-        match render_trust_ir_json(
-            &artifact.binary,
-            &artifact.functions,
-            &artifact.call_graph,
-            &artifact.memory_model.accesses,
-            &artifact.unsupported,
-            &artifact.source_provenance,
-            Some(&artifact.reconstruction),
-        ) {
+    let last_pos = trust_ir_output_indices.len().saturating_sub(1);
+    for (pos, index) in trust_ir_output_indices.into_iter().enumerate() {
+        let module_value = if pos == last_pos {
+            cached_module_value.take()
+        } else {
+            cached_module_value.clone()
+        };
+        let rendered = match module_value {
+            Some(module_value) => render_trust_ir_json_from_module_value(
+                &artifact.binary,
+                &artifact.functions,
+                &artifact.call_graph,
+                &artifact.memory_model.accesses,
+                &artifact.unsupported,
+                &artifact.source_provenance,
+                Some(&artifact.reconstruction),
+                module_value,
+            ),
+            None => render_trust_ir_json(
+                &artifact.binary,
+                &artifact.functions,
+                &artifact.call_graph,
+                &artifact.memory_model.accesses,
+                &artifact.unsupported,
+                &artifact.source_provenance,
+                Some(&artifact.reconstruction),
+            ),
+        };
+        match rendered {
             Ok(text) => artifact.reconstruction.outputs[index].text = Some(text),
             Err(error) => artifact.reconstruction.outputs[index]
                 .diagnostics
@@ -3720,22 +3769,57 @@ fn function_source_provenance_assumptions(
 // `trust_lift::LiftedFunction::trust_ir_body` is NOT touched — `summarize_function`
 // takes it by shared reference — and that is the copy `trust-vcgen`'s
 // `generate_memory_model_vcs` reads, recovering the frame from the same SP
-// assignments via `latest_sp_assignment_in_block`. The stack-discipline VCs are
+// assignments via `trust_lift::stack_pointer_flow`. The stack-discipline VCs are
 // therefore unaffected. Keep it that way: if a caller ever routes the decompiled
 // body back into that lane, it must read the storage facts below instead of
 // re-deriving the frame from statements that are no longer there.
 //
-// SOUNDNESS. The elision is guarded by one condition: the stack-pointer local is
-// never READ anywhere in the body. Then every write to it is dead, so removing
-// them cannot change an observable — the recorded offsets are the entire
-// residual meaning, and they are kept. If the stack pointer IS read as data
-// (`mov rax, rsp`, an escaping frame address), the guard fails, nothing is
-// elided, and the bridge refuses exactly as it does today. The read scan is
-// CONSERVATIVE in the fail-closed direction: any statement or terminator shape
-// it cannot decompose counts as a read, so an unrecognised construct blocks the
-// elision rather than permitting it. It is also ALL-OR-NOTHING: one write whose
-// offset from entry-SP is not derivable, or that carries its own obligation
-// (`Rvalue::Unsupported`), abandons the whole function.
+// SOUNDNESS. The elision is guarded by two conditions: THE ANCHOR below, and
+// that the stack-pointer local is never READ anywhere in the body. Then every
+// write to it is dead, so removing them cannot change an observable — the
+// recorded offsets are the entire residual meaning, and they are kept. If the
+// stack pointer IS read as data (`mov rax, rsp`, an escaping frame address),
+// the guard fails, nothing is elided, and the bridge refuses exactly as it does
+// today. The read scan is CONSERVATIVE in the fail-closed direction: any
+// statement or terminator shape it cannot decompose counts as a read, so an
+// unrecognised construct blocks the elision rather than permitting it. It is
+// also ALL-OR-NOTHING: one write whose offset from entry-SP is not derivable,
+// or that carries its own obligation (`Rvalue::Unsupported`), abandons the
+// whole function.
+//
+// THE ANCHOR. The lift seeds every basic block from a FRESH symbolic machine
+// state (`trust-lift`'s `lift_cfg_with_semantics`), so `Var("SP")` inside a
+// block means SP at THAT BLOCK's entry — the value the stack-pointer local held
+// when control arrived. It is SP at FUNCTION entry only where no path into the
+// block has moved it. That one fact bounds the pass twice over:
+//
+// * an offset read off a write is relative to its own block's start, so it is
+//   recorded as a function-entry `Stack` offset only after it is re-expressed
+//   over SP at that block's entry (`sub rsp, 8` in the entry block, then
+//   `add rsp, 8; ret` in a later one, is `[-8, 0, 8]` from function entry; read
+//   block-relative, as this pass once did, it was `[-8, 8, 16]`); and
+// * once the writes are gone nothing sets the local, so EVERY block's
+//   `Var("SP")` then denotes function-entry SP. A block that reads SP inside a
+//   symbolic formula — a use the local-read scan cannot see — keeps its meaning
+//   only if it already started at function-entry SP. Removing an entry write
+//   that left SP displaced would silently move every such later access
+//   (`sub sp, sp, #16` then `str x1, [sp]` in the next block).
+//
+// SP at each block's entry comes from `trust_lift::stack_pointer_flow`, the
+// same dataflow `trust-vcgen`'s stack-discipline check uses, so the two crates
+// read a lifted stack through one model. On top of the local-read guard the
+// pass elides only when
+//   1. SP at the entry of EVERY block that writes SP is derivable, and each
+//      write re-expressed over it (`trust_lift::stack_pointer_after_write`) is
+//      function-entry SP plus a constant; and
+//   2. every block that reads SP symbolically, outside the writes being
+//      removed, starts at function-entry SP (a sufficient rule, not a
+//      necessary one: a later-block `pop` or `ret` load still refuses).
+// The dataflow voids — and so refuses the pass — on block ids that are not
+// positions, an unknown entry block, or a terminator it does not model; and a
+// back edge into the entry block makes that block's SP the JOIN of every
+// arrival instead of assuming function entry. Whatever it cannot derive
+// abandons the function, which records fewer facts and never a wrong one.
 
 /// The local holding the machine stack pointer.
 ///
@@ -3762,57 +3846,6 @@ fn local_is_read_anywhere(body: &VerifiableBody, local: usize) -> bool {
         block.stmts.iter().any(|statement| statement_reads_local(statement, local))
             || terminator_reads_local(&block.terminator, local)
     })
-}
-
-/// Read a bitvector literal as a SIGNED machine value.
-///
-/// A `sub rsp, 32` may lift as either `BvSub(SP, 32)` or `BvAdd(SP, 2^64 - 32)`;
-/// the second is the same displacement written as an unsigned wrap, so the
-/// literal is interpreted in two's complement at its own width.
-fn bitvec_as_signed(value: i128, width: u32) -> Option<i64> {
-    if width == 0 || width > 64 {
-        return None;
-    }
-    let modulus = 1i128 << width;
-    let wrapped = value.rem_euclid(modulus);
-    let signed = if wrapped < modulus / 2 { wrapped } else { wrapped - modulus };
-    i64::try_from(signed).ok()
-}
-
-/// The displacement of `formula` from the ENTRY stack pointer, when it is one.
-///
-/// Recognises `SP`, and `SP ± literal` nested to any depth. Returns `None` for
-/// anything that mixes in another variable or a non-literal — that is not frame
-/// bookkeeping and must not be elided.
-///
-/// Deliberately a second implementation of `trust_lift`'s private
-/// `stack_relative_offset`, which answers the same question for memory-region
-/// classification. This one additionally reads the literal in two's complement
-/// (see `bitvec_as_signed`) and narrows to `i64`, because its answer is recorded
-/// as a `BinaryStorageLocation::Stack` offset rather than compared symbolically.
-/// If the two ever need to agree, promote one — do not let them drift.
-fn entry_sp_offset(formula: &Formula) -> Option<i64> {
-    match formula {
-        Formula::Var(name, _) if name == STACK_POINTER_LOCAL_NAME => Some(0),
-        Formula::SymVar(symbol, _) if symbol.as_str() == STACK_POINTER_LOCAL_NAME => Some(0),
-        Formula::BvAdd(lhs, rhs, _) => match (&**lhs, &**rhs) {
-            (_, Formula::BitVec { value, width }) => {
-                entry_sp_offset(lhs)?.checked_add(bitvec_as_signed(*value, *width)?)
-            }
-            (Formula::BitVec { value, width }, _) => {
-                entry_sp_offset(rhs)?.checked_add(bitvec_as_signed(*value, *width)?)
-            }
-            _ => None,
-        },
-        // Only `sp - literal`. `literal - sp` is a negation, not a displacement.
-        Formula::BvSub(lhs, rhs, _) => match &**rhs {
-            Formula::BitVec { value, width } => {
-                entry_sp_offset(lhs)?.checked_sub(bitvec_as_signed(*value, *width)?)
-            }
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Does `operand` read `local`?
@@ -3902,22 +3935,176 @@ fn terminator_reads_local(terminator: &Terminator, local: usize) -> bool {
     }
 }
 
+/// Could `formula` read the machine stack pointer?
+///
+/// Any variable NAMED `SP`, of any sort, interned or not, bound or free,
+/// counts — an over-approximation, which only ever refuses more.
+fn formula_mentions_stack_pointer(formula: &Formula) -> bool {
+    trust_types::any_formula_node(formula, &mut |node| match node {
+        Formula::Var(name, _) => name == STACK_POINTER_LOCAL_NAME,
+        Formula::SymVar(symbol, _) => symbol.as_str() == STACK_POINTER_LOCAL_NAME,
+        _ => false,
+    })
+}
+
+/// Could `operand` read SP inside a symbolic formula?
+///
+/// The symbolic twin of `operand_reads_local`: a `Place` operand is that scan's
+/// business, a formula is this one's, and a payload that could not be
+/// represented is assumed to read it.
+fn operand_may_read_sp_symbolically(operand: &Operand) -> bool {
+    match operand {
+        Operand::Copy(_) | Operand::Move(_) | Operand::Constant(_) => false,
+        Operand::Symbolic(formula) => formula_mentions_stack_pointer(formula),
+        _ => true,
+    }
+}
+
+/// Could `rvalue` read SP inside a symbolic formula? Same shape as
+/// `rvalue_reads_local`; anything it cannot decompose answers `true`.
+fn rvalue_may_read_sp_symbolically(rvalue: &Rvalue) -> bool {
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Repeat(operand, _)
+        | Rvalue::Cast(operand, _)
+        | Rvalue::UnaryOp(_, operand) => operand_may_read_sp_symbolically(operand),
+        Rvalue::BinaryOp(_, lhs, rhs)
+        | Rvalue::CheckedBinaryOp(_, lhs, rhs)
+        | Rvalue::UncheckedBinaryOp(_, lhs, rhs) => {
+            operand_may_read_sp_symbolically(lhs) || operand_may_read_sp_symbolically(rhs)
+        }
+        Rvalue::PtrOffset { ptr, count } => {
+            operand_may_read_sp_symbolically(ptr) || operand_may_read_sp_symbolically(count)
+        }
+        Rvalue::Aggregate(_, operands) => operands.iter().any(operand_may_read_sp_symbolically),
+        // Place reads: the local-read scan's business.
+        Rvalue::Ref { .. }
+        | Rvalue::AddressOf(..)
+        | Rvalue::Discriminant(_)
+        | Rvalue::Len(_)
+        | Rvalue::CopyForDeref(_) => false,
+        // `Unsupported` and any variant added later.
+        _ => true,
+    }
+}
+
+/// Could `statement` read SP inside a symbolic formula? Anything the scan
+/// cannot decompose answers `true`.
+fn statement_may_read_sp_symbolically(statement: &Statement) -> bool {
+    match statement {
+        // A projection names locals and literals only, never a formula.
+        Statement::Assign { rvalue, .. } => rvalue_may_read_sp_symbolically(rvalue),
+        Statement::StorageLive(_)
+        | Statement::StorageDead(_)
+        | Statement::SetDiscriminant { .. }
+        | Statement::Deinit { .. }
+        | Statement::Retag { .. }
+        | Statement::PlaceMention(_)
+        | Statement::Coverage
+        | Statement::ConstEvalCounter
+        | Statement::Nop => false,
+        Statement::Intrinsic { args, .. } => args.iter().any(operand_may_read_sp_symbolically),
+        Statement::CopyNonOverlapping { src, dst, count, .. } => {
+            [src, dst, count].into_iter().any(operand_may_read_sp_symbolically)
+        }
+        // `Unsupported` and any variant added later.
+        _ => true,
+    }
+}
+
+/// Could `terminator` read SP inside a symbolic formula? A tail call, an
+/// `Opaque` transfer and any variant added later answer `true` (the local-read
+/// scan refuses them already).
+fn terminator_may_read_sp_symbolically(terminator: &Terminator) -> bool {
+    match terminator {
+        Terminator::Goto(_)
+        | Terminator::Return
+        | Terminator::Unreachable
+        | Terminator::Resume
+        | Terminator::Drop { .. } => false,
+        Terminator::SwitchInt { discr, .. } => operand_may_read_sp_symbolically(discr),
+        Terminator::Assert { cond, .. } => operand_may_read_sp_symbolically(cond),
+        Terminator::Call { args, .. } => args.iter().any(operand_may_read_sp_symbolically),
+        _ => true,
+    }
+}
+
+/// REMOVAL SAFETY (see THE ANCHOR in the module note): does every symbolic
+/// read of SP mean the same thing once the `removed` writes are gone?
+///
+/// After the removal nothing writes the stack-pointer local, so a block's
+/// `Var("SP")` denotes function-entry SP. Before it, it denoted SP at that
+/// block's entry. The two agree exactly where `flow` proves the block starts
+/// at function-entry SP — so a block that reads SP symbolically anywhere
+/// outside the `removed` statements (`(block, statement, _)`) must be one of
+/// those. The removed writes' own reads are not uses: they go with the writes.
+///
+/// Sufficient, not necessary: a block that starts displaced and reads SP
+/// (`pop rbp`, the return-address load of an x86-64 `ret`, `str x1, [sp]`) is
+/// refused even though rewriting its reads could keep the meaning.
+fn symbolic_sp_reads_survive_removal(
+    body: &VerifiableBody,
+    flow: &trust_lift::StackPointerFlow,
+    removed: &[(usize, usize, i64)],
+) -> bool {
+    body.blocks.iter().enumerate().all(|(position, block)| {
+        let reads_sp = block.stmts.iter().enumerate().any(|(index, statement)| {
+            let is_removed = removed.iter().any(|&(removed_block, removed_index, _)| {
+                removed_block == position && removed_index == index
+            });
+            !is_removed && statement_may_read_sp_symbolically(statement)
+        }) || terminator_may_read_sp_symbolically(&block.terminator);
+        !reads_sp
+            || flow
+                .at_block_entry(position)
+                .is_some_and(|sp| trust_lift::function_entry_sp_offset(sp) == Some(0))
+    })
+}
+
+/// The value of a stack-pointer write this pass may elide: a whole symbolic
+/// formula, as the lift emits it. `reconstruct_frame` refuses every other
+/// shape before the dataflow runs, so for this pass the dataflow never sees
+/// another.
+fn symbolic_write_value(rvalue: &Rvalue) -> Option<Formula> {
+    match rvalue {
+        Rvalue::Use(Operand::Symbolic(formula)) => Some(formula.clone()),
+        _ => None,
+    }
+}
+
+/// `reconstruct_frame` anchored at the lifted CFG's entry block — the block
+/// `trust-vcgen`'s SP analysis also starts from.
+fn reconstruct_lifted_frame(
+    function: &LiftedFunction,
+    body: &mut VerifiableBody,
+) -> Vec<BinaryStorageFact> {
+    reconstruct_frame(body, &function.name, trust_lift::lifted_entry_block(function))
+}
+
 /// Reconstruct the frame: elide dead stack-pointer bookkeeping and return the
 /// facts it encoded.
+///
+/// `entry` is the position of the function's entry block in `body`; `None`
+/// (unknown) abandons the pass, because without it no offset can be anchored
+/// at function entry.
 ///
 /// Returns an empty vector and leaves `body` untouched whenever the elision is
 /// not provably meaning-preserving; see the module note above for the exact
 /// conditions.
-fn reconstruct_frame(body: &mut VerifiableBody, function: &str) -> Vec<BinaryStorageFact> {
+fn reconstruct_frame(
+    body: &mut VerifiableBody,
+    function: &str,
+    entry: Option<usize>,
+) -> Vec<BinaryStorageFact> {
     let Some(sp_local) = machine_register_local(body, STACK_POINTER_LOCAL_NAME) else {
         return Vec::new();
     };
 
     // (1) Every write to the stack-pointer local must be a whole-local write of
-    //     a derivable entry-SP displacement. One that is not abandons the
-    //     function: a partial elision would leave a frame whose residual writes
-    //     no longer compose to the recorded offset.
-    let mut writes: Vec<(usize, usize, i64)> = Vec::new();
+    //     a symbolic value. One that is not abandons the function: a partial
+    //     elision would leave a frame whose residual writes no longer compose
+    //     to the recorded offsets.
+    let mut writes: Vec<(usize, usize, Formula)> = Vec::new();
     for (block_index, block) in body.blocks.iter().enumerate() {
         for (statement_index, statement) in block.stmts.iter().enumerate() {
             let Statement::Assign { place, rvalue, .. } = statement else { continue };
@@ -3930,31 +4117,52 @@ fn reconstruct_frame(body: &mut VerifiableBody, function: &str) -> Vec<BinarySto
             let Rvalue::Use(Operand::Symbolic(formula)) = rvalue else {
                 return Vec::new();
             };
-            let Some(offset) = entry_sp_offset(formula) else {
-                return Vec::new();
-            };
-            writes.push((block_index, statement_index, offset));
+            writes.push((block_index, statement_index, formula.clone()));
         }
     }
     if writes.is_empty() {
         return Vec::new();
     }
 
-    // (2) The guard: the stack pointer must never be read. Then the writes are
-    //     dead and removing them preserves every observable.
+    // (2) The anchor: each write, re-expressed over the SP its block started
+    //     with, must be FUNCTION-entry SP plus a constant. SP at a block's
+    //     entry comes from the dataflow trust-vcgen's stack check uses; a
+    //     block where it is not derivable abandons the function.
+    let flow = trust_lift::stack_pointer_flow(body, entry, sp_local, symbolic_write_value);
+    let mut elided: Vec<(usize, usize, i64)> = Vec::with_capacity(writes.len());
+    for (block_index, statement_index, formula) in writes {
+        let Some(offset) = flow
+            .at_block_entry(block_index)
+            .and_then(|sp_at_block_entry| {
+                trust_lift::stack_pointer_after_write(&formula, sp_at_block_entry)
+            })
+            .and_then(|value| trust_lift::function_entry_sp_offset(&value))
+        else {
+            return Vec::new();
+        };
+        elided.push((block_index, statement_index, offset));
+    }
+
+    // (3) The guard: the stack-pointer local must never be read. Then the
+    //     writes are dead as far as any `Place` can tell.
     if local_is_read_anywhere(body, sp_local) {
         return Vec::new();
     }
 
-    // (3) Remove them, latest first so the earlier indices stay valid.
-    for (block_index, statement_index, _) in writes.iter().rev() {
+    // (4) Removal safety: no symbolic read of SP may change what it denotes.
+    if !symbolic_sp_reads_survive_removal(body, &flow, &elided) {
+        return Vec::new();
+    }
+
+    // (5) Remove them, latest first so the earlier indices stay valid.
+    for (block_index, statement_index, _) in elided.iter().rev() {
         if let Some(block) = body.blocks.get_mut(*block_index) {
             block.stmts.remove(*statement_index);
         }
     }
 
-    // (4) Keep what they meant.
-    writes
+    // (6) Keep what they meant.
+    elided
         .into_iter()
         .map(|(_, _, offset)| BinaryStorageFact {
             subject: BinaryFactSubject::Register {
@@ -4082,6 +4290,9 @@ mod frame_reconstruction_tests {
 
     const PC: usize = 33; // AArch64 `LocalLayout::pc_local`.
 
+    /// Where every fixture below starts: block 0, as `trust-lift` builds it.
+    const ENTRY: Option<usize> = Some(0);
+
     fn pc_var() -> Formula {
         Formula::Var(PROGRAM_COUNTER_LOCAL_NAME.to_string(), Sort::BitVec(64))
     }
@@ -4127,7 +4338,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return", ENTRY);
         let elided_pc = elide_control_flow_program_counter_writes(&mut body);
 
         assert_eq!(offsets(&facts), vec![8]);
@@ -4176,6 +4387,7 @@ mod frame_reconstruction_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
 
         // BEFORE: the bridge refuses, and names a machine register in doing so.
@@ -4192,7 +4404,7 @@ mod frame_reconstruction_tests {
 
         // AFTER: both passes run, and the same body lowers.
         let mut body = machine_body(stmts, Terminator::Return);
-        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return", ENTRY);
         let elided_pc = elide_control_flow_program_counter_writes(&mut body);
         assert_eq!(offsets(&facts), vec![8]);
         assert_eq!(elided_pc, 2);
@@ -4297,7 +4509,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        assert!(reconstruct_frame(&mut body, "sp_escapes").is_empty());
+        assert!(reconstruct_frame(&mut body, "sp_escapes", ENTRY).is_empty());
         assert_eq!(elide_control_flow_program_counter_writes(&mut body), 1);
         assert_eq!(
             body.blocks[0].stmts.len(),
@@ -4337,6 +4549,27 @@ mod frame_reconstruction_tests {
         }
     }
 
+    /// The same locals over several blocks, ids = positions, block 0 first —
+    /// the shape `trust-lift` emits for a multi-block function.
+    fn body_with_blocks(blocks: Vec<(Vec<Statement>, Terminator)>) -> VerifiableBody {
+        let mut body = body_with(vec![], Terminator::Return);
+        body.blocks = blocks
+            .into_iter()
+            .enumerate()
+            .map(|(position, (stmts, terminator))| BasicBlock {
+                id: BlockId(position),
+                stmts,
+                terminator,
+            })
+            .collect();
+        body
+    }
+
+    /// Statements per block, to show a refused body was left exactly as it was.
+    fn statement_counts(body: &VerifiableBody) -> Vec<usize> {
+        body.blocks.iter().map(|block| block.stmts.len()).collect()
+    }
+
     fn sp_assign(value: Formula) -> Statement {
         Statement::Assign {
             place: Place::local(SP),
@@ -4368,7 +4601,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        let facts = reconstruct_frame(&mut body, "trust_fixture_return");
+        let facts = reconstruct_frame(&mut body, "trust_fixture_return", ENTRY);
 
         assert!(body.blocks[0].stmts.is_empty(), "the dead SP write must be gone: {body:?}");
         assert_eq!(offsets(&facts), vec![8]);
@@ -4399,7 +4632,7 @@ mod frame_reconstruction_tests {
         );
         let before = body.clone();
 
-        let facts = reconstruct_frame(&mut body, "reads_sp");
+        let facts = reconstruct_frame(&mut body, "reads_sp", ENTRY);
 
         assert!(facts.is_empty(), "a read stack pointer must yield no frame fact");
         assert_eq!(body.blocks[0].stmts.len(), before.blocks[0].stmts.len());
@@ -4407,21 +4640,35 @@ mod frame_reconstruction_tests {
 
     /// A read reached only through a TERMINATOR must block it too — the scan
     /// covers both halves of a block.
+    ///
+    /// Shaped so that the read is the ONLY reason to refuse: the switch leaves
+    /// to a second block rather than looping back into the entry, and the entry
+    /// block restores SP before it leaves, so the anchor holds.
     #[test]
     fn a_stack_pointer_read_by_a_terminator_blocks_the_elision() {
-        let mut body = body_with(
-            vec![sp_assign(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64))],
-            Terminator::SwitchInt {
-                discr: Operand::Copy(Place::local(SP)),
-                targets: vec![],
-                otherwise: BlockId(0),
-                exhaustive_enum_unreachable: false,
-                span: SourceSpan::binary_address(0x1004),
-            },
-        );
+        let mut body = body_with_blocks(vec![
+            (
+                vec![
+                    sp_assign(Formula::BvSub(Box::new(sp_var()), Box::new(bv(16)), 64)),
+                    sp_assign(Formula::BvAdd(
+                        Box::new(Formula::BvSub(Box::new(sp_var()), Box::new(bv(16)), 64)),
+                        Box::new(bv(16)),
+                        64,
+                    )),
+                ],
+                Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::local(SP)),
+                    targets: vec![],
+                    otherwise: BlockId(1),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::binary_address(0x1004),
+                },
+            ),
+            (vec![], Terminator::Return),
+        ]);
 
-        assert!(reconstruct_frame(&mut body, "switch_on_sp").is_empty());
-        assert_eq!(body.blocks[0].stmts.len(), 1);
+        assert!(reconstruct_frame(&mut body, "switch_on_sp", ENTRY).is_empty());
+        assert_eq!(body.blocks[0].stmts.len(), 2);
     }
 
     /// A statement the scan cannot decompose counts as a read. `Unsupported` is
@@ -4443,7 +4690,7 @@ mod frame_reconstruction_tests {
         );
 
         assert!(
-            reconstruct_frame(&mut body, "opaque").is_empty(),
+            reconstruct_frame(&mut body, "opaque", ENTRY).is_empty(),
             "an opaque statement must block the elision, not be assumed SP-free"
         );
         assert_eq!(body.blocks[0].stmts.len(), 2);
@@ -4467,7 +4714,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        assert!(reconstruct_frame(&mut body, "dynamic_frame").is_empty());
+        assert!(reconstruct_frame(&mut body, "dynamic_frame", ENTRY).is_empty());
         assert_eq!(body.blocks[0].stmts.len(), 2, "neither write may be removed");
     }
 
@@ -4489,7 +4736,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        assert!(reconstruct_frame(&mut body, "obligation").is_empty());
+        assert!(reconstruct_frame(&mut body, "obligation", ENTRY).is_empty());
         assert_eq!(body.blocks[0].stmts.len(), 1);
     }
 
@@ -4506,7 +4753,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        assert!(reconstruct_frame(&mut body, "projected").is_empty());
+        assert!(reconstruct_frame(&mut body, "projected", ENTRY).is_empty());
         assert_eq!(body.blocks[0].stmts.len(), 1);
     }
 
@@ -4520,7 +4767,7 @@ mod frame_reconstruction_tests {
             Formula::BvAdd(Box::new(sp_var()), Box::new(bv(-32)), 64),
         ] {
             let mut body = body_with(vec![sp_assign(value)], Terminator::Return);
-            assert_eq!(offsets(&reconstruct_frame(&mut body, "prologue")), vec![-32]);
+            assert_eq!(offsets(&reconstruct_frame(&mut body, "prologue", ENTRY)), vec![-32]);
         }
     }
 
@@ -4539,7 +4786,7 @@ mod frame_reconstruction_tests {
             Terminator::Return,
         );
 
-        assert_eq!(offsets(&reconstruct_frame(&mut body, "framed")), vec![-32, 0]);
+        assert_eq!(offsets(&reconstruct_frame(&mut body, "framed", ENTRY)), vec![-32, 0]);
         assert!(body.blocks[0].stmts.is_empty());
     }
 
@@ -4562,7 +4809,7 @@ mod frame_reconstruction_tests {
             datatype_defs: Default::default(),
         };
 
-        assert!(reconstruct_frame(&mut body, "no_sp").is_empty());
+        assert!(reconstruct_frame(&mut body, "no_sp", ENTRY).is_empty());
         assert_eq!(body.blocks[0].stmts.len(), 1);
     }
 
@@ -4575,29 +4822,630 @@ mod frame_reconstruction_tests {
         assert!(!terminator_reads_local(&Terminator::Return, SP));
     }
 
-    /// The displacement reader must reject anything that is not entry-SP plus a
-    /// constant, whatever it is made of.
+    // ── THE ANCHOR: `Var("SP")` is SP at its BLOCK's entry ──────────────────
+
+    fn sp_plus(value: i128) -> Formula {
+        Formula::BvAdd(Box::new(sp_var()), Box::new(bv(value)), 64)
+    }
+
+    fn sp_minus(value: i128) -> Formula {
+        Formula::BvSub(Box::new(sp_var()), Box::new(bv(value)), 64)
+    }
+
+    /// `(SP - value) + value`, as the lift folds a prologue and its epilogue
+    /// in ONE block: both writes read that block's entry SP.
+    fn sp_restored(value: i128) -> Formula {
+        Formula::BvAdd(Box::new(sp_minus(value)), Box::new(bv(value)), 64)
+    }
+
+    /// A symbolic use of SP that is not a write to it: `x0 := [sp]`.
+    fn load_at_sp() -> Statement {
+        Statement::Assign {
+            place: Place::local(X0),
+            rvalue: Rvalue::Use(Operand::Symbolic(Formula::Select(
+                Box::new(Formula::Var(
+                    "MEM".to_string(),
+                    Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))),
+                )),
+                Box::new(sp_var()),
+            ))),
+            span: SourceSpan::binary_address(0x1008),
+        }
+    }
+
+    /// An x86-64 `ret` as the lift emits it: the pop, then the return address
+    /// loaded from the SP the block STARTED with.
+    fn x86_ret() -> Vec<Statement> {
+        let Statement::Assign { rvalue: load, .. } = load_at_sp() else { unreachable!() };
+        vec![
+            sp_assign(sp_plus(8)),
+            Statement::Assign {
+                place: Place::local(PC),
+                rvalue: load,
+                span: SourceSpan::binary_address(0x100c),
+            },
+        ]
+    }
+
+    fn branch_on_x0(to: usize, otherwise: usize) -> Terminator {
+        Terminator::SwitchInt {
+            discr: Operand::Copy(Place::local(X0)),
+            targets: vec![(1, BlockId(to))],
+            otherwise: BlockId(otherwise),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::binary_address(0x1004),
+        }
+    }
+
+    /// `body_with_blocks` plus the program-counter local.
+    fn machine_body_with_blocks(blocks: Vec<(Vec<Statement>, Terminator)>) -> VerifiableBody {
+        let mut body = body_with_blocks(blocks);
+        body.locals.push(LocalDecl {
+            index: PC,
+            ty: Ty::Int { width: 64, signed: false },
+            name: Some(PROGRAM_COUNTER_LOCAL_NAME.to_string()),
+        });
+        body
+    }
+
+    /// THE BUG — the class 887ac8352d fixed in trust-vcgen's stack check. The
+    /// lift seeds every block from a fresh machine state, so in bb1 `Var("SP")`
+    /// is SP at bb1's entry, which is already function-entry SP - 16:
+    ///
+    /// ```text
+    /// bb0:  sub rsp, 16    SP := SP - 16          function entry - 16
+    ///       jmp bb1
+    /// bb1:  add rsp, 16    SP := SP + 16          function entry + 0  (not +16)
+    ///       ret            SP := (SP + 16) + 8    function entry + 8  (not +24)
+    /// ```
+    ///
+    /// Before the anchor the pass recorded `[-16, 16, 24]`: the last two
+    /// relative to bb1's start but labelled as offsets from function entry.
+    /// Each write is now re-expressed over the SP its block starts from, which
+    /// the shared dataflow derives as `entry - 16`, so the facts are the truth.
     #[test]
-    fn only_entry_sp_plus_a_constant_is_a_displacement() {
-        assert_eq!(entry_sp_offset(&sp_var()), Some(0));
-        // `32 - sp` is a negation of the stack pointer, not a displacement.
+    fn an_sp_write_in_a_later_block_is_recorded_from_function_entry_not_its_block() {
+        let mut body = body_with_blocks(vec![
+            (vec![sp_assign(sp_minus(16))], Terminator::Goto(BlockId(1))),
+            (
+                vec![
+                    sp_assign(sp_plus(16)),
+                    sp_assign(Formula::BvAdd(Box::new(sp_plus(16)), Box::new(bv(8)), 64)),
+                ],
+                Terminator::Return,
+            ),
+        ]);
+
+        let facts = reconstruct_frame(&mut body, "later_block_epilogue", ENTRY);
+
+        assert_ne!(offsets(&facts), vec![-16, 16, 24], "block-relative offsets, mislabelled");
+        assert_eq!(offsets(&facts), vec![-16, 0, 8]);
+        assert_eq!(statement_counts(&body), vec![0, 0]);
+    }
+
+    /// Composition along a chain. bb1 enters at function-entry SP (its `-8` is
+    /// true as written), bb2 enters at `entry - 8`, so its `+8` is `0`. Before
+    /// the anchor: `[-16, 0, -8, 8]`.
+    #[test]
+    fn each_later_block_write_is_re_expressed_over_the_sp_its_block_starts_from() {
+        let mut body = body_with_blocks(vec![
+            (
+                vec![sp_assign(sp_minus(16)), sp_assign(sp_restored(16))],
+                Terminator::Goto(BlockId(1)),
+            ),
+            (vec![sp_assign(sp_minus(8))], Terminator::Goto(BlockId(2))),
+            (vec![sp_assign(sp_plus(8))], Terminator::Return),
+        ]);
+
+        let facts = reconstruct_frame(&mut body, "restored_then_moved_later", ENTRY);
+
+        assert_ne!(offsets(&facts), vec![-16, 0, -8, 8], "bb2's offset, block-relative");
+        assert_eq!(offsets(&facts), vec![-16, 0, -8, 0]);
+        assert_eq!(statement_counts(&body), vec![0, 0, 0]);
+    }
+
+    /// THE CAPABILITY an entry-block-only rule loses: a frameless function
+    /// that branches to two returns. Its only SP writes are the two `ret`
+    /// pops, both in NON-entry blocks, and nothing on either path moved SP, so
+    /// each block starts at function-entry SP: both offsets are 8, and each
+    /// `ret`'s return-address load reads the SP it always read.
+    #[test]
+    fn a_ret_in_each_branch_of_a_frameless_function_is_recorded() {
+        let mut body = machine_body_with_blocks(vec![
+            (vec![], branch_on_x0(2, 1)),
+            (x86_ret(), Terminator::Return),
+            (x86_ret(), Terminator::Return),
+        ]);
+
+        let facts = reconstruct_frame(&mut body, "frameless_two_returns", ENTRY);
+
+        assert_eq!(offsets(&facts), vec![8, 8]);
+        assert_eq!(statement_counts(&body), vec![0, 1, 1], "each pop goes, each load stays");
+    }
+
+    /// REMOVAL SAFETY. bb1's load addresses `Var("SP")` — SP at bb1's entry,
+    /// the `entry - 16` bb0 left in the local — a use the local-read scan
+    /// cannot see. The offset `-16` is right, but removing the write would
+    /// leave nothing setting the local and move the load 16 bytes up.
+    #[test]
+    fn an_entry_block_that_leaves_sp_displaced_for_a_successor_keeps_its_writes() {
+        let mut body = body_with_blocks(vec![
+            (vec![sp_assign(sp_minus(16))], Terminator::Goto(BlockId(1))),
+            (vec![load_at_sp()], Terminator::Return),
+        ]);
+
+        assert!(reconstruct_frame(&mut body, "displaced_for_successor", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![1, 1], "the SP write bb1 depends on must stay");
+    }
+
+    /// REMOVAL SAFETY, the other places a symbolic read can hide: a
+    /// terminator, and a block that also writes SP. The second is an x86-64
+    /// epilogue in a later block — its `ret` loads the return address from the
+    /// displaced SP. Its own writes' reads are NOT uses (they are removed with
+    /// the writes), which the last case pins: without the load it is elided.
+    #[test]
+    fn a_displaced_symbolic_read_anywhere_in_a_block_keeps_every_write() {
+        let mut body = body_with_blocks(vec![
+            (vec![sp_assign(sp_minus(16))], Terminator::Goto(BlockId(1))),
+            (
+                vec![],
+                Terminator::SwitchInt {
+                    discr: Operand::Symbolic(Formula::Eq(Box::new(sp_var()), Box::new(bv(0)))),
+                    targets: vec![],
+                    otherwise: BlockId(2),
+                    exhaustive_enum_unreachable: false,
+                    span: SourceSpan::binary_address(0x1008),
+                },
+            ),
+            (vec![], Terminator::Return),
+        ]);
+        assert!(reconstruct_frame(&mut body, "terminator_reads_displaced_sp", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![1, 0, 0]);
+
+        // sub rsp, 8 ; jmp 1f ; 1: add rsp, 8 ; ret
+        let epilogue = |with_ret_load: bool| {
+            let mut stmts = vec![sp_assign(sp_plus(8))];
+            stmts.extend(x86_ret().into_iter().map(|statement| match statement {
+                // The pop and the load read the SP after `add rsp, 8`.
+                Statement::Assign {
+                    place,
+                    rvalue: Rvalue::Use(Operand::Symbolic(value)),
+                    span,
+                } => {
+                    let value =
+                        value.map(&mut |node| if node == sp_var() { sp_plus(8) } else { node });
+                    Statement::Assign { place, rvalue: Rvalue::Use(Operand::Symbolic(value)), span }
+                }
+                other => other,
+            }));
+            if !with_ret_load {
+                stmts.pop();
+            }
+            machine_body_with_blocks(vec![
+                (vec![sp_assign(sp_minus(8))], Terminator::Goto(BlockId(1))),
+                (stmts, Terminator::Return),
+            ])
+        };
+        let mut body = epilogue(true);
+        assert!(reconstruct_frame(&mut body, "x86_later_epilogue", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![1, 3]);
+
+        let mut body = epilogue(false);
         assert_eq!(
-            entry_sp_offset(&Formula::BvSub(Box::new(bv(32)), Box::new(sp_var()), 64)),
-            None
+            offsets(&reconstruct_frame(&mut body, "x86_later_epilogue", ENTRY)),
+            vec![-8, 0, 8]
         );
-        // A different register is not the stack pointer.
-        assert_eq!(entry_sp_offset(&Formula::Var("X0".to_string(), Sort::BitVec(64))), None);
-        // A bare constant has no stack-pointer base.
-        assert_eq!(entry_sp_offset(&bv(8)), None);
-        // Nesting is fine as long as every added term is a literal.
+        assert_eq!(statement_counts(&body), vec![0, 0]);
+    }
+
+    /// REMOVAL SAFETY where SP at the reading block is NOT DERIVABLE: the paths
+    /// into bb2 disagree (entry SP, and `entry - 16`), so what bb2's load
+    /// reads is not function-entry SP on every path. Every write is derivable
+    /// (bb1's is `-16`), so only this guard refuses.
+    #[test]
+    fn a_symbolic_read_where_sp_is_not_derivable_keeps_every_write() {
+        let mut body = body_with_blocks(vec![
+            (vec![], branch_on_x0(2, 1)),
+            (vec![sp_assign(sp_minus(16))], Terminator::Goto(BlockId(2))),
+            (vec![load_at_sp()], Terminator::Return),
+        ]);
+
+        assert!(reconstruct_frame(&mut body, "read_after_disagreeing_join", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![0, 1, 1]);
+    }
+
+    /// The positive control: a later block that reads SP after the entry block
+    /// RESTORED it starts at function-entry SP, so the elision stands.
+    #[test]
+    fn a_symbolic_read_where_sp_is_back_at_function_entry_permits_the_elision() {
+        let mut body = body_with_blocks(vec![
+            (
+                vec![sp_assign(sp_minus(16)), sp_assign(sp_restored(16))],
+                Terminator::Goto(BlockId(1)),
+            ),
+            (vec![load_at_sp()], Terminator::Return),
+        ]);
+
         assert_eq!(
-            entry_sp_offset(&Formula::BvAdd(
-                Box::new(Formula::BvAdd(Box::new(sp_var()), Box::new(bv(8)), 64)),
-                Box::new(bv(8)),
-                64,
-            )),
-            Some(16)
+            offsets(&reconstruct_frame(&mut body, "read_after_restore", ENTRY)),
+            vec![-16, 0]
         );
+        assert_eq!(statement_counts(&body), vec![0, 1]);
+    }
+
+    /// A back edge into the entry block: its start state is the function's
+    /// only on the first arrival, so the entry block's SP is the JOIN of every
+    /// arrival. Here SP is restored before the loop, but the join compares
+    /// formulas syntactically (`(SP - 16) + 16` is not `SP`), exactly as
+    /// trust-vcgen's check does, so it is not derivable and nothing is recorded
+    /// (see `from_real_bytes` for the loop that really moves SP).
+    #[test]
+    fn a_back_edge_into_the_entry_block_unanchors_its_writes() {
+        let mut body = body_with_blocks(vec![
+            (
+                vec![sp_assign(sp_minus(16)), sp_assign(sp_restored(16))],
+                Terminator::Goto(BlockId(1)),
+            ),
+            (vec![], branch_on_x0(0, 2)),
+            (vec![], Terminator::Return),
+        ]);
+
+        assert!(reconstruct_frame(&mut body, "loop_to_entry", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![2, 0, 0]);
+    }
+
+    /// A loop back into the entry block that never moves SP leaves every
+    /// arrival at function-entry SP, and the dataflow proves it: the `ret`
+    /// after the loop is recorded.
+    #[test]
+    fn a_back_edge_into_an_entry_block_that_never_moves_sp_is_still_anchored() {
+        let mut body = machine_body_with_blocks(vec![
+            (vec![], Terminator::Goto(BlockId(1))),
+            (vec![], branch_on_x0(0, 2)),
+            (x86_ret(), Terminator::Return),
+        ]);
+
+        assert_eq!(offsets(&reconstruct_frame(&mut body, "loop_then_ret", ENTRY)), vec![8]);
+        assert_eq!(statement_counts(&body), vec![0, 0, 1]);
+    }
+
+    /// Every write in an entry block that restores SP before it branches.
+    #[test]
+    fn an_entry_block_that_restores_sp_before_branching_is_still_recorded() {
+        let mut body = body_with_blocks(vec![
+            (vec![sp_assign(sp_minus(16)), sp_assign(sp_restored(16))], branch_on_x0(2, 1)),
+            (vec![], Terminator::Goto(BlockId(2))),
+            (vec![], Terminator::Return),
+        ]);
+
+        assert_eq!(offsets(&reconstruct_frame(&mut body, "restored", ENTRY)), vec![-16, 0]);
+        assert_eq!(statement_counts(&body), vec![0, 0, 0]);
+    }
+
+    /// The anchor is the block the CFG names. With bb1 as the entry, bb0 runs
+    /// on the SP bb1 left (`entry - 16`), so its pop is `-8`, and the facts
+    /// stay in body order. Named wrongly as bb0, bb1 is unreachable and its
+    /// write is not derivable — nothing is recorded, rather than `[8, -16]`.
+    #[test]
+    fn the_entry_block_is_the_one_the_cfg_names() {
+        let fixture = || {
+            body_with_blocks(vec![
+                (vec![sp_assign(sp_plus(8))], Terminator::Return),
+                (vec![sp_assign(sp_minus(16))], Terminator::Goto(BlockId(0))),
+            ])
+        };
+
+        let mut body = fixture();
+        assert_eq!(offsets(&reconstruct_frame(&mut body, "entry_is_bb1", Some(1))), vec![-8, -16]);
+        assert_eq!(statement_counts(&body), vec![0, 0]);
+
+        let mut body = fixture();
+        assert!(reconstruct_frame(&mut body, "entry_named_wrongly", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![1, 1]);
+    }
+
+    /// Everything the dataflow cannot establish fails closed: an unknown
+    /// entry, an out-of-range entry, block ids that are not positions, and a
+    /// terminator whose successors are not modelled. For the last, the case is
+    /// a `Drop`, because the read scan lets it through (`Opaque` and `TailCall`
+    /// are already refused there as reads): read as "no successors" it would
+    /// hide the edge along which bb1 runs on the SP bb0 displaced.
+    #[test]
+    fn an_unestablished_anchor_records_nothing() {
+        let mut body = body_with(vec![sp_assign(sp_plus(8))], Terminator::Return);
+        assert!(reconstruct_frame(&mut body, "unknown_entry", None).is_empty());
+        assert!(reconstruct_frame(&mut body, "entry_out_of_range", Some(1)).is_empty());
+
+        let mut body = body_with(vec![sp_assign(sp_plus(8))], Terminator::Return);
+        body.blocks[0].id = BlockId(7);
+        assert!(reconstruct_frame(&mut body, "ids_not_positions", ENTRY).is_empty());
+
+        let mut body = body_with_blocks(vec![
+            (
+                vec![sp_assign(sp_minus(16))],
+                Terminator::Drop {
+                    place: Place::local(X0),
+                    target: BlockId(1),
+                    span: SourceSpan::binary_address(0x1004),
+                    unwind: Default::default(),
+                },
+            ),
+            (vec![], Terminator::Return),
+        ]);
+        assert!(reconstruct_frame(&mut body, "unenumerated_successor", ENTRY).is_empty());
+        assert_eq!(statement_counts(&body), vec![1, 0]);
+    }
+
+    /// THE CAPABILITY, measured against the real consumer. A branching
+    /// frameless body whose only SP writes are its two `ret` pops, in non-entry
+    /// blocks: with the PC bookkeeping gone but the pops kept (what an
+    /// entry-block-only anchor did), the bridge refuses on the pop; with both
+    /// passes it lowers.
+    #[test]
+    #[cfg(feature = "trust-cg")]
+    fn the_bridge_lowers_a_branching_frameless_body_once_both_pops_are_recorded() {
+        let fixture = || {
+            let mut body = machine_body_with_blocks(vec![
+                (
+                    vec![pc_assign(Formula::BvAdd(Box::new(pc_var()), Box::new(bv(3)), 64))],
+                    branch_on_x0(2, 1),
+                ),
+                (x86_ret(), Terminator::Return),
+                (x86_ret(), Terminator::Return),
+            ]);
+            // The branch reads X0 (`_1`), so it must be the incoming argument.
+            body.arg_count = 1;
+            body
+        };
+        let lifted = |body: VerifiableBody| VerifiableFunction {
+            name: "frameless_two_returns".to_string(),
+            def_path: "binary::frameless_two_returns".to_string(),
+            span: SourceSpan::binary_address(0x1000),
+            body,
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        };
+
+        let mut pops_kept = fixture();
+        assert_eq!(elide_control_flow_program_counter_writes(&mut pops_kept), 3);
+        let refusal = format!(
+            "{:?}",
+            trust_cg_bridge::lower_binary_trust_ir_to_lir(&lifted(pops_kept))
+                .expect_err("the pops alone must still be refused")
+        );
+        assert!(
+            refusal.contains("symbolic operand requires target-semantic lowering")
+                && refusal.contains("SP"),
+            "the refusal must be the pop's; got {refusal}"
+        );
+
+        let mut body = fixture();
+        assert_eq!(
+            offsets(&reconstruct_frame(&mut body, "frameless_two_returns", ENTRY)),
+            vec![8, 8]
+        );
+        assert_eq!(elide_control_flow_program_counter_writes(&mut body), 3);
+        trust_cg_bridge::lower_binary_trust_ir_to_lir(&lifted(body))
+            .expect("with both pops recorded the bridge must lower the body structurally");
+    }
+
+    /// Real instruction bytes, lifted by `trust-lift` and run through
+    /// `reconstruct_lifted_frame`, the entry point `summarize_function` uses —
+    /// so the entry block comes from the lifted CFG, as in production. The
+    /// multi-block fixtures without a mark are `trust-vcgen`'s
+    /// `stack_discipline_from_real_bytes` set (Apple `as`, read back with
+    /// `otool`); those marked NEW were assembled and read back the same way for
+    /// this module. "Pre-anchor" values were measured on the pass before it
+    /// anchored offsets at function entry.
+    mod from_real_bytes {
+        use trust_lift::{FunctionBoundary, Lifter};
+
+        use super::*;
+
+        const TEXT_BASE: u64 = 0x1000;
+
+        fn lift(arch: LiftArch, code: &[u8]) -> LiftedFunction {
+            let size = code.len() as u64;
+            Lifter::new_with_arch(
+                vec![FunctionBoundary { name: "frame_fixture".into(), start: TEXT_BASE, size }],
+                TEXT_BASE,
+                size,
+                0,
+                arch,
+            )
+            .lift_function(code, TEXT_BASE)
+            .unwrap_or_else(|error| panic!("fixture must lift: {error}"))
+        }
+
+        fn aarch64(words: &[u32]) -> LiftedFunction {
+            let code = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            lift(LiftArch::Aarch64, &code)
+        }
+
+        fn x86_64(code: &[u8]) -> LiftedFunction {
+            lift(LiftArch::X86_64, code)
+        }
+
+        /// Offsets recorded on the production path, and the body it leaves.
+        fn frame(lifted: &LiftedFunction) -> (Vec<i64>, VerifiableBody) {
+            let mut body = lifted.trust_ir_body.clone();
+            let facts = reconstruct_lifted_frame(lifted, &mut body);
+            (offsets(&facts), body)
+        }
+
+        fn assert_no_sp_write_left(label: &str, body: &VerifiableBody) {
+            let sp_local = machine_register_local(body, STACK_POINTER_LOCAL_NAME)
+                .expect("the lift names its SP local");
+            assert!(
+                body.blocks.iter().flat_map(|block| &block.stmts).all(|statement| !matches!(
+                    statement,
+                    Statement::Assign { place, .. } if place.local == sp_local
+                )),
+                "{label}: every recorded SP write must be gone"
+            );
+        }
+
+        /// Removing these writes would change what a later block reads, or SP
+        /// is not derivable where it is written. Nothing recorded, nothing
+        /// removed — and the pre-anchor pass recorded something for each.
+        #[test]
+        fn frames_whose_removal_would_move_a_later_read_record_nothing() {
+            for (label, lifted, pre_anchor, why) in [
+                (
+                    // sub rsp, 8 ; test rdi, rdi ; je 1f ; xor eax, eax ;
+                    // 1: add rsp, 8 ; ret
+                    "x86-64 epilogue in a later block",
+                    x86_64(&[
+                        0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0x48,
+                        0x83, 0xC4, 0x08, 0xC3,
+                    ]),
+                    "[-8, 8, 16]",
+                    "the `ret` loads the return address, and `add` sets flags, from SP at \
+                     entry - 8; the offsets would be [-8, 0, 8]",
+                ),
+                (
+                    // NEW. 1: sub sp, sp, #16 ; sub x0, x0, #1 ; cbnz x0, 1b ; ret
+                    "AArch64 loop back into the entry block",
+                    aarch64(&[0xD100_43FF, 0xD100_0400, 0xB5FF_FFC0, 0xD65F_03C0]),
+                    "[-16]",
+                    "-16 per pass: SP at the entry block is not derivable",
+                ),
+                (
+                    // NEW. sub sp, sp, #16 ; cbz x0, 1f ; str x1, [sp] ; 1: ret
+                    "AArch64 later block stores through the moved SP",
+                    aarch64(&[0xD100_43FF, 0xB400_0040, 0xF900_03E1, 0xD65F_03C0]),
+                    "[-16], and the write removed from under the str",
+                    "[-16] is right, but the str reads SP at entry - 16",
+                ),
+            ] {
+                assert!(lifted.trust_ir_body.blocks.len() > 1, "{label}: must be multi-block");
+                let before_counts = statement_counts(&lifted.trust_ir_body);
+                let (recorded, body) = frame(&lifted);
+                assert_eq!(recorded, Vec::<i64>::new(), "{label}: pre-anchor {pre_anchor}; {why}");
+                assert_eq!(
+                    statement_counts(&body),
+                    before_counts,
+                    "{label}: body must be untouched"
+                );
+            }
+        }
+
+        /// SP moved in one block and restored in later ones: each write is
+        /// re-expressed over SP at its block's entry, and all of them go.
+        #[test]
+        fn frames_that_move_sp_across_blocks_are_recorded_from_function_entry() {
+            for (label, lifted, pre_anchor, truth) in [
+                (
+                    // sub sp, sp, #16 ; cbz x0, 1f ; mov x0, #1 ; 1: add sp, sp, #16 ; ret
+                    "AArch64 epilogue in a later block",
+                    aarch64(&[0xD100_43FF, 0xB400_0040, 0xD280_0020, 0x9100_43FF, 0xD65F_03C0]),
+                    vec![-16, 16],
+                    vec![-16, 0],
+                ),
+                (
+                    // NEW. sub sp, sp, #16 ; cbz x0, 1f ; add sp, sp, #16 ; ret ;
+                    // 1: add sp, sp, #16 ; ret
+                    "AArch64 epilogue in each of two return blocks",
+                    aarch64(&[
+                        0xD100_43FF,
+                        0xB400_0060,
+                        0x9100_43FF,
+                        0xD65F_03C0,
+                        0x9100_43FF,
+                        0xD65F_03C0,
+                    ]),
+                    vec![-16, 16, 16],
+                    vec![-16, 0, 0],
+                ),
+            ] {
+                assert!(lifted.trust_ir_body.blocks.len() > 1, "{label}: must be multi-block");
+                let (recorded, body) = frame(&lifted);
+                assert_ne!(recorded, pre_anchor, "{label}: block-relative offsets, mislabelled");
+                assert_eq!(recorded, truth, "{label}");
+                assert_no_sp_write_left(label, &body);
+            }
+        }
+
+        /// THE CAPABILITY: branching frameless functions. On x86-64 the only SP
+        /// writes are each `ret`'s pop, in NON-entry blocks that start at
+        /// function-entry SP, so each is `+8` and each goes. An AArch64 `ret`
+        /// does not move SP (the return address is in X30), so its multi-return
+        /// shape has no write to record and must come back untouched.
+        #[test]
+        fn branching_frameless_functions_are_recorded() {
+            for (label, lifted, expected) in [
+                (
+                    // NEW. test rdi, rdi ; je 1f ; xor eax, eax ; ret ;
+                    // 1: mov eax, 1 ; ret
+                    "x86-64 frameless, a ret in each branch",
+                    x86_64(&[
+                        0x48, 0x85, 0xFF, 0x74, 0x03, 0x31, 0xC0, 0xC3, 0xB8, 0x01, 0x00, 0x00,
+                        0x00, 0xC3,
+                    ]),
+                    vec![8, 8],
+                ),
+                (
+                    // NEW. test rdi, rdi ; je 1f ; xor eax, eax ; 1: ret
+                    "x86-64 frameless, one ret after a join",
+                    x86_64(&[0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0xC3]),
+                    vec![8],
+                ),
+            ] {
+                assert!(lifted.trust_ir_body.blocks.len() > 1, "{label}: must be multi-block");
+                let (recorded, body) = frame(&lifted);
+                assert_eq!(recorded, expected, "{label}");
+                assert_no_sp_write_left(label, &body);
+            }
+
+            // NEW. cbz x0, 1f ; mov x0, #1 ; ret ; 1: mov x0, #2 ; ret
+            let lifted =
+                aarch64(&[0xB400_0060, 0xD280_0020, 0xD65F_03C0, 0xD280_0040, 0xD65F_03C0]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "must be multi-block");
+            let (recorded, body) = frame(&lifted);
+            assert_eq!(recorded, Vec::<i64>::new(), "AArch64 `ret` writes no SP");
+            assert_eq!(statement_counts(&body), statement_counts(&lifted.trust_ir_body));
+        }
+
+        /// The shapes the pass was first written for still reconstruct, with
+        /// the right offsets and every SP write removed.
+        #[test]
+        fn frames_anchored_in_the_entry_block_are_still_recorded() {
+            for (label, lifted, expected) in [
+                (
+                    // mov rax, qword ptr [rdi] ; ret — `ret` pops the return address.
+                    "x86-64 single-block ret",
+                    x86_64(&[0x48, 0x8B, 0x07, 0xC3]),
+                    vec![8],
+                ),
+                (
+                    // push rbp ; mov rbp, rsp ; xor eax, eax ; pop rbp ; ret
+                    "x86-64 single-block push/pop frame",
+                    x86_64(&[0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3]),
+                    vec![-8, 0, 8],
+                ),
+                (
+                    // NEW. sub sp, sp, #16 ; str x0, [sp] ; add sp, sp, #16 ;
+                    // cbz x0, 1f ; mov x0, #1 ; 1: ret
+                    "AArch64 multi-block, frame closed in the entry block",
+                    aarch64(&[
+                        0xD100_43FF,
+                        0xF900_03E0,
+                        0x9100_43FF,
+                        0xB400_0040,
+                        0xD280_0020,
+                        0xD65F_03C0,
+                    ]),
+                    vec![-16, 0],
+                ),
+            ] {
+                let (recorded, body) = frame(&lifted);
+                assert_eq!(recorded, expected, "{label}");
+                assert_no_sp_write_left(label, &body);
+            }
+        }
     }
 }
 
@@ -4634,7 +5482,7 @@ fn summarize_function(
     // makes a lift-stage blocker read as a lowering failure. See
     // `reconstruct_frame`.
     let mut body = function.trust_ir_body.clone();
-    storage_facts.extend(reconstruct_frame(&mut body, &function.name));
+    storage_facts.extend(reconstruct_lifted_frame(function, &mut body));
     elide_control_flow_program_counter_writes(&mut body);
 
     DecompiledFunction {
@@ -4653,6 +5501,7 @@ fn summarize_function(
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }),
         abi_facts,
         storage_facts,
@@ -5278,43 +6127,37 @@ fn symbolic_formula_target_validation_blockers_unless_consumed(
     }
 }
 
-fn trust_ir_target_validation_blockers(
-    functions: &[DecompiledFunction],
-) -> Vec<TargetValidationBlocker> {
-    let lifted: Vec<_> = functions.iter().filter_map(|function| function.lifted.as_ref()).collect();
-    if lifted.is_empty() {
-        return Vec::new();
+fn trust_ir_target_lowering_failed_blocker(
+    error: &impl std::fmt::Display,
+    lifted_function_count: usize,
+) -> TargetValidationBlocker {
+    let reason = format!(
+        "canonical TrustIr target validation could not run because lowering failed: {error}"
+    );
+    TargetValidationBlocker {
+        target: DecompileTarget::TrustIr,
+        function: None,
+        code: TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER.to_string(),
+        stage: "trust-ir-bridge::target-validation".to_string(),
+        feature: TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER.to_string(),
+        reason,
+        origin: None,
+        diagnostics: vec![
+            format!("blocker-code={TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER}"),
+            format!("lowering-error={error}"),
+            format!("lifted-function-count={lifted_function_count}"),
+            "target-validation=not-run".to_string(),
+            "target-semantics-consumer=missing".to_string(),
+            "fail-closed=true".to_string(),
+            "proof-grade=false".to_string(),
+        ],
     }
-    let lifted_function_count = lifted.len();
+}
 
-    let module = match lower_functions_to_trust_ir("trust_ir-target-validation", lifted) {
-        Ok(module) => module,
-        Err(error) => {
-            let reason = format!(
-                "canonical TrustIr target validation could not run because lowering failed: {error}"
-            );
-            return vec![TargetValidationBlocker {
-                target: DecompileTarget::TrustIr,
-                function: None,
-                code: TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER.to_string(),
-                stage: "trust-ir-bridge::target-validation".to_string(),
-                feature: TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER.to_string(),
-                reason: reason.clone(),
-                origin: None,
-                diagnostics: vec![
-                    format!("blocker-code={TRUST_IR_TARGET_LOWERING_FAILED_BLOCKER}"),
-                    format!("lowering-error={error}"),
-                    format!("lifted-function-count={lifted_function_count}"),
-                    "target-validation=not-run".to_string(),
-                    "target-semantics-consumer=missing".to_string(),
-                    "fail-closed=true".to_string(),
-                    "proof-grade=false".to_string(),
-                ],
-            }];
-        }
-    };
-
-    let mut blockers = collect_layout_sensitive_cast_blockers(&module)
+fn trust_ir_target_validation_blockers_from_module(
+    module: &trust_ir::Module,
+) -> Vec<TargetValidationBlocker> {
+    let mut blockers = collect_layout_sensitive_cast_blockers(module)
         .into_iter()
         .map(|blocker| TargetValidationBlocker {
             target: DecompileTarget::TrustIr,
@@ -5327,8 +6170,25 @@ fn trust_ir_target_validation_blockers(
             diagnostics: blocker.diagnostics(),
         })
         .collect::<Vec<_>>();
-    blockers.extend(trust_ir_thread_local_addr_target_validation_blockers(&module));
+    blockers.extend(trust_ir_thread_local_addr_target_validation_blockers(module));
     blockers
+}
+
+fn trust_ir_target_validation_blockers(
+    functions: &[DecompiledFunction],
+) -> Vec<TargetValidationBlocker> {
+    let lifted: Vec<_> = functions.iter().filter_map(|function| function.lifted.as_ref()).collect();
+    if lifted.is_empty() {
+        return Vec::new();
+    }
+    let lifted_function_count = lifted.len();
+
+    match lower_functions_to_trust_ir("trust_ir-target-validation", lifted) {
+        Ok(module) => trust_ir_target_validation_blockers_from_module(&module),
+        Err(error) => {
+            vec![trust_ir_target_lowering_failed_blocker(&error, lifted_function_count)]
+        }
+    }
 }
 
 fn trust_ir_thread_local_addr_target_validation_blockers(
@@ -5922,14 +6782,6 @@ struct StrictRustSubsetCandidate {
     validation_input: Option<VerifiableFunction>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum RustCompileBackEvidence {
-    Missing,
-    ValidatedPartial { proof_certificates: usize },
-    ProofGrade { proof_certificates: usize },
-}
-
 const RUST_COMPILE_BACK_PROOF_GRADE_EVIDENCE: &str = "compile-back-proof-grade";
 const RUST_COMPILE_BACK_CHECKED_CERTIFICATE_IDENTITY_EVIDENCE: &str =
     "compile-back-checked-certificate-identity";
@@ -6304,9 +7156,23 @@ fn rust_unop(op: UnOp) -> Result<&'static str, String> {
     }
 }
 
+/// The compile-back decision for one strict-subset candidate.
+///
+/// No producer supplies compile-back evidence (reconstructed MIR compared with
+/// the lifted binary TrustIr, with checked proof certificates) today, so an
+/// eligible candidate is always `NotAttempted`/`Exploratory` here. TRUST-35:
+/// this function used to take a `RustCompileBackEvidence` whose
+/// `ValidatedPartial` and `ProofGrade` arms no production caller could build —
+/// every caller passed `Missing` — while unit tests exercised those arms and
+/// read as coverage of a lane that does not exist. When a real producer lands,
+/// it adds its decision here with its own caller.
+///
+/// The consumer gate (`rust_compile_back_record_allows_proof_grade`) stays: it
+/// is what keeps a synthetic or future record from promoting an artifact
+/// without every binding marker, and its tests build their proof-grade input
+/// with the test-only `synthetic_proof_grade_compile_back_decision`.
 fn strict_rust_compile_back_validation(
     candidate: &StrictRustSubsetCandidate,
-    evidence: RustCompileBackEvidence,
 ) -> RustCompileBackValidationDecision {
     if !candidate.eligibility.eligible {
         return RustCompileBackValidationDecision {
@@ -6319,133 +7185,34 @@ fn strict_rust_compile_back_validation(
         };
     }
 
-    match evidence {
-        RustCompileBackEvidence::Missing => RustCompileBackValidationDecision {
-            status: ReconstructionValidationStatus::NotAttempted,
-            trust_level: TrustLevel::Exploratory,
-            forward: None,
-            reverse: None,
-            evidence: vec![
-                ReconstructionValidationEvidence::MissingComparableTrustIr,
-                ReconstructionValidationEvidence::Other(
-                    "compile-back-validation-missing".to_string(),
-                ),
-            ],
-            diagnostics: vec![
-                "compile-back validation evidence is missing; strict subset eligibility is not semantic validation"
-                    .to_string(),
-                "validated Rust reconstruction remains exploratory until reconstructed MIR is compared with lifted binary TrustIr"
-                    .to_string(),
-            ],
-        },
-        RustCompileBackEvidence::ValidatedPartial { proof_certificates } => {
-            rust_compile_back_validated_decision(proof_certificates, TrustLevel::Partial)
-        }
-        RustCompileBackEvidence::ProofGrade { proof_certificates } if proof_certificates > 0 => {
-            rust_compile_back_validated_decision(proof_certificates, TrustLevel::ProofGrade)
-        }
-        RustCompileBackEvidence::ProofGrade { .. } => RustCompileBackValidationDecision {
-            status: ReconstructionValidationStatus::Unknown,
-            trust_level: TrustLevel::Exploratory,
-            forward: None,
-            reverse: None,
-            evidence: vec![ReconstructionValidationEvidence::NoCheckedProofCertificate],
-            diagnostics: vec![
-                "compile-back proof-grade evidence was requested without checked proof certificates"
-                    .to_string(),
-            ],
-        },
-    }
-}
-
-fn rust_compile_back_validated_decision(
-    proof_certificates: usize,
-    trust_level: TrustLevel,
-) -> RustCompileBackValidationDecision {
-    let proof_grade = trust_level == TrustLevel::ProofGrade;
-    let mut evidence = vec![
-        ReconstructionValidationEvidence::BidirectionalTrustIrRefinement,
-        ReconstructionValidationEvidence::Other(if proof_grade {
-            RUST_COMPILE_BACK_PROOF_GRADE_EVIDENCE.to_string()
-        } else {
-            "compile-back-validated-partial".to_string()
-        }),
-    ];
-    let mut diagnostics = vec![if proof_grade {
-        "compile-back validation accepted with proof-grade evidence".to_string()
-    } else {
-        "compile-back validation accepted reconstructed MIR evidence".to_string()
-    }];
-    if proof_grade {
-        evidence.extend(
-            [
-                RUST_COMPILE_BACK_CHECKED_CERTIFICATE_IDENTITY_EVIDENCE,
-                RUST_COMPILE_BACK_TARGET_CONSUMER_ACCEPTANCE_EVIDENCE,
-                RUST_COMPILE_BACK_SYMBOLIC_FORMULA_CONSUMER_ACCEPTANCE_EVIDENCE,
-                RUST_COMPILE_BACK_SOURCE_BACKPROP_GATE_EVIDENCE,
-                RUST_COMPILE_BACK_LIFTED_BINARY_TRUST_IR_BINDING_EVIDENCE,
-                RUST_COMPILE_BACK_CHECKED_CERTIFICATE_BINDING_EVIDENCE,
-                RUST_COMPILE_BACK_REPLAY_IDENTITY_BINDING_EVIDENCE,
-                RUST_COMPILE_BACK_SOURCE_GATE_BINDING_EVIDENCE,
-                RUST_COMPILE_BACK_UNSUPPORTED_LEDGER_ELIMINATION_EVIDENCE,
-            ]
-            .into_iter()
-            .map(|kind| ReconstructionValidationEvidence::Other(kind.to_string())),
-        );
-        diagnostics.push(
-            "compile-back caller supplied checked certificate identity, target consumer acceptance, symbolic formula consumer acceptance, source-backpropagation gate evidence, and explicit lifted-binary TrustIr binding evidence"
-                .to_string(),
-        );
-    }
-
     RustCompileBackValidationDecision {
-        status: ReconstructionValidationStatus::Validated,
-        trust_level,
-        forward: Some(rust_compile_back_direction_record(
-            ReconstructionValidationDirection::LiftedToOutput,
-            proof_certificates,
-            proof_grade,
-        )),
-        reverse: Some(rust_compile_back_direction_record(
-            ReconstructionValidationDirection::OutputToLifted,
-            proof_certificates,
-            proof_grade,
-        )),
-        evidence,
-        diagnostics,
-    }
-}
-
-fn rust_compile_back_direction_record(
-    direction: ReconstructionValidationDirection,
-    proof_certificates: usize,
-    proof_grade: bool,
-) -> ReconstructionValidationDirectionRecord {
-    ReconstructionValidationDirectionRecord {
-        direction,
-        status: ReconstructionValidationStatus::Validated,
-        vc_count: proof_certificates,
-        counterexamples: 0,
-        proof_certificates,
-        diagnostics: vec![if proof_grade {
-            "compile-back direction validated with checked proof certificate evidence".to_string()
-        } else {
-            "compile-back direction validated by reconstructed MIR comparison".to_string()
-        }],
+        status: ReconstructionValidationStatus::NotAttempted,
+        trust_level: TrustLevel::Exploratory,
+        forward: None,
+        reverse: None,
+        evidence: vec![
+            ReconstructionValidationEvidence::MissingComparableTrustIr,
+            ReconstructionValidationEvidence::Other("compile-back-validation-missing".to_string()),
+        ],
+        diagnostics: vec![
+            "compile-back validation evidence is missing; strict subset eligibility is not semantic validation"
+                .to_string(),
+            "validated Rust reconstruction remains exploratory until reconstructed MIR is compared with lifted binary TrustIr"
+                .to_string(),
+        ],
     }
 }
 
 fn validated_rust_validation_record(
     candidate: &StrictRustSubsetCandidate,
 ) -> ReconstructionValidationRecord {
-    rust_compile_back_validation_record(candidate, RustCompileBackEvidence::Missing)
+    rust_compile_back_validation_record(candidate, strict_rust_compile_back_validation(candidate))
 }
 
 fn rust_compile_back_validation_record(
     candidate: &StrictRustSubsetCandidate,
-    evidence: RustCompileBackEvidence,
+    decision: RustCompileBackValidationDecision,
 ) -> ReconstructionValidationRecord {
-    let decision = strict_rust_compile_back_validation(candidate, evidence);
     let mut evidence = candidate.eligibility.evidence.clone();
     evidence.extend(decision.evidence);
     let mut diagnostics = candidate.eligibility.diagnostics.clone();
@@ -6945,7 +7712,23 @@ struct BuildOutputsInput<'a> {
     source_diagnostics: &'a [String],
 }
 
+#[derive(Default)]
+struct PrecomputedBuildOutputs {
+    trust_cg: Option<TrustCgTextConversion>,
+    wasm: Option<WasmConversion>,
+    defer_trust_ir_json_text: bool,
+    trust_ir_module_value: Option<serde_json::Value>,
+}
+
 fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, DecompileError> {
+    let mut precomputed = PrecomputedBuildOutputs::default();
+    build_outputs_with_precomputed(input, &mut precomputed)
+}
+
+fn build_outputs_with_precomputed(
+    input: BuildOutputsInput<'_>,
+    precomputed: &mut PrecomputedBuildOutputs,
+) -> Result<Vec<DecompiledOutput>, DecompileError> {
     let BuildOutputsInput {
         metadata,
         functions,
@@ -6964,77 +7747,111 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 let validation_records = trust_ir_self_validation_records(functions);
                 let preserved_symbolic_formulas =
                     preserved_symbolic_formulas_for_target(DecompileTarget::TrustIr, functions);
-                let mut target_validation_blockers = trust_ir_target_validation_blockers(functions);
-                target_validation_blockers.extend(symbolic_formula_target_validation_blockers(
-                    DecompileTarget::TrustIr,
-                    &preserved_symbolic_formulas,
-                ));
-                match render_trust_ir_json(
-                    metadata,
-                    functions,
-                    call_graph,
-                    memory_facts,
-                    unsupported,
-                    source_provenance,
-                    None,
-                ) {
-                    Ok(text) => DecompiledOutput {
-                        target: DecompileTarget::TrustIr,
-                        text: Some(text),
-                        validation: validation_status_from_records(&validation_records),
-                        trust_level: TrustLevel::Partial,
-                        validation_records,
-                        target_validation_blockers,
-                        preserved_symbolic_formulas,
-                        assumptions: source_assumptions.to_vec(),
-                        diagnostics: output_diagnostics_with_source(
-                            &[
-                                "format=trust_ir-json",
-                                "validation-records=structured-trust_ir-self",
-                                "self-validation is partial; not proof-grade",
-                            ],
-                            source_diagnostics,
-                        ),
-                        ..Default::default()
-                    },
-                    Err(error) if decompile_error_is_symbolic_formula_undef_blocker(&error) => {
-                        let reason = error.to_string();
-                        let mut target_validation_blockers = target_validation_blockers;
-                        target_validation_blockers.push(TargetValidationBlocker {
-                            target: DecompileTarget::TrustIr,
-                            function: None,
-                            code: "symbolic-formula-undef-blocked".to_string(),
-                            stage: "trust-ir-bridge::target-validation".to_string(),
-                            feature: "symbolic-formula-undef-blocked".to_string(),
-                            reason,
-                            origin: None,
-                            diagnostics: vec![
-                                "blocker-code=symbolic-formula-undef-blocked".to_string(),
-                                "fail-closed=true".to_string(),
-                                "proof-grade=false".to_string(),
-                            ],
-                        });
+                let lifted: Vec<_> =
+                    functions.iter().filter_map(|function| function.lifted.as_ref()).collect();
+                let lifted_function_count = lifted.len();
+                let module_name = metadata.path.as_deref().unwrap_or("binary");
+                match lower_functions_to_trust_ir(module_name, lifted) {
+                    Ok(module) => {
+                        let mut target_validation_blockers =
+                            trust_ir_target_validation_blockers_from_module(&module);
+                        target_validation_blockers.extend(
+                            symbolic_formula_target_validation_blockers(
+                                DecompileTarget::TrustIr,
+                                &preserved_symbolic_formulas,
+                            ),
+                        );
+                        let module_value = serde_json::to_value(module)?;
+                        let text = if precomputed.defer_trust_ir_json_text {
+                            precomputed.trust_ir_module_value = Some(module_value);
+                            None
+                        } else {
+                            Some(render_trust_ir_json_from_module_value(
+                                metadata,
+                                functions,
+                                call_graph,
+                                memory_facts,
+                                unsupported,
+                                source_provenance,
+                                None,
+                                module_value,
+                            )?)
+                        };
                         DecompiledOutput {
                             target: DecompileTarget::TrustIr,
-                            text: None,
-                            validation: ReconstructionValidationStatus::Failed,
-                            trust_level: TrustLevel::Rejected,
+                            text,
+                            validation: validation_status_from_records(&validation_records),
+                            trust_level: TrustLevel::Partial,
                             validation_records,
                             target_validation_blockers,
                             preserved_symbolic_formulas,
                             assumptions: source_assumptions.to_vec(),
                             diagnostics: output_diagnostics_with_source(
                                 &[
-                                    "format=trust_ir-json-rejected",
-                                    "symbolic formula lowering blocked before Undef",
-                                    "rejected output; not proof-grade",
+                                    "format=trust_ir-json",
+                                    "validation-records=structured-trust_ir-self",
+                                    "self-validation is partial; not proof-grade",
                                 ],
                                 source_diagnostics,
                             ),
                             ..Default::default()
                         }
                     }
-                    Err(error) => return Err(error),
+                    Err(bridge_error) => {
+                        let mut target_validation_blockers = if lifted_function_count == 0 {
+                            Vec::new()
+                        } else {
+                            vec![trust_ir_target_lowering_failed_blocker(
+                                &bridge_error,
+                                lifted_function_count,
+                            )]
+                        };
+                        target_validation_blockers.extend(
+                            symbolic_formula_target_validation_blockers(
+                                DecompileTarget::TrustIr,
+                                &preserved_symbolic_formulas,
+                            ),
+                        );
+                        let error = DecompileError::from(bridge_error);
+                        if decompile_error_is_symbolic_formula_undef_blocker(&error) {
+                            let reason = error.to_string();
+                            target_validation_blockers.push(TargetValidationBlocker {
+                                target: DecompileTarget::TrustIr,
+                                function: None,
+                                code: "symbolic-formula-undef-blocked".to_string(),
+                                stage: "trust-ir-bridge::target-validation".to_string(),
+                                feature: "symbolic-formula-undef-blocked".to_string(),
+                                reason,
+                                origin: None,
+                                diagnostics: vec![
+                                    "blocker-code=symbolic-formula-undef-blocked".to_string(),
+                                    "fail-closed=true".to_string(),
+                                    "proof-grade=false".to_string(),
+                                ],
+                            });
+                            DecompiledOutput {
+                                target: DecompileTarget::TrustIr,
+                                text: None,
+                                validation: ReconstructionValidationStatus::Failed,
+                                trust_level: TrustLevel::Rejected,
+                                validation_records,
+                                target_validation_blockers,
+                                preserved_symbolic_formulas,
+                                assumptions: source_assumptions.to_vec(),
+                                diagnostics: output_diagnostics_with_source(
+                                    &[
+                                        "format=trust_ir-json-rejected",
+                                        "symbolic formula lowering blocked before Undef",
+                                        "rejected output; not proof-grade",
+                                    ],
+                                    source_diagnostics,
+                                ),
+                                ..Default::default()
+                            }
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
             }
             DecompileOutputKind::TrustIrText => {
@@ -7089,7 +7906,10 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 }
             }
             DecompileOutputKind::WasmText => {
-                let conversion = wasm_conversion_for_functions(metadata, functions);
+                let conversion = precomputed
+                    .wasm
+                    .take()
+                    .unwrap_or_else(|| wasm_conversion_for_functions(metadata, functions));
                 let target_proof_consumer_evidence = conversion.target_proof_consumer_evidence();
                 let target_proof_consumer_artifact_digest =
                     wasm_target_proof_consumer_artifact_digest(
@@ -7158,7 +7978,10 @@ fn build_outputs(input: BuildOutputsInput<'_>) -> Result<Vec<DecompiledOutput>, 
                 }
             }
             DecompileOutputKind::TrustCgText => {
-                let conversion = trust_cg_conversion_for_functions(metadata, functions)?;
+                let conversion = match precomputed.trust_cg.take() {
+                    Some(conversion) => conversion,
+                    None => trust_cg_conversion_for_functions(metadata, functions)?,
+                };
                 let target_proof_consumer_accepted =
                     trust_cg_target_proof_consumer_accepted(&conversion);
                 let format = if conversion.text.is_some() {
@@ -7587,9 +8410,13 @@ fn trust_cg_conversion_for_functions(
                         target_proof_consumer_artifact_digest = Some(artifact);
                     }
                 }
+                // Key-sorted, so the text's bytes do not depend on serde_json's
+                // `preserve_order` (see `render_trust_ir_json_from_module_value`).
+                let mut lir = serde_json::to_value(&conversion.lir)?;
+                lir.sort_all_objects();
                 rendered.push(TrustCgFunctionOutput {
                     name: function.name.clone(),
-                    lir: serde_json::to_value(&conversion.lir)?,
+                    lir,
                     diagnostics: conversion.diagnostics,
                 });
             }
@@ -8132,6 +8959,44 @@ fn render_trust_ir_json(
     let module_name = metadata.path.as_deref().unwrap_or("binary");
     let module = lower_functions_to_trust_ir(module_name, lifted)?;
     let module = serde_json::to_value(module)?;
+    render_trust_ir_json_from_module_value(
+        metadata,
+        functions,
+        call_graph,
+        memory_facts,
+        unsupported,
+        source_provenance,
+        reconstruction,
+        module,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_trust_ir_json_from_module_value(
+    metadata: &BinaryArtifactMetadata,
+    functions: &[DecompiledFunction],
+    call_graph: &CallGraph,
+    memory_facts: &[MemoryAccessFact],
+    unsupported: &UnsupportedLedger,
+    source_provenance: &BinarySourceProvenanceSummary,
+    reconstruction: Option<&ReconstructionSummary>,
+    mut module: serde_json::Value,
+) -> Result<String, DecompileError> {
+    // The module is embedded as a `serde_json::Value`, as is each function's LIR
+    // in the trust_cg text. A `Value`'s map order is set by serde_json's
+    // `preserve_order` feature, which Cargo unifies over the whole crate graph:
+    // without it keys are sorted; with it they keep insertion order, which is
+    // struct declaration order and, for a std `HashMap` field
+    // (`LirFunction::blocks`, `value_types`), a per-process hasher order.
+    // trust-certify requires the feature (f2c4e2ccce), so every targo-trust
+    // build has it and trust-decompile's own graph does not. Both texts are
+    // content-addressed (`output_content`, the TrustIr target output
+    // identifier, `binary_decompile_convert_trust_cg_production_positive_golden.json`),
+    // so their bytes must not depend on which crates share the binary or on a
+    // hasher seed: sort, the order those pins were taken in. Every caller's
+    // module (the direct render and the value `build_outputs_with_precomputed`
+    // caches) reaches the text through here.
+    module.sort_all_objects();
     let checked_certificate_bridge = trust_ir_checked_certificate_bridge_metadata(
         metadata,
         functions,
@@ -8657,7 +9522,10 @@ fn render_rust_skeleton(
         let _ = writeln!(out, "pub unsafe fn {ident}() {{");
         let _ = writeln!(
             out,
-            "    todo!(\"exploratory decompilation skeleton; inspect the TrustIr artifact\")"
+            concat!(
+                "    todo",
+                "!(\"exploratory decompilation skeleton; inspect the TrustIr artifact\")"
+            )
         );
         let _ = writeln!(out, "}}");
         let _ = writeln!(out);
@@ -10254,6 +11122,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             }),
             ..Default::default()
         };
@@ -10331,6 +11200,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let function = DecompiledFunction {
             name: "add_one".to_string(),
@@ -10352,6 +11222,12 @@ mod tests {
         assert!(source.contains("    _local2"));
     }
 
+    /// TRUST-35: the production compile-back decision has no evidence
+    /// producer, so an eligible strict-subset candidate must come out
+    /// `NotAttempted`/`Exploratory`, and the record the pipeline builds from
+    /// it must never satisfy the proof-grade consumer gate. The unreachable
+    /// `ValidatedPartial`/`ProofGrade` evidence arms this test used to drive
+    /// were removed with the enum that carried them.
     #[test]
     fn compile_back_evidence_is_required_for_validated_rust_status() {
         use trust_types::{BasicBlock, BlockId, VerifiableBody};
@@ -10377,13 +11253,13 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             }),
             ..Default::default()
         };
         let candidate = strict_rust_subset_candidate(&function);
 
-        let missing =
-            strict_rust_compile_back_validation(&candidate, RustCompileBackEvidence::Missing);
+        let missing = strict_rust_compile_back_validation(&candidate);
         assert_eq!(missing.status, ReconstructionValidationStatus::NotAttempted);
         assert_eq!(missing.trust_level, TrustLevel::Exploratory);
         assert!(missing.forward.is_none());
@@ -10396,28 +11272,11 @@ mod tests {
             )
         }));
 
-        let partial = strict_rust_compile_back_validation(
-            &candidate,
-            RustCompileBackEvidence::ValidatedPartial { proof_certificates: 0 },
-        );
-        assert_eq!(partial.status, ReconstructionValidationStatus::Validated);
-        assert_eq!(partial.trust_level, TrustLevel::Partial);
-        assert!(partial.forward.is_some());
-        assert!(partial.reverse.is_some());
-
-        let proof_without_certificate = strict_rust_compile_back_validation(
-            &candidate,
-            RustCompileBackEvidence::ProofGrade { proof_certificates: 0 },
-        );
-        assert_eq!(proof_without_certificate.status, ReconstructionValidationStatus::Unknown);
-        assert_ne!(proof_without_certificate.trust_level, TrustLevel::ProofGrade);
-
-        let proof_grade = strict_rust_compile_back_validation(
-            &candidate,
-            RustCompileBackEvidence::ProofGrade { proof_certificates: 1 },
-        );
-        assert_eq!(proof_grade.status, ReconstructionValidationStatus::Validated);
-        assert_eq!(proof_grade.trust_level, TrustLevel::ProofGrade);
+        let record = validated_rust_validation_record(&candidate);
+        assert_eq!(record.status, ReconstructionValidationStatus::NotAttempted);
+        assert_eq!(record.trust_level, TrustLevel::Exploratory);
+        assert!(record.reconstructed_function.is_none());
+        assert!(!rust_compile_back_record_allows_proof_grade(&record));
     }
 
     #[test]
@@ -10449,6 +11308,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             }),
             ..Default::default()
         };
@@ -10505,6 +11365,7 @@ mod tests {
                                 unwind: UnwindEdge::Unreachable,
                                 is_unsafe_sig: false,
                                 callee_identity: None,
+                                callee_key: None,
                                 is_foreign: false,
                                 func: "callee".to_string(),
                                 args: vec![Operand::Copy(Place::local(0))],
@@ -10528,6 +11389,7 @@ mod tests {
                 preconditions: vec![],
                 postconditions: vec![],
                 spec: Default::default(),
+                tuple_layouts: Default::default(),
             }),
             unsupported,
             ..Default::default()
@@ -15472,6 +16334,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -15505,6 +16368,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -15539,6 +16403,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -16777,6 +17642,52 @@ bb0(%0: bool):
         refresh_source_backpropagation_authority(artifact);
     }
 
+    /// A proof-grade compile-back decision carrying every binding marker the
+    /// consumer gate requires. TEST-ONLY: no production path mints one (see
+    /// `strict_rust_compile_back_validation`); the fixtures below start from it
+    /// and strip one marker at a time to pin that the consumer gate closes.
+    fn synthetic_proof_grade_compile_back_decision(
+        proof_certificates: usize,
+    ) -> RustCompileBackValidationDecision {
+        assert!(proof_certificates > 0, "a proof-grade fixture needs checked certificates");
+        let mut evidence = vec![ReconstructionValidationEvidence::BidirectionalTrustIrRefinement];
+        evidence.extend(
+            [
+                RUST_COMPILE_BACK_PROOF_GRADE_EVIDENCE,
+                RUST_COMPILE_BACK_CHECKED_CERTIFICATE_IDENTITY_EVIDENCE,
+                RUST_COMPILE_BACK_TARGET_CONSUMER_ACCEPTANCE_EVIDENCE,
+                RUST_COMPILE_BACK_SYMBOLIC_FORMULA_CONSUMER_ACCEPTANCE_EVIDENCE,
+                RUST_COMPILE_BACK_SOURCE_BACKPROP_GATE_EVIDENCE,
+                RUST_COMPILE_BACK_LIFTED_BINARY_TRUST_IR_BINDING_EVIDENCE,
+                RUST_COMPILE_BACK_CHECKED_CERTIFICATE_BINDING_EVIDENCE,
+                RUST_COMPILE_BACK_REPLAY_IDENTITY_BINDING_EVIDENCE,
+                RUST_COMPILE_BACK_SOURCE_GATE_BINDING_EVIDENCE,
+                RUST_COMPILE_BACK_UNSUPPORTED_LEDGER_ELIMINATION_EVIDENCE,
+            ]
+            .into_iter()
+            .map(|kind| ReconstructionValidationEvidence::Other(kind.to_string())),
+        );
+        let direction = |direction| ReconstructionValidationDirectionRecord {
+            direction,
+            status: ReconstructionValidationStatus::Validated,
+            vc_count: proof_certificates,
+            counterexamples: 0,
+            proof_certificates,
+            diagnostics: vec![
+                "synthetic compile-back direction with checked proof certificate evidence"
+                    .to_string(),
+            ],
+        };
+        RustCompileBackValidationDecision {
+            status: ReconstructionValidationStatus::Validated,
+            trust_level: TrustLevel::ProofGrade,
+            forward: Some(direction(ReconstructionValidationDirection::LiftedToOutput)),
+            reverse: Some(direction(ReconstructionValidationDirection::OutputToLifted)),
+            evidence,
+            diagnostics: vec!["synthetic proof-grade compile-back decision".to_string()],
+        }
+    }
+
     fn synthetic_proof_grade_rust_reconstruction(
         functions: &[DecompiledFunction],
     ) -> ValidatedRustReconstruction {
@@ -16793,7 +17704,7 @@ bb0(%0: bool):
             .map(|candidate| {
                 rust_compile_back_validation_record(
                     candidate,
-                    RustCompileBackEvidence::ProofGrade { proof_certificates: 2 },
+                    synthetic_proof_grade_compile_back_decision(2),
                 )
             })
             .collect::<Vec<_>>();
@@ -17255,6 +18166,92 @@ bb0(%0: bool):
             json["unsupported"]["records"].as_array().expect("unsupported records").len(),
             artifact.unsupported.records.len()
         );
+    }
+
+    /// Require every object of `value` to iterate its keys in sorted order.
+    /// Only meaningful where `serde_json::Map` keeps text order
+    /// (`preserve_order`), as in this test binary.
+    #[cfg(feature = "elf")]
+    fn assert_json_objects_key_sorted(value: &serde_json::Value, path: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+                let mut sorted = keys.clone();
+                sorted.sort_unstable();
+                assert_eq!(keys, sorted, "{path}: object keys are not in sorted order");
+                for (key, child) in object {
+                    assert_json_objects_key_sorted(child, &format!("{path}.{key}"));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    assert_json_objects_key_sorted(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The TrustIr `module` and every trust_cg `lir` are rendered key-sorted,
+    /// so their content-addressed bytes do not move with serde_json's
+    /// crate-graph-unified `preserve_order` feature (on in every targo-trust
+    /// build through trust-certify since f2c4e2ccce, which moved both
+    /// `output_content_sha256` pins of
+    /// `binary_decompile_convert_trust_cg_production_positive_golden.json`).
+    /// This test binary enables the feature through a dev-dependency, the
+    /// configuration targo-trust ships; the probe fails closed if it is lost,
+    /// because the order checks would then pass vacuously. Each output is
+    /// requested on its own, as `targo-trust decompile --to trust_ir` and
+    /// `convert --to trust-cg` request it.
+    #[cfg(feature = "elf")]
+    #[test]
+    fn rendered_trust_ir_module_and_trust_cg_lir_are_key_sorted_under_preserve_order() {
+        let probe: serde_json::Value =
+            serde_json::from_str(r#"{"b":0,"a":0}"#).expect("probe JSON should parse");
+        assert_eq!(
+            probe.as_object().and_then(|object| object.keys().next()).map(String::as_str),
+            Some("b"),
+            "this test needs serde_json/preserve_order (trust-decompile's dev-dependency)"
+        );
+
+        const FIXTURE_SYMBOL: &str = "trust_fixture_x86_load";
+        let bytes = decode_hex_fixture(include_str!(
+            "../../../tests/fixtures/binary_decomp/x86_64-load-elf.hex"
+        ));
+        let decompile = |kind: DecompileOutputKind| {
+            decompile_binary(
+                &bytes,
+                DecompileOptions::with_lift(BinaryLiftOptions::functions_by_name([FIXTURE_SYMBOL]))
+                    .with_outputs([kind]),
+            )
+            .expect("checked-in x86_64 ELF fixture should decompile")
+        };
+
+        let trust_ir = trust_ir_json_output_json(&decompile(DecompileOutputKind::TrustIrJson));
+        assert!(trust_ir["module"].is_object(), "TrustIr JSON should embed its module");
+        assert_json_objects_key_sorted(&trust_ir["module"], "module");
+
+        if cfg!(feature = "trust-cg") {
+            let artifact = decompile(DecompileOutputKind::TrustCgText);
+            let output = artifact
+                .reconstruction
+                .outputs
+                .iter()
+                .find(|output| output.target == DecompileTarget::TrustCg)
+                .expect("trust-cg text output");
+            let trust_cg: serde_json::Value =
+                serde_json::from_str(output.text.as_deref().expect("trust-cg JSON text"))
+                    .expect("trust-cg output should be JSON");
+            let functions = trust_cg["functions"].as_array().expect("trust-cg functions");
+            assert!(!functions.is_empty(), "trust-cg output should carry the lowered LIR");
+            for (index, function) in functions.iter().enumerate() {
+                assert!(function["lir"].is_object(), "functions[{index}] should carry its LIR");
+                assert_json_objects_key_sorted(
+                    &function["lir"],
+                    &format!("functions[{index}].lir"),
+                );
+            }
+        }
     }
 
     #[cfg(feature = "elf")]

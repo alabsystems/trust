@@ -319,29 +319,4 @@ mod tests {
         assert_eq!(arches[0].size, 0x2000);
         assert_eq!(arches[0].align, 14);
     }
-
-    #[test]
-    fn test_mach_header_64_eq_and_debug() {
-        let hdr = MachHeader64 {
-            magic: MH_MAGIC_64,
-            cputype: CPU_TYPE_ARM64,
-            cpusubtype: 0,
-            filetype: MH_EXECUTE,
-            ncmds: 0,
-            sizeofcmds: 0,
-            flags: 0,
-            reserved: 0,
-        };
-        let hdr2 = hdr;
-        assert_eq!(hdr, hdr2);
-        let _ = format!("{:?}", hdr);
-    }
-
-    #[test]
-    fn test_fat_arch_eq_and_debug() {
-        let arch = FatArch { cputype: CPU_TYPE_ARM64, cpusubtype: 0, offset: 0, size: 0, align: 0 };
-        let arch2 = arch;
-        assert_eq!(arch, arch2);
-        let _ = format!("{:?}", arch);
-    }
 }

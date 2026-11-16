@@ -176,6 +176,7 @@ fn emitted_chain(
                 is_foreign: false,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 unwind: UnwindEdge::Unreachable,
             },
         })
@@ -197,6 +198,7 @@ fn emitted_chain(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

@@ -3,7 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //! Rung 1, the positive case: a `#[trust::panic_free]` trait method whose every
 //! implementation discharges the inherited obligation.
 //!
@@ -58,6 +58,9 @@ impl Sink for Masked {
 }
 
 /// `<S as Sink>::absorb` is statically unresolvable here.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `trait_panic_free_impl_discharges::drive`
+//~v NOTE this function has no obligation of its own
 pub fn drive<S: Sink>(sink: &mut S, x: u32) -> u32 {
     sink.absorb(x)
 }

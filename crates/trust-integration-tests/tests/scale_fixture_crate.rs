@@ -163,6 +163,7 @@ fn noop_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -217,6 +218,7 @@ fn checked_add_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -260,6 +262,7 @@ fn division_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -331,6 +334,7 @@ fn contract_fn(name: &str) -> VerifiableFunction {
             Box::new(Formula::Var("lo".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -377,6 +381,7 @@ fn array_index_fn(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -711,17 +716,7 @@ fn test_fixture_targo_trust_standalone() {
     let root = fixture_crate_root();
     assert!(root.exists(), "fixture crate must exist");
 
-    // Find the targo-trust binary. It should be built in the workspace target.
-    // We try the CARGO_TARGET_DIR and some common locations.
-    let targo_trust_bin = find_targo_trust_binary();
-    if targo_trust_bin.is_none() {
-        eprintln!("=== SKIP: targo-trust binary not found in target/ ===");
-        eprintln!("  Build it with: cargo build -p targo-trust");
-        eprintln!("  Then re-run this test.");
-        // Don't fail -- the binary might not be built yet.
-        return;
-    }
-    let targo_trust_bin = targo_trust_bin.unwrap();
+    let targo_trust_bin = require_targo_trust_binary();
 
     // Run: targo-trust trust check --standalone --format json
     // (We invoke it directly, not via `targo trust`, since we want to
@@ -734,78 +729,100 @@ fn test_fixture_targo_trust_standalone() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let context = format!(
+        "{} trust check --standalone --format json in {}\nexit: {:?}\nstdout (first 500): {}\nstderr (first 2000): {}",
+        targo_trust_bin.display(),
+        root.display(),
+        output.status.code(),
+        stdout.chars().take(500).collect::<String>(),
+        stderr.chars().take(2000).collect::<String>(),
+    );
 
-    eprintln!("=== targo-trust standalone output ===");
-    eprintln!("  Exit code: {:?}", output.status.code());
-    eprintln!("  Stdout length: {} bytes", stdout.len());
-    eprintln!("  Stderr (first 500 chars):");
-    eprintln!("    {}", &stderr[..stderr.len().min(500)]);
+    // Every outcome below is asserted: a binary that crashes, prints nothing,
+    // prints something other than the source-audit report, or exits in a way
+    // its own report does not explain FAILS this test. Until 2026-09-30 empty or
+    // non-JSON stdout only warned, so `/usr/bin/false` and `/bin/echo` passed;
+    // after that fix a one-line script printing `{"functions_found":100}` still
+    // passed (measured 2026-09-30), because nothing else in the report, and not
+    // the exit status, was checked.
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not the JSON report: {e}\n{context}"));
+    assert_eq!(json["schema_version"], "trust.source-audit.v1", "{context}");
+    assert_eq!(json["mode"], "source-audit", "{context}");
+    // Standalone mode is a source audit: it must never claim proof authority.
+    assert_eq!(json["proof_authority"], "none", "{context}");
+    assert_eq!(json["compiler_verification_performed"], false, "{context}");
 
-    // The standalone mode should produce JSON output on stdout.
-    if !stdout.is_empty() {
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-        match parsed {
-            Ok(json) => {
-                // Validate key fields exist
-                assert!(
-                    json.get("functions_found").is_some()
-                        || json.get("total_vcs").is_some()
-                        || json.get("mode").is_some(),
-                    "JSON output should contain analysis fields"
-                );
+    let functions_found =
+        json["functions_found"].as_u64().unwrap_or_else(|| panic!("no functions_found\n{context}"));
+    assert!(
+        functions_found >= 100,
+        "should find >= 100 functions, got {functions_found}\n{context}"
+    );
+    let functions =
+        json["functions"].as_array().unwrap_or_else(|| panic!("no functions array\n{context}"));
+    assert_eq!(
+        functions.len() as u64,
+        functions_found,
+        "functions array vs functions_found\n{context}"
+    );
+    assert!(json["files_analyzed"].as_u64().unwrap_or(0) > 0, "no file analyzed\n{context}");
 
-                if let Some(functions_found) = json["functions_found"].as_u64() {
-                    assert!(
-                        functions_found >= 100,
-                        "should find >= 100 functions, got {}",
-                        functions_found
-                    );
-                }
+    // The counts the report states must be the rows it lists.
+    let rows = json["audit_rows"].as_array().unwrap_or_else(|| panic!("no audit_rows\n{context}"));
+    assert_eq!(json["total_audit_rows"].as_u64(), Some(rows.len() as u64), "{context}");
+    let count = |outcome: &str| rows.iter().filter(|r| r["outcome"] == outcome).count() as u64;
+    assert_eq!(json["present"].as_u64(), Some(count("Present")), "present\n{context}");
+    assert_eq!(json["failed"].as_u64(), Some(count("Failed")), "failed\n{context}");
+    assert_eq!(json["unknown"].as_u64(), Some(count("Unknown")), "unknown\n{context}");
 
-                eprintln!("  Functions found: {}", json["functions_found"]);
-                eprintln!("  Total VCs: {}", json["total_vcs"]);
-                eprintln!("  Proved: {}", json["proved"]);
-                eprintln!("  Failed: {}", json["failed"]);
-            }
-            Err(e) => {
-                eprintln!("  Warning: stdout was not valid JSON: {e}");
-                eprintln!("  First 200 chars: {}", &stdout[..stdout.len().min(200)]);
-            }
-        }
-    }
-
-    eprintln!("=====================================");
+    // The exit code is the report's verdict, and nothing else: 0 when the
+    // audit passed, 1 when it did not (the fixture's hardened-profile
+    // findings make it fail today), never a crash or another code.
+    let audit_passed =
+        json["audit_passed"].as_bool().unwrap_or_else(|| panic!("no audit_passed\n{context}"));
+    assert_eq!(audit_passed, count("Failed") == 0, "audit_passed vs failed rows\n{context}");
+    assert_eq!(
+        output.status.code(),
+        Some(if audit_passed { 0 } else { 1 }),
+        "exit code must be the audit verdict\n{context}"
+    );
+    eprintln!(
+        "targo-trust standalone: exit {:?}, {functions_found} functions, {} rows ({} failed)",
+        output.status.code(),
+        rows.len(),
+        count("Failed")
+    );
 }
 
-/// Try to find the targo-trust binary in common target directories.
-fn find_targo_trust_binary() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // targo-trust lives one level up from crates/
-    let trust_root = manifest_dir.parent()?;
-
-    // Check CARGO_TARGET_DIR first
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let candidate = PathBuf::from(&target_dir).join("debug/targo-trust");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    // Try common locations
-    let candidates = [
-        trust_root.join("target/debug/targo-trust"),
-        trust_root.join("target/release/targo-trust"),
-        // targo-trust has its own workspace with target/
-        trust_root.parent()?.join("targo-trust/target/debug/targo-trust"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Some(candidate.clone());
-        }
-    }
-
-    None
+/// The `targo-trust` binary these tests run: the file `TRUST_TARGO_TRUST_BIN`
+/// names. Unset, empty, relative, or not a file panics; there is no search and
+/// no skip (docs/issues/2026-09-29-binary-to-trust-ir-e2e-golden-stale-and-passes-without-its-binary.md,
+/// defect 2). The search this replaces took whatever binary it found, built from
+/// whatever tree, and when it found none the test returned early, which libtest
+/// counts as a pass. scripts/check_crates_tests_scoped.py, scripts/dev-test.sh and
+/// `targo trust gate check-all --run-tests` build targo-trust from the tree under
+/// test and set the variable to a private copy of it. A relative value is
+/// refused: `is_file` would check it against the test's cwd, but `Command::new`
+/// looks a slash-free one up on PATH, so the file checked would not be the file
+/// run. binary_to_trust_ir_e2e.rs has the same helper.
+fn require_targo_trust_binary() -> PathBuf {
+    const HOW: &str = "build it from this tree with `targo --unverified build --manifest-path \
+        targo-trust/Cargo.toml --bin targo-trust --locked` and set TRUST_TARGO_TRUST_BIN to the \
+        absolute path of that binary (the `executable` of cargo's compiler-artifact message under \
+        --message-format json). Use the binary built from this tree and commit. \
+        To leave this test out of a local run, pass \
+        libtest's `--skip <test name>`";
+    let Some(value) = std::env::var_os("TRUST_TARGO_TRUST_BIN").filter(|v| !v.is_empty()) else {
+        panic!("TRUST_TARGO_TRUST_BIN is unset or empty, and this test runs targo-trust: {HOW}");
+    };
+    let path = PathBuf::from(value);
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "TRUST_TARGO_TRUST_BIN={} is not the absolute path of an existing file: {HOW}",
+        path.display()
+    );
+    path
 }
 
 // ===========================================================================

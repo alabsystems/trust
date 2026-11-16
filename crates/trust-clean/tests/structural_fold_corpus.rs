@@ -36,7 +36,7 @@
 //     explicitly.
 //
 // Run with:
-//   RUSTC_BOOTSTRAP=1 cargo test -p trust-clean --manifest-path crates/Cargo.toml \
+//   targo --unverified test -p trust-clean --manifest-path crates/Cargo.toml \
 //       --test structural_fold_corpus -- --nocapture
 //
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0 OR MIT

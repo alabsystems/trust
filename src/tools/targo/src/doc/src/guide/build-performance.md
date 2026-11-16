@@ -9,6 +9,22 @@ Example workflows to consider include:
 - Test feedback as you develop (`cargo test` after making a code change)
 - CI builds
 
+<!-- Trust: expose the native content-snapshot refusal diagnostics. -->
+## Diagnosing build-script rebuilds in Targo
+
+To inspect unavailable build-script input snapshots, enable this diagnostic target:
+
+```console
+$ CARGO_LOG=targo::compiler::fingerprint::build_script_inputs=debug targo --unverified build
+```
+
+An `observation-error` reports a failed input observation, its I/O error kind when
+available, and a bounded, escaped error summary. An
+`execution-window-not-covered` reports that the input observation was not covered
+by any retained original execution window; `available_windows` gives their count.
+Each event identifies its unit and phase. These diagnostics describe the existing
+cache admission decision.
+
 ## Cargo and Compiler Configuration
 
 Cargo uses configuration defaults that try to balance several aspects, including debuggability, runtime performance, build performance, binary size and others. This section describes several approaches for changing these defaults that should be designed to maximize build performance.
@@ -160,7 +176,7 @@ This may have false positives from:
 
 Also, periodically review hidden [`cargo::unused_dependencies`] results:
 ```console
-$ CARGO_LOG=cargo::diagnostics::rules::unused_dependencies=debug cargo +nightly check -Zcargo-lints --workspace --all-targets
+$ CARGO_LOG=targo_core::diagnostics::rules::unused_dependencies=debug cargo +nightly check -Zcargo-lints --workspace --all-targets
 ```
 This will show potential unused dependencies for
 - registry and git dependencies

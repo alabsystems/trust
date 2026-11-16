@@ -38,6 +38,9 @@ fn dependency_project() -> Project {
                 version = "1.0.0"
                 edition = "2015"
                 repository = "https://example.com/"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", FUTURE_EXAMPLE)
@@ -53,6 +56,9 @@ fn dependency_project() -> Project {
 
                 [dependencies]
                 bar = "1.0"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -129,7 +135,7 @@ fn incompat_in_dependency() {
         .env("RUSTFLAGS", "-Zfuture-incompat-test")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [CHECKING] bar v1.0.0
@@ -545,6 +551,9 @@ fn suggestions_for_updates() {
                 with_updates = "1"
                 big_update = "1"
                 without_updates = "1"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/lib.rs", "")
@@ -678,7 +687,7 @@ fn correct_report_id_when_cached() {
         .env("RUSTFLAGS", "-Zfuture-incompat-test")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
 [CHECKING] bar v1.0.0

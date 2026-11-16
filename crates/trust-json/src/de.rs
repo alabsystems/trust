@@ -3,28 +3,32 @@
 
 //! The JSON parser.
 //!
-//! # Why this reproduces the incumbent's *imprecise* float parse on purpose
+//! # Floats are parsed with correct rounding, because the incumbent's are
 //!
-//! `serde_json` has a `float_roundtrip` feature that swaps in a correctly-
-//! rounded decimal-to-binary conversion. **This tree does not enable it** — the
-//! only non-default `serde_json` feature anywhere in `crates/` is
-//! `unbounded_depth`, at `crates/trust-types/Cargo.toml:49`. So the incumbent's
-//! live behaviour is the default path: accumulate the significand into a `u64`,
-//! then multiply or divide by a table of `f64` powers of ten. That path is off
-//! by an ULP on plenty of inputs.
+//! `serde_json` has two float parsers. The default one accumulates the
+//! significand into a `u64`, then multiplies or divides by a table of `f64`
+//! powers of ten, and is off by an ULP on plenty of inputs; its
+//! `float_roundtrip` feature swaps in a correctly-rounded conversion. **This
+//! workspace enables `float_roundtrip`**: first-party/clean's
+//! `crates/clean-olean/Cargo.toml` names it (clean 99ddfe452), and Cargo
+//! feature unification turns it on for every `serde_json` in a build graph that
+//! contains clean-olean. So the live incumbent returns the IEEE-754 double
+//! nearest to the decimal text, ties to even.
 //!
-//! A "better" parser here would be a REGRESSION: `parse -> serialize` is how
-//! this tree moves proof bundles between processes, so a parser that lands on a
-//! different `f64` than the incumbent changes the bytes on the way back out,
-//! and every digest with it. The algorithm below is therefore a transcription,
-//! including:
+//! `parse -> serialize` is how this tree moves proof bundles between
+//! processes, so a parser that lands on a different `f64` than the incumbent
+//! changes the bytes on the way back out, and every digest with it. Correct
+//! rounding has exactly one answer per input, so this parser does not copy the
+//! incumbent's algorithm (serde_json's vendored lexical: extended-float with a
+//! big-integer fallback). Short significands take Clinger's exact fast path
+//! (below 2^53, power of ten up to 10^22, `POW10_EXACT`); everything else is
+//! handed to `core`'s `f64::from_str`, which is also correctly rounded. What is
+//! kept from the incumbent is the GRAMMAR and the error behaviour, including:
 //!
-//! * `POW10` as 309 **literals**, not a computed table. `1e100` written as a
-//!   literal is the correctly-rounded `f64` nearest to 10^100; ten repeated
-//!   multiplications by `10.0` is a different, drifted value. Generating this
-//!   table with a loop silently changes results for large exponents.
-//! * the `u64` significand overflow cut-over, which simply DISCARDS the digits
-//!   past the overflow point (`parse_decimal_overflow`);
+//! * the `u64` significand overflow cut-over, after which the FULL digit text
+//!   is converted (`parse_long_integer`, `parse_decimal_overflow`) — the
+//!   default incumbent path discarded those digits, the correctly-rounded one
+//!   does not;
 //! * `1e400` being an error (`number out of range`) while `1e-400` is `0.0`;
 //! * `-0` parsing to the FLOAT `-0.0` rather than an integer, because negating
 //!   a zero significand in the signed domain lands back on a non-negative
@@ -32,6 +36,8 @@
 //!
 //! The last of those is the kind of thing that only a differential finds: it is
 //! not written down anywhere, it falls out of `parse_number`'s `if neg >= 0`.
+//! `tests/differential_json.rs::oracle_identity` asserts the incumbent's parse
+//! mode with a `1e-30` sentinel, so a change of mode fails with its reason.
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::map::Map;
@@ -47,6 +53,9 @@ pub struct Deserializer<'a> {
     index: usize,
     remaining_depth: u8,
     recursion_limit: bool,
+    /// Index of the first digit of the number being parsed (after any `-`).
+    /// The long paths convert `slice[number_start..index]` as text.
+    number_start: usize,
 }
 
 enum ParserNumber {
@@ -73,6 +82,7 @@ impl<'a> Deserializer<'a> {
             index: 0,
             remaining_depth: DEFAULT_RECURSION_LIMIT,
             recursion_limit: true,
+            number_start: 0,
         }
     }
 
@@ -140,10 +150,7 @@ impl<'a> Deserializer<'a> {
             Some(p) => p + 1,
             None => 0,
         };
-        let line = 1 + self.slice[..start_of_line]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count();
+        let line = 1 + self.slice[..start_of_line].iter().filter(|&&b| b == b'\n').count();
         (line, i.min(self.slice.len()) - start_of_line)
     }
 
@@ -437,7 +444,8 @@ impl<'a> Deserializer<'a> {
                         if !(0xDC00..=0xDFFF).contains(&n2) {
                             return Err(self.error(ErrorCode::LoneLeadingSurrogateInHexEscape));
                         }
-                        let n = ((u32::from(n1 - 0xD800) << 10) | u32::from(n2 - 0xDC00)) + 0x1_0000;
+                        let n =
+                            ((u32::from(n1 - 0xD800) << 10) | u32::from(n2 - 0xDC00)) + 0x1_0000;
                         match char::from_u32(n) {
                             Some(c) => c,
                             None => return Err(self.error(ErrorCode::InvalidUnicodeCodePoint)),
@@ -490,6 +498,7 @@ impl<'a> Deserializer<'a> {
     // -- numbers -------------------------------------------------------------
 
     fn parse_integer(&mut self, positive: bool) -> Result<ParserNumber> {
+        self.number_start = self.index;
         let next = match self.next_char() {
             Some(b) => b,
             None => return Err(self.error(ErrorCode::EofWhileParsingValue)),
@@ -510,11 +519,9 @@ impl<'a> Deserializer<'a> {
                             let digit = u64::from(c - b'0');
                             // Once a `u64` cannot hold the significand any
                             // more, the incumbent stops accumulating and
-                            // switches to a float, DISCARDING the rest.
+                            // switches to converting the whole digit text.
                             if significand > (u64::MAX - digit) / 10 {
-                                return Ok(ParserNumber::F64(
-                                    self.parse_long_integer(positive, significand)?,
-                                ));
+                                return Ok(ParserNumber::F64(self.parse_long_integer(positive)?));
                             }
                             self.eat_char();
                             significand = significand * 10 + digit;
@@ -560,7 +567,7 @@ impl<'a> Deserializer<'a> {
             let digit = u64::from(c - b'0');
             if significand > (u64::MAX - digit) / 10 {
                 let exponent = exponent_before_decimal_point + exponent_after_decimal_point;
-                return self.parse_decimal_overflow(positive, significand, exponent);
+                return self.parse_decimal_overflow(positive, exponent);
             }
             self.eat_char();
             significand = significand * 10 + digit;
@@ -622,36 +629,82 @@ impl<'a> Deserializer<'a> {
         self.f64_from_parts(positive, significand, final_exp)
     }
 
-    fn parse_long_integer(&mut self, positive: bool, significand: u64) -> Result<f64> {
-        let mut exponent = 0;
+    /// The significand no longer fits a `u64`: keep consuming digits and
+    /// convert the whole text. Only reached from `parse_integer`, so no `.`
+    /// has been seen yet.
+    fn parse_long_integer(&mut self, positive: bool) -> Result<f64> {
         loop {
             match self.peek_or_null() {
-                b'0'..=b'9' => {
+                b'0'..=b'9' => self.eat_char(),
+                b'.' => {
                     self.eat_char();
-                    exponent += 1;
+                    return self.parse_long_decimal(positive, false);
                 }
-                b'.' => return self.parse_decimal(positive, significand, exponent),
-                b'e' | b'E' => return self.parse_exponent(positive, significand, exponent),
-                _ => return self.f64_from_parts(positive, significand, exponent),
+                b'e' | b'E' => return self.parse_long_exponent(positive),
+                _ => return self.f64_long_from_text(positive),
             }
         }
     }
 
-    fn parse_decimal_overflow(
-        &mut self,
-        positive: bool,
-        significand: u64,
-        exponent: i32,
-    ) -> Result<f64> {
-        // The next multiply/add would overflow, so all further digits are
-        // simply dropped. This is lossy, and it is the shipped behaviour.
+    /// The significand overflowed inside the fraction. `exponent` is minus
+    /// the number of fraction digits consumed so far; the significand itself
+    /// is superseded by the text, as in the incumbent's `float_roundtrip`
+    /// path.
+    fn parse_decimal_overflow(&mut self, positive: bool, exponent: i32) -> Result<f64> {
+        self.parse_long_decimal(positive, exponent < 0)
+    }
+
+    fn parse_long_decimal(&mut self, positive: bool, mut at_least_one_digit: bool) -> Result<f64> {
         while let b'0'..=b'9' = self.peek_or_null() {
             self.eat_char();
+            at_least_one_digit = true;
+        }
+        if !at_least_one_digit {
+            return match self.peek() {
+                Some(_) => Err(self.peek_error(ErrorCode::InvalidNumber)),
+                None => Err(self.peek_error(ErrorCode::EofWhileParsingValue)),
+            };
         }
         match self.peek_or_null() {
-            b'e' | b'E' => self.parse_exponent(positive, significand, exponent),
-            _ => self.f64_from_parts(positive, significand, exponent),
+            b'e' | b'E' => self.parse_long_exponent(positive),
+            _ => self.f64_long_from_text(positive),
         }
+    }
+
+    fn parse_long_exponent(&mut self, positive: bool) -> Result<f64> {
+        let mantissa_end = self.index;
+        self.eat_char();
+        let positive_exp = match self.peek_or_null() {
+            b'+' => {
+                self.eat_char();
+                true
+            }
+            b'-' => {
+                self.eat_char();
+                false
+            }
+            _ => true,
+        };
+        let next = match self.next_char() {
+            Some(b) => b,
+            None => return Err(self.error(ErrorCode::EofWhileParsingValue)),
+        };
+        let mut exp = match next {
+            c @ b'0'..=b'9' => i32::from(c - b'0'),
+            _ => return Err(self.error(ErrorCode::InvalidNumber)),
+        };
+        while let c @ b'0'..=b'9' = self.peek_or_null() {
+            self.eat_char();
+            let digit = i32::from(c - b'0');
+            if exp > (i32::MAX - digit) / 10 {
+                let zero_significand = self.slice[self.number_start..mantissa_end]
+                    .iter()
+                    .all(|&b| b == b'0' || b == b'.');
+                return self.parse_exponent_overflow(positive, zero_significand, positive_exp);
+            }
+            exp = exp * 10 + digit;
+        }
+        self.f64_long_from_text(positive)
     }
 
     fn parse_exponent_overflow(
@@ -670,39 +723,32 @@ impl<'a> Deserializer<'a> {
         Ok(if positive { 0.0 } else { -0.0 })
     }
 
-    fn f64_from_parts(
-        &mut self,
-        positive: bool,
-        significand: u64,
-        mut exponent: i32,
-    ) -> Result<f64> {
-        let mut f = significand as f64;
-        loop {
-            match POW10.get(exponent.unsigned_abs() as usize) {
-                Some(&pow) => {
-                    if exponent >= 0 {
-                        f *= pow;
-                        if f.is_infinite() {
-                            return Err(self.error(ErrorCode::NumberOutOfRange));
-                        }
-                    } else {
-                        f /= pow;
-                    }
-                    break;
-                }
-                None => {
-                    if f == 0.0 {
-                        break;
-                    }
-                    if exponent >= 0 {
-                        return Err(self.error(ErrorCode::NumberOutOfRange));
-                    }
-                    f /= 1e308;
-                    exponent += 308;
-                }
-            }
+    /// Converts `slice[number_start..index]`, which the grammar above has
+    /// already validated as `digits [. digits] [(e|E) [+|-] digits]`.
+    fn f64_long_from_text(&mut self, positive: bool) -> Result<f64> {
+        let text = &self.slice[self.number_start..self.index];
+        let f = match core::str::from_utf8(text).ok().and_then(|t| t.parse::<f64>().ok()) {
+            Some(f) => f,
+            // Unreachable: the text is ASCII and matches `f64::from_str`'s
+            // grammar. Reported rather than panicked on.
+            None => return Err(self.error(ErrorCode::InvalidNumber)),
+        };
+        self.finish_float(positive, f)
+    }
+
+    fn f64_from_parts(&mut self, positive: bool, significand: u64, exponent: i32) -> Result<f64> {
+        match concise_float(significand, exponent) {
+            Some(f) => self.finish_float(positive, f),
+            None => Err(self.error(ErrorCode::InvalidNumber)),
         }
-        Ok(if positive { f } else { -f })
+    }
+
+    fn finish_float(&self, positive: bool, f: f64) -> Result<f64> {
+        if f.is_infinite() {
+            Err(self.error(ErrorCode::NumberOutOfRange))
+        } else {
+            Ok(if positive { f } else { -f })
+        }
     }
 
     /// Consumes trailing whitespace and errors if anything else is left.
@@ -734,41 +780,59 @@ pub fn from_slice(v: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
-/// The incumbent's `POW10`, as LITERALS. See the module docs: a computed table
-/// is a different table.
+/// The correctly-rounded `f64` nearest to `significand * 10^exponent`
+/// (possibly infinite). `None` is unreachable: the text handed to
+/// `f64::from_str` is always `<digits>e[-]<digits>`.
+fn concise_float(significand: u64, exponent: i32) -> Option<f64> {
+    if significand == 0 {
+        return Some(0.0);
+    }
+    // Clinger's fast path: both operands are exact doubles, and a single IEEE
+    // multiply or divide is correctly rounded.
+    if significand >> 53 == 0 && (-22..=22).contains(&exponent) {
+        let f = significand as f64;
+        let pow = POW10_EXACT[exponent.unsigned_abs() as usize];
+        return Some(if exponent >= 0 { f * pow } else { f / pow });
+    }
+    // `u64::MAX` is 20 digits and an `i32` exponent at most 10 digits plus a
+    // sign, so 32 bytes always suffice.
+    let mut buf = [0u8; 32];
+    let mut len = push_decimal(&mut buf, 0, significand);
+    buf[len] = b'e';
+    len += 1;
+    if exponent < 0 {
+        buf[len] = b'-';
+        len += 1;
+    }
+    len = push_decimal(&mut buf, len, u64::from(exponent.unsigned_abs()));
+    core::str::from_utf8(&buf[..len]).ok()?.parse::<f64>().ok()
+}
+
+/// Writes `n` in decimal at `buf[at..]`; returns the new end.
+fn push_decimal(buf: &mut [u8; 32], mut at: usize, mut n: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut k = 0;
+    loop {
+        digits[k] = b'0' + (n % 10) as u8;
+        k += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        buf[at] = digits[k];
+        at += 1;
+    }
+    at
+}
+
+/// 10^0 ..= 10^22: every entry is exactly representable as an `f64`.
 #[rustfmt::skip]
-static POW10: [f64; 309] = [
-    1e000, 1e001, 1e002, 1e003, 1e004, 1e005, 1e006, 1e007, 1e008, 1e009,
-    1e010, 1e011, 1e012, 1e013, 1e014, 1e015, 1e016, 1e017, 1e018, 1e019,
-    1e020, 1e021, 1e022, 1e023, 1e024, 1e025, 1e026, 1e027, 1e028, 1e029,
-    1e030, 1e031, 1e032, 1e033, 1e034, 1e035, 1e036, 1e037, 1e038, 1e039,
-    1e040, 1e041, 1e042, 1e043, 1e044, 1e045, 1e046, 1e047, 1e048, 1e049,
-    1e050, 1e051, 1e052, 1e053, 1e054, 1e055, 1e056, 1e057, 1e058, 1e059,
-    1e060, 1e061, 1e062, 1e063, 1e064, 1e065, 1e066, 1e067, 1e068, 1e069,
-    1e070, 1e071, 1e072, 1e073, 1e074, 1e075, 1e076, 1e077, 1e078, 1e079,
-    1e080, 1e081, 1e082, 1e083, 1e084, 1e085, 1e086, 1e087, 1e088, 1e089,
-    1e090, 1e091, 1e092, 1e093, 1e094, 1e095, 1e096, 1e097, 1e098, 1e099,
-    1e100, 1e101, 1e102, 1e103, 1e104, 1e105, 1e106, 1e107, 1e108, 1e109,
-    1e110, 1e111, 1e112, 1e113, 1e114, 1e115, 1e116, 1e117, 1e118, 1e119,
-    1e120, 1e121, 1e122, 1e123, 1e124, 1e125, 1e126, 1e127, 1e128, 1e129,
-    1e130, 1e131, 1e132, 1e133, 1e134, 1e135, 1e136, 1e137, 1e138, 1e139,
-    1e140, 1e141, 1e142, 1e143, 1e144, 1e145, 1e146, 1e147, 1e148, 1e149,
-    1e150, 1e151, 1e152, 1e153, 1e154, 1e155, 1e156, 1e157, 1e158, 1e159,
-    1e160, 1e161, 1e162, 1e163, 1e164, 1e165, 1e166, 1e167, 1e168, 1e169,
-    1e170, 1e171, 1e172, 1e173, 1e174, 1e175, 1e176, 1e177, 1e178, 1e179,
-    1e180, 1e181, 1e182, 1e183, 1e184, 1e185, 1e186, 1e187, 1e188, 1e189,
-    1e190, 1e191, 1e192, 1e193, 1e194, 1e195, 1e196, 1e197, 1e198, 1e199,
-    1e200, 1e201, 1e202, 1e203, 1e204, 1e205, 1e206, 1e207, 1e208, 1e209,
-    1e210, 1e211, 1e212, 1e213, 1e214, 1e215, 1e216, 1e217, 1e218, 1e219,
-    1e220, 1e221, 1e222, 1e223, 1e224, 1e225, 1e226, 1e227, 1e228, 1e229,
-    1e230, 1e231, 1e232, 1e233, 1e234, 1e235, 1e236, 1e237, 1e238, 1e239,
-    1e240, 1e241, 1e242, 1e243, 1e244, 1e245, 1e246, 1e247, 1e248, 1e249,
-    1e250, 1e251, 1e252, 1e253, 1e254, 1e255, 1e256, 1e257, 1e258, 1e259,
-    1e260, 1e261, 1e262, 1e263, 1e264, 1e265, 1e266, 1e267, 1e268, 1e269,
-    1e270, 1e271, 1e272, 1e273, 1e274, 1e275, 1e276, 1e277, 1e278, 1e279,
-    1e280, 1e281, 1e282, 1e283, 1e284, 1e285, 1e286, 1e287, 1e288, 1e289,
-    1e290, 1e291, 1e292, 1e293, 1e294, 1e295, 1e296, 1e297, 1e298, 1e299,
-    1e300, 1e301, 1e302, 1e303, 1e304, 1e305, 1e306, 1e307, 1e308,
+static POW10_EXACT: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
 ];
 
 #[cfg(test)]
@@ -802,6 +866,47 @@ mod tests {
         assert!(from_str("-1e400").is_err());
         // Underflow is NOT an error; it is zero.
         assert_eq!(from_str("1e-400").unwrap().to_string(), "0.0");
+    }
+
+    fn bits(text: &str) -> u64 {
+        from_str(text).unwrap().as_f64().unwrap().to_bits()
+    }
+
+    #[test]
+    fn floats_are_correctly_rounded() {
+        // Expected bits computed with exact rational arithmetic, rounded
+        // half-to-even. The first four were each one ULP off under the old
+        // pow10-table parse (`0x...c29f`, `...abeb`, `...7186`, `...6be9`).
+        assert_eq!(bits("1e-30"), 0x39b4_484b_feeb_c2a0);
+        assert_eq!(bits("6e49"), 0x4a44_86de_8697_abec);
+        assert_eq!(bits("73226931040922149623.126525269250477665"), 0x440f_c1d2_8e78_7185);
+        assert_eq!(bits("-1.0877008403719409e-197"), 0x970a_04a6_3cf0_6bea);
+        assert_eq!(bits("3E91"), 0x52ed_745e_1896_c42b);
+        assert_eq!(bits("7E81"), 0x50ed_84a5_c19f_92f0);
+    }
+
+    #[test]
+    fn long_significands_keep_every_digit() {
+        // The u64 overflow cut-over used to DISCARD the remaining digits.
+        let ones = format!("{}.{}", "1".repeat(40), "7".repeat(40));
+        assert_eq!(from_str(&ones).unwrap().to_string(), "1.1111111111111112e+39");
+        let nines = format!("{}e-10", "9".repeat(100));
+        assert_eq!(from_str(&nines).unwrap().to_string(), "1e+90");
+        // Overflow inside the fraction, with a leading-zero integer part.
+        let frac = format!("0.{}", "3".repeat(60));
+        assert_eq!(from_str(&frac).unwrap().to_string(), "0.3333333333333333");
+        assert_eq!(from_str(&format!("-{frac}")).unwrap().to_string(), "-0.3333333333333333");
+        // Long-path range behaviour matches the short path.
+        assert!(from_str(&format!("{}e400", "1".repeat(30))).is_err());
+        assert!(from_str(&format!("{}e99999999999", "1".repeat(30))).is_err());
+        assert_eq!(
+            from_str(&format!("{}e-99999999999", "1".repeat(30))).unwrap().to_string(),
+            "0.0"
+        );
+        // ... and so does its grammar.
+        assert!(from_str(&format!("{}.", "1".repeat(30))).is_err());
+        assert!(from_str(&format!("{}e", "1".repeat(30))).is_err());
+        assert!(from_str(&format!("{}e+", "1".repeat(30))).is_err());
     }
 
     #[test]

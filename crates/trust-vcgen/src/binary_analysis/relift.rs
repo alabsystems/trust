@@ -338,7 +338,7 @@ fn diagnostics_for_relift(
     source_provenance: &BinarySourceProvenanceSummary,
     verification: &BinaryVerificationSummary,
 ) -> Vec<BinaryReliftDiagnostic> {
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = Vec::with_capacity(2 + lifted.failures.len() + vcs.len());
     diagnostics.push(BinaryReliftDiagnostic {
         code: "binary-relift-complete".to_string(),
         severity: BinaryReliftDiagnosticSeverity::Info,
@@ -389,16 +389,13 @@ fn diagnostic_for_vc(vc: &VerificationCondition) -> BinaryReliftDiagnostic {
         VcKind::UnsupportedMir { .. } => {
             ("binary-vc-unsupported-semantics".to_string(), BinaryReliftDiagnosticSeverity::Error)
         }
-        _ if classify_binary_security_vc(vc).is_some() => (
-            format!(
-                "binary-security-vc-{}",
-                classify_binary_security_vc(vc)
-                    .map(|classification| classification.family.stable_id().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
+        _ => match classify_binary_security_vc(vc) {
+            Some(classification) => (
+                format!("binary-security-vc-{}", classification.family.stable_id()),
+                BinaryReliftDiagnosticSeverity::Error,
             ),
-            BinaryReliftDiagnosticSeverity::Error,
-        ),
-        _ => ("binary-vc-generated".to_string(), BinaryReliftDiagnosticSeverity::Warning),
+            None => ("binary-vc-generated".to_string(), BinaryReliftDiagnosticSeverity::Warning),
+        },
     };
 
     BinaryReliftDiagnostic {
@@ -595,5 +592,336 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic.contains("lack exact source spans") })
         );
+    }
+
+    /// `analyze_compiled_binary` on REAL bytes: parse -> lift -> analyze.
+    ///
+    /// The tests above feed `analyze_lifted_binary` a hand-built `LiftedBinary`.
+    /// These feed the public entry point real ELF and Mach-O images, the path
+    /// that trust-lift's default-on `elf`/`macho` features (cdcc3bee15) made live:
+    /// before that commit every call here returned
+    /// `LiftError::BinaryParserUnavailable`.
+    mod compiled_binary {
+        use trust_lift::LiftError as TrustLiftError;
+        use trust_types::{
+            BinaryArtifactDigest, BinaryArtifactFormat, BinaryVerificationStatus,
+            ProofCertificateStatus, ReplayStatus, SolverDispatchStatus, TrustLevel, Ty, VcKind,
+            VerificationCondition, stable_sha256_hex,
+        };
+
+        use super::super::{
+            BinaryReliftAnalysis, BinaryReliftError, BinaryReliftOptions, analyze_compiled_binary,
+            analyze_lifted_binary,
+        };
+
+        /// x86-64 ELF, 576 bytes: `trust_fixture_x86_load` = `mov rax, [rdi]; ret`
+        /// at 0x400000 (also `e_entry`). Shared with trust-integration-tests,
+        /// trust-symex and trust-decompile, which pin the same digest.
+        const X86_64_LOAD_ELF_HEX: &str =
+            include_str!("../../../../tests/fixtures/binary_decomp/x86_64-load-elf.hex");
+        const X86_64_LOAD_ELF_SHA256: &str =
+            "251757e36749c41d81a42feb4764e9ed80c354990f9de66858a498e549524000";
+        const X86_64_LOAD_ELF_ENTRY: u64 = 0x40_0000;
+
+        /// AArch64 Mach-O, 288 bytes: `_trust_fixture_aarch64_load` =
+        /// `ldr x0, [x0]; ret` at 0x1_0000_00e8 (also LC_MAIN). The file documents
+        /// every field and how it was produced.
+        const AARCH64_LOAD_MACHO_HEX: &str =
+            include_str!("../../tests/fixtures/relift_aarch64_load_macho.hex");
+        const AARCH64_LOAD_MACHO_SHA256: &str =
+            "e541ad3162bd438840e7ea9f05e117755f57d5948f96f943f6f382392b82df77";
+        const AARCH64_LOAD_MACHO_ENTRY: u64 = 0x1_0000_00e8;
+
+        /// Decode a hex fixture (`#` starts a comment) and pin its digest, so a
+        /// drifted fixture fails here instead of silently testing other bytes.
+        fn fixture_bytes(hex_text: &str, expected_sha256: &str) -> Vec<u8> {
+            let hex = hex_text
+                .lines()
+                .map(|line| line.split('#').next().unwrap_or_default())
+                .flat_map(str::chars)
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            assert!(!hex.is_empty() && hex.len() % 2 == 0, "malformed hex fixture");
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|index| {
+                    u8::from_str_radix(&hex[index..index + 2], 16)
+                        .unwrap_or_else(|error| panic!("bad hex at {index}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stable_sha256_hex(&bytes), expected_sha256, "fixture bytes drifted");
+            bytes
+        }
+
+        fn elf_bytes() -> Vec<u8> {
+            fixture_bytes(X86_64_LOAD_ELF_HEX, X86_64_LOAD_ELF_SHA256)
+        }
+
+        fn macho_bytes() -> Vec<u8> {
+            fixture_bytes(AARCH64_LOAD_MACHO_HEX, AARCH64_LOAD_MACHO_SHA256)
+        }
+
+        fn relift(bytes: &[u8]) -> BinaryReliftAnalysis {
+            analyze_compiled_binary(bytes, BinaryReliftOptions::default())
+                .unwrap_or_else(|error| panic!("real fixture must relift: {error}"))
+        }
+
+        /// THE SOUNDNESS PROMISE of `analyze_compiled_binary`: relift generates
+        /// VCs but never discharges one. Every VC is `NotDispatched` and counted
+        /// `unknown`; nothing is proved, refuted, certified or replayed, and no
+        /// lifted function or summary claims `ProofGrade`. Non-vacuous: the
+        /// fixture must yield at least one lifted function AND at least one VC.
+        fn assert_no_vc_is_claimed_discharged(analysis: &BinaryReliftAnalysis, label: &str) {
+            assert!(!analysis.lifted.functions.is_empty(), "{label}: no function lifted");
+            assert!(
+                !analysis.vcs.is_empty(),
+                "{label}: no VC generated, the check would be vacuous"
+            );
+            assert_eq!(analysis.verifiable_functions.len(), analysis.lifted.functions.len());
+
+            let verification = &analysis.verification;
+            assert_eq!(verification.total_vcs, analysis.vcs.len(), "{label}");
+            assert_eq!(verification.solver_dispatch.len(), analysis.vcs.len(), "{label}");
+            for record in &verification.solver_dispatch {
+                assert_eq!(
+                    record.status,
+                    SolverDispatchStatus::NotDispatched,
+                    "{label}: {} claims a solver outcome without a solver",
+                    record.id
+                );
+                assert!(record.result.is_none(), "{label}: {} carries a verdict", record.id);
+                assert_eq!(record.certificate, ProofCertificateStatus::NotRequested, "{label}");
+                assert_eq!(record.replay, ReplayStatus::NotAttempted, "{label}");
+            }
+
+            assert_eq!(verification.proved, 0, "{label}: relift reported a VC PROVED");
+            assert_eq!(verification.failed, 0, "{label}: relift reported a VC REFUTED");
+            assert_eq!(verification.unknown, analysis.vcs.len(), "{label}: not all VCs unknown");
+            // `unsupported` counts ledger records on top of the VCs; with any, the
+            // aggregate is `Mixed` (unknown + unsupported), never `Proved`.
+            let expected_status = if verification.unsupported == 0 {
+                BinaryVerificationStatus::Unknown
+            } else {
+                BinaryVerificationStatus::Mixed
+            };
+            assert_eq!(verification.status, expected_status, "{label}");
+            assert_ne!(verification.trust_level, TrustLevel::ProofGrade, "{label}");
+            assert_eq!(verification.proof_certificate, ProofCertificateStatus::NotRequested);
+            assert_eq!(verification.replay, ReplayStatus::NotAttempted, "{label}");
+            assert!(verification.claims.is_empty(), "{label}: relift issued a compiler claim");
+            assert!(
+                analysis
+                    .lifted
+                    .functions
+                    .iter()
+                    .all(|function| function.trust_level != TrustLevel::ProofGrade),
+                "{label}: a lifted function claims ProofGrade"
+            );
+            assert!(
+                analysis
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.source_backpropagation_allowed),
+                "{label}: a relift diagnostic granted source backpropagation"
+            );
+        }
+
+        #[test]
+        fn real_elf_relift_generates_vcs_and_discharges_none() {
+            assert_no_vc_is_claimed_discharged(&relift(&elf_bytes()), "x86-64 ELF");
+        }
+
+        #[test]
+        fn real_macho_relift_generates_vcs_and_discharges_none() {
+            assert_no_vc_is_claimed_discharged(&relift(&macho_bytes()), "AArch64 Mach-O");
+        }
+
+        fn is_malformed_trust_ir(vc: &VerificationCondition) -> bool {
+            matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "MalformedTrustIr")
+        }
+
+        /// Every lifted body was once self-contradictory — return place `_0: u64`
+        /// against `return_ty: ()` — so `validate_function` refused it and the
+        /// whole standard VC pipeline collapsed to one `MalformedTrustIr` row per
+        /// function. The real fixtures' bodies are now well-typed, and the
+        /// return place has the declared (unit) return type.
+        #[test]
+        fn real_relift_bodies_are_well_typed_and_emit_no_malformed_trust_ir() {
+            for (label, bytes) in [("x86-64 ELF", elf_bytes()), ("AArch64 Mach-O", macho_bytes())] {
+                let analysis = relift(&bytes);
+                for function in &analysis.verifiable_functions {
+                    crate::validate_function(function)
+                        .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    assert_eq!(function.body.return_ty, Ty::Unit, "{label}");
+                    assert_eq!(function.body.locals[0].ty, function.body.return_ty, "{label}");
+                }
+                assert!(
+                    !analysis.vcs.iter().any(is_malformed_trust_ir),
+                    "{label}: a relifted body is still malformed: {:#?}",
+                    analysis.vcs
+                );
+            }
+        }
+
+        /// The validation that fired is still armed: re-introduce the same kind
+        /// of disagreement between the return place and the declared return type
+        /// — in either direction — into a real relifted body, and relift analysis
+        /// reports `MalformedTrustIr` again.
+        #[test]
+        fn a_return_place_that_disagrees_with_return_ty_is_still_malformed() {
+            type Mutation = fn(&mut trust_types::VerifiableBody);
+            let mutations: [(&str, Mutation); 2] = [
+                ("return place u64, return type ()", |body| body.locals[0].ty = Ty::u64()),
+                ("return place (), return type u64", |body| body.return_ty = Ty::u64()),
+            ];
+            for (label, bytes) in [("x86-64 ELF", elf_bytes()), ("AArch64 Mach-O", macho_bytes())] {
+                for (mutation_label, mutate) in mutations {
+                    let mut lifted = relift(&bytes).lifted;
+                    mutate(&mut lifted.functions[0].trust_ir_body);
+                    let analysis = analyze_lifted_binary(&bytes, lifted, None);
+                    let malformed =
+                        analysis.vcs.iter().find(|vc| is_malformed_trust_ir(vc)).unwrap_or_else(
+                            || panic!("{label}/{mutation_label}: malformation went unreported"),
+                        );
+                    assert!(
+                        matches!(&malformed.kind, VcKind::UnsupportedMir { detail, .. }
+                            if detail.contains("return-place local has type")),
+                        "{label}/{mutation_label}: {malformed:?}"
+                    );
+                    assert_no_vc_is_claimed_discharged(&analysis, label);
+                }
+            }
+        }
+
+        /// Neither fixture moves SP (`ldr x0, [x0]; ret`, `mov rax, [rdi]; ret`),
+        /// so the stack-discipline violation must be UNSAT — and it is, when a
+        /// solver is asked. Relift itself still asks none: the same VC stays
+        /// `NotDispatched`/unknown in the analysis, which is the relift promise.
+        #[test]
+        fn real_relift_stack_vc_is_unsat_for_a_solver_but_not_dispatched_by_relift() {
+            use trust_router::{InProcessAyBackend, VerificationBackend};
+            use trust_types::VerificationResult;
+
+            for (label, bytes) in [("x86-64 ELF", elf_bytes()), ("AArch64 Mach-O", macho_bytes())] {
+                let analysis = relift(&bytes);
+                let stack_vcs = analysis
+                    .vcs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, vc)| {
+                        matches!(&vc.kind, VcKind::Assertion { message }
+                            if message.starts_with("stack pointer not restored"))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(stack_vcs.len(), 1, "{label}: one return block, one stack VC");
+                let (index, vc) = stack_vcs[0];
+
+                let backend = InProcessAyBackend::new();
+                assert!(backend.can_handle(vc), "{label}");
+                let result = backend.verify(vc);
+                assert!(
+                    matches!(result, VerificationResult::Proved { .. }),
+                    "{label}: SP is untouched, the violation must be UNSAT; got {result:?} for {:?}",
+                    vc.formula
+                );
+
+                let record_id = format!("relift-vc-{index:06}");
+                let record = analysis
+                    .verification
+                    .solver_dispatch
+                    .iter()
+                    .find(|record| record.id == record_id)
+                    .unwrap_or_else(|| panic!("{label}: no dispatch record {record_id}"));
+                assert_eq!(record.status, SolverDispatchStatus::NotDispatched, "{label}");
+                assert!(record.result.is_none(), "{label}");
+                assert_no_vc_is_claimed_discharged(&analysis, label);
+            }
+        }
+
+        /// Metadata is read from the input, not invented: format, architecture
+        /// and entry come from the parsed image, and the digest and length are
+        /// of the exact bytes passed in (checked against digests computed
+        /// independently when the fixtures were checked in).
+        #[test]
+        fn real_binary_relift_metadata_matches_input_format_digest_and_length() {
+            let cases = [
+                (
+                    elf_bytes(),
+                    X86_64_LOAD_ELF_SHA256,
+                    BinaryArtifactFormat::Elf,
+                    "ELF",
+                    "x86-64",
+                    X86_64_LOAD_ELF_ENTRY,
+                ),
+                (
+                    macho_bytes(),
+                    AARCH64_LOAD_MACHO_SHA256,
+                    BinaryArtifactFormat::MachO,
+                    "Mach-O",
+                    "AArch64",
+                    AARCH64_LOAD_MACHO_ENTRY,
+                ),
+            ];
+            for (bytes, sha256, format, lifted_format, architecture, entry) in cases {
+                let options = BinaryReliftOptions::default().with_binary_path("fixtures/app");
+                let analysis = analyze_compiled_binary(&bytes, options)
+                    .unwrap_or_else(|error| panic!("{lifted_format} must relift: {error}"));
+                let binary = &analysis.binary;
+                let len = u64::try_from(bytes.len()).expect("fixture length fits u64");
+
+                assert_eq!(binary.format, format, "{lifted_format}");
+                assert_eq!(analysis.lifted.format, lifted_format);
+                assert_eq!(binary.architecture, architecture, "{lifted_format}");
+                assert_eq!(binary.entry_point, Some(entry), "{lifted_format}");
+                assert_eq!(analysis.lifted.functions[0].entry_point, entry, "{lifted_format}");
+                assert_eq!(binary.path.as_deref(), Some("fixtures/app"), "{lifted_format}");
+                assert_eq!(binary.byte_len, Some(len), "{lifted_format}");
+                assert_eq!(
+                    binary.root_artifact_digest,
+                    Some(BinaryArtifactDigest::sha256(sha256)),
+                    "{lifted_format}"
+                );
+                let image = binary.selected_image.as_ref().expect("selected image identity");
+                assert_eq!(image.sha256, sha256, "{lifted_format}");
+                assert_eq!(image.file_size, len, "{lifted_format}");
+                assert_eq!(image.file_offset, 0, "{lifted_format}");
+            }
+        }
+
+        /// Bytes that are not a supported binary fail with
+        /// `BinaryReliftError::Lift` carrying a real parse/lift error: no panic,
+        /// no `Ok` with nothing in it, and not `BinaryParserUnavailable` (which
+        /// would mean the parsers were compiled out again). Best-effort mode is
+        /// used on purpose: it tolerates per-function failures, so it is the
+        /// mode that could turn garbage into an empty success.
+        #[test]
+        fn garbage_bytes_fail_relift_with_lift_error_not_panic_or_empty_success() {
+            let elf = elf_bytes();
+            let macho = macho_bytes();
+            let cases: [(&str, &[u8]); 5] = [
+                ("empty", &[]),
+                ("text", b"this is not an executable image, just some prose"),
+                ("zeros", &[0u8; 256]),
+                ("truncated ELF header", &elf[..24]),
+                ("truncated Mach-O load commands", &macho[..48]),
+            ];
+            for (label, bytes) in cases {
+                let result = analyze_compiled_binary(
+                    bytes,
+                    BinaryReliftOptions::all_functions_best_effort(),
+                );
+                match result {
+                    Err(BinaryReliftError::Lift(TrustLiftError::BinaryParserUnavailable)) => {
+                        panic!("{label}: binary parsers are compiled out")
+                    }
+                    Err(BinaryReliftError::Lift(_)) => {}
+                    Ok(analysis) => panic!(
+                        "{label}: garbage relifted to Ok with {} function(s), {} VC(s)",
+                        analysis.lifted.functions.len(),
+                        analysis.vcs.len()
+                    ),
+                }
+            }
+        }
     }
 }

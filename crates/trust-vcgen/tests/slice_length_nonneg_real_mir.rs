@@ -20,8 +20,8 @@
 // and fails the user's build.
 //
 // THE FIX is `conjoin_length_nonneg_bounds` (`generate::type_ranges`), applied
-// from `generate_v2_safety_vcs_impl_with_origins` to exactly the VC kinds the
-// pre-existing range battery does NOT reach. The bound `0 <= len` already
+// from `generate_v2_safety_vcs_impl_with_origins_checked` to exactly the VC kinds
+// the pre-existing range battery does NOT reach. The bound `0 <= len` already
 // existed in `conjoin_slice_len_bounds`, but that pass runs only on
 // `ArithmeticOverflow` and bounds VCs, so `Unreachable`, `Assertion` and the
 // panic-family rows never saw it. The fix is NAME-DRIVEN and per-VC; it is NOT a
@@ -125,6 +125,9 @@
 // them cannot iterate over an empty list. Both are stated rather than dressed up.
 use trust_types::{CounterexampleValue, Formula, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
 }
@@ -134,7 +137,7 @@ fn vc_rows(
 ) -> Vec<(trust_types::VerificationCondition, VerificationResult)> {
     let context = trust_vcgen::VcgenContext::for_function(func.def_path.clone());
     let vcs = trust_vcgen::generate_vcs_with_context(func, &context);
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     vcs.into_iter()
         .map(|vc| {
             let results = router.verify_all(std::slice::from_ref(&vc));

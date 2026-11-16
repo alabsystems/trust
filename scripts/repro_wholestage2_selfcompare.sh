@@ -25,8 +25,8 @@
 #     - bin/trustc and the whole rustlib/<host>/lib tree
 #   so bootstrap genuinely recompiles+relinks the driver and reassembles the
 #   sysroot. Stage0/stage1 stay cached (keeps each build inside the time-box).
-#   The build logs are grepped afterwards for "Compiling rustc_driver" /
-#   "Assembling" evidence; if neither fires the run is flagged NON-INDEPENDENT.
+#   Each build log must show "Compiling rustc_driver" or rustc_driver_impl;
+#   missing recompilation evidence is NON-INDEPENDENT and exits before comparison.
 #
 # NEUTRALIZERS (env; bootstrap.py preserves a pre-set RUSTFLAGS)
 #   - SOURCE_DATE_EPOCH      : fixed epoch — kill timestamp fields
@@ -52,7 +52,7 @@
 # EXIT CODES
 #   0  every artifact byte-identical (whole-stage2 reproducible)
 #   1  one or more artifacts differ (nondeterminism present — the honest work-list)
-#   2  setup/build/independence failure
+#   2  setup/build/independence failure or an unmeasured artifact
 
 set -uo pipefail   # NOT -e: we want to characterize differs, not abort on cmp rc=1
 
@@ -170,12 +170,13 @@ build_once() {
   fi
   log "build ${tag} OK in ${elapsed}s"
   # Independence evidence: did the driver actually recompile?
-  local comp asm
-  comp="$(grep -cE "Compiling rustc_driver( |_impl )" "$blog" 2>/dev/null || echo 0)"
-  asm="$(grep -cE "Assembling|Creating a sysroot|Copying|Install" "$blog" 2>/dev/null || echo 0)"
+  local comp asm driver_pattern="Compiling rustc_driver( |_impl )"
+  comp="$(grep -cE "$driver_pattern" "$blog" 2>/dev/null || true)"
+  asm="$(grep -cE "Assembling|Creating a sysroot|Copying|Install" "$blog" 2>/dev/null || true)"
   log "    independence: 'Compiling rustc_driver*' lines=${comp}, assemble/copy lines=${asm}"
-  if [ "$comp" -eq 0 ]; then
-    log "    WARN: no 'Compiling rustc_driver' in ${tag} log — driver may be a CACHED no-op."
+  if ! grep -qE "$driver_pattern" "$blog"; then
+    log "    NON-INDEPENDENT: ${tag} has no driver recompilation; refusing cached comparison."
+    return 2
   fi
   return 0
 }
@@ -205,16 +206,29 @@ resolve_artifact() {
 
 capture_set() {
   local tag="$1"
-  local i key src dst
+  local i key src dst measured_sha measured_size
   for i in "${!ART_KEYS[@]}"; do
     key="${ART_KEYS[$i]}"
     src="$(resolve_artifact "$key")"
     dst="${LOGDIR}/${tag}-${key}-${STAMP}.bin"
     if [ -n "$src" ] && [ -e "$src" ]; then
-      cp "$src" "$dst"
-      eval "PATH_${key}=\"\$src\""
-      eval "${tag}_SHA_${key}=\"\$(shasum -a 256 \"\$dst\" | awk '{print \$1}')\""
-      eval "${tag}_SIZE_${key}=\"\$(stat -f%z \"\$dst\" 2>/dev/null || stat -c%s \"\$dst\")\""
+      if ! cp "$src" "$dst"; then
+        log "    CAPTURE ${tag} FAILED: ${key} could not be copied."
+        return 2
+      fi
+      if ! measured_sha="$(shasum -a 256 "$dst" | awk '{print $1}')" ||
+          ! [[ "$measured_sha" =~ ^[[:xdigit:]]{64}$ ]]; then
+        log "    CAPTURE ${tag} FAILED: ${key} has no valid SHA-256 measurement."
+        return 2
+      fi
+      if ! measured_size="$(stat -f%z "$dst" 2>/dev/null || stat -c%s "$dst")" ||
+          ! [[ "$measured_size" =~ ^[0-9]+$ ]]; then
+        log "    CAPTURE ${tag} FAILED: ${key} has no valid size measurement."
+        return 2
+      fi
+      printf -v "PATH_${key}" '%s' "$src"
+      printf -v "${tag}_SHA_${key}" '%s' "$measured_sha"
+      printf -v "${tag}_SIZE_${key}" '%s' "$measured_size"
     else
       log "    MISSING after ${tag}: ${key} (no match for its glob) — artifact not produced by this build"
       eval "${tag}_SHA_${key}=MISSING"
@@ -227,13 +241,13 @@ capture_set() {
 log ""
 log "########## BUILD A ##########"
 build_once A || { log "ABORT: build A did not complete (see log)"; exit 2; }
-capture_set A
+capture_set A || { log "ABORT: capture A did not complete (see log)"; exit 2; }
 
 # ---------------- BUILD B ----------------
 log ""
 log "########## BUILD B ##########"
 build_once B || { log "ABORT: build B did not complete (see log)"; exit 2; }
-capture_set B
+capture_set B || { log "ABORT: capture B did not complete (see log)"; exit 2; }
 
 # ---------------- COMPARE + CHARACTERIZE ----------------
 log ""
@@ -259,7 +273,9 @@ for i in "${!ART_KEYS[@]}"; do
     log "    RESULT : MATCH (byte-identical across two independent builds)"
   else
     log "    RESULT : DIFFER"
-    OVERALL_RC=1
+    # An unmeasured artifact keeps the comparison incomplete even if a later
+    # artifact has a known byte difference.
+    if [ "$OVERALL_RC" -eq 0 ]; then OVERALL_RC=1; fi
     if [ "$za" != "$zb" ]; then
       log "    size   : DIFFERS (${za} vs ${zb}) -> STRUCTURAL nondeterminism (CGU/symbol/member count)"
     else
@@ -333,6 +349,9 @@ elif [ "$OVERALL_RC" -eq 1 ]; then
   log ""
   log "WHOLE-STAGE2: one or more artifacts DIFFER (see per-artifact characterization above)."
   log "This is the honest nondeterminism work-list, NOT a DDC failure. DDC still needs a disjoint toolchain B."
+elif [ "$OVERALL_RC" -eq 2 ]; then
+  log ""
+  log "WHOLE-STAGE2: one or more artifacts UNMEASURED (see per-artifact results above)."
 fi
 
 if [ "$KEEP" -eq 0 ]; then

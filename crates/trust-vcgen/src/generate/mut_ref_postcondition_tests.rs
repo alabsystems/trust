@@ -13,7 +13,17 @@
 //! identically Failed.
 //!
 //! These tests assert the EXACT formulas, because the whole defect was a
-//! formula that looked plausible while binding nothing.
+//! formula that looked plausible while binding nothing. A store through the
+//! parameter is now also stamped by block-definition extraction: field stores
+//! first, and a WHOLE-deref store `*x = v` since 2026-09-30 (P3 of the `vac` root
+//! cause, found independently by the r8c union review), when the establish search
+//! became keyed on the full subject `x*` (`block_defs::def_subject_establish_stmt`),
+//! so the store itself is its establish point. Each genuine fact therefore appears
+//! twice: the stamped def inside, the out-parameter pin outside. The repeat is
+//! idempotent, and it is kept rather than deduplicated because it is the visible
+//! witness that BOTH lanes bind the store.
+//! `stored_field_values_distinguish_true_and_false_postconditions` checks the
+//! denotation.
 
 use trust_types::{
     BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Projection, Rvalue, Sort,
@@ -71,6 +81,7 @@ fn build(
         preconditions: vec![],
         postconditions,
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -97,6 +108,42 @@ fn postcondition_formula(f: &VerifiableFunction) -> String {
     found.pop().unwrap()
 }
 
+/// Check the denotation as well as the exact snapshots: repeated store facts
+/// must neither discharge a false clause nor refute a true one.
+#[test]
+fn stored_field_values_distinguish_true_and_false_postconditions() {
+    for clause_value in [0, 1] {
+        for f in [
+            scalar_out_param(clause_value),
+            field_out_param(clause_value),
+            nested_out_param(clause_value),
+            struct_two_field_writes(mixed_clause(clause_value)),
+        ] {
+            let vcs: Vec<_> = generate_v2_contract_vcs_impl(&f, None)
+                .into_iter()
+                .filter(|vc| matches!(vc.kind, trust_types::VcKind::Postcondition))
+                .collect();
+            assert_eq!(vcs.len(), 1);
+            let ground = vcs[0].formula.clone().map(&mut |node| match node {
+                Formula::Var(name, Sort::Int)
+                    if name.starts_with("x*#")
+                        || name.starts_with("self*.0#")
+                        || name.starts_with("self*.0.0#") =>
+                {
+                    Formula::Int(0)
+                }
+                Formula::Var(name, Sort::Bool) if name.starts_with("self*.1#") => {
+                    Formula::Bool(false)
+                }
+                other => other,
+            });
+            assert!(ground.free_variables().is_empty(), "{ground:?}");
+            let expected = if clause_value == 1 { ground } else { Formula::Not(Box::new(ground)) };
+            assert!(trust_router::violation_is_forced(&expected), "{expected:?}");
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // `fn d(x: &mut u64) ensures *x == N { *x = 0; }`
 // -------------------------------------------------------------------------
@@ -112,11 +159,17 @@ fn scalar_out_param(clause_value: i128) -> VerifiableFunction {
 /// TRUE clause. The pin `x*#s0_0 == 0` must be conjoined, making the VC UNSAT —
 /// i.e. PROVED. Without the pin the formula is the bare negation and the
 /// obligation is decided by havoc.
+///
+/// Trust (2026-09-29): the body's own block definition now carries the same
+/// versioned fact, as a field store's has since `85c69918393` (the second
+/// conjunct): a whole-pointee store is versioned at its own statement instead of
+/// shipping with the bare entry-value spelling `x*`, which proved programs that
+/// read `*x` before the store (`whole_pointee_store_is_a_new_value_refused.rs`).
 #[test]
 fn scalar_out_param_true_clause_is_unsat() {
     assert_eq!(
         postcondition_formula(&scalar_out_param(0)),
-        r#"And([Eq(Var("x*#s0_0", Int), Int(0)), Not(Eq(Var("x*#s0_0", Int), Int(0)))])"#,
+        r#"And([Eq(Var("x*#s0_0", Int), Int(0)), And([Eq(Var("x*#s0_0", Int), Int(0)), Not(Eq(Var("x*#s0_0", Int), Int(0)))])])"#,
         "the store `*x = 0` must pin the pointee under the SAME versioned name the \
          obligation body carries, so `P and not-P` is UNSAT and the clause proves"
     );
@@ -130,7 +183,7 @@ fn scalar_out_param_true_clause_is_unsat() {
 fn scalar_out_param_false_twin_stays_sat() {
     assert_eq!(
         postcondition_formula(&scalar_out_param(1)),
-        r#"And([Eq(Var("x*#s0_0", Int), Int(0)), Not(Eq(Var("x*#s0_0", Int), Int(1)))])"#,
+        r#"And([Eq(Var("x*#s0_0", Int), Int(0)), And([Eq(Var("x*#s0_0", Int), Int(0)), Not(Eq(Var("x*#s0_0", Int), Int(1)))])])"#,
         "the false twin must carry the GENUINE pin (value 0 from the body), so the \
          solver refutes it from the real stored value rather than from havoc"
     );
@@ -156,7 +209,7 @@ fn field_out_param(clause_value: i128) -> VerifiableFunction {
 fn self_field_true_clause_is_unsat() {
     assert_eq!(
         postcondition_formula(&field_out_param(0)),
-        r#"And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0#s0_0", Int), Int(0)))])"#,
+        r#"And([Eq(Var("self*.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0#s0_0", Int), Int(0)))])])"#,
         "`ensures self.n == 0` over `self.n = 0` must PROVE"
     );
 }
@@ -166,7 +219,7 @@ fn self_field_true_clause_is_unsat() {
 fn self_field_false_twin_stays_sat() {
     assert_eq!(
         postcondition_formula(&field_out_param(1)),
-        r#"And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0#s0_0", Int), Int(1)))])"#,
+        r#"And([Eq(Var("self*.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0#s0_0", Int), Int(1)))])])"#,
         "`ensures self.n == 1` over `self.n = 0` must stay REFUTABLE"
     );
 }
@@ -197,7 +250,7 @@ fn nested_out_param(clause_value: i128) -> VerifiableFunction {
 fn nested_projection_true_clause_is_unsat() {
     assert_eq!(
         postcondition_formula(&nested_out_param(0)),
-        r#"And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0.0#s0_0", Int), Int(0)))])"#,
+        r#"And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0.0#s0_0", Int), Int(0)))])])"#,
     );
 }
 
@@ -205,7 +258,7 @@ fn nested_projection_true_clause_is_unsat() {
 fn nested_projection_false_twin_stays_sat() {
     assert_eq!(
         postcondition_formula(&nested_out_param(1)),
-        r#"And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0.0#s0_0", Int), Int(1)))])"#,
+        r#"And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0.0#s0_0", Int), Int(0)), Not(Eq(Var("self*.0.0#s0_0", Int), Int(1)))])])"#,
     );
 }
 
@@ -231,7 +284,8 @@ fn only_the_reaching_definition_is_pinned() {
     let formula = postcondition_formula(&f);
     assert!(!formula.contains("Int(7)"), "the OVERWRITTEN value must never be pinned: {formula}");
     assert_eq!(
-        formula, r#"And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(0)))])"#,
+        formula,
+        r#"And([Eq(Var("x*#s0_1", Int), Int(0)), And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(0)))])])"#,
         "only the reaching definition (statement 1) may pin, under statement 1's token"
     );
 }
@@ -253,7 +307,7 @@ fn stale_store_can_never_prove_a_false_clause() {
     );
     assert_eq!(
         postcondition_formula(&f),
-        r#"And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(7)))])"#,
+        r#"And([Eq(Var("x*#s0_1", Int), Int(0)), And([Eq(Var("x*#s0_1", Int), Int(0)), Not(Eq(Var("x*#s0_1", Int), Int(7)))])])"#,
         "`ensures *x == 7` over `*x = 7; *x = 0;` is FALSE and must stay refutable; \
          pinning the stale statement-0 value would make it vacuously UNSAT"
     );
@@ -356,7 +410,9 @@ fn kinded_adt(name: &str, fields: Vec<(String, Ty)>, kind: Option<trust_types::A
             layout,
             enum_layout,
             ..
-        } => Ty::Adt { arbitrary_precision: None,
+        } => Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name,
             fields,
             variants,
@@ -430,7 +486,7 @@ fn vc_kind_names(f: &VerifiableFunction) -> Vec<String> {
 fn two_field_writes_mixed_true_clause_is_unsat() {
     assert_eq!(
         postcondition_formula(&struct_two_field_writes(mixed_clause(0))),
-        r#"And([Eq(Var("self*.1#s0_1", Bool), Bool(false)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Var("self*.1#s0_1", Bool))]))])])"#,
+        r#"And([Eq(Var("self*.1#s0_1", Bool), Bool(false)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Eq(Var("self*.1#s0_1", Bool), Bool(false)), Not(And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(Var("self*.1#s0_1", Bool))]))])])])"#,
         "BOTH writes must be pinned, each under the token its OWN read carries \
          (`self*.0#s0_0` from statement 0, `self*.1#s0_1` from statement 1), so \
          `P and not-P` is UNSAT. Pre-fix, `self*.0` was stamped `#s0_1` by its \
@@ -447,7 +503,7 @@ fn two_field_writes_mixed_false_twin_stays_sat() {
     let formula = postcondition_formula(&struct_two_field_writes(mixed_clause(1)));
     assert_eq!(
         formula,
-        r#"And([Eq(Var("self*.1#s0_1", Bool), Bool(false)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Not(And([Eq(Var("self*.0#s0_0", Int), Int(1)), Not(Var("self*.1#s0_1", Bool))]))])])"#,
+        r#"And([Eq(Var("self*.1#s0_1", Bool), Bool(false)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), And([Eq(Var("self*.0#s0_0", Int), Int(0)), Eq(Var("self*.1#s0_1", Bool), Bool(false)), Not(And([Eq(Var("self*.0#s0_0", Int), Int(1)), Not(Var("self*.1#s0_1", Bool))]))])])])"#,
         "the false twin must carry the GENUINE pins (body value 0, never the \
          clause's 1), so `self*.0#s0_0 == 0` together with `not(self*.0#s0_0 == 1)` \
          stays SATisfiable and the clause is refuted from the REAL stored value"

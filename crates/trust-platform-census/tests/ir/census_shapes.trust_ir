@@ -1,0 +1,1016 @@
+; TrustIr text format v1
+; trustc c054d5b16f0689fc92ce4d9a4c2b6decfb881e07 2026-10-08
+module "census_shapes"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "census_shapes.rs"
+
+struct @Strip { bound: i32 @0 } size=4 align=4 id=0
+
+struct @"std::marker::PhantomData<core::io::error::ErrorData<core::io::error::CustomOwner>>" {  } size=0 align=1 id=1
+
+struct @"std::ptr::NonNull<()>" { pointer: ptr @0 } size=8 align=8 repr=transparent id=2
+
+struct @"core::io::error::repr::Repr" { 0: struct.2 @0, 1: struct.1 } size=8 align=8 repr=transparent id=3
+
+struct @"std::io::Error" { repr: struct.3 @0 } size=8 align=8 id=4
+
+struct @"std::sys::process::unix::unix::ExitStatus" { 0: i32 @0 } size=4 align=4 id=5
+
+struct @"core::num::niche_types::I32NotAllOnes" { 0: i32 @0 } size=4 align=4 repr=transparent id=6
+
+struct @"std::os::fd::OwnedFd" { fd: struct.6 @0 } size=4 align=4 repr=transparent id=7
+
+struct @"std::sys::fd::unix::FileDesc" { 0: struct.7 @0 } size=4 align=4 id=8
+
+struct @"std::process::ChildStdin" { inner: struct.8 @0 } size=4 align=4 id=9
+
+struct @"std::process::ChildStdout" { inner: struct.8 @0 } size=4 align=4 id=10
+
+struct @"std::process::ChildStderr" { inner: struct.8 @0 } size=4 align=4 id=11
+
+struct @"std::sys::process::unix::unix::Process" { pid: i32 @8, status: enum.2 @0 } size=12 align=4 id=12
+
+struct @"std::process::Child" { handle: struct.12 @0, stdin: enum.3 @12, stdout: enum.4 @16, stderr: enum.5 @20 } size=24 align=4 id=13
+
+struct @"std::ptr::NonNull<std::os::fd::OwnedFd>" { pointer: ptr @0 } size=8 align=8 repr=transparent id=14
+
+struct @"std::marker::PhantomData<std::os::fd::OwnedFd>" {  } size=0 align=1 id=15
+
+struct @"std::ptr::Unique<std::os::fd::OwnedFd>" { pointer: struct.14 @0, _marker: struct.15 } size=8 align=8 repr=transparent id=16
+
+struct @"std::alloc::Global" {  } size=0 align=1 id=17
+
+struct @"std::boxed::Box<std::os::fd::OwnedFd>" { 0: struct.16 @0, 1: struct.17 } size=8 align=8 id=18
+
+enum @Result { Ok(()) = 0, Err(struct.4) = 1 } layout(niche untagged=1 variants=0..=0 start=0 lane=u64@0 size=8 align=8 offsets=[[0], [0]]) id=0
+
+enum @Result repr(u32) { Ok(i32) = 0, Err(struct.4) = 1 } layout(direct tag@0 size=16 align=8 offsets=[[4], [8]]) id=1
+
+enum @Option repr(u32) { None = 0, Some(struct.5) = 1 } layout(direct tag@0 size=8 align=4 offsets=[[], [4]]) id=2
+
+enum @Option { None = 0, Some(struct.9) = 1 } layout(niche untagged=1 variants=0..=0 start=4294967295 lane=i32@0 size=4 align=4 offsets=[[], [0]]) id=3
+
+enum @Option { None = 0, Some(struct.10) = 1 } layout(niche untagged=1 variants=0..=0 start=4294967295 lane=i32@0 size=4 align=4 offsets=[[], [0]]) id=4
+
+enum @Option { None = 0, Some(struct.11) = 1 } layout(niche untagged=1 variants=0..=0 start=4294967295 lane=i32@0 size=4 align=4 offsets=[[], [0]]) id=5
+
+enum @Result { Ok(struct.13) = 0, Err(struct.4) = 1 } layout(niche untagged=0 variants=1..=1 start=4294967295 lane=u32@0 size=24 align=8 offsets=[[0], [8]]) id=6
+
+functy.0 = (ptr) -> (ptr)
+
+functy.1 = (struct.0, ptr, ptr) -> (i32)
+
+functy.2 = (ptr, ptr) -> (i32)
+
+functy.3 = () -> (i32)
+
+functy.4 = (ptr, struct.0) -> ()
+
+functy.5 = (ptr) -> (enum.0)
+
+functy.6 = (ptr) -> ()
+
+functy.7 = (i32, ptr, ptr) -> (i32)
+
+functy.8 = (i32) -> (i32)
+
+functy.9 = (ptr) -> (bool)
+
+functy.10 = (struct.7, ptr, ptr) -> (i32)
+
+functy.11 = (()) -> ()
+
+functy.12 = (i32) -> ()
+
+functy.13 = (ptr, ptr, ptr) -> (i32)
+
+functy.14 = (ptr) -> (struct.0)
+
+functy.15 = (...) -> (i32)
+
+functy.16 = (i32) -> (i64)
+
+functy.17 = (ptr, (i32)) -> (ptr)
+
+functy.18 = () -> (u32)
+
+functy.19 = () -> (enum.1)
+
+functy.20 = (enum.1, i32) -> (i32)
+
+functy.21 = (ptr) -> (enum.6)
+
+functy.22 = (struct.7) -> ()
+
+functy.23 = (struct.7) -> (struct.18)
+
+functy.24 = (struct.18) -> ()
+
+functy.25 = (ptr, i32) -> (i32)
+
+functy.26 = () -> (ptr)
+
+functy.27 = (ptr, ptr, functy.0, ptr) -> (i32)
+
+rustcc fn @fork_strip_exec(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="strip", %1="path", %2="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 14 4
+    ; #scope: 2 parent=1 at 0 16 8
+bb0(%0: struct.0, %1: ptr, %2: ptr):
+    %6 = call @func.38()  ; #loc: 0 14 23  ; #scope: 0
+    %7 = const i32 0  ; #loc: 0 15 14  ; #scope: 1
+    %8 = icmp eq i32 %6, %7  ; #loc: 0 15 7  ; #scope: 1
+    condbr %8, bb1, bb2  ; #loc: 0 15 4  ; #scope: 1
+bb1:
+    %9 = const i32 3  ; #loc: 0 16 21  ; #scope: 1
+    br bb4(%9)  ; #loc: 0 17 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 15 4  ; #scope: 1
+bb3:
+    ret %6  ; #loc: 0 21 1  ; #scope: 0
+bb4(%3: i32):
+    %10 = extractfield i32 %0, 0  ; #loc: 0 17 19  ; #scope: 2
+    %11 = icmp slt i32 %3, %10  ; #loc: 0 17 14  ; #scope: 2
+    condbr %11, bb6, bb7  ; #loc: 0 17 8  ; #scope: 2
+bb5(%4: i32):
+    %12 = call @func.40(%1, %2)  ; #loc: 0 18 17  ; #scope: 2
+    %13 = const i32 127  ; #loc: 0 18 54  ; #scope: 2
+    call @func.41(%13)  ; #loc: 0 18 42  ; #scope: 2
+    unreachable  ; #loc: 0 18 42  ; #scope: 2
+bb6:
+    %14 = const i32 2  ; #loc: 0 17 58  ; #scope: 2
+    %15 = const i32 1  ; #loc: 0 17 73  ; #scope: 2
+    %16 = call @func.39(%3, %14, %15)  ; #loc: 0 17 42  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 17 100  ; #scope: 2
+    %18, %19 = add.overflow i32 %3, %17  ; #loc: 0 17 94  ; #scope: 2
+    %20 = const bool false  ; #loc: 0 17 94  ; #scope: 2
+    %21 = const bool true  ; #loc: 0 17 94  ; #scope: 2
+    %22 = select bool %19, %20, %21  ; #loc: 0 17 94  ; #scope: 2
+    assert %22, overflow add  ; #proof: no_overflow  ; #loc: 0 17 94  ; #scope: 2
+    br bb8(%18)  ; #loc: 0 17 8  ; #scope: 2
+bb7:
+    br bb5(%3)  ; #loc: 0 17 8  ; #scope: 2
+bb8(%5: i32):
+    br bb4(%5)  ; #loc: 0 17 8  ; #scope: 2
+}
+
+rustcc fn @spawn_capped(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+bb0(%0: ptr, %1: ptr):
+    %2 = const i32 1  ; #loc: 0 25 35
+    %3 = const i32 16  ; #loc: 0 25 40
+    %4 = bitcast i32 %3 to u32  ; #loc: 0 25 35
+    %5 = const u32 32  ; #loc: 0 25 35
+    %6 = icmp ult u32 %4, %5  ; #loc: 0 25 35
+    assert %6, overflow shl  ; #proof: shift_in_range  ; #loc: 0 25 35
+    %7 = shl i32 %2, %3  ; #loc: 0 25 35
+    %8 = const struct.0 { 0 }  ; #loc: 0 25 20
+    %9 = insertfield struct.0 %8, 0, %7  ; #loc: 0 25 20
+    %10 = call @func.0(%9, %0, %1)  ; #loc: 0 25 4
+    ret %10  ; #loc: 0 26 1
+}
+
+rustcc fn @spawn_full(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+bb0(%0: ptr, %1: ptr):
+    %2 = const i32 2147483647  ; #loc: 0 30 35
+    %3 = const struct.0 { 0 }  ; #loc: 0 30 20
+    %4 = insertfield struct.0 %3, 0, %2  ; #loc: 0 30 20
+    %5 = call @func.0(%4, %0, %1)  ; #loc: 0 30 4
+    ret %5  ; #loc: 0 31 1
+}
+
+rustcc fn @ceiling(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0:
+    %0 = const i32 1  ; #loc: 0 33 22
+    %1 = const i32 16  ; #loc: 0 33 27
+    %2 = bitcast i32 %1 to u32  ; #loc: 0 33 22
+    %3 = const u32 32  ; #loc: 0 33 22
+    %4 = icmp ult u32 %2, %3  ; #loc: 0 33 22
+    assert %4, overflow shl  ; #proof: shift_in_range  ; #loc: 0 33 22
+    %5 = shl i32 %0, %1  ; #loc: 0 33 22
+    ret %5  ; #loc: 0 33 31
+}
+
+rustcc fn @spawn_ceiling(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+bb0(%0: ptr, %1: ptr):
+    %2 = call @func.3()  ; #loc: 0 37 35
+    %3 = const struct.0 { 0 }  ; #loc: 0 37 20
+    %4 = insertfield struct.0 %3, 0, %2  ; #loc: 0 37 20
+    %5 = call @func.0(%4, %0, %1)  ; #loc: 0 37 4
+    ret %5  ; #loc: 0 38 1
+}
+
+rustcc fn @spawn_sysconf(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 42 4
+bb0(%0: ptr, %1: ptr):
+    %2 = const i32 5  ; #loc: 0 42 39  ; #scope: 0
+    %3 = call @func.42(%2)  ; #loc: 0 42 25  ; #scope: 0
+    %4 = trunc i64 %3 to i32  ; #loc: 0 42 16  ; #scope: 0
+    %5 = const struct.0 { 0 }  ; #loc: 0 43 20  ; #scope: 1
+    %6 = insertfield struct.0 %5, 0, %4  ; #loc: 0 43 20  ; #scope: 1
+    %7 = call @func.0(%6, %0, %1)  ; #loc: 0 43 4  ; #scope: 1
+    ret %7  ; #loc: 0 44 1  ; #scope: 0
+}
+
+rustcc fn @spawn_setsid(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 48 4
+    ; #scope: 2 parent=1 at 0 51 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.38()  ; #loc: 0 48 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 49 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 49 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 49 4  ; #scope: 1
+bb1:
+    %8 = call @func.43()  ; #loc: 0 50 17  ; #scope: 1
+    %9 = const i32 3  ; #loc: 0 51 21  ; #scope: 1
+    br bb4(%9)  ; #loc: 0 52 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 49 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 56 1  ; #scope: 0
+bb4(%2: i32):
+    %10 = const i32 2147483647  ; #loc: 0 52 19  ; #scope: 2
+    %11 = icmp slt i32 %2, %10  ; #loc: 0 52 14  ; #scope: 2
+    condbr %11, bb6, bb7  ; #loc: 0 52 8  ; #scope: 2
+bb5(%3: i32):
+    %12 = call @func.40(%0, %1)  ; #loc: 0 53 17  ; #scope: 2
+    %13 = const i32 127  ; #loc: 0 53 54  ; #scope: 2
+    call @func.41(%13)  ; #loc: 0 53 42  ; #scope: 2
+    unreachable  ; #loc: 0 53 42  ; #scope: 2
+bb6:
+    %14 = const i32 2  ; #loc: 0 52 55  ; #scope: 2
+    %15 = const i32 1  ; #loc: 0 52 70  ; #scope: 2
+    %16 = call @func.39(%2, %14, %15)  ; #loc: 0 52 39  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 52 97  ; #scope: 2
+    %18, %19 = add.overflow i32 %2, %17  ; #loc: 0 52 91  ; #scope: 2
+    %20 = const bool false  ; #loc: 0 52 91  ; #scope: 2
+    %21 = const bool true  ; #loc: 0 52 91  ; #scope: 2
+    %22 = select bool %19, %20, %21  ; #loc: 0 52 91  ; #scope: 2
+    assert %22, overflow add  ; #proof: no_overflow  ; #loc: 0 52 91  ; #scope: 2
+    br bb8(%18)  ; #loc: 0 52 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 52 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 52 8  ; #scope: 2
+}
+
+rustcc fn @install(functy.4) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd", %1="strip"
+bb0(%0: ptr, %1: struct.0):
+    %2 = const (i32) { 0 }  ; #loc: 0 61 21
+    %3 = extractfield i32 %1, 0  ; #loc: 0 61 21
+    %4 = insertfield (i32) %2, 0, %3  ; #loc: 0 61 21
+    %5 = call @func.44(%0, %4)  ; #loc: 0 61 12
+    ret  ; #loc: 0 68 1
+}
+
+rustcc fn @"install::{closure#0}"(functy.5) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0(%0: ptr):
+    %1 = const i32 3  ; #loc: 0 62 22
+    %2 = load (i32), ptr %0  ; #loc: 0 62 25
+    %3 = extractfield i32 %2, 0  ; #loc: 0 62 25
+    %4 = alloca i32  ; #loc: 0 62 12
+    store i32 %1, ptr %4  ; #loc: 0 62 12
+    br bb1  ; #loc: 0 62 12
+bb1:
+    %5 = load i32, ptr %4  ; #loc: 0 62 12
+    %6 = icmp slt i32 %5, %3  ; #loc: 0 62 12
+    condbr %6, bb3, bb4  ; #loc: 0 62 12
+bb2:
+    %7 = const enum.0 { 0, phantomdata }  ; #loc: 0 65 12
+    ret %7  ; #loc: 0 66 9
+bb3:
+    %8 = const i32 1  ; #loc: 0 62 12
+    %9 = add i32 %5, %8  ; #loc: 0 62 12
+    store i32 %9, ptr %4  ; #loc: 0 62 12
+    %10 = const i32 2  ; #loc: 0 63 32
+    %11 = const i32 1  ; #loc: 0 63 47
+    %12 = call @func.39(%5, %10, %11)  ; #loc: 0 63 16
+    br bb5  ; #loc: 0 62 12
+bb4:
+    br bb2  ; #loc: 0 62 12
+bb5:
+    br bb1  ; #loc: 0 62 12
+}
+
+rustcc fn @hook_capped(functy.6) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd"
+bb0(%0: ptr):
+    %1 = const i32 1  ; #loc: 0 70 68
+    %2 = const i32 16  ; #loc: 0 70 73
+    %3 = bitcast i32 %2 to u32  ; #loc: 0 70 68
+    %4 = const u32 32  ; #loc: 0 70 68
+    %5 = icmp ult u32 %3, %4  ; #loc: 0 70 68
+    assert %5, overflow shl  ; #proof: shift_in_range  ; #loc: 0 70 68
+    %6 = shl i32 %1, %2  ; #loc: 0 70 68
+    %7 = const struct.0 { 0 }  ; #loc: 0 70 53
+    %8 = insertfield struct.0 %7, 0, %6  ; #loc: 0 70 53
+    call @func.7(%0, %8)  ; #loc: 0 70 40
+    ret  ; #loc: 0 70 80
+}
+
+rustcc fn @hook_full(functy.6) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd"
+bb0(%0: ptr):
+    %1 = const i32 2147483647  ; #loc: 0 71 66
+    %2 = const struct.0 { 0 }  ; #loc: 0 71 51
+    %3 = insertfield struct.0 %2, 0, %1  ; #loc: 0 71 51
+    call @func.7(%0, %3)  ; #loc: 0 71 38
+    ret  ; #loc: 0 71 79
+}
+
+rustcc fn @spawn_close_param(functy.7) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="fd", %1="path", %2="argv"
+bb0(%0: i32, %1: ptr, %2: ptr):
+    %3 = call @func.45(%0)  ; #loc: 0 75 13
+    %4 = const i32 2147483647  ; #loc: 0 76 35
+    %5 = const struct.0 { 0 }  ; #loc: 0 76 20
+    %6 = insertfield struct.0 %5, 0, %4  ; #loc: 0 76 20
+    %7 = call @func.0(%6, %1, %2)  ; #loc: 0 76 4
+    ret %7  ; #loc: 0 77 1
+}
+
+rustcc fn @spawn_fcntl_cmd(functy.7) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd", %1="path", %2="argv"
+bb0(%0: i32, %1: ptr, %2: ptr):
+    %3 = const i32 3  ; #loc: 0 81 25
+    %4 = const i32 1  ; #loc: 0 81 33
+    %5 = call @func.39(%3, %0, %4)  ; #loc: 0 81 13
+    %6 = const i32 2147483647  ; #loc: 0 82 35
+    %7 = const struct.0 { 0 }  ; #loc: 0 82 20
+    %8 = insertfield struct.0 %7, 0, %6  ; #loc: 0 82 20
+    %9 = call @func.0(%8, %1, %2)  ; #loc: 0 82 4
+    ret %9  ; #loc: 0 83 1
+}
+
+rustcc fn @depth(functy.8) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="n"
+bb0(%0: i32):
+    %2 = const i32 0  ; #loc: 0 86 33
+    %3 = icmp sgt i32 %0, %2  ; #loc: 0 86 29
+    condbr %3, bb1, bb2  ; #loc: 0 86 26
+bb1:
+    %4 = const i32 1  ; #loc: 0 86 47
+    %5, %6 = sub.overflow i32 %0, %4  ; #loc: 0 86 43
+    %7 = const bool false  ; #loc: 0 86 43
+    %8 = const bool true  ; #loc: 0 86 43
+    %9 = select bool %6, %7, %8  ; #loc: 0 86 43
+    assert %9, overflow sub  ; #proof: no_overflow  ; #loc: 0 86 43
+    %10 = call @func.13(%5)  ; #loc: 0 86 37
+    br bb3(%10)  ; #loc: 0 86 26
+bb2:
+    %11 = const i32 3  ; #loc: 0 86 59
+    br bb3(%11)  ; #loc: 0 86 26
+bb3(%1: i32):
+    ret %1  ; #loc: 0 86 64
+}
+
+rustcc fn @spawn_recursive(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+bb0(%0: ptr, %1: ptr):
+    %2 = const i32 4  ; #loc: 0 88 41
+    %3 = call @func.13(%2)  ; #loc: 0 88 35
+    %4 = const struct.0 { 0 }  ; #loc: 0 88 20
+    %5 = insertfield struct.0 %4, 0, %3  ; #loc: 0 88 20
+    %6 = call @func.0(%5, %0, %1)  ; #loc: 0 88 4
+    ret %6  ; #loc: 0 89 1
+}
+
+rustcc fn @spawn_after_id(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 93 4
+bb0(%0: ptr, %1: ptr):
+    %2 = call @func.46()  ; #loc: 0 93 13  ; #scope: 0
+    %3 = const u32 0  ; #loc: 0 94 13  ; #scope: 1
+    %4 = icmp eq u32 %2, %3  ; #loc: 0 94 7  ; #scope: 1
+    condbr %4, bb1, bb2  ; #loc: 0 94 4  ; #scope: 1
+bb1:
+    %5 = const i32 -1  ; #loc: 0 94 24  ; #scope: 1
+    ret %5  ; #loc: 0 94 17  ; #scope: 1
+bb2:
+    br bb3  ; #loc: 0 94 4  ; #scope: 1
+bb3:
+    %6 = const i32 2147483647  ; #loc: 0 95 35  ; #scope: 1
+    %7 = const struct.0 { 0 }  ; #loc: 0 95 20  ; #scope: 1
+    %8 = insertfield struct.0 %7, 0, %6  ; #loc: 0 95 20  ; #scope: 1
+    %9 = call @func.0(%8, %0, %1)  ; #loc: 0 95 4  ; #scope: 1
+    ret %9  ; #loc: 0 96 1  ; #scope: 0
+}
+
+rustcc fn @spawn_upstream(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 100 4
+bb0(%0: ptr, %1: ptr):
+    %2 = const i32 2147483647  ; #loc: 0 100 45  ; #scope: 0
+    %3 = const struct.0 { 0 }  ; #loc: 0 100 30  ; #scope: 0
+    %4 = insertfield struct.0 %3, 0, %2  ; #loc: 0 100 30  ; #scope: 0
+    %5 = call @func.0(%4, %0, %1)  ; #loc: 0 100 14  ; #scope: 0
+    %6 = call @func.47(%5)  ; #loc: 0 101 4  ; #scope: 1
+    ret %6  ; #loc: 0 102 1  ; #scope: 0
+}
+
+rustcc fn @spawn_indirect(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 106 4
+bb0:
+    %0 = const functy.3 fndef<func.38>  ; #loc: 0 106 51  ; #scope: 0
+    %1 = call_indirect %0(functy.3)()  ; #loc: 0 107 13  ; #scope: 1
+    ret %1  ; #loc: 0 108 1  ; #scope: 0
+}
+
+rustcc fn @spawn_full_inline(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 112 4
+    ; #scope: 2 parent=1 at 0 114 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.38()  ; #loc: 0 112 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 113 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 113 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 113 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 114 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 115 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 113 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 119 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 115 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 115 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 115 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = call @func.40(%0, %1)  ; #loc: 0 116 17  ; #scope: 2
+    %12 = const i32 127  ; #loc: 0 116 54  ; #scope: 2
+    call @func.41(%12)  ; #loc: 0 116 42  ; #scope: 2
+    unreachable  ; #loc: 0 116 42  ; #scope: 2
+bb6:
+    %13 = const i32 2  ; #loc: 0 115 55  ; #scope: 2
+    %14 = const i32 1  ; #loc: 0 115 70  ; #scope: 2
+    %15 = call @func.39(%2, %13, %14)  ; #loc: 0 115 39  ; #scope: 2
+    %16 = const i32 1  ; #loc: 0 115 97  ; #scope: 2
+    %17, %18 = add.overflow i32 %2, %16  ; #loc: 0 115 91  ; #scope: 2
+    %19 = const bool false  ; #loc: 0 115 91  ; #scope: 2
+    %20 = const bool true  ; #loc: 0 115 91  ; #scope: 2
+    %21 = select bool %18, %19, %20  ; #loc: 0 115 91  ; #scope: 2
+    assert %21, overflow add  ; #proof: no_overflow  ; #loc: 0 115 91  ; #scope: 2
+    br bb8(%17)  ; #loc: 0 115 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 115 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 115 8  ; #scope: 2
+}
+
+rustcc fn @hook_full_inline(functy.6) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 123 4
+bb0(%0: ptr):
+    %1 = const i32 2147483647  ; #loc: 0 123 16  ; #scope: 0
+    %2 = const (i32) { 0 }  ; #loc: 0 125 21  ; #scope: 1
+    %3 = insertfield (i32) %2, 0, %1  ; #loc: 0 125 21  ; #scope: 1
+    %4 = call @func.48(%0, %3)  ; #loc: 0 125 12  ; #scope: 1
+    ret  ; #loc: 0 132 1  ; #scope: 0
+}
+
+rustcc fn @"hook_full_inline::{closure#0}"(functy.5) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0(%0: ptr):
+    %1 = const i32 3  ; #loc: 0 126 22
+    %2 = load (i32), ptr %0  ; #loc: 0 126 25
+    %3 = extractfield i32 %2, 0  ; #loc: 0 126 25
+    %4 = alloca i32  ; #loc: 0 126 12
+    store i32 %1, ptr %4  ; #loc: 0 126 12
+    br bb1  ; #loc: 0 126 12
+bb1:
+    %5 = load i32, ptr %4  ; #loc: 0 126 12
+    %6 = icmp slt i32 %5, %3  ; #loc: 0 126 12
+    condbr %6, bb3, bb4  ; #loc: 0 126 12
+bb2:
+    %7 = const enum.0 { 0, phantomdata }  ; #loc: 0 129 12
+    ret %7  ; #loc: 0 130 9
+bb3:
+    %8 = const i32 1  ; #loc: 0 126 12
+    %9 = add i32 %5, %8  ; #loc: 0 126 12
+    store i32 %9, ptr %4  ; #loc: 0 126 12
+    %10 = const i32 2  ; #loc: 0 127 32
+    %11 = const i32 1  ; #loc: 0 127 47
+    %12 = call @func.39(%5, %10, %11)  ; #loc: 0 127 16
+    br bb5  ; #loc: 0 126 12
+bb4:
+    br bb2  ; #loc: 0 126 12
+bb5:
+    br bb1  ; #loc: 0 126 12
+}
+
+rustcc fn @spawn_refused_helper(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 141 4
+bb0(%0: ptr, %1: ptr):
+    %2 = call @func.49()  ; #loc: 0 141 16  ; #scope: 0
+    %3 = const i32 1  ; #loc: 0 141 43  ; #scope: 0
+    %4 = const i32 16  ; #loc: 0 141 48  ; #scope: 0
+    %5 = bitcast i32 %4 to u32  ; #loc: 0 141 43  ; #scope: 0
+    %6 = const u32 32  ; #loc: 0 141 43  ; #scope: 0
+    %7 = icmp ult u32 %5, %6  ; #loc: 0 141 43  ; #scope: 0
+    assert %7, overflow shl  ; #proof: shift_in_range  ; #loc: 0 141 43  ; #scope: 0
+    %8 = shl i32 %3, %4  ; #loc: 0 141 43  ; #scope: 0
+    %9 = call @func.50(%2, %8)  ; #loc: 0 141 33  ; #scope: 0
+    %10 = const struct.0 { 0 }  ; #loc: 0 142 20  ; #scope: 1
+    %11 = insertfield struct.0 %10, 0, %9  ; #loc: 0 142 20  ; #scope: 1
+    %12 = call @func.0(%11, %0, %1)  ; #loc: 0 142 4  ; #scope: 1
+    ret %12  ; #loc: 0 143 1  ; #scope: 0
+}
+
+rustcc fn @std_spawn(functy.9) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="cmd"
+bb0(%0: ptr):
+    %1 = call @func.51(%0)  ; #loc: 0 146 50
+    %2 = alloca enum.6  ; #loc: 0 146 46
+    store enum.6 %1, ptr %2  ; #loc: 0 146 46
+    %3 = call @func.52(%2)  ; #loc: 0 146 58
+    ret %3  ; #loc: 0 146 67
+}
+
+rustcc fn @spawn_vfork(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0:
+    %0 = call @func.53()  ; #loc: 0 165 39
+    ret %0  ; #loc: 0 165 55
+}
+
+rustcc fn @fork_returns(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0:
+    %0 = call @func.38()  ; #loc: 0 168 40
+    ret %0  ; #loc: 0 168 56
+}
+
+rustcc fn @spawn_after_drop(functy.10) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="fd", %1="path", %2="argv"
+bb0(%0: struct.7, %1: ptr, %2: ptr):
+    call @func.54(%0)  ; #loc: 0 173 4
+    %3 = const i32 2147483647  ; #loc: 0 174 35
+    %4 = const struct.0 { 0 }  ; #loc: 0 174 20
+    %5 = insertfield struct.0 %4, 0, %3  ; #loc: 0 174 20
+    %6 = call @func.0(%5, %1, %2)  ; #loc: 0 174 4
+    ret %6  ; #loc: 0 175 1
+}
+
+rustcc fn @"spawn_with_thread::{closure#0}"(functy.11) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0(%0: ()):
+    ret  ; #loc: 0 179 37
+}
+
+rustcc fn @dup_stdout_for(functy.12) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="n"
+bb0(%0: i32):
+    %1 = const i32 0  ; #loc: 0 187 37
+    %2 = alloca i32  ; #loc: 0 187 28
+    store i32 %1, ptr %2  ; #loc: 0 187 28
+    br bb1  ; #loc: 0 187 28
+bb1:
+    %3 = load i32, ptr %2  ; #loc: 0 187 28
+    %4 = icmp slt i32 %3, %0  ; #loc: 0 187 28
+    condbr %4, bb3, bb4  ; #loc: 0 187 28
+bb2:
+    ret  ; #loc: 0 187 72
+bb3:
+    %5 = const i32 1  ; #loc: 0 187 28
+    %6 = add i32 %3, %5  ; #loc: 0 187 28
+    store i32 %6, ptr %2  ; #loc: 0 187 28
+    %7 = const i32 1  ; #loc: 0 187 63
+    %8 = call @func.55(%7)  ; #loc: 0 187 53
+    br bb5  ; #loc: 0 187 28
+bb4:
+    br bb2  ; #loc: 0 187 28
+bb5:
+    br bb1  ; #loc: 0 187 28
+}
+
+rustcc fn @spawn_erased_leak(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 189 4
+    ; #scope: 2 parent=1 at 0 191 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.38()  ; #loc: 0 189 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 190 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 190 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 190 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 191 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 192 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 190 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 197 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 192 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 192 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 192 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = const i32 1  ; #loc: 0 193 23  ; #scope: 2
+    call @func.27(%11)  ; #loc: 0 193 8  ; #scope: 2
+    %12 = call @func.40(%0, %1)  ; #loc: 0 194 17  ; #scope: 2
+    %13 = const i32 127  ; #loc: 0 194 54  ; #scope: 2
+    call @func.41(%13)  ; #loc: 0 194 42  ; #scope: 2
+    unreachable  ; #loc: 0 194 42  ; #scope: 2
+bb6:
+    %14 = const i32 2  ; #loc: 0 192 55  ; #scope: 2
+    %15 = const i32 1  ; #loc: 0 192 70  ; #scope: 2
+    %16 = call @func.39(%2, %14, %15)  ; #loc: 0 192 39  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 192 97  ; #scope: 2
+    %18, %19 = add.overflow i32 %2, %17  ; #loc: 0 192 91  ; #scope: 2
+    %20 = const bool false  ; #loc: 0 192 91  ; #scope: 2
+    %21 = const bool true  ; #loc: 0 192 91  ; #scope: 2
+    %22 = select bool %19, %20, %21  ; #loc: 0 192 91  ; #scope: 2
+    assert %22, overflow add  ; #proof: no_overflow  ; #loc: 0 192 91  ; #scope: 2
+    br bb8(%18)  ; #loc: 0 192 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 192 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 192 8  ; #scope: 2
+}
+
+rustcc fn @dup_stdout_while(functy.12) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="n"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 200 30
+bb0(%0: i32):
+    %4 = const i32 0  ; #loc: 0 200 42  ; #scope: 0
+    br bb1(%4)  ; #loc: 0 200 45  ; #scope: 1
+bb1(%1: i32):
+    %5 = icmp slt i32 %1, %0  ; #loc: 0 200 51  ; #scope: 1
+    condbr %5, bb3, bb4  ; #loc: 0 200 45  ; #scope: 1
+bb2(%2: i32):
+    ret  ; #loc: 0 200 95  ; #scope: 0
+bb3:
+    %6 = const i32 1  ; #loc: 0 200 78  ; #scope: 1
+    %7 = call @func.55(%6)  ; #loc: 0 200 68  ; #scope: 1
+    %8 = const i32 1  ; #loc: 0 200 89  ; #scope: 1
+    %9, %10 = add.overflow i32 %1, %8  ; #loc: 0 200 84  ; #scope: 1
+    %11 = const bool false  ; #loc: 0 200 84  ; #scope: 1
+    %12 = const bool true  ; #loc: 0 200 84  ; #scope: 1
+    %13 = select bool %10, %11, %12  ; #loc: 0 200 84  ; #scope: 1
+    assert %13, overflow add  ; #proof: no_overflow  ; #loc: 0 200 84  ; #scope: 1
+    br bb5(%9)  ; #loc: 0 200 45  ; #scope: 1
+bb4:
+    br bb2(%1)  ; #loc: 0 200 45  ; #scope: 1
+bb5(%3: i32):
+    br bb1(%3)  ; #loc: 0 200 45  ; #scope: 1
+}
+
+rustcc fn @spawn_dup_leak(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 202 4
+    ; #scope: 2 parent=1 at 0 204 8
+bb0(%0: ptr, %1: ptr):
+    %5 = call @func.38()  ; #loc: 0 202 23  ; #scope: 0
+    %6 = const i32 0  ; #loc: 0 203 14  ; #scope: 1
+    %7 = icmp eq i32 %5, %6  ; #loc: 0 203 7  ; #scope: 1
+    condbr %7, bb1, bb2  ; #loc: 0 203 4  ; #scope: 1
+bb1:
+    %8 = const i32 3  ; #loc: 0 204 21  ; #scope: 1
+    br bb4(%8)  ; #loc: 0 205 8  ; #scope: 2
+bb2:
+    br bb3  ; #loc: 0 203 4  ; #scope: 1
+bb3:
+    ret %5  ; #loc: 0 210 1  ; #scope: 0
+bb4(%2: i32):
+    %9 = const i32 2147483647  ; #loc: 0 205 19  ; #scope: 2
+    %10 = icmp slt i32 %2, %9  ; #loc: 0 205 14  ; #scope: 2
+    condbr %10, bb6, bb7  ; #loc: 0 205 8  ; #scope: 2
+bb5(%3: i32):
+    %11 = const i32 1  ; #loc: 0 206 25  ; #scope: 2
+    call @func.29(%11)  ; #loc: 0 206 8  ; #scope: 2
+    %12 = call @func.40(%0, %1)  ; #loc: 0 207 17  ; #scope: 2
+    %13 = const i32 127  ; #loc: 0 207 54  ; #scope: 2
+    call @func.41(%13)  ; #loc: 0 207 42  ; #scope: 2
+    unreachable  ; #loc: 0 207 42  ; #scope: 2
+bb6:
+    %14 = const i32 2  ; #loc: 0 205 55  ; #scope: 2
+    %15 = const i32 1  ; #loc: 0 205 70  ; #scope: 2
+    %16 = call @func.39(%2, %14, %15)  ; #loc: 0 205 39  ; #scope: 2
+    %17 = const i32 1  ; #loc: 0 205 97  ; #scope: 2
+    %18, %19 = add.overflow i32 %2, %17  ; #loc: 0 205 91  ; #scope: 2
+    %20 = const bool false  ; #loc: 0 205 91  ; #scope: 2
+    %21 = const bool true  ; #loc: 0 205 91  ; #scope: 2
+    %22 = select bool %19, %20, %21  ; #loc: 0 205 91  ; #scope: 2
+    assert %22, overflow add  ; #proof: no_overflow  ; #loc: 0 205 91  ; #scope: 2
+    br bb8(%18)  ; #loc: 0 205 8  ; #scope: 2
+bb7:
+    br bb5(%2)  ; #loc: 0 205 8  ; #scope: 2
+bb8(%4: i32):
+    br bb4(%4)  ; #loc: 0 205 8  ; #scope: 2
+}
+
+rustcc fn @spawn_boxed_fd(functy.10) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="fd", %1="path", %2="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 215 4
+    ; #scope: 2 parent=1 at 0 216 4
+bb0(%0: struct.7, %1: ptr, %2: ptr):
+    %3 = call @func.56(%0)  ; #loc: 0 215 15  ; #scope: 0
+    %4 = const i32 2147483647  ; #loc: 0 216 45  ; #scope: 1
+    %5 = const struct.0 { 0 }  ; #loc: 0 216 30  ; #scope: 1
+    %6 = insertfield struct.0 %5, 0, %4  ; #loc: 0 216 30  ; #scope: 1
+    %7 = call @func.0(%6, %1, %2)  ; #loc: 0 216 14  ; #scope: 1
+    call @func.57(%3)  ; #loc: 0 217 4  ; #scope: 2
+    ret %7  ; #loc: 0 219 1  ; #scope: 0
+}
+
+rustcc fn @spawn_with_actions(functy.13) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="actions", %1="path", %2="argv"
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = const i32 3  ; #loc: 0 224 61
+    %4 = call @func.58(%0, %3)  ; #loc: 0 224 13
+    %5 = const i32 2147483647  ; #loc: 0 225 35
+    %6 = const struct.0 { 0 }  ; #loc: 0 225 20
+    %7 = insertfield struct.0 %6, 0, %5  ; #loc: 0 225 20
+    %8 = call @func.0(%7, %1, %2)  ; #loc: 0 225 4
+    ret %8  ; #loc: 0 226 1
+}
+
+fn @worker(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0(%0: ptr):
+    %1 = call @func.59()  ; #loc: 0 228 46
+    ret %1  ; #loc: 0 228 68
+}
+
+rustcc fn @spawn_after_pthread(functy.13) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="t", %1="path", %2="argv"
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = call @func.60()  ; #loc: 0 233 36
+    %4 = const functy.0 fndef<func.33>  ; #loc: 0 233 54
+    %5 = call @func.59()  ; #loc: 0 233 62
+    %6 = call @func.61(%0, %3, %4, %5)  ; #loc: 0 233 13
+    %7 = const i32 2147483647  ; #loc: 0 234 35
+    %8 = const struct.0 { 0 }  ; #loc: 0 234 20
+    %9 = insertfield struct.0 %8, 0, %7  ; #loc: 0 234 20
+    %10 = call @func.0(%9, %1, %2)  ; #loc: 0 234 4
+    ret %10  ; #loc: 0 235 1
+}
+
+rustcc fn @spawn_pid_dependent(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="path", %1="argv"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 240 4
+bb0(%0: ptr, %1: ptr):
+    %3 = call @func.62()  ; #loc: 0 240 28  ; #scope: 0
+    %4 = const i32 1  ; #loc: 0 240 48  ; #scope: 0
+    %5 = icmp eq i32 %3, %4  ; #loc: 0 240 19  ; #scope: 0
+    condbr %5, bb1, bb2  ; #loc: 0 240 16  ; #scope: 0
+bb1:
+    %6 = const i32 2147483647  ; #loc: 0 240 52  ; #scope: 0
+    br bb3(%6)  ; #loc: 0 240 16  ; #scope: 0
+bb2:
+    %7 = const i32 1  ; #loc: 0 240 70  ; #scope: 0
+    %8 = const i32 16  ; #loc: 0 240 75  ; #scope: 0
+    %9 = bitcast i32 %8 to u32  ; #loc: 0 240 70  ; #scope: 0
+    %10 = const u32 32  ; #loc: 0 240 70  ; #scope: 0
+    %11 = icmp ult u32 %9, %10  ; #loc: 0 240 70  ; #scope: 0
+    assert %11, overflow shl  ; #proof: shift_in_range  ; #loc: 0 240 70  ; #scope: 0
+    %12 = shl i32 %7, %8  ; #loc: 0 240 70  ; #scope: 0
+    br bb3(%12)  ; #loc: 0 240 16  ; #scope: 0
+bb3(%2: i32):
+    %13 = const struct.0 { 0 }  ; #loc: 0 241 20  ; #scope: 1
+    %14 = insertfield struct.0 %13, 0, %2  ; #loc: 0 241 20  ; #scope: 1
+    %15 = call @func.0(%14, %0, %1)  ; #loc: 0 241 4  ; #scope: 1
+    ret %15  ; #loc: 0 242 1  ; #scope: 0
+}
+
+rustcc fn @spawn_never_execs(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 246 4
+bb0:
+    %0 = call @func.38()  ; #loc: 0 246 23  ; #scope: 0
+    %1 = const i32 0  ; #loc: 0 247 14  ; #scope: 1
+    %2 = icmp eq i32 %0, %1  ; #loc: 0 247 7  ; #scope: 1
+    condbr %2, bb1, bb2  ; #loc: 0 247 4  ; #scope: 1
+bb1:
+    %3 = const i32 0  ; #loc: 0 248 29  ; #scope: 1
+    call @func.41(%3)  ; #loc: 0 248 17  ; #scope: 1
+    unreachable  ; #loc: 0 248 17  ; #scope: 1
+bb2:
+    br bb3  ; #loc: 0 247 4  ; #scope: 1
+bb3:
+    ret %0  ; #loc: 0 251 1  ; #scope: 0
+}
+
+rustcc fn @"<Strip as std::clone::Clone>::clone"(functy.14) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="self"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 8 9
+bb0(%0: ptr):
+    %1 = load struct.0, ptr %0  ; #loc: 0 8 9  ; #scope: 1
+    ret %1  ; #loc: 0 8 9  ; #scope: 0
+}
+
+fn @"libc::fork"(functy.3) {
+    ; #producer: trust
+}
+
+fn @"libc::fcntl"(functy.15) {
+    ; #producer: trust
+}
+
+fn @"libc::execv"(functy.15) {
+    ; #producer: trust
+}
+
+fn @"libc::_exit"(functy.12) {
+    ; #producer: trust
+}
+
+fn @"libc::sysconf"(functy.16) {
+    ; #producer: trust
+}
+
+fn @"libc::setsid"(functy.3) {
+    ; #producer: trust
+}
+
+rustcc fn @"!trust_bodyless_instance::<std::process::Command as std::os::unix::process::CommandExt>::pre_exec::8eafaddd7ba4b1fa39602f12f116ba30-6861766f633a3c7374643a3a70726f636573733a3a436f6d6d616e64206173207374643a3a6f733a3a756e69783a3a70726f636573733a3a436f6d6d616e644578743e3a3a7072655f657865637c636f6e63726574652d76313a303138656166616464643762613462316661333936303266313266313136626133303030303030303030303030303030303030313031313030303234356339663164636261393738633332653430653238653035666438316638303030303030303030303030303030333033303030303030303030303030303030333639333133363066303030303030303030303030303030393732373537333734326436333631366336633031303030303030303030303030303030303030303230373030303030303030303030303030303030363537386138366535323532386232313563356138616436363434633030396330303030303030303030303030303030323037303030303030303030303030303030303036353738613836653532353238623231356531313234353334343837366538356530303030303030303030303030303030303730303030303030303030303030303031303330303030303030303030303030303033363933333332"(functy.17) {
+    ; #producer: trust
+}
+
+fn @"libc::close"(functy.8) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::process::id"(functy.18) {
+    ; #producer: trust
+}
+
+fn @"libc::WEXITSTATUS"(functy.8) {
+    ; #producer: trust
+}
+
+rustcc fn @"!trust_bodyless_instance::<std::process::Command as std::os::unix::process::CommandExt>::pre_exec::8eafaddd7ba4b1fa39602f12f116ba30-6861766f633a3c7374643a3a70726f636573733a3a436f6d6d616e64206173207374643a3a6f733a3a756e69783a3a70726f636573733a3a436f6d6d616e644578743e3a3a7072655f657865637c636f6e63726574652d76313a303138656166616464643762613462316661333936303266313266313136626133303030303030303030303030303030303030313031313030303234356339663164636261393738633366356632656635303263353334353165303030303030303030303030303030333033303030303030303030303030303030333639333133363066303030303030303030303030303030393732373537333734326436333631366336633031303030303030303030303030303030303030303230373030303030303030303030303030303030363537386138366535323532386232313563356138616436363434633030396330303030303030303030303030303030323037303030303030303030303030303030303036353738613836653532353238623231356531313234353334343837366538356530303030303030303030303030303030303730303030303030303030303030303031303330303030303030303030303030303033363933333332"(functy.17) {
+    ; #producer: trust
+}
+
+rustcc fn @bound_from_env(functy.19) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::result::Result::<T, E>::unwrap_or"(functy.20) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::process::Command::spawn"(functy.21) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::result::Result::<T, E>::is_ok"(functy.9) {
+    ; #producer: trust
+}
+
+fn @"ffi::vfork"(functy.3) {
+    ; #producer: trust
+}
+
+rustcc fn @"!trust_bodyless_instance::std::mem::drop::578a86e52528b215134223a7fe5dd324-6861766f633a7374643a3a6d656d3a3a64726f707c636f6e63726574652d76313a3031353738613836653532353238623231353133343232336137666535646433323430303030303030303030303030303030303130313036386561666164646437626134623166616464363639323663616466306261316530303030303030303030303030303030"(functy.22) {
+    ; #producer: trust
+}
+
+fn @"libc::dup"(functy.8) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::boxed::Box::<T>::new"(functy.23) {
+    ; #producer: trust
+}
+
+rustcc fn @"!trust_bodyless_instance::std::mem::drop::578a86e52528b215134223a7fe5dd324-6861766f633a7374643a3a6d656d3a3a64726f707c636f6e63726574652d76313a303135373861383665353235323862323135313334323233613766653564643332343030303030303030303030303030303030313031303633383762306437376433323139666637333265636231303635643661373964353030303030303030303030303030303230363865616661646464376261346231666164643636393236636164663062613165303030303030303030303030303030303036333837623064373764333231396666373339356538653933636531313930363430303030303030303030303030303030"(functy.24) {
+    ; #producer: trust
+}
+
+fn @"ffi::posix_spawn_file_actions_addclose"(functy.25) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::ptr::null_mut"(functy.26) {
+    ; #producer: trust
+}
+
+rustcc fn @"std::ptr::null"(functy.26) {
+    ; #producer: trust
+}
+
+fn @"ffi::pthread_create"(functy.27) {
+    ; #producer: trust
+}
+
+fn @"libc::getpid"(functy.3) {
+    ; #producer: trust
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L17C94 of `census_shapes::fork_strip_exec`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::fork_strip_exec#L17C94#overflow#o0" range 0 17 94 17 101 site f0/bb6#8
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L25C35 of `census_shapes::spawn_capped`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_capped#L25C35#overflow#o0" range 0 25 35 25 42 site f1/bb0#5
+
+obligation 2 arithmetic_safety pending "direct THIR Assert (overflow) at L33C22 of `census_shapes::ceiling`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 3 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::ceiling#L33C22#overflow#o0" range 0 33 22 33 29 site f3/bb0#5
+
+obligation 3 arithmetic_safety pending "direct THIR Assert (overflow) at L52C91 of `census_shapes::spawn_setsid`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 6 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_setsid#L52C91#overflow#o0" range 0 52 91 52 98 site f6/bb6#8
+
+obligation 4 arithmetic_safety pending "direct THIR Assert (overflow) at L70C68 of `census_shapes::hook_capped`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 9 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::hook_capped#L70C68#overflow#o0" range 0 70 68 70 75 site f9/bb0#5
+
+obligation 5 arithmetic_safety pending "direct THIR Assert (overflow) at L86C43 of `census_shapes::depth`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 13 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::depth#L86C43#overflow#o0" range 0 86 43 86 48 site f13/bb1#5
+
+obligation 6 arithmetic_safety pending "direct THIR Assert (overflow) at L115C91 of `census_shapes::spawn_full_inline`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 18 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_full_inline#L115C91#overflow#o0" range 0 115 91 115 98 site f18/bb6#8
+
+obligation 7 arithmetic_safety pending "direct THIR Assert (overflow) at L141C43 of `census_shapes::spawn_refused_helper`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 21 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_refused_helper#L141C43#overflow#o0" range 0 141 43 141 50 site f21/bb0#6
+
+obligation 8 arithmetic_safety pending "direct THIR Assert (overflow) at L192C91 of `census_shapes::spawn_erased_leak`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 28 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_erased_leak#L192C91#overflow#o0" range 0 192 91 192 98 site f28/bb6#8
+
+obligation 9 arithmetic_safety pending "direct THIR Assert (overflow) at L200C84 of `census_shapes::dup_stdout_while`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 29 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::dup_stdout_while#L200C84#overflow#o0" range 0 200 84 200 90 site f29/bb3#7
+
+obligation 10 arithmetic_safety pending "direct THIR Assert (overflow) at L205C91 of `census_shapes::spawn_dup_leak`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 30 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_dup_leak#L205C91#overflow#o0" range 0 205 91 205 98 site f30/bb6#8
+
+obligation 11 arithmetic_safety pending "direct THIR Assert (overflow) at L240C70 of `census_shapes::spawn_pid_dependent`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 35 source "trust-thir-lower/direct-assert@1" assertion "census_shapes::spawn_pid_dependent#L240C70#overflow#o0" range 0 240 70 240 77 site f35/bb2#5

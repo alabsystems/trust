@@ -1,11 +1,10 @@
 use rustc_infer::infer::InferOk;
 use rustc_infer::infer::canonical::QueryRegionConstraint;
-use rustc_infer::infer::resolve::OpportunisticRegionResolver;
 use rustc_infer::traits::query::type_op::ImpliedOutlivesBounds;
 use rustc_macros::extension;
 use rustc_middle::infer::canonical::{OriginalQueryValues, QueryRegionConstraints};
 pub use rustc_middle::traits::query::OutlivesBound;
-use rustc_middle::ty::{self, ParamEnv, Ty, TypeFolder, TypeVisitableExt};
+use rustc_middle::ty::{self, ParamEnv, Ty, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
 use tracing::instrument;
 
@@ -39,8 +38,14 @@ fn implied_outlives_bounds<'a, 'tcx>(
     ty: Ty<'tcx>,
     disable_implied_bounds_hack: bool,
 ) -> Vec<OutlivesBound<'tcx>> {
-    let ty = infcx.resolve_vars_if_possible(ty);
-    let ty = OpportunisticRegionResolver::new(infcx).fold_ty(ty);
+    if !ty.has_infer()
+        && !infcx.disable_trait_solver_fast_paths()
+        && crate::traits::implied_outlives_bounds::trivial_implied_outlives_bounds(ty)
+    {
+        return vec![];
+    }
+
+    let ty = infcx.deeply_resolve_via_unification_table(ty);
 
     // We do not expect existential variables in implied bounds.
     // We may however encounter unconstrained lifetime variables
@@ -49,6 +54,12 @@ fn implied_outlives_bounds<'a, 'tcx>(
     // See `ui/implied-bounds/implied-bounds-unconstrained-2.rs` for
     // an example.
     assert!(!ty.has_non_region_infer());
+
+    if !infcx.disable_trait_solver_fast_paths()
+        && crate::traits::implied_outlives_bounds::trivial_implied_outlives_bounds(ty)
+    {
+        return vec![];
+    }
 
     let mut canonical_var_values = OriginalQueryValues::default();
     let input = ImpliedOutlivesBounds { ty };

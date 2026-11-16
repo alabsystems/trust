@@ -1,0 +1,49 @@
+error[E0425]: cannot find function `bvdef` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_nonliteral_width.rs:48:15
+   |
+LL |     crate::m::bvdef(x)
+   |               ^^^^^ not found in `crate::m`
+   |
+note: `bvdef` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_nonliteral_width.rs:42:9
+   |
+LL |         def bvdef  (x : BitVec w)         : BitVec w         := x
+   |         ^^^
+   = note: `bvdef` is kernel-checked, but its type has no TOTAL Rust carrier, so there is no Rust type that can hold its values without loss:
+           the Clean signature `BitVec .. -> BitVec ..` (1 argument) has no Rust carrier, because argument 0 has none. The WHOLE signature is refused, not just that position: a carrier for a signature is total in every position or it does not exist, since a call that carries the other values faithfully still emits a wrong value for this one.
+           options: (1) change argument 0 to a carried type — the refusal for that position, quoted below, lists the specific fixes; (2) keep the whole declaration PROOF-only, where no position needs a carrier at all; (3) split it — the carryable part becomes a `def` Rust calls, and the part that needs argument 0 stays PROOF-only and is cited from `requires`/`ensures`
+           the refusal at argument 0 is:
+           no Rust carrier is modeled for the Clean type `BitVec ..`, so it cannot cross into Rust — a type this compiler cannot represent exactly is never represented approximately.
+           options: (1) use one of the modeled value types — `Bool`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, or `BitVec 8/16/32/64`; (2) keep the declaration PROOF-only and cite it from `requires`/`ensures`, where no carrier is needed; (3) if this type should be carried, extend the carrier map in `trust-clean-carrier` — extending capability extends the CHECK, never trust (v7/D2)
+           This is not a limitation of the call syntax. A partial carrier would make the emitted binary disagree with the declaration on some inputs — kernel definitional equality does not catch that, which is why the carrier is a separate obligation.
+           options:
+           - restate `bvdef` at a fixed-width Clean type (`UInt8`/`UInt16`/`UInt32`/`UInt64`), which carries exactly AND is callable from Rust today. A LITERAL-width `BitVec 8/16/32/64` also carries exactly, but it is refused one step later at the reflection, so it is a fix for a proof-position use and not for a call (`docs/design/2026-09-14-bitvec-return-direction.md`);
+           - keep the unbounded type and cite `bvdef` from proof position, where no carrier is needed;
+           - introduce a bounded wrapper in Clean with the bound as part of its type, and call that.
+
+error[E0425]: cannot find function `bvexpr` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_nonliteral_width.rs:54:15
+   |
+LL |     crate::m::bvexpr(x)
+   |               ^^^^^^ not found in `crate::m`
+   |
+note: `bvexpr` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_nonliteral_width.rs:43:9
+   |
+LL |         def bvexpr (x : BitVec (32 + 32)) : BitVec (32 + 32) := x
+   |         ^^^
+   = note: `bvexpr` is kernel-checked, but its type has no TOTAL Rust carrier, so there is no Rust type that can hold its values without loss:
+           the Clean signature `BitVec .. -> BitVec ..` (1 argument) has no Rust carrier, because argument 0 has none. The WHOLE signature is refused, not just that position: a carrier for a signature is total in every position or it does not exist, since a call that carries the other values faithfully still emits a wrong value for this one.
+           options: (1) change argument 0 to a carried type — the refusal for that position, quoted below, lists the specific fixes; (2) keep the whole declaration PROOF-only, where no position needs a carrier at all; (3) split it — the carryable part becomes a `def` Rust calls, and the part that needs argument 0 stays PROOF-only and is cited from `requires`/`ensures`
+           the refusal at argument 0 is:
+           no Rust carrier is modeled for the Clean type `BitVec ..`, so it cannot cross into Rust — a type this compiler cannot represent exactly is never represented approximately.
+           options: (1) use one of the modeled value types — `Bool`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, or `BitVec 8/16/32/64`; (2) keep the declaration PROOF-only and cite it from `requires`/`ensures`, where no carrier is needed; (3) if this type should be carried, extend the carrier map in `trust-clean-carrier` — extending capability extends the CHECK, never trust (v7/D2)
+           This is not a limitation of the call syntax. A partial carrier would make the emitted binary disagree with the declaration on some inputs — kernel definitional equality does not catch that, which is why the carrier is a separate obligation.
+           options:
+           - restate `bvexpr` at a fixed-width Clean type (`UInt8`/`UInt16`/`UInt32`/`UInt64`), which carries exactly AND is callable from Rust today. A LITERAL-width `BitVec 8/16/32/64` also carries exactly, but it is refused one step later at the reflection, so it is a fix for a proof-position use and not for a call (`docs/design/2026-09-14-bitvec-return-direction.md`);
+           - keep the unbounded type and cite `bvexpr` from proof position, where no carrier is needed;
+           - introduce a bounded wrapper in Clean with the bound as part of its type, and call that.
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `trustc --explain E0425`.

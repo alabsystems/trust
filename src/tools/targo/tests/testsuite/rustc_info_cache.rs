@@ -17,7 +17,7 @@ fn rustc_info_cache() {
         .build();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .with_stderr_contains("[..]failed to read rustc info cache[..]")
         .with_stderr_contains(MISS)
         .with_stderr_does_not_contain(HIT)
@@ -25,7 +25,7 @@ fn rustc_info_cache() {
         .run();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
         .with_stderr_does_not_contain(MISS)
@@ -33,7 +33,7 @@ fn rustc_info_cache() {
         .run();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .env("CARGO_CACHE_RUSTC_INFO", "0")
         .with_stderr_contains("[..]rustc info cache disabled[..]")
         .with_stderr_does_not_contain(UPDATE)
@@ -54,7 +54,14 @@ fn rustc_info_cache() {
                         for arg in env::args_os().skip(1) {
                             cmd.arg(arg);
                         }
-                        std::process::exit(cmd.status().unwrap().code().unwrap());
+                        // Trust: this wrapper only forwards; preserve inherited descriptors.
+                        #[cfg(unix)] {
+                            use std::os::unix::process::CommandExt;
+                            panic!("failed to exec compiler: {}", cmd.exec());
+                        }
+                        #[cfg(not(unix))] {
+                            std::process::exit(cmd.status().unwrap().code().unwrap());
+                        }
                     }
                 "#,
             )
@@ -67,7 +74,7 @@ fn rustc_info_cache() {
     };
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
         .with_stderr_contains("[..]different compiler, creating new rustc info cache[..]")
         .with_stderr_contains(MISS)
@@ -76,7 +83,7 @@ fn rustc_info_cache() {
         .run();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
@@ -87,7 +94,7 @@ fn rustc_info_cache() {
     other_rustc.move_into_the_future();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
         .with_stderr_contains("[..]different compiler, creating new rustc info cache[..]")
         .with_stderr_contains(MISS)
@@ -96,7 +103,7 @@ fn rustc_info_cache() {
         .run();
 
     p.cargo("build")
-        .env("CARGO_LOG", "cargo::util::rustc=debug")
+        .env("CARGO_LOG", "targo::util::rustc=debug")
         .env("RUSTC", other_rustc.display().to_string())
         .with_stderr_contains("[..]reusing existing rustc info cache[..]")
         .with_stderr_contains(HIT)
@@ -137,15 +144,25 @@ fn rustc_info_cache_with_wrappers() {
                 let mut args = std::env::args_os();
                 let _me = args.next().unwrap();
                 let rustc = args.next().unwrap();
-                let status = std::process::Command::new(rustc).args(args).status().unwrap();
-                std::process::exit(if status.success() { 0 } else { 1 })
+                let mut command = std::process::Command::new(rustc);
+                command.args(args);
+                // Trust: a transparent compiler wrapper preserves the caller's
+                // scheduling handoff by replacing itself on Unix.
+                #[cfg(unix)] {
+                    use std::os::unix::process::CommandExt;
+                    panic!("failed to exec compiler: {}", command.exec());
+                }
+                #[cfg(not(unix))] {
+                    let status = command.status().unwrap();
+                    std::process::exit(if status.success() { 0 } else { 1 });
+                }
             }
             "#,
         );
         wrapper_project.cargo("build").with_status(0).run();
 
         p.cargo("build")
-            .env("CARGO_LOG", "cargo::util::rustc=debug")
+            .env("CARGO_LOG", "targo::util::rustc=debug")
             .env(wrapper_env, &wrapper)
             .with_stderr_contains("[..]failed to read rustc info cache[..]")
             .with_stderr_contains(MISS)
@@ -154,7 +171,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_status(0)
             .run();
         p.cargo("build")
-            .env("CARGO_LOG", "cargo::util::rustc=debug")
+            .env("CARGO_LOG", "targo::util::rustc=debug")
             .env(wrapper_env, &wrapper)
             .with_stderr_contains("[..]reusing existing rustc info cache[..]")
             .with_stderr_contains(HIT)
@@ -167,7 +184,7 @@ fn rustc_info_cache_with_wrappers() {
         wrapper_project.cargo("build").with_status(0).run();
 
         p.cargo("build")
-            .env("CARGO_LOG", "cargo::util::rustc=debug")
+            .env("CARGO_LOG", "targo::util::rustc=debug")
             .env(wrapper_env, &wrapper)
             .with_stderr_contains("[..]different compiler, creating new rustc info cache[..]")
             .with_stderr_contains(MISS)
@@ -176,7 +193,7 @@ fn rustc_info_cache_with_wrappers() {
             .with_status(101)
             .run();
         p.cargo("build")
-            .env("CARGO_LOG", "cargo::util::rustc=debug")
+            .env("CARGO_LOG", "targo::util::rustc=debug")
             .env(wrapper_env, &wrapper)
             .with_stderr_contains("[..]reusing existing rustc info cache[..]")
             .with_stderr_contains(HIT)

@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::exec::ExecutionContext;
 use super::helpers;
-use crate::Build;
+use crate::core::session::Session;
 use crate::utils::helpers::t;
 
 #[derive(Clone, Default)]
@@ -36,6 +36,16 @@ pub struct Info {
 
 impl GitInfo {
     pub fn new(omit_git_hash: bool, dir: &Path, exec_ctx: impl AsRef<ExecutionContext>) -> GitInfo {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::utils::metadata_scheduler::hosted_graph_active() {
+            // Native local observation only. Never turn a declined external
+            // Git child into Absent, a saved tarball record, or a weaker source.
+            return crate::utils::metadata_scheduler::host_graph::native_git_info(
+                dir,
+                omit_git_hash,
+            )
+            .unwrap_or_else(|error| panic!("original graph native Git identity: {error}"));
+        }
         // See if this even begins to look like a git dir
         if !dir.join(".git").exists() {
             match read_commit_info_file(dir) {
@@ -111,8 +121,8 @@ impl GitInfo {
         self.info().map(|s| &s.commit_date[..])
     }
 
-    pub fn version(&self, build: &Build, num: &str) -> String {
-        let mut version = build.release(num);
+    pub fn version(&self, sess: &Session, num: &str) -> String {
+        let mut version = sess.release(num);
         if let Some(inner) = self.info() {
             version.push_str(" (");
             version.push_str(&inner.short_sha);

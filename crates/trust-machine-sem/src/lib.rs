@@ -1,10 +1,4 @@
 // dead_code audit: crate-level suppression removed
-// `contracts_internals` is an internal compiler feature used by the
-// `contract_requires { ... }` syntax in concrete.rs. The
-// `internal_features` lint is suppressed because this is precisely
-// the use case (verification IR using compiler-internal contracts).
-#![allow(internal_features)]
-#![feature(contracts_internals)]
 #![feature(register_tool)]
 // The effect-surface census (effect.rs) needs NO unstable feature. It used to
 // spend `#![feature(variant_count)]` on a const assertion that
@@ -13,8 +7,8 @@
 // token list by `declare_effect_census!`, so drift is unrepresentable instead of
 // asserted. That removed the only entry this crate needed on
 // `CARGO_TRUST_ALLOW_FEATURES` for its own census — it does NOT make the crate
-// feature-free: `contracts_internals` and `register_tool` above are still spent,
-// and both are already on that list for other reasons.
+// feature-free: `register_tool` above is still spent, and it is already on that
+// list for other reasons.
 #![register_tool(trust)]
 //! trust-machine-sem: ISA semantics formalization
 //!
@@ -49,6 +43,7 @@
 
 pub(crate) mod aarch64;
 pub mod concrete;
+pub mod frame_pair;
 pub(crate) mod effect;
 pub(crate) mod error;
 pub(crate) mod semantics;
@@ -70,7 +65,3 @@ pub use x86_64::X86_64Semantics;
 
 #[cfg(test)]
 mod tests;
-
-pub fn trigger_trust_verifier_overflow(x: u64, y: u64) -> u64 {
-    x + y
-}

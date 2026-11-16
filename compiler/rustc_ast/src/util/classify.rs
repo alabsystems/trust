@@ -101,7 +101,10 @@ pub fn expr_requires_semi_to_be_stmt(e: &ast::Expr) -> bool {
 pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
     loop {
         match &expr.kind {
-            Block(_, label) | ForLoop { label, .. } | Loop(_, label, _, _) | While(_, _, label, _) => {
+            Block(_, label)
+            | ForLoop(ast::ForLoop { label, .. })
+            | Loop(_, label, _, _)
+            | While(_, _, label, _) => {
                 return label.is_some();
             }
 
@@ -155,6 +158,7 @@ pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
             | Yeet(..)
             | Yield(..)
             | UnsafeBinderCast(..)
+            | GcaMacro(..)
             | Err(..)
             | Dummy => return false,
         }
@@ -240,6 +244,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<TrailingBrace<'_>> {
             | Try(_)
             | Yeet(None)
             | UnsafeBinderCast(..)
+            | GcaMacro(..)
             | Err(_)
             | Dummy => {
                 break None;
@@ -257,10 +262,10 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
                 break (mac.args.delim == Delimiter::Brace).then_some(mac);
             }
 
-            ast::TyKind::Ptr(mut_ty)
-            | ast::TyKind::Ref(_, mut_ty)
-            | ast::TyKind::PinnedRef(_, mut_ty) => {
-                ty = &mut_ty.ty;
+            ast::TyKind::Ptr(inner_ty, _)
+            | ast::TyKind::Ref(_, inner_ty, _)
+            | ast::TyKind::PinnedRef(_, inner_ty, _) => {
+                ty = inner_ty;
             }
 
             ast::TyKind::UnsafeBinder(binder) => {
@@ -301,9 +306,10 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
             | ast::TyKind::CVarArgs
             | ast::TyKind::Pat(..)
             | ast::TyKind::FieldOf(..)
+            | ast::TyKind::View(..)
+            | ast::TyKind::GcaMacro(..)
             | ast::TyKind::Dummy
-            | ast::TyKind::Err(..)
-            | ast::TyKind::View(..) => break None,
+            | ast::TyKind::Err(..) => break None,
         }
     }
 }

@@ -279,7 +279,7 @@ mod cfg {
     }
 
     /// The CPU [target architecture](https://doc.rust-lang.org/stable/reference/conditional-compilation.html#target_arch).
-    /// This is similar to the first element of the platform's target triple, but not identical.
+    /// This is similar to the first element of the platform's target tuple, but not identical.
     #[track_caller]
     pub fn cargo_cfg_target_arch() -> String {
         to_string(var_or_panic("CARGO_CFG_TARGET_ARCH"))
@@ -292,7 +292,7 @@ mod cfg {
     }
 
     /// The [target environment](https://doc.rust-lang.org/stable/reference/conditional-compilation.html#target_env) ABI.
-    /// This value is similar to the fourth element of the platform's target triple.
+    /// This value is similar to the fourth element of the platform's target tuple.
     ///
     /// For historical reasons, this value is only defined as not the empty-string when
     /// actually needed for disambiguation. Thus, for example, on many GNU platforms,
@@ -320,17 +320,6 @@ mod cfg {
         to_strings(var_or_panic(&cargo_cfg_var("target_has_atomic")), ',')
     }
 
-    /// List of atomic widths that have equal alignment requirements.
-    #[doc = unstable!(cfg_target_has_atomic_equal_alignment, 93822)]
-    #[cfg(feature = "unstable")]
-    #[track_caller]
-    pub fn cargo_cfg_target_has_atomic_equal_alignment() -> Vec<String> {
-        to_strings(
-            var_or_panic(&cargo_cfg_var("target_has_atomic_equal_alignment")),
-            ',',
-        )
-    }
-
     /// List of atomic widths that have atomic load and store operations.
     #[doc = unstable!(cfg_target_has_atomic_load_store, 94039)]
     #[cfg(feature = "unstable")]
@@ -342,8 +331,18 @@ mod cfg {
         )
     }
 
+    /// List of atomic widths where the [atomic type has the same alignment as the corresponding integer type](https://doc.rust-lang.org/stable/reference/conditional-compilation.html#target_has_atomic_primitive_alignment).
+    #[doc = requires_msrv!("1.97")]
+    #[track_caller]
+    pub fn cargo_cfg_target_has_atomic_primitive_alignment() -> Vec<String> {
+        to_strings(
+            var_or_panic(&cargo_cfg_var("target_has_atomic_primitive_alignment")),
+            ',',
+        )
+    }
+
     /// The [target operating system](https://doc.rust-lang.org/stable/reference/conditional-compilation.html#target_os).
-    /// This value is similar to the second and third element of the platform's target triple.
+    /// This value is similar to the second and third element of the platform's target tuple.
     #[track_caller]
     pub fn cargo_cfg_target_os() -> String {
         to_string(var_or_panic("CARGO_CFG_TARGET_OS"))
@@ -405,16 +404,16 @@ pub fn out_dir() -> PathBuf {
     to_path(var_or_panic("OUT_DIR"))
 }
 
-/// The [target triple] that is being compiled for. Native code should be compiled
-///  for this triple.
+/// The [target tuple] that is being compiled for. Native code should be compiled
+///  for this tuple.
 ///
-/// [target triple]: https://doc.rust-lang.org/stable/cargo/appendix/glossary.html#target
+/// [target tuple]: https://doc.rust-lang.org/stable/cargo/appendix/glossary.html#target
 #[track_caller]
 pub fn target() -> String {
     to_string(var_or_panic("TARGET"))
 }
 
-/// The host triple of the Rust compiler.
+/// The host tuple of the Rust compiler.
 #[track_caller]
 pub fn host() -> String {
     to_string(var_or_panic("HOST"))
@@ -612,6 +611,35 @@ pub fn cargo_pkg_readme() -> Option<PathBuf> {
     to_opt(var_or_panic("CARGO_PKG_README")).map(to_path)
 }
 
+/// The value of the [`trim-paths`] profile option.
+///
+/// If the build script introduces absolute paths to built artifacts (such as by invoking a compiler),
+/// the user may request them to be sanitized in different types of artifacts.
+/// Common paths requiring sanitization include `OUT_DIR`, `CARGO_MANIFEST_DIR` and `CARGO_MANIFEST_PATH`,
+/// plus any other introduced by the build script, such as include directories.
+///
+/// [`trim-paths`]: https://doc.rust-lang.org/stable/cargo/reference/profiles.html#trim-paths
+#[doc = respected_msrv!("1.101")]
+#[track_caller]
+pub fn cargo_trim_paths_scope() -> Option<Vec<String>> {
+    ENV.get("CARGO_TRIM_PATHS_SCOPE")
+        .map(|v| to_strings(v, ','))
+}
+
+/// The `<from>=<to>` path remap pairs Cargo passes to the compiler.
+///
+/// Empty when [`trim-paths`] is `"none"`.
+/// Build scripts can forward these mappings to C/C++ compilers and other tools,
+/// for example via `cc`'s `-ffile-prefix-map`,
+/// to sanitize paths consistently with the rest of the build.
+///
+/// [`trim-paths`]: https://doc.rust-lang.org/stable/cargo/reference/profiles.html#trim-paths
+#[doc = respected_msrv!("1.101")]
+#[track_caller]
+pub fn cargo_trim_paths_remap() -> Option<Vec<(PathBuf, PathBuf)>> {
+    ENV.get("CARGO_TRIM_PATHS_REMAP").map(to_remap_pairs)
+}
+
 #[track_caller]
 fn var_or_panic(key: &str) -> std::ffi::OsString {
     ENV.get(key)
@@ -647,6 +675,24 @@ fn to_strings(value: std::ffi::OsString, sep: char) -> Vec<String> {
 }
 
 #[track_caller]
+fn to_remap_pairs(value: std::ffi::OsString) -> Vec<(PathBuf, PathBuf)> {
+    let mut pairs = Vec::new();
+    for pair in std::env::split_paths(&value) {
+        if pair.as_os_str().is_empty() {
+            continue;
+        }
+        let pair = to_string(pair.into_os_string());
+        // Split at the last `=` like rustc does.
+        // <https://github.com/rust-lang/rust/blob/feaadeeaca7/compiler/rustc_session/src/config.rs#L2662-L2676>
+        let Some((from, to)) = pair.rsplit_once('=') else {
+            panic!("invalid path remap pair {pair:?}, expected `<from>=<to>`")
+        };
+        pairs.push((PathBuf::from(from), PathBuf::from(to)));
+    }
+    pairs
+}
+
+#[track_caller]
 fn to_parsed<T>(value: std::ffi::OsString) -> T
 where
     T: std::str::FromStr,
@@ -658,5 +704,25 @@ where
         Err(err) => {
             panic!("{err}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_pairs() {
+        let value =
+            std::env::join_paths(["/from=with=equals=.", "/sysroot=/rustc/some-hash"]).unwrap();
+        assert_eq!(
+            to_remap_pairs(value),
+            vec![
+                (PathBuf::from("/from=with=equals"), PathBuf::from(".")),
+                (PathBuf::from("/sysroot"), PathBuf::from("/rustc/some-hash")),
+            ]
+        );
+
+        assert_eq!(to_remap_pairs(std::ffi::OsString::new()), Vec::new());
     }
 }

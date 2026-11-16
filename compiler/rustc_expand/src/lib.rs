@@ -2,12 +2,18 @@
 #![allow(internal_features)]
 #![feature(associated_type_defaults)]
 #![feature(default_field_values)]
+#![feature(deref_patterns)]
 #![feature(macro_metavar_expr)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_internals)]
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
 // tidy-alphabetical-end
+// Trust (D21): native equality controls and the exact ABI in worker duplex tests.
+#![cfg_attr(
+    test,
+    feature(proc_macro_span, proc_macro_expand, proc_macro_tracked_env, proc_macro_tracked_path)
+)]
 
 mod build;
 mod diagnostics;
@@ -22,7 +28,3 @@ pub mod config;
 pub mod expand;
 pub mod module;
 pub mod proc_macro;
-
-pub fn provide(providers: &mut rustc_middle::query::Providers) {
-    providers.derive_macro_expansion = proc_macro::provide_derive_macro_expansion;
-}

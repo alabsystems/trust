@@ -1,0 +1,46 @@
+{
+  "id": "al07-laundered-alias-elide",
+  "class": "LAUNDERED-ALIAS-ELIDE-1",
+  "title": "the al02 shape with an overflow row, laundered by a plain `as` cast: proved, kernel-certified, and its check elided in the advisory lane",
+  "origin": [
+    "KH 'FIXED 2026-10-11 ... LAUNDERED-ALIAS-ELIDE-1'",
+    "crates/trust-vcgen/tests/fixtures/ploss_adv/h1_alias_cast.rs (al07, al18)"
+  ],
+  "lang": "rust",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "al07_cast_store_add_bug",
+    "obligation": {
+      "kind": "overflow",
+      "at": "x + 1"
+    }
+  },
+  "twin": {
+    "function": "al18_store_then_read_ctl",
+    "obligation": {
+      "kind": "overflow",
+      "at": "*q + 1"
+    }
+  },
+  "witness": {
+    "input": "m = usize::MAX, n = 3",
+    "observed": "attempt to add with overflow",
+    "exit": 101,
+    "main": "witness.rs"
+  },
+  "expect": {
+    "trust-vc-syn": {
+      "twin": "not-in-fragment"
+    }
+  },
+  "opt_levels": [
+    "0",
+    "1"
+  ],
+  "expected_refusal": {
+    "trust-vc-syn": {
+      "reproducer": "assignment through a dereferenced reference is unsupported in vc_extraction",
+      "twin": "assignment through a dereferenced reference is unsupported in vc_extraction"
+    }
+  }
+}

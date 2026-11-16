@@ -1,11 +1,11 @@
 use rustc_abi::ExternAbi;
 use rustc_ast::InlineAsmOptions;
 use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
+use rustc_lint_defs::builtin::FFI_UNWIND_CALLS;
 use rustc_middle::mir::*;
 use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::{self, TyCtxt, layout};
-use rustc_middle::{bug, span_bug};
-use rustc_session::lint::builtin::FFI_UNWIND_CALLS;
+use rustc_span::{bug, span_bug};
 use rustc_target::spec::PanicStrategy;
 use tracing::debug;
 
@@ -24,21 +24,21 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
 
     let body = &*tcx.mir_built(local_def_id).borrow();
 
-    let body_ty = tcx.type_of(def_id).skip_binder();
-    let body_abi = match body_ty.kind() {
-        ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
-        ty::Closure(..) => ExternAbi::RustCall,
-        ty::CoroutineClosure(..) => ExternAbi::RustCall,
-        ty::Coroutine(..) => ExternAbi::Rust,
-        ty::Error(_) => return false,
-        _ => span_bug!(body.span, "unexpected body ty: {:?}", body_ty),
+    let mut body_can_unwind: Option<bool> = None;
+    let check_body_can_unwind = |body_can_unwind: &mut Option<bool>| -> bool {
+        *body_can_unwind.get_or_insert_with(|| {
+            let body_ty = tcx.type_of(def_id).skip_binder();
+            let body_abi = match body_ty.kind() {
+                ty::FnDef(..) => body_ty.fn_sig(tcx).abi(),
+                ty::Closure(..) => ExternAbi::RustCall,
+                ty::CoroutineClosure(..) => ExternAbi::RustCall,
+                ty::Coroutine(..) => ExternAbi::Rust,
+                ty::Error(_) => return false,
+                _ => span_bug!(body.span, "unexpected body ty: {:?}", body_ty),
+            };
+            layout::fn_can_unwind(tcx, Some(def_id), body_abi)
+        })
     };
-    let body_can_unwind = layout::fn_can_unwind(tcx, Some(def_id), body_abi);
-
-    // Foreign unwinds cannot leak past functions that themselves cannot unwind.
-    if !body_can_unwind {
-        return false;
-    }
 
     let mut tainted = false;
 
@@ -50,6 +50,9 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
 
         if let TerminatorKind::InlineAsm { options, .. } = &terminator.kind {
             if options.contains(InlineAsmOptions::MAY_UNWIND) {
+                if !check_body_can_unwind(&mut body_can_unwind) {
+                    return false;
+                }
                 // We have detected an inline asm block that can possibly leak foreign unwind.
                 //
                 // Because the function body itself can unwind, we are not aborting this function call
@@ -78,14 +81,6 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
         let TerminatorKind::Call { func, .. } = &terminator.kind else { continue };
 
         let ty = func.ty(body, tcx);
-        let sig = ty.fn_sig(tcx);
-
-        // Rust calls cannot themselves create foreign unwinds.
-        // We assume this is true for intrinsics as well.
-        if sig.abi().is_rustic_abi() {
-            continue;
-        };
-
         let fn_def_id = match ty.kind() {
             ty::FnPtr(..) => None,
             &ty::FnDef(def_id, _) => {
@@ -99,6 +94,18 @@ fn has_ffi_unwind_calls(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
             }
             _ => bug!("invalid callee of type {:?}", ty),
         };
+
+        let sig = ty.fn_sig(tcx);
+
+        // Rust calls cannot themselves create foreign unwinds.
+        // We assume this is true for intrinsics as well.
+        if sig.abi().is_rustic_abi() {
+            continue;
+        };
+
+        if !check_body_can_unwind(&mut body_can_unwind) {
+            return false;
+        }
 
         if layout::fn_can_unwind(tcx, fn_def_id, sig.abi()) {
             // We have detected a call that can possibly leak foreign unwind.

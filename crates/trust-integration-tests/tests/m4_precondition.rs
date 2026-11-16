@@ -80,9 +80,11 @@ fn test_m4_binary_search_without_precondition_fails() {
     assert!(!proposals.is_empty(), "strengthen should propose preconditions for IndexOutOfBounds");
 
     // The top proposal should be a requires(index < slice.len()) precondition.
+    // strengthen emits native clause text (`requires ...`), not the
+    // `#[requires(...)]` attribute, since fecb0d83b03.
     let top = &proposals[0];
     assert!(
-        top.spec_text.contains("#[requires("),
+        top.spec_text.starts_with("requires "),
         "top proposal should be a requires precondition: got '{}'",
         top.spec_text
     );
@@ -329,24 +331,29 @@ fn test_m4_binary_search_with_sorted_precondition_succeeds() {
 
     assert!(proved_result.is_proved(), "with is_sorted, OOB VC should be proved");
 
-    // Build proof report showing the verification succeeds.
+    // Build the report. Since 72ada1163c6, build_json_report runs the
+    // fail-closed publication gate: a hand-built raw `Proved` with no
+    // request-bound structured proof or transport evidence is published as
+    // Unknown, never counted as proved. The precondition removes the failure;
+    // it cannot make a freely constructible result publication-grade.
     let results = vec![(vc.clone(), proved_result)];
     let report = trust_report::build_json_report("m4-sorted-precondition", &results);
 
-    assert_eq!(
-        report.summary.total_proved, 1,
-        "all obligations should be proved with is_sorted precondition"
-    );
     assert_eq!(report.summary.total_failed, 0, "no failures with is_sorted precondition");
+    assert_eq!(
+        report.summary.total_proved, 0,
+        "a raw hand-built Proved must not be published as proved"
+    );
+    assert_eq!(report.summary.total_unknown, 1, "the gate publishes the raw Proved as Unknown");
     assert!(
-        matches!(report.summary.verdict, trust_types::CrateVerdict::Verified),
-        "verdict should be Verified, got: {:?}",
+        !matches!(report.summary.verdict, trust_types::CrateVerdict::Verified),
+        "verdict must not be Verified without publication-grade evidence, got: {:?}",
         report.summary.verdict
     );
 
     eprintln!("=== M4 Precondition Inference: With is_sorted ===");
     eprintln!("  VC: {:?}", vc.kind);
-    eprintln!("  Result: PROVED (is_sorted precondition applied)");
+    eprintln!("  Result: raw PROVED, published as Unknown by the publication gate");
     eprintln!("  Verdict: {:?}", report.summary.verdict);
     eprintln!("==================================================");
 }
@@ -484,20 +491,31 @@ fn test_m4_full_precondition_inference_loop() {
         total_with_assumptions: 0,
     };
 
+    // The failure is gone after strengthening. The raw hand-built Proved is
+    // still published as Unknown by the fail-closed publication gate
+    // (72ada1163c6), so the report must not claim Verified.
     let report2 =
         trust_report::build_json_report("phase3", &strengthened_crate.functions[0].results);
-    assert_eq!(report2.summary.total_proved, 1, "Phase 3: should be proved after strengthening");
     assert_eq!(report2.summary.total_failed, 0, "Phase 3: no failures");
+    assert_eq!(
+        report2.summary.total_proved, 0,
+        "Phase 3: a raw hand-built Proved must not be published as proved"
+    );
+    assert_eq!(report2.summary.total_unknown, 1, "Phase 3: the gate publishes it as Unknown");
     assert!(
-        matches!(report2.summary.verdict, trust_types::CrateVerdict::Verified),
-        "Phase 3: verdict should be Verified"
+        !matches!(report2.summary.verdict, trust_types::CrateVerdict::Verified),
+        "Phase 3: verdict must not be Verified, got: {:?}",
+        report2.summary.verdict
     );
 
     // --- Summary ---
     eprintln!("=== M4 Full Precondition Inference Loop ===");
     eprintln!("  Phase 1 (no precondition): FAILED ({} violations)", report1.summary.total_failed);
     eprintln!("  Phase 2 (strengthen): {} proposals generated", output.proposals.len());
-    eprintln!("  Phase 3 (with is_sorted): VERIFIED ({} proved)", report2.summary.total_proved);
+    eprintln!(
+        "  Phase 3 (with is_sorted): {} failed, {} unknown (publication gate)",
+        report2.summary.total_failed, report2.summary.total_unknown
+    );
     eprintln!("  Demonstrates: fail -> infer is_sorted -> re-verify -> proved");
     eprintln!("============================================");
 }

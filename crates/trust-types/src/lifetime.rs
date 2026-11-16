@@ -328,35 +328,36 @@ impl BorrowChecker {
     /// Updates the ownership map based on moves, copies, and borrows
     /// observed in the statement. Returns any ownership transfers.
     pub fn track_ownership(&mut self, stmt: &Statement) -> Vec<OwnershipTransfer> {
-        let mut new_transfers = Vec::new();
+        let prev_len = self.transfers.len();
+        self.track_ownership_in_place(stmt);
+        self.transfers[prev_len..].to_vec()
+    }
 
+    /// Track ownership changes from a statement without allocating a return vector.
+    pub(crate) fn track_ownership_in_place(&mut self, stmt: &Statement) {
         if let Statement::Assign { place, rvalue, span } = stmt {
             match rvalue {
                 Rvalue::Use(Operand::Move(src)) => {
                     // Move: source becomes moved, dest becomes owned.
-                    let transfer = OwnershipTransfer::Move {
-                        from: src.clone(),
-                        to: place.clone(),
-                        span: span.clone(),
-                    };
                     self.ownership.insert(
                         src.local,
                         OwnershipState::Moved { destination: place.clone(), span: span.clone() },
                     );
                     self.ownership.insert(place.local, OwnershipState::Owned);
-                    self.transfers.push(transfer.clone());
-                    new_transfers.push(transfer);
-                }
-                Rvalue::Use(Operand::Copy(src)) => {
-                    // Copy: source stays owned, dest becomes owned.
-                    let transfer = OwnershipTransfer::Copy {
+                    self.transfers.push(OwnershipTransfer::Move {
                         from: src.clone(),
                         to: place.clone(),
                         span: span.clone(),
-                    };
+                    });
+                }
+                Rvalue::Use(Operand::Copy(src)) => {
+                    // Copy: source stays owned, dest becomes owned.
                     self.ownership.insert(place.local, OwnershipState::Owned);
-                    self.transfers.push(transfer.clone());
-                    new_transfers.push(transfer);
+                    self.transfers.push(OwnershipTransfer::Copy {
+                        from: src.clone(),
+                        to: place.clone(),
+                        span: span.clone(),
+                    });
                 }
                 Rvalue::Ref { mutable, place: borrowed_place } => {
                     // Borrow: dest gets a reference, source stays owned.
@@ -375,8 +376,6 @@ impl BorrowChecker {
                 }
             }
         }
-
-        new_transfers
     }
 }
 
@@ -418,7 +417,7 @@ fn generate_block_borrow_vcs(
     for stmt in &block.stmts {
         if let Statement::Assign { place: _, rvalue, span } = stmt {
             // Check for use-after-move on operands.
-            for operand_place in operand_places(rvalue) {
+            for_each_rvalue_operand_place(rvalue, |operand_place| {
                 if let OwnershipState::Moved { span: move_span, .. } =
                     checker.ownership_state(operand_place.local)
                 {
@@ -437,7 +436,7 @@ fn generate_block_borrow_vcs(
                         obligation: None,
                     });
                 }
-            }
+            });
 
             // Check borrow conflicts for references.
             if let Rvalue::Ref { mutable, place: borrowed } = rvalue {
@@ -455,7 +454,7 @@ fn generate_block_borrow_vcs(
             }
 
             // Track ownership changes.
-            checker.track_ownership(stmt);
+            checker.track_ownership_in_place(stmt);
         }
     }
 
@@ -465,33 +464,40 @@ fn generate_block_borrow_vcs(
     }
 }
 
-/// Extract places used as operands in an rvalue.
-fn operand_places(rvalue: &Rvalue) -> Vec<&Place> {
+/// Visit each place used as an operand in an rvalue without heap allocation.
+pub(crate) fn for_each_rvalue_operand_place<'a>(
+    rvalue: &'a Rvalue,
+    mut f: impl FnMut(&'a Place),
+) {
     match rvalue {
-        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
-            operand_place(op).into_iter().collect()
+        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) | Rvalue::Repeat(op, _) => {
+            if let Some(p) = operand_place(op) {
+                f(p);
+            }
         }
         Rvalue::BinaryOp(_, a, b)
         | Rvalue::CheckedBinaryOp(_, a, b)
-        | Rvalue::UncheckedBinaryOp(_, a, b) => {
-            let mut places = Vec::new();
-            places.extend(operand_place(a));
-            places.extend(operand_place(b));
-            places
+        | Rvalue::UncheckedBinaryOp(_, a, b)
+        | Rvalue::PtrOffset { ptr: a, count: b } => {
+            if let Some(p) = operand_place(a) {
+                f(p);
+            }
+            if let Some(p) = operand_place(b) {
+                f(p);
+            }
         }
-        Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => vec![place],
-        Rvalue::Aggregate(_, ops) => ops.iter().filter_map(operand_place).collect(),
-        Rvalue::Repeat(op, _) => operand_place(op).into_iter().collect(),
-        Rvalue::Discriminant(p) | Rvalue::Len(p) | Rvalue::CopyForDeref(p) => vec![p],
-        // Trust: W2 inc-0 — pointer arithmetic reads BOTH the base pointer and
-        // the offset count, exactly like a `BinaryOp`.
-        Rvalue::PtrOffset { ptr, count } => {
-            let mut places = Vec::new();
-            places.extend(operand_place(ptr));
-            places.extend(operand_place(count));
-            places
+        Rvalue::Ref { place, .. }
+        | Rvalue::AddressOf(_, place)
+        | Rvalue::Discriminant(place)
+        | Rvalue::Len(place)
+        | Rvalue::CopyForDeref(place) => f(place),
+        Rvalue::Aggregate(_, ops) | Rvalue::Unsupported { operands: ops, .. } => {
+            for op in ops {
+                if let Some(p) = operand_place(op) {
+                    f(p);
+                }
+            }
         }
-        Rvalue::Unsupported { operands, .. } => operands.iter().filter_map(operand_place).collect(),
     }
 }
 
@@ -533,13 +539,6 @@ mod tests {
         let lt = Lifetime::static_lifetime();
         assert_eq!(lt.name, "'static");
         assert_eq!(lt.scope, BlockId(0));
-    }
-
-    #[test]
-    fn test_lifetime_new() {
-        let lt = Lifetime::new("'a", BlockId(3));
-        assert_eq!(lt.name, "'a");
-        assert_eq!(lt.scope, BlockId(3));
     }
 
     // --- Borrow checking tests ---

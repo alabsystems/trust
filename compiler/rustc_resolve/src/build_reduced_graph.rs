@@ -13,32 +13,34 @@ use rustc_ast::{
     DelegationSource, Fn, ForeignItem, ForeignItemKind, Inline, Item, ItemKind, NodeId, StaticItem,
     StmtKind, TraitAlias, TyAlias,
 };
+use rustc_attr_ir::{Attribute, AttributeKind, MacroUseArgs};
 use rustc_attr_parsing::AttributeParser;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::sync::WriteGuard;
 use rustc_expand::base::{ResolverExpand, SyntaxExtension, SyntaxExtensionKind};
-use rustc_hir::Attribute;
-use rustc_hir::attrs::{AttributeKind, MacroUseArgs};
 use rustc_hir::def::{self, *};
-use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_metadata::creader::LoadedMacro;
-use rustc_middle::metadata::{ModChild, Reexport};
+use rustc_middle::middle::resolve::{ModChild, PartialRes, Reexport};
 use rustc_middle::ty::{TyCtxtFeed, Visibility};
-use rustc_middle::{bug, span_bug};
+use rustc_span::def_id::{CRATE_MOD_ID, ModId};
 use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind};
-use rustc_span::{Ident, Span, Symbol, kw, sym};
+use rustc_span::{Ident, Span, Symbol, bug, kw, span_bug, sym};
 use thin_vec::ThinVec;
 use tracing::debug;
 
 use crate::Namespace::{MacroNS, TypeNS, ValueNS};
 use crate::def_collector::DefCollector;
-use crate::error_helper::{OnUnknownData, StructCtor};
-use crate::imports::{ImportData, ImportKind};
+use crate::diagnostics::impls::{OnUnknownData, StructCtor};
+use crate::imports::{ImportData, ImportKind, NameResolution, NameResolutionRef};
 use crate::macros::{MacroRulesDecl, MacroRulesScope, MacroRulesScopeRef};
 use crate::ref_mut::CmCell;
 use crate::{
     BindingKey, Decl, DeclData, DeclKind, DelayedVisResolutionError, ExternModule,
     ExternPreludeEntry, Finalize, IdentKey, LocalModule, Module, ModuleKind, ModuleOrUniformRoot,
-    ParentScope, PathResult, Res, Resolver, Segment, Used, VisResolutionError, diagnostics,
+    ParentScope, PathResult, Res, ResolutionTable, Resolver, Segment, Used, VisResolutionError,
+    diagnostics,
 };
 
 impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
@@ -70,49 +72,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         expn_id: LocalExpnId,
     ) {
         let decl =
-            self.arenas.new_def_decl(res, vis.to_def_id(), span, expn_id, Some(parent.to_module()));
+            self.arenas.new_def_decl(res, vis.to_mod_id(), span, expn_id, Some(parent.to_module()));
         let ident = IdentKey::new(orig_ident);
         self.plant_decl_into_local_module(ident, orig_ident.span, ns, decl);
-    }
-
-    /// Create a name definition from the given components, and put it into the extern module.
-    fn define_extern(
-        &self,
-        parent: ExternModule<'ra>,
-        ident: IdentKey,
-        orig_ident_span: Span,
-        ns: Namespace,
-        child_index: usize,
-        res: Res,
-        vis: Visibility<DefId>,
-        span: Span,
-        expansion: LocalExpnId,
-        ambiguity: Option<(Decl<'ra>, bool)>,
-    ) {
-        let decl = self.arenas.alloc_decl(DeclData {
-            kind: DeclKind::Def(res),
-            ambiguity: CmCell::new(ambiguity),
-            initial_vis: vis,
-            ambiguity_vis_max: CmCell::new(None),
-            ambiguity_vis_min: CmCell::new(None),
-            span,
-            expansion,
-            parent_module: Some(parent.to_module()),
-        });
-        // Even if underscore names cannot be looked up, we still need to add them to modules,
-        // because they can be fetched by glob imports from those modules, and bring traits
-        // into scope both directly and through glob imports.
-        let key =
-            BindingKey::new_disambiguated(ident, ns, || (child_index + 1).try_into().unwrap()); // 0 indicates no underscore
-        if self
-            .resolution_or_default(parent.to_module(), key, orig_ident_span)
-            .borrow_mut_unchecked()
-            .non_glob_decl
-            .replace(decl)
-            .is_some()
-        {
-            span_bug!(span, "an external binding was already defined");
-        }
     }
 
     /// Walks up the tree of definitions starting at `def_id`,
@@ -154,35 +116,57 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 if let module @ Some(..) = self.extern_module_map.borrow().get(&def_id) {
                     return module.map(|m| m.to_module());
                 }
-
-                // Query `def_kind` is not used because query system overhead is too expensive here.
-                let def_kind = self.cstore().def_kind_untracked(def_id);
-                if def_kind.is_module_like() {
-                    let parent = self.tcx.opt_parent(def_id).map(|parent_id| {
-                        self.get_nearest_non_block_module(parent_id).expect_extern()
-                    });
-                    // Query `expn_that_defined` is not used because
-                    // hashing spans in its result is expensive.
-                    let expn_id = self.cstore().expn_that_defined_untracked(self.tcx, def_id);
-                    let module = self.new_extern_module(
-                        parent,
-                        ModuleKind::Def(
-                            def_kind,
-                            def_id,
-                            DUMMY_NODE_ID,
-                            Some(self.tcx.item_name(def_id)),
-                        ),
-                        expn_id,
-                        self.def_span(def_id),
-                        // FIXME: Account for `#[no_implicit_prelude]` attributes.
-                        parent.is_some_and(|module| module.no_implicit_prelude),
-                    );
-                    return Some(module.to_module());
-                }
-
-                None
+                // We need the lock on the extern_module_map for the entire duration of this call.
+                // It is otherwise entirely possible 2 different threads will create and allocate
+                // the exact same module during speculative resolution.
+                // FIXME(parallel_import_resolution): We lock the entire map to make sure
+                // no 2+ threads try to create the exact same module. Could it be possible to
+                // only "lock on" `def_id`?
+                let mut lock = self.extern_module_map.borrow_mut();
+                // No reentrant locking possible, so do a recursive call with lock
+                // passed as argument.
+                self.get_extern_module_with_lock(def_id, &mut lock).map(ExternModule::to_module)
             }
         }
+    }
+
+    fn get_extern_module_with_lock(
+        &self,
+        def_id: DefId,
+        map_lock: &mut WriteGuard<'_, FxIndexMap<DefId, ExternModule<'ra>>>,
+    ) -> Option<ExternModule<'ra>> {
+        if let module @ Some(..) = map_lock.get(&def_id) {
+            return module.copied();
+        }
+        // Query `def_kind` is not used because query system overhead is too expensive here.
+        let def_kind = self.cstore().def_kind_untracked(def_id);
+        if def_kind.is_module_like() {
+            let parent = self.tcx.opt_parent(def_id).map(|mut parent_id| {
+                loop {
+                    match self.get_extern_module_with_lock(parent_id, map_lock) {
+                        Some(module) => break module,
+                        None => parent_id = self.tcx.parent(parent_id),
+                    }
+                }
+            });
+            // Query `expn_that_defined` is not used because
+            // hashing spans in its result is expensive.
+            let expn_id = self.cstore().expn_that_defined_untracked(self.tcx, def_id);
+            let module = ExternModule::new(
+                parent,
+                ModuleKind::Def(def_kind, def_id, DUMMY_NODE_ID, Some(self.tcx.item_name(def_id))),
+                self.tcx.visibility(def_id),
+                expn_id,
+                self.def_span(def_id),
+                // FIXME: Account for `#[no_implicit_prelude]` attributes.
+                parent.is_some_and(|module| module.no_implicit_prelude),
+                self.arenas,
+            );
+            map_lock.insert(def_id, module);
+            return Some(module);
+        }
+
+        None
     }
 
     pub(crate) fn expn_def_scope(&self, expn_id: ExpnId) -> Module<'ra> {
@@ -294,7 +278,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         res,
                     ))
                 };
-                match self.cm().resolve_path(
+                match self.cm_mut().resolve_path(
                     &segments,
                     None,
                     parent_scope,
@@ -313,7 +297,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                     Ok(Visibility::Public)
                                 }
                                 _ => {
-                                    let vis = Visibility::Restricted(res.def_id());
+                                    let vis =
+                                        Visibility::Restricted(ModId::new_unchecked(res.def_id()));
                                     if self.is_accessible_from(vis, parent_scope.module) {
                                         if finalize {
                                             self.record_partial_res(id, PartialRes::new(res));
@@ -332,14 +317,15 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     PathResult::NonModule(partial_res) => {
                         expected_found_error(partial_res.expect_full_res())
                     }
-                    PathResult::Failed { label, suggestion, message, segment, .. } => {
-                        Err(VisResolutionError::FailedToResolve(
-                            segment.span,
-                            segment.name,
+                    PathResult::Failed { label, suggestion, help, message, segment, .. } => {
+                        Err(VisResolutionError::FailedToResolve {
+                            span: segment.span,
+                            segment: segment.name,
                             label,
                             suggestion,
+                            help,
                             message,
-                        ))
+                        })
                     }
                     PathResult::Indeterminate => Err(VisResolutionError::Indeterminate(path.span)),
                 }
@@ -347,11 +333,21 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
     }
 
-    pub(crate) fn build_reduced_graph_external(&self, module: ExternModule<'ra>) {
+    pub(crate) fn build_reduced_graph_external(
+        &self,
+        module: ExternModule<'ra>,
+    ) -> ResolutionTable<'ra> {
+        let mut resolutions = FxIndexMap::default();
         let def_id = module.def_id();
         let children = self.tcx.module_children(def_id);
         for (i, child) in children.iter().enumerate() {
-            self.build_reduced_graph_for_external_crate_res(child, module, i, None)
+            self.build_reduced_graph_for_external_crate_res(
+                child,
+                module,
+                i,
+                None,
+                &mut resolutions,
+            )
         }
         for (i, child) in
             self.cstore().ambig_module_children_untracked(self.tcx, def_id).enumerate()
@@ -361,8 +357,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 module,
                 children.len() + i,
                 Some(&child.second),
+                &mut resolutions,
             )
         }
+        resolutions
     }
 
     /// Builds the reduced graph for a single item in an external crate.
@@ -372,6 +370,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         parent: ExternModule<'ra>,
         child_index: usize,
         ambig_child: Option<&ModChild>,
+        resolutions: &mut FxIndexMap<BindingKey, NameResolutionRef<'ra>>,
     ) {
         let child_span = |this: &Self, reexport_chain: &[Reexport], res: def::Res<_>| {
             this.def_span(
@@ -395,19 +394,35 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         });
 
         // Record primary definitions.
-        let define_extern = |ns| {
-            self.define_extern(
-                parent,
-                ident,
-                orig_ident.span,
-                ns,
-                child_index,
-                res,
-                vis,
+        let mut define_extern = |ns| {
+            let orig_ident_span = orig_ident.span;
+            let reexport_chain: &[Reexport] = if !reexport_chain.is_empty() {
+                self.arenas.dropless.alloc_slice(reexport_chain)
+            } else {
+                &[]
+            };
+            let decl = self.arenas.alloc_decl(DeclData {
+                kind: DeclKind::Def(res, reexport_chain),
+                ambiguity: CmCell::new(ambig),
+                initial_vis: vis,
+                ambiguity_vis_max: CmCell::new(None),
+                ambiguity_vis_min: CmCell::new(None),
                 span,
                 expansion,
-                ambig,
-            )
+                parent_module: Some(parent.to_module()),
+            });
+            let resolution = self.arenas.alloc_name_resolution(NameResolution {
+                non_glob_decl: Some(decl),
+                orig_ident_span,
+                single_imports: Default::default(),
+                ..
+            });
+
+            let key =
+                BindingKey::new_disambiguated(ident, ns, || (child_index + 1).try_into().unwrap());
+            if resolutions.insert(key, resolution).is_some() {
+                span_bug!(span, "an external binding was already defined");
+            }
         };
         match res {
             Res::Def(
@@ -430,8 +445,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 DefKind::Fn
                 | DefKind::AssocFn
                 | DefKind::Static { .. }
-                | DefKind::Const { .. }
-                | DefKind::AssocConst { .. }
+                | DefKind::Const
+                | DefKind::AssocConst
                 | DefKind::Ctor(..),
                 _,
             ) => define_extern(ValueNS),
@@ -443,13 +458,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 | DefKind::Use
                 | DefKind::ForeignMod
                 | DefKind::AnonConst
-                | DefKind::InlineConst
                 | DefKind::Field
                 | DefKind::LifetimeParam
                 | DefKind::GlobalAsm
                 | DefKind::Closure
                 | DefKind::SyntheticCoroutineBody
-                | DefKind::Impl { .. },
+                | DefKind::Impl { .. }
+                | DefKind::TestBinderConstraints,
                 _,
             )
             | Res::Local(..)
@@ -538,6 +553,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         let parent = self.parent_scope.module.expect_local();
         let expansion = self.parent_scope.expansion;
         // PUBLIC, and this is the parity criterion rather than a convenience.
+        // (One exception, for `private`: see the loop.)
         //
         // The `clean { … }` island has no visibility syntax, so the choice is
         // between two inventions and the question is which one keeps the two
@@ -551,11 +567,23 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         // the parity fixture rules out. `Public` is the reach Clean already
         // gives it. (Measured: `Restricted` produced `E0603: function `f` is
         // private` on `clean_origin_call_parity.rs`.)
-        let vis = Visibility::Public;
-
+        //
+        // Trust (2026-09-28): EXCEPT a `private def`, which is `pub(crate)`.
+        // The CALL capability obeys the declaring language's own visibility
+        // (spec surface §4.1.1, "Clean `private`/`protected`"), and `Public`
+        // for every declaration made a Lean `private def` callable from ANOTHER
+        // crate (measured: `privlib::api::secret(21)` built and ran). The same
+        // parity argument picks the crate as its reach: any island in this crate
+        // may call a `private def` of another module's island (measured), so
+        // `crate::m::f` is nameable exactly where `Crate.m.f` is.
         for decl in &island.decls {
             let Some(grant) = self.r.clean_origin_mints.grant(decl.node_id).cloned() else {
                 continue;
+            };
+            let vis = if decl.is_private {
+                Visibility::Restricted(CRATE_MOD_ID)
+            } else {
+                Visibility::Public
             };
             let ident = Ident::new(grant.name, grant.span);
             let feed = self.create_def(decl.node_id, Some(grant.name), DefKind::Fn, grant.span);
@@ -572,6 +600,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             self.r.define_local(parent, ident, ValueNS, res, vis, grant.span, expansion);
 
             self.r.clean_origin_defs.push((def_id, grant.name, grant.span));
+            self.r.clean_origin_def_nodes.insert(decl.node_id, def_id);
         }
     }
 
@@ -601,8 +630,9 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             param_def_id_to_index: Default::default(),
             has_self: false,
             has_late_bound_regions: None,
+            has_arg_pos_consts: false,
         });
-        feed.explicit_predicates_of(ty::GenericPredicates { parent: None, predicates: &[] });
+        feed.explicit_clauses_of(ty::GenericClauses { parent: None, clauses: &[] });
         feed.inferred_outlives_of(&[]);
         feed.param_env(ty::ParamEnv::empty());
 
@@ -642,7 +672,11 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         );
         feed.type_of(ty::EarlyBinder::bind(
             tcx,
-            Ty::new_fn_def(tcx, def_id.to_def_id(), [] as [ty::GenericArg<'tcx>; 0]),
+            Ty::new_fn_def(
+                tcx,
+                def_id.to_def_id(),
+                ty::Binder::dummy([] as [ty::GenericArg<'tcx>; 0]),
+            ),
         ));
 
         // Pure, total, deterministic — so const-callable, which is what the
@@ -656,8 +690,18 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         // safety property. `always: false` also makes
         // `is_conditionally_const` true, which is why `const_conditions` is fed
         // below.
-        feed.constness(rustc_hir::Constness::Const { always: false });
-        feed.const_conditions(ty::ConstConditions { parent: None, predicates: &[] });
+        // Trust (W5, Lean-calls-Rust): `Const` ONLY when the grant says so — a
+        // def whose body calls a Rust `fn` is `const` iff every callee's own
+        // header is `const fn` (`CleanOriginMint::is_const`). Feeding `Const`
+        // unconditionally would send a non-`const` callee reached from
+        // `const X = twice_inc(5)` into CTFE with a bare rustc error instead
+        // of the ordinary E0015 at the `const` item.
+        feed.constness(if grant.is_const {
+            rustc_hir::Constness::Const { always: false }
+        } else {
+            rustc_hir::Constness::NotConst
+        });
+        feed.const_conditions(ty::ConstConditions { parent: None, clauses: &[] });
         feed.codegen_fn_attrs(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs::new());
     }
 
@@ -674,7 +718,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         let defaults = fields
             .iter()
             .enumerate()
-            .filter_map(|(i, field)| field.default.as_ref().map(|_| field_name(i, field).name))
+            .filter_map(|(i, field)| field.default_value().map(|_| field_name(i, field).name))
             .collect();
         self.r.field_names.insert(def_id, field_names);
         self.r.field_defaults.insert(def_id, defaults);
@@ -724,13 +768,13 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             on_unknown_attr: OnUnknownData::from_attrs(self.r, &item.attrs),
         });
 
-        self.r.indeterminate_imports.push(import);
+        self.r.indeterminate_imports.push((import, None, 0));
         match import.kind {
             ImportKind::Single { target, .. } => {
                 // Don't add underscore imports to `single_imports`
                 // because they cannot define any usable names.
                 if target.name != kw::Underscore {
-                    self.r.per_ns(|this, ns| {
+                    self.r.per_ns_mut(|this, ns| {
                         let key = BindingKey::new(IdentKey::new(target), ns);
                         this.resolution_or_default(current_module.to_module(), key, target.span)
                             .borrow_mut(this)
@@ -744,16 +788,17 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         }
     }
 
+    /// Note:
+    /// - `item` is the top-level `use` item.
+    /// - `use_tree` is the particular use tree within the top-level `use` item.
     fn build_reduced_graph_for_use_tree(
         &mut self,
-        // This particular use tree
+        item: &Item,
         use_tree: &ast::UseTree,
         id: NodeId,
         parent_prefix: &[Segment],
         nested: bool,
         list_stem: bool,
-        // The whole `use` item
-        item: &Item,
         vis: Visibility,
         root_span: Span,
         feed: TyCtxtFeed<'tcx, LocalDefId>,
@@ -914,14 +959,20 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                 }
             }
             ast::UseTreeKind::Nested { ref items, .. } => {
-                for &(ref tree, id) in items {
-                    self.with_owner(id, None, DefKind::Use, use_tree.span(), |this, feed| {
-                        this.build_reduced_graph_for_use_tree(
-                            // This particular use tree
-                            tree, id, &prefix, true, false, // The whole `use` item
-                            item, vis, root_span, feed,
-                        )
-                    });
+                for tree in items {
+                    let id = tree.id;
+                    let feed = self.create_def(id, None, DefKind::Use, use_tree.span());
+                    self.build_reduced_graph_for_use_tree(
+                        item,
+                        &tree.inner,
+                        id,
+                        &prefix,
+                        true,
+                        false,
+                        vis,
+                        root_span,
+                        feed,
+                    );
                 }
 
                 // Empty groups `a::b::{}` are turned into synthetic `self` imports
@@ -936,20 +987,11 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                         prefix: ast::Path::from_ident(Ident::new(kw::SelfLower, new_span)),
                         kind: ast::UseTreeKind::Simple(Some(Ident::new(kw::Underscore, new_span))),
                     };
+                    let vis = Visibility::Restricted(
+                        self.parent_scope.module.nearest_parent_mod().expect_local(),
+                    );
                     self.build_reduced_graph_for_use_tree(
-                        // This particular use tree
-                        &tree,
-                        id,
-                        &prefix,
-                        true,
-                        true,
-                        // The whole `use` item
-                        item,
-                        Visibility::Restricted(
-                            self.parent_scope.module.nearest_parent_mod().expect_local(),
-                        ),
-                        root_span,
-                        feed,
+                        item, &tree, id, &prefix, true, true, vis, root_span, feed,
                     );
                 }
             }
@@ -996,14 +1038,12 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         match item.kind {
             ItemKind::Use(ref use_tree) => {
                 self.build_reduced_graph_for_use_tree(
-                    // This particular use tree
+                    item,
                     use_tree,
                     item.id,
                     &[],
                     false,
                     false,
-                    // The whole `use` item
-                    item,
                     vis,
                     use_tree.span(),
                     feed,
@@ -1093,7 +1133,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                     let mut ctor_vis = if vis.is_public()
                         && ast::attr::contains_name(&item.attrs, sym::non_exhaustive)
                     {
-                        Visibility::Restricted(CRATE_DEF_ID)
+                        Visibility::Restricted(CRATE_MOD_ID)
                     } else {
                         vis
                     };
@@ -1111,7 +1151,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                         if ctor_vis.greater_than(field_vis, self.r.tcx) {
                             ctor_vis = field_vis;
                         }
-                        field_visibilities.push(field_vis.to_def_id());
+                        field_visibilities.push(field_vis.to_mod_id());
                     }
                     // If this is a unit or tuple-like struct, register the constructor.
                     let feed = self.create_def(
@@ -1129,7 +1169,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                     self.insert_field_visibilities_local(ctor_def_id.to_def_id(), vdata.fields());
 
                     let ctor =
-                        StructCtor { res: ctor_res, vis: ctor_vis.to_def_id(), field_visibilities };
+                        StructCtor { res: ctor_res, vis: ctor_vis.to_mod_id(), field_visibilities };
                     self.r.struct_ctors.insert(local_def_id, ctor);
                 }
                 self.r.struct_generics.insert(local_def_id, generics.clone());
@@ -1151,7 +1191,8 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             | ItemKind::ForeignMod(..)
             | ItemKind::GlobalAsm(..)
             | ItemKind::CleanIsland(..)
-            | ItemKind::ConstBlock(..) => {}
+            | ItemKind::ConstBlock(..)
+            | ItemKind::TestBinderConstraints(..) => {}
 
             ItemKind::MacroDef(..) | ItemKind::MacCall(_) | ItemKind::DelegationMac(..) => {
                 unreachable!()
@@ -1313,7 +1354,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         let mut import_all = None;
         let mut single_imports = ThinVec::new();
         if let Some(Attribute::Parsed(AttributeKind::MacroUse { span, arguments })) =
-            AttributeParser::parse_limited(self.r.tcx.sess, &item.attrs, &[sym::macro_use])
+            AttributeParser::parse_limited_sym(self.r.tcx.sess, &item.attrs, &[sym::macro_use])
         {
             if self.parent_scope.module.expect_local().parent.is_some() {
                 self.r.dcx().emit_err(diagnostics::ExternCrateLoadingMacroNotAtCrateRoot {
@@ -1344,7 +1385,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                 root_span: span,
                 span,
                 module_path: Vec::new(),
-                vis: Visibility::Restricted(CRATE_DEF_ID),
+                vis: Visibility::Restricted(CRATE_MOD_ID),
                 vis_span: item.vis.span,
                 on_unknown_attr: OnUnknownData::from_attrs(this.r, &item.attrs),
             })
@@ -1456,7 +1497,9 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
     // items will be reported as `unused_macros`.
     fn insert_unused_macro(&mut self, ident: Ident, def_id: LocalDefId, node_id: NodeId) {
         if !ident.as_str().starts_with('_') {
-            self.r.unused_macros.insert(def_id, (node_id, ident));
+            self.r
+                .unused_macros
+                .insert(def_id, (node_id, ident, self.parent_scope.module.opt_def_id()));
             if let SyntaxExtensionKind::MacroRules(mr) = &self.r.local_macro_map[&def_id].kind {
                 let value = (def_id, DenseBitSet::new_filled(mr.nrules()));
                 self.r.unused_macro_rules.insert(node_id, value);
@@ -1495,16 +1538,16 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
 
         if macro_rules {
             let ident = IdentKey::new(orig_ident);
-            self.r.macro_names.insert(ident);
+            self.r.macro_names.insert(ident, def_id);
             let is_macro_export = ast::attr::contains_name(&item.attrs, sym::macro_export);
             let vis = if is_macro_export {
                 Visibility::Public
             } else {
-                Visibility::Restricted(CRATE_DEF_ID)
+                Visibility::Restricted(CRATE_MOD_ID)
             };
             let decl = self.r.arenas.new_def_decl(
                 res,
-                vis.to_def_id(),
+                vis.to_mod_id(),
                 span,
                 expansion,
                 Some(parent_scope.module),
@@ -1592,6 +1635,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                 }
                 match item.kind {
                     ItemKind::Mod(..) if self.contains_macro_use(&item.attrs) => {
+                        self.r.macro_use_mods.insert(item.id);
                         self.parent_scope.macro_rules
                     }
                     _ => orig_macro_rules_scope,
@@ -1706,7 +1750,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         // If the variant is marked as non_exhaustive then lower the visibility to within the crate.
         let ctor_vis =
             if vis.is_public() && ast::attr::contains_name(&variant.attrs, sym::non_exhaustive) {
-                Visibility::Restricted(CRATE_DEF_ID)
+                Visibility::Restricted(CRATE_MOD_ID)
             } else {
                 vis
             };

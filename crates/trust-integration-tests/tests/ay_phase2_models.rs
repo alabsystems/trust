@@ -15,7 +15,7 @@
 
 #![allow(rustc::default_hash_types, rustc::potential_query_instability)]
 
-use trust_integration_tests::ay_test_support::{ay_available, require_ay};
+use trust_integration_tests::ay_test_support::require_ay;
 use trust_router::VerificationBackend;
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
@@ -144,6 +144,7 @@ fn build_literal_positive_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -258,6 +259,7 @@ fn build_literal_negative_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -418,6 +420,7 @@ fn build_leb128_shift_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -565,6 +568,7 @@ fn build_vsids_bump_score_model() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -674,10 +678,6 @@ fn test_vsids_bump_score_vc_generation() {
 /// the constant 1, which is in range for u32.
 #[test]
 fn test_real_ay_literal_positive_shift_safe() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_literal_positive_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -711,10 +711,6 @@ fn test_real_ay_literal_positive_shift_safe() {
 /// positive; `(var.0 << 1) | 1` uses an in-range constant shift amount.
 #[test]
 fn test_real_ay_literal_negative_shift_safe() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_literal_negative_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -758,10 +754,6 @@ fn test_real_ay_literal_negative_shift_safe() {
 /// refuted, and it carries the shift >= 64 counterexample.
 #[test]
 fn test_real_ay_leb128_shift_without_guard() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_leb128_shift_model();
     let vcs = trust_vcgen::generate_vcs(&func);
@@ -806,11 +798,9 @@ fn test_real_ay_leb128_shift_without_guard() {
 /// AY checks the VSIDS bump_score model: activity addition can overflow f64
 /// when both activity and increment are large positive values.
 #[test]
+#[ignore = "measurement instrument: logs ay's verdict on each float-add overflow VC and passes \
+            on any of them; run with --ignored --nocapture"]
 fn test_real_ay_vsids_bump_score_overflow() {
-    if !ay_available() {
-        eprintln!("SKIP: ay not found by integration-test helper");
-        return;
-    }
     let ay = require_ay();
     let func = build_vsids_bump_score_model();
     let vcs = trust_vcgen::generate_vcs(&func);

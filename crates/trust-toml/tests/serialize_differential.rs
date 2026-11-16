@@ -31,15 +31,14 @@
 //! multi-line literal — to minimise escaping, and measurement (see
 //! `src/emit.rs`) shows the choice is not reducible to a short rule. Nothing in
 //! this repository depends on which spelling is used; everything depends on the
-//! value being preserved. So the contract is value preservation, and byte-level
-//! agreement is asserted where it actually holds and matters:
-//! [`emitted_text_is_byte_identical_to_the_incumbent_on_the_shapes_this_tree_writes`]
-//! covers the eleven real `toml::to_string*` call sites' data shapes, and
+//! value being preserved. So the contract is value preservation, and
 //! [`byte_agreement_over_the_whole_corpus_holds_at_the_measured_floor`] pins the
-//! corpus-wide rate so a *regression* in agreement is visible even though
-//! perfect agreement is not required.
+//! corpus-wide byte-agreement rate so a *regression* in agreement is visible
+//! even though perfect agreement is not required. (A byte-identity test over
+//! the `tests/js262/*.toml` ledgers that `trust-js-differential` rewrote in
+//! place went with both on 2026-11-10.)
 //!
-//! # Three tests, three separable failures
+//! # Separable failures
 //!
 //! Split for the same reason the read-path gate is split: a corpus that quietly
 //! lost every array-of-tables would keep a merged test green while testing
@@ -157,96 +156,6 @@ fn emitted_text_reread_by_the_incumbent_equals_the_incumbents_own_tree() {
     );
 }
 
-/// Documents this repository's tooling actually *writes* with `toml::to_string`.
-///
-/// The eleven `toml::to_string*` call sites under `crates/` all live in
-/// `trust-js-differential` and all serialize one of these ledgers. Byte
-/// agreement here is what makes `src/emit.rs`'s documented string-style
-/// deviation affordable: on the real workload there is no deviation.
-const SHAPES_THIS_TREE_WRITES: &[&str] = &[
-    "tests/js262/coverage.toml",
-    "tests/js262/coverage-async.toml",
-    "tests/js262/coverage-module.toml",
-    "tests/js262/baseline.toml",
-    "tests/js262/divergence-audit.toml",
-    "tests/js262/test-exceptions.toml",
-    "tests/js262/S0.toml",
-];
-
-/// The first line where two emissions diverge, with its neighbours.
-///
-/// Printing both whole documents is what this reported at first, and on a
-/// 12,000-line ledger the result was unreadable — which in practice means the
-/// gate fires and nobody can act on it. One located line is the diagnosis.
-fn first_difference(left: &str, right: &str) -> String {
-    let left_lines: Vec<&str> = left.lines().collect();
-    let right_lines: Vec<&str> = right.lines().collect();
-    for (index, (left_line, right_line)) in left_lines.iter().zip(&right_lines).enumerate() {
-        if left_line != right_line {
-            let context = index.saturating_sub(1);
-            return format!(
-                "  first difference at line {}:\n    context   {}\n    incumbent {left_line}\n    \
-                 trust-toml {right_line}",
-                index + 1,
-                left_lines.get(context).copied().unwrap_or("")
-            );
-        }
-    }
-    format!(
-        "  identical for {} lines, then the length differs: incumbent {} lines, trust-toml {} lines",
-        left_lines.len().min(right_lines.len()),
-        left_lines.len(),
-        right_lines.len()
-    )
-}
-
-#[test]
-fn emitted_text_is_byte_identical_to_the_incumbent_on_the_shapes_this_tree_writes() {
-    let root = repository_root();
-    let mut checked = 0usize;
-    let mut differences: Vec<String> = Vec::new();
-
-    for path in SHAPES_THIS_TREE_WRITES {
-        let text = std::fs::read_to_string(root.join(path))
-            .unwrap_or_else(|error| panic!("{path}: {error} — this list is pinned, not globbed"));
-        let theirs_tree: incumbent_toml::Value =
-            incumbent_toml::from_str(&text).unwrap_or_else(|error| panic!("{path}: {error}"));
-        let ours_tree: trust_toml::Value =
-            trust_toml::from_str(&text).unwrap_or_else(|error| panic!("{path}: {error}"));
-
-        for (label, theirs, ours) in [
-            (
-                "to_string",
-                incumbent_toml::to_string(&theirs_tree),
-                trust_toml::to_string(&ours_tree).map_err(|e| e.to_string()),
-            ),
-            (
-                "to_string_pretty",
-                incumbent_toml::to_string_pretty(&theirs_tree),
-                trust_toml::to_string_pretty(&ours_tree).map_err(|e| e.to_string()),
-            ),
-        ] {
-            checked += 1;
-            let theirs = theirs.expect("the incumbent emits its own tree");
-            let ours = ours.expect("we emit our own tree");
-            if theirs != ours {
-                differences.push(format!("{path} [{label}]\n{}", first_difference(&theirs, &ours)));
-            }
-        }
-    }
-
-    println!("byte-identity on written shapes: {checked} emissions checked");
-    assert!(
-        differences.is_empty(),
-        "the two emitters disagree byte-for-byte on {} of {checked} emission(s) of the documents \
-         this repository's own tooling writes. `src/emit.rs` claims the deviation is confined to \
-         string spellings this workload does not contain; that claim is now false and must be \
-         corrected there, not silenced here.\n\n{}",
-        differences.len(),
-        differences.join("\n\n")
-    );
-}
-
 #[test]
 fn byte_agreement_over_the_whole_corpus_holds_at_the_measured_floor() {
     // Full byte agreement is NOT required — see the module docs. What is
@@ -313,8 +222,34 @@ const BYTE_AGREEMENT_FLOOR: f64 = 1.0;
 /// without them every generated string would be pathological and the common
 /// case would go untested.
 const STRING_ALPHABET: &[&str] = &[
-    "a", "Z", "9", " ", "_", "-", ".", "#", "=", "[", "]", "{", "}", ",", "é", "→", "\u{10348}",
-    "\"", "'", "\\", "\n", "\t", "\r", "\u{8}", "\u{c}", "\u{1}", "\u{1f}", "\u{7f}",
+    "a",
+    "Z",
+    "9",
+    " ",
+    "_",
+    "-",
+    ".",
+    "#",
+    "=",
+    "[",
+    "]",
+    "{",
+    "}",
+    ",",
+    "é",
+    "→",
+    "\u{10348}",
+    "\"",
+    "'",
+    "\\",
+    "\n",
+    "\t",
+    "\r",
+    "\u{8}",
+    "\u{c}",
+    "\u{1}",
+    "\u{1f}",
+    "\u{7f}",
 ];
 
 /// A tiny deterministic PRNG, so a failure is reproducible from its seed.
@@ -396,7 +331,9 @@ fn string_spelling_matches_the_incumbent_over_generated_strings() {
         // is strictly stronger than agreeing on the spelling.
         match incumbent_toml::from_str::<incumbent_toml::Value>(&ours) {
             Ok(reread) if reread["k"].as_str() == Some(value.as_str()) => {}
-            other => lost.push(format!("{value:?}\n    we wrote {ours:?}\n    incumbent read {other:?}")),
+            other => {
+                lost.push(format!("{value:?}\n    we wrote {ours:?}\n    incumbent read {other:?}"))
+            }
         }
         // And our own parser, so the crate can read what it writes.
         match trust_toml::from_str::<trust_toml::Value>(&ours) {

@@ -1,0 +1,6 @@
+{
+  "type": "alethe_certificate",
+  "version": "1.0",
+  "problem": "(set-logic UFLIA)\n(declare-fun x () Int)\n(define-fun k () Int x)\n(define-fun h ((x Int)) Int k)\n(assert (= (h 5) x))\n(assert (not (= x 5)))\n(check-sat)\n",
+  "proof": "(assume a0 (= (h 5) x))\n(assume a1 (not (= x 5)))\n(step t1 (cl (= x 5)) :rule symm :premises (a0))\n(step t2 (cl) :rule resolution :premises (a1 t1))\n"
+}

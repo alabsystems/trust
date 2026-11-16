@@ -155,23 +155,21 @@ impl HoudiniRefiner {
             });
         }
 
-        // Track which candidates are still alive by index.
+        // Track which candidates are still alive by index, reusing one formula buffer across rounds.
         let mut alive: Vec<bool> = vec![true; candidates.len()];
+        let mut alive_formulas: Vec<Formula> = Vec::with_capacity(candidates.len());
         let mut removed_indices: Vec<usize> = Vec::new();
         let mut iterations = 0;
 
         #[allow(clippy::explicit_counter_loop)]
         for _ in 0..self.config.max_iterations {
-            // Collect alive candidate formulas.
-            let alive_formulas: Vec<Formula> = alive
-                .iter()
-                .enumerate()
-                .filter_map(
-                    |(i, &is_alive)| {
-                        if is_alive { Some(candidates[i].clone()) } else { None }
-                    },
-                )
-                .collect();
+            // Collect alive candidate formulas into the reused buffer.
+            alive_formulas.clear();
+            for (i, &is_alive) in alive.iter().enumerate() {
+                if is_alive {
+                    alive_formulas.push(candidates[i].clone());
+                }
+            }
 
             if alive_formulas.is_empty() {
                 // All candidates removed -- trivially converged.
@@ -199,15 +197,23 @@ impl HoudiniRefiner {
                     });
                 }
                 Some(cex) => {
-                    // Counterexample found: remove falsified candidates.
-                    let falsified: Vec<usize> = (0..alive.len())
-                        .filter(|&i| alive[i] && is_falsified_by(&candidates[i], &cex))
-                        .collect();
-                    for &i in &falsified {
-                        alive[i] = false;
-                        removed_indices.push(i);
+                    // Counterexample found: build pre-sized assignment map once and remove falsified candidates.
+                    let mut assignments: FxHashMap<&str, i128> =
+                        FxHashMap::with_capacity_and_hasher(
+                            cex.assignments.len(),
+                            Default::default(),
+                        );
+                    for (name, val) in &cex.assignments {
+                        assignments.insert(name.as_str(), *val);
                     }
-                    let any_removed = !falsified.is_empty();
+                    let mut any_removed = false;
+                    for (i, is_alive) in alive.iter_mut().enumerate() {
+                        if *is_alive && matches!(eval_formula(&candidates[i], &assignments), Some(false)) {
+                            *is_alive = false;
+                            removed_indices.push(i);
+                            any_removed = true;
+                        }
+                    }
 
                     if !any_removed {
                         // Counterexample doesn't falsify any individual candidate.
@@ -241,14 +247,12 @@ impl HoudiniRefiner {
 ///
 /// Builds a `HashMap` from the counterexample assignments for O(1) variable
 /// lookup instead of the previous O(n) linear scan per variable reference.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_falsified_by(formula: &Formula, cex: &Counterexample) -> bool {
     let assignments: FxHashMap<&str, i128> =
         cex.assignments.iter().map(|(name, val)| (name.as_str(), *val)).collect();
-    match eval_formula(formula, &assignments) {
-        Some(false) => true, // Definitely false -> falsified.
-        _ => false,          // True or unknown -> not falsified.
-    }
+    matches!(eval_formula(formula, &assignments), Some(false))
 }
 
 /// Evaluate a formula under concrete variable assignments.

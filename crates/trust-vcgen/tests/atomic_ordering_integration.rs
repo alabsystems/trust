@@ -33,6 +33,7 @@ fn make_atomic_func(name: &str, atomic_ops: Vec<AtomicOperation>) -> VerifiableF
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: None,
                 is_foreign: false,
                 func: format!("core::intrinsics::atomic_{}", op.op_kind),
                 args: vec![Operand::Copy(Place::local(1))],
@@ -70,6 +71,7 @@ fn make_atomic_func(name: &str, atomic_ops: Vec<AtomicOperation>) -> VerifiableF
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -165,10 +167,12 @@ fn test_integration_l3_cas_failure_release_produces_vc() {
     assert!(!vcs.is_empty(), "CAS with failure=Release should produce L3 VC");
 }
 
+/// The retired L4 rule: a CAS failure ordering stronger than the success
+/// ordering is valid Rust since 1.64, and `core::sync::atomic` issues it.
 #[test]
-fn test_integration_l4_cas_failure_stronger_than_success() {
+fn test_integration_failure_stronger_than_success_is_legal() {
     let func = make_atomic_func(
-        "bad_cas_order",
+        "cas_failure_stronger",
         vec![make_op(
             AtomicOpKind::CompareExchange,
             AtomicOrdering::Relaxed,
@@ -177,8 +181,9 @@ fn test_integration_l4_cas_failure_stronger_than_success() {
     );
 
     let ops = extract_atomic_ops(&func);
+    assert_eq!(ops.len(), 1, "the CAS must be extracted for the check to mean anything");
     let vcs = MemoryModelChecker::check_operation_legality(&ops, &func.name);
-    assert!(!vcs.is_empty(), "CAS with failure > success should produce L4 VC");
+    assert!(vcs.is_empty(), "failure stronger than success is legal, got {vcs:?}");
 }
 
 #[test]
@@ -332,6 +337,7 @@ fn test_integration_function_with_no_atomics() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let ops = extract_atomic_ops(&func);
@@ -342,7 +348,8 @@ fn test_integration_function_with_no_atomics() {
 
 #[test]
 fn test_integration_every_legality_rule_in_one_function() {
-    // Build a function that violates all 5 rules at once
+    // Build a function that violates every live rule (L1, L2, L3, L5) at once,
+    // plus the shape the retired L4 used to flag.
     let func = make_atomic_func(
         "all_violations",
         vec![
@@ -356,7 +363,8 @@ fn test_integration_every_legality_rule_in_one_function() {
                 AtomicOrdering::SeqCst,
                 Some(AtomicOrdering::AcqRel),
             ),
-            // L4: CAS failure > success (Relaxed success, Acquire failure)
+            // Retired L4: failure stronger than success (Relaxed success,
+            // Acquire failure) is valid Rust and must emit nothing.
             make_op(
                 AtomicOpKind::CompareExchangeWeak,
                 AtomicOrdering::Relaxed,
@@ -369,8 +377,12 @@ fn test_integration_every_legality_rule_in_one_function() {
 
     let ops = extract_atomic_ops(&func);
     let vcs = MemoryModelChecker::check_operation_legality(&ops, &func.name);
-    // L1 + L2 + L3 + L4 + L5 = at least 5 VCs
-    assert!(vcs.len() >= 5, "should detect at least one violation per rule, got {} VCs", vcs.len());
+    // L1 + L2 + L3 + L5 = exactly 4 VCs; the retired-L4 CAS contributes none.
+    assert_eq!(vcs.len(), 4, "one violation per live rule, got {vcs:?}");
+    for rule in ["L1", "L2", "L3", "L5"] {
+        assert!(vcs.iter().any(|vc| vc.kind.description().contains(rule)), "missing {rule}");
+    }
+    assert!(!vcs.iter().any(|vc| vc.kind.description().contains("L4")), "{vcs:?}");
 }
 
 #[test]

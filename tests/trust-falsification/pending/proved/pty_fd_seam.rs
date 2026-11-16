@@ -29,8 +29,10 @@ const SIGTERM: i32 = 15;
 /// fd or -1. Checked at every step; the fds themselves carry no proof
 /// obligations (EBADF is errno, not UB).
 pub fn dup_nonblocking(fd: i32) -> i32 {
-    // SAFETY: dup/fcntl/close take only integer fd/flag arguments; an
-    // invalid fd is reported via errno (EBADF), never UB.
+    // Sound: dup/fcntl/close take only integer fd/flag arguments; an
+    // invalid fd is reported via errno (EBADF), never UB. (Not marked as a SAFETY
+    // comment on purpose: one would declare this block, SAFETY-ASSUME-1, and
+    // certify would refuse the declaration instead of judging the fd summaries.)
     unsafe {
         let dup_fd = dup(fd);
         if dup_fd < 0 {
@@ -53,10 +55,11 @@ pub fn dup_nonblocking(fd: i32) -> i32 {
 /// broadcast forms are refused) and reap the child, returning the raw wait
 /// status or -1.
 pub fn shutdown_child(pid: i32, pgrp: i32) -> i32 {
-    // SAFETY: killpg takes only integer pgrp/signal arguments (ESRCH/EPERM
+    // Sound: killpg takes only integer pgrp/signal arguments (ESRCH/EPERM
     // are errno); waitpid writes through `status`, which is a `&mut i32` —
     // non-null and writable by construction (NULL would also be legal per
-    // the summary's nullable status contract).
+    // the summary's nullable status contract). Not marked as a SAFETY comment,
+    // for the reason given in `dup_nonblocking`.
     unsafe {
         if pgrp > 0 {
             let _ = killpg(pgrp, SIGTERM);

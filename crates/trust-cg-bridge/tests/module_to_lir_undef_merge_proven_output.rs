@@ -81,6 +81,7 @@ fn make_undef_merge_module(name: &str, op: ICmpOp) -> Module {
         params: vec![Ty::I32, Ty::I32],
         returns: vec![Ty::I32],
         is_vararg: false,
+        abi: None,
     });
     let mut function = IrFunction::new(FuncId::new(0), name, FuncTyId::new(0), BlockId::new(0));
 

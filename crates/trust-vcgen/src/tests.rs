@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 use std::path::PathBuf;
 
 use trust_types::{
@@ -77,6 +78,7 @@ pub fn midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -246,6 +248,7 @@ fn assert_refutation_declines_a_guard_whose_value_depends_on_an_opaque_call() {
                         is_unsafe_sig: false,
                         unwind: UnwindEdge::Continue,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("test::opaque_sum"),
                     },
                 },
                 BasicBlock {
@@ -319,6 +322,9 @@ fn assert_refutation_declines_a_guard_whose_value_depends_on_an_opaque_call() {
                         is_unsafe_sig: false,
                         unwind: UnwindEdge::Continue,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::panicking::assert_failed::<u64, u64>",
+                        ),
                     },
                 },
                 BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
@@ -331,6 +337,7 @@ fn assert_refutation_declines_a_guard_whose_value_depends_on_an_opaque_call() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(
@@ -435,6 +442,7 @@ fn test_binary_admission_rejects_symbolic_payload_without_a_rust_type_identity()
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let int_payload = Formula::var_owned("trust_symbolic.formula".to_string(), Sort::Int);
@@ -572,6 +580,7 @@ fn test_generate_vcs_threads_symbolic_aggregate_fields() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let div_vc = generate_vcs(&func)
@@ -675,6 +684,7 @@ fn test_generate_vcs_threads_closure_capture_fields_without_unsupported_mir() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -739,6 +749,7 @@ fn test_generate_vcs_blocks_unconsumed_symbolic_formula_schema_without_undef() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let blocker = generate_vcs(&func)
@@ -826,6 +837,7 @@ fn test_generate_vcs_fails_closed_on_symbolic_formula_missing_sort_metadata() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -875,6 +887,7 @@ fn test_symbolic_aggregate_with_recoverable_sorts_is_not_spuriously_fail_closed(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // The symbolic operands declare concrete SMT sorts (BitVec(64)), so the
@@ -949,6 +962,7 @@ fn unsupported_mir_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -981,6 +995,7 @@ fn malformed_atomic_metadata_opaque_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1111,6 +1126,7 @@ fn unsupported_cast_function(name: &str, from_ty: Ty, to_ty: Ty) -> VerifiableFu
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1166,6 +1182,7 @@ fn unsupported_checked_op_function(op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1211,6 +1228,7 @@ fn test_unsupported_mir_statement_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1241,6 +1259,7 @@ fn test_assume_intrinsic_statement_is_metadata_noop() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -1277,6 +1296,7 @@ fn test_unknown_intrinsic_statement_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1307,6 +1327,7 @@ fn test_assume_intrinsic_non_bool_condition_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1340,6 +1361,7 @@ fn test_unsupported_mir_rvalue_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1385,6 +1407,7 @@ fn test_ptr_offset_rvalue_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // Generic fail-closed contract: an UnsupportedMir VC is emitted AND
@@ -1434,6 +1457,7 @@ fn test_thread_local_ref_rvalue_uses_sealed_address_model() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -1565,7 +1589,7 @@ fn test_unsized_tail_adt_pointee_is_fat_not_thin() {
     let unsized_tail = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "UnsizedTail".to_string(),
         disc_index_safe: false,
         faithful_enum_repr: None,
@@ -1573,24 +1597,27 @@ fn test_unsized_tail_adt_pointee_is_fat_not_thin() {
         fields: vec![
             ("len".to_string(), Ty::usize()),
             ("tail".to_string(), Ty::Slice { elem: Box::new(Ty::u8()) }),
-        ],
+        ]
+        .into(),
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     let nested = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Nested".to_string(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
-        fields: vec![("inner".to_string(), unsized_tail.clone())],
+        fields: vec![("inner".to_string(), unsized_tail.clone())].into(),
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     let sized_tail = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "SizedTail".to_string(),
         disc_index_safe: false,
         faithful_enum_repr: None,
@@ -1598,13 +1625,19 @@ fn test_unsized_tail_adt_pointee_is_fat_not_thin() {
         fields: vec![
             ("head".to_string(), Ty::Slice { elem: Box::new(Ty::u8()) }),
             ("tail".to_string(), Ty::usize()),
-        ],
+        ]
+        .into(),
         arbitrary_precision: None,
+        validity_wrapper: None,
     };
     for (pointee, thin, why) in [
         (unsized_tail, false, "unsized-tail ADT pointee must be FAT"),
         (nested, false, "unsized tail through one nesting level must be FAT"),
-        (sized_tail, true, "a SIZED last field keeps the pointee thin (only the tail carries metadata)"),
+        (
+            sized_tail,
+            true,
+            "a SIZED last field keeps the pointee thin (only the tail carries metadata)",
+        ),
     ] {
         let pointer = Ty::RawPtr { mutable: false, pointee: Box::new(pointee) };
         assert_eq!(crate::is_thin_pointer_ty(&pointer), thin, "{why}");
@@ -1657,17 +1690,9 @@ fn ptr_add_precondition_shape_is_statable_over_the_pointer_term() {
                 LocalDecl { index: 2, ty: Ty::usize(), name: Some("count_arg".into()) },
                 LocalDecl { index: 3, ty: Ty::usize(), name: Some("size_arg".into()) },
                 LocalDecl { index: 4, ty: Ty::usize(), name: Some("addr_word".into()) },
-                LocalDecl {
-                    index: 5,
-                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
-                    name: None,
-                },
+                LocalDecl { index: 5, ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]), name: None },
                 LocalDecl { index: 6, ty: Ty::usize(), name: Some("byte_off".into()) },
-                LocalDecl {
-                    index: 7,
-                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
-                    name: None,
-                },
+                LocalDecl { index: 7, ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]), name: None },
             ],
             blocks: vec![
                 BasicBlock {
@@ -1737,6 +1762,7 @@ fn ptr_add_precondition_shape_is_statable_over_the_pointer_term() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     assert!(
@@ -1767,6 +1793,198 @@ fn ptr_recover_cast_stays_fail_closed() {
                 if kind == "Rvalue::Cast" && detail.contains("unsupported cast")
         )),
         "int->ptr (provenance recover) must remain a fail-closed UnsupportedMir VC: {vcs:#?}"
+    );
+}
+
+/// Trust (ZST transmute lane): a cast between two inhabited zero-sized
+/// types — the ZST `transmute` the extractor admits on layout evidence,
+/// which upstream's ZST const-prop now spells with constant aggregate
+/// operands — moves the unique inhabitant and must mint NO fail-closed
+/// cast row in any lane. Red before `is_zst_to_zst_cast` was wired into
+/// the three accept-lists (the nested units of
+/// `tests/ui/trust/trust_ir_huge_array_types_first_class.rs`).
+#[test]
+fn zst_to_zst_cast_mints_no_unsupported_vc() {
+    let unit_arr = |len: u64| Ty::Array { elem: Box::new(Ty::Unit), len };
+    for (name, from, to) in [
+        ("unit_to_unit_arr", Ty::Unit, unit_arr(4)),
+        (
+            "nested_zst_transpose",
+            Ty::Array { elem: Box::new(unit_arr(8)), len: 9 },
+            Ty::Array { elem: Box::new(unit_arr(9)), len: 8 },
+        ),
+        ("zero_len_value_arr", Ty::Array { elem: Box::new(Ty::u32()), len: 0 }, Ty::Unit),
+    ] {
+        let vcs = generate_vcs(&unsupported_cast_function(name, from, to));
+        assert!(
+            !mints_unsupported_cast_vc(&vcs),
+            "{name}: an inhabited ZST-to-ZST cast must mint no unsupported-cast VC: {vcs:#?}"
+        );
+    }
+}
+
+/// FALSIFYING twin: a cast with a non-ZST side is a genuine value
+/// reinterpretation and must KEEP its fail-closed refusal — the ZST lane
+/// keys on BOTH types being inhabited zero-sized, never on one side or
+/// on the target alone.
+#[test]
+fn cast_with_a_non_zst_side_stays_fail_closed() {
+    for (name, from, to) in [
+        ("int_to_unit", Ty::u32(), Ty::Unit),
+        ("unit_to_value_arr", Ty::Unit, Ty::Array { elem: Box::new(Ty::u32()), len: 3 }),
+        ("unit_to_mixed_tuple", Ty::Unit, Ty::Tuple(vec![Ty::Unit, Ty::u32()])),
+    ] {
+        let vcs = generate_vcs(&unsupported_cast_function(name, from, to));
+        assert!(
+            mints_unsupported_cast_vc(&vcs),
+            "{name}: a cast with a non-ZST side must remain fail-closed: {vcs:#?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust (2026-09-12): the -O print-machinery casts. `fn main(){ println!("x") }`
+// compiled at -Copt-level>=2 inlines std's `format_args!` into `main`, which
+// emits three DEFINED casts the VC lane used to refuse as `unsupported_mir`,
+// poisoning every printing program's release build: a `&str -> &[u8]`
+// transmute of the literal, a fat->thin `*const str -> *const u8` metadata drop,
+// and the `usize -> NonNull<Argument>` packing the extractor deliberately
+// admits. Each positive test below is paired with the fail-closed twin it must
+// NOT widen into.
+
+fn mints_unsupported_cast_vc(vcs: &[VerificationCondition]) -> bool {
+    vcs.iter().any(|vc| {
+        matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "Rvalue::Cast" && detail.contains("unsupported cast")
+        )
+    })
+}
+
+fn nonnull_newtype_ty() -> Ty {
+    // `core::ptr::NonNull<u8>` as the extractor spells it: a struct whose single
+    // non-pad field is a thin raw pointer.
+    Ty::Adt {
+        name: "core::ptr::non_null::NonNull".to_string(),
+        fields: vec![(
+            "pointer".to_string(),
+            Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) },
+        )]
+        .into(),
+        variants: vec![].into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(trust_types::AdtKind::Struct),
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
+}
+
+/// `fn go() -> <to_ty>` whose bb0 is `_0 = <const> as <to_ty>` — the shape
+/// `format_args!` emits for a string literal (`const "x" as &[u8]`).
+fn const_cast_function(name: &str, cv: trust_types::ConstValue, to_ty: Ty) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    VerifiableFunction {
+        name: name.to_string(),
+        def_path: format!("test::{name}"),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![LocalDecl { index: 0, ty: to_ty.clone(), name: None }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Cast(Operand::Constant(cv), to_ty.clone()),
+                    span,
+                }],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 0,
+            return_ty: to_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+#[test]
+fn fat_to_thin_raw_ptr_cast_is_modeled_not_fail_closed() {
+    // [A] `*const str -> *const u8`: a metadata drop, address-preserving, infallible.
+    let fat =
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let thin = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let vcs = generate_vcs(&unsupported_cast_function("fat_to_thin_ptr", fat, thin));
+    assert!(
+        !mints_unsupported_cast_vc(&vcs),
+        "fat->thin raw pointer cast (metadata drop) must be modeled, not a fail-closed UnsupportedMir VC: {vcs:#?}"
+    );
+}
+
+#[test]
+fn thin_to_fat_raw_ptr_cast_stays_fail_closed() {
+    // The REVERSE fabricates slice metadata from a bare pointer — genuinely
+    // unsupported, and the direction gate must keep it that way.
+    let thin = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let fat =
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let vcs = generate_vcs(&unsupported_cast_function("thin_to_fat_ptr", thin, fat));
+    assert!(
+        mints_unsupported_cast_vc(&vcs),
+        "thin->fat raw pointer cast (metadata fabrication) must REMAIN a fail-closed UnsupportedMir VC: {vcs:#?}"
+    );
+}
+
+#[test]
+fn usize_to_pointer_newtype_transmute_is_modeled_not_fail_closed() {
+    // [C] the `fmt::Arguments` packing transmute the extractor admits.
+    let vcs = generate_vcs(&unsupported_cast_function(
+        "usize_to_nonnull",
+        Ty::usize(),
+        nonnull_newtype_ty(),
+    ));
+    assert!(
+        !mints_unsupported_cast_vc(&vcs),
+        "usize -> single-pointer-newtype transmute must be modeled (fresh value), not a fail-closed UnsupportedMir VC: {vcs:#?}"
+    );
+    // The bare-pointer recover twin is `ptr_recover_cast_stays_fail_closed`
+    // (usize -> *const u8), which this arm must not widen into.
+}
+
+#[test]
+fn str_const_to_byte_slice_ref_cast_is_modeled_not_fail_closed() {
+    // [B] `const "x" as &[u8]` — the literal's byte view; a syntactic identity
+    // once the constant carries its `&[u8]` type.
+    let byte_slice_ref =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let vcs = generate_vcs(&const_cast_function(
+        "str_const_as_bytes",
+        trust_types::ConstValue::Str { bytes: b"hello\n".to_vec() },
+        byte_slice_ref,
+    ));
+    assert!(
+        !mints_unsupported_cast_vc(&vcs),
+        "`&str` literal -> `&[u8]` cast must be modeled as identity, not a fail-closed UnsupportedMir VC: {vcs:#?}"
+    );
+}
+
+#[test]
+fn byte_slice_ref_to_str_ref_cast_stays_fail_closed() {
+    // The REVERSE asserts UTF-8 validity of arbitrary bytes — a real obligation
+    // this lane does not discharge, so it must stay refused (faithful `Ty::Str`).
+    let byte_slice_ref =
+        Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+    let str_ref = Ty::Ref { mutable: false, inner: Box::new(Ty::Str) };
+    let vcs = generate_vcs(&unsupported_cast_function("bytes_to_str", byte_slice_ref, str_ref));
+    assert!(
+        mints_unsupported_cast_vc(&vcs),
+        "`&[u8] -> &str` (UTF-8-asserting) must REMAIN a fail-closed UnsupportedMir VC: {vcs:#?}"
     );
 }
 
@@ -1805,10 +2023,10 @@ fn test_unsupported_mir_operand_fails_closed() {
                 id: BlockId(0),
                 stmts: vec![Statement::Assign {
                     place: Place::local(0),
-                    rvalue: Rvalue::Use(Operand::Unsupported {
-                        kind: "ConstValue::Ty".to_string(),
-                        detail: "unsupported constant kind".to_string(),
-                    }),
+                    rvalue: Rvalue::Use(Operand::unsupported(
+                        "ConstValue::Ty",
+                        "unsupported constant kind",
+                    )),
                     span,
                 }],
                 terminator: Terminator::Return,
@@ -1821,6 +2039,7 @@ fn test_unsupported_mir_operand_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1856,6 +2075,7 @@ fn test_unsupported_type_in_local_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1891,6 +2111,7 @@ fn test_unsupported_type_in_projection_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -1924,11 +2145,15 @@ fn tagged_adt_with_field(field_name: &str, field_ty: Ty) -> Ty {
     Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Tagged".to_string(),
-        fields: vec![(field_name.to_string(), field_ty), ("payload".to_string(), Ty::i32())],
+        fields: vec![(field_name.to_string(), field_ty), ("payload".to_string(), Ty::i32())].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
 }
 
 fn set_discriminant_function(name: &str, local_ty: Ty, variant_index: usize) -> VerifiableFunction {
@@ -1955,6 +2180,7 @@ fn set_discriminant_function(name: &str, local_ty: Ty, variant_index: usize) -> 
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -1962,7 +2188,7 @@ fn set_discriminant_function(name: &str, local_ty: Ty, variant_index: usize) -> 
 fn test_set_discriminant_on_explicit_tagged_adt_is_modeled() {
     let func = set_discriminant_function(
         "tagged_set_discriminant",
-        tagged_adt_with_field("tag", Ty::u32()),
+        tagged_adt_with_field("__tag", Ty::u32()),
         2,
     );
 
@@ -1993,7 +2219,7 @@ fn test_set_discriminant_on_explicit_tagged_adt_is_modeled() {
 fn generated_discriminant_definition_cannot_alias_source_scalar() {
     let mut func = set_discriminant_function(
         "tagged_discriminant_namespace",
-        tagged_adt_with_field("tag", Ty::u32()),
+        tagged_adt_with_field("__tag", Ty::u32()),
         1,
     );
     // `discr_e` is a legal source binding and was the old generated spelling.
@@ -2013,6 +2239,98 @@ fn generated_discriminant_definition_cannot_alias_source_scalar() {
     assert_ne!(crate::discriminant_formula_var_name("e"), "discr_e");
 }
 
+/// Trust (triage ticket 216): a flat enum `Ty::Adt` as the extractor shapes it —
+/// an `i64` `__tag` and a variant descriptor of fieldless variants.
+fn flat_enum_216(variants: &[(&str, i128)]) -> Ty {
+    Ty::Adt {
+        adt_kind: Some(trust_types::AdtKind::Enum),
+        layout: None,
+        variants: variants
+            .iter()
+            .map(|(name, discriminant)| trust_types::VariantDef {
+                name: (*name).to_string(),
+                discriminant: *discriminant,
+                fields: vec![],
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        name: "E".to_string(),
+        fields: vec![("__tag".to_string(), Ty::i64())].into(),
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
+}
+
+fn set_discriminant_values_216(variants: &[(&str, i128)], variant_index: usize) -> Vec<Formula> {
+    let func =
+        set_discriminant_function("flat_set_discriminant", flat_enum_216(variants), variant_index);
+    crate::generate::set_discriminant_definitions(&func, &Place::local(1), variant_index)
+        .expect("a flat enum SetDiscriminant must produce definitions")
+}
+
+fn tag_and_discr_facts_216(value: i128) -> [Formula; 2] {
+    [
+        Formula::Eq(
+            Box::new(Formula::Var("e.0".to_string(), Sort::Int)),
+            Box::new(Formula::Int(value)),
+        ),
+        Formula::Eq(
+            Box::new(Formula::Var(crate::discriminant_formula_var_name("e"), Sort::Int)),
+            Box::new(Formula::Int(value)),
+        ),
+    ]
+}
+
+/// Trust (triage ticket 216): both facts a `SetDiscriminant` defines — the `__tag`
+/// field and the canonical `discr_*` — carry the DECLARED discriminant, the value
+/// `enum_variant_tag_set` constrains `discr_*` to. The index fact `discr_e == 1`
+/// contradicted `discr_e ∈ {5, 9}`.
+#[test]
+fn set_discriminant_definitions_carry_the_declared_discriminant_not_the_index() {
+    let defs = set_discriminant_values_216(&[("A", 5), ("B", 9)], 1);
+    assert_eq!(defs, tag_and_discr_facts_216(9).to_vec(), "E::B is 9 in both facts");
+    assert!(
+        !defs.iter().any(|f| matches!(f, Formula::Eq(_, rhs) if **rhs == Formula::Int(1))),
+        "the variant index 1 must not be defined anywhere: {defs:?}"
+    );
+}
+
+#[test]
+fn set_discriminant_definitions_carry_a_negative_discriminant_decoded() {
+    let defs = set_discriminant_values_216(&[("A", -3), ("B", 7)], 0);
+    assert_eq!(defs, tag_and_discr_facts_216(-3).to_vec(), "G::A is the decoded -3");
+}
+
+/// The CONTROL: index == discriminant, so the definitions are the old ones.
+#[test]
+fn set_discriminant_definitions_of_a_dense_enum_are_unchanged() {
+    let defs = set_discriminant_values_216(&[("Z", 0), ("O", 1)], 1);
+    assert_eq!(defs, tag_and_discr_facts_216(1).to_vec());
+}
+
+/// Trust (triage ticket 216): a variant the non-empty descriptor lacks has no
+/// declared discriminant, and falling back to its index would define
+/// `e.0 == 2`, `discr_e == 2` against `discr_e ∈ {5, 9}` — the vacuous
+/// hypothesis this ticket closes. Both the definitions and the VC stream fail
+/// closed.
+#[test]
+fn set_discriminant_definitions_refuse_a_variant_the_descriptor_lacks() {
+    let func =
+        set_discriminant_function("flat_set_discriminant", flat_enum_216(&[("A", 5), ("B", 9)]), 2);
+    let err = crate::generate::set_discriminant_definitions(&func, &Place::local(1), 2)
+        .expect_err("a variant the descriptor lacks must not fall back to the index");
+    assert!(err.contains("variant 2 has no declared discriminant"), "{err}");
+    assert!(generate_vcs(&func).iter().any(|vc| matches!(
+        &vc.kind,
+        VcKind::UnsupportedMir { kind, detail }
+            if kind == "StatementKind::SetDiscriminant"
+                && detail.contains("variant 2 has no declared discriminant")
+    )));
+}
+
 #[test]
 fn test_set_discriminant_without_explicit_tag_fails_closed() {
     let func = set_discriminant_function(
@@ -2020,11 +2338,15 @@ fn test_set_discriminant_without_explicit_tag_fails_closed() {
         Ty::Adt {
             adt_kind: None,
             layout: None,
-            variants: Vec::new(),
+            variants: Vec::new().into(),
             name: "Untagged".to_string(),
-            fields: vec![("payload".to_string(), Ty::i32())],
+            fields: vec![("payload".to_string(), Ty::i32())].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        },
         1,
     );
 
@@ -2039,11 +2361,50 @@ fn test_set_discriminant_without_explicit_tag_fails_closed() {
     }));
 }
 
+/// TAG-FIELD-1: the tag lane is the extractor's own `__tag`, and only on an ADT
+/// that can carry one. Before the fix the name set `discriminant | __discriminant |
+/// tag | __tag` matched on ANY ADT, so a user struct's field named `tag` was read
+/// as its discriminant (every assertion below on a `tag`/`discriminant` field, and
+/// on a `Struct`/`Union`-stamped `__tag`, was `Ok` before).
+#[test]
+fn explicit_discriminant_field_is_the_extractor_tag_on_a_taggable_adt_only() {
+    use trust_types::AdtKind;
+    let with = |name: &str, kind: Option<AdtKind>| {
+        let mut ty = tagged_adt_with_field(name, Ty::u32());
+        if let Ty::Adt { adt_kind, .. } = &mut ty {
+            *adt_kind = kind;
+        }
+        set_discriminant_function("tag_field", ty, 0)
+    };
+    for kind in [Some(AdtKind::Enum), None] {
+        let func = with("__tag", kind);
+        let field = crate::explicit_discriminant_field_for_place(&func, &Place::local(1))
+            .expect("an enum or unstamped ADT keeps its `__tag` lane");
+        assert_eq!(field.name, "__tag", "{kind:?}");
+    }
+    for kind in [AdtKind::Struct, AdtKind::Union] {
+        for name in ["__tag", "tag", "discriminant", "__discriminant"] {
+            let func = with(name, Some(kind));
+            assert!(
+                crate::explicit_discriminant_field_for_place(&func, &Place::local(1)).is_err(),
+                "{kind:?} field `{name}` is user data, not a tag lane"
+            );
+        }
+    }
+    for name in ["tag", "discriminant", "__discriminant"] {
+        let func = with(name, None);
+        assert!(
+            crate::explicit_discriminant_field_for_place(&func, &Place::local(1)).is_err(),
+            "`{name}` is no longer a tag name"
+        );
+    }
+}
+
 #[test]
 fn test_set_discriminant_bool_tag_out_of_range_fails_closed() {
     let func = set_discriminant_function(
         "bool_tag_set_discriminant",
-        tagged_adt_with_field("discriminant", Ty::Bool),
+        tagged_adt_with_field("__tag", Ty::Bool),
         2,
     );
 
@@ -2080,6 +2441,7 @@ fn test_deinit_stale_internal_compatibility_variant_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2122,6 +2484,7 @@ fn test_safe_retag_statement_is_metadata_noop() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2159,6 +2522,7 @@ fn test_retag_with_raw_pointer_surface_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -2186,6 +2550,7 @@ fn test_sparse_local_type_resolution_uses_decl_index() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert_eq!(operand_ty(&func, &Operand::Copy(Place::local(2))), Some(Ty::Bool));
@@ -2225,6 +2590,7 @@ fn test_unsupported_mir_aggregate_kind_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     });
 }
 
@@ -2272,6 +2638,7 @@ fn test_closure_aggregate_mismatched_capture_count_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(
@@ -2347,6 +2714,7 @@ fn test_closure_aggregate_mismatched_capture_type_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(
@@ -2442,6 +2810,7 @@ fn test_closure_capture_by_mut_ref_write_through_upvar_is_a_captured_write() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2511,6 +2880,7 @@ fn test_closure_aggregate_capture_check_ignores_declared_name() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let is_closure_unsupported = |vcs: &[VerificationCondition]| {
@@ -2536,6 +2906,124 @@ fn test_closure_aggregate_capture_check_ignores_declared_name() {
     assert!(
         !is_closure_unsupported(&generate_vcs(&matched)),
         "a bogus name must not cause a false reject of an otherwise-consistent closure aggregate"
+    );
+}
+
+#[test]
+fn test_closure_aggregate_callable_item_constant_capture_accepted() {
+    // Upstream move-elimination const-propagates a captured fn item into the
+    // closure aggregate as a CONSTANT (`{ g: add1 }`), where the pre-port MIR
+    // spelled it as a copy of the fn-item local. vcgen types a callable-item
+    // constant as `Ty::Unit` (it is an opaque unit-sorted value), while the
+    // capture's declared type is `Ty::FnDef`, so the consistency check must
+    // recognize the constant by its extraction-vetted identity — same kind,
+    // same def_path — without minting any solver fact from the path (the
+    // value stays unit-sorted everywhere downstream). Mismatched identity
+    // (wrong path or wrong callable kind) must still refuse.
+    let fndef_ty = |name: &str| Ty::FnDef {
+        name: name.to_string(),
+        sig: Box::new(trust_types::FnSig { params: vec![Ty::u32()], ret: Box::new(Ty::u32()) }),
+    };
+    let item = |def_path: &str, kind: trust_types::CallableKind| {
+        Operand::Constant(trust_types::ConstValue::CallableItem {
+            def_path: def_path.to_string(),
+            kind,
+            def_path_hash: trust_types::CallableDefPathHash::new(1, 1),
+        })
+    };
+    let make_func =
+        |captures: Vec<Ty>, upvars: Vec<Ty>, operands: Vec<Operand>| VerifiableFunction {
+            name: "probe".to_string(),
+            def_path: "test::probe".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Closure {
+                            name: "test::probe::{closure#0}".to_string(),
+                            upvars,
+                            call: None,
+                        },
+                        name: Some("closure_env".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(1),
+                        rvalue: Rvalue::Aggregate(
+                            AggregateKind::Closure {
+                                name: "test::probe::{closure#0}".to_string(),
+                                captures,
+                                call_kind: ClosureCallKind::Fn,
+                            },
+                            operands,
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+            tuple_layouts: Default::default(),
+        };
+    let closure_ty =
+        |name: &str| Ty::Closure { name: name.to_string(), upvars: vec![], call: None };
+    let is_closure_unsupported = |vcs: &[VerificationCondition]| {
+        vcs.iter()
+            .any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind, .. } if kind == "AggregateKind::Closure"))
+    };
+
+    // Same fn item, as a constant: the shape const-propagation produces.
+    let same_fn = make_func(
+        vec![fndef_ty("test::add1")],
+        vec![fndef_ty("test::add1")],
+        vec![item("test::add1", trust_types::CallableKind::FnDef)],
+    );
+    assert!(
+        !is_closure_unsupported(&generate_vcs(&same_fn)),
+        "a callable-item constant naming the captured fn item must be accepted"
+    );
+
+    // Same def_path but the wrong callable KIND: still refused.
+    let wrong_kind = make_func(
+        vec![fndef_ty("test::add1")],
+        vec![fndef_ty("test::add1")],
+        vec![item("test::add1", trust_types::CallableKind::Closure)],
+    );
+    assert!(
+        is_closure_unsupported(&generate_vcs(&wrong_kind)),
+        "a closure-kind constant must not satisfy an FnDef capture"
+    );
+
+    // Right kind, wrong item: still refused.
+    let wrong_item = make_func(
+        vec![fndef_ty("test::add1")],
+        vec![fndef_ty("test::add1")],
+        vec![item("test::other", trust_types::CallableKind::FnDef)],
+    );
+    assert!(
+        is_closure_unsupported(&generate_vcs(&wrong_item)),
+        "a callable-item constant naming a DIFFERENT item must still be refused"
+    );
+
+    // A non-capturing closure captured into another closure, same identity.
+    let same_closure = make_func(
+        vec![closure_ty("test::inner::{closure#0}")],
+        vec![closure_ty("test::inner::{closure#0}")],
+        vec![item("test::inner::{closure#0}", trust_types::CallableKind::Closure)],
+    );
+    assert!(
+        !is_closure_unsupported(&generate_vcs(&same_closure)),
+        "a callable-item constant naming the captured closure must be accepted"
     );
 }
 
@@ -2573,6 +3061,7 @@ fn test_thin_raw_ptr_aggregate_does_not_emit_unsupported_mir() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2624,6 +3113,7 @@ fn test_fat_raw_ptr_aggregate_fails_closed() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2673,6 +3163,7 @@ fn test_float_bits_zero_divisor_emits_no_obligation() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2774,6 +3265,7 @@ fn test_generate_vcs_skips_rustc_const_false_divzero_assert() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2858,6 +3350,7 @@ fn test_const_false_divzero_assert_does_not_suppress_variable_divisor_in_target(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2911,6 +3404,7 @@ fn test_division_vc_uses_only_prior_same_block_defs() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -2978,6 +3472,7 @@ fn test_division_vc_kills_overwritten_prior_same_block_defs() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -3053,6 +3548,7 @@ fn test_const_false_assert_skip_does_not_use_stale_condition_assignment() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -3114,6 +3610,7 @@ fn test_const_false_assert_skip_respects_copied_condition_time() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -3164,6 +3661,7 @@ fn test_division_vc_carries_same_block_defs_for_temp_divisor() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -3181,7 +3679,7 @@ fn test_division_vc_carries_same_block_defs_for_temp_divisor() {
 
 #[test]
 fn test_narrowing_temp_cast_is_defined_no_overflow_vc() {
-    // Drop-in (owner decision 2026-07-06): `tmp = 300; ret = tmp as u8` — a
+    // Drop-in (decision 2026-07-06): `tmp = 300; ret = tmp as u8` — a
     // truncating cast of a constant — is DEFINED (`300 as u8 == 44`), so it emits NO
     // CastOverflow obligation and compiles. (Previously this asserted the cast VC
     // carried the `tmp == 300` block-def; that VC no longer exists.)
@@ -3219,6 +3717,7 @@ fn test_narrowing_temp_cast_is_defined_no_overflow_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -3477,6 +3976,7 @@ fn guarded_div_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3624,6 +4124,7 @@ fn nested_guard_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3665,11 +4166,15 @@ fn match_exhaustive_function() -> VerifiableFunction {
                     ty: Ty::Adt {
                         adt_kind: None,
                         layout: None,
-                        variants: Vec::new(),
+                        variants: Vec::new().into(),
                         name: "Status".into(),
-                        fields: vec![("discriminant".into(), Ty::u32())],
+                        fields: vec![("discriminant".into(), Ty::u32())].into(),
                         disc_index_safe: false,
-                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                        faithful_enum_repr: None,
+                        enum_layout: None,
+                        arbitrary_precision: None,
+                        validity_wrapper: None,
+                    },
                     name: Some("status".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: Some("x".into()) },
@@ -3720,6 +4225,7 @@ fn match_exhaustive_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3805,6 +4311,7 @@ fn make_binop_func(op: BinOp, ty: Ty) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -3937,10 +4444,8 @@ fn binary_assignment_admission_accepts_each_audited_rust_carrier_family() {
     else {
         unreachable!()
     };
-    *rhs = Operand::Unsupported {
-        kind: "test::unsupported_u32".into(),
-        detail: "the producer could not retain this operand".into(),
-    };
+    *rhs =
+        Operand::unsupported("test::unsupported_u32", "the producer could not retain this operand");
     assert!(validate_function(&explicit_unsupported).is_ok());
     assert!(try_generate_vcs(&explicit_unsupported).unwrap().iter().any(|vc| matches!(
         &vc.kind,
@@ -3993,7 +4498,7 @@ fn binary_assignment_admission_rejects_every_unauthenticated_type_shape() {
     *rvalue = Rvalue::BinaryOp(
         BinOp::Eq,
         Operand::Constant(ConstValue::Int(1)),
-        Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true }),
+        Operand::Constant(ConstValue::opaque_scalar(8, true)),
     );
     assert_binary_malformed(&ambiguous_literals, BinOp::Eq);
 
@@ -4093,6 +4598,7 @@ fn make_unchecked_binop_func(op: BinOp, lhs: Operand) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -4321,6 +4827,7 @@ fn ptr_metadata_assign_func(operand_ty: Ty, dest_ty: Ty, operand: Operand) -> Ve
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -4501,6 +5008,7 @@ fn forged_target_overflow_assert(op: BinOp) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -4587,6 +5095,7 @@ fn inverse_bounds_assert_proves_its_actual_condition_not_the_usual_success_edge(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = try_generate_vcs(&func).expect("inverse BoundsCheck remains valid public TrustIR");
     let exact = vcs
@@ -4674,6 +5183,7 @@ fn bounds_assert_never_rewrites_the_condition_operands_after_the_comparison() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let assert_span = SourceSpan::binary_address(0x5510);
@@ -4768,6 +5278,7 @@ fn bounds_assert_snapshot_survives_a_later_write_through_mutable_alias() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = try_generate_vcs(&func).expect("the alias-write fixture is valid public TrustIR");
@@ -4850,6 +5361,7 @@ fn division_static_truth_fold_refuses_a_later_mutable_alias_write() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = try_generate_vcs(&func).expect("the mutable-alias fixture is valid public TrustIR");
@@ -4928,6 +5440,7 @@ fn checked_overflow_flag_alias_write_cannot_reuse_the_old_safe_operation() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs =
@@ -4970,6 +5483,186 @@ fn checked_overflow_flag_alias_write_cannot_reuse_the_old_safe_operation() {
         matches!(backend.verify(boundary), VerificationResult::Failed { .. }),
         "the hardened lane must also refuse the stale checked-operation specialization"
     );
+}
+
+/// The m3 `Branching` shape: ONE tuple local `_4` is written by `CheckedAdd(x, y)`
+/// in bb1 and by `CheckedMul(x, y)` in bb2, each block ending in its own
+/// `Assert(!_4.1, Overflow(op))`. Public-schema MIR is not SSA, so a carrier
+/// reused across branches is legal; `bounds` optionally pins `x, y` to a range.
+fn checked_flag_tuple_reused_across_branches(
+    bounds: Option<(i128, i128)>,
+    add_span: &SourceSpan,
+    mul_span: &SourceSpan,
+) -> VerifiableFunction {
+    let tuple_ty = Ty::Tuple(vec![Ty::u32(), Ty::Bool]);
+    let checked_block = |id: usize, op: BinOp, span: &SourceSpan| BasicBlock {
+        id: BlockId(id),
+        stmts: vec![Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::CheckedBinaryOp(
+                op,
+                Operand::Copy(Place::local(1)),
+                Operand::Copy(Place::local(2)),
+            ),
+            span: SourceSpan::default(),
+        }],
+        terminator: Terminator::Assert {
+            cond: Operand::Copy(Place::field(4, 1)),
+            expected: false,
+            msg: AssertMessage::Overflow(op),
+            target: BlockId(3),
+            span: span.clone(),
+            unwind: UnwindEdge::Unreachable,
+        },
+    };
+    let bounded = |name: &str, lo: i128, hi: i128| {
+        Formula::And(vec![
+            Formula::Le(Box::new(Formula::Int(lo)), Box::new(Formula::var(name, Sort::Int))),
+            Formula::Le(Box::new(Formula::var(name, Sort::Int)), Box::new(Formula::Int(hi))),
+        ])
+    };
+    let preconditions = match bounds {
+        Some((lo, hi)) => vec![bounded("x", lo, hi), bounded("y", lo, hi)],
+        None => vec![],
+    };
+    VerifiableFunction {
+        name: "checked_flag_tuple_reused_across_branches".into(),
+        def_path: "test::checked_flag_tuple_reused_across_branches".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: Ty::u32(), name: Some("y".into()) },
+                LocalDecl { index: 3, ty: Ty::Bool, name: Some("cond".into()) },
+                LocalDecl { index: 4, ty: tuple_ty, name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(3)),
+                        targets: vec![(0, BlockId(1)), (1, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                checked_block(1, BinOp::Add, add_span),
+                checked_block(2, BinOp::Mul, mul_span),
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::field(4, 0))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                },
+            ],
+            arg_count: 3,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions,
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The overflow VC of each branch's assert, asserting it is the exact
+/// `ArithmeticOverflow(op)` row and that its formula reads no `_4.1` flag symbol
+/// (the flag must be bound to its own block's checked operation, not left free).
+fn reused_tuple_overflow_vc<'a>(
+    vcs: &'a [VerificationCondition],
+    span: &SourceSpan,
+    op: BinOp,
+) -> &'a VerificationCondition {
+    let rows: Vec<_> = vcs.iter().filter(|vc| &vc.location == span).collect();
+    assert_eq!(rows.len(), 1, "exactly one row per branch assert: {vcs:#?}");
+    let vc = rows[0];
+    assert!(
+        matches!(&vc.kind, VcKind::ArithmeticOverflow { op: vc_op, .. } if *vc_op == op),
+        "the branch assert must lower to ArithmeticOverflow({op:?}): {:?}",
+        vc.kind
+    );
+    let free_flags: Vec<_> = crate::vc_slicing::collect_vars(&vc.formula)
+        .into_iter()
+        .filter(|name| name.starts_with("_4.1") || name.starts_with("_4#"))
+        .collect();
+    assert!(
+        free_flags.is_empty(),
+        "the {op:?} overflow flag must be bound to its own CheckedBinaryOp, not free: \
+         {free_flags:?} in {:?}",
+        vc.formula
+    );
+    vc
+}
+
+#[test]
+fn checked_flag_tuple_reused_across_branches_binds_its_own_block_op() {
+    use trust_router::{InProcessAyBackend, VerificationBackend};
+
+    // Regression (m3_scale_100 `Branching`, 12 false refutations): since
+    // 4ca0cb0eacf the exact flag binding was refused whenever the tuple local
+    // had 2+ stores ANYWHERE in the function, so each assert fell to the
+    // clobbered-flag path whose versioned `_4.1` symbol has no definition (block
+    // defs skip CheckedBinaryOp) — a free Bool that made safe code refutable.
+    let add_span = SourceSpan::binary_address(0x5521);
+    let mul_span = SourceSpan::binary_address(0x5522);
+    let func = checked_flag_tuple_reused_across_branches(Some((0, 1000)), &add_span, &mul_span);
+    let vcs = try_generate_vcs(&func).expect("the reused-tuple fixture is valid public TrustIR");
+
+    // Add is linear: the in-process ay backend decides it directly.
+    let add = reused_tuple_overflow_vc(&vcs, &add_span, BinOp::Add);
+    let backend = InProcessAyBackend::new();
+    assert!(backend.can_handle(add));
+    let result = backend.verify(add);
+    assert!(
+        matches!(result, VerificationResult::Proved { .. }),
+        "x, y in [0, 1000] cannot overflow u32 under Add; got {result:?} for {:?}",
+        add.formula
+    );
+
+    // Mul carries the same BV-and-nonlinear-Int operand-core encoding as a
+    // single-block checked Mul, which in-process ay answers Unknown on; the m3
+    // pipeline discharges that encoding through the interval backend, so the
+    // bound row must be PROVED there (a free flag would make it unprovable).
+    let mul = reused_tuple_overflow_vc(&vcs, &mul_span, BinOp::Mul);
+    let interval = trust_router::interval_backend::IntervalBackend;
+    assert!(interval.can_handle(mul));
+    let result = interval.verify(mul);
+    assert!(
+        result.is_proved(),
+        "x, y in [0, 1000] cannot overflow u32 under Mul; got {result:?} for {:?}",
+        mul.formula
+    );
+}
+
+#[test]
+fn checked_flag_tuple_reused_across_branches_unbounded_twin_refutes() {
+    use trust_router::{InProcessAyBackend, VerificationBackend};
+
+    // The same binding must still expose a real overflow: with no preconditions
+    // both `x + y` and `x * y` can exceed u32::MAX, so each row must FAIL.
+    let add_span = SourceSpan::binary_address(0x5523);
+    let mul_span = SourceSpan::binary_address(0x5524);
+    let func = checked_flag_tuple_reused_across_branches(None, &add_span, &mul_span);
+    let vcs = try_generate_vcs(&func).expect("the reused-tuple fixture is valid public TrustIR");
+    let backend = InProcessAyBackend::new();
+    for (span, op) in [(&add_span, BinOp::Add), (&mul_span, BinOp::Mul)] {
+        let vc = reused_tuple_overflow_vc(&vcs, span, op);
+        assert!(backend.can_handle(vc));
+        let result = backend.verify(vc);
+        assert!(
+            matches!(result, VerificationResult::Failed { .. }),
+            "unbounded u32 {op:?} can overflow; got {result:?} for {:?}",
+            vc.formula
+        );
+    }
 }
 
 #[test]
@@ -5032,6 +5725,7 @@ fn negation_assert_never_rewrites_the_condition_operand_after_the_comparison() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = try_generate_vcs(&func).expect("the non-SSA public body remains structurally valid");
     assert!(
@@ -5326,8 +6020,6 @@ fn unchecked_binary_op_rejects_every_non_arithmetic_spelling_before_generation()
         BinOp::BitAnd,
         BinOp::BitOr,
         BinOp::BitXor,
-        BinOp::Shl,
-        BinOp::Shr,
         BinOp::Cmp,
     ] {
         let func = make_unchecked_binop_func(op, Operand::Copy(Place::local(1)));
@@ -5344,14 +6036,54 @@ fn unchecked_binary_op_rejects_every_non_arithmetic_spelling_before_generation()
     }
 }
 
+/// `unchecked_shl`/`unchecked_shr` (MIR `ShlUnchecked`/`ShrUnchecked`) are a LIVE
+/// carrier since trust-mir-extract stopped spelling them `Rvalue::Unsupported`: they
+/// are admitted structurally (the plain shift's operand typing) and keep exactly
+/// the fail-closed `UnsupportedMir` row the old marker produced, under the same
+/// kind — this lane has no UB-class shift obligation kind, so no verdict moves.
+#[test]
+fn unchecked_shifts_are_admitted_and_keep_their_fail_closed_row() {
+    for (op, kind) in [(BinOp::Shl, "BinOp::ShlUnchecked"), (BinOp::Shr, "BinOp::ShrUnchecked")] {
+        let func = make_unchecked_binop_func(op, Operand::Copy(Place::local(1)));
+        validate_function(&func).unwrap_or_else(|error| {
+            panic!("UncheckedBinaryOp({op:?}) is a live carrier, not malformed MIR: {error:?}")
+        });
+        let vcs = try_generate_vcs(&func).expect("the admitted carrier must reach VC generation");
+        let rows: Vec<_> = vcs
+            .iter()
+            .filter(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { kind: k, .. } if k == kind))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one fail-closed `{kind}` row: {vcs:#?}");
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                vc.kind,
+                VcKind::ShiftOverflow { .. } | VcKind::UncheckedArithmeticOverflow { .. }
+            )),
+            "no checked-shift or arithmetic-overflow row may stand in for the UB shift: {vcs:#?}"
+        );
+    }
+}
+
+/// A forged unchecked shift whose shifted operand is not the destination's type
+/// still fails structural admission (the plain shift's rule).
+#[test]
+fn a_mistyped_unchecked_shift_is_still_malformed() {
+    let mut func = make_unchecked_binop_func(BinOp::Shl, Operand::Copy(Place::local(1)));
+    func.body.locals[1].ty = Ty::u8();
+    assert!(
+        matches!(validate_function(&func), Err(VcgenError::MalformedMir { .. })),
+        "a u8 value shifted into a u32 destination is malformed"
+    );
+}
+
 #[test]
 fn unchecked_binary_op_traverses_unsupported_operands_fail_closed() {
     let func = make_unchecked_binop_func(
         BinOp::Add,
-        Operand::Unsupported {
-            kind: "Operand::UncheckedArithmeticOpaque".into(),
-            detail: "unchecked arithmetic operand has no modeled value".into(),
-        },
+        Operand::unsupported(
+            "Operand::UncheckedArithmeticOpaque",
+            "unchecked arithmetic operand has no modeled value",
+        ),
     );
     assert!(
         validate_function(&func).is_ok(),
@@ -5410,7 +6142,7 @@ fn unchecked_binary_op_rejects_projected_operand_reads_at_admission() {
 
 #[test]
 fn identityless_opaque_arithmetic_never_acquires_an_overflow_proof() {
-    let opaque = Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true });
+    let opaque = Operand::Constant(ConstValue::opaque_scalar(8, true));
 
     let mut plain = make_binop_func(BinOp::Sub, Ty::i8());
     let Statement::Assign { rvalue, .. } = &mut plain.body.blocks[0].stmts[0] else {
@@ -5423,7 +6155,7 @@ fn identityless_opaque_arithmetic_never_acquires_an_overflow_proof() {
             &vc.kind,
             VcKind::UnsupportedMir { kind, detail }
                 if kind == "IntegerArithmeticOpaqueScalar"
-                    && detail.contains("cannot distinguish identity-less OpaqueScalar")
+                    && detail.contains("does not model OpaqueScalar operands")
         )),
         "identity-less operands must produce an explicit fail-closed row: {vcs:#?}"
     );
@@ -5459,7 +6191,7 @@ fn identityless_opaque_arithmetic_never_acquires_an_overflow_proof() {
 
 #[test]
 fn identityless_opaque_scalar_fails_closed_at_every_public_operand_boundary() {
-    let opaque = Operand::Constant(ConstValue::OpaqueScalar { width: 8, signed: true });
+    let opaque = Operand::Constant(ConstValue::opaque_scalar(8, true));
 
     for op in [BinOp::Div, BinOp::Rem] {
         let result_ty = if op == BinOp::Eq { Ty::Bool } else { Ty::i8() };
@@ -5477,7 +6209,7 @@ fn identityless_opaque_scalar_fails_closed_at_every_public_operand_boundary() {
                 &vc.kind,
                 VcKind::UnsupportedMir { kind, detail }
                     if kind == "ConstValue::OpaqueScalar"
-                        && detail.contains("identity-less opaque")
+                        && detail.contains("has no modeled value")
             )),
             "{op:?} must retain the common identity-less-operand refusal: {vcs:#?}"
         );
@@ -5560,6 +6292,7 @@ fn identityless_opaque_scalar_fails_closed_at_every_public_operand_boundary() {
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("test::opaque_consumer"),
         unwind: UnwindEdge::Unreachable,
     };
     assert!(try_generate_vcs(&called).unwrap().iter().any(|vc| matches!(
@@ -5589,6 +6322,7 @@ fn unwind_resume_is_a_modeled_sink_not_an_unreachable_assertion() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let resume_vcs = try_generate_vcs(&func).expect("UnwindResume is valid modeled Trust MIR");
@@ -5797,6 +6531,7 @@ fn make_shift_func(op: BinOp, value_ty: Ty, amount: ShiftAmount) -> VerifiableFu
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -5953,6 +6688,7 @@ fn test_vc_coverage_neg_generates_negation_overflow() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = generate_vcs(&func);
     assert!(
@@ -6118,6 +6854,7 @@ fn test_float_div_by_variable_emits_no_obligation_through_pipeline() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6168,6 +6905,7 @@ fn test_float_add_generates_overflow_vc_through_pipeline() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6322,6 +7060,7 @@ fn test_float_div_guarded_or_not_emits_no_obligation() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6361,6 +7100,9 @@ fn test_float_overflow_safe_path_generates_guarded_obligation() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::f64::<impl f64>::abs",
+                        ),
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -6396,6 +7138,9 @@ fn test_float_overflow_safe_path_generates_guarded_obligation() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::f64::<impl f64>::abs",
+                        ),
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -6456,6 +7201,7 @@ fn test_float_overflow_safe_path_generates_guarded_obligation() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6585,6 +7331,9 @@ fn test_float_overflow_join_does_not_use_first_path_guard_shortcut() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::f64::<impl f64>::abs",
+                        ),
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -6620,6 +7369,9 @@ fn test_float_overflow_join_does_not_use_first_path_guard_shortcut() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::f64::<impl f64>::abs",
+                        ),
                         is_foreign: false,
                         func: "core::f64::<impl f64>::abs".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -6670,6 +7422,7 @@ fn test_float_overflow_join_does_not_use_first_path_guard_shortcut() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6732,6 +7485,9 @@ fn test_begin_panic_call_generates_guarded_assertion_vc() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::rt::begin_panic::<&str>",
+                        ),
                         is_foreign: false,
                         func: "std::rt::begin_panic::<&str>".to_string(),
                         args: vec![],
@@ -6759,6 +7515,7 @@ fn test_begin_panic_call_generates_guarded_assertion_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -6830,6 +7587,9 @@ fn contract_panic_fixture(def_path: &str, msg: Option<&str>) -> VerifiableFuncti
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::panicking::panic_fmt",
+                        ),
                         is_foreign: false,
                         func: "core::panicking::panic_fmt".to_string(),
                         args,
@@ -6857,6 +7617,7 @@ fn contract_panic_fixture(def_path: &str, msg: Option<&str>) -> VerifiableFuncti
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -7040,6 +7801,18 @@ fn callee_summary_fixture(marker: i128, certified: &str) -> CalleeSummaryContext
             variants: vec![0, 1],
         },
     );
+    let mut return_field_summaries = trust_types::fx::FxHashMap::default();
+    return_field_summaries.insert(
+        CALLEE.to_string(),
+        generate::ReturnFieldSummary {
+            param_count: 1,
+            subject_param: 1,
+            struct_name: "test::S".into(),
+            field: 0,
+            field_ty: (64, false),
+            value: generate::ReturnFieldValue::Compare { op: BinOp::Eq, rhs: marker },
+        },
+    );
 
     CalleeSummaryContext::default()
         .with_certified_backing_structs(certified_backing_structs)
@@ -7049,6 +7822,7 @@ fn callee_summary_fixture(marker: i128, certified: &str) -> CalleeSummaryContext
         .with_return_disc_summaries(return_disc_summaries)
         .with_setter_summaries(setter_summaries)
         .with_return_bool_preds(return_bool_preds)
+        .with_return_field_summaries(return_field_summaries)
 }
 
 fn assert_callee_summary_marker(marker: i128) {
@@ -7068,6 +7842,10 @@ fn assert_callee_summary_marker(marker: i128) {
         Some(SetterSummary { src: SetterSrc::Const(value), .. }) if value == marker
     ));
     assert_eq!(callee_return_bool_pred(CALLEE).unwrap().pred_tag, marker);
+    assert_eq!(
+        callee_return_field_summary(CALLEE).map(|s| s.value),
+        Some(generate::ReturnFieldValue::Compare { op: BinOp::Eq, rhs: marker })
+    );
 }
 
 fn assert_no_callee_summaries() {
@@ -7080,6 +7858,7 @@ fn assert_no_callee_summaries() {
     assert!(callee_return_disc_summary(CALLEE).is_none());
     assert!(callee_setter_summary(CALLEE).is_none());
     assert!(callee_return_bool_pred(CALLEE).is_none());
+    assert!(callee_return_field_summary(CALLEE).is_none());
 }
 
 #[test]
@@ -7193,6 +7972,89 @@ fn contract_panic_annotation_stamps_matching_panic_call_vc() {
 }
 
 #[test]
+fn contract_panic_outlined_defaults_share_usage_and_site_matching() {
+    for (callee, message) in [
+        ("core::panicking::panic_default_msg", "explicit panic"),
+        ("core::panicking::unimplemented_default_msg", "not implemented"),
+        ("core::panicking::todo_default_msg", "not yet implemented"),
+    ] {
+        let mut func = contract_panic_fixture("test::outlined_contract_panic", None);
+        let Terminator::Call { func: call, callee_key, .. } = &mut func.body.blocks[1].terminator
+        else {
+            unreachable!()
+        };
+        *call = callee.to_string();
+        *callee_key = crate::sep_engine::tests::fixture_key(callee);
+
+        for (payload, matches) in [(message, true), ("unrelated panic message", false)] {
+            let context = VcgenContext::for_function(func.def_path.clone())
+                .with_contract_panic_annotations(vec![payload.to_string()]);
+            let ordinary = generate_vcs_with_context(&func, &context);
+            let refutation = generate_full_assert_refutation_vcs_with_context(&func, &context);
+            for vcs in [&ordinary, &refutation] {
+                let mut panic_rows = 0;
+                for vc in vcs {
+                    if let VcKind::Assertion { message } = &vc.kind
+                        && message.contains("panic call:")
+                    {
+                        panic_rows += 1;
+                        assert_eq!(
+                            message.contains(trust_types::assumption::CONTRACT_PANIC_VC_MARKER),
+                            matches,
+                            "{callee} with payload {payload:?}: {message}"
+                        );
+                    }
+                }
+                assert!(panic_rows > 0, "{callee} must retain its panic obligation");
+            }
+            assert_eq!(
+                refutation.iter().any(|vc| matches!(
+                    &vc.kind,
+                    VcKind::Assertion { message }
+                        if message.contains(trust_types::assumption::CONTRACT_PANIC_UNUSED_VC_MARKER)
+                )),
+                !matches,
+                "usage and call-site classification must agree for {callee} with {payload:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn contract_panic_outlined_lookalikes_cannot_supply_a_fixed_message() {
+    for callee in
+        ["mycrate::panicking::panic_default_msg", "core::panicking::panic_default_msg_extra"]
+    {
+        let mut func = contract_panic_fixture("test::forged_outlined_contract_panic", None);
+        let Terminator::Call { func: call, callee_key, .. } = &mut func.body.blocks[1].terminator
+        else {
+            unreachable!()
+        };
+        *call = callee.to_string();
+        *callee_key = crate::sep_engine::tests::fixture_key(callee);
+        let context = VcgenContext::for_function(func.def_path.clone())
+            .with_contract_panic_annotations(vec!["explicit panic".to_string()]);
+        let vcs = generate_full_assert_refutation_vcs_with_context(&func, &context);
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::Assertion { message }
+                    if message.contains(trust_types::assumption::CONTRACT_PANIC_VC_MARKER)
+            )),
+            "{callee} cannot supply an authenticated fixed message"
+        );
+        assert!(
+            vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::Assertion { message }
+                    if message.contains(trust_types::assumption::CONTRACT_PANIC_UNUSED_VC_MARKER)
+            )),
+            "{callee} must leave the annotation unused"
+        );
+    }
+}
+
+#[test]
 fn contract_panic_annotation_leaves_non_matching_message_unstamped() {
     // The payload does NOT occur in the panic message → no marker (the row
     // stays a plain refutable panic obligation; nothing to reclassify).
@@ -7265,6 +8127,7 @@ fn contract_panic_unused_annotation_mints_failed_refutation_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let context = VcgenContext::for_function(func.def_path.clone())
         .with_contract_panic_annotations(vec!["capacity is".to_string()]);
@@ -7356,6 +8219,9 @@ fn contract_panic_inlined_panic_fmt_arguments_from_str_counts_as_used_and_stamps
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "std::fmt::Arguments::<'a>::from_str",
+                        ),
                         is_foreign: false,
                         func: "std::fmt::Arguments::<'a>::from_str".to_string(),
                         args: vec![Operand::Constant(ConstValue::Str {
@@ -7374,6 +8240,7 @@ fn contract_panic_inlined_panic_fmt_arguments_from_str_counts_as_used_and_stamps
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("std::rt::panic_fmt"),
                         is_foreign: false,
                         func: "std::rt::panic_fmt".to_string(),
                         args: vec![Operand::Move(Place::local(5))],
@@ -7401,6 +8268,7 @@ fn contract_panic_inlined_panic_fmt_arguments_from_str_counts_as_used_and_stamps
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let context = VcgenContext::for_function(func.def_path.clone())
         .with_contract_panic_annotations(vec!["capacity is".to_string()]);
@@ -7488,6 +8356,9 @@ fn contract_panic_formatted_fixture(def_path: &str, template: &[u8]) -> Verifiab
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::fmt::Arguments::<'_>::new::<10, 1>",
+                        ),
                         is_foreign: false,
                         func: "core::fmt::Arguments::<'_>::new::<10, 1>".to_string(),
                         args: vec![Operand::Move(Place::local(5)), Operand::Copy(Place::local(6))],
@@ -7504,6 +8375,9 @@ fn contract_panic_formatted_fixture(def_path: &str, template: &[u8]) -> Verifiab
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::fmt::Arguments::<'_>::new::<10, 1>",
+                        ),
                         is_foreign: false,
                         func: "core::panicking::panic_fmt".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -7531,6 +8405,7 @@ fn contract_panic_formatted_fixture(def_path: &str, template: &[u8]) -> Verifiab
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -7676,6 +8551,19 @@ fn float_clamp_weighted_sum_fixture(
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        // NUM-METHOD-ANCHOR-1 (2026-10-04): the std `f64` arms decide on
+                        // the extractor's key; std's `clamp` is minted
+                        // `krate_is_real_sysroot: true` (measured), a user one is not.
+                        callee_key: Some(trust_types::CalleeKey {
+                            sysroot_item: None,
+                            krate_is_real_sysroot: clamp_callee.starts_with("core::"),
+                            krate_name_is_ambiguous: false,
+                            stable_crate_id: 0x1234,
+                            krate_name: clamp_callee.split("::").next().unwrap_or("").into(),
+                            foreign_block_leaf: None,
+                            upstream_foreign_link_symbol: None,
+                            diverging_entry: None,
+                        }),
                         is_foreign: false,
                         func: clamp_callee.to_string(),
                         args: vec![Operand::Copy(Place::local(1)), lo, hi],
@@ -7726,6 +8614,7 @@ fn float_clamp_weighted_sum_fixture(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -7760,11 +8649,129 @@ fn float_add_with_small_literal_operand_discharges_overflow_vc() {
     // T5 pin (aterm-types lib.rs:265 shape, `lighter + 0.05`): ONE small
     // literal operand suffices for the Add discharge (the witness needs BOTH
     // magnitudes above f64::MAX/2).
+    //
+    // Trust (2026-10-18, gate RCA precision T7, binary32 only): this binary64 add
+    // keeps the seal's answer, NO row; its binary32 twin
+    // (`float32_add_with_small_literal_operand_keeps_a_refuted_row`) keeps the row.
+    let func = small_literal_add(64);
+    let vcs = float_overflow_vcs(&func);
+    assert!(vcs.is_empty(), "x + 0.05 must discharge its overflow VC, got {vcs:?}");
+}
+
+/// Trust (2026-10-18, gate RCA precision T7): the binary32 twin of
+/// [`float_add_with_small_literal_operand_discharges_overflow_vc`] (aterm-effects
+/// `kitty_pet.rs:7601`, `self.quiet + 4.0`): the discharge earned by a tiny CONSTANT
+/// operand keeps its row, carrying `T <= |a|` and `T <= |b|` (`T = ulp(MAX)/2 = 2^103`
+/// at binary32), so the row is decided by a conjunct false on a ground term
+/// (`T <= |0.05|`) instead of vanishing, as the published seal reported it.
+#[test]
+fn float32_add_with_small_literal_operand_keeps_a_refuted_row() {
+    let func = small_literal_add(32);
+    let rows: Vec<VerificationCondition> = generate_vcs(&func)
+        .into_iter()
+        .filter(|vc| matches!(vc.kind, VcKind::FloatOverflowToInfinity { .. }))
+        .collect();
+    assert_eq!(rows.len(), 1, "x + 0.05f32 keeps exactly one overflow row, got {rows:?}");
+    assert!(
+        has_ground_false_bv_conjunct(&rows[0].formula),
+        "x + 0.05f32's row must be refuted by a ground conjunct: {:?}",
+        rows[0].formula
+    );
+}
+
+/// `x + 0.05` at the given IEEE width (32 or 64), the literal encoded at that width.
+fn small_literal_add(width: u32) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    let float_ty = Ty::Float { width };
+    let literal = match width {
+        32 => Operand::Constant(ConstValue::FloatBits {
+            bits: u128::from(0.05f32.to_bits()),
+            width: 32,
+        }),
+        _ => f64_lit(0.05),
+    };
+    VerifiableFunction {
+        name: "add_small_literal".to_string(),
+        def_path: "test::add_small_literal".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: float_ty.clone(), name: None },
+                LocalDecl { index: 1, ty: float_ty.clone(), name: Some("x".into()) },
+                LocalDecl { index: 2, ty: float_ty.clone(), name: None },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![
+                    Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Operand::Copy(Place::local(1)),
+                            literal,
+                        ),
+                        span: span.clone(),
+                    },
+                    Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+                        span: span.clone(),
+                    },
+                ],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: float_ty,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The value of a ground bit-vector term (a constant, or an extract of one); `None`
+/// when it has a free variable.
+fn ground_bv_value(f: &Formula) -> Option<u128> {
+    match f {
+        Formula::BitVec { value, .. } => u128::try_from(*value).ok(),
+        Formula::BvExtract { inner, high, low } => {
+            let v = ground_bv_value(inner)?;
+            let width = high - low + 1;
+            let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+            Some((v >> low) & mask)
+        }
+        _ => None,
+    }
+}
+
+/// Whether some conjunct of `f` (through nested `And`s) is a ground unsigned
+/// bit-vector comparison that is FALSE.
+fn has_ground_false_bv_conjunct(f: &Formula) -> bool {
+    match f {
+        Formula::And(conjuncts) => conjuncts.iter().any(has_ground_false_bv_conjunct),
+        Formula::BvULe(a, b, _) => {
+            matches!((ground_bv_value(a), ground_bv_value(b)), (Some(x), Some(y)) if x > y)
+        }
+        Formula::BvULt(a, b, _) => {
+            matches!((ground_bv_value(a), ground_bv_value(b)), (Some(x), Some(y)) if x >= y)
+        }
+        _ => false,
+    }
+}
+
+/// The negative control of [`float_add_with_small_literal_operand_discharges_overflow_vc`]:
+/// `x + 1.0e308` can overflow (the constant is far above `T`), is not discharged, and
+/// keeps the plain witness, with no conjunct a ground term refutes.
+#[test]
+fn float_add_with_a_large_literal_keeps_the_plain_witness() {
     let span = SourceSpan::default();
     let f64_ty = Ty::Float { width: 64 };
     let func = VerifiableFunction {
-        name: "add_small_literal".to_string(),
-        def_path: "test::add_small_literal".to_string(),
+        name: "add_large_literal".to_string(),
+        def_path: "test::add_large_literal".to_string(),
         span: span.clone(),
         body: VerifiableBody {
             locals: vec![
@@ -7780,7 +8787,7 @@ fn float_add_with_small_literal_operand_discharges_overflow_vc() {
                         rvalue: Rvalue::BinaryOp(
                             BinOp::Add,
                             Operand::Copy(Place::local(1)),
-                            f64_lit(0.05),
+                            f64_lit(1.0e308),
                         ),
                         span: span.clone(),
                     },
@@ -7800,9 +8807,18 @@ fn float_add_with_small_literal_operand_discharges_overflow_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
-    let vcs = float_overflow_vcs(&func);
-    assert!(vcs.is_empty(), "x + 0.05 must discharge its overflow VC, got {vcs:?}");
+    let rows: Vec<VerificationCondition> = generate_vcs(&func)
+        .into_iter()
+        .filter(|vc| matches!(vc.kind, VcKind::FloatOverflowToInfinity { .. }))
+        .collect();
+    assert_eq!(rows.len(), 1, "x + 1e308 keeps its overflow row, got {rows:?}");
+    assert!(
+        !has_ground_false_bv_conjunct(&rows[0].formula),
+        "x + 1e308 can overflow; its row must not be refuted by a ground conjunct: {:?}",
+        rows[0].formula
+    );
 }
 
 #[test]
@@ -7880,6 +8896,9 @@ fn test_unreachable_display_call_generates_guarded_unreachable_vc() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "core::panicking::unreachable_display::<&str>",
+                        ),
                         is_foreign: false,
                         func: "core::panicking::unreachable_display::<&str>".to_string(),
                         args: vec![],
@@ -7899,6 +8918,7 @@ fn test_unreachable_display_call_generates_guarded_unreachable_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -7992,6 +9012,7 @@ fn enum_discriminant_match_function(
         preconditions: vec![precondition],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8245,6 +9266,7 @@ fn nested_enum_discriminant_match_function(
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8399,6 +9421,60 @@ fn test_operand_to_formula_unknown_const_does_not_panic() {
     assert!(matches!(second, Formula::Var(_, Sort::Int)));
 }
 
+/// OPAQUE-REF-ID-1: every carrier with no modeled value renders by its occurrence identity.
+/// Two sites are two terms, one site is one term, and no carrier falls back to the shared
+/// `__unknown_const`; an `Operand::Unsupported` is named by its site, never by its
+/// diagnostic text (two `f16` constants share kind and detail but are two values).
+#[test]
+fn test_operand_to_formula_names_unmodeled_carriers_by_site() {
+    let func = midpoint_function();
+    let at = |block, stmt, slot| trust_types::OpaqueOrigin::Site { block, stmt, slot };
+    let render = |op: Operand| operand_to_formula(&func, &op);
+    let carriers: [fn(trust_types::OpaqueOrigin) -> Operand; 4] = [
+        |o| Operand::Constant(ConstValue::OpaqueConst(o)),
+        |o| {
+            Operand::Constant(ConstValue::UnitVariantRef {
+                enum_name: "core::option::Option".into(),
+                variant: 0,
+                origin: o,
+            })
+        },
+        |o| {
+            Operand::Constant(ConstValue::StructScalarFieldsRef {
+                adt_name: "probe::S".into(),
+                fields: vec![ConstValue::Uint(7, 8)],
+                origin: o,
+            })
+        },
+        |o| Operand::Unsupported {
+            kind: "Const::F16".into(),
+            detail: "float constant width 16".into(),
+            origin: o,
+        },
+    ];
+    for carrier in carriers {
+        let a = render(carrier(at(0, 0, 0)));
+        let a_again = render(carrier(at(0, 0, 0)));
+        let b = render(carrier(at(0, 1, 0)));
+        let c = render(carrier(at(1, 0, 1)));
+        assert_eq!(a, a_again, "one site is one term");
+        assert_ne!(a, b, "two sites are two terms: {a:?}");
+        assert_ne!(a, c, "two sites are two terms: {a:?}");
+        assert_ne!(b, c, "two sites are two terms: {b:?}");
+        for f in [&a, &b, &c] {
+            let Formula::Var(name, Sort::Int) = f else { panic!("an Int symbol: {f:?}") };
+            assert_ne!(name, "__unknown_const");
+            assert!(
+                name.starts_with(trust_types::OPAQUE_REF_SYMBOL_PREFIX)
+                    || name.starts_with(trust_types::UNSUPPORTED_OPERAND_SYMBOL_PREFIX),
+                "{name}"
+            );
+        }
+    }
+    // The two families never meet, even at one site.
+    assert_ne!(render(carriers[0](at(0, 0, 0))), render(carriers[3](at(0, 0, 0))));
+}
+
 #[test]
 fn test_float_ops_integer_isolation() {
     // Integer Div emits a DivisionByZero VC but never produces
@@ -8441,6 +9517,9 @@ fn atomic_load_release_function() -> VerifiableFunction {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(
+                        "core::intrinsics::atomic_load_release",
+                    ),
                     is_foreign: false,
                     func: "core::intrinsics::atomic_load_release".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -8465,6 +9544,7 @@ fn atomic_load_release_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8518,6 +9598,9 @@ fn test_atomic_legality_legal_load_no_vc() {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(
+                        "core::intrinsics::atomic_load_acquire",
+                    ),
                     is_foreign: false,
                     func: "core::intrinsics::atomic_load_acquire".to_string(),
                     args: vec![Operand::Copy(Place::local(1))],
@@ -8542,6 +9625,7 @@ fn test_atomic_legality_legal_load_no_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -8675,6 +9759,7 @@ fn safe_midpoint_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8751,6 +9836,7 @@ fn semantic_guard_join_reenqueue_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -8890,6 +9976,9 @@ fn test_atomic_legality_fence_relaxed_generates_vc() {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: crate::sep_engine::tests::fixture_key(
+                        "core::intrinsics::atomic_fence_relaxed",
+                    ),
                     is_foreign: false,
                     func: "core::intrinsics::atomic_fence_relaxed".to_string(),
                     args: vec![],
@@ -8914,6 +10003,7 @@ fn test_atomic_legality_fence_relaxed_generates_vc() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let vcs = generate_vcs(&func);
@@ -9019,6 +10109,7 @@ fn single_block_func(locals: Vec<LocalDecl>, stmts: Vec<Statement>) -> Verifiabl
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -9265,17 +10356,27 @@ fn place_ty_resolves_nested_enum_variant_payload() {
     let inner_opt = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Option".into(),
-        fields: vec![("__tag".into(), tag()), ("__v1_0".into(), Ty::u32())],
+        fields: vec![("__tag".into(), tag()), ("__v1_0".into(), Ty::u32())].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-    let outer_opt = Ty::Adt { adt_kind: None, layout: None,
-        variants: Vec::new(),
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
+    let outer_opt = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
         name: "Option".into(),
-        fields: vec![("__tag".into(), tag()), ("__v1_0".into(), inner_opt.clone())],
+        fields: vec![("__tag".into(), tag()), ("__v1_0".into(), inner_opt.clone())].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -9326,7 +10427,7 @@ fn operand_ty_cow_is_byte_identical_to_operand_ty() {
     let fat = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Expr".into(),
         fields: vec![
             (
@@ -9334,15 +10435,25 @@ fn operand_ty_cow_is_byte_identical_to_operand_ty() {
                 Ty::Adt {
                     adt_kind: None,
                     layout: None,
-                    variants: Vec::new(),
+                    variants: Vec::new().into(),
                     name: "ExprKind".into(),
-                    fields: vec![("x".into(), Ty::u32())],
+                    fields: vec![("x".into(), Ty::u32())].into(),
                     disc_index_safe: false,
-                    faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
             ),
             ("flag".into(), Ty::Bool),
-        ],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        ]
+        .into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::Unit, name: None },
@@ -9389,14 +10500,19 @@ fn deref_of_reborrowed_payload_converges_to_referent_name() {
     let opt = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Option".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
             ("__v1_0".into(), Ty::u32()),
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let opt_ref = Ty::Ref { mutable: false, inner: Box::new(opt) };
     let payload = Place {
         local: 1,
@@ -9489,11 +10605,15 @@ fn place_ty_struct_field_without_downcast_stays_flat() {
     let s = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "S".into(),
-        fields: vec![("x".into(), Ty::u32()), ("y".into(), Ty::Bool)],
+        fields: vec![("x".into(), Ty::u32()), ("y".into(), Ty::Bool)].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -9706,11 +10826,15 @@ fn deref_shared_struct_field_array_const_index_converges() {
     let buf = Ty::Adt {
         adt_kind: None,
         layout: None,
-        variants: Vec::new(),
+        variants: Vec::new().into(),
         name: "Buf".to_string(),
-        fields: vec![("data".to_string(), arr)],
+        fields: vec![("data".to_string(), arr)].into(),
         disc_index_safe: false,
-        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let bref = Ty::Ref { mutable: false, inner: Box::new(buf) };
     let func = single_block_func(
         vec![
@@ -9779,9 +10903,46 @@ fn deref_shared_array_nonconst_prefix_index_does_not_converge() {
 // minimal `safe_struct_payload`-shaped function. Local 1 "s" is the enum
 // arg; `_3` "p" is the moved-out payload (`_3 = move (_1 as v0).0`); `_4` "p" is the
 // guard's reborrow (`_4 = &(_1 as v0).0`). `extra` lets a test inject a mutation
-// that must defeat the value-alias fold. Types are irrelevant to naming, so all
-// locals are u32.
+// that must defeat the value-alias fold.
+//
+// Trust: 2026-10-15 (INTERIOR-MUT-CHANNEL-1 re-pin) — the locals carry the program's
+// own types: `s: test::E` (`two_variant_enum`, `A(Point)`/`B(Point)`), `p: Point` and
+// `&Point`. Until G2 every local was a `u32` ("types are irrelevant to naming"); since
+// G2 the guard's SHARED reborrow is a write channel to `s`'s own storage when the
+// borrowed payload may hold an `UnsafeCell` (`generate::shared_borrow_cell_places`),
+// and a `Downcast`/`Field` of a `u32` cannot be typed, so it was named whole (the
+// fail-closed arm) and the fold refused. The program's payload is `Freeze`;
+// `struct_payload_with_a_cell_keeps_its_write_channel` is the cell-holding twin.
 fn struct_payload_alias_fn(extra: Vec<Statement>) -> VerifiableFunction {
+    struct_payload_alias_fn_with(payload_point(), extra)
+}
+
+/// `test::Point { x: u32 }`, a stamped struct (`adt_kind: Some(Struct)`), as the extractor
+/// renders one.
+fn payload_point() -> Ty {
+    let mut ty = Ty::adt("test::Point", vec![("x".to_string(), Ty::u32())]);
+    if let Ty::Adt { adt_kind, .. } = &mut ty {
+        *adt_kind = Some(trust_types::AdtKind::Struct);
+    }
+    ty
+}
+
+/// `test::CPoint { x: u32, c: core::cell::Cell<u32> }`: the same shape holding a cell.
+fn payload_cell_point() -> Ty {
+    let stamped = |name: &str, fields: Vec<(&str, Ty)>| {
+        let mut ty = Ty::adt(name, fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
+        if let Ty::Adt { adt_kind, .. } = &mut ty {
+            *adt_kind = Some(trust_types::AdtKind::Struct);
+        }
+        ty
+    };
+    let unsafe_cell = stamped("core::cell::UnsafeCell<u32>", vec![("value", Ty::u32())]);
+    let cell = stamped("core::cell::Cell<u32>", vec![("value", unsafe_cell)]);
+    stamped("test::CPoint", vec![("x", Ty::u32()), ("c", cell)])
+}
+
+fn struct_payload_alias_fn_with(payload_ty: Ty, extra: Vec<Statement>) -> VerifiableFunction {
+    let enum_ty = two_variant_enum(payload_ty.clone());
     let payload =
         || Place { local: 1, projections: vec![Projection::Downcast(0), Projection::Field(0)] };
     let mut stmts = vec![
@@ -9797,14 +10958,17 @@ fn struct_payload_alias_fn(extra: Vec<Statement>) -> VerifiableFunction {
         },
     ];
     stmts.extend(extra);
+    let shared_payload = Ty::Ref { mutable: false, inner: Box::new(payload_ty.clone()) };
+    let mut_enum = Ty::Ref { mutable: true, inner: Box::new(enum_ty.clone()) };
     single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
-            LocalDecl { index: 1, ty: Ty::u32(), name: Some("s".into()) },
+            LocalDecl { index: 1, ty: enum_ty, name: Some("s".into()) },
             LocalDecl { index: 2, ty: Ty::u32(), name: None },
-            LocalDecl { index: 3, ty: Ty::u32(), name: Some("p".into()) },
-            LocalDecl { index: 4, ty: Ty::u32(), name: Some("p".into()) },
-            LocalDecl { index: 5, ty: Ty::u32(), name: None },
+            LocalDecl { index: 3, ty: payload_ty, name: Some("p".into()) },
+            LocalDecl { index: 4, ty: shared_payload, name: Some("p".into()) },
+            // `_5 = &mut _1` in `struct_payload_fold_blocked_by_mut_borrow_of_source`.
+            LocalDecl { index: 5, ty: mut_enum, name: None },
         ],
         stmts,
     )
@@ -9830,6 +10994,58 @@ fn struct_payload_moved_base_local_field_converges_with_guard_reborrow() {
     let guard_operand =
         Place { local: 4, projections: vec![Projection::Deref, Projection::Field(0)] };
     assert_eq!(place_to_var_name(&func, &guard_operand), source_name);
+
+    // INTERIOR-MUT-CHANNEL-1: the guard's shared reborrow of a `Freeze` payload hands out
+    // no write channel to `s`, so `s` keeps one value.
+    assert!(crate::generate::shared_borrowed_cell_places(&func, 1).is_empty());
+    assert!(crate::place_source_is_stable(&func, 1));
+}
+
+/// Trust: 2026-10-15 (INTERIOR-MUT-CHANNEL-1) — the cell-holding twin of
+/// `struct_payload_moved_base_local_field_converges_with_guard_reborrow`: the same
+/// shape with a payload `CPoint { x: u32, c: Cell<u32> }`. The guard's SHARED reborrow
+/// `_4 = &(_1 as v0).0` reaches the payload's cell bytes, which any holder of `_4` writes
+/// with defined behaviour (`Cell::set`), so `s`'s cell sub-place is a write channel: it is
+/// named for the call havoc, `s` no longer holds one value, and the moved-out cell
+/// `_3.1` must not be read as the source cell `s@0.0.1` (the value a holder of `_4` may
+/// have replaced before the move). Whether the FROZEN sibling `_3.0` may still fold is a
+/// precision question this row does not pin.
+#[test]
+fn struct_payload_with_a_cell_keeps_its_write_channel() {
+    let func = struct_payload_alias_fn_with(payload_cell_point(), vec![]);
+    let cell = Place {
+        local: 1,
+        projections: vec![Projection::Downcast(0), Projection::Field(0), Projection::Field(1)],
+    };
+    assert_eq!(*crate::generate::shared_borrowed_cell_places(&func, 1), vec![cell.clone()]);
+    let cell_name = place_to_var_name(&func, &cell);
+    assert_eq!(cell_name, "s@0.0.1");
+    let names = crate::generate::stored_ref_pointee_names(&func);
+    assert!(names.contains(&cell_name), "`{cell_name}` must be havocked: {names:?}");
+    assert!(!crate::place_source_is_stable(&func, 1));
+    let moved_cell = Place { local: 3, projections: vec![Projection::Field(1)] };
+    assert_ne!(place_to_var_name(&func, &moved_cell), cell_name);
+}
+
+/// Trust: 2026-10-15 (INTERIOR-MUT-CHANNEL-1) — the body as this row's fixture spelled it
+/// before G2, every local a `u32`: `(_1 as v0).0` of a `u32` cannot be typed, so the
+/// guard's shared reborrow is named as a cell channel (the fail-closed arm of
+/// `generate::shared_borrow_cell_places`) and the fold is refused. An ill-typed body
+/// earns no fact. Trust: 2026-10-16 (INTERIOR-MUT-CHANNEL-2): the base of the borrowed
+/// `Field` cannot be classified, so it may be a union, and the borrow names its union
+/// cover `(_1 as v0)` (the cut `union_write_cover_name` takes on an untyped step), wider
+/// than the borrowed place itself.
+#[test]
+fn struct_payload_on_an_untypable_borrow_fails_closed() {
+    let mut func = struct_payload_alias_fn(vec![]);
+    for decl in &mut func.body.locals {
+        decl.ty = Ty::u32();
+    }
+    let cover = Place { local: 1, projections: vec![Projection::Downcast(0)] };
+    assert_eq!(*crate::generate::shared_borrowed_cell_places(&func, 1), vec![cover]);
+    assert!(!crate::place_source_is_stable(&func, 1));
+    let overflow_operand = Place { local: 3, projections: vec![Projection::Field(0)] };
+    assert_eq!(place_to_var_name(&func, &overflow_operand), "_3.0");
 }
 
 #[test]
@@ -9911,6 +11127,7 @@ fn array_param_fn(arr_len: u64, stmts: Vec<Statement>) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -9976,6 +11193,7 @@ fn array_theory_local_none_for_index_reassigned_via_call_dest() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("reidx"),
                         is_foreign: false,
                         func: "reidx".to_string(),
                         args: vec![Operand::Copy(Place::local(2))],
@@ -9995,6 +11213,7 @@ fn array_theory_local_none_for_index_reassigned_via_call_dest() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(!index_local_stable(&func, 2), "index reassigned via Call dest is not stable");
     assert_eq!(array_theory_local(&func, 1), None);
@@ -10025,6 +11244,7 @@ fn array_theory_local_none_for_whole_array_call_reseat() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("fresh"),
                         is_foreign: false,
                         func: "fresh".to_string(),
                         args: vec![],
@@ -10044,6 +11264,7 @@ fn array_theory_local_none_for_whole_array_call_reseat() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(array_local_escapes(&func, 1), "whole-array Call reseat must escape");
     assert_eq!(array_theory_local(&func, 1), None);
@@ -10090,6 +11311,7 @@ fn v2_widening_bv_source_declines_reassigned_operand() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let op = Operand::Copy(Place::local(3));
@@ -10134,6 +11356,7 @@ fn v2_widening_bv_source_declines_call_and_binop_reassign() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let op = Operand::Copy(Place::local(2));
     // (b) Call-dest reassign: `w = x as i64;` then `w = f()` (Call dest into w).
@@ -10143,6 +11366,7 @@ fn v2_widening_bv_source_declines_call_and_binop_reassign() {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("f"),
             is_foreign: false,
             func: "f".to_string(),
             args: vec![],
@@ -10260,6 +11484,7 @@ fn array_theory_local_none_when_function_has_if_else_join() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(!func_has_no_join(&func), "bb3 has two predecessors");
     assert_eq!(array_theory_local(&func, 1), None);
@@ -10310,6 +11535,7 @@ fn array_theory_local_none_for_nonscalar_elem() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(array_theory_local(&func, 1), None);
 }
@@ -10376,6 +11602,7 @@ fn func_has_no_join_false_for_diamond_join() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(!func_has_no_join(&func));
 }
@@ -10434,6 +11661,7 @@ fn array_theory_read_emits_select_based_formula() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     assert!(array_theory_local(&func, 1).is_some(), "array must be eligible");
@@ -10457,6 +11685,201 @@ fn array_theory_read_emits_select_based_formula() {
             );
         }
     }
+}
+
+/// `[7u32; n]` constructed into a local; then, in a successor block, `t = a[j]`,
+/// a variable-index store `a[i] = 7` (which makes the array an array-theory
+/// local) and `w / t`. Params `i`, `j`, `w` are locals 1-3, the array is local
+/// 4, `t` local 5. `extra` statements are appended to the construction block.
+///
+/// The shape is chosen so the division VC decides on the seed alone. The read
+/// is of `v0` (before the store) and sits in a SUCCESSOR block: a read in the
+/// construction's own block takes the statement-version oracle's exact-prefix
+/// fallback for the synthetic `arr$L$vN` names and comes out
+/// `arr$4$v0#s0_pre`, which no array definition names, so the relevance filter
+/// drops them and the read is unconstrained (sound; a pre-existing precision
+/// gap independent of how `[v; N]` is seeded). A read of `v1` would need
+/// read-over-write reasoning through the store, whose UNSAT the in-process
+/// lane's strict proof check rejects today ("unsupported theory lemma kind
+/// Generic"), for a store chain as much as for a constant array.
+fn repeat_seeded_array_fn(n: usize, extra: Vec<Statement>) -> VerifiableFunction {
+    let seven = || Operand::Constant(ConstValue::Uint(7, 32));
+    let mut construct = vec![Statement::Assign {
+        place: Place::local(4),
+        rvalue: Rvalue::Repeat(seven(), n),
+        span: SourceSpan::default(),
+    }];
+    construct.extend(extra);
+    let body = vec![
+        Statement::Assign {
+            place: Place::local(5),
+            rvalue: Rvalue::Use(Operand::Copy(Place {
+                local: 4,
+                projections: vec![Projection::Index(2)],
+            })),
+            span: SourceSpan::default(),
+        },
+        Statement::Assign {
+            place: Place { local: 4, projections: vec![Projection::Index(1)] },
+            rvalue: Rvalue::Use(seven()),
+            span: SourceSpan::default(),
+        },
+        Statement::Assign {
+            place: Place::local(6),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Div,
+                Operand::Copy(Place::local(3)),
+                Operand::Copy(Place::local(5)),
+            ),
+            span: SourceSpan::default(),
+        },
+    ];
+    VerifiableFunction {
+        name: "repeat_read".to_string(),
+        def_path: "test::repeat_read".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: Ty::usize(), name: Some("i".into()) },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("j".into()) },
+                LocalDecl { index: 3, ty: Ty::u32(), name: Some("w".into()) },
+                LocalDecl {
+                    index: 4,
+                    ty: Ty::Array { elem: Box::new(Ty::u32()), len: n as u64 },
+                    name: Some("a".into()),
+                },
+                LocalDecl { index: 5, ty: Ty::u32(), name: Some("t".into()) },
+                LocalDecl { index: 6, ty: Ty::u32(), name: None },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: construct,
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock { id: BlockId(1), stmts: body, terminator: Terminator::Return },
+            ],
+            arg_count: 3,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+fn division_vc(func: &VerifiableFunction) -> VerificationCondition {
+    generate_vcs(func)
+        .into_iter()
+        .find(|vc| matches!(vc.kind, VcKind::DivisionByZero))
+        .expect("the `w / a[j]` division-by-zero VC")
+}
+
+/// Phase 2b: `[v; N]` is the constant array `((as const (Array Int E)) v)` for
+/// EVERY `N`. The division VC is the same formula, node for node, at
+/// `N` = 2, 64, 65, 1024 and 4097 — `N` does not occur in it — where the
+/// retired seed built an `N`-long Store chain up to 64 and lost `v` beyond (a
+/// free base, so `a[j]` was unconstrained: a false FAIL). Small lengths on
+/// purpose: equal VCs across them already show nothing grows per lane, and a
+/// regression then fails as a cheap assertion instead of touching memory in
+/// proportion to a huge `N` under a parallel test runner.
+#[test]
+fn repeat_seed_is_a_constant_array_whose_size_is_independent_of_n() {
+    let render = |n: usize| {
+        let func = repeat_seeded_array_fn(n, Vec::new());
+        assert!(array_theory_local(&func, 4).is_some(), "eligible at N = {n}");
+        let vc = division_vc(&func);
+        let mut const_arrays = 0usize;
+        let mut stores = 0usize;
+        let mut nodes = 0usize;
+        vc.formula.visit(&mut |node| {
+            nodes += 1;
+            match node {
+                Formula::ConstArray { .. } => const_arrays += 1,
+                Formula::Store(..) => stores += 1,
+                _ => {}
+            }
+        });
+        (format!("{:?}", vc.formula), nodes, const_arrays, stores)
+    };
+    let two = render(2);
+    assert!(two.2 >= 1, "a constant array states the seed");
+    assert_eq!(two.3, 0, "no Store: the retired seed was a chain of them");
+    for n in [64, 65, 1024, 4097] {
+        assert_eq!(render(n), two, "the VC must not grow with N = {n}");
+    }
+}
+
+/// Phase 2b, the precision half: every lane of `[7; N]` is 7, so `a[j] == 7`
+/// and `w / a[j]` cannot divide by zero — PROVED at `N` = 4 and at `N` = 1024.
+/// The retired seed made both a false FAIL: an unguarded `j` reads past a
+/// 4-lane Store chain into its free base, and beyond 64 the whole array was the
+/// free base.
+#[test]
+fn repeat_seed_proves_reads_of_a_large_uniform_array() {
+    for n in [4usize, 1024] {
+        let vc = division_vc(&repeat_seeded_array_fn(n, Vec::new()));
+        let result = crate::test_router::shipped_vc_clock_router()
+            .verify_all(std::slice::from_ref(&vc))
+            .into_iter()
+            .next()
+            .map(|(_, result)| result)
+            .expect("one result");
+        assert!(result.is_proved(), "N = {n}: expected Proved, got {result:?}");
+    }
+}
+
+/// `v0` has ONE definition. A second whole-local write (here a re-construction
+/// after the element store) would give it two — equating `[7; N]` with
+/// `[1; N]` — so the array leaves the channel (the sound opaque fallback).
+#[test]
+fn a_second_whole_array_write_declines_the_array_channel() {
+    let rebuild = Statement::Assign {
+        place: Place::local(4),
+        rvalue: Rvalue::Repeat(Operand::Constant(ConstValue::Uint(1, 32)), 8),
+        span: SourceSpan::default(),
+    };
+    assert!(array_theory_local(&repeat_seeded_array_fn(8, Vec::new()), 4).is_some());
+    assert!(array_theory_local(&repeat_seeded_array_fn(8, vec![rebuild]), 4).is_none());
+    // A parameter's `v0` is the caller's value, so any whole write declines.
+    let mut param_rewrite = array_param_fn(8, vec![variable_index_store()]);
+    param_rewrite.body.blocks[0].stmts.insert(
+        0,
+        Statement::Assign {
+            place: Place::local(1),
+            rvalue: Rvalue::Repeat(Operand::Constant(ConstValue::Uint(0, 32)), 8),
+            span: SourceSpan::default(),
+        },
+    );
+    assert!(array_theory_local(&param_rewrite, 1).is_none());
+}
+
+/// A FROM-END constant index (`let [.., last] = a` reads `a[1 of 1 from end]`)
+/// selects lane `len - offset`, not lane `offset`.
+#[test]
+fn from_end_constant_index_reads_the_lane_it_names() {
+    let func = repeat_seeded_array_fn(8, Vec::new());
+    let versions = v2_array_version_prepass(&func);
+    let ctx = ArrayReadCtx::new(&versions, BlockId(1), 0);
+    let read = |offset: usize, from_end: bool| {
+        array_element_select(
+            &func,
+            &Operand::Copy(Place {
+                local: 4,
+                projections: vec![Projection::ConstantIndex { offset, min_length: 1, from_end }],
+            }),
+            &ctx,
+        )
+        .expect("an eligible element read")
+    };
+    let Formula::Select(_, index) = read(1, true) else { panic!("a Select") };
+    assert_eq!(*index, Formula::Int(7), "1 from the end of 8 lanes is lane 7");
+    let Formula::Select(_, index) = read(1, false) else { panic!("a Select") };
+    assert_eq!(*index, Formula::Int(1));
 }
 
 /// loop-backedge regression: a loop variable reassigned on the back-edge
@@ -10555,6 +11978,7 @@ fn loop_backedge_call_dest_havocs_preloop_fact() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("next_i"),
                         is_foreign: false,
                         func: "next_i".to_string(),
                         args: vec![],
@@ -10574,6 +11998,7 @@ fn loop_backedge_call_dest_havocs_preloop_fact() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     // The loop header (bb1) is reached from the entry edge (`i == 0`) and the
@@ -10657,6 +12082,7 @@ fn call_arg_mut_ref_havocs_pointee_fact() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key("mutate"),
                         is_foreign: false,
                         func: "mutate".to_string(),
                         args: vec![Operand::Move(Place::local(2))],
@@ -10676,6 +12102,7 @@ fn call_arg_mut_ref_havocs_pointee_fact() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let map = crate::generate::v2_build_path_definition_map_pub(&func);
@@ -10773,6 +12200,7 @@ fn store_through_pointer_havocs_referent_fact() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
 
     let stale_x_eq_5 =
@@ -10891,6 +12319,7 @@ fn cast_laundered_pointer_store_havocs_referent_fact() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let stale_x_eq_5 =
         Formula::Eq(Box::new(Formula::Var("x".into(), Sort::Int)), Box::new(Formula::Int(5)));
@@ -11001,6 +12430,7 @@ fn reseated_ptr_deref_store_havocs_referent_fact() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let stale_x_eq_5 =
@@ -11118,6 +12548,7 @@ fn same_block_compare_then_reassign_drops_stale_guard() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let overflow_smt = |reassign: bool| {
@@ -11264,6 +12695,7 @@ fn cross_block_bitand_range_guard_dropped_on_reassign() {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     };
     let overflow_smt = |reassign: bool| {
@@ -11354,6 +12786,7 @@ fn index_projection_func(dest: Place, rvalue: Rvalue, dest_local0_ty: Ty) -> Ver
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11570,6 +13003,7 @@ fn guarded_store_side_index_projection_proves() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = index_bounds_vcs(&func);
     assert_eq!(
@@ -11646,6 +13080,7 @@ fn guarded_mut_ref_index_projection_proves() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let vcs = index_bounds_vcs(&func);
     assert_eq!(vcs.len(), 1);
@@ -11820,6 +13255,7 @@ fn tuple_field_discriminant_function(stable: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11859,6 +13295,740 @@ fn unstable_aggregate_field_discriminants_not_tied() {
     );
 }
 
+// ── Owned-aggregate discriminant CSE AFTER A CALL (TRUST-10, 2026-09-23) ──────
+//
+// bit-vec 0.9.1's `impl Ord for BitVec` builds `_5 = (a.next(), b.next())` and
+// re-reads `discriminant(_5.1)` into three temps; every read follows the calls, so
+// the pre-barrier-only builder tied none of them and the shared
+// `otherwise -> unreachable` was refuted. An owned aggregate no code can reach is
+// now tied across a barrier; the rows below pin each exposure that must still
+// refuse it. The real-MIR half is `tests/discriminant_cse_after_call_realmir.rs`.
+
+/// What, besides the call barrier, the post-call fixture carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostCallExposure {
+    /// Nothing: `_3` is built, read twice, never borrowed.
+    None,
+    /// `_6 = &_3` — a SHARED borrow of the aggregate (an interior-mutable field would
+    /// be reachable through it).
+    SharedBorrow,
+    /// `_6 = &mut _3` — a MUTABLE borrow a call could write through.
+    MutBorrow,
+    /// `_6 = &raw const (_3.0)` — a raw address of one field.
+    RawFieldAddress,
+    /// `_6 = Unsupported { operands: [Copy(_3)] }` — the extractor's `Reborrow`.
+    UnsupportedAlias,
+    /// A `Drop(_3)` terminator between the reads.
+    Drop,
+    /// The first temp is REUSED: `_4 = copy _1` after its discriminant read.
+    ReusedTemp,
+    /// An unmodelled `Statement::Unsupported` that names no local: an `Unlocatable`
+    /// write, which no local can be ruled out of.
+    UnlocatableElsewhere,
+}
+
+/// bb0: `_7 = test::opaque_sum() -> bb1` (the barrier);
+/// bb1: `_3 = (_1, _2); _4 = disc(_3.0); [exposure]; _5 = disc(_3.0)` then return.
+fn tuple_field_discriminant_after_call(exposure: PostCallExposure) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    let field0 = Place::field(3, 0);
+    let mut first = vec![
+        Statement::Assign {
+            place: Place::local(3),
+            rvalue: Rvalue::Aggregate(
+                AggregateKind::Tuple,
+                vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            ),
+            span: span.clone(),
+        },
+        Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Discriminant(field0.clone()),
+            span: span.clone(),
+        },
+    ];
+    let exposing = match exposure {
+        PostCallExposure::None | PostCallExposure::Drop => None,
+        PostCallExposure::SharedBorrow => {
+            Some(Rvalue::Ref { mutable: false, place: Place::local(3) })
+        }
+        PostCallExposure::MutBorrow => Some(Rvalue::Ref { mutable: true, place: Place::local(3) }),
+        PostCallExposure::RawFieldAddress => Some(Rvalue::AddressOf(false, field0.clone())),
+        PostCallExposure::UnsupportedAlias => Some(Rvalue::Unsupported {
+            kind: "Reborrow".into(),
+            detail: "test".into(),
+            operands: vec![Operand::Copy(Place::local(3))],
+        }),
+        PostCallExposure::ReusedTemp => {
+            first.push(Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                span: span.clone(),
+            });
+            None
+        }
+        PostCallExposure::UnlocatableElsewhere => {
+            first.push(Statement::Unsupported {
+                kind: "InlineAsmLike".into(),
+                detail: "test".into(),
+                operands: vec![],
+                span: span.clone(),
+            });
+            None
+        }
+    };
+    if let Some(rvalue) = exposing {
+        first.push(Statement::Assign { place: Place::local(6), rvalue, span: span.clone() });
+    }
+    let second = vec![Statement::Assign {
+        place: Place::local(5),
+        rvalue: Rvalue::Discriminant(field0.clone()),
+        span: span.clone(),
+    }];
+    let call = BasicBlock {
+        id: BlockId(0),
+        stmts: vec![],
+        terminator: Terminator::Call {
+            func: "test::opaque_sum".into(),
+            args: vec![],
+            dest: Place::local(7),
+            target: Some(BlockId(1)),
+            span: span.clone(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            unwind: UnwindEdge::Continue,
+            callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("test::opaque_sum"),
+        },
+    };
+    let blocks = if exposure == PostCallExposure::Drop {
+        vec![
+            call,
+            BasicBlock {
+                id: BlockId(1),
+                stmts: first,
+                terminator: Terminator::Drop {
+                    place: Place::local(3),
+                    target: BlockId(2),
+                    span: span.clone(),
+                    unwind: UnwindEdge::Continue,
+                },
+            },
+            BasicBlock { id: BlockId(2), stmts: second, terminator: Terminator::Return },
+        ]
+    } else {
+        let mut stmts = first;
+        stmts.extend(second);
+        vec![call, BasicBlock { id: BlockId(1), stmts, terminator: Terminator::Return }]
+    };
+    VerifiableFunction {
+        name: "tuple_field_discriminant_after_call".to_string(),
+        def_path: "test::tuple_field_discriminant_after_call".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: Ty::i32(), name: None },
+                LocalDecl { index: 2, ty: Ty::i32(), name: None },
+                LocalDecl { index: 3, ty: Ty::i32(), name: None },
+                LocalDecl { index: 4, ty: Ty::i32(), name: None },
+                LocalDecl { index: 5, ty: Ty::i32(), name: None },
+                LocalDecl {
+                    index: 6,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::i32()) },
+                    name: None,
+                },
+                LocalDecl { index: 7, ty: Ty::u32(), name: None },
+            ],
+            blocks,
+            arg_count: 2,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+#[test]
+fn unexposed_owned_aggregate_field_discriminants_are_tied_after_a_call() {
+    let func = tuple_field_discriminant_after_call(PostCallExposure::None);
+    assert!(crate::local_defs::storage_never_aliased(&func, 3));
+    let facts = crate::generate::build_discriminant_cse_facts(&func);
+    assert!(
+        facts_tie(&facts, "_4", "_5"),
+        "no code can reach `_3`, so a call before the reads cannot change `_3.0`; got {facts:?}"
+    );
+}
+
+#[test]
+fn exposed_owned_aggregate_field_discriminants_are_not_tied_after_a_call() {
+    for (exposure, why) in [
+        (PostCallExposure::SharedBorrow, "a shared borrow of the aggregate"),
+        (PostCallExposure::MutBorrow, "a mutable borrow of the aggregate"),
+        (PostCallExposure::RawFieldAddress, "a raw address of the read field"),
+        (PostCallExposure::UnsupportedAlias, "an `Unsupported` rvalue naming the aggregate"),
+        (PostCallExposure::Drop, "a `Drop` of the aggregate between the reads"),
+        (PostCallExposure::ReusedTemp, "a second value in the first temp"),
+        (PostCallExposure::UnlocatableElsewhere, "an unlocatable write anywhere in the body"),
+    ] {
+        let func = tuple_field_discriminant_after_call(exposure);
+        // The seam question itself refuses every exposure of `_3`; a reused TEMP is
+        // guard 3's refusal, not an exposure of the aggregate.
+        assert_eq!(
+            crate::local_defs::storage_never_aliased(&func, 3),
+            exposure == PostCallExposure::ReusedTemp,
+            "{why}: `storage_never_aliased(_3)`"
+        );
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert!(
+            !facts_tie(&facts, "_4", "_5"),
+            "{why} must refuse the post-call tie (fail-closed); got {facts:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reused_temp_is_not_tied_even_before_any_barrier() {
+    // Guard 3 holds in the pre-barrier region too: `_4 = disc(_3.0); _4 = _1;
+    // _5 = disc(_3.0)` — `_4 == _5` is false after the second write.
+    let mut func = tuple_field_discriminant_function(true);
+    func.body.blocks[0].stmts.insert(
+        2,
+        Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+            span: SourceSpan::default(),
+        },
+    );
+    let facts = crate::generate::build_discriminant_cse_facts(&func);
+    assert!(!facts_tie(&facts, "_4", "_5"), "a reused temp must not be tied; got {facts:?}");
+}
+
+// ── Shared-reference PARAMETER discriminant CSE AFTER A CALL (TRUST-09, 2026-09-25) ──
+//
+// A `#[derive(Ord)]` enum with data-carrying variants reads `disc(*self)` before the
+// `<isize as Ord>::cmp` call and re-reads it through `_9 = (copy _1, copy _2)` after
+// it; the pre-barrier-only arm (a) left the re-reads free and the derive's
+// `_ => unreachable` was refuted (regex-syntax's `Utf8Sequence::cmp`). The pointee of
+// this function's own `&T` parameter is protected for the whole body, so with no
+// `UnsafeCell` in `T` its discriminant is one value throughout. The rows below pin the
+// tie and every refusal. The real-MIR half is `tests/derived_ord_cmp_realmir.rs`.
+
+/// What the post-call shared-parameter fixture varies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SharedParamCase {
+    /// `_1: &E`, `E` two data-carrying variants of `u8`: the tie is made.
+    Frozen,
+    /// `E`'s payload is a `Cell<u8>` — an `UnsafeCell` inline in the pointee.
+    UnsafeCellPayload,
+    /// `E`'s payload is a by-name `Datatype` marker the walk cannot see into.
+    OpaquePayload,
+    /// `_1: &mut E` — not a shared reference.
+    MutParam,
+    /// `_1 = copy _2` after the call — the parameter is not pinned.
+    ReassignedParam,
+    /// The reads are of `*_9` with `_9 = &_8` a LOCAL borrow, not a parameter.
+    LocalSharedRef,
+    /// The barrier is a FOREIGN call.
+    ForeignCallee,
+    /// The barrier is a call of an `unsafe fn`.
+    UnsafeCallee,
+    /// The barrier makes an atomic write.
+    AtomicCallee,
+    /// A second barrier, an `Opaque` terminator, runs before the re-read.
+    OpaqueBarrier,
+}
+
+fn two_variant_enum(payload: Ty) -> Ty {
+    Ty::Adt {
+        name: "test::E".to_string(),
+        fields: vec![
+            ("__tag".to_string(), Ty::Int { width: 64, signed: true }),
+            ("__v0_0".to_string(), payload.clone()),
+            ("__v1_0".to_string(), payload.clone()),
+        ]
+        .into(),
+        variants: vec![
+            trust_types::VariantDef {
+                name: "A".to_string(),
+                discriminant: 0,
+                fields: vec![("0".to_string(), payload.clone())],
+            },
+            trust_types::VariantDef {
+                name: "B".to_string(),
+                discriminant: 1,
+                fields: vec![("0".to_string(), payload)],
+            },
+        ]
+        .into(),
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(trust_types::AdtKind::Enum),
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
+}
+
+/// bb0: `_3 = disc(*_1); _7 = test::safe_callee() -> bb1` (the barrier);
+/// bb1: `_4 = (copy _1, copy _2); _5 = copy (_4.0); _6 = disc(*_5)` then return —
+/// the derive's shape, where `*_5` canonicalizes to `*_1`. The `LocalSharedRef` case
+/// reads `*_9` (`_9 = &_8`) on both sides instead.
+fn shared_param_discriminant_after_call(case: SharedParamCase) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    let payload = match case {
+        SharedParamCase::UnsafeCellPayload => Ty::Adt {
+            name: "core::cell::Cell<u8>".to_string(),
+            fields: vec![(
+                "value".to_string(),
+                Ty::Adt {
+                    name: "core::cell::UnsafeCell<u8>".to_string(),
+                    fields: vec![("value".to_string(), Ty::u8())].into(),
+                    variants: vec![].into(),
+                    disc_index_safe: false,
+                    faithful_enum_repr: None,
+                    layout: None,
+                    enum_layout: None,
+                    adt_kind: Some(trust_types::AdtKind::Struct),
+                    arbitrary_precision: None,
+                    validity_wrapper: None,
+                },
+            )]
+            .into(),
+            variants: vec![].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: Some(trust_types::AdtKind::Struct),
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        },
+        SharedParamCase::OpaquePayload => {
+            Ty::Datatype { name: "test::Opaque".to_string(), variants: vec![] }
+        }
+        _ => Ty::u8(),
+    };
+    let e = two_variant_enum(payload);
+    let e_ref = |mutable: bool| Ty::Ref { mutable, inner: Box::new(e.clone()) };
+    let read_through = if case == SharedParamCase::LocalSharedRef { 9 } else { 1 };
+    let deref = |local: usize| Place { local, projections: vec![Projection::Deref] };
+    let mut entry = Vec::new();
+    if case == SharedParamCase::LocalSharedRef {
+        entry.push(Statement::Assign {
+            place: Place::local(9),
+            rvalue: Rvalue::Ref { mutable: false, place: Place::local(8) },
+            span: span.clone(),
+        });
+    }
+    entry.push(Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::Discriminant(deref(read_through)),
+        span: span.clone(),
+    });
+    let mut after = Vec::new();
+    if case == SharedParamCase::ReassignedParam {
+        after.push(Statement::Assign {
+            place: Place::local(1),
+            rvalue: Rvalue::Use(Operand::Copy(Place::local(2))),
+            span: span.clone(),
+        });
+    }
+    if case == SharedParamCase::LocalSharedRef {
+        after.push(Statement::Assign {
+            place: Place::local(6),
+            rvalue: Rvalue::Discriminant(deref(9)),
+            span: span.clone(),
+        });
+    } else {
+        after.extend([
+            Statement::Assign {
+                place: Place::local(4),
+                rvalue: Rvalue::Aggregate(
+                    AggregateKind::Tuple,
+                    vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+                ),
+                span: span.clone(),
+            },
+            Statement::Assign {
+                place: Place::local(5),
+                rvalue: Rvalue::Use(Operand::Copy(Place::field(4, 0))),
+                span: span.clone(),
+            },
+            Statement::Assign {
+                place: Place::local(6),
+                rvalue: Rvalue::Discriminant(deref(5)),
+                span: span.clone(),
+            },
+        ]);
+    }
+    let callee = "test::safe_callee";
+    let call = Terminator::Call {
+        func: callee.into(),
+        args: vec![],
+        dest: Place::local(7),
+        target: Some(BlockId(1)),
+        span: span.clone(),
+        atomic: (case == SharedParamCase::AtomicCallee).then(|| trust_types::AtomicOperation {
+            place: Place::local(7),
+            dest: None,
+            op_kind: trust_types::AtomicOpKind::FetchAdd,
+            ordering: trust_types::AtomicOrdering::SeqCst,
+            failure_ordering: None,
+            span: span.clone(),
+        }),
+        is_foreign: case == SharedParamCase::ForeignCallee,
+        is_unsafe_sig: case == SharedParamCase::UnsafeCallee,
+        unwind: UnwindEdge::Continue,
+        callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(callee),
+    };
+    let mut blocks = vec![BasicBlock { id: BlockId(0), stmts: entry, terminator: call }];
+    if case == SharedParamCase::OpaqueBarrier {
+        blocks.push(BasicBlock {
+            id: BlockId(1),
+            stmts: vec![],
+            terminator: Terminator::Opaque {
+                kind: "InlineAsm".into(),
+                targets: vec![BlockId(2)],
+                span: span.clone(),
+            },
+        });
+        blocks.push(BasicBlock { id: BlockId(2), stmts: after, terminator: Terminator::Return });
+    } else {
+        blocks.push(BasicBlock { id: BlockId(1), stmts: after, terminator: Terminator::Return });
+    }
+    VerifiableFunction {
+        name: "shared_param_discriminant_after_call".to_string(),
+        def_path: "test::shared_param_discriminant_after_call".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: e_ref(case == SharedParamCase::MutParam), name: None },
+                LocalDecl { index: 2, ty: e_ref(false), name: None },
+                LocalDecl { index: 3, ty: Ty::Int { width: 64, signed: true }, name: None },
+                LocalDecl { index: 4, ty: Ty::Tuple(vec![e_ref(false), e_ref(false)]), name: None },
+                LocalDecl { index: 5, ty: e_ref(false), name: None },
+                LocalDecl { index: 6, ty: Ty::Int { width: 64, signed: true }, name: None },
+                LocalDecl { index: 7, ty: Ty::u32(), name: None },
+                LocalDecl { index: 8, ty: e.clone(), name: None },
+                LocalDecl { index: 9, ty: e_ref(false), name: None },
+            ],
+            blocks,
+            arg_count: 2,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+#[test]
+fn frozen_shared_param_discriminants_are_tied_after_a_call() {
+    let func = shared_param_discriminant_after_call(SharedParamCase::Frozen);
+    let facts = crate::generate::build_discriminant_cse_facts(&func);
+    assert!(
+        facts_tie(&facts, "_3", "_6"),
+        "`*_1` is the pointee of this body's own protected `&E` parameter and `E` holds no \
+         `UnsafeCell`, so a call cannot change `disc(*_1)`; got {facts:?}"
+    );
+}
+
+#[test]
+fn unfrozen_or_unprotected_discriminants_are_not_tied_after_a_call() {
+    for (case, why) in [
+        (SharedParamCase::UnsafeCellPayload, "an `UnsafeCell` inline in the pointee"),
+        (SharedParamCase::OpaquePayload, "a pointee type the walk cannot see into"),
+        (SharedParamCase::MutParam, "a `&mut` parameter"),
+        (SharedParamCase::ReassignedParam, "a parameter reassigned after the call"),
+        (SharedParamCase::LocalSharedRef, "a shared borrow that is a local, not a parameter"),
+        (SharedParamCase::ForeignCallee, "a foreign barrier"),
+        (SharedParamCase::UnsafeCallee, "an `unsafe fn` barrier"),
+        (SharedParamCase::AtomicCallee, "a barrier with an atomic write"),
+        (SharedParamCase::OpaqueBarrier, "an `Opaque` barrier"),
+    ] {
+        let func = shared_param_discriminant_after_call(case);
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert!(
+            !facts_tie(&facts, "_3", "_6"),
+            "{why} ({case:?}) must refuse the post-call tie (fail-closed); got {facts:?}"
+        );
+    }
+}
+
+// ── Discriminant CSE BEFORE any barrier: a statement write or a reseat
+//    (DISC-CSE-PRE-BARRIER-WRITE-1, 2026-10-12) ──────────────────────────────────
+//
+// Arm (a) groups `disc(*L)` reads by their CANONICAL referent, so `_3 = &_2;
+// disc(*_3)` and `_5 = &_2; disc(*_5)` share the key `_2` though they go through two
+// different borrows. It tied every such pair in the pre-barrier region, on the claim
+// that only a `Call`/`Drop`/`Opaque` can change the referent; a plain statement
+// between the reads does it with no barrier (`cur = None`), and safe Rust then got an
+// overflow row kernel-certified and its check elided. A pre-barrier tie now needs a
+// body-stable referent or a frozen shared-reference parameter's pointee. The rows
+// below pin each write channel on hand-built MIR (including `SetDiscriminant` and
+// `Deinit`, which safe source does not emit here), and the real-MIR rows further
+// down pin the compiler's own extraction of the five source shapes and the controls.
+// `tests/discriminant_cse_statement_write_realmir.rs` is the verdict-level half.
+
+/// What sits between the two pre-barrier reads of `_2` (or, for `Reseat`, of `*_3`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreBarrierWrite {
+    /// Nothing: `_2` holds its one value; the tie is made.
+    Stable,
+    /// `_2 = copy _1` a second time — a whole re-assignment.
+    WholeReassign,
+    /// `_7 = &mut _2; (*_7) = copy _1` — a store through a `&mut` borrow.
+    MutBorrowStore,
+    /// `_9 = &raw const _2` — a raw pointer a `*mut` cast could write through.
+    RawConstBorrow,
+    /// `discriminant(_2) = 1`.
+    SetDiscriminant,
+    /// `Deinit(_2)`.
+    Deinit,
+    /// `_3 = &_8` — the shared reference itself is reseated; both reads are `*_3`.
+    Reseat,
+}
+
+/// bb0: `_2 = copy _1; _3 = &_2; _4 = disc(*_3); [write]; _5 = &_2; _6 = disc(*_5)`
+/// then return, with no barrier anywhere. `Reseat` reads `_6 = disc(*_3)` after
+/// `_3 = &_8` instead.
+fn pre_barrier_local_referent(case: PreBarrierWrite) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    let e = two_variant_enum(Ty::u8());
+    let e_ref = Ty::Ref { mutable: false, inner: Box::new(e.clone()) };
+    let deref = |local: usize| Place { local, projections: vec![Projection::Deref] };
+    let assign =
+        |place: Place, rvalue: Rvalue| Statement::Assign { place, rvalue, span: span.clone() };
+    let mut stmts = vec![
+        assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::local(1)))),
+        assign(Place::local(3), Rvalue::Ref { mutable: false, place: Place::local(2) }),
+        assign(Place::local(4), Rvalue::Discriminant(deref(3))),
+    ];
+    match case {
+        PreBarrierWrite::Stable | PreBarrierWrite::Reseat => {}
+        PreBarrierWrite::WholeReassign => {
+            stmts.push(assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::local(1)))));
+        }
+        PreBarrierWrite::MutBorrowStore => {
+            stmts.push(assign(
+                Place::local(7),
+                Rvalue::Ref { mutable: true, place: Place::local(2) },
+            ));
+            stmts.push(assign(deref(7), Rvalue::Use(Operand::Copy(Place::local(1)))));
+        }
+        PreBarrierWrite::RawConstBorrow => {
+            stmts.push(assign(Place::local(9), Rvalue::AddressOf(false, Place::local(2))));
+        }
+        PreBarrierWrite::SetDiscriminant => {
+            stmts.push(Statement::SetDiscriminant { place: Place::local(2), variant_index: 1 });
+        }
+        PreBarrierWrite::Deinit => stmts.push(Statement::Deinit { place: Place::local(2) }),
+    }
+    if case == PreBarrierWrite::Reseat {
+        stmts.push(assign(Place::local(3), Rvalue::Ref { mutable: false, place: Place::local(8) }));
+        stmts.push(assign(Place::local(6), Rvalue::Discriminant(deref(3))));
+    } else {
+        stmts.push(assign(Place::local(5), Rvalue::Ref { mutable: false, place: Place::local(2) }));
+        stmts.push(assign(Place::local(6), Rvalue::Discriminant(deref(5))));
+    }
+    VerifiableFunction {
+        name: "pre_barrier_local_referent".to_string(),
+        def_path: "test::pre_barrier_local_referent".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: None },
+                LocalDecl { index: 1, ty: e.clone(), name: None },
+                LocalDecl { index: 2, ty: e.clone(), name: None },
+                LocalDecl { index: 3, ty: e_ref.clone(), name: None },
+                LocalDecl { index: 4, ty: Ty::Int { width: 64, signed: true }, name: None },
+                LocalDecl { index: 5, ty: e_ref, name: None },
+                LocalDecl { index: 6, ty: Ty::Int { width: 64, signed: true }, name: None },
+                LocalDecl {
+                    index: 7,
+                    ty: Ty::Ref { mutable: true, inner: Box::new(e.clone()) },
+                    name: None,
+                },
+                LocalDecl { index: 8, ty: e.clone(), name: None },
+                LocalDecl {
+                    index: 9,
+                    ty: Ty::RawPtr { mutable: false, pointee: Box::new(e) },
+                    name: None,
+                },
+            ],
+            blocks: vec![BasicBlock { id: BlockId(0), stmts, terminator: Terminator::Return }],
+            arg_count: 1,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The canonical name of the source of `dest`'s one `Discriminant` read.
+fn discriminant_read_key(func: &VerifiableFunction, dest: usize) -> String {
+    let Some(Rvalue::Discriminant(src)) = crate::local_defs::unique_value_def(func, dest) else {
+        panic!("`_{dest}` must hold one `Discriminant` read");
+    };
+    crate::place_to_var_name(func, src)
+}
+
+#[test]
+fn an_unwritten_local_referent_is_tied_before_any_barrier() {
+    let func = pre_barrier_local_referent(PreBarrierWrite::Stable);
+    let facts = crate::generate::build_discriminant_cse_facts(&func);
+    assert!(
+        facts_tie(&facts, "_4", "_6"),
+        "`_2` holds one value and nothing writes it, so two shared borrows of it read one \
+         discriminant; got {facts:?}"
+    );
+}
+
+#[test]
+fn a_statement_write_or_a_reseat_refuses_the_pre_barrier_tie() {
+    for (case, why) in [
+        (PreBarrierWrite::WholeReassign, "a whole re-assignment of the referent"),
+        (PreBarrierWrite::MutBorrowStore, "a store through a `&mut` borrow of the referent"),
+        (PreBarrierWrite::RawConstBorrow, "a `&raw const` of the referent"),
+        (PreBarrierWrite::SetDiscriminant, "a `SetDiscriminant` of the referent"),
+        (PreBarrierWrite::Deinit, "a `Deinit` of the referent"),
+        (PreBarrierWrite::Reseat, "a reseat of the shared reference"),
+    ] {
+        let func = pre_barrier_local_referent(case);
+        // Not vacuous: both reads still share their grouping key, so only guard 2
+        // stands between them and the tie.
+        assert_eq!(
+            discriminant_read_key(&func, 4),
+            discriminant_read_key(&func, 6),
+            "{why} ({case:?}): the two reads must share a canonical referent"
+        );
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert!(
+            !facts_tie(&facts, "_4", "_6"),
+            "{why} ({case:?}) changes the referent between the reads with no barrier, so \
+             the pre-barrier tie must be refused (fail-closed); got {facts:?}"
+        );
+    }
+}
+
+/// The derived-`eq` shape with NO barrier and a `&raw const (*_1)` in the body: the
+/// body-stable scan refuses `*_1` (a write-capable pointer under the root), and the
+/// frozen-parameter admission keeps the tie. With an `UnsafeCell` in the pointee
+/// neither admission covers it, so the tie is refused: a FAIL-CLOSED boundary (the
+/// pre-barrier rule is exactly "body-stable or frozen parameter"), not a known false
+/// tie — relaxing it needs its own soundness argument and this row's update.
+#[test]
+fn a_frozen_shared_param_pointee_is_tied_before_any_barrier_despite_a_raw_const() {
+    for (case, tied) in
+        [(SharedParamCase::Frozen, true), (SharedParamCase::UnsafeCellPayload, false)]
+    {
+        let mut func = shared_param_discriminant_after_call(case);
+        func.body.blocks[0].terminator = Terminator::Goto(BlockId(1));
+        let raw_ty = Ty::RawPtr {
+            mutable: false,
+            pointee: Box::new(match crate::local_ty_ref(&func, 1) {
+                Some(Ty::Ref { inner, .. }) => (**inner).clone(),
+                other => panic!("`_1` must be a reference, got {other:?}"),
+            }),
+        };
+        func.body.locals.push(LocalDecl { index: 10, ty: raw_ty, name: None });
+        func.body.blocks[0].stmts.push(Statement::Assign {
+            place: Place::local(10),
+            rvalue: Rvalue::AddressOf(
+                false,
+                Place { local: 1, projections: vec![Projection::Deref] },
+            ),
+            span: SourceSpan::default(),
+        });
+        assert!(
+            !crate::place_is_body_stable(
+                &func,
+                &Place { local: 1, projections: vec![Projection::Deref] }
+            ),
+            "{case:?}: the `&raw const (*_1)` must make the body-stable scan refuse `*_1`"
+        );
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert_eq!(
+            facts_tie(&facts, "_3", "_6"),
+            tied,
+            "{case:?}: the pre-barrier tie of `*_1` must follow the frozen-parameter rule; \
+             got {facts:?}"
+        );
+    }
+}
+
+/// `tests/fixtures/discr_cse_stmt_write_<name>_mir.json`: the compiler's own
+/// extraction (see `tests/discriminant_cse_statement_write_realmir.rs` for the source).
+fn stmt_write_fixture(name: &str) -> VerifiableFunction {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/fixtures/discr_cse_stmt_write_{name}_mir.json"));
+    let json = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("fixture {} must be readable: {e}", path.display()));
+    serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("fixture {} must deserialize: {e}", path.display()))
+}
+
+#[test]
+fn real_mir_statement_writes_and_reseats_are_not_tied_before_any_barrier() {
+    for (name, a, b) in [
+        ("assign", 4, 7),      // `cur = None`
+        ("start", 3, 6),       // `self.st = St::Busy` through `&mut self`
+        ("ref_mut", 4, 8),     // `let m = &mut e; *m = None`
+        ("param_store", 4, 7), // `*e = None` through a `&mut` parameter
+        ("reseat", 5, 7),      // `r = &b`
+        ("idx", 5, 8),         // `s = S::Busy`, the bounds-row shape
+    ] {
+        let func = stmt_write_fixture(name);
+        assert_eq!(
+            discriminant_read_key(&func, a),
+            discriminant_read_key(&func, b),
+            "{name}: `_{a}` and `_{b}` must read one canonical referent, or this row is vacuous"
+        );
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert!(
+            !facts_tie(&facts, &format!("_{a}"), &format!("_{b}")),
+            "{name}: a statement between the reads changes the referent, so `_{a} == _{b}` \
+             is false on the path that reaches the second arm; got {facts:?}"
+        );
+    }
+}
+
+#[test]
+fn real_mir_stable_referents_keep_their_pre_barrier_tie() {
+    for (name, a, b) in [
+        ("stable", 4, 6),       // `let cur = Some(v)`, never written
+        ("unwritten", 4, 6),    // the same, with `unreachable!()` in the dead arm
+        ("stable_param", 3, 4), // `cur: &Option<u8>`, a frozen parameter
+        ("derived_eq", 3, 9),   // `#[derive(PartialEq)]`: `*self` re-read via `_6.0`
+        ("derived_eq", 4, 7),   // `*other` re-read via `_6.1`
+        ("derived_eq", 4, 8),
+    ] {
+        let func = stmt_write_fixture(name);
+        let facts = crate::generate::build_discriminant_cse_facts(&func);
+        assert!(
+            facts_tie(&facts, &format!("_{a}"), &format!("_{b}")),
+            "{name}: nothing writes or reseats the referent, so `_{a} == _{b}` must stay \
+             tied (precision); got {facts:?}"
+        );
+    }
+}
+
 // ── Trust (R3, generics): pre-monomorphization alias declaration relaxation ──
 
 /// A trivial function whose only non-return local is declared at an
@@ -11893,6 +14063,7 @@ fn alias_marker_local_function(detail: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11933,5 +14104,205 @@ fn test_monomorphic_alias_details_still_stamp_unsupported_mir_vc() {
             )),
             "monomorphic alias detail {detail:?} must keep stamping UnsupportedMir"
         );
+    }
+}
+
+// ── The result of a primitive-integer `Ord::cmp` (TRUST-09, 2026-09-25) ────────────
+//
+// The extractor rewrites a compiler-authenticated `<P as Ord>::cmp` to the total-call
+// sentinel, whose result was havocked; a derived `Ord::cmp` branches on its `Equal`.
+// `build_primitive_int_cmp_facts` restores the integer order for exactly the shape
+// only that call has. The real-MIR half is `tests/derived_ord_cmp_realmir.rs`.
+
+/// What the `cmp` fixture varies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CmpCase {
+    /// `_3 = copy _1; _4 = copy _2` (one `Assign` each), the derive's shape.
+    Locals,
+    /// The operands are the parameters themselves: `_6 = &_1; _7 = &_2`.
+    Params,
+    /// The callee is not the sentinel.
+    OtherCallee,
+    /// The destination is an `i32`, not `Ordering`.
+    NotOrdering,
+    /// The two operands have different integer types.
+    MixedTypes,
+    /// The operands are 128-bit.
+    Wide,
+    /// `_3` gets a second value after the call.
+    OperandReassigned,
+    /// The borrow `_6` gets a second value.
+    BorrowReassigned,
+    /// The discriminant temp `_8` gets a second value.
+    TagReassigned,
+    /// The whole body is a loop.
+    InLoop,
+}
+
+fn std_ordering_ty() -> Ty {
+    let unit_variant = |name: &str, discriminant: i128| trust_types::VariantDef {
+        name: name.to_string(),
+        discriminant,
+        fields: vec![],
+    };
+    Ty::Adt {
+        name: "core::cmp::Ordering".to_string(),
+        fields: vec![("__tag".to_string(), Ty::Int { width: 64, signed: true })].into(),
+        variants: vec![
+            unit_variant("Less", -1),
+            unit_variant("Equal", 0),
+            unit_variant("Greater", 1),
+        ]
+        .into(),
+        disc_index_safe: true,
+        faithful_enum_repr: None,
+        layout: None,
+        enum_layout: None,
+        adt_kind: Some(trust_types::AdtKind::Enum),
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    }
+}
+
+/// bb0: `[_3 = copy _1; _4 = copy _2;] _6 = &X; _7 = &Y; _5 = SENTINEL(copy _6, copy _7)
+/// -> bb1`; bb1: `_8 = discriminant(_5)` then return (or back to bb0 for `InLoop`).
+fn primitive_cmp_function(case: CmpCase) -> VerifiableFunction {
+    let span = SourceSpan::default();
+    let int = |width: u32| Ty::Int { width, signed: true };
+    let a_width = if case == CmpCase::Wide { 128 } else { 64 };
+    let b_width = match case {
+        CmpCase::Wide => 128,
+        CmpCase::MixedTypes => 32,
+        _ => 64,
+    };
+    let assign = |local: usize, rvalue: Rvalue| Statement::Assign {
+        place: Place::local(local),
+        rvalue,
+        span: span.clone(),
+    };
+    let (x, y) = if case == CmpCase::Params { (1, 2) } else { (3, 4) };
+    let mut entry = Vec::new();
+    if case != CmpCase::Params {
+        entry.push(assign(3, Rvalue::Use(Operand::Copy(Place::local(1)))));
+        entry.push(assign(4, Rvalue::Use(Operand::Copy(Place::local(2)))));
+    }
+    entry.push(assign(6, Rvalue::Ref { mutable: false, place: Place::local(x) }));
+    entry.push(assign(7, Rvalue::Ref { mutable: false, place: Place::local(y) }));
+    if case == CmpCase::BorrowReassigned {
+        entry.push(assign(6, Rvalue::Ref { mutable: false, place: Place::local(y) }));
+    }
+    let callee = if case == CmpCase::OtherCallee {
+        "core::cmp::Ord::cmp".to_string()
+    } else {
+        trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL.to_string()
+    };
+    let call = Terminator::Call {
+        func: callee.clone(),
+        args: vec![Operand::Copy(Place::local(6)), Operand::Copy(Place::local(7))],
+        dest: Place::local(5),
+        target: Some(BlockId(1)),
+        span: span.clone(),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        unwind: UnwindEdge::Continue,
+        callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee),
+    };
+    let mut after = vec![assign(8, Rvalue::Discriminant(Place::local(5)))];
+    if case == CmpCase::OperandReassigned {
+        after.push(assign(3, Rvalue::Use(Operand::Copy(Place::local(2)))));
+    }
+    if case == CmpCase::TagReassigned {
+        after.push(assign(8, Rvalue::Use(Operand::Constant(ConstValue::Int(0)))));
+    }
+    let exit =
+        if case == CmpCase::InLoop { Terminator::Goto(BlockId(0)) } else { Terminator::Return };
+    let dest_ty = if case == CmpCase::NotOrdering { int(32) } else { std_ordering_ty() };
+    let a_ty = int(a_width);
+    let b_ty = int(b_width);
+    VerifiableFunction {
+        name: "primitive_cmp".to_string(),
+        def_path: "test::primitive_cmp".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: a_ty.clone(), name: None },
+                LocalDecl { index: 2, ty: b_ty.clone(), name: None },
+                LocalDecl { index: 3, ty: a_ty.clone(), name: None },
+                LocalDecl { index: 4, ty: b_ty.clone(), name: None },
+                LocalDecl { index: 5, ty: dest_ty, name: None },
+                LocalDecl {
+                    index: 6,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(a_ty) },
+                    name: None,
+                },
+                LocalDecl {
+                    index: 7,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(b_ty) },
+                    name: None,
+                },
+                LocalDecl { index: 8, ty: int(64), name: None },
+            ],
+            blocks: vec![
+                BasicBlock { id: BlockId(0), stmts: entry, terminator: call },
+                BasicBlock { id: BlockId(1), stmts: after, terminator: exit },
+            ],
+            arg_count: 2,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// The one complete case split `build_primitive_int_cmp_facts` emits for tag `t` over
+/// operands `a`, `b`.
+fn cmp_case_split(t: &str, a: &str, b: &str) -> Formula {
+    let v = |n: &str| Box::new(Formula::Var(n.to_string(), Sort::Int));
+    let case = |k: i128, rel: Formula| {
+        Formula::And(vec![Formula::Eq(v(t), Box::new(Formula::Int(k))), rel])
+    };
+    Formula::Or(vec![
+        case(-1, Formula::Lt(v(a), v(b))),
+        case(0, Formula::Eq(v(a), v(b))),
+        case(1, Formula::Gt(v(a), v(b))),
+    ])
+}
+
+#[test]
+fn a_primitive_int_cmp_result_is_the_integer_order_of_its_operands() {
+    for (case, a, b) in [(CmpCase::Locals, "_3", "_4"), (CmpCase::Params, "_1", "_2")] {
+        let func = primitive_cmp_function(case);
+        let facts = crate::generate::build_primitive_int_cmp_facts(&func);
+        assert_eq!(
+            facts,
+            vec![cmp_case_split("_8", a, b)],
+            "{case:?}: `_8 = discriminant(<i64 as Ord>::cmp(&{a}, &{b}))` is -1/0/1 exactly \
+             when {a} is less than / equal to / greater than {b}"
+        );
+    }
+}
+
+#[test]
+fn a_cmp_fact_needs_the_whole_shape() {
+    for (case, why) in [
+        (CmpCase::OtherCallee, "a callee that is not the authenticated sentinel"),
+        (CmpCase::NotOrdering, "a destination that is not `Ordering`"),
+        (CmpCase::MixedTypes, "operands of two different types"),
+        (CmpCase::Wide, "128-bit operands"),
+        (CmpCase::OperandReassigned, "an operand with a second value"),
+        (CmpCase::BorrowReassigned, "a borrow with a second value"),
+        (CmpCase::TagReassigned, "a discriminant temp with a second value"),
+        (CmpCase::InLoop, "a loop, which could pair values from two iterations"),
+    ] {
+        let func = primitive_cmp_function(case);
+        let facts = crate::generate::build_primitive_int_cmp_facts(&func);
+        assert!(facts.is_empty(), "{why} ({case:?}) must emit no cmp fact; got {facts:?}");
     }
 }

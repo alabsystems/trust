@@ -4,10 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
 use trust_types::fx::FxHashMap;
-use trust_types::{
-    ConcurrencyPoint, HappensBeforeEdgeKind, VerifiableFunction, detect_thread_joins,
-    detect_thread_spawns,
-};
+use trust_types::{ConcurrencyPoint, HappensBeforeEdgeKind, VerifiableFunction};
 
 use super::checker::MemoryModelChecker;
 use super::happens_before::HappensBefore;
@@ -51,12 +48,7 @@ impl HappensBeforeGraph {
         let idx = self.index_to_point.len();
         self.point_to_index.insert(point.clone(), idx);
         self.index_to_point.push(point);
-        // Rebuild the HB relation with the new event count.
-        self.hb = HappensBefore::new(self.index_to_point.len());
-        // Re-add all existing edges.
-        for &(from, to) in self.edge_labels.keys() {
-            self.hb.add_edge(from, to);
-        }
+        self.hb.add_event();
         idx
     }
 
@@ -72,14 +64,34 @@ impl HappensBeforeGraph {
     ) -> bool {
         let from_idx = match self.point_to_index.get(from) {
             Some(&idx) => idx,
-            None => return false,
+            None => {
+                self.hb.invalidate();
+                return false;
+            }
         };
         let to_idx = match self.point_to_index.get(to) {
             Some(&idx) => idx,
-            None => return false,
+            None => {
+                self.hb.invalidate();
+                return false;
+            }
         };
-        self.edge_labels.insert((from_idx, to_idx), kind);
-        self.hb.add_edge(from_idx, to_idx)
+        self.add_edge_indices(from_idx, to_idx, kind)
+    }
+
+    /// Add a happens-before edge between two already-registered node indices.
+    pub(crate) fn add_edge_indices(
+        &mut self,
+        from_idx: usize,
+        to_idx: usize,
+        kind: HappensBeforeEdgeKind,
+    ) -> bool {
+        if self.hb.add_edge(from_idx, to_idx) {
+            self.edge_labels.insert((from_idx, to_idx), kind);
+            true
+        } else {
+            false
+        }
     }
 
     /// Check whether point `from` happens-before point `to` (transitively).
@@ -148,76 +160,18 @@ impl HappensBeforeGraph {
 impl MemoryModelChecker {
     /// Build a happens-before graph from a set of verifiable functions.
     ///
-    /// Detects thread spawn/join sites and establishes:
-    /// - Program-order edges within each function (sequential blocks).
-    /// - Spawn edges from the spawn call to the child thread's entry.
-    /// - Join edges from the child thread's exit to the join return.
-    /// - Release-acquire sync edges from the atomic access log.
+    /// Function blocks and spawn/join sites are static program points, not
+    /// execution events. They cannot supply program-order or thread-lifecycle
+    /// edges without invocation and child-event identities, so this builder
+    /// leaves them out of the event graph. Synchronization pairs may be added
+    /// only when the atomic access log supplies them with sufficient evidence.
     ///
     /// This is Phase 2 of the memory ordering verification pipeline.
     #[must_use]
-    pub fn build_happens_before(&self, functions: &[&VerifiableFunction]) -> HappensBeforeGraph {
+    pub fn build_happens_before(&self, _functions: &[&VerifiableFunction]) -> HappensBeforeGraph {
         let mut graph = HappensBeforeGraph::new();
 
-        // Phase 1: Add program-order edges within each function.
-        for func in functions {
-            let thread_id = "main"; // Initial: all in main thread
-            for (i, block) in func.body.blocks.iter().enumerate() {
-                let point = ConcurrencyPoint::new(&func.def_path, block.id, thread_id);
-                graph.add_node(point.clone());
-
-                // Program-order edge from previous block to this block.
-                if i > 0 {
-                    let prev = ConcurrencyPoint::new(
-                        &func.def_path,
-                        func.body.blocks[i - 1].id,
-                        thread_id,
-                    );
-                    graph.add_edge(&prev, &point, HappensBeforeEdgeKind::ProgramOrder);
-                }
-            }
-        }
-
-        // Phase 2: Detect spawn/join sites and add spawn/join edges.
-        for func in functions {
-            let spawns = detect_thread_spawns(func);
-            let joins = detect_thread_joins(func);
-
-            for spawn in &spawns {
-                let spawn_point =
-                    ConcurrencyPoint::new(&spawn.caller_function, spawn.block, "main");
-
-                // Create a synthetic entry point for the spawned thread.
-                let child_thread_id = format!("spawned_at_bb{}", spawn.block.0);
-                let child_entry =
-                    ConcurrencyPoint::new(&spawn.caller_function, spawn.block, &child_thread_id);
-
-                graph.add_node(spawn_point.clone());
-                graph.add_node(child_entry.clone());
-                graph.add_edge(&spawn_point, &child_entry, HappensBeforeEdgeKind::Spawn);
-            }
-
-            for join in &joins {
-                let join_point = ConcurrencyPoint::new(&join.caller_function, join.block, "main");
-
-                // Create a synthetic exit point for the joined thread.
-                // We match by handle_local back to the spawn site.
-                let child_thread_id = spawns
-                    .iter()
-                    .find(|s| s.join_handle_local == Some(join.handle_local))
-                    .map(|s| format!("spawned_at_bb{}", s.block.0))
-                    .unwrap_or_else(|| format!("joined_at_bb{}", join.block.0));
-
-                let child_exit =
-                    ConcurrencyPoint::new(&join.caller_function, join.block, &child_thread_id);
-
-                graph.add_node(child_exit.clone());
-                graph.add_node(join_point.clone());
-                graph.add_edge(&child_exit, &join_point, HappensBeforeEdgeKind::Join);
-            }
-        }
-
-        // Phase 3: Add release-acquire sync edges from the atomic access log.
+        // Only evidence-backed release-acquire pairs may create sync edges.
         let pairs = self.log.find_release_acquire_pairs();
         for (release_idx, acquire_idx) in pairs {
             if let (Some(release), Some(acquire)) =
@@ -236,9 +190,13 @@ impl MemoryModelChecker {
                     &acquire.thread_id,
                 );
 
-                graph.add_node(release_point.clone());
-                graph.add_node(acquire_point.clone());
-                graph.add_edge(&release_point, &acquire_point, HappensBeforeEdgeKind::SyncWith);
+                let release_node = graph.add_node(release_point);
+                let acquire_node = graph.add_node(acquire_point);
+                graph.add_edge_indices(
+                    release_node,
+                    acquire_node,
+                    HappensBeforeEdgeKind::SyncWith,
+                );
             }
         }
 

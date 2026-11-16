@@ -1,0 +1,2 @@
+error: unstable option `trust-platform-budget` requires a positive number of states (`-Z trust-platform-budget=<value>`)
+

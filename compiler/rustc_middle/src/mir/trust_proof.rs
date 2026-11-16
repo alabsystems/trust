@@ -68,6 +68,23 @@ pub struct TrustProofResults {
 
     /// Trust: Function-level summary statistics.
     pub summary: TrustFunctionSummary,
+
+    /// Trust (TINV step 10.7): the named premises of every obligation whose `Trusted`
+    /// disposition rests on a certified type invariant (`TypeInvariantComposed`), each
+    /// spelled `assumes type_invariant(S)#k ...`. Disclosure only: codegen never reads it,
+    /// and an obligation listed here is never `Certified` (checked by
+    /// [`Self::has_aligned_obligation_arrays`]). Empty for every other function.
+    pub premises: Vec<TrustObligationPremise>,
+}
+
+/// Trust (TINV step 10.7): one obligation's disclosed premises (see
+/// [`TrustProofResults::premises`]).
+#[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, StableHash)]
+pub struct TrustObligationPremise {
+    /// Trust: the obligation whose verdict rests on the premises.
+    pub obligation: ObligationId,
+    /// Trust: one disclosure line per premise (`assumes type_invariant(S)#k ...`).
+    pub assumes: Vec<Symbol>,
 }
 
 impl TrustProofResults {
@@ -116,6 +133,23 @@ impl TrustProofResults {
     #[must_use]
     pub fn has_aligned_obligation_arrays(&self) -> bool {
         self.dispositions.len() == self.fingerprints.len()
+            // Trust (TINV step 10.7): every premise names a real obligation, discloses
+            // something, and sits on a non-`Certified` disposition.
+            && self.premises.iter().all(|premise| {
+                !premise.assumes.is_empty()
+                    && self.dispositions.get(premise.obligation).is_some_and(|disposition| {
+                        !disposition.certified && disposition.status != TrustStatus::Certified
+                    })
+            })
+    }
+
+    /// Trust (TINV step 10.7): the disclosed premises of one obligation (empty when none).
+    #[must_use]
+    pub fn premises_of(&self, obligation: ObligationId) -> &[Symbol] {
+        self.premises
+            .iter()
+            .find(|premise| premise.obligation == obligation)
+            .map_or(&[], |premise| premise.assumes.as_slice())
     }
 }
 
@@ -203,6 +237,11 @@ pub struct TrustObligationDetail {
     /// Trust: Structured runtime fallback metadata, if the obligation was
     /// checked dynamically because the solver could not discharge it.
     pub runtime_fallback: Option<TrustRuntimeFallback>,
+
+    /// Trust (TINV step 10.7): the premises the obligation's verdict rests on
+    /// (`assumes type_invariant(S)#k ...`), the same lines `TrustProofResults::premises`
+    /// carries. Empty for every obligation that is not `TypeInvariantComposed`.
+    pub assumes: Vec<Symbol>,
 }
 
 /// Trust: Runtime fallback metadata for a verification obligation.
@@ -373,6 +412,9 @@ pub enum TrustObligationKind {
     NonTermination,
     /// Trust: Hardened profile boundary hazard.
     HardenedBoundary(TrustHardenedVcCategory),
+    /// Trust: inferred struct-field invariant (TINV) obligation. APPENDED LAST so the
+    /// encoded discriminants of the variants above do not move.
+    TypeInvariant,
 }
 
 /// Trust: Stable hardened profile boundary categories.
@@ -530,6 +572,8 @@ impl TrustObligationKind {
             | TrustObligationKind::NonTermination
             | TrustObligationKind::TaintViolation
             | TrustObligationKind::ResilienceViolation
+            // Trust: TINV (design 2026-10-04 §P4) is a functional obligation.
+            | TrustObligationKind::TypeInvariant
             | TrustObligationKind::HardenedBoundary(_) => TrustProofLevel::L1Functional,
             TrustObligationKind::Deadlock
             | TrustObligationKind::Temporal
@@ -555,4 +599,73 @@ pub enum TrustProofLevel {
     L1Functional,
     /// Trust: L2: Domain properties (temporal, distributed).
     L2Domain,
+}
+
+// ---------------------------------------------------------------------------
+// Trust: the spawn census (design 2026-09-29-spawn-census-by-construction §5.5)
+// ---------------------------------------------------------------------------
+//
+// The results of `trust_spawn_census` (one per crate) and of its projection
+// `trust_spawn_sites` (one per local body). The census itself is the
+// rustc-free engine in trust-ir (`function_dependencies::ReachGraph`), fed by
+// the MIR adapter in `trust_mir_extract::concurrency_effects`; these types
+// only carry its answer through the query system, so they hold no MIR and no
+// engine state: a verdict, the rendered rows, and the mentioned items the
+// adapter covered (for TrustVerify's coverage self-audit).
+
+/// Trust: a spawn-census verdict, weakest first. Every verdict but `Quiet`
+/// refuses; only `Spawns` claims a spawn.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(TyEncodable, TyDecodable, StableHash)]
+pub enum TrustSpawnVerdict {
+    /// No path to a thread-creation entry point or to code the census could
+    /// not enumerate.
+    #[default]
+    Quiet,
+    /// Reaches code the census could not enumerate; no spawn was found.
+    Unknown,
+    /// Reaches a spawn only through an indirect call's pool or a hand-off.
+    Indirect,
+    /// Names, erases or reads a callable that reaches a spawn.
+    Escapes,
+    /// Reaches a thread-creation entry point through calls and drops only.
+    Spawns,
+}
+
+/// Trust: one refused site of a body: an `UnmodeledThreadSpawnEffect` row.
+/// `verdict` is the row's own strength (never `Quiet`); `text` is the row
+/// detail the census rendered, witness included.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, TyEncodable, TyDecodable, StableHash)]
+pub struct TrustSpawnRow {
+    pub span: rustc_span::Span,
+    pub verdict: TrustSpawnVerdict,
+    pub text: String,
+}
+
+/// Trust: the census answer for one local body (`trust_spawn_sites`).
+#[derive(Clone, Debug, Default, TyEncodable, TyDecodable, StableHash)]
+pub struct TrustSpawnSites<'tcx> {
+    /// The strongest verdict over the body's identity instance and every
+    /// concrete instance the census reached.
+    pub verdict: TrustSpawnVerdict,
+    /// At most the strongest rows per source position.
+    pub rows: Vec<TrustSpawnRow>,
+    /// Whether the census walked this body. A body it did not walk (a
+    /// Clean-origin def, R5) has no coverage to audit.
+    pub walked: bool,
+    /// Every `MentionedItem` the census enumerated in the body it walked, and
+    /// what `remap_mir_for_const_eval_select` turns a `const_eval_select` call
+    /// into: the codegen body's `mentioned_items()` must be a subset
+    /// (self-audit check 2), or TrustVerify refuses the body as UNKNOWN.
+    pub covered: Vec<super::MentionedItem<'tcx>>,
+}
+
+/// Trust: the crate's spawn census (`trust_spawn_census`).
+#[derive(Clone, Debug, Default, TyEncodable, TyDecodable, StableHash)]
+pub struct TrustSpawnCensus<'tcx> {
+    /// Every local body the census walked, sorted by `DefIndex`.
+    pub definitions: Vec<(rustc_span::def_id::LocalDefId, TrustSpawnSites<'tcx>)>,
+    /// Why every node fell back to UNKNOWN (a malformed fact or a rejected
+    /// certificate), if it did.
+    pub fallback: Option<String>,
 }

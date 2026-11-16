@@ -6,7 +6,7 @@
 
 clean {
     theorem hole : True := sorry
-    //~^ ERROR the publish audit refused this batch
 }
+//~^^ ERROR the publish audit refused this batch
 
 fn main() {}

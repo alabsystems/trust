@@ -21,21 +21,34 @@
 //! checked for SAT. UNSAT ⇒ the property holds ⇒ the refuter had a gap.
 //! SAT ⇒ counterexample ⇒ declining was correct.
 //!
-//! Point it at a log with `TRUST_ADJUDICATE_VC_LOG=<file>`; without one it is a
-//! no-op, so it costs the default suite nothing.
+//! Point it at a log with `TRUST_ADJUDICATE_VC_LOG=<file>`. It is a measurement
+//! driver, not a check, so it is `#[ignore]`d (it costs the default suite
+//! nothing and no lane counts it as a pass), and without the log it panics with
+//! the recipe, so a bare `--ignored` run cannot pass having adjudicated nothing.
 
 use trust_types::{Formula, SourceSpan, Symbol, VcKind, VerificationCondition, VerificationResult};
 
 #[test]
+#[ignore = "measurement driver: set TRUST_ADJUDICATE_VC_LOG=<trust-clean undischarged-VC log> \
+            and run with --ignored --nocapture"]
 fn adjudicate_undischarged_vcs() {
     let Ok(path) = std::env::var("TRUST_ADJUDICATE_VC_LOG") else {
-        eprintln!("TRUST_ADJUDICATE_VC_LOG unset — nothing to adjudicate");
-        return;
+        panic!(
+            "adjudicate_undischarged_vcs is a measurement driver and TRUST_ADJUDICATE_VC_LOG \
+             is unset, so it adjudicated nothing. Run: TRUST_ADJUDICATE_VC_LOG=<a log written \
+             under trust-clean's TRUST_UNDISCHARGED_VC_LOG> [TRUST_GAP_DUMP=<file>] \
+             targo --unverified test --manifest-path crates/Cargo.toml -p trust-router \
+             --features ay-backend --test adjudicate_undischarged_vcs -- --ignored --exact \
+             adjudicate_undischarged_vcs --nocapture"
+        );
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
         panic!("cannot read {path}");
     };
-    let router = trust_router::Router::deterministic_in_process_ay(10_000);
+    let router = trust_router::Router::deterministic_in_process_ay(
+        10_000,
+        trust_types::determinism::EffortScale::BUILTIN,
+    );
 
     let (mut gap, mut correct, mut unknown, mut skipped) = (0usize, 0usize, 0usize, 0usize);
     for line in text.lines() {

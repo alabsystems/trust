@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 
 //! Contains infrastructure for configuring the compiler, including parsing
 //! command-line options.
@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::{self, FromStr};
 use std::sync::{LazyLock, Mutex};
-use std::{cmp, fs, iter};
+use std::{cmp, fs, iter, thread};
 
 use externs::{ExternOpt, split_extern_opt};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
@@ -24,12 +25,15 @@ use rustc_errors::{ColorConfig, DiagCtxtFlags};
 use rustc_feature::UnstableFeatures;
 use rustc_hashes::Hash64;
 use rustc_macros::{BlobDecodable, Decodable, Encodable, StableHash};
-use rustc_span::edition::{DEFAULT_EDITION, EDITION_NAME_LIST, Edition, LATEST_STABLE_EDITION};
+use rustc_span::edition::{
+    DEFAULT_EDITION, EDITION_NAME_LIST, EDITION_NAME_LIST_STABLE, Edition, LATEST_STABLE_EDITION,
+};
 use rustc_span::source_map::FilePathMapping;
 use rustc_span::{
     FileName, RealFileName, RemapPathScopeComponents, SourceFileHash, SourceFileHashAlgorithm,
     Symbol, sym,
 };
+use rustc_structures::CrateType;
 use rustc_target::spec::{
     FramePointer, LinkSelfContainedComponents, LinkerFeatures, PanicStrategy, SplitDebuginfo,
     Target, TargetTuple,
@@ -38,8 +42,11 @@ use tracing::debug;
 
 pub use crate::config::cfg::{Cfg, CheckCfg, ExpectedValues};
 use crate::config::native_libs::parse_native_libs;
-pub use crate::config::print_request::{PrintKind, PrintRequest};
-use crate::errors::FileWriteFail;
+pub use crate::config::print_request::{
+    PrintCategory, PrintKind, PrintRequest, collect_print_requests,
+};
+use crate::diagnostics::FileWriteFail;
+use crate::macros::AllVariants;
 pub use crate::options::*;
 use crate::search_paths::SearchPath;
 use crate::utils::CanonicalizedPath;
@@ -50,6 +57,12 @@ mod externs;
 mod native_libs;
 mod print_request;
 pub mod sigpipe;
+
+/// A recommended stack size for worker threads spawned within a session.
+pub const DEFAULT_STACK_SIZE: usize = 17 * 1024 * 1024;
+
+/// Special CPU name requesting the CPU of the current host.
+pub const NATIVE_CPU: &str = "native";
 
 /// The different settings that the `-C strip` flag can have.
 #[derive(Clone, Copy, PartialEq, Hash, Debug)]
@@ -107,6 +120,17 @@ pub enum OptLevel {
     Size,
     /// `-Copt-level=z`
     SizeMin,
+}
+
+impl OptLevel {
+    /// Infers an MIR opt-level (if not otherwise specified) from general opt-level.
+    /// Produces `1` at opt-level 0, and `2` at all other levels.
+    pub fn mir_opt_level(&self) -> usize {
+        match self {
+            OptLevel::No => 1,
+            _ => 2,
+        }
+    }
 }
 
 /// This is what the `LtoCli` values get mapped to after resolving defaults and
@@ -205,6 +229,150 @@ impl TrustIrLower {
     }
 }
 
+/// Trust: the spawn census's trust-ir lane, run in SHADOW beside the MIR lane, which decides
+/// every verdict until the flip (design `docs/design/2026-09-29-spawn-census-by-construction.md`
+/// §5.7, plan step P4). Measurement only: no mode changes a verdict, a row or a diagnostic of
+/// the compilation it observes; `Check` only adds an error of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrustSpawnCensusShadow {
+    /// The default: the lane does not run, and nothing is retained for it.
+    #[default]
+    Off,
+    /// Run it, and print each fn-like body's verdict on both lanes, the gaps that keep the
+    /// trust-ir lane from deciding it, and a crate summary.
+    Report,
+    /// `Report`, and fail the compilation on an invariant violation (the trust-ir lane QUIET
+    /// where the MIR lane refuses, or reaching a spawn where the MIR lane is QUIET), and on a
+    /// crate whose MIR census fell back, where nothing was compared.
+    Check,
+}
+
+impl TrustSpawnCensusShadow {
+    /// Does the lane run?
+    pub const fn runs(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// Trust (platform protocols, design `docs/design/2026-10-01-platform-protocols-as-trustc-errors.md`
+/// Part 3 §3.2; plan L1a = design PR 8): one property `-Ztrust-platform-properties` asks the
+/// platform-protocol pass to check. Refutation-only: a property can fail the build, and it never
+/// proves anything (OD-8).
+///
+/// The domain is CLOSED and holds only what this trustc can check (FC-7). The design also names
+/// `lock-release` and `fd-identity`; their census does not exist yet (plan L4a-L4c), so they are
+/// not variants here, and their spellings are refused at parse time with the same error as a
+/// typo rather than accepted as a flag that checks nothing. A variant is added in the landing
+/// that makes the pass check it, never before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TrustPlatformProperty {
+    /// No descriptor other than 0, 1 and 2 reaches the image a spawned child executes.
+    FdInherit,
+}
+
+/// Why a spelling is not a [`TrustPlatformProperty`]. Both are parse errors; the distinction is
+/// kept so the refusal can be pinned as "not supported by this trustc" for the names the design
+/// defines, separately from a typo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustPlatformPropertyRefusal {
+    /// Not a property name at all (case, separators and whitespace are significant).
+    Unknown,
+    /// A property the design defines that this trustc cannot check yet.
+    NotSupported,
+}
+
+impl TrustPlatformProperty {
+    /// Every property this trustc checks, in spelling order.
+    pub const ALL: &'static [Self] = &[Self::FdInherit];
+
+    /// Property names the design defines whose census this trustc does not have (L4c removes
+    /// them from here and adds their variants). Refused, never accepted inertly (FC-7).
+    pub const NOT_SUPPORTED: &'static [&'static str] = &["lock-release", "fd-identity"];
+
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::FdInherit => "fd-inherit",
+        }
+    }
+
+    /// The exact-spelling parse: no trimming, no case folding, no `_` for `-`. A spelling that
+    /// only resembles a property is a different string, and a near miss that silently
+    /// normalized would make `-Ztrust-platform-properties` a place where a typo can hide.
+    pub fn from_spelling(spelling: &str) -> Result<Self, TrustPlatformPropertyRefusal> {
+        if let Some(property) = Self::ALL.iter().copied().find(|p| p.spelling() == spelling) {
+            Ok(property)
+        } else if Self::NOT_SUPPORTED.contains(&spelling) {
+            Err(TrustPlatformPropertyRefusal::NotSupported)
+        } else {
+            Err(TrustPlatformPropertyRefusal::Unknown)
+        }
+    }
+}
+
+/// Trust (platform protocols, plan L1a): the set `-Ztrust-platform-properties` names. Empty, the
+/// default, means the platform pass does not run. Ordered and deduplicated, so the tracked hash
+/// cannot depend on how the set was spelled.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TrustPlatformProperties(BTreeSet<TrustPlatformProperty>);
+
+impl TrustPlatformProperties {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, property: TrustPlatformProperty) -> bool {
+        self.0.contains(&property)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = TrustPlatformProperty> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Adds a property; the set only grows (a later occurrence of the option never removes
+    /// what an earlier one asked for).
+    pub fn insert(&mut self, property: TrustPlatformProperty) {
+        self.0.insert(property);
+    }
+}
+
+impl FromIterator<TrustPlatformProperty> for TrustPlatformProperties {
+    fn from_iter<I: IntoIterator<Item = TrustPlatformProperty>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Trust (platform protocols, plan L1a/L2a): how a policy site the platform pass cannot analyse
+/// is reported. A site is never silently passed in either mode (FC-1): `Warn` names it in a
+/// warning, `Deny` makes it an error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrustPlatformUnanalysed {
+    #[default]
+    Warn,
+    Deny,
+}
+
+impl TrustPlatformUnanalysed {
+    pub const fn is_deny(self) -> bool {
+        matches!(self, Self::Deny)
+    }
+}
+
+/// Trust (platform protocols, plan L1a/L1e): how much the platform pass prints. Every refutation,
+/// every unanalysed site and the crate summary note are printed in both modes; `Verbose` adds a
+/// note per site that is not refuted, with its premises.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrustPlatformReport {
+    #[default]
+    Summary,
+    Verbose,
+}
+
+impl TrustPlatformReport {
+    pub const fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+}
+
 /// Trust: how strictly an active verification run enforces its own verdicts.
 ///
 /// The three settings are mutually exclusive by construction. Encoding them as
@@ -278,9 +446,9 @@ impl TrustPolicy {
 /// silently replayed from a different one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TrustWitness {
-    /// Managed: mint and replay both run against `<out-dir>/trust-witness`,
-    /// router-gated to bodies where replay beats fresh typeck. Inert without an
-    /// `--out-dir`.
+    /// Managed: mint and replay both run against a flat `<StableCrateId>.twit` file in
+    /// the `--out-dir`, router-gated to bodies where replay beats fresh typeck. Inert
+    /// without an `--out-dir`.
     #[default]
     Auto,
     Off,
@@ -395,12 +563,20 @@ pub enum CoverageLevel {
 // The different settings that the `-Z offload` flag can have.
 #[derive(Clone, PartialEq, Hash, Debug, Encodable, Decodable)]
 pub enum Offload {
-    /// Entry point for `std::offload`, enables kernel compilation for a gpu device
-    Device,
-    /// Second step in the offload pipeline, generates the host code to call kernels.
+    /// Second step in the offload pipeline, enables kernel compilation for a gpu device
+    /// Reads a manifest of required generic kernel instantiations
+    /// produced by a previous `HostMetadata` pass. An empty manifest
+    /// means there are no generic kernels at all, or that generic kernels are only
+    /// called from non-generic device entry points and never from the host, so we
+    /// don't need to track their instantiations.
+    Device(String),
+    /// Third step in the offload pipeline, generates the host code to call kernels.
     Host(String),
     /// Test is similar to Host, but allows testing without a device artifact.
     Test,
+    /// First step in the offload pipeline: compile for the host but only emit a manifest of
+    /// kernel instantiations required by the host code.
+    HostMetadata(String),
 }
 
 /// The different settings that the `-Z codegen-emit-retag` flag can have.
@@ -458,15 +634,23 @@ pub enum AnnotateMoves {
     Enabled(Option<u64>),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct InstrumentMcountOpts {
+    // Insert a nop which could be replaced by an mcount call.
+    pub no_call: bool,
+    // Record the location of the call instrument in a special linker section.
+    pub record: bool,
+}
+
 /// The different settings that the `-Z Instrument-mcount` flag can have.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum InstrumentMcount {
     /// `-Z instrument-mcount=no`
     Disabled,
     /// `-Z instrument-mcount=yes`
-    Mcount,
+    Mcount(InstrumentMcountOpts),
     /// `-Z instrument-mcount=fentry`
-    Fentry,
+    Fentry(InstrumentMcountOpts),
 }
 
 /// Settings for `-Z instrument-xray` flag.
@@ -676,7 +860,7 @@ impl LinkerFeaturesCli {
 
     /// When *not* using `-Z unstable-options` on the CLI, ensure only stable linker features are
     /// used, for the given `TargetTuple`. Returns `Ok` if no unstable variants are used.
-    /// The caller should ensure that e.g. `nightly_options::is_unstable_enabled()`
+    /// The caller should ensure that e.g. [`nightly_options::unstable_options_enabled`]
     /// returns false.
     pub(crate) fn check_unstable_variants(&self, target_tuple: &TargetTuple) -> Result<(), String> {
         // `-C linker-features=-lld` is only stable on x64 linux.
@@ -1234,19 +1418,38 @@ impl ExternEntry {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Default)]
-pub struct NextSolverConfig {
-    /// Whether the new trait solver should be enabled in coherence.
-    pub coherence: bool = true,
-    /// Whether the new trait solver should be enabled everywhere.
-    /// This is only `true` if `coherence` is also enabled.
-    pub globally: bool = false,
+/// Where the new trait solver should be enabled only in coherence or everywhere.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum NextSolverConfig {
+    Coherence,
+    Globally,
+}
+
+// FIXME(#160895): Using -Znext-solver as default on nightly
+// See https://github.com/rust-lang/compiler-team/issues/1014
+impl Default for NextSolverConfig {
+    fn default() -> Self {
+        if option_env!("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY").is_some() {
+            Self::Globally
+        } else {
+            Self::Coherence
+        }
+    }
 }
 
 #[derive(Clone)]
 pub enum Input {
     /// Load source code from a file.
     File(PathBuf),
+    /// Load source code from a doctest string.
+    DocTestStr {
+        /// The file associated with this input.
+        file: PathBuf,
+        // Line associated with this input
+        line: isize,
+        /// An anonymous string containing the source code.
+        input: String,
+    },
     /// Load source code from a string.
     Str {
         /// A string that is shown in place of a filename.
@@ -1277,6 +1480,14 @@ impl Input {
                     .path_mapping()
                     .to_real_filename(session.psess.source_map().working_dir(), ifile.as_path()),
             ),
+            Input::DocTestStr { ref file, line, .. } => FileName::DocTest(
+                session
+                    .psess
+                    .source_map()
+                    .path_mapping()
+                    .to_real_filename(session.psess.source_map().working_dir(), file.as_path()),
+                line,
+            ),
             Input::Str { ref name, .. } => name.clone(),
         }
     }
@@ -1284,6 +1495,7 @@ impl Input {
     pub fn opt_path(&self) -> Option<&Path> {
         match self {
             Input::File(file) => Some(file),
+            Input::DocTestStr { file, .. } => Some(file),
             Input::Str { name, .. } => match name {
                 FileName::Real(real) => real.local_path(),
                 FileName::CfgSpec(_) => None,
@@ -1292,7 +1504,7 @@ impl Input {
                 FileName::ProcMacroSourceCode(_) => None,
                 FileName::CliCrateAttr(_) => None,
                 FileName::Custom(_) => None,
-                FileName::DocTest(path, _) => Some(path),
+                FileName::DocTest(path, _) => path.local_path(),
                 FileName::InlineAsm(_) => None,
             },
         }
@@ -1616,12 +1828,11 @@ impl Sysroot {
     }
 }
 
+/// Get the host triple out of the build environment. This ensures that our
+/// idea of the host triple is the same as for the set of libraries we've
+/// actually built. We can't just take LLVM's host triple because they
+/// normalize all ix86 architectures to i386.
 pub fn host_tuple() -> &'static str {
-    // Get the host triple out of the build environment. This ensures that our
-    // idea of the host triple is the same as for the set of libraries we've
-    // actually built. We can't just take LLVM's host triple because they
-    // normalize all ix86 architectures to i386.
-    //
     // Instead of grabbing the host triple (for the current host), we grab (at
     // compile time) the target triple that this rustc is built with and
     // calling that (at runtime) the host triple.
@@ -1675,7 +1886,6 @@ impl Default for Options {
             test: false,
             incremental: None,
             untracked_state_hash: Default::default(),
-            trust_solver_content_fingerprint: String::new(),
             trust_verify_explicit_off: false,
             unstable_opts,
             prints: Vec::new(),
@@ -1708,11 +1918,33 @@ impl Default for Options {
             verbose: false,
             target_modifiers: BTreeMap::default(),
             mitigation_coverage_map: Default::default(),
+            jobs: Jobs { frontend: None, backend: None, linker: LinkerJobs::Default },
+            resource_worker_v2: false,
+            resource_worker_v3: false,
+            resource_subgroups_v3: false,
+            resource_bootstrap_fixed_v1: false,
+            recommended_stack_size: DEFAULT_STACK_SIZE,
         }
     }
 }
 
 impl Options {
+    // Trust: the options half of the typeck-witness key (crates/trust-witness key.rs). It is the
+    // whole `[TRACKED]` fingerprint (docs/TYPECK_MOONSHOT.md, A3), so the lint levels
+    // (`lint_opts`, `lint_cap`) and every other `[TRACKED_NO_CRATE_HASH]` option are in it, less
+    // exactly the two per-invocation freshness values: `untracked_state_hash`, which
+    // `finalize_untracked_session_state` sets per process when verification is on, and
+    // `-Ztrust-verify-session`, the per-run nonce of `targo trust`. Both exist so that no proof
+    // result is reused across invocations; typeck reads neither, and a witness carries no proof.
+    // Keeping them made every verified compile miss every stored root. Any option added later
+    // stays in the key unless it is named here.
+    pub fn witness_tracking_hash(&self) -> Hash64 {
+        let mut options = self.clone();
+        options.untracked_state_hash = Hash64::default();
+        options.unstable_opts.trust_verify_session = None;
+        options.dep_tracking_hash(false)
+    }
+
     /// Returns `true` if there is a reason to build the dep graph.
     pub fn build_dep_graph(&self) -> bool {
         self.incremental.is_some()
@@ -1828,8 +2060,6 @@ pub enum EntryFnType {
     },
 }
 
-pub use rustc_hir::attrs::CrateType;
-
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Encodable, Decodable)]
 pub enum Passes {
     Some(Vec<String>),
@@ -1870,6 +2100,179 @@ pub struct BranchProtection {
     pub bti: bool,
     pub pac_ret: Option<PacRet>,
     pub gcs: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
+pub enum PointerAuthOption {
+    // See <compiler/rustc_session/src/options.rs> and Clang's command line reference:
+    // <https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-fptrauth-auth-traps>
+    // for the origin and meaning of the enum values.
+    // tidy-alphabetical-start
+    Aarch64JumpTableHardening,
+    AuthTraps,
+    Calls,
+    ElfGot,
+    FunctionPointerTypeDiscrimination,
+    IndirectGotos,
+    InitFini,
+    InitFiniAddressDiscrimination,
+    Intrinsics,
+    ReturnAddresses,
+    TypeInfoVTPtrDisc,
+    VTPtrAddrDisc,
+    VTPtrTypeDisc,
+    // tidy-alphabetical-end
+}
+impl PointerAuthOption {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "aarch64-jump-table-hardening" => Some(Self::Aarch64JumpTableHardening),
+            "auth-traps" => Some(Self::AuthTraps),
+            "calls" => Some(Self::Calls),
+            "elf-got" => Some(Self::ElfGot),
+            "function-pointer-type-discrimination" => Some(Self::FunctionPointerTypeDiscrimination),
+            "indirect-gotos" => Some(Self::IndirectGotos),
+            "init-fini" => Some(Self::InitFini),
+            "init-fini-address-discrimination" => Some(Self::InitFiniAddressDiscrimination),
+            "intrinsics" => Some(Self::Intrinsics),
+            "return-addresses" => Some(Self::ReturnAddresses),
+            "typeinfo-vt-ptr-discrimination" => Some(Self::TypeInfoVTPtrDisc),
+            "vt-ptr-addr-discrimination" => Some(Self::VTPtrAddrDisc),
+            "vt-ptr-type-discrimination" => Some(Self::VTPtrTypeDisc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum LinkerJobs {
+    /// Do not pass anything to the linker, use it's default behavior.
+    Default,
+    /// Pass some specific number of jobs to use to the linker.
+    Explicit(NonZero<usize>),
+}
+
+impl LinkerJobs {
+    pub fn limit(self) -> Option<NonZero<usize>> {
+        match self {
+            LinkerJobs::Default => None,
+            LinkerJobs::Explicit(n) => Some(n),
+        }
+    }
+}
+
+/// `None` for frontend and backend means everything is single-threaded
+/// and synchronization can be disabled.
+#[derive(Clone, Copy)]
+pub struct Jobs {
+    pub frontend: Option<NonZero<usize>>,
+    pub backend: Option<NonZero<usize>>,
+    pub linker: LinkerJobs,
+}
+
+fn parse_jobs_all(
+    early_dcx: &EarlyDiagCtxt,
+    matches: &getopts::Matches,
+    zthreads: Option<&str>,
+    zno_parallel_backend: bool,
+    unstable: bool,
+) -> Jobs {
+    if zno_parallel_backend {
+        early_dcx.early_fatal("`-Zno-parallel-backend` is removed, use `--jobs-backend=1` instead");
+    }
+    let mut available = None;
+    let jobs = matches
+        .opt_str("jobs")
+        .map(|s| parse_jobs_one(early_dcx, "--jobs", &s, unstable, &mut available));
+    let check_upper_limit = |value: Option<_>, opt_name| {
+        if let Some(jobs) = jobs
+            && value.or(NonZero::new(1)) > jobs.or(NonZero::new(1))
+        {
+            early_dcx.early_fatal(format!("`{opt_name}` cannot be larger than `--jobs`"));
+        }
+    };
+    let frontend = match matches.opt_str("jobs-frontend") {
+        Some(jobs_frontend) => {
+            let opt_name = "--jobs-frontend";
+            let frontend =
+                parse_jobs_one(early_dcx, opt_name, &jobs_frontend, unstable, &mut available);
+            check_upper_limit(frontend, opt_name);
+            if zthreads.is_some() {
+                early_dcx.early_fatal("cannot use both `--jobs-frontend` and `-Zthreads`");
+            }
+            frontend
+        }
+        None => match zthreads {
+            Some(zthreads) => {
+                let opt_name = "-Zthreads";
+                let frontend =
+                    parse_jobs_one(early_dcx, opt_name, zthreads, unstable, &mut available);
+                check_upper_limit(frontend, opt_name);
+                frontend
+            }
+            None => None, // default to 1 thread irrespectively of `jobs` for now
+        },
+    };
+    let backend = match matches.opt_str("jobs-backend") {
+        Some(jobs_backend) => {
+            let opt_name = "--jobs-backend";
+            let backend =
+                parse_jobs_one(early_dcx, opt_name, &jobs_backend, unstable, &mut available);
+            check_upper_limit(backend, opt_name);
+            backend
+        }
+        None => match jobs {
+            Some(n) => n,
+            // Use all available parallelism as the default.
+            None => parse_jobs_one(early_dcx, "", "0", unstable, &mut available),
+        },
+    };
+    let linker = match matches.opt_str("jobs-linker") {
+        Some(jobs_linker) => {
+            let opt_name = "--jobs-linker";
+            let linker =
+                parse_jobs_one(early_dcx, opt_name, &jobs_linker, unstable, &mut available);
+            check_upper_limit(linker, opt_name);
+            LinkerJobs::Explicit(linker.or(NonZero::new(1)).unwrap())
+        }
+        None => match jobs {
+            Some(n) => LinkerJobs::Explicit(n.or(NonZero::new(1)).unwrap()),
+            None => LinkerJobs::Default, // back compat with lld
+        },
+    };
+
+    Jobs { frontend, backend, linker }
+}
+
+// Parse a string passed to one of the `--jobs` options or `-Zthreads`.
+fn parse_jobs_one(
+    early_dcx: &EarlyDiagCtxt,
+    opt_name: &str,
+    s: &str,
+    unstable: bool,
+    available: &mut Option<u8>,
+) -> Option<NonZero<usize>> {
+    if s == "sync" {
+        // Enable synchronization overhead for benchmarking despite only using one thread.
+        if !unstable {
+            early_dcx.early_fatal(format!("`{opt_name}=sync` requires `-Z unstable-options`"));
+        }
+        return NonZero::new(1);
+    }
+    // The number of jobs is capped by 255 (`u8::MAX`) to avoid arbitrary large numbers like 999999
+    // causing compiler panics (#117638). The limit can be potentially increased, because e.g.
+    // rustc thread pool supports up to `u16::MAX` threads in theory.
+    let n = match u8::from_str(s) {
+        Ok(0) => *available.get_or_insert_with(|| match thread::available_parallelism() {
+            Ok(n) => u8::try_from(n.get()).unwrap_or(u8::MAX),
+            Err(_) => 1,
+        }),
+        Ok(n) => n,
+        Err(_) => early_dcx
+            .early_fatal(format!("`{opt_name}`: expected a number from 0 to 255 or `sync`")),
+    };
+    // `Jobs` uses `usize` for more convenient use, even if the actual values are limited to `u8`.
+    (n > 1).then_some(NonZero::new(usize::from(n)).unwrap())
 }
 
 pub fn build_configuration(sess: &Session, mut user_cfg: Cfg) -> Cfg {
@@ -1919,7 +2322,7 @@ pub fn build_target_config(
             {
                 err.help(format!("did you mean `{suggestion}`?"));
             }
-            err.emit()
+            err.emit_fatal()
         }
     }
 }
@@ -2186,6 +2589,51 @@ pub fn rustc_optgroups() -> Vec<RustcOptGroup> {
             "Defines which scopes of paths should be remapped by `--remap-path-prefix`",
             "<macro,diagnostics,debuginfo,coverage,object,all>",
         ),
+        opt(Unstable, Opt, "j", "jobs", "Limit on the number of used parallel jobs", "<N>"),
+        // Trust: accepted only with a validated inherited worker credit.
+        opt(Unstable, Flag, "", "resource-worker-v2", "Use native runtime CPU ownership", ""),
+        opt(Unstable, Flag, "", "resource-worker-v3", "Use retained native worker custody", ""),
+        // Trust: marker alone grants nothing; actual private Fixed adoption is required.
+        opt(
+            Unstable,
+            Flag,
+            "",
+            "resource-bootstrap-fixed-v1",
+            "Use private original-Root compiler custody",
+            "",
+        ),
+        opt(
+            Unstable,
+            Flag,
+            "",
+            "resource-subgroups-v3",
+            "Require retained native subgroup custody",
+            "",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "jobs-frontend",
+            "Limit on the number of parallel jobs used by frontend",
+            "<N>",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "jobs-backend",
+            "Limit on the number of parallel jobs used by backend",
+            "<N>",
+        ),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "jobs-linker",
+            "Limit on the number of parallel jobs used by linker",
+            "<N>",
+        ),
         opt(Unstable, Multi, "", "env-set", "Inject an environment variable", "<VAR>=<VALUE>"),
     ];
     options.extend(verbose_only.into_iter().map(|mut opt| {
@@ -2394,22 +2842,35 @@ pub fn parse_error_format(
     error_format
 }
 
-pub fn parse_crate_edition(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches) -> Edition {
+pub fn parse_crate_edition(
+    early_dcx: &EarlyDiagCtxt,
+    matches: &getopts::Matches,
+    has_input: bool,
+) -> Edition {
+    let is_nightly = nightly_options::match_is_nightly_build(matches);
+    let edition_list = if is_nightly { EDITION_NAME_LIST } else { EDITION_NAME_LIST_STABLE };
     let edition = match matches.opt_str("edition") {
         Some(arg) => Edition::from_str(&arg).unwrap_or_else(|_| {
             early_dcx.early_fatal(format!(
-                "argument for `--edition` must be one of: \
-                     {EDITION_NAME_LIST}. (instead was `{arg}`)"
+                "argument for `--edition` must be one of: {edition_list} (instead was `{arg}`)",
             ))
         }),
-        None => DEFAULT_EDITION,
+        None => {
+            if has_input {
+                eprintln!(
+                    "`--edition` is unspecified, defaulting to `{DEFAULT_EDITION}` while the \
+                     latest is `{LATEST_STABLE_EDITION}`; it must be one of: {edition_list}\n",
+                );
+            }
+            DEFAULT_EDITION
+        }
     };
 
-    if !edition.is_stable() && !nightly_options::is_unstable_enabled(matches) {
-        let is_nightly = nightly_options::match_is_nightly_build(matches);
+    if !edition.is_stable() && !nightly_options::unstable_options_enabled(matches) {
         let msg = if !is_nightly {
             format!(
-                "the crate requires edition {edition}, but the latest edition supported by this Rust version is {LATEST_STABLE_EDITION}"
+                "the crate requires edition {edition}, but the latest edition supported by this \
+                 Rust version is {LATEST_STABLE_EDITION}"
             )
         } else {
             format!("edition {edition} is unstable and only available with -Z unstable-options")
@@ -2423,10 +2884,10 @@ pub fn parse_crate_edition(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches
 fn check_error_format_stability(
     early_dcx: &EarlyDiagCtxt,
     unstable_opts: &UnstableOptions,
-    is_nightly_build: bool,
+    unstable_flags_enabled: bool,
     format: ErrorOutputType,
 ) {
-    if unstable_opts.unstable_options || is_nightly_build {
+    if unstable_opts.unstable_options || unstable_flags_enabled {
         return;
     }
     let format = match format {
@@ -2544,56 +3005,90 @@ pub fn parse_target_triple(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches
 // invoking callbacks. Reading both from the declaration removes the failure
 // mode this type used to have: a `-Ztrust-*` option protected at one boundary,
 // forgotten at the other, and noticed only by a test nobody had run.
+//
+// Trust (plan P4 / T4.1, 2026-10-10): the snapshot used to carry a second,
+// compiler-populated field, the content fingerprint of the external `ay`
+// snapshot. trustc now links its ay, so there is no such state; every Trust
+// control left is an option in that table.
 #[derive(Clone)]
 pub struct TrustFrontendAuthoritySnapshot {
-    trust_solver_content_fingerprint: String,
     unstable_opts: Box<UnstableOptions>,
 }
 
 impl TrustFrontendAuthoritySnapshot {
     #[allow(rustc::bad_opt_access)]
     pub fn capture(opts: &Options) -> Self {
-        Self {
-            trust_solver_content_fingerprint: opts.trust_solver_content_fingerprint.clone(),
-            unstable_opts: Box::new(opts.unstable_opts.clone()),
-        }
+        Self { unstable_opts: Box::new(opts.unstable_opts.clone()) }
     }
 
     /// The first authority-bearing control a callback changed, if any.
     #[allow(rustc::bad_opt_access)]
     pub fn changed_option(&self, opts: &Options) -> Option<String> {
-        if self.trust_solver_content_fingerprint != opts.trust_solver_content_fingerprint {
-            return Some(COMPILER_POPULATED_SOLVER_IDENTITY.to_string());
-        }
         self.unstable_opts.first_changed_trust_authority(&opts.unstable_opts)
     }
 
     /// Return the first caller-populated Trust control that a public embedded
-    /// frontend cannot safely inherit. Authority-only controls are excluded:
-    /// either incoming value is overwritten by [`Self::deauthorize`].
+    /// frontend cannot safely inherit: an `EvidenceControl` held away from its
+    /// declared default.
+    ///
+    /// Decided on the EFFECTIVE configuration — the fully parsed, last-wins
+    /// option values — never on how many times, or in what order, a caller
+    /// spelled an option. Excluded, because [`Self::deauthorize`] overwrites
+    /// them and nothing of the caller's value survives into the compilation:
+    ///
+    /// * `AuthorityOnly` controls. `-Ztrust-verify` is forced off. So is
+    ///   `-Ztrust-ir-lower`, whatever was requested. With verification off, the
+    ///   direct lowering claims nothing: it is the compat lane's diagnostic
+    ///   opt-in (a body it cannot lower is a coverage-only skip, `strict`
+    ///   degrading to `on` — [`crate::trust_ir_lower_strict_by_flags`], and an
+    ///   invalid crate module a warning, not an error); it publishes nothing
+    ///   without a `-Ztrust-dump` sink, which stays an `EvidenceControl`; the
+    ///   only emitted code it can change is the flip, which installs derived MIR
+    ///   solely after an exact differential proof against the MIR this frontend
+    ///   uses instead; and its remaining effect is extra compile-time checking
+    ///   (the Clean-origin call gate demanded for emitted references, producer
+    ///   diagnostics). A frontend that produces no evidence drops that checking
+    ///   exactly as it drops codegen-time checking; the canonical compilation of
+    ///   the same unit still performs it. The option used to be refused here as
+    ///   "a caller that asked for lowering has populated evidence authority",
+    ///   which made every repository whose committed posture carries
+    ///   `-Ztrust-ir-lower=strict` (ay's does) unable to lint or document at all,
+    ///   even with the effective `-Ztrust-verify=off` Targo appends for those
+    ///   passes.
+    /// * `VerificationSelector` controls: every effect they have is conditional
+    ///   on the verification (or lowering) this frontend never runs, and
+    ///   deauthorization resets them to their defaults.
+    ///
+    /// An explicit, effective `-Ztrust-verify=on` is refused by the argv-owning
+    /// boundary in `rustc_driver_impl` (`frontend_forbidden_option`), the only
+    /// place that can tell an explicit request from the declared default.
     #[allow(rustc::bad_opt_access)]
     pub fn first_nondefault_evidence_control(opts: &Options) -> Option<String> {
-        let defaults = Options::default();
-        if opts.trust_solver_content_fingerprint != defaults.trust_solver_content_fingerprint {
-            return Some(COMPILER_POPULATED_SOLVER_IDENTITY.to_string());
-        }
-        // `-Ztrust-ir-lower` is a request, not a state, and the driver stamps
-        // its resolved answer into the field before an embedded frontend ever
-        // sees it. Both "unset" and "explicitly off" therefore arrive here as
-        // configurations deauthorization can inherit unchanged; only a caller
-        // that asked for lowering has populated evidence authority. Comparing
-        // against the declared default instead would reject every canonicalized
-        // compile, which is why it is classified `AuthorityOnly` in the table
-        // and carries this one explicit rejection.
-        if opts.unstable_opts.trust_ir_lower.is_some_and(TrustIrLower::runs) {
-            return Some("-Ztrust-ir-lower".to_string());
-        }
         opts.unstable_opts.first_nondefault_trust_evidence_control()
     }
 
-    /// Remove integrated Trust verification, direct TrustIR lowering, and any
-    /// compiler-populated solver identity from an embedded frontend
-    /// configuration.
+    /// The first verification selector a configuration still holds away from
+    /// its declared default. After [`Self::deauthorize`] this is `None` by
+    /// construction; a deauthorized frontend re-checks it after `Session`
+    /// construction so no later mutation can reinstate a posture (a `certify`
+    /// policy, a proof level, a hardened profile) that frontend cannot honour.
+    #[allow(rustc::bad_opt_access)]
+    pub fn first_live_verification_selector(opts: &Options) -> Option<String> {
+        opts.unstable_opts.first_live_trust_verification_selector()
+    }
+
+    /// Remove integrated Trust verification, direct TrustIR lowering and every
+    /// verification-posture selector from an embedded frontend configuration.
+    ///
+    /// After this, every Trust field except the untouched `EvidenceControl`s
+    /// (which [`Self::first_nondefault_evidence_control`] has already required
+    /// to be at their defaults) holds exactly the value the same frontend holds
+    /// when given NO Trust option: accepting a posture adds no behaviour a plain
+    /// `-Ztrust-verify=off` run of this frontend does not already have. The one
+    /// selector effect that is not verification-conditional — the SIGPIPE
+    /// disposition a Unix-tool verification profile declares for `main` — is
+    /// first materialized into `-Zon-broken-pipe`, so the neutralized
+    /// configuration still compiles the entry point the caller's did.
     #[allow(rustc::bad_opt_access)]
     pub fn deauthorize(opts: &mut Options) {
         opts.unstable_opts.trust_verify = TrustVerify::Off;
@@ -2601,16 +3096,21 @@ impl TrustFrontendAuthoritySnapshot {
         // forced off, an unset request would still read as "the toolchain
         // decides" to anything that inspects the field later.
         opts.unstable_opts.trust_ir_lower = Some(TrustIrLower::Off);
-        opts.trust_solver_content_fingerprint.clear();
+        opts.unstable_opts.on_broken_pipe = crate::trust_effective_on_broken_pipe_by_flags(
+            opts.unstable_opts.on_broken_pipe,
+            opts.unstable_opts.trust_verify_profile.as_deref(),
+        );
+        opts.unstable_opts.neutralize_trust_verification_selectors();
+        // Trust: EW18-DROPIN-1 (2026-11-05). An embedded frontend's link keeps what
+        // upstream rustc's keeps: the deletion is a caller's own opt-in, not
+        // something a frontend inherits from shared RUSTFLAGS.
+        opts.unstable_opts.trust_drop_rlib_objects = false;
         // A deauthorized-by-design frontend never claims the explicit
         // `-Ztrust-verify=off` spelling: it announces its policy once at this
         // boundary, not once per crate through the loud-when-off note.
         opts.trust_verify_explicit_off = false;
     }
 }
-
-pub(crate) const COMPILER_POPULATED_SOLVER_IDENTITY: &str =
-    "compiler-populated Trust solver content fingerprint";
 
 /// Classifies compiler entry points by whether they can initialize or reuse a
 /// process-global codegen backend.
@@ -2712,15 +3212,19 @@ pub fn enter_compiler_backend_route(
 /// Legacy ambient inputs that used to alter Trust proof obligations, solver
 /// routing, verdicts, or generated MIR without participating in dependency
 /// tracking. Diagnostic-only switches intentionally remain outside this list.
+// Trust: producer-lane switches and std obligation-discharge switches are
+// semantic inputs too, even when their value disables a default-on lane.
 pub const LEGACY_TRUST_SEMANTIC_ENV_VARS: &[&str] = &[
     "AY_DIRECT_SOLVE_TIMEOUT_MS",
     "AY_PATH",
     "TRUST_AGGREGATE_PERTURB",
     "TRUST_BACKING_INVARIANTS",
     "TRUST_BRIDGE_GATE",
+    "TRUST_BUNDLE_CAP",
     "TRUST_CACHE_DIR",
     "TRUST_CALLEE_PERTURB",
     "TRUST_COMPILER_CACHE",
+    "TRUST_COMPOSE_NO_SCOPE",
     "TRUST_DISABLE_CEGAR",
     "TRUST_DISABLE_CERTIFY",
     "TRUST_DISABLE_STRENGTHEN",
@@ -2741,11 +3245,16 @@ pub const LEGACY_TRUST_SEMANTIC_ENV_VARS: &[&str] = &[
     "TRUST_IR_FLIP",
     "TRUST_IR_LOWER",
     "TRUST_LEVEL",
+    "TRUST_MAX_BUNDLE_FUNCTIONS",
+    "TRUST_MC_DATAFLOW_CHC",
     "TRUST_MC_PATH",
     "TRUST_MEMORDER_PERTURB",
     "TRUST_NATIVE_UNIVERSAL",
+    "TRUST_NO_BUNDLE_DECLARED",
     "TRUST_NO_COMPILER_CACHE",
     "TRUST_NO_R1",
+    "TRUST_NSA",
+    "TRUST_OPTION_FLAG_LANES",
     "TRUST_PARALLEL",
     "TRUST_PROFILE",
     "TRUST_PROOF_LEVEL",
@@ -2754,12 +3263,14 @@ pub const LEGACY_TRUST_SEMANTIC_ENV_VARS: &[&str] = &[
     "TRUST_RECHECK_FRONTIER_OVERRIDE",
     "TRUST_REFREAD_PERTURB",
     "TRUST_RESULT_CACHE_CAP",
+    "TRUST_SHARED_RECV_PLACE",
     "TRUST_SKIP_FUNCTIONS",
     "TRUST_SOLVER",
     "TRUST_SOLVER_MEMORY_LIMIT_MB",
     "TRUST_SPINE_CONTRACT_FLIP",
     "TRUST_SPINE_NATIVE_GEN",
     "TRUST_SPINE_VERDICT_FLIP",
+    "TRUST_STD_UNSAFE_CALL_SKIP",
     "TRUST_STRUCTFIELD_PERTURB",
     "TRUST_STR_RETURN_PERTURB",
     "TRUST_SWITCH_PERTURB",
@@ -3047,7 +3558,7 @@ pub fn parse_externs(
     let mut externs: BTreeMap<String, ExternEntry> = BTreeMap::new();
     for arg in matches.opt_strs("extern") {
         let ExternOpt { crate_name: name, path, options } =
-            split_extern_opt(early_dcx, unstable_opts, &arg).unwrap_or_else(|e| e.emit());
+            split_extern_opt(early_dcx, unstable_opts, &arg).unwrap_or_else(|e| e.emit_fatal());
 
         let entry = externs.entry(name.to_owned());
 
@@ -3170,10 +3681,14 @@ fn parse_logical_env(
 
 // JUSTIFICATION: before wrapper fn is available
 #[allow(rustc::bad_opt_access)]
-pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::Matches) -> Options {
+pub fn build_session_options(
+    early_dcx: &mut EarlyDiagCtxt,
+    matches: &getopts::Matches,
+    has_input: bool,
+) -> Options {
     let color = parse_color(early_dcx, matches);
 
-    let edition = parse_crate_edition(early_dcx, matches);
+    let edition = parse_crate_edition(early_dcx, matches, has_input);
 
     let crate_name = matches.opt_str("crate-name");
     let unstable_features = UnstableFeatures::from_environment(crate_name.as_deref());
@@ -3202,6 +3717,26 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
 
     let mut unstable_opts = UnstableOptions::build(early_dcx, matches, &mut collected_options);
 
+    // `-Zassumptions-on-binders` requires the next trait solver globally. Normalize after
+    // parsing so the effective config is independent of flag order and so consumers that
+    // read `next_solver` directly (e.g. feature-gate checks) see the right value.
+    if unstable_opts.assumptions_on_binders {
+        // Only warn when the last `-Znext-solver` given has a value that doesn't enable
+        // the solver globally, so a later `-Znext-solver=globally` overrides an earlier one.
+        let no_next_solver = matches
+            .opt_strs("Z")
+            .iter()
+            .rfind(|arg| arg.starts_with("next-solver"))
+            .is_some_and(|arg| *arg == "next-solver=no" || *arg == "next-solver=coherence");
+        if no_next_solver {
+            early_dcx.early_warn(
+                "-Zassumptions-on-binders unconditionally enables the next trait solver; \
+                 `-Znext-solver=no` is ignored",
+            );
+        }
+        unstable_opts.next_solver = NextSolverConfig::Globally;
+    }
+
     if unstable_opts.staticlib_hide_internal_symbols && !crate_types.contains(&CrateType::StaticLib)
     {
         early_dcx.early_warn(
@@ -3226,7 +3761,7 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
     check_error_format_stability(
         early_dcx,
         &unstable_opts,
-        unstable_features.is_nightly_build(),
+        unstable_features.allow_unstable_compiler_flag("error-format"),
         error_format,
     );
 
@@ -3240,21 +3775,17 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         cg.codegen_units,
     );
 
-    if unstable_opts.threads == Some(parse::MAX_THREADS_CAP) {
-        early_dcx.early_warn(format!("number of threads was capped at {}", parse::MAX_THREADS_CAP));
-    }
-
     let incremental = cg.incremental.as_ref().map(PathBuf::from);
 
     if cg.profile_generate.enabled() && cg.profile_use.is_some() {
         early_dcx.early_fatal("options `-C profile-generate` and `-C profile-use` are exclusive");
     }
 
-    if unstable_opts.profile_sample_use.is_some()
+    if cg.profile_sample_use.is_some()
         && (cg.profile_generate.enabled() || cg.profile_use.is_some())
     {
         early_dcx.early_fatal(
-            "option `-Z profile-sample-use` cannot be used with `-C profile-generate` or `-C profile-use`",
+            "option `-C profile-sample-use` cannot be used with `-C profile-generate` or `-C profile-use`",
         );
     }
 
@@ -3326,18 +3857,17 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         }
     }
 
-    let unstable_options_enabled = nightly_options::is_unstable_enabled(matches);
+    let unstable_options_enabled = nightly_options::unstable_options_enabled(matches);
     if !unstable_options_enabled && cg.force_frame_pointers == FramePointer::NonLeaf {
         early_dcx.early_fatal(
             "`-Cforce-frame-pointers=non-leaf` or `always` also requires `-Zunstable-options` \
-                and a nightly compiler",
+             and a nightly compiler",
         )
     }
 
-    if !nightly_options::is_unstable_enabled(matches) && !unstable_opts.offload.is_empty() {
+    if !unstable_options_enabled && !unstable_opts.offload.is_empty() {
         early_dcx.early_fatal(
-            "`-Zoffload=Enable` also requires `-Zunstable-options` \
-                and a nightly compiler",
+            "`-Zoffload=Enable` also requires `-Zunstable-options` and a nightly compiler",
         )
     }
 
@@ -3360,8 +3890,8 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         if let Some(flavor) = cg.linker_flavor {
             if flavor.is_unstable() {
                 early_dcx.early_fatal(format!(
-                    "the linker flavor `{}` is unstable, the `-Z unstable-options` \
-                        flag must also be passed to use the unstable values",
+                    "the linker flavor `{}` is unstable, the `-Z unstable-options` flag must also \
+                     be passed to use the unstable values",
                     flavor.desc()
                 ));
             }
@@ -3381,7 +3911,13 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         ));
     }
 
-    let prints = print_request::collect_print_requests(early_dcx, &mut cg, &unstable_opts, matches);
+    let prints = print_request::collect_print_requests(
+        early_dcx,
+        &mut cg,
+        &unstable_opts,
+        matches,
+        PrintCategory::ALL_VARIANTS,
+    );
 
     // -Zretpoline-external-thunk also requires -Zretpoline
     if unstable_opts.retpoline_external_thunk {
@@ -3414,7 +3950,7 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
     }
 
     // Parse any `-l` flags, which link to native libraries.
-    let libs = parse_native_libs(early_dcx, &unstable_opts, unstable_features, matches);
+    let libs = parse_native_libs(early_dcx, &unstable_opts, &unstable_features, matches);
 
     let test = matches.opt_present("test");
 
@@ -3425,6 +3961,10 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
     if cg.remark.is_empty() && unstable_opts.remark_dir.is_some() {
         early_dcx
             .early_warn("using -Z remark-dir without enabling remarks using e.g. -C remark=all");
+    }
+
+    if cg.embed_metadata.is_some() && unstable_opts.embed_metadata.is_some() {
+        early_dcx.early_fatal("can't use both -Z embed-metadata and -C embed-metadata");
     }
 
     let externs = parse_externs(early_dcx, matches, &unstable_opts);
@@ -3507,8 +4047,20 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
 
     let verbose = matches.opt_present("verbose") || unstable_opts.verbose_internals;
 
+    let jobs = parse_jobs_all(
+        early_dcx,
+        matches,
+        unstable_opts.threads.as_deref(),
+        unstable_opts.no_parallel_backend,
+        unstable_opts.unstable_options,
+    );
+
     Options {
         crate_types,
+        resource_worker_v2: matches.opt_present("resource-worker-v2"),
+        resource_worker_v3: matches.opt_present("resource-worker-v3"),
+        resource_subgroups_v3: matches.opt_present("resource-subgroups-v3"),
+        resource_bootstrap_fixed_v1: matches.opt_present("resource-bootstrap-fixed-v1"),
         optimize: opt_level,
         debuginfo,
         lint_opts,
@@ -3521,7 +4073,6 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         test,
         incremental,
         untracked_state_hash: Default::default(),
-        trust_solver_content_fingerprint: String::new(),
         trust_verify_explicit_off: false,
         unstable_opts,
         prints,
@@ -3554,6 +4105,8 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         verbose,
         target_modifiers: collected_options.target_modifiers,
         mitigation_coverage_map: collected_options.mitigations,
+        jobs,
+        recommended_stack_size: DEFAULT_STACK_SIZE,
     }
 }
 
@@ -3638,17 +4191,16 @@ pub mod nightly_options {
     #[cfg(test)]
     mod tests;
 
-    pub fn is_unstable_enabled(matches: &getopts::Matches) -> bool {
-        match_is_nightly_build(matches)
+    pub fn unstable_options_enabled(matches: &getopts::Matches) -> bool {
+        let unstable_features =
+            UnstableFeatures::from_environment(matches.opt_str("crate-name").as_deref());
+        unstable_features.allow_unstable_compiler_flag("unstable-options")
             && matches.opt_strs("Z").iter().any(|x| *x == "unstable-options")
     }
 
     pub fn match_is_nightly_build(matches: &getopts::Matches) -> bool {
-        is_nightly_build(matches.opt_str("crate-name").as_deref())
-    }
-
-    fn is_nightly_build(krate: Option<&str>) -> bool {
-        UnstableFeatures::from_environment(krate).is_nightly_build()
+        let krate = matches.opt_str("crate-name");
+        UnstableFeatures::from_environment(krate.as_deref()).is_nightly_build()
     }
 
     pub fn check_nightly_options(
@@ -3657,7 +4209,8 @@ pub mod nightly_options {
         flags: &[RustcOptGroup],
     ) {
         let has_z_unstable_option = matches.opt_strs("Z").iter().any(|x| *x == "unstable-options");
-        let really_allows_unstable_options = match_is_nightly_build(matches);
+        let unstable_features =
+            UnstableFeatures::from_environment(matches.opt_str("crate-name").as_deref());
         let mut nightly_options_on_stable = 0;
 
         for opt in flags.iter() {
@@ -3674,35 +4227,63 @@ pub mod nightly_options {
                     opt.name
                 ));
             }
-            if really_allows_unstable_options {
+
+            // Check if the matched values are enabled
+            // If we're dealing with -Z, then check all the matched values (i.e. -Zfoo, -Zbar, etc.)
+            // If we're dealing with other flags, check their name directly
+            if opt.name == "Z" {
+                // For `-Zui-testing -Zfoo=bar -Zfoo=baz`, this returns
+                // ["ui-testing", "foo=bar", "foo=baz"].
+                // Check that all of them are allowed
+                let values = matches.opt_strs(opt.name);
+                let disallowed_flags = values
+                    .iter()
+                    .map(|flag| flag.split_once("=").map(|(k, _)| k).unwrap_or(flag))
+                    .filter(|flag| !unstable_features.allow_unstable_compiler_flag(flag))
+                    .collect::<Vec<_>>();
+                if disallowed_flags.is_empty() {
+                    continue;
+                }
+
+                // Check if we're using the "allow specified unstable flags only" mode.
+                // In this case, if the user allowed only foo and bar, but then -Zbaz was also
+                // passed, rustc would only print that `-Z` is not allowed, which doesn't tell the
+                // user the actual -Z flag value that was disallowed. So we try to provide better
+                // diagnostics here (solely for the use-case of debugging compiletest itself).
+                if matches!(
+                    unstable_features,
+                    UnstableFeatures::AllowSelectedUnstableCompilerFlagsOnly { .. }
+                ) {
+                    for flag in disallowed_flags {
+                        let _ = early_dcx.early_err(format!("the -Z{flag} option was not allowed through `-allow-unstable-compiler-flags`"));
+                    }
+                }
+            } else if unstable_features.allow_unstable_compiler_flag(opt.name) {
                 continue;
             }
-            match opt.stability {
-                OptionStability::Unstable => {
-                    if opt.name == "Z" && z_options_are_stable_trust_compat(matches) {
-                        continue;
-                    }
-                    nightly_options_on_stable += 1;
-                    let msg = format!(
-                        "the option `{}` is only accepted on the nightly compiler",
-                        opt.name
-                    );
-                    // The non-zero nightly_options_on_stable will force an early_fatal eventually.
-                    let _ = early_dcx.early_err(msg);
-                }
-                OptionStability::Stable => {}
+            // Trust: stable-compat `-Z` options are exempt from the nightly check.
+            if opt.name == "Z" && z_options_are_stable_trust_compat(matches) {
+                continue;
             }
+
+            nightly_options_on_stable += 1;
+            let msg = format!("the option `{}` is only accepted on the nightly compiler", opt.name);
+            // The non-zero nightly_options_on_stable will force an early_fatal eventually.
+            let _ = early_dcx.early_err(msg);
         }
+
         if nightly_options_on_stable > 0 {
-            early_dcx
-                .early_help("consider switching to the Trust toolchain: `rustup default trust`");
-            early_dcx.early_note("selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>");
-            early_dcx.early_note("Trust keeps the inherited unstable option model; use the Trust toolchain for `-Z` workflows.");
-            early_dcx.early_fatal(format!(
-                "{} nightly option{} were parsed",
-                nightly_options_on_stable,
-                if nightly_options_on_stable > 1 { "s" } else { "" }
+            let (s, were) = if nightly_options_on_stable > 1 { ("s", "were") } else { ("", "was") };
+            let mut err = early_dcx.early_struct_fatal(format!(
+                "{nightly_options_on_stable} nightly option{s} {were} parsed",
             ));
+            err.help("consider switching to the Trust toolchain: `rustup default trust`");
+            err.note(
+                "selecting a toolchain with `+toolchain` arguments require a rustup proxy; \
+                see <https://rust-lang.github.io/rustup/concepts/index.html>",
+            );
+            err.note("Trust keeps the inherited unstable option model; use the Trust toolchain for `-Z` workflows.");
+            err.emit();
         }
     }
 
@@ -3826,13 +4407,13 @@ pub(crate) mod dep_tracking {
     use rustc_abi::Align;
     use rustc_ast::attr::version::RustcVersion;
     use rustc_data_structures::fx::FxIndexMap;
-    use rustc_data_structures::stable_hash::StableHasher;
+    use rustc_data_structures::stable_hash::{DummyStableHashCtxt, StableHash, StableHasher};
     use rustc_errors::LanguageIdentifier;
     use rustc_feature::UnstableFeatures;
     use rustc_hashes::Hash64;
-    use rustc_hir::attrs::CollapseMacroDebuginfo;
     use rustc_span::edition::Edition;
     use rustc_span::{RealFileName, RemapPathScopeComponents};
+    use rustc_structures::CollapseMacroDebuginfo;
     use rustc_target::spec::{
         CodeModel, FramePointer, MergeFunctions, OnBrokenPipe, PanicStrategy, RelocModel,
         RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, SymbolVisibility, TargetTuple,
@@ -3842,11 +4423,13 @@ pub(crate) mod dep_tracking {
     use super::{
         AnnotateMoves, AutoDiff, BranchProtection, CFGuard, CFProtection, CodegenRetagOptions,
         CoverageOptions, CrateType, DebugInfo, DebugInfoCompression, ErrorOutputType, FmtDebug,
-        FunctionReturn, InliningThreshold, InstrumentCoverage, InstrumentMcount, InstrumentXRay,
-        LinkerPluginLto, LocationDetail, LtoCli, MirStripDebugInfo, NextSolverConfig, Offload,
-        OptLevel, OutFileName, OutputType, OutputTypes, PatchableFunctionEntry, Polonius,
-        ResolveDocLinks, SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath,
-        SymbolManglingVersion, TrustDump, TrustIrLower, TrustPolicy, TrustVerify, TrustWitness,
+        FunctionReturn, InliningThreshold, InstrumentCoverage, InstrumentMcount,
+        InstrumentMcountOpts, InstrumentXRay, LinkerPluginLto, LocationDetail, LtoCli,
+        MirStripDebugInfo, NextSolverConfig, Offload, OptLevel, OutFileName, OutputType,
+        OutputTypes, PatchableFunctionEntry, PointerAuthOption, Polonius, ResolveDocLinks,
+        SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath, SymbolManglingVersion,
+        TrustDump, TrustIrLower, TrustPlatformProperties, TrustPlatformReport,
+        TrustPlatformUnanalysed, TrustPolicy, TrustSpawnCensusShadow, TrustVerify, TrustWitness,
         WasiExecModel,
     };
     use crate::lint;
@@ -3889,76 +4472,84 @@ pub(crate) mod dep_tracking {
     }
 
     impl_dep_tracking_hash_via_hash!(
+        // tidy-alphabetical-start
         (),
+        Align,
         AnnotateMoves,
         AutoDiff,
-        Offload,
-        bool,
-        usize,
-        NonZero<usize>,
-        u64,
-        Hash64,
-        String,
-        PathBuf,
-        lint::Level,
-        WasiExecModel,
-        u32,
-        FramePointer,
-        RelocModel,
-        CodeModel,
-        TlsModel,
-        InstrumentCoverage,
-        CoverageOptions,
-        TrustDump,
-        TrustIrLower,
-        TrustPolicy,
-        TrustVerify,
-        TrustWitness,
-        InstrumentMcount,
-        InstrumentXRay,
-        CrateType,
-        MergeFunctions,
-        OnBrokenPipe,
-        PanicStrategy,
-        RelroLevel,
-        OptLevel,
-        LtoCli,
-        DebugInfo,
-        DebugInfoCompression,
-        MirStripDebugInfo,
-        CollapseMacroDebuginfo,
-        UnstableFeatures,
-        NativeLib,
-        SanitizerSet,
+        BranchProtection,
         CFGuard,
         CFProtection,
-        TargetTuple,
+        CodeModel,
+        CodegenRetagOptions,
+        CollapseMacroDebuginfo,
+        CoverageOptions,
+        CrateType,
+        DebugInfo,
+        DebugInfoCompression,
         Edition,
+        FmtDebug,
+        FramePointer,
+        FunctionReturn,
+        Hash64,
+        InliningThreshold,
+        InstrumentCoverage,
+        InstrumentMcount,
+        InstrumentMcountOpts,
+        InstrumentXRay,
+        LanguageIdentifier,
         LinkerPluginLto,
+        LocationDetail,
+        LtoCli,
+        MergeFunctions,
+        MirStripDebugInfo,
+        NativeLib,
+        NextSolverConfig,
+        NonZero<usize>,
+        Offload,
+        OnBrokenPipe,
+        OptLevel,
+        OutFileName,
+        OutputType,
+        PanicStrategy,
+        PatchableFunctionEntry,
+        PointerAuthOption,
+        Polonius,
+        RelocModel,
+        RelroLevel,
+        RemapPathScopeComponents,
         ResolveDocLinks,
+        RustcVersion,
+        SanitizerSet,
+        SourceFileHashAlgorithm,
         SplitDebuginfo,
         SplitDwarfKind,
         StackProtector,
+        String,
         SwitchWithOptPath,
         SymbolManglingVersion,
         SymbolVisibility,
-        RemapPathScopeComponents,
-        SourceFileHashAlgorithm,
-        OutFileName,
-        OutputType,
-        RealFileName,
-        LocationDetail,
-        FmtDebug,
-        BranchProtection,
-        LanguageIdentifier,
-        NextSolverConfig,
-        PatchableFunctionEntry,
-        Polonius,
-        InliningThreshold,
-        FunctionReturn,
-        Align,
-        CodegenRetagOptions,
-        RustcVersion,
+        TargetTuple,
+        TlsModel,
+        // Trust: dep-tracking hashes for the Trust option enums (kept beside
+        // the upstream-sorted run; alphabetical position after TlsModel).
+        TrustDump,
+        TrustIrLower,
+        TrustPlatformProperties,
+        TrustPlatformReport,
+        TrustPlatformUnanalysed,
+        TrustPolicy,
+        TrustSpawnCensusShadow,
+        TrustVerify,
+        TrustWitness,
+        UnstableFeatures,
+        WasiExecModel,
+        bool,
+        lint::Level,
+        u32,
+        u64,
+        usize,
+        // tidy-alphabetical-end
     );
 
     impl<T1, T2> DepTrackingHash for (T1, T2)
@@ -4047,6 +4638,28 @@ pub(crate) mod dep_tracking {
         }
     }
 
+    impl DepTrackingHash for PathBuf {
+        fn hash(
+            &self,
+            hasher: &mut StableHasher,
+            _error_format: ErrorOutputType,
+            _for_crate_hash: bool,
+        ) {
+            self.stable_hash(&mut DummyStableHashCtxt, hasher);
+        }
+    }
+
+    impl DepTrackingHash for RealFileName {
+        fn hash(
+            &self,
+            hasher: &mut StableHasher,
+            _error_format: ErrorOutputType,
+            _for_crate_hash: bool,
+        ) {
+            self.stable_hash(&mut DummyStableHashCtxt, hasher);
+        }
+    }
+
     // This is a stable hash because BTreeMap is a sorted container
     pub(crate) fn stable_hash(
         sub_hashes: BTreeMap<&'static str, &dyn DepTrackingHash>,
@@ -4132,10 +4745,9 @@ impl PatchableFunctionEntry {
 
 /// `-Zpolonius` values, enabling the borrow checker polonius analysis, and which version: legacy,
 /// or future prototype.
-#[derive(Clone, Copy, PartialEq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
 pub enum Polonius {
-    /// The default value: disabled.
-    #[default]
+    /// Polonius is disabled, only use NLL.
     Off,
 
     /// Legacy version, using datalog and the `polonius-engine` crate. Historical value for `-Zpolonius`.
@@ -4145,7 +4757,16 @@ pub enum Polonius {
     Next,
 }
 
+impl Default for Polonius {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl Polonius {
+    pub(crate) const DEFAULT: Self =
+        if option_env!("CFG_DEFAULT_POLONIUS_NEXT").is_some() { Self::Next } else { Self::Off };
+
     /// Returns whether the legacy version of polonius is enabled
     pub fn is_legacy_enabled(&self) -> bool {
         matches!(self, Polonius::Legacy)

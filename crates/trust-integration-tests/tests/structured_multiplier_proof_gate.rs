@@ -25,33 +25,31 @@
 //! [VALIDATED] (the `MAX_RECHECKABLE_MUL_WIDTH` guard in `verify_output` holds).
 //! See the proof-rung report for the precise wiring residual.
 //!
-//! Opt-in: skips with a notice when no `clean` checker is discoverable.
+//! This is the BINARY half. The same headline theorems
+//! (`clean_proof_obligations::G16_HEADLINE_THEOREMS`) are required IN PROCESS
+//! by `trust_integration_tests::clean_proof_obligations`, as real theorems of
+//! the file with a certified (foundational-only) closure, through the Clean
+//! kernel linked into this crate; nothing there is discovered and nothing
+//! skips. This file checks that a `clean` built from the pinned
+//! `first-party/clean` agrees. It is `#[ignore]`d and runs only under
+//! `slow.clean-binary-proof-gates`, which builds that `clean` and names it in
+//! `TRUST_CLEAN_BIN`; selected without it, it panics with the build recipe.
 
-use std::path::Path;
 use std::process::Command;
 
-use trust_integration_tests::clean_test_support::clean_checker_path;
-
-/// The headline theorems that MUST be present, real Theorems, and axiom-free.
-const REQUIRED_FOUNDATIONAL_THEOREMS: &[&str] =
-    &["G16Mul.mul_equiv", "G16Mul.addval", "G16Mul.addval_step", "G16Mul.mul_distinct"];
+use trust_integration_tests::clean_proof_obligations::{
+    G16_HEADLINE_THEOREMS, G16_MULTIPLIER_PROOF, repo_path,
+};
+use trust_integration_tests::clean_test_support::require_clean_bin;
 
 #[test]
+#[ignore = "needs TRUST_CLEAN_BIN (slow.clean-binary-proof-gates)"]
 fn structured_multiplier_proof_gate() {
-    let proof = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../proofs/codegen-equivalence/g16_multiplier_equivalence.lean")
+    let proof = repo_path(G16_MULTIPLIER_PROOF)
         .canonicalize()
         .expect("g16_multiplier_equivalence.lean must exist");
 
-    let Some(bin) = clean_checker_path() else {
-        eprintln!(
-            "NOTICE: no `clean` checker discoverable — skipping the structured-multiplier-proof \
-             gate. Proof at {}.",
-            proof.display()
-        );
-        return;
-    };
-    eprintln!("clean checker: {}", bin.display());
+    let bin = require_clean_bin();
 
     // (1) The whole file kernel-checks with ZERO sorry-axioms.
     let check = Command::new(&bin)
@@ -110,7 +108,7 @@ fn structured_multiplier_proof_gate() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect::<Vec<_>>();
-    for needed in REQUIRED_FOUNDATIONAL_THEOREMS {
+    for needed in G16_HEADLINE_THEOREMS {
         assert!(
             exported.contains(needed),
             "headline theorem {needed} must export with a FOUNDATIONAL-only axiom closure; \
@@ -122,7 +120,7 @@ fn structured_multiplier_proof_gate() {
         "STRUCTURED-MULTIPLIER-PROOF GATE GREEN: g16_multiplier_equivalence.lean kernel-checks \
          (0 sorry-axioms) and {} headline theorems (incl. mul_equiv, addval) are REAL Theorems \
          with axiom closure ⊆ FOUNDATIONAL ({})",
-        REQUIRED_FOUNDATIONAL_THEOREMS.len(),
+        G16_HEADLINE_THEOREMS.len(),
         bin.display()
     );
 }

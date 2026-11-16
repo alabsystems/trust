@@ -8,6 +8,14 @@ LL | |         Nat.le (UInt64.toNat d) (UInt64.toNat d) :=
 LL | |         fun d k => Nat.le.refl (UInt64.toNat d)
    | |_______________________________________________^
 
+note: island definition `ident_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_field_projection_discharge::degree_of`
+  --> $DIR/e9_field_projection_discharge.rs:51:13
+   |
+LL |     ensures result == ident_isl(c.degree)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
 
 === Trust Verification Report (e9_field_projection_discharge) ===
 
@@ -22,6 +30,14 @@ LL | | }
    | |_^
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `ident_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_field_projection_discharge::coeff_of`
+  --> $DIR/e9_field_projection_discharge.rs:59:13
+   |
+LL |     ensures result == ident_isl(c.coeff)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
 
 note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e9_field_projection_discharge.rs:58:1
@@ -47,6 +63,14 @@ LL | | }
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
+note: island definition `ident_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_field_projection_discharge::second_degree`
+  --> $DIR/e9_field_projection_discharge.rs:88:13
+   |
+LL |     ensures result == ident_isl(b.degree)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
 note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e9_field_projection_discharge.rs:87:1
    |
@@ -65,5 +89,5 @@ note: citation `degree_le_self` kernel-discharges this postcondition statement: 
 LL |     ensures result <= c.degree by degree_le_self
    |                                   ^^^^^^^^^^^^^^
    |
-   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
 

@@ -225,3 +225,50 @@ fn identical_formulas_always_match() {
         assert!(parsed_clause_matches_typed(&f, &f), "{f:?} must match itself");
     }
 }
+
+// ─────────── float `==` is IEEE `FpEq` once typed (SPEC-FLOAT-EQ-STRUCTURAL-1) ───────────
+
+/// `requires x == y` over two f64 parameters: the parser has no signature and
+/// spells it `Eq` over its `Int` sentinel; the typed lowering is `FpEq` over the
+/// float sorts. It is the same clause and must be recognized as such — a miss
+/// appends a second, ill-sorted copy of the clause (the defect this file pins).
+#[test]
+fn reparsed_float_parameter_equality_matches_its_fp_eq_lowering() {
+    let f64s = Sort::Float { eb: 11, sb: 53 };
+    let parsed = trust_types::parse_spec_expr("x == y").expect("must parse");
+    assert_eq!(parsed, eq(v("x", Sort::Int), v("y", Sort::Int)), "parser sentinel changed");
+    let typed = Formula::FpEq(Box::new(v("x", f64s.clone())), Box::new(v("y", f64s)));
+    assert!(parsed_clause_matches_typed(&parsed, &typed));
+    // `!=` is the negation of the same equality.
+    let parsed = trust_types::parse_spec_expr("x != y").expect("must parse");
+    assert!(parsed_clause_matches_typed(&parsed, &not(typed)));
+}
+
+/// A float literal fixes the sort at parse time, so the parser itself spells the
+/// clause `FpEq` and it matches its typed lowering exactly.
+#[test]
+fn reparsed_float_literal_equality_matches_exactly() {
+    let f64s = Sort::Float { eb: 11, sb: 53 };
+    let parsed = trust_types::parse_spec_expr("x == 1.0").expect("must parse");
+    let one = Formula::FpConst { bits: u128::from(1.0_f64.to_bits()), eb: 11, sb: 53 };
+    let typed = Formula::FpEq(Box::new(v("x", f64s)), Box::new(one));
+    assert_eq!(parsed, typed);
+    assert!(parsed_clause_matches_typed(&parsed, &typed));
+}
+
+/// The relaxation is one-directional and operand-exact: a typed STRUCTURAL `Eq`
+/// is never the lowering of a parsed `FpEq`, and a different operand is still a
+/// different clause.
+#[test]
+fn fp_eq_relaxation_refuses_the_reverse_and_other_operands() {
+    let f64s = Sort::Float { eb: 11, sb: 53 };
+    let fp_eq = |a: &str, b: &str| {
+        Formula::FpEq(Box::new(v(a, f64s.clone())), Box::new(v(b, f64s.clone())))
+    };
+    let parsed_fp = fp_eq("x", "y");
+    let typed_structural = eq(v("x", f64s.clone()), v("y", f64s.clone()));
+    assert!(!parsed_clause_matches_typed(&parsed_fp, &typed_structural));
+    let parsed = trust_types::parse_spec_expr("x == y").expect("must parse");
+    assert!(!parsed_clause_matches_typed(&parsed, &fp_eq("x", "z")));
+    assert!(!parsed_clause_matches_typed(&parsed, &fp_eq("y", "x")));
+}

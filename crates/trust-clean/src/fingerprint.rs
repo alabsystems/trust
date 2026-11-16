@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 use trust_types::VerificationCondition;
 
-use crate::canonical::canonical_vc_bytes;
+use crate::canonical::with_canonical_vc_bytes;
 
 /// A 128-bit fingerprint of a verification condition's logical content.
 ///
@@ -61,8 +61,12 @@ impl Fingerprint {
     /// Reconstruct from a 16-byte array (big-endian).
     #[must_use]
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let hi = u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let lo = u64::from_be_bytes(bytes[8..].try_into().expect("8 bytes"));
+        let hi = u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let lo = u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
         Fingerprint { hi, lo }
     }
 }
@@ -93,8 +97,7 @@ impl fmt::Display for Fingerprint {
 /// collision resistance sufficient for VC identity tracking.
 #[must_use]
 pub fn compute_vc_fingerprint(vc: &VerificationCondition) -> Fingerprint {
-    let canonical = canonical_vc_bytes(vc);
-    fingerprint_bytes(&canonical)
+    with_canonical_vc_bytes(vc, fingerprint_bytes)
 }
 
 /// Compute a fingerprint directly from canonical bytes.

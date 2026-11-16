@@ -1,0 +1,1589 @@
+{
+ "steps": 200000,
+ "fuel": 2000,
+ "bound": 65536,
+ "theorems": [
+  {
+   "n": 0,
+   "test": "tests::abort::abort",
+   "record": 0,
+   "expect": {
+    "kind": "abort",
+    "msg": null
+   },
+   "reference_result": "Abort",
+   "theorem": "k8t_0"
+  },
+  {
+   "n": 1,
+   "test": "tests::align::addr_of_misaligned_ptr",
+   "record": 1,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_1"
+  },
+  {
+   "n": 2,
+   "test": "tests::align::addr_of_misaligned_ref",
+   "record": 2,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: unaligned safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: unaligned safe pointer"
+   },
+   "theorem": "k8t_2"
+  },
+  {
+   "n": 3,
+   "test": "tests::align::deref_misaligned_ref",
+   "record": 3,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: unaligned safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: unaligned safe pointer"
+   },
+   "theorem": "k8t_3"
+  },
+  {
+   "n": 4,
+   "test": "tests::align::deref_overaligned",
+   "record": 4,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_4"
+  },
+  {
+   "n": 5,
+   "test": "tests::assume::assume_false",
+   "record": 8,
+   "expect": {
+    "kind": "ub",
+    "msg": "`Assume` intrinsic called on condition that is violated"
+   },
+   "reference_result": {
+    "Ub": "`Assume` intrinsic called on condition that is violated"
+   },
+   "theorem": "k8t_5"
+  },
+  {
+   "n": 6,
+   "test": "tests::assume::assume_true",
+   "record": 9,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_6"
+  },
+  {
+   "n": 7,
+   "test": "tests::assume::assume_wrong_argnum",
+   "record": 10,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid number of arguments for `Assume` intrinsic"
+   },
+   "reference_result": {
+    "Ub": "invalid number of arguments for `Assume` intrinsic"
+   },
+   "theorem": "k8t_7"
+  },
+  {
+   "n": 8,
+   "test": "tests::assume::assume_wrong_argty",
+   "record": 11,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid argument for `Assume` intrinsic: not a Boolean"
+   },
+   "reference_result": {
+    "Ub": "invalid argument for `Assume` intrinsic: not a Boolean"
+   },
+   "theorem": "k8t_8"
+  },
+  {
+   "n": 9,
+   "test": "tests::blocks::call_next_block_non_exist",
+   "record": 30,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Terminator: next block does not exist"
+   },
+   "reference_result": {
+    "IllFormed": "Terminator: next block does not exist"
+   },
+   "theorem": "k8t_9"
+  },
+  {
+   "n": 10,
+   "test": "tests::blocks::call_unwindblock_wrong_kind",
+   "record": 32,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Terminator: unwind block has the wrong block kind"
+   },
+   "reference_result": {
+    "IllFormed": "Terminator: unwind block has the wrong block kind"
+   },
+   "theorem": "k8t_10"
+  },
+  {
+   "n": 11,
+   "test": "tests::blocks::unwind_block_non_exist",
+   "record": 42,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Terminator: unwind block does not exist"
+   },
+   "reference_result": {
+    "IllFormed": "Terminator: unwind block does not exist"
+   },
+   "theorem": "k8t_11"
+  },
+  {
+   "n": 12,
+   "test": "tests::bool::bit_and_bool_works",
+   "record": 44,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_12"
+  },
+  {
+   "n": 13,
+   "test": "tests::bool::bool_or_works",
+   "record": 45,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_13"
+  },
+  {
+   "n": 14,
+   "test": "tests::bool::bool_xor_works",
+   "record": 46,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_14"
+  },
+  {
+   "n": 15,
+   "test": "tests::bool::false_to_int_works",
+   "record": 47,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_15"
+  },
+  {
+   "n": 16,
+   "test": "tests::bool::not_works_both_ways",
+   "record": 48,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_16"
+  },
+  {
+   "n": 17,
+   "test": "tests::bool::true_to_int_works",
+   "record": 49,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_17"
+  },
+  {
+   "n": 18,
+   "test": "tests::builder_api::arg_and_ret_var",
+   "record": 50,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_18"
+  },
+  {
+   "n": 19,
+   "test": "tests::builder_api::global_var",
+   "record": 51,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_19"
+  },
+  {
+   "n": 20,
+   "test": "tests::builder_api::local_var",
+   "record": 52,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_20"
+  },
+  {
+   "n": 21,
+   "test": "tests::builder_api::switch_int",
+   "record": 53,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_21"
+  },
+  {
+   "n": 22,
+   "test": "tests::builder_api::while_",
+   "record": 54,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_22"
+  },
+  {
+   "n": 23,
+   "test": "tests::call::call_arg_abi",
+   "record": 55,
+   "expect": {
+    "kind": "ub",
+    "msg": "call ABI violation: argument types are not compatible"
+   },
+   "reference_result": {
+    "Ub": "call ABI violation: argument types are not compatible"
+   },
+   "theorem": "k8t_23"
+  },
+  {
+   "n": 24,
+   "test": "tests::call::call_arg_count",
+   "record": 56,
+   "expect": {
+    "kind": "ub",
+    "msg": "call ABI violation: number of arguments does not agree"
+   },
+   "reference_result": {
+    "Ub": "call ABI violation: number of arguments does not agree"
+   },
+   "theorem": "k8t_24"
+  },
+  {
+   "n": 25,
+   "test": "tests::call::call_non_exist",
+   "record": 57,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Constant::FnPointer: invalid function name"
+   },
+   "reference_result": {
+    "IllFormed": "Constant::FnPointer: invalid function name"
+   },
+   "theorem": "k8t_25"
+  },
+  {
+   "n": 26,
+   "test": "tests::call::call_ret_abi",
+   "record": 58,
+   "expect": {
+    "kind": "ub",
+    "msg": "call ABI violation: return types are not compatible"
+   },
+   "reference_result": {
+    "Ub": "call ABI violation: return types are not compatible"
+   },
+   "theorem": "k8t_26"
+  },
+  {
+   "n": 27,
+   "test": "tests::call::call_success",
+   "record": 59,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_27"
+  },
+  {
+   "n": 28,
+   "test": "tests::call::ret_mismatch",
+   "record": 60,
+   "expect": {
+    "kind": "ub",
+    "msg": "call ABI violation: return types are not compatible"
+   },
+   "reference_result": {
+    "Ub": "call ABI violation: return types are not compatible"
+   },
+   "theorem": "k8t_28"
+  },
+  {
+   "n": 29,
+   "test": "tests::dereferenceable::assign_dangling_ref",
+   "record": 287,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "theorem": "k8t_29"
+  },
+  {
+   "n": 30,
+   "test": "tests::dereferenceable::deref_dangling_ptr",
+   "record": 288,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_30"
+  },
+  {
+   "n": 31,
+   "test": "tests::dereferenceable::deref_dangling_ref",
+   "record": 289,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "theorem": "k8t_31"
+  },
+  {
+   "n": 32,
+   "test": "tests::dereferenceable::ref_dangling_ptr",
+   "record": 290,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "theorem": "k8t_32"
+  },
+  {
+   "n": 33,
+   "test": "tests::dereferenceable::validate_dangling_ref",
+   "record": 291,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "theorem": "k8t_33"
+  },
+  {
+   "n": 34,
+   "test": "tests::expose::pointer_works",
+   "record": 321,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_34"
+  },
+  {
+   "n": 35,
+   "test": "tests::expose::requires_pointer",
+   "record": 322,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer"
+   },
+   "reference_result": {
+    "Ub": "invalid argument for `PointerExposeProvenance` intrinsic: not a thin pointer"
+   },
+   "theorem": "k8t_35"
+  },
+  {
+   "n": 36,
+   "test": "tests::heap_intrinsics::alloc_align_err",
+   "record": 323,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid alignment for `Allocate` intrinsic: not a power of 2"
+   },
+   "reference_result": {
+    "Ub": "invalid alignment for `Allocate` intrinsic: not a power of 2"
+   },
+   "theorem": "k8t_36"
+  },
+  {
+   "n": 37,
+   "test": "tests::heap_intrinsics::alloc_argcount",
+   "record": 324,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid number of arguments for `Allocate` intrinsic"
+   },
+   "reference_result": {
+    "Ub": "invalid number of arguments for `Allocate` intrinsic"
+   },
+   "theorem": "k8t_37"
+  },
+  {
+   "n": 38,
+   "test": "tests::heap_intrinsics::alloc_size_err",
+   "record": 325,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid size for `Allocate` intrinsic: negative size"
+   },
+   "reference_result": {
+    "Ub": "invalid size for `Allocate` intrinsic: negative size"
+   },
+   "theorem": "k8t_38"
+  },
+  {
+   "n": 39,
+   "test": "tests::heap_intrinsics::alloc_wrongarg1",
+   "record": 326,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid first argument to `Allocate` intrinsic: not an integer"
+   },
+   "reference_result": {
+    "Ub": "invalid first argument to `Allocate` intrinsic: not an integer"
+   },
+   "theorem": "k8t_39"
+  },
+  {
+   "n": 40,
+   "test": "tests::heap_intrinsics::alloc_wrongarg2",
+   "record": 327,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid second argument to `Allocate` intrinsic: not an integer"
+   },
+   "reference_result": {
+    "Ub": "invalid second argument to `Allocate` intrinsic: not an integer"
+   },
+   "theorem": "k8t_40"
+  },
+  {
+   "n": 41,
+   "test": "tests::heap_intrinsics::alloc_wrongreturn",
+   "record": 328,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid return type for `Allocate` intrinsic"
+   },
+   "reference_result": {
+    "Ub": "invalid return type for `Allocate` intrinsic"
+   },
+   "theorem": "k8t_41"
+  },
+  {
+   "n": 42,
+   "test": "tests::heap_intrinsics::dealloc_align_err",
+   "record": 329,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid alignment for `Deallocate` intrinsic: not a power of 2"
+   },
+   "reference_result": {
+    "Ub": "invalid alignment for `Deallocate` intrinsic: not a power of 2"
+   },
+   "theorem": "k8t_42"
+  },
+  {
+   "n": 43,
+   "test": "tests::heap_intrinsics::dealloc_argcount",
+   "record": 330,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid number of arguments for `Deallocate` intrinsic"
+   },
+   "reference_result": {
+    "Ub": "invalid number of arguments for `Deallocate` intrinsic"
+   },
+   "theorem": "k8t_43"
+  },
+  {
+   "n": 44,
+   "test": "tests::heap_intrinsics::dealloc_size_err",
+   "record": 331,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid size for `Deallocate` intrinsic: negative size"
+   },
+   "reference_result": {
+    "Ub": "invalid size for `Deallocate` intrinsic: negative size"
+   },
+   "theorem": "k8t_44"
+  },
+  {
+   "n": 45,
+   "test": "tests::heap_intrinsics::dealloc_success",
+   "record": 332,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_45"
+  },
+  {
+   "n": 46,
+   "test": "tests::heap_intrinsics::dealloc_wrongarg1",
+   "record": 333,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid first argument to `Deallocate` intrinsic: not a thin pointer"
+   },
+   "reference_result": {
+    "Ub": "invalid first argument to `Deallocate` intrinsic: not a thin pointer"
+   },
+   "theorem": "k8t_46"
+  },
+  {
+   "n": 47,
+   "test": "tests::heap_intrinsics::dealloc_wrongarg2",
+   "record": 334,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid second argument to `Deallocate` intrinsic: not an integer"
+   },
+   "reference_result": {
+    "Ub": "invalid second argument to `Deallocate` intrinsic: not an integer"
+   },
+   "theorem": "k8t_47"
+  },
+  {
+   "n": 48,
+   "test": "tests::heap_intrinsics::dealloc_wrongarg3",
+   "record": 335,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid third argument to `Deallocate` intrinsic: not an integer"
+   },
+   "reference_result": {
+    "Ub": "invalid third argument to `Deallocate` intrinsic: not an integer"
+   },
+   "theorem": "k8t_48"
+  },
+  {
+   "n": 49,
+   "test": "tests::heap_intrinsics::dealloc_wrongreturn",
+   "record": 336,
+   "expect": {
+    "kind": "ub",
+    "msg": "invalid return type for `Deallocate` intrinsic"
+   },
+   "reference_result": {
+    "Ub": "invalid return type for `Deallocate` intrinsic"
+   },
+   "theorem": "k8t_49"
+  },
+  {
+   "n": 50,
+   "test": "tests::heap_intrinsics::double_free",
+   "record": 337,
+   "expect": {
+    "kind": "ub",
+    "msg": "double-free"
+   },
+   "reference_result": {
+    "Ub": "double-free"
+   },
+   "theorem": "k8t_50"
+  },
+  {
+   "n": 51,
+   "test": "tests::heap_intrinsics::dynamic_memory",
+   "record": 338,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_51"
+  },
+  {
+   "n": 52,
+   "test": "tests::heap_intrinsics::mem_dealloc_not_beginning",
+   "record": 340,
+   "expect": {
+    "kind": "ub",
+    "msg": "deallocating with pointer not to the beginning of its allocation"
+   },
+   "reference_result": {
+    "Ub": "deallocating with pointer not to the beginning of its allocation"
+   },
+   "theorem": "k8t_52"
+  },
+  {
+   "n": 53,
+   "test": "tests::heap_intrinsics::mem_dealloc_stack",
+   "record": 341,
+   "expect": {
+    "kind": "ub",
+    "msg": "deallocating Stack memory with Heap deallocation operation"
+   },
+   "reference_result": {
+    "Ub": "deallocating Stack memory with Heap deallocation operation"
+   },
+   "theorem": "k8t_53"
+  },
+  {
+   "n": 54,
+   "test": "tests::heap_intrinsics::mem_dealloc_wrong_align",
+   "record": 342,
+   "expect": {
+    "kind": "ub",
+    "msg": "deallocating with incorrect alignment information"
+   },
+   "reference_result": {
+    "Ub": "deallocating with incorrect alignment information"
+   },
+   "theorem": "k8t_54"
+  },
+  {
+   "n": 55,
+   "test": "tests::heap_intrinsics::mem_dealloc_wrong_size",
+   "record": 343,
+   "expect": {
+    "kind": "ub",
+    "msg": "deallocating with incorrect size information"
+   },
+   "reference_result": {
+    "Ub": "deallocating with incorrect size information"
+   },
+   "theorem": "k8t_55"
+  },
+  {
+   "n": 56,
+   "test": "tests::heap_intrinsics::memory_leak",
+   "record": 344,
+   "expect": {
+    "kind": "memory_leak",
+    "msg": null
+   },
+   "reference_result": "MemoryLeak",
+   "theorem": "k8t_56"
+  },
+  {
+   "n": 57,
+   "test": "tests::heap_intrinsics::use_after_free",
+   "record": 345,
+   "expect": {
+    "kind": "ub",
+    "msg": "dereferencing pointer to dead allocation"
+   },
+   "reference_result": {
+    "Ub": "dereferencing pointer to dead allocation"
+   },
+   "theorem": "k8t_57"
+  },
+  {
+   "n": 58,
+   "test": "tests::ill_formed::no_main",
+   "record": 347,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Program: start function does not exist"
+   },
+   "reference_result": {
+    "IllFormed": "Program: start function does not exist"
+   },
+   "theorem": "k8t_58"
+  },
+  {
+   "n": 59,
+   "test": "tests::ill_formed::type_mismatch",
+   "record": 349,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Statement::Assign: destination and source type differ"
+   },
+   "reference_result": {
+    "IllFormed": "Statement::Assign: destination and source type differ"
+   },
+   "theorem": "k8t_59"
+  },
+  {
+   "n": 60,
+   "test": "tests::int::arith_works",
+   "record": 350,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_60"
+  },
+  {
+   "n": 61,
+   "test": "tests::int::bit_and_int_works",
+   "record": 351,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_61"
+  },
+  {
+   "n": 62,
+   "test": "tests::int::bit_and_no_int_bool_mixing",
+   "record": 352,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "BinOp::Int: invalid left type"
+   },
+   "reference_result": {
+    "IllFormed": "BinOp::Int: invalid left type"
+   },
+   "theorem": "k8t_62"
+  },
+  {
+   "n": 63,
+   "test": "tests::int::bit_int_not_works",
+   "record": 354,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_63"
+  },
+  {
+   "n": 64,
+   "test": "tests::int::bit_or_int_works",
+   "record": 355,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_64"
+  },
+  {
+   "n": 65,
+   "test": "tests::int::bit_xor_int_works",
+   "record": 356,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_65"
+  },
+  {
+   "n": 66,
+   "test": "tests::int::cmp_ill_formed_left",
+   "record": 357,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "BinOp::Rel: invalid left type"
+   },
+   "reference_result": {
+    "IllFormed": "BinOp::Rel: invalid left type"
+   },
+   "theorem": "k8t_66"
+  },
+  {
+   "n": 67,
+   "test": "tests::int::cmp_ill_formed_right",
+   "record": 358,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "BinOp::Rel: invalid right type"
+   },
+   "reference_result": {
+    "IllFormed": "BinOp::Rel: invalid right type"
+   },
+   "theorem": "k8t_67"
+  },
+  {
+   "n": 68,
+   "test": "tests::int::cmp_works",
+   "record": 359,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_68"
+  },
+  {
+   "n": 69,
+   "test": "tests::int::count_ones_works",
+   "record": 360,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_69"
+  },
+  {
+   "n": 70,
+   "test": "tests::int::div_exact_arith",
+   "record": 361,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_70"
+  },
+  {
+   "n": 71,
+   "test": "tests::int::div_exact_remainder",
+   "record": 362,
+   "expect": {
+    "kind": "ub",
+    "msg": "non-zero remainder in exact division"
+   },
+   "reference_result": {
+    "Ub": "non-zero remainder in exact division"
+   },
+   "theorem": "k8t_71"
+  },
+  {
+   "n": 72,
+   "test": "tests::int::div_overflow",
+   "record": 363,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in division"
+   },
+   "reference_result": {
+    "Ub": "overflow in division"
+   },
+   "theorem": "k8t_72"
+  },
+  {
+   "n": 73,
+   "test": "tests::int::div_zero",
+   "record": 364,
+   "expect": {
+    "kind": "ub",
+    "msg": "division by zero"
+   },
+   "reference_result": {
+    "Ub": "division by zero"
+   },
+   "theorem": "k8t_73"
+  },
+  {
+   "n": 74,
+   "test": "tests::int::overflow_add_works",
+   "record": 365,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_74"
+  },
+  {
+   "n": 75,
+   "test": "tests::int::overflow_ill_formed_left",
+   "record": 366,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "BinOp::IntWithOverflow: invalid left type"
+   },
+   "reference_result": {
+    "IllFormed": "BinOp::IntWithOverflow: invalid left type"
+   },
+   "theorem": "k8t_75"
+  },
+  {
+   "n": 76,
+   "test": "tests::int::overflow_ill_formed_right",
+   "record": 367,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "BinOp::IntWithOverflow: invalid right type"
+   },
+   "reference_result": {
+    "IllFormed": "BinOp::IntWithOverflow: invalid right type"
+   },
+   "theorem": "k8t_76"
+  },
+  {
+   "n": 77,
+   "test": "tests::int::overflow_mul_works",
+   "record": 368,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_77"
+  },
+  {
+   "n": 78,
+   "test": "tests::int::overflow_sub_works",
+   "record": 369,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_78"
+  },
+  {
+   "n": 79,
+   "test": "tests::int::rem_overflow",
+   "record": 370,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in remainder"
+   },
+   "reference_result": {
+    "Ub": "overflow in remainder"
+   },
+   "theorem": "k8t_79"
+  },
+  {
+   "n": 80,
+   "test": "tests::int::rem_zero",
+   "record": 371,
+   "expect": {
+    "kind": "ub",
+    "msg": "modulus of remainder is zero"
+   },
+   "reference_result": {
+    "Ub": "modulus of remainder is zero"
+   },
+   "theorem": "k8t_80"
+  },
+  {
+   "n": 81,
+   "test": "tests::int::shl_works",
+   "record": 372,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_81"
+  },
+  {
+   "n": 82,
+   "test": "tests::int::shr_works",
+   "record": 373,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_82"
+  },
+  {
+   "n": 83,
+   "test": "tests::int::unchecked_add_ub",
+   "record": 374,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked add"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked add"
+   },
+   "theorem": "k8t_83"
+  },
+  {
+   "n": 84,
+   "test": "tests::int::unchecked_add_ub",
+   "record": 375,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked add"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked add"
+   },
+   "theorem": "k8t_84"
+  },
+  {
+   "n": 85,
+   "test": "tests::int::unchecked_add_works",
+   "record": 376,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_85"
+  },
+  {
+   "n": 86,
+   "test": "tests::int::unchecked_mul_ub",
+   "record": 377,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked mul"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked mul"
+   },
+   "theorem": "k8t_86"
+  },
+  {
+   "n": 87,
+   "test": "tests::int::unchecked_mul_ub",
+   "record": 378,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked mul"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked mul"
+   },
+   "theorem": "k8t_87"
+  },
+  {
+   "n": 88,
+   "test": "tests::int::unchecked_mul_works",
+   "record": 379,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_88"
+  },
+  {
+   "n": 89,
+   "test": "tests::int::unchecked_shl_ub",
+   "record": 380,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_89"
+  },
+  {
+   "n": 90,
+   "test": "tests::int::unchecked_shl_ub",
+   "record": 381,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_90"
+  },
+  {
+   "n": 91,
+   "test": "tests::int::unchecked_shl_ub",
+   "record": 382,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_91"
+  },
+  {
+   "n": 92,
+   "test": "tests::int::unchecked_shl_works",
+   "record": 383,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_92"
+  },
+  {
+   "n": 93,
+   "test": "tests::int::unchecked_shr_ub",
+   "record": 384,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_93"
+  },
+  {
+   "n": 94,
+   "test": "tests::int::unchecked_shr_ub",
+   "record": 385,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_94"
+  },
+  {
+   "n": 95,
+   "test": "tests::int::unchecked_shr_ub",
+   "record": 386,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_95"
+  },
+  {
+   "n": 96,
+   "test": "tests::int::unchecked_shr_ub",
+   "record": 387,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked shift"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked shift"
+   },
+   "theorem": "k8t_96"
+  },
+  {
+   "n": 97,
+   "test": "tests::int::unchecked_shr_works",
+   "record": 388,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_97"
+  },
+  {
+   "n": 98,
+   "test": "tests::int::unchecked_sub_ub",
+   "record": 389,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked sub"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked sub"
+   },
+   "theorem": "k8t_98"
+  },
+  {
+   "n": 99,
+   "test": "tests::int::unchecked_sub_ub",
+   "record": 390,
+   "expect": {
+    "kind": "ub",
+    "msg": "overflow in unchecked sub"
+   },
+   "reference_result": {
+    "Ub": "overflow in unchecked sub"
+   },
+   "theorem": "k8t_99"
+  },
+  {
+   "n": 100,
+   "test": "tests::int::unchecked_sub_works",
+   "record": 391,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_100"
+  },
+  {
+   "n": 101,
+   "test": "tests::locals::assign_dead",
+   "record": 392,
+   "expect": {
+    "kind": "ub",
+    "msg": "access to a dead local"
+   },
+   "reference_result": {
+    "Ub": "access to a dead local"
+   },
+   "theorem": "k8t_101"
+  },
+  {
+   "n": 102,
+   "test": "tests::locals::dead_before_live",
+   "record": 393,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_102"
+  },
+  {
+   "n": 103,
+   "test": "tests::locals::double_live",
+   "record": 394,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_103"
+  },
+  {
+   "n": 104,
+   "test": "tests::main::main_returns",
+   "record": 418,
+   "expect": {
+    "kind": "ub",
+    "msg": "the start function must not return"
+   },
+   "reference_result": {
+    "Ub": "the start function must not return"
+   },
+   "theorem": "k8t_104"
+  },
+  {
+   "n": 105,
+   "test": "tests::packed::packed_works",
+   "record": 425,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_105"
+  },
+  {
+   "n": 106,
+   "test": "tests::place_mention::place_mention_dangling_pointer",
+   "record": 426,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_106"
+  },
+  {
+   "n": 107,
+   "test": "tests::place_mention::place_mention_not_ignored",
+   "record": 427,
+   "expect": {
+    "kind": "ub",
+    "msg": "dereferencing pointer without provenance"
+   },
+   "reference_result": {
+    "Ub": "dereferencing pointer without provenance"
+   },
+   "theorem": "k8t_107"
+  },
+  {
+   "n": 108,
+   "test": "tests::ptr::pointer_partial_overwrite",
+   "record": 431,
+   "expect": {
+    "kind": "ub",
+    "msg": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "reference_result": {
+    "Ub": "Value::Ptr: non-dereferenceable safe pointer"
+   },
+   "theorem": "k8t_108"
+  },
+  {
+   "n": 109,
+   "test": "tests::ptr::pointer_rel",
+   "record": 432,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_109"
+  },
+  {
+   "n": 110,
+   "test": "tests::ptr_offset::ptr_offset_inbounds",
+   "record": 434,
+   "expect": {
+    "kind": "ub",
+    "msg": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "reference_result": {
+    "Ub": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "theorem": "k8t_110"
+  },
+  {
+   "n": 111,
+   "test": "tests::ptr_offset::ptr_offset_no_inbounds",
+   "record": 435,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_111"
+  },
+  {
+   "n": 112,
+   "test": "tests::ptr_offset::ptr_offset_out_of_bounds",
+   "record": 436,
+   "expect": {
+    "kind": "ub",
+    "msg": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "reference_result": {
+    "Ub": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "theorem": "k8t_112"
+  },
+  {
+   "n": 113,
+   "test": "tests::ptr_offset::ptr_offset_success",
+   "record": 437,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_113"
+  },
+  {
+   "n": 114,
+   "test": "tests::ptr_offset_from::inbounds_cross_alloc",
+   "record": 438,
+   "expect": {
+    "kind": "ub",
+    "msg": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "reference_result": {
+    "Ub": "dereferencing pointer outside the bounds of its allocation"
+   },
+   "theorem": "k8t_114"
+  },
+  {
+   "n": 115,
+   "test": "tests::ptr_offset_from::inbounds_cross_alloc_same_addr",
+   "record": 439,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_115"
+  },
+  {
+   "n": 116,
+   "test": "tests::ptr_offset_from::oob_success",
+   "record": 442,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_116"
+  },
+  {
+   "n": 117,
+   "test": "tests::return_::return_intrinsic_no_next",
+   "record": 450,
+   "expect": {
+    "kind": "ub",
+    "msg": "return from an intrinsic where caller did not specify next block"
+   },
+   "reference_result": {
+    "Ub": "return from an intrinsic where caller did not specify next block"
+   },
+   "theorem": "k8t_117"
+  },
+  {
+   "n": 118,
+   "test": "tests::return_::return_no_next",
+   "record": 451,
+   "expect": {
+    "kind": "ub",
+    "msg": "return from a function where caller did not specify next block"
+   },
+   "reference_result": {
+    "Ub": "return from a function where caller did not specify next block"
+   },
+   "theorem": "k8t_118"
+  },
+  {
+   "n": 119,
+   "test": "tests::return_::return_success",
+   "record": 452,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_119"
+  },
+  {
+   "n": 120,
+   "test": "tests::switch::boolean_switch_is_ill_formed",
+   "record": 480,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "Terminator::Switch: switch is not Int"
+   },
+   "reference_result": {
+    "IllFormed": "Terminator::Switch: switch is not Int"
+   },
+   "theorem": "k8t_120"
+  },
+  {
+   "n": 121,
+   "test": "tests::switch::else_works",
+   "record": 481,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_121"
+  },
+  {
+   "n": 122,
+   "test": "tests::switch::if_works",
+   "record": 482,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_122"
+  },
+  {
+   "n": 123,
+   "test": "tests::switch::switch_int_works",
+   "record": 484,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_123"
+  },
+  {
+   "n": 124,
+   "test": "tests::too_large_alloc::too_large_alloc",
+   "record": 485,
+   "expect": {
+    "kind": "ub",
+    "msg": "asking for a too large allocation"
+   },
+   "reference_result": {
+    "Ub": "asking for a too large allocation"
+   },
+   "theorem": "k8t_124"
+  },
+  {
+   "n": 125,
+   "test": "tests::uninit_read::uninit_read",
+   "record": 499,
+   "expect": {
+    "kind": "ub",
+    "msg": "load at type Bool but the data in memory violates the language invariant"
+   },
+   "reference_result": {
+    "Ub": "load at type Bool but the data in memory violates the language invariant"
+   },
+   "theorem": "k8t_125"
+  },
+  {
+   "n": 126,
+   "test": "tests::unreachable::reach_unreachable",
+   "record": 500,
+   "expect": {
+    "kind": "ub",
+    "msg": "reached unreachable code"
+   },
+   "reference_result": {
+    "Ub": "reached unreachable code"
+   },
+   "theorem": "k8t_126"
+  },
+  {
+   "n": 127,
+   "test": "tests::unsized_struct::ill_negative_field",
+   "record": 503,
+   "expect": {
+    "kind": "ill_formed",
+    "msg": "PlaceExpr::Field: invalid field"
+   },
+   "reference_result": {
+    "IllFormed": "PlaceExpr::Field: invalid field"
+   },
+   "theorem": "k8t_127"
+  },
+  {
+   "n": 128,
+   "test": "tests::zst::zst_tuple",
+   "record": 540,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_128"
+  },
+  {
+   "n": 129,
+   "test": "tests::zst::zst_tuple2",
+   "record": 541,
+   "expect": {
+    "kind": "stop",
+    "msg": null
+   },
+   "reference_result": "MachineStop",
+   "theorem": "k8t_129"
+  }
+ ]
+}

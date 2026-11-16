@@ -1,3 +1,4 @@
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-10-17; do not grow casually
 //! Repeatable upstream Rust test porting workflow.
 //!
 //! This module is the Rust implementation of the upstream test re-import,
@@ -10,9 +11,12 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,15 +29,16 @@ use crate::{
     TestExceptionKind, TestExceptionLedger, TestInventory, TestInventoryEntry, TestKind,
     TestOutcome, TestProofBundle, TestProofTotals, TestResult, TestResultReport, TestSource,
     TrustAddedTestCommand, TrustAddedTestManifest, UpstreamFixLedger, UpstreamFixStatus,
-    parse_baseline_json, parse_baseline_toml, parse_test_inventory_json,
+    ValidationFinding, parse_baseline_json, parse_baseline_toml, parse_test_inventory_json,
     parse_test_result_report_json, parse_trust_added_tests_json, parse_trust_added_tests_toml,
     parse_upstream_fixes_json, parse_upstream_fixes_toml, validate_test_exceptions_for_date,
     validate_test_proof_bundle, validate_trust_added_tests,
 };
 
 const UPSTREAM_TEST_PREFIX: &str = "tests/";
-const DEFAULT_REVIEWED_UPSTREAM_REVISION: &str =
-    "rust-lang/rust:5e91de65d75d3c849c643f5079509b9e5985a5c0";
+mod case_events;
+mod observations;
+mod ui_denominator;
 const LATEST_UPSTREAM_REVISION_REQUEST: &str = "rust-lang/rust:HEAD";
 const DEFAULT_UPSTREAM_REMOTE: &str = "https://github.com/rust-lang/rust.git";
 const PROOF_ARTIFACT_NAMES: [&str; 3] = ["inventory.json", "results.json", "proof-summary.json"];
@@ -120,6 +125,35 @@ impl ProofMode {
             Self::Auto => "auto",
             Self::Smoke => "smoke",
             Self::Full => "full",
+        }
+    }
+}
+
+/// Which test population a porting proof claims to cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofScope {
+    /// Upstream Rust tests plus the Trust-added manifest commands.
+    Combined,
+    /// The complete upstream Rust suite, with no Trust-added rows or commands.
+    UpstreamRust,
+}
+
+impl ProofScope {
+    /// Parse the explicit porting CLI proof scope.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "combined" => Some(Self::Combined),
+            "upstream-rust" => Some(Self::UpstreamRust),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::UpstreamRust => "upstream_rust",
         }
     }
 }
@@ -279,7 +313,7 @@ fn io_at(op: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -
     move |source| PortError::IoAt { path, op, source }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct GitTreeEntry {
     path: String,
     mode: String,
@@ -428,6 +462,7 @@ struct RevisionResolution {
     requested_ref: String,
     requested_qualifier: Option<String>,
     upstream_remote: String,
+    effective_fetch_url: Option<String>,
     fetch_enabled: bool,
     fetch_succeeded: Option<bool>,
     source: String,
@@ -442,6 +477,7 @@ impl RevisionResolution {
             "requested_ref": self.requested_ref,
             "requested_qualifier": self.requested_qualifier,
             "upstream_remote": self.upstream_remote,
+            "effective_fetch_url": self.effective_fetch_url,
             "fetch_enabled": self.fetch_enabled,
             "fetch_succeeded": self.fetch_succeeded,
             "source": self.source,
@@ -453,9 +489,23 @@ impl RevisionResolution {
 
 /// Run the complete upstream porting workflow.
 pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
+    run_porting_with_scope(options, ProofScope::Combined)
+}
+
+/// Run the porting workflow for an explicit proof population.
+pub fn run_porting_with_scope(
+    options: PortOptions,
+    proof_scope: ProofScope,
+) -> Result<PortRunReport, PortError> {
     if options.execute && options.scorecard_log.is_some() {
         return Err(PortError::Message(
             "--scorecard-log is log-parse mode; pass it without --execute so scorecard evidence cannot be mistaken for a fresh suite run".to_string(),
+        ));
+    }
+    if proof_scope == ProofScope::UpstreamRust && options.max_files.is_some() {
+        return Err(PortError::Message(
+            "UpstreamRust proof scope requires the entire upstream suite; omit --max-files"
+                .to_string(),
         ));
     }
     if options.max_files.is_some() && options.apply {
@@ -591,6 +641,7 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
             &local_head,
             &test_exceptions,
             &test_exception_validation_date,
+            proof_scope,
         )?;
         execution_exit_status = Some(execution.exit_status);
         execution_log_path = Some(execution.execution_log);
@@ -616,11 +667,14 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         .map(|path| root_path(&root, path))
         .unwrap_or_else(|| out_dir.join("llm-directives.md"));
     let proof_validation = proof_artifact_validation(
+        &root,
         &proof_dir,
+        &resolved,
         options.release,
         &test_exceptions,
         &test_exception_validation_date,
         options.max_files.is_some(),
+        proof_scope,
     )?;
     let proof_artifacts_complete =
         proof_validation.get("complete").and_then(Value::as_bool).unwrap_or(false);
@@ -699,8 +753,11 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
     );
     set_object_field(&mut scorecard, "execution_exit_status", json!(execution_exit_status));
     set_object_field(&mut scorecard, "execution_telemetry", execution_telemetry);
+    // Verbose terminal records can diagnose coverage but cannot authenticate execution.
+    set_object_field(&mut scorecard, "execution_authenticated", json!(false));
     set_object_field(&mut scorecard, "trust_cargo_driver", json!(cargo_driver));
     set_object_field(&mut scorecard, "proof_mode", json!(proof_mode.label()));
+    set_object_field(&mut scorecard, "proof_scope", json!(proof_scope.label()));
     set_object_field(&mut scorecard, "proof_required_for_exit", json!(proof_required));
     set_object_field(
         &mut scorecard,
@@ -754,6 +811,15 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         &missing_locally,
         patch_report.as_ref().map(|r| &r.deleted_paths).unwrap_or(&BTreeSet::new()),
     );
+    let mut validation_failures = validation_failures;
+    if options.release
+        && scorecard.get("execution_authenticated").and_then(Value::as_bool) != Some(true)
+    {
+        validation_failures.push(json!({
+            "kind": "unauthenticated-upstream-execution",
+            "message": "release compatibility requires authenticated per-case execution; terminal records are diagnostic only",
+        }));
+    }
     set_object_field(
         &mut scorecard,
         "validation_failures",
@@ -804,6 +870,7 @@ pub fn run_porting(options: PortOptions) -> Result<PortRunReport, PortError> {
         &resolved,
         &local_head,
         exit_code,
+        proof_scope,
     )?;
     write_json(&compatibility_summary_path, &serde_json::to_value(compatibility_summary)?)?;
 
@@ -842,6 +909,7 @@ fn compatibility_summary_from_porting(
     resolved_upstream_revision: &str,
     local_head: &str,
     exit_code: u8,
+    proof_scope: ProofScope,
 ) -> Result<CompatibilityResultSummary, PortError> {
     let all_compatible = compatibility_summary_is_admissible_pass(scorecard, options, exit_code);
     let observed = compatibility_summary_observed(scorecard, options, all_compatible);
@@ -878,6 +946,7 @@ fn compatibility_summary_from_porting(
     let release_facing_argv = release_facing_upstream_tests_argv(
         options,
         proof_mode,
+        proof_scope,
         &summary_out,
         &out_dir,
         &run_id,
@@ -890,9 +959,21 @@ fn compatibility_summary_from_porting(
     let mut runner_metadata = BTreeMap::new();
     runner_metadata.insert("release".to_string(), json!(options.release));
     runner_metadata.insert("execute".to_string(), json!(options.execute));
+    runner_metadata.insert(
+        "execution_authenticated".to_string(),
+        scorecard.get("execution_authenticated").cloned().unwrap_or(json!(false)),
+    );
     runner_metadata.insert("apply".to_string(), json!(options.apply));
     runner_metadata.insert("fetch".to_string(), json!(options.fetch));
     runner_metadata.insert("proof_mode".to_string(), json!(proof_mode.label()));
+    runner_metadata.insert("proof_scope".to_string(), json!(proof_scope.label()));
+    runner_metadata.insert(
+        "proof_totals".to_string(),
+        scorecard
+            .pointer("/proof_artifact_validation/summary_totals")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
     runner_metadata.insert("proof_mode_requested".to_string(), json!(options.proof_mode.label()));
     runner_metadata.insert("proof_mode_resolved".to_string(), json!(proof_mode.label()));
     runner_metadata.insert("run_id".to_string(), json!(run_id.clone()));
@@ -914,6 +995,7 @@ fn compatibility_summary_from_porting(
             "release": options.release,
             "execute": options.execute,
             "proof_mode": proof_mode.label(),
+            "proof_scope": proof_scope.label(),
             "summary_out": summary_out,
             "out_dir": out_dir,
             "run_id": run_id.clone(),
@@ -924,13 +1006,16 @@ fn compatibility_summary_from_porting(
             "host_triple": host_triple.clone(),
             "requires_release": true,
             "requires_execute": true,
+            "requires_authenticated_execution": true,
+            "execution_authenticated": scorecard.get("execution_authenticated").and_then(Value::as_bool).unwrap_or(false),
             "requires_proof_mode": "full",
             "requires_summary_out": true,
             "satisfied": options.release
                 && options.execute
                 && options.max_files.is_none()
                 && proof_mode == ProofMode::Full
-                && options.summary_out.is_some(),
+                && options.summary_out.is_some()
+                && scorecard.get("execution_authenticated").and_then(Value::as_bool) == Some(true),
         }),
     );
 
@@ -969,6 +1054,7 @@ fn compatibility_summary_from_porting(
 fn release_facing_upstream_tests_argv(
     options: &PortOptions,
     proof_mode: ProofMode,
+    proof_scope: ProofScope,
     summary_out: &str,
     out_dir: &str,
     run_id: &str,
@@ -986,6 +1072,9 @@ fn release_facing_upstream_tests_argv(
     ];
     if options.release {
         argv.push("--release".to_string());
+    }
+    if proof_scope == ProofScope::UpstreamRust {
+        argv.extend(["--proof-scope".to_string(), "upstream-rust".to_string()]);
     }
     argv.extend(["--proof-mode".to_string(), proof_mode.label().to_string()]);
     argv.push(if options.execute { "--execute" } else { "--no-execute" }.to_string());
@@ -1042,6 +1131,7 @@ fn compatibility_summary_is_admissible_pass(
     exit_code == 0
         && options.release
         && options.execute
+        && scorecard.get("execution_authenticated").and_then(Value::as_bool) == Some(true)
         && options.max_files.is_none()
         && options.proof_mode.resolved(options.max_files) == ProofMode::Full
         && scorecard_total(scorecard, "failed") == 0
@@ -1059,7 +1149,9 @@ fn repo_dirty(root: &Path) -> Result<bool, PortError> {
 }
 
 fn current_host_triple() -> Option<String> {
-    let output = Command::new("rustc").arg("-vV").output().ok()?;
+    // The Trust compiler by its own name: a bare `rustc` is the aterm reroute
+    // stub (exit 127) or a rustup shim that may resolve stock Rust.
+    let output = Command::new("trustc").arg("-vV").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1092,11 +1184,14 @@ fn run_capture(
     args: &[&str],
     check: bool,
 ) -> Result<Vec<u8>, PortError> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .output()
-        .map_err(io_at("spawn", program))?;
+    let mut command = if program == "git" {
+        git_command(root)
+    } else {
+        let mut command = Command::new(program);
+        command.current_dir(root);
+        command
+    };
+    let output = command.args(args).output().map_err(io_at("spawn", program))?;
     if check && !output.status.success() {
         return Err(PortError::CommandFailed {
             command: shell_join(
@@ -1113,19 +1208,201 @@ fn run_capture(
     Ok(output.stdout)
 }
 
+fn sanitize_git_environment(command: &mut Command) {
+    for (name, _) in env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" });
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(root);
+    sanitize_git_environment(&mut command);
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, PortError> {
     let stdout = run_capture(root, "git", args, true)?;
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 fn git_maybe(root: &Path, args: &[&str]) -> Result<(ExitStatus, String, String), PortError> {
-    let output =
-        Command::new("git").args(args).current_dir(root).output().map_err(io_at("spawn", "git"))?;
+    git_command_maybe(git_command(root), args)
+}
+
+fn git_command_maybe(
+    mut command: Command,
+    args: &[&str],
+) -> Result<(ExitStatus, String, String), PortError> {
+    let output = command.args(args).output().map_err(io_at("spawn", "git"))?;
     Ok((
         output.status,
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     ))
+}
+
+fn git_fetch_command(root: &Path, remote: &str) -> Command {
+    let mut command = git_command(root);
+    if remote.starts_with("https://") || remote.starts_with("http://") {
+        if let Some(askpass) = env::var_os("GIT_ASKPASS") {
+            command.env("GIT_ASKPASS", askpass);
+        }
+    } else if remote.starts_with("ssh://") || is_scp_style_remote(remote) {
+        for name in ["GIT_SSH_COMMAND", "GIT_SSH"] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
+    command
+}
+
+fn is_scp_style_remote(remote: &str) -> bool {
+    // Git treats a colon as SCP syntax only when it precedes every path separator.
+    !remote.starts_with('/')
+        && !remote.starts_with("./")
+        && !remote.starts_with("../")
+        && !remote.contains("://")
+        && remote.split_once(':').is_some_and(|(host, path)| {
+            !host.is_empty() && !path.is_empty() && !host.contains('/') && !host.contains('\\')
+        })
+}
+
+fn is_relative_filesystem_remote(remote: &str) -> bool {
+    if let Some(path) = remote.strip_prefix("file://") {
+        return !Path::new(path).is_absolute();
+    }
+    if remote.starts_with("file:") {
+        return true;
+    }
+    if cfg!(windows) && remote.as_bytes().get(1) == Some(&b':') {
+        return !Path::new(remote).is_absolute();
+    }
+    !Path::new(remote).is_absolute() && !remote.contains("://") && !is_scp_style_remote(remote)
+}
+
+fn is_authenticated_symbolic_remote(remote: &str) -> bool {
+    let Some(rest) = remote.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.contains(['@', '\\', '?', '#'])
+        && !remote.contains(['\r', '\n'])
+}
+
+fn checked_effective_fetch_url(root: &Path, remote: &str) -> Result<String, PortError> {
+    let effective = git(root, &["ls-remote", "--get-url", remote])?;
+    let effective = effective.trim_end_matches(['\r', '\n']);
+    if effective.is_empty() || effective.contains(['\r', '\n']) || effective != remote {
+        return Err(PortError::Message(format!(
+            "refusing upstream fetch: requested remote '{remote}' resolves to effective Git URL '{effective}'; a Git remote alias or url.*.insteadOf rewrite cannot establish requested-source provenance"
+        )));
+    }
+    Ok(effective.to_string())
+}
+
+struct IsolatedFetchRepo(PathBuf);
+
+impl IsolatedFetchRepo {
+    fn new() -> Result<Self, PortError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        let root = (0..64)
+            .find_map(|_| {
+                let nonce =
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+                let path = env::temp_dir().join(format!(
+                    "trust-upstream-fetch-{}-{nonce}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match builder.create(&path) {
+                    Ok(()) => Some(Ok(path)),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                    Err(error) => {
+                        Some(Err(PortError::IoAt { op: "create dir", path, source: error }))
+                    }
+                }
+            })
+            .ok_or_else(|| {
+                PortError::Message("could not create isolated Git fetch directory".to_string())
+            })??;
+        let repo = Self(root);
+        let template = repo.0.join("empty-template");
+        fs::create_dir(&template).map_err(io_at("create dir", &template))?;
+        let template_arg = template.to_str().ok_or_else(|| {
+            PortError::Message("isolated Git fetch template path is not UTF-8".to_string())
+        })?;
+        git(&repo.0, &["init", "-q", "--bare", "--template", template_arg])?;
+        Ok(repo)
+    }
+}
+
+impl Drop for IsolatedFetchRepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn git_object_directory(root: &Path) -> Result<PathBuf, PortError> {
+    let raw = git(root, &["rev-parse", "--git-path", "objects"])?;
+    let path = Path::new(raw.trim());
+    let path = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+    path.canonicalize().map_err(io_at("canonicalize", &path))
+}
+
+fn isolated_symbolic_fetch(
+    root: &Path,
+    remote: &str,
+    ref_name: &str,
+) -> Result<(ExitStatus, Option<String>, String), PortError> {
+    let isolated = IsolatedFetchRepo::new()?;
+    checked_effective_fetch_url(&isolated.0, remote)?;
+    let objects = git_object_directory(root)?;
+    let mut fetch = git_fetch_command(&isolated.0, remote);
+    fetch.env("GIT_OBJECT_DIRECTORY", &objects);
+    let (status, _stdout, stderr) = git_command_maybe(
+        fetch,
+        &[
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "http.sslVerify=true",
+            "fetch",
+            "--no-tags",
+            remote,
+            ref_name,
+        ],
+    )?;
+    if !status.success() {
+        return Ok((status, None, stderr));
+    }
+    let mut resolve = git_command(&isolated.0);
+    resolve.env("GIT_OBJECT_DIRECTORY", &objects);
+    let (resolve_status, resolved, resolve_stderr) =
+        git_command_maybe(resolve, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
+    if !resolve_status.success() {
+        return Err(PortError::Message(format!(
+            "isolated upstream fetch did not resolve FETCH_HEAD to a commit: {resolve_stderr}"
+        )));
+    }
+    let resolved = resolved.trim();
+    let imported = git(root, &["rev-parse", "--verify", &format!("{resolved}^{{commit}}")])?;
+    if imported.trim() != resolved {
+        return Err(PortError::Message(format!(
+            "isolated upstream fetch commit '{resolved}' is not present in the target object store"
+        )));
+    }
+    Ok((status, Some(resolved.to_string()), stderr))
 }
 
 fn revision_ref(spec: &str) -> &str {
@@ -1154,19 +1431,45 @@ fn resolve_revision_report(
     let ref_name = revision_ref(spec);
     let qualified = is_remote_qualified_revision(spec);
     if fetch {
-        let (status, _stdout, stderr) = git_maybe(root, &["fetch", "--no-tags", remote, ref_name])?;
+        if !is_full_commit_hash(ref_name) && is_relative_filesystem_remote(remote) {
+            return Err(PortError::Message(format!(
+                "refusing symbolic upstream fetch '{spec}' from relative filesystem remote '{remote}': the caller repository and isolated fetch repository resolve it to different paths; use an absolute filesystem path or absolute file URL"
+            )));
+        }
+        if !is_full_commit_hash(ref_name) && !is_authenticated_symbolic_remote(remote) {
+            return Err(PortError::Message(format!(
+                "refusing symbolic upstream fetch '{spec}' from '{remote}': only an authenticated HTTPS remote is supported; use an exact commit for other transports"
+            )));
+        }
+        let effective_fetch_url = checked_effective_fetch_url(root, remote)?;
+        let (status, isolated_resolved, stderr) = if is_full_commit_hash(ref_name) {
+            let (status, _stdout, stderr) = git_command_maybe(
+                git_fetch_command(root, remote),
+                &["-c", "http.followRedirects=false", "fetch", "--no-tags", remote, ref_name],
+            )?;
+            (status, None, stderr)
+        } else {
+            isolated_symbolic_fetch(root, remote, ref_name)?
+        };
         if status.success() {
-            let resolved =
-                git(root, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?.trim().to_string();
+            let resolved = match isolated_resolved {
+                Some(resolved) => resolved,
+                None => {
+                    git(root, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?.trim().to_string()
+                }
+            };
             return Ok(RevisionResolution {
                 requested_revision: spec.to_string(),
                 requested_ref: ref_name.to_string(),
                 requested_qualifier: revision_qualifier(spec).map(str::to_string),
                 upstream_remote: remote.to_string(),
+                effective_fetch_url: Some(effective_fetch_url.clone()),
                 fetch_enabled: true,
                 fetch_succeeded: Some(true),
                 source: "remote-fetch".to_string(),
-                source_detail: format!("fetched ref '{ref_name}' from {remote}"),
+                source_detail: format!(
+                    "fetched ref '{ref_name}' from effective Git URL '{effective_fetch_url}'"
+                ),
                 resolved_revision: resolved,
             });
         }
@@ -1180,6 +1483,7 @@ fn resolve_revision_report(
                 requested_ref: ref_name.to_string(),
                 requested_qualifier: revision_qualifier(spec).map(str::to_string),
                 upstream_remote: remote.to_string(),
+                effective_fetch_url: Some(effective_fetch_url),
                 fetch_enabled: true,
                 fetch_succeeded: Some(false),
                 source: "local-fallback-after-fetch-failure".to_string(),
@@ -1209,6 +1513,7 @@ fn resolve_revision_report(
         requested_ref: ref_name.to_string(),
         requested_qualifier: revision_qualifier(spec).map(str::to_string),
         upstream_remote: remote.to_string(),
+        effective_fetch_url: None,
         fetch_enabled: false,
         fetch_succeeded: None,
         source: "local-ref-no-fetch".to_string(),
@@ -1269,9 +1574,8 @@ fn export_overlay(
     fs::create_dir_all(destination).map_err(io_at("create dir", destination))?;
 
     if max_files.is_none() {
-        let mut archive = Command::new("git")
+        let mut archive = git_command(root)
             .args(["archive", "--format=tar", revision, "tests"])
-            .current_dir(root)
             .stdout(Stdio::piped())
             .spawn()
             .map_err(io_at("spawn", "git"))?;
@@ -1301,10 +1605,9 @@ fn export_overlay(
         if max_files.is_some_and(|limit| exported.len() >= limit) {
             break;
         }
-        let output = Command::new("git")
+        let output = git_command(root)
             .arg("show")
             .arg(format!("{revision}:{}", entry.path))
-            .current_dir(root)
             .output()
             .map_err(io_at("spawn", "git"))?;
         if !output.status.success() {
@@ -2470,6 +2773,10 @@ fn revision_drift(
     let comparable =
         baseline.as_deref().is_some_and(|value| !value.is_empty()) && !resolved.is_empty();
     let drifted = comparable && baseline.as_deref() != Some(resolved);
+    let default_reviewed_request = comparable
+        && baseline.as_deref() == Some(requested_ref)
+        && revision_qualifier(requested_revision) == Some("rust-lang/rust")
+        && upstream_remote == DEFAULT_UPSTREAM_REMOTE;
     json!({
         "baseline_revision": baseline,
         "baseline_revision_present": baseline_revision.is_some_and(|value| !value.is_empty()),
@@ -2482,7 +2789,7 @@ fn revision_drift(
         "can_compare_to_baseline": comparable,
         "drifted_from_baseline": drifted,
         "requires_upstream_fix_review": drifted || !comparable,
-        "default_reviewed_upstream_request": requested == DEFAULT_REVIEWED_UPSTREAM_REVISION && upstream_remote == DEFAULT_UPSTREAM_REMOTE,
+        "default_reviewed_upstream_request": default_reviewed_request,
         "default_latest_upstream_request": requested == LATEST_UPSTREAM_REVISION_REQUEST && upstream_remote == DEFAULT_UPSTREAM_REMOTE,
     })
 }
@@ -2631,7 +2938,12 @@ fn prune_empty_parents(path: &Path, stop: &Path) -> Result<(), PortError> {
 }
 
 fn primary_compiletest_path(path: &str) -> Option<String> {
-    if !COMPILETEST_PREFIXES.iter().any(|prefix| path.starts_with(prefix)) {
+    // compiletest never recurses into an auxiliary directory, at any depth
+    // (src/tools/compiletest/src/lib.rs::collect_tests_from_dir). Its contents
+    // remain imported dependencies, never independently executed proof cases.
+    if path.split('/').any(|component| component == "auxiliary")
+        || !COMPILETEST_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+    {
         return None;
     }
     if path.starts_with("tests/run-make/") {
@@ -3851,18 +4163,24 @@ fn proof_accounting_status(
 }
 
 fn proof_artifact_validation(
+    root: &Path,
     proof_dir: &Path,
+    expected_upstream_revision: &str,
     release: bool,
     test_exceptions: &TestExceptionLedger,
     validation_date: &str,
     bounded_inventory: bool,
+    proof_scope: ProofScope,
 ) -> Result<Value, PortError> {
     let mut artifacts = serde_json::Map::new();
     let mut missing = Vec::<String>::new();
     let mut invalid = BTreeSet::<String>::new();
     let mut loaded = BTreeMap::<String, Value>::new();
 
-    for name in PROOF_ARTIFACT_NAMES {
+    for name in PROOF_ARTIFACT_NAMES
+        .into_iter()
+        .chain((!bounded_inventory).then_some("ui-denominator.json"))
+    {
         let path = proof_dir.join(name);
         let mut record = serde_json::Map::new();
         record.insert("path".to_string(), json!(path.to_string_lossy()));
@@ -3954,11 +4272,94 @@ fn proof_artifact_validation(
             }
         }
     });
+    if typed_inventory
+        .as_ref()
+        .is_some_and(|inventory| inventory.upstream_revision != expected_upstream_revision)
+    {
+        mark_invalid(
+            &mut artifacts,
+            &mut invalid,
+            "inventory.json",
+            "inventory upstream revision differs from the resolved upstream commit",
+        );
+    }
+    if !bounded_inventory {
+        if let (Some(inventory), Some(results)) = (&typed_inventory, &typed_results) {
+            let pristine = proof_dir.parent().map(|dir| dir.join("imported"));
+            let roster = pristine
+                .as_deref()
+                .ok_or_else(|| PortError::Message("proof directory has no parent".into()))
+                .and_then(|pristine| {
+                    ui_denominator::UiRoster::load(root, expected_upstream_revision, pristine)
+                });
+            match roster {
+                Ok(roster) => {
+                    if let Some(artifact) = loaded.get("ui-denominator.json") {
+                        if let Err(message) = roster.validate_artifact(artifact, inventory, results)
+                        {
+                            mark_invalid(
+                                &mut artifacts,
+                                &mut invalid,
+                                "ui-denominator.json",
+                                &message,
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    mark_invalid(
+                        &mut artifacts,
+                        &mut invalid,
+                        "inventory.json",
+                        &error.to_string(),
+                    );
+                    mark_invalid(
+                        &mut artifacts,
+                        &mut invalid,
+                        "ui-denominator.json",
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+    }
     if let Some(inventory) = &typed_inventory {
         validate_typed_trust_added_paths(inventory, &mut artifacts, &mut invalid);
+        if proof_scope == ProofScope::UpstreamRust
+            && inventory.tests.iter().any(|test| test.source == TestSource::TrustAdded)
+        {
+            mark_invalid(
+                &mut artifacts,
+                &mut invalid,
+                "inventory.json",
+                "UpstreamRust proof scope cannot contain Trust-added inventory rows",
+            );
+        }
+    }
+    if proof_scope == ProofScope::UpstreamRust
+        && typed_summary.as_ref().is_some_and(|summary| summary.trust_added != 0)
+    {
+        mark_invalid(
+            &mut artifacts,
+            &mut invalid,
+            "proof-summary.json",
+            "UpstreamRust proof scope requires zero Trust-added proof rows",
+        );
     }
     let trust_added_manifest =
         read_proof_trust_added_manifest(proof_dir, &mut artifacts, &mut invalid)?;
+    if proof_scope == ProofScope::UpstreamRust {
+        for name in ["trust-added-manifest.json", "trust-added-manifest.toml"] {
+            if proof_dir.join(name).exists() {
+                mark_invalid(
+                    &mut artifacts,
+                    &mut invalid,
+                    name,
+                    "UpstreamRust proof scope cannot contain a Trust-added proof manifest",
+                );
+            }
+        }
+    }
     if let (Some(inventory), Some(results), Some(summary)) =
         (&typed_inventory, &typed_results, &typed_summary)
     {
@@ -3969,14 +4370,17 @@ fn proof_artifact_validation(
         } else {
             test_exceptions
         };
-        match validate_test_proof_bundle(TestProofBundle {
-            inventory,
-            results,
-            exceptions: validation_exceptions,
-            trust_added_tests: trust_added_manifest.as_ref(),
-            validation_date,
-            release,
-        }) {
+        match validate_scoped_test_proof_bundle(
+            TestProofBundle {
+                inventory,
+                results,
+                exceptions: validation_exceptions,
+                trust_added_tests: trust_added_manifest.as_ref(),
+                validation_date,
+                release,
+            },
+            proof_scope,
+        ) {
             Ok(computed) if computed == *summary => {}
             Ok(computed) => {
                 mark_invalid(
@@ -4147,6 +4551,47 @@ fn proof_artifact_validation(
         "artifacts": artifacts,
         "summary_totals": summary_totals,
     }))
+}
+
+/// Validate a proof bundle for one explicit porting population.
+pub fn validate_scoped_test_proof_bundle(
+    bundle: TestProofBundle<'_>,
+    proof_scope: ProofScope,
+) -> Result<TestProofTotals, Vec<ValidationFinding>> {
+    if proof_scope == ProofScope::Combined {
+        return validate_test_proof_bundle(bundle);
+    }
+
+    let (computed, mut findings) = match validate_test_proof_bundle(bundle) {
+        Ok(computed) => (Some(computed), Vec::new()),
+        Err(findings) => (None, findings),
+    };
+    // The shared validator requires a nonempty Trust-added manifest for every
+    // release bundle. Only that absence finding is inapplicable to this scope;
+    // all upstream release checks above still ran with release=true.
+    if bundle.trust_added_tests.is_none() {
+        findings.retain(|finding| {
+            finding.field != "trust_added_tests"
+                || finding.message != "proof must include a Trust-added test manifest"
+        });
+    } else {
+        findings.push(ValidationFinding {
+            field: "trust_added_tests".to_string(),
+            message: "UpstreamRust proof scope cannot contain a Trust-added manifest".to_string(),
+        });
+    }
+    if bundle.inventory.tests.iter().any(|test| test.source == TestSource::TrustAdded) {
+        findings.push(ValidationFinding {
+            field: "tests.source".to_string(),
+            message: "UpstreamRust proof scope cannot contain Trust-added inventory rows"
+                .to_string(),
+        });
+    }
+    if findings.is_empty() {
+        Ok(computed.unwrap_or_else(|| proof_totals(bundle.inventory, bundle.results)))
+    } else {
+        Err(findings)
+    }
 }
 
 fn test_exceptions_for_inventory(
@@ -4379,14 +4824,54 @@ fn execute_suite(
     local_head: &str,
     test_exceptions: &TestExceptionLedger,
     test_exception_validation_date: &str,
+    proof_scope: ProofScope,
 ) -> Result<SuiteExecution, PortError> {
     let log_path = out_dir.join("execution.log");
     let proof_dir = out_dir.join("proof");
     let proof_log_path = proof_dir.join("upstream-rust-compat.log");
     let release_driver = if release { Some(resolve_trust_cargo(root, true)?) } else { None };
-    let proof_tests = proof_inventory_tests(max_files, upstream_entries, exported_paths);
-    let trust_added_manifest =
-        if max_files.is_none() { Some(read_trust_added_manifest(root)?) } else { None };
+    let ui_roster = if max_files.is_none() {
+        match ui_denominator::UiRoster::load(root, resolved_revision, &out_dir.join("imported"))
+            .and_then(|roster| {
+                roster.check_import_listing(upstream_entries)?;
+                Ok(roster)
+            }) {
+            Ok(roster) => Some(roster),
+            Err(error) => {
+                ui_denominator::write_failure(
+                    &proof_dir.join("ui-denominator.json"),
+                    resolved_revision,
+                    &error,
+                )?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let proof_tests =
+        proof_inventory_tests(max_files, upstream_entries, exported_paths, ui_roster.as_ref())?;
+    let input_closure_before = observations::input_closure(root);
+    let input_admission = observations::input_admission(
+        &input_closure_before,
+        &out_dir.join("imported"),
+        &out_dir.join("ported"),
+    );
+    // Freeze the expected case roster before bootstrap can run or rewrite a fixture.
+    let expected_cases = observations::expected_cases(
+        root,
+        &out_dir.join("imported"),
+        &out_dir.join("ported"),
+        &proof_tests,
+        extra_args,
+        host_triple,
+        target_triple,
+    );
+    let trust_added_manifest = if proof_scope == ProofScope::Combined && max_files.is_none() {
+        Some(read_trust_added_manifest(root)?)
+    } else {
+        None
+    };
     let trust_added_test_count = trust_added_manifest
         .as_ref()
         .map(|(_, manifest)| trust_added_inventory_ids(manifest).len())
@@ -4417,7 +4902,14 @@ fn execute_suite(
         command.extend(["--target".to_string(), target_triple.to_string()]);
     }
     command.extend(command_paths);
-    command.extend(split_words(extra_args));
+    command.extend(split_words(extra_args).into_iter().filter(|arg| arg != "--force-rerun"));
+    // Bootstrap renders compiletest's JSON itself; --json-output does not expose
+    // those events. Named terminal records and fresh execution are both required.
+    command.extend([
+        "--set".to_string(),
+        "rust.verbose-tests=true".to_string(),
+        "--force-rerun".to_string(),
+    ]);
     let execution_command = shell_join(&command);
 
     if let Some(parent) = log_path.parent() {
@@ -4448,6 +4940,7 @@ fn execute_suite(
     let stderr = log.try_clone().map_err(io_at("clone", &log_path))?;
     let mut process = Command::new(&command[0]);
     process.args(&command[1..]).current_dir(root);
+    sanitize_git_environment(&mut process);
     process.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
     process.env("TRUST_UPSTREAM_RUST_EXECUTOR", "rust-bootstrap");
     process.env("TRUST_UPSTREAM_RUST_CURRENT_REVISION", resolved_revision);
@@ -4486,6 +4979,8 @@ fn execute_suite(
         // third-party-code-in-verification-scope accident CLAUDE.md's "Why
         // targo, not stock cargo?" describes.
         "TRUST_TARGO_FRONTEND",
+        "RUST_TEST_NOCAPTURE",
+        "RUSTC_BLESS",
     ] {
         process.env_remove(marker);
     }
@@ -4509,7 +5004,7 @@ fn execute_suite(
     writeln!(log, "# exit_status={execution_exit_status}").map_err(io_at("write", &log_path))?;
     log.flush().map_err(io_at("write", &log_path))?;
     fs::copy(&log_path, &proof_log_path).map_err(io_at("copy", &log_path))?;
-    write_execution_proof_artifacts(
+    write_execution_proof_artifacts_with_scope(
         root,
         &proof_dir,
         resolved_revision,
@@ -4522,6 +5017,13 @@ fn execute_suite(
         release,
         test_exceptions,
         test_exception_validation_date,
+        &expected_cases,
+        &input_closure_before,
+        &input_admission,
+        proof_scope,
+        ui_roster.as_ref(),
+        host_triple,
+        target_triple,
     )?;
     let scorecard_log = proof_log_path;
     Ok(SuiteExecution {
@@ -4540,7 +5042,8 @@ fn execute_suite(
             "proof_inventory_tests": proof_tests.len() + trust_added_test_count,
             "upstream_proof_inventory_tests": proof_tests.len(),
             "trust_added_proof_inventory_tests": trust_added_test_count,
-            "trust_added_manifest_executed": max_files.is_none(),
+            "trust_added_manifest_executed": proof_scope == ProofScope::Combined && max_files.is_none(),
+            "proof_scope": proof_scope.label(),
             "trust_added_manifest": display_path(&trust_added.manifest_path, root),
             "trust_added_commands": trust_added.commands.iter().map(|command| {
                 json!({
@@ -4984,7 +5487,8 @@ fn proof_inventory_tests(
     max_files: Option<usize>,
     upstream_entries: &[GitTreeEntry],
     exported_paths: &[String],
-) -> Vec<ProofUpstreamTest> {
+    ui_roster: Option<&ui_denominator::UiRoster>,
+) -> Result<Vec<ProofUpstreamTest>, PortError> {
     let upstream_by_path = upstream_entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
@@ -4992,13 +5496,18 @@ fn proof_inventory_tests(
     let all_upstream_paths =
         upstream_entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>();
     let source = if max_files.is_some() { exported_paths } else { &all_upstream_paths };
-    let primary = unique_primary_paths(source);
-    let paths = if primary.is_empty() {
-        source.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>()
-    } else {
-        primary
-    };
-    paths
+    let mut paths = unique_primary_paths(source);
+    if let Some(roster) = ui_roster {
+        paths.retain(|path| !path.starts_with("tests/ui/"));
+        paths.extend(roster.test_paths.iter().cloned());
+        paths.sort();
+    }
+    if paths.is_empty() {
+        return Err(PortError::Message(
+            "upstream execution selected no independently executable primary cases; imported files remain input dependencies, not proof inventory cases".into(),
+        ));
+    }
+    Ok(paths
         .into_iter()
         .enumerate()
         .map(|(index, path)| ProofUpstreamTest {
@@ -5006,10 +5515,11 @@ fn proof_inventory_tests(
             source_git_blob: proof_source_git_blob(&upstream_by_path, &path),
             path,
         })
-        .collect()
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)] // proof-artifact writer captures the full execution context for each suite
+#[cfg(test)]
 fn write_execution_proof_artifacts(
     root: &Path,
     proof_dir: &Path,
@@ -5023,8 +5533,119 @@ fn write_execution_proof_artifacts(
     release: bool,
     test_exceptions: &TestExceptionLedger,
     test_exception_validation_date: &str,
+    expected_cases: &[observations::ExpectedCases],
+    input_closure_before: &observations::InputClosure,
+    input_admission: &observations::InputAdmission,
 ) -> Result<(), PortError> {
-    let upstream_passed = upstream_exit_status == 0;
+    write_execution_proof_artifacts_with_scope(
+        root,
+        proof_dir,
+        resolved_revision,
+        local_revision,
+        proof_tests,
+        upstream_exit_status,
+        trust_added,
+        log_path,
+        execution_command,
+        release,
+        test_exceptions,
+        test_exception_validation_date,
+        expected_cases,
+        input_closure_before,
+        input_admission,
+        ProofScope::Combined,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // proof-artifact writer captures the full execution context for each suite
+fn write_execution_proof_artifacts_with_scope(
+    root: &Path,
+    proof_dir: &Path,
+    resolved_revision: &str,
+    local_revision: &str,
+    proof_tests: &[ProofUpstreamTest],
+    upstream_exit_status: i32,
+    trust_added: &TrustAddedExecution,
+    log_path: &Path,
+    execution_command: &str,
+    release: bool,
+    test_exceptions: &TestExceptionLedger,
+    test_exception_validation_date: &str,
+    expected_cases: &[observations::ExpectedCases],
+    input_closure_before: &observations::InputClosure,
+    input_admission: &observations::InputAdmission,
+    proof_scope: ProofScope,
+    ui_roster: Option<&ui_denominator::UiRoster>,
+    host_triple: Option<&str>,
+    target_triple: Option<&str>,
+) -> Result<(), PortError> {
+    let log = fs::read_to_string(log_path).map_err(io_at("read", log_path))?;
+    let observations = observations::parse_log(&log);
+    let sidecars = case_events::inspect(
+        proof_dir,
+        ui_roster.map(|roster| roster.cases.as_slice()),
+        &observations,
+        host_triple,
+        target_triple,
+    );
+    let mut reconciled = observations::reconcile(root, expected_cases, &observations);
+    if let Some(roster) = ui_roster {
+        let diagnostic = roster.reconcile(&observations);
+        if diagnostic["observations_reconciled"] != true {
+            let ui_ids = proof_tests
+                .iter()
+                .filter(|test| test.path.starts_with("tests/ui/"))
+                .map(|test| test.id.as_str())
+                .collect::<BTreeSet<_>>();
+            for row in reconciled.iter_mut().filter(|row| ui_ids.contains(row.test_id.as_str())) {
+                if row.outcome == TestOutcome::Passed {
+                    row.outcome = TestOutcome::Unknown;
+                }
+                row.detail.push_str("; complete pinned UI case roster did not reconcile");
+            }
+        }
+        write_json(&proof_dir.join("ui-denominator.json"), &diagnostic)?;
+    }
+    let input_closure_after = observations::input_closure(root);
+    if !observations::closure_matches(input_closure_before, &input_closure_after)
+        || !input_admission.unresolved.is_empty()
+    {
+        for row in &mut reconciled {
+            if row.outcome == TestOutcome::Passed {
+                row.outcome = TestOutcome::Unknown;
+            }
+            row.detail.push_str(
+                "; test input closure changed or contains unbound pristine/adapted inputs",
+            );
+        }
+    }
+    write_json(
+        &proof_dir.join("case-evidence.json"),
+        &json!({
+            "schema": "trust.upstream-rust.case-evidence.v1",
+            "upstream_revision": resolved_revision,
+            "local_revision": local_revision,
+            "aggregate_exit_status": upstream_exit_status,
+            "aggregate_exit_supplies_individual_outcomes": false,
+            "execution_command": execution_command,
+            "proof_scope": proof_scope.label(),
+            "log_sha256": sha256_bytes(log.as_bytes()),
+            "parser_source_sha256": sha256_bytes(include_bytes!("porting/observations.rs")),
+            "sidecar_parser_source_sha256": sha256_bytes(include_bytes!("porting/case_events.rs")),
+            "driver_source_sha256": sha256_bytes(include_bytes!("porting.rs")),
+            "test_input_closure_before": input_closure_before,
+            "test_input_closure_after": input_closure_after,
+            "test_input_admission": input_admission,
+            "evidence_scope": "Bound native verbose renderer records and diagnostic compiletest sidecars share one bootstrap process; neither is an independently authenticated event channel. Unsupported contexts, adaptations, and incomplete case populations remain unknown.",
+            "expected": expected_cases,
+            "observations": observations,
+            "structured_sidecars": sidecars,
+            "reconciled": reconciled,
+        }),
+    )?;
     let upstream_artifact = log_path.to_string_lossy().into_owned();
     let trust_added_artifact = trust_added.log_path.to_string_lossy().into_owned();
     let trust_added_inventory_path = display_path(&trust_added.manifest_path, root);
@@ -5066,19 +5687,21 @@ fn write_execution_proof_artifacts(
         tests: inventory_tests,
     };
 
+    let evidence_by_id =
+        reconciled.iter().map(|row| (row.test_id.as_str(), row)).collect::<BTreeMap<_, _>>();
     let mut results = proof_tests
         .iter()
         .map(|test| {
-            let outcome = if upstream_passed { TestOutcome::Passed } else { TestOutcome::Failed };
+            let evidence = evidence_by_id.get(test.id.as_str());
+            let outcome = evidence.map_or(TestOutcome::Unknown, |row| row.outcome);
             TestResult {
                 test_id: test.id.clone(),
                 outcome,
                 exception_id: matching_test_exception_id(test_exceptions, &test.id, outcome),
-                observed: Some(if upstream_passed {
-                    "upstream bootstrap test run passed".to_string()
-                } else {
-                    format!("upstream bootstrap exited with {upstream_exit_status}")
-                }),
+                observed: Some(evidence.map_or_else(
+                    || "no bound case roster; individual execution is unmeasured".to_string(),
+                    |row| row.detail.clone(),
+                )),
                 artifact: Some(upstream_artifact.clone()),
             }
         })
@@ -5105,15 +5728,18 @@ fn write_execution_proof_artifacts(
         command: proof_command_line(execution_command, trust_added),
         results,
     };
-    let summary = validate_test_proof_bundle(TestProofBundle {
-        inventory: &inventory,
-        results: &result_report,
-        exceptions: test_exceptions,
-        trust_added_tests: (!trust_added.manifest.commands.is_empty())
-            .then_some(&trust_added.manifest),
-        validation_date: test_exception_validation_date,
-        release,
-    })
+    let summary = validate_scoped_test_proof_bundle(
+        TestProofBundle {
+            inventory: &inventory,
+            results: &result_report,
+            exceptions: test_exceptions,
+            trust_added_tests: (!trust_added.manifest.commands.is_empty())
+                .then_some(&trust_added.manifest),
+            validation_date: test_exception_validation_date,
+            release,
+        },
+        proof_scope,
+    )
     .unwrap_or_else(|_| proof_totals(&inventory, &result_report));
     write_json(&proof_dir.join("inventory.json"), &serde_json::to_value(&inventory)?)?;
     write_json(&proof_dir.join("results.json"), &serde_json::to_value(&result_report)?)?;
@@ -5325,14 +5951,22 @@ fn resolve_trust_cargo(root: &Path, require_trust: bool) -> Result<Vec<String>, 
         ));
     }
 
-    if let Some(targo) = which("targo") {
+    resolve_developer_path_targo(which)
+}
+
+/// The developer lane's last resort: `targo` on PATH, and nothing else. There is
+/// no stock fallback — an ambient `cargo` is upstream Cargo (or the aterm reroute
+/// stub), which cannot run `trust domination` at all (owner directive
+/// 2026-09-28: Trust for all ALab systems). `lookup` is the PATH search, injected
+/// so the refusal is testable without mutating the process environment.
+fn resolve_developer_path_targo(
+    lookup: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<Vec<String>, PortError> {
+    if let Some(targo) = lookup("targo") {
         return Ok(vec![targo.to_string_lossy().into_owned()]);
     }
-    if let Some(cargo) = which("cargo") {
-        return Ok(vec![cargo.to_string_lossy().into_owned()]);
-    }
     Err(PortError::Message(
-        "Trust targo was not found; set TRUST_TARGO_BIN or TRUST_UPSTREAM_COMPAT_CARGO".to_string(),
+        "Trust targo was not found; put targo on PATH, or set TRUST_TARGO_BIN or TRUST_UPSTREAM_COMPAT_CARGO (ambient cargo is never used)".to_string(),
     ))
 }
 
@@ -5473,13 +6107,417 @@ fn sha256_bytes(data: &[u8]) -> String {
     format!("sha256:{digest:x}")
 }
 
+// The migration byte oracles are kept separate from the large runner tests.
+#[cfg(test)]
+#[path = "porting_expectation_tests.rs"]
+mod expectation_tests;
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::{
         BaselineEntry, BaselineStatus, CompatibilityExpectation, CompatibilitySurface,
         LocalSnapshot, UpstreamSnapshot,
     };
+
+    #[test]
+    fn reviewed_request_tracks_selected_baseline_revision() {
+        let baseline = "1111111111111111111111111111111111111111";
+        let requested = format!("rust-lang/rust:{baseline}");
+        let report = revision_drift(
+            Some(baseline),
+            &requested,
+            baseline,
+            DEFAULT_UPSTREAM_REMOTE,
+            "fixture",
+        );
+        assert_eq!(report["default_reviewed_upstream_request"], true);
+        assert_eq!(report["requires_upstream_fix_review"], false);
+
+        let different = "2222222222222222222222222222222222222222";
+        let drift = revision_drift(
+            Some(baseline),
+            &format!("rust-lang/rust:{different}"),
+            different,
+            DEFAULT_UPSTREAM_REMOTE,
+            "fixture",
+        );
+        assert_eq!(drift["default_reviewed_upstream_request"], false);
+        assert_eq!(drift["requires_upstream_fix_review"], true);
+
+        for (selected, revision, remote) in [
+            (Some(baseline), requested.as_str(), "https://example.invalid/rust.git"),
+            (Some(baseline), baseline, DEFAULT_UPSTREAM_REMOTE),
+            (None, requested.as_str(), DEFAULT_UPSTREAM_REMOTE),
+        ] {
+            let report = revision_drift(selected, revision, baseline, remote, "fixture");
+            assert_eq!(report["default_reviewed_upstream_request"], false);
+        }
+    }
+
+    /// Regression (2026-09-28): the developer lane used to fall back to any
+    /// `cargo` on PATH after `targo`. It must consult `targo` only, and refuse
+    /// rather than run an ambient Cargo.
+    #[test]
+    fn developer_cargo_resolution_never_falls_back_to_ambient_cargo() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let only_cargo = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            (name == "cargo").then(|| PathBuf::from("/ambient/bin/cargo"))
+        };
+        let error = resolve_developer_path_targo(only_cargo)
+            .expect_err("an ambient cargo must never be selected");
+        assert!(error.to_string().contains("ambient cargo is never used"), "{error}");
+        assert_eq!(asked.borrow().as_slice(), ["targo"], "only targo may be looked up");
+
+        let with_targo = |name: &str| (name == "targo").then(|| PathBuf::from("/pkg/bin/targo"));
+        assert_eq!(
+            resolve_developer_path_targo(with_targo).expect("PATH targo is the developer lane"),
+            vec!["/pkg/bin/targo".to_string()]
+        );
+    }
+
+    struct GitFetchFixture(PathBuf);
+
+    impl GitFetchFixture {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = env::temp_dir().join(format!(
+                "trust-upstream-fetch-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            Self::at(root, name)
+        }
+
+        fn at(root: PathBuf, name: &str) -> Self {
+            fs::create_dir(&root).unwrap();
+            let fixture = Self(root);
+            fixture.git(&["init", "-q"]);
+            let test = fixture.0.join(format!("tests/ui/{name}.rs"));
+            fs::create_dir_all(test.parent().unwrap()).unwrap();
+            fs::write(test, "fn main() {}\n").unwrap();
+            fixture.git(&["add", "tests/ui"]);
+            fixture.git(&[
+                "-c",
+                "user.name=Trust Test",
+                "-c",
+                "user.email=trust@example.invalid",
+                "commit",
+                "-qm",
+                name,
+            ]);
+            fixture
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = Command::new("git").args(args).current_dir(&self.0).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        }
+
+        fn url(&self) -> String {
+            format!("file://{}", self.0.display())
+        }
+    }
+
+    impl Drop for GitFetchFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn command_env(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    fn symbolic_fetch_ignores_global_rewrite_and_scopes_transport_auth() {
+        let wanted = GitFetchFixture::new("wanted-global");
+        let spoof = GitFetchFixture::new("spoof-global");
+        let caller = GitFetchFixture::new("caller-global");
+        let wanted_revision = wanted.git(&["rev-parse", "HEAD"]);
+        assert_ne!(wanted_revision, spoof.git(&["rev-parse", "HEAD"]));
+        let config = caller.0.join("spoof-global.gitconfig");
+        caller.git(&[
+            "config",
+            "--file",
+            config.to_str().unwrap(),
+            &format!("url.{}.insteadOf", spoof.url()),
+            &wanted.url(),
+        ]);
+
+        let output = Command::new(env::current_exe().unwrap())
+            // The child is `#[ignore]`d: `--ignored` selects it, `--exact` only it.
+            .args([
+                "--ignored",
+                "--exact",
+                "porting::tests::symbolic_fetch_global_rewrite_child",
+                "--nocapture",
+            ])
+            .env("TRUST_FETCH_TEST_CALLER", &caller.0)
+            .env("TRUST_FETCH_TEST_WANTED_URL", wanted.url())
+            .env("TRUST_FETCH_TEST_SPOOF_URL", spoof.url())
+            .env("TRUST_FETCH_TEST_WANTED_REVISION", wanted_revision)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .env("GIT_ASKPASS", "trust-test-askpass")
+            .env("GIT_SSH_COMMAND", "trust-test-ssh")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child half of `symbolic_fetch_ignores_global_rewrite_and_scopes_transport_auth`,
+    /// which re-executes it with `--ignored --exact` under a hostile global git
+    /// config. A no-op without that environment, and `#[ignore]`d so a plain run
+    /// does not count that no-op as a pass.
+    #[test]
+    #[ignore = "subprocess child: re-executed by \
+                symbolic_fetch_ignores_global_rewrite_and_scopes_transport_auth"]
+    fn symbolic_fetch_global_rewrite_child() {
+        let Some(caller) = env::var_os("TRUST_FETCH_TEST_CALLER") else {
+            return;
+        };
+        let caller = PathBuf::from(caller);
+        let wanted_url = env::var("TRUST_FETCH_TEST_WANTED_URL").unwrap();
+        let spoof_url = env::var("TRUST_FETCH_TEST_SPOOF_URL").unwrap();
+        let wanted_revision = env::var("TRUST_FETCH_TEST_WANTED_REVISION").unwrap();
+
+        let ambient_url = Command::new("git")
+            .args(["ls-remote", "--get-url", &wanted_url])
+            .current_dir(&caller)
+            .output()
+            .unwrap();
+        assert!(ambient_url.status.success());
+        assert_eq!(String::from_utf8_lossy(&ambient_url.stdout).trim(), spoof_url);
+
+        let probe = git_command(&caller);
+        assert_eq!(
+            command_env(&probe, "GIT_CONFIG_GLOBAL").as_deref(),
+            Some(std::ffi::OsStr::new(if cfg!(windows) { "NUL" } else { "/dev/null" }))
+        );
+        assert_eq!(
+            command_env(&probe, "GIT_CONFIG_NOSYSTEM").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            command_env(&probe, "GIT_NO_REPLACE_OBJECTS").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(command_env(&probe, "GIT_ASKPASS"), None);
+        assert_eq!(command_env(&probe, "GIT_SSH_COMMAND"), None);
+        let https_fetch = git_fetch_command(&caller, "https://example.invalid/repo.git");
+        assert_eq!(
+            command_env(&https_fetch, "GIT_ASKPASS").as_deref(),
+            Some(std::ffi::OsStr::new("trust-test-askpass"))
+        );
+        assert_eq!(command_env(&https_fetch, "GIT_SSH_COMMAND"), None);
+        let ssh_fetch = git_fetch_command(&caller, "ssh://example.invalid/repo.git");
+        assert_eq!(
+            command_env(&ssh_fetch, "GIT_SSH_COMMAND").as_deref(),
+            Some(std::ffi::OsStr::new("trust-test-ssh"))
+        );
+        assert_eq!(command_env(&ssh_fetch, "GIT_ASKPASS"), None);
+        let file_fetch = git_fetch_command(&caller, &wanted_url);
+        assert_eq!(command_env(&file_fetch, "GIT_ASKPASS"), None);
+        assert_eq!(command_env(&file_fetch, "GIT_SSH_COMMAND"), None);
+
+        let (status, resolved, stderr) = isolated_symbolic_fetch(&caller, &wanted_url, "HEAD")
+            .expect("isolated symbolic fetch must use the requested repository");
+        assert!(status.success(), "{stderr}");
+        assert_eq!(resolved.as_deref(), Some(wanted_revision.as_str()));
+        let error = resolve_revision_report(&caller, "rust-lang/rust:HEAD", &wanted_url, true)
+            .expect_err("product symbolic fetch must require HTTPS");
+        assert!(error.to_string().contains("authenticated HTTPS"));
+    }
+
+    #[test]
+    fn symbolic_fetch_refuses_local_url_rewrite_before_network() {
+        let spoof = GitFetchFixture::new("spoof-local");
+        let caller = GitFetchFixture::new("caller-local");
+        let wanted_url = "https://example.invalid/rust.git";
+        let spoof_url = spoof.url();
+        caller.git(&["config", &format!("url.{spoof_url}.insteadOf"), wanted_url]);
+        let error = resolve_revision_report(&caller.0, "rust-lang/rust:HEAD", wanted_url, true)
+            .expect_err("local insteadOf rewrite must be refused before fetch");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(&wanted_url), "{diagnostic}");
+        assert!(diagnostic.contains(&spoof_url), "{diagnostic}");
+        assert!(diagnostic.contains("insteadOf"), "{diagnostic}");
+        assert!(!caller.0.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn symbolic_fetch_ignores_repo_local_url_specific_http_transport_config() {
+        let wanted = GitFetchFixture::new("wanted-http-config");
+        let caller = GitFetchFixture::new("caller-http-config");
+        let wanted_revision = wanted.git(&["rev-parse", "HEAD"]);
+        let https_url = "https://example.invalid/rust.git";
+        caller.git(&["config", &format!("http.{https_url}.followRedirects"), "true"]);
+        caller.git(&["config", &format!("http.{https_url}.sslVerify"), "false"]);
+        caller.git(&["config", &format!("http.{https_url}.proxy"), "http://127.0.0.1:9"]);
+
+        let objects = git_object_directory(&caller.0).unwrap();
+        let setting = |repo: &Path, key: &str, default: &str, with_target_objects: bool| {
+            let mut command = git_command(repo);
+            if with_target_objects {
+                command.env("GIT_OBJECT_DIRECTORY", &objects);
+            }
+            git_command_maybe(command, &["-c", default, "config", "--get-urlmatch", key, https_url])
+                .unwrap()
+        };
+        let (status, redirects, _) =
+            setting(&caller.0, "http.followRedirects", "http.followRedirects=false", false);
+        assert!(status.success());
+        assert_eq!(redirects.trim(), "true", "URL-specific config overrides generic -c");
+        let (status, tls, _) = setting(&caller.0, "http.sslVerify", "http.sslVerify=true", false);
+        assert!(status.success());
+        assert_eq!(tls.trim(), "false", "URL-specific config overrides generic -c");
+        let (status, proxy, _) = setting(&caller.0, "http.proxy", "http.proxy=", false);
+        assert!(status.success());
+        assert_eq!(proxy.trim(), "http://127.0.0.1:9");
+
+        let isolated = IsolatedFetchRepo::new().unwrap();
+        let (status, redirects, _) =
+            setting(&isolated.0, "http.followRedirects", "http.followRedirects=false", true);
+        assert!(status.success());
+        assert_eq!(redirects.trim(), "false");
+        let (status, tls, _) = setting(&isolated.0, "http.sslVerify", "http.sslVerify=true", true);
+        assert!(status.success());
+        assert_eq!(tls.trim(), "true");
+        let (status, proxy, _) = setting(&isolated.0, "http.proxy", "http.proxy=", true);
+        assert!(status.success());
+        assert_eq!(proxy.trim(), "");
+
+        let (status, resolved, stderr) = isolated_symbolic_fetch(&caller.0, &wanted.url(), "HEAD")
+            .expect("isolated symbolic fetch must populate target objects");
+        assert!(status.success(), "{stderr}");
+        assert_eq!(resolved.as_deref(), Some(wanted_revision.as_str()));
+        let error = resolve_revision_report(&caller.0, "rust-lang/rust:HEAD", &wanted.url(), true)
+            .expect_err("product symbolic fetch must require HTTPS");
+        assert!(error.to_string().contains("authenticated HTTPS"));
+        assert_eq!(
+            git(&caller.0, &["rev-parse", "--verify", &format!("{wanted_revision}^{{commit}}")])
+                .unwrap()
+                .trim(),
+            wanted_revision
+        );
+    }
+
+    #[test]
+    fn symbolic_fetch_refuses_untrusted_transports_before_network() {
+        let caller = GitFetchFixture::new("symbolic-transport");
+        assert!(is_authenticated_symbolic_remote("https://github.com/rust-lang/rust.git"));
+        for remote in [
+            "git://example.invalid/rust.git",
+            "helper::../rust",
+            "http://example.invalid/rust.git",
+            "ssh://example.invalid/rust.git",
+            "git@example.invalid:rust.git",
+            "file:///tmp/rust.git",
+            "/tmp/rust.git",
+            "https://user@example.invalid/rust.git",
+            "https:///rust.git",
+            "https://example.invalid\\rust.git",
+            "https://example.invalid?foo/rust.git",
+            "https://example.invalid#foo/rust.git",
+        ] {
+            assert!(!is_authenticated_symbolic_remote(remote), "{remote}");
+            let error = resolve_revision_report(&caller.0, "rust-lang/rust:HEAD", remote, true)
+                .expect_err("symbolic fetch must refuse an unauthenticated transport");
+            assert!(error.to_string().contains("authenticated HTTPS"), "{remote}: {error}");
+        }
+        assert!(!caller.0.join(".git/FETCH_HEAD").exists());
+    }
+
+    #[test]
+    fn relative_symbolic_remote_is_refused_before_isolated_fetch_but_exact_sha_still_works() {
+        let group = GitFetchFixture::new("relative-group");
+        let wanted = GitFetchFixture::at(group.0.join("rust"), "relative-wanted");
+        let caller = GitFetchFixture::at(group.0.join("caller"), "relative-caller");
+        let relative = "../rust";
+        let wanted_revision = wanted.git(&["rev-parse", "HEAD"]);
+        let isolated = IsolatedFetchRepo::new().unwrap();
+        assert!(!is_relative_filesystem_remote(wanted.0.to_str().unwrap()));
+        assert!(!is_relative_filesystem_remote(&wanted.url()));
+        assert!(!is_relative_filesystem_remote("https://example.invalid/rust.git"));
+        assert!(!is_relative_filesystem_remote("git@example.invalid:rust.git"));
+        #[cfg(windows)]
+        assert!(is_relative_filesystem_remote("C:rust"));
+        assert_eq!(checked_effective_fetch_url(&caller.0, relative).unwrap(), relative);
+        assert_eq!(checked_effective_fetch_url(&isolated.0, relative).unwrap(), relative);
+        assert_eq!(
+            caller.0.join(relative).canonicalize().unwrap(),
+            wanted.0.canonicalize().unwrap()
+        );
+        assert_ne!(isolated.0.parent().unwrap().join("rust"), wanted.0);
+
+        for remote in ["../rust", "./rust", "rust", "file://../rust", "file:../rust"] {
+            let error = resolve_revision_report(&caller.0, "rust-lang/rust:HEAD", remote, true)
+                .expect_err("relative symbolic remote must fail before changing directories");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("relative filesystem remote"), "{diagnostic}");
+            assert!(diagnostic.contains(remote), "{diagnostic}");
+            assert_ne!(error.exit_code(), 0);
+        }
+        assert!(!caller.0.join(".git/FETCH_HEAD").exists());
+
+        let exact = format!("rust-lang/rust:{wanted_revision}");
+        let resolved = resolve_revision_report(&caller.0, &exact, relative, true)
+            .expect("exact-SHA fetch keeps the caller-relative path and no-replace behavior");
+        assert_eq!(resolved.resolved_revision, wanted_revision);
+        assert_eq!(resolved.effective_fetch_url.as_deref(), Some(relative));
+        assert_eq!(resolved.source, "remote-fetch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slash_before_colon_is_a_relative_local_remote_not_scp_syntax() {
+        let caller = GitFetchFixture::new("slash-colon-caller");
+        fs::create_dir(caller.0.join("dir")).unwrap();
+        let wanted = GitFetchFixture::at(caller.0.join("dir/repo:variant"), "slash-colon-wanted");
+        let isolated = IsolatedFetchRepo::new().unwrap();
+        fs::create_dir(isolated.0.join("dir")).unwrap();
+        let spoof = GitFetchFixture::at(isolated.0.join("dir/repo:variant"), "slash-colon-spoof");
+        let relative = "dir/repo:variant";
+        let wanted_revision = wanted.git(&["rev-parse", "HEAD"]);
+        let spoof_revision = spoof.git(&["rev-parse", "HEAD"]);
+        assert_ne!(wanted_revision, spoof_revision);
+        assert!(!is_scp_style_remote(relative));
+        assert!(is_relative_filesystem_remote(relative));
+        assert!(is_scp_style_remote("git@example.invalid:dir/repo"));
+        assert_eq!(checked_effective_fetch_url(&caller.0, relative).unwrap(), relative);
+        assert_eq!(checked_effective_fetch_url(&isolated.0, relative).unwrap(), relative);
+        assert_eq!(
+            git(&caller.0, &["ls-remote", relative, "HEAD"]).unwrap().split_whitespace().next(),
+            Some(wanted_revision.as_str())
+        );
+        assert_eq!(
+            git(&isolated.0, &["ls-remote", relative, "HEAD"]).unwrap().split_whitespace().next(),
+            Some(spoof_revision.as_str())
+        );
+
+        let error = resolve_revision_report(&caller.0, "rust-lang/rust:HEAD", relative, true)
+            .expect_err("symbolic slash-before-colon path must fail before isolated fetch");
+        assert!(error.to_string().contains("relative filesystem remote"));
+        assert!(!caller.0.join(".git/FETCH_HEAD").exists());
+
+        let exact = format!("rust-lang/rust:{wanted_revision}");
+        let resolved = resolve_revision_report(&caller.0, &exact, relative, true)
+            .expect("exact-SHA path remains relative to caller repository");
+        assert_eq!(resolved.resolved_revision, wanted_revision);
+    }
 
     #[test]
     fn run_make_directory_resolves_its_blob_through_rmake_rs() {
@@ -5498,7 +6536,7 @@ mod tests {
             path: "tests/ui/bar.rs".to_string(),
             mode: "100644".to_string(),
             kind: "blob".to_string(),
-            blob: "cafebabe".to_string(),
+            blob: "2222222".to_string(),
             size: Some(10),
         };
         let map: BTreeMap<&str, &GitTreeEntry> =
@@ -5511,13 +6549,97 @@ mod tests {
         );
         assert_eq!(
             proof_source_git_blob(&map, "tests/ui/bar.rs"),
-            Some("cafebabe".to_string()),
+            Some("2222222".to_string()),
             "a direct file lookup must keep working"
         );
         // FAIL-CLOSED: no rmake.rs means no blob. Substituting another file in
         // the directory would attest to a blob that does not identify the test.
         assert_eq!(proof_source_git_blob(&map, "tests/run-make/missing"), None);
         assert_eq!(proof_source_git_blob(&map, "tests/ui/absent.rs"), None);
+    }
+
+    #[test]
+    fn auxiliary_inputs_cannot_become_primary_cases_or_a_nonempty_proof_roster() {
+        let paths = [
+            "tests/auxiliary/minicore.rs",
+            "tests/auxiliary/minisimd.rs",
+            "tests/auxiliary/rust_test_helpers.c",
+            "tests/ui/auxiliary/helper.rs",
+            "tests/ui/nested/auxiliary/deep/helper.rs",
+            "tests/codegen/nested/auxiliary/helper.rs",
+            "tests/rustdoc/auxiliary/helper.rs",
+            "tests/rustdoc-js/auxiliary/helper.js",
+            "tests/run-make/example/auxiliary/helper.rs",
+        ]
+        .map(str::to_string);
+        assert!(unique_primary_paths(&paths).is_empty());
+        assert_eq!(primary_compiletest_path("tests/ui/pass.rs"), Some("tests/ui/pass.rs".into()));
+        for path in ["tests/ui/auxiliary.rs", "tests/ui/auxiliary-names/helper.rs"] {
+            assert_eq!(primary_compiletest_path(path), Some(path.into()));
+        }
+        assert_eq!(
+            primary_compiletest_path("tests/run-make/example/rmake.rs"),
+            Some("tests/run-make/example".into())
+        );
+        let entries = paths
+            .iter()
+            .map(|path| GitTreeEntry {
+                path: path.clone(),
+                mode: "100644".into(),
+                kind: "blob".into(),
+                blob: "deadbeef".into(),
+                size: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let error = proof_inventory_tests(Some(paths.len()), &entries, &paths, None).unwrap_err();
+        assert!(error.to_string().contains("no independently executable primary cases"));
+    }
+
+    #[test]
+    #[ignore = "requires the locally fetched pinned rust-lang/rust object"]
+    fn pinned_upstream_auxiliary_files_remain_inputs_without_inflating_case_counts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let pin = "5e91de65d75d3c849c643f5079509b9e5985a5c0";
+        let entries = list_upstream_tests(root, pin).unwrap();
+        let mut selected = entries
+            .iter()
+            .filter(|entry| entry.path.starts_with("tests/auxiliary/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            [
+                "tests/auxiliary/minicore.rs",
+                "tests/auxiliary/minisimd.rs",
+                "tests/auxiliary/rust_test_helpers.c",
+            ]
+        );
+        let ui = entries
+            .iter()
+            .find(|entry| entry.path == "tests/ui/abi/abi-sysv64-arg-passing.rs")
+            .unwrap()
+            .clone();
+        selected.push(ui.clone());
+        let fixture = GitFetchFixture::new("pinned-auxiliary-roster");
+        let imported = fixture.0.join("imported");
+        let exported =
+            export_overlay(root, pin, &selected, &imported, Some(selected.len())).unwrap();
+        assert_eq!(exported.len(), 4);
+        let closure = serde_json::to_value(observations::input_closure(&imported)).unwrap();
+        assert_eq!(closure["errors"], json!([]));
+        let files = closure["files"].as_object().unwrap();
+        assert_eq!(files.len(), exported.len());
+        for path in &exported {
+            assert!(files.contains_key(path), "missing input dependency: {path}");
+        }
+        assert_eq!(unique_primary_paths(&exported), [ui.path.clone()]);
+        let error =
+            proof_inventory_tests(Some(3), &selected[..3], &exported[..3], None).unwrap_err();
+        assert!(error.to_string().contains("no independently executable primary cases"));
+        let roster = proof_inventory_tests(Some(4), &selected, &exported, None).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].path, ui.path);
+        assert_eq!(roster[0].source_git_blob.as_deref(), Some(ui.blob.as_str()));
     }
 
     #[test]
@@ -5703,6 +6825,7 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 0,
+                ProofScope::Combined,
             )
             .expect("release/full/execute summary should build");
             assert_eq!(summary.run_id.as_deref(), Some(case.run_id));
@@ -5711,8 +6834,8 @@ mod tests {
             assert_eq!(summary.target_triple.as_deref(), Some(case.target_triple));
             assert_eq!(summary.host.as_deref(), Some(case.host));
             assert_eq!(summary.host_triple.as_deref(), Some(case.host_triple));
-            assert_eq!(summary.totals.compatible, 1);
-            assert_eq!(summary.totals.unknown, 0);
+            assert_eq!(summary.totals.compatible, 0);
+            assert_eq!(summary.totals.unknown, 1);
 
             let value = serde_json::to_value(&summary).expect("summary should serialize");
             let runner = &value["runner"];
@@ -5759,7 +6882,8 @@ mod tests {
             assert_eq!(contract["requires_proof_mode"].as_str(), Some("full"));
             assert_eq!(contract["requires_summary_out"].as_bool(), Some(true));
             assert_eq!(contract["out_dir"].as_str(), Some(case.out_dir));
-            assert_eq!(contract["satisfied"].as_bool(), Some(true));
+            assert_eq!(contract["satisfied"].as_bool(), Some(false));
+            assert_eq!(contract["execution_authenticated"].as_bool(), Some(false));
             assert_eq!(contract["run_id"].as_str(), Some(case.run_id));
             assert_eq!(contract["target_arch"].as_str(), Some(case.target_arch));
             assert_eq!(contract["target_triple"].as_str(), Some(case.target_triple));
@@ -6124,8 +7248,17 @@ expected_replacements = 1
         .expect("write proof summary");
 
         let exceptions = empty_test_exception_ledger();
-        let validation = proof_artifact_validation(&dir, false, &exceptions, "2026-04-29", false)
-            .expect("validate proof artifacts");
+        let validation = proof_artifact_validation(
+            &dir,
+            &dir,
+            "fixture",
+            false,
+            &exceptions,
+            "2026-04-29",
+            false,
+            ProofScope::Combined,
+        )
+        .expect("validate proof artifacts");
         assert!(!validation["complete"].as_bool().unwrap());
         let invalid = validation["invalid"].as_array().expect("invalid artifacts");
         assert!(invalid.iter().any(|value| value.as_str() == Some("inventory.json")));
@@ -6140,7 +7273,7 @@ expected_replacements = 1
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp dir");
         let test_id = "upstream.00000000.tests.ui.proof.rs";
-        let revision = "rust-lang/rust:feedface";
+        let revision = "rust-lang/rust:1111111";
         let inventory = TestInventory {
             schema_version: crate::SCHEMA_VERSION.to_string(),
             upstream_revision: revision.to_string(),
@@ -6208,12 +7341,34 @@ expected_replacements = 1
         write_json(&dir.join("proof-summary.json"), &serde_json::to_value(summary).unwrap())
             .expect("write proof summary");
 
-        let validation = proof_artifact_validation(&dir, false, &exceptions, "2026-04-29", false)
-            .expect("validate proof artifacts");
+        let validation = proof_artifact_validation(
+            &dir,
+            &dir,
+            revision,
+            false,
+            &exceptions,
+            "2026-04-29",
+            true,
+            ProofScope::Combined,
+        )
+        .expect("validate proof artifacts");
         assert!(validation["complete"].as_bool().unwrap());
         assert!(validation["invalid"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(validation["summary_totals"]["excepted"].as_u64(), Some(1));
         assert_eq!(validation["summary_totals"]["unaccounted"].as_u64(), Some(0));
+        let wrong_revision = proof_artifact_validation(
+            &dir,
+            &dir,
+            "different-resolved-commit",
+            false,
+            &exceptions,
+            "2026-04-29",
+            true,
+            ProofScope::Combined,
+        )
+        .expect("validate proof artifacts against resolved revision");
+        assert_eq!(wrong_revision["complete"], false);
+        assert!(wrong_revision["invalid"].as_array().unwrap().contains(&json!("inventory.json")));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6246,6 +7401,67 @@ expected_replacements = 1
                 labels: vec!["release-evidence".to_string()],
             }],
         }
+    }
+
+    /// The checked-in manifest must describe the checked-in tree. A porter
+    /// re-import applies each active `string-replace` row to the pristine
+    /// upstream file, so the on-disk file is what that application produced
+    /// only while the row's `replace` text is still IN it, `expected_replacements`
+    /// times. A row whose file was edited afterwards (measured 2026-09-24:
+    /// `trust.naming.run-make-version-prefix`, zero occurrences after the file
+    /// grew a lane-aware `match brand`) would make the next re-import silently
+    /// reinstate the stale text and drop the edit.
+    #[test]
+    fn checked_in_patch_manifest_replacements_are_present_in_the_tree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let manifest_path = root.join("tests/upstream-rust/patches.toml");
+        let manifest: PatchManifest =
+            toml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let mut checked = 0usize;
+        let mut stale = Vec::new();
+        // Two active rows with one path and one `find` (measured 2026-11-03: a
+        // merge kept both sides' ledger rows for the same input-stats repair)
+        // each see their `replace` once in the tree, so the count below passes
+        // both; but a re-import applies the first and leaves the second
+        // nothing to match, so the porter refuses the whole manifest.
+        let mut finds: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+        for patch in &manifest.patches {
+            if patch.status != PatchStatus::Active || patch.kind != PatchKind::StringReplace {
+                continue;
+            }
+            let rel = patch.path.as_deref().expect("string-replace row has a path");
+            let replace = patch.replace.as_deref().expect("string-replace row has replace");
+            let find = patch.find.as_deref().expect("string-replace row has find");
+            if let Some(first) = finds.insert((rel, find), patch.id.as_str()) {
+                stale.push(format!(
+                    "{}: same `find` in {rel} as the earlier active row {first}; a re-import \
+                     applies {first} and leaves this row nothing to match",
+                    patch.id
+                ));
+            }
+            let Ok(text) = fs::read_to_string(root.join(rel)) else {
+                if !patch.allow_missing {
+                    stale.push(format!("{}: target {rel} is missing", patch.id));
+                }
+                continue;
+            };
+            let expected = patch.expected_replacements.unwrap_or(1);
+            let found = text.matches(replace).count();
+            if found != expected {
+                stale.push(format!(
+                    "{}: `replace` occurs {found} time(s) in {rel}, expected {expected}",
+                    patch.id
+                ));
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no active string-replace rows were checked");
+        assert!(
+            stale.is_empty(),
+            "patches.toml rows no longer describe the checked-in files; update each row's \
+             `find`/`replace` to reproduce the file from pristine upstream:\n  {}",
+            stale.join("\n  ")
+        );
     }
 
     fn json_string_array(value: &Value) -> Vec<String> {

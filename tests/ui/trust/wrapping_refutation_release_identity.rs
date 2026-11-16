@@ -1,4 +1,5 @@
 //@ needs-trust-verify
+//@ revisions: release
 //@ compile-flags: -Ztrust-verify=on -O
 //@ check-pass
 //@ dont-require-annotations: NOTE
@@ -7,6 +8,9 @@
 //@ normalize-stderr: "elapsed_ms=\d+" -> "elapsed_ms=$$TIME"
 //@ normalize-stderr: "sha256:[0-9a-f]{64}" -> "sha256:$$DIGEST"
 //@ normalize-stderr: "trust-mc@\d+\.\d+\.\d+" -> "trust-mc@$$ENGINE"
+// -O parity (2026-09-25): `release` is a plain `-O` verifying session, which runs
+// the `-O0` MIR pipeline; since T6 a proof session refuses the options that would
+// add the MIR inliner or GVN, so this is the one release session there is.
 //! Release-mode identity pin for exact core wrapping calls outside the narrow
 //! E6 import lane. Signed and pointer-sized add/sub remain available to the
 //! full assertion-refutation model, while u128 remains a precise total

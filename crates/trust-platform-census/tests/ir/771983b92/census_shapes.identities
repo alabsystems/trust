@@ -1,0 +1,152 @@
+# Identities for 771983b92/census_shapes.trust_ir (held, platform-pass L0): ../census_shapes.identities as it
+# was when this dump was current.
+# Identities for census_shapes.trust_ir (the measurement stage1 trustc
+# 771983b92's dump of census_shapes.rs): what the compiler resolver (design
+# §2.2) would answer where the module's own names cannot. Read by
+# trust_platform_census::stub::SidecarContext.
+#
+# Positions are the producer's spans: line, 0-based column of the callee's
+# path (of the method name for a method call). The `effects` rows are EVERY
+# HIR call whose callee is not audited effect-free (trust_platform_census::
+# audit: `unwrap_or`, `is_ok`, `null`, `Box::new`, a `for` over an integer
+# range's desugared `into_iter`/`next`, … are skipped on both sides) —
+# foreign items, std callees, local bodies, upstream functions, indirect
+# calls (`<indirect>`) — read from census_shapes.rs (NOT from the dump):
+# I-EFFECTS-COVERED compares them with the trust-ir. Constructors (`Ok`,
+# `Strip { .. }`) are not calls. The HIR site census is the site-kind
+# subset of these rows plus the `site` rows (bodies the producer refused).
+# The `drops` rows are typeck's facts: the locals, temporaries and by-value
+# parameters whose drop glue may have a platform effect (an fd carrier, a
+# Drop impl), read from the source; an empty row is "none".
+
+# D4: the pub functions.
+body spawn_capped pub
+body spawn_full pub
+body spawn_ceiling pub
+body spawn_sysconf pub
+body spawn_setsid pub
+body hook_capped pub
+body hook_full pub
+body spawn_close_param pub
+body spawn_fcntl_cmd pub
+body spawn_recursive pub
+body spawn_after_id pub
+body spawn_upstream pub
+body spawn_indirect pub
+body spawn_full_inline pub
+body hook_full_inline pub
+body spawn_refused_helper pub
+body std_spawn pub
+body spawn_vfork pub
+body fork_returns pub
+body spawn_after_drop pub
+body spawn_erased_leak pub
+body spawn_dup_leak pub
+body spawn_boxed_fd pub
+body spawn_with_actions pub
+body spawn_after_pthread pub
+body spawn_pid_dependent pub
+body spawn_never_execs pub
+
+# libc's `WEXITSTATUS` is a Rust `const fn`, not a foreign item.
+upstream libc::WEXITSTATUS libc
+# Local `extern "C"` items (the producer mints them rustcc: increment S2).
+foreign ffi::vfork vfork
+foreign ffi::posix_spawn_file_actions_addclose posix_spawn_file_actions_addclose
+foreign ffi::pthread_create pthread_create
+# `Box::new` is alloc's.
+core "std::boxed::Box::<T>::new" alloc::boxed::Box::new
+# The producer refused this local body (B1a: `?` on io::Result).
+refused bound_from_env
+
+# The closure argument of each `pre_exec` instance (its DefPathHash).
+closure func.44 "install::{closure#0}"
+closure func.48 "hook_full_inline::{closure#0}"
+
+# The symbol census (C-3): `nm -u` of the libc rlib these dumps link
+# references no spawn-capable symbol (tests/ir/nm/liblibc.nm).
+spawners
+# The product census (C-7): the checked build's sites, nothing else ships.
+product-census
+
+effects fork_strip_exec 14:23=fork 17:42=fcntl 18:17=execv 18:42=_exit
+effects spawn_capped 25:4=fork_strip_exec
+effects spawn_full 30:4=fork_strip_exec
+effects ceiling
+effects spawn_ceiling 37:4=fork_strip_exec 37:35=ceiling
+effects spawn_sysconf 42:25=sysconf 43:4=fork_strip_exec
+effects spawn_setsid 48:23=fork 50:17=setsid 52:39=fcntl 53:17=execv 53:42=_exit
+effects install 61:12=std::os::unix::process::CommandExt::pre_exec
+effects "install::{closure#0}" 63:16=fcntl
+effects hook_capped 70:40=install
+effects hook_full 71:38=install
+effects spawn_close_param 75:13=close 76:4=fork_strip_exec
+effects spawn_fcntl_cmd 81:13=fcntl 82:4=fork_strip_exec
+effects depth 86:37=depth
+effects spawn_recursive 88:4=fork_strip_exec 88:35=depth
+effects spawn_after_id 93:13=std::process::id 95:4=fork_strip_exec
+effects spawn_upstream 100:14=fork_strip_exec 101:4=libc::WEXITSTATUS
+effects spawn_indirect 107:13=<indirect>
+effects spawn_full_inline 112:23=fork 115:39=fcntl 116:17=execv 116:42=_exit
+effects hook_full_inline 125:12=std::os::unix::process::CommandExt::pre_exec
+effects "hook_full_inline::{closure#0}" 127:16=fcntl
+effects spawn_refused_helper 141:16=bound_from_env 142:4=fork_strip_exec
+effects std_spawn 146:50=std::process::Command::spawn
+# Bodies the producer refused: their HIR sites.
+site pspawn 161:13=posix_spawn
+site spawn_with_thread 179:13=std::thread::spawn
+effects spawn_vfork 165:39=vfork
+effects fork_returns 168:40=fork
+effects spawn_after_drop 173:4=std::mem::drop 174:4=fork_strip_exec
+# The `for` loop's `dup` is in the HIR; the producer's summary erased it (S1).
+effects dup_stdout_for 187:53=dup
+effects spawn_erased_leak 189:23=fork 192:39=fcntl 193:8=dup_stdout_for 194:17=execv 194:42=_exit
+effects dup_stdout_while 200:68=dup
+effects spawn_dup_leak 202:23=fork 205:39=fcntl 206:8=dup_stdout_while 207:17=execv 207:42=_exit
+effects spawn_boxed_fd 216:14=fork_strip_exec 217:4=std::mem::drop
+effects spawn_with_actions 224:13=posix_spawn_file_actions_addclose 225:4=fork_strip_exec
+effects worker
+effects spawn_after_pthread 233:13=pthread_create 234:4=fork_strip_exec
+effects spawn_pid_dependent 240:28=getpid 241:4=fork_strip_exec
+effects spawn_never_execs 246:23=fork 248:17=_exit
+
+# typeck drop facts: every body with an effects row; the fd carriers below.
+drops fork_strip_exec
+drops spawn_capped
+drops spawn_full
+drops ceiling
+drops spawn_ceiling
+drops spawn_sysconf
+drops spawn_setsid
+drops install
+drops "install::{closure#0}"
+drops hook_capped
+drops hook_full
+drops spawn_close_param
+drops spawn_fcntl_cmd
+drops depth
+drops spawn_recursive
+drops spawn_after_id
+drops spawn_upstream
+drops spawn_indirect
+drops spawn_full_inline
+drops hook_full_inline
+drops "hook_full_inline::{closure#0}"
+# `bound_from_env()?`'s io::Result<i32> temporary: io::Error's glue frees
+# memory only (a payload's drop is judged where it is boxed).
+drops spawn_refused_helper
+# `cmd.spawn()`'s io::Result<Child> temporary: a Child owns its pipe ends.
+drops std_spawn std::process::Child
+drops spawn_vfork
+drops fork_returns
+drops spawn_after_drop std::os::fd::OwnedFd
+drops dup_stdout_for
+drops spawn_erased_leak
+drops dup_stdout_while
+drops spawn_dup_leak
+drops spawn_boxed_fd std::os::fd::OwnedFd
+drops spawn_with_actions
+drops worker
+drops spawn_after_pthread
+drops spawn_pid_dependent
+drops spawn_never_execs

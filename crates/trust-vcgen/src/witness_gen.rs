@@ -137,42 +137,30 @@ impl WitnessGenerator {
             ));
         }
 
-        // Extract variable names from constraints and property.
-        let mut variables = Vec::new();
-        let all_text: Vec<&str> =
-            constraints.iter().copied().chain(std::iter::once(property)).collect();
+        // Extract variable names from constraints and property and build assignments in one pass.
+        let mut assignments = Vec::new();
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        let prefer_small = self.config.prefer_small_values;
 
-        for text in &all_text {
+        for text in constraints.iter().copied().chain(std::iter::once(property)) {
             for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
                 if !token.is_empty()
                     && token.chars().next().is_some_and(|c| c.is_alphabetic())
                     && !is_keyword(token)
-                    && !variables.contains(&token.to_string())
+                    && seen.insert(token)
                 {
-                    variables.push(token.to_string());
+                    let i = assignments.len();
+                    let value = if prefer_small { default_small_value(i) } else { default_value(i) };
+                    assignments.push(WitnessAssignment { variable: token.to_string(), value });
                 }
             }
         }
 
-        if variables.is_empty() {
+        if assignments.is_empty() {
             return Err(WitnessError::GenerationFailed(
                 "no variables found in property or constraints".to_string(),
             ));
         }
-
-        // Generate assignments respecting config.
-        let assignments: Vec<WitnessAssignment> = variables
-            .into_iter()
-            .enumerate()
-            .map(|(i, var)| {
-                let value = if self.config.prefer_small_values {
-                    default_small_value(i)
-                } else {
-                    default_value(i)
-                };
-                WitnessAssignment { variable: var, value }
-            })
-            .collect();
 
         Ok(Witness { assignments, property: property.to_string(), is_valid: true })
     }
@@ -211,8 +199,14 @@ impl WitnessGenerator {
             let _ = writeln!(out, "    let {} = {};", assign.variable, assign.value);
         }
 
-        let args: Vec<&str> = witness.assignments.iter().map(|a| a.variable.as_str()).collect();
-        let _ = writeln!(out, "    let _result = {function_name}({});", args.join(", "));
+        let _ = write!(out, "    let _result = {function_name}(");
+        for (i, assign) in witness.assignments.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&assign.variable);
+        }
+        out.push_str(");\n");
         let _ = writeln!(out, "    // Property: {}", witness.property);
         out.push_str("}\n");
         out

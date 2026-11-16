@@ -12,7 +12,6 @@
 //!     will still not cause any further changes.
 //!
 
-use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
@@ -21,7 +20,9 @@ use rustc_mir_dataflow::debuginfo::debuginfo_locals;
 use rustc_mir_dataflow::impls::{
     LivenessTransferFunction, MaybeTransitiveLiveLocals, borrowed_locals,
 };
+use rustc_span::bug;
 
+use crate::PassPolicy;
 use crate::simplify::UsedInStmtLocals;
 use crate::util::most_packed_projection;
 
@@ -36,6 +37,30 @@ fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
     // If the user requests complete debuginfo, mark the locals that appear in it as live, so
     // we don't remove assignments to them.
     let debuginfo_locals = debuginfo_locals(body);
+
+    let has_candidates = body.basic_blocks.iter().any(|bb_data| {
+        (if let TerminatorKind::Call { ref args, .. } = bb_data.terminator().kind {
+            args.iter().any(|a| {
+                matches!(
+                    a.node,
+                    Operand::Copy(place)
+                        if !place.is_indirect() && !borrowed_locals.contains(place.local)
+                )
+            })
+        } else {
+            false
+        }) || bb_data.statements.iter().any(|stmt| {
+            MaybeTransitiveLiveLocals::can_be_removed_if_dead(
+                &stmt.kind,
+                &borrowed_locals,
+                &debuginfo_locals,
+            )
+            .is_some()
+        })
+    });
+    if !has_candidates {
+        return false;
+    }
 
     let mut live = MaybeTransitiveLiveLocals::new(&borrowed_locals, &debuginfo_locals)
         .iterate_to_fixpoint(tcx, body, None)
@@ -61,6 +86,13 @@ fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
                 visit::PlaceContext::MutatingUse(visit::MutatingUseContext::Call),
                 loc,
             );
+
+            // The logic in LivenessTransferFunction isn't quite what we need; it ignores call
+            // destinations that are just locals because they are killed by the call, which makes
+            // it eligible to be moved-from in the argument list. That's backwards.
+            if !destination.is_indirect() {
+                state.insert(destination.local);
+            }
 
             for (index, arg) in args.iter().map(|a| &a.node).enumerate().rev() {
                 if let Operand::Copy(place) = *arg
@@ -140,8 +172,8 @@ impl<'tcx> crate::MirPass<'tcx> for DeadStoreElimination {
         }
     }
 
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() >= 2
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 2)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -151,9 +183,5 @@ impl<'tcx> crate::MirPass<'tcx> for DeadStoreElimination {
                 data.strip_nops();
             }
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }

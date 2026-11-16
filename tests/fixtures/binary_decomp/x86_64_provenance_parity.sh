@@ -79,7 +79,7 @@ out_path.write_bytes(data)
 PY
 
 echo "--- disasm provenance: trust-disasm keeps original bytes for MOVABS"
-trust_cargo test --manifest-path "$TRUST_ROOT/crates/Cargo.toml" -p trust-disasm \
+trust_cargo test --manifest-path "$TRUST_ROOT/Cargo.toml" -p trust-disasm \
     x86_64::tests::test_original_bytes_preserved_for_10_byte_instruction
 
 mkdir -p "$TMP_DIR/disasm-json/src"

@@ -7,6 +7,15 @@
 //! reshaped ny-cert wrappers (selfcheck::check_entailment /
 //! check_farkas, branch::check_branch_tree) and the ORIGINAL
 //! check_farkas `Not(is_positive)` / `is_negative` two-def join.
+//!
+//! ORD-WITNESS-CONSISTENT-1 (2026-10-05): a pair guard is credited only on a
+//! payload type the COMPILER established order-consistent
+//! (`CalleeSummaryContext::with_order_consistent_adts`). The positive pair
+//! tests below run under a context that admits `rational::Rat`, which is what
+//! they test (the guard-to-pin mechanics), not a claim that ny-cert's real
+//! `Rat` would be admitted: its `Ord` is hand-written and the compiler does not
+//! admit it. The sign lane is retired, so its two shapes are now pinned
+//! fail-closed.
 
 use trust_types::{
     AggregateKind, BasicBlock, BlockId, ConstValue, Contract, ContractKind, Formula, LocalDecl,
@@ -14,7 +23,7 @@ use trust_types::{
     VariantDef, VcKind, VerifiableBody, VerifiableFunction,
 };
 
-use super::{generate_v2_contract_vcs_impl, parse_ok_pair_model_var, parse_sign_model_var};
+use super::{generate_v2_contract_vcs_impl, parse_ok_pair_model_var};
 
 const OK0: &str = "_0__value.__trust_ok_0";
 const OK1: &str = "_0__value.__trust_ok_1";
@@ -25,10 +34,14 @@ fn i64_ty() -> Ty {
 }
 
 fn rat_ty() -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "rational::Rat".into(),
-        fields: vec![("id".into(), Ty::Int { width: 32, signed: false })],
-        variants: vec![],
+        fields: vec![("id".into(), Ty::Int { width: 32, signed: false })].into(),
+        variants: vec![].into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -46,13 +59,18 @@ fn ref_rat_ty() -> Ty {
 /// `std::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
+    Ty::Adt {
+        arbitrary_precision: None,
+        validity_wrapper: None,
+        adt_kind: None,
+        layout: None,
         name: "std::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
             ("__v0_0".into(), ok_payload.clone()),
             ("__v1_0".into(), i64_ty()),
-        ],
+        ]
+        .into(),
         variants: vec![
             VariantDef {
                 name: "Ok".into(),
@@ -64,7 +82,8 @@ fn result_ty(ok_payload: Ty) -> Ty {
                 discriminant: 1,
                 fields: vec![("0".into(), i64_ty())],
             },
-        ],
+        ]
+        .into(),
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
@@ -97,6 +116,7 @@ fn func_with(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -115,6 +135,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Termina
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         unwind: Default::default(),
     }
 }
@@ -190,15 +211,44 @@ fn has_ok_discr_pin(f: &Formula) -> bool {
     })
 }
 
-fn postcondition_vcs(func: &VerifiableFunction) -> Vec<trust_types::VerificationCondition> {
+/// The compiler-established order-consistent set most tests generate under:
+/// the fixture payload type `rational::Rat` (see the module doc).
+const RAT_CONSISTENT: &[&str] = &["rational::Rat"];
+
+/// Generate `func`'s contract VCs with `consistent` installed as the
+/// compiler's order-consistent ADT set (empty = the default context's set).
+fn contract_vcs_under(
+    func: &VerifiableFunction,
+    consistent: &[&str],
+) -> Vec<trust_types::VerificationCondition> {
+    let _guard = crate::enter_test_callee_summaries(
+        crate::CalleeSummaryContext::default().with_order_consistent_adts(
+            consistent.iter().map(|name| (*name).to_string()).collect(),
+        ),
+    );
     generate_v2_contract_vcs_impl(func, None)
+}
+
+fn postcondition_vcs(func: &VerifiableFunction) -> Vec<trust_types::VerificationCondition> {
+    postcondition_vcs_under(func, RAT_CONSISTENT)
+}
+
+fn postcondition_vcs_under(
+    func: &VerifiableFunction,
+    consistent: &[&str],
+) -> Vec<trust_types::VerificationCondition> {
+    contract_vcs_under(func, consistent)
         .into_iter()
         .filter(|vc| matches!(vc.kind, VcKind::Postcondition))
         .collect()
 }
 
 fn ungrounded_details(func: &VerifiableFunction) -> Vec<String> {
-    generate_v2_contract_vcs_impl(func, None)
+    ungrounded_details_under(func, RAT_CONSISTENT)
+}
+
+fn ungrounded_details_under(func: &VerifiableFunction, consistent: &[&str]) -> Vec<String> {
+    contract_vcs_under(func, consistent)
         .into_iter()
         .filter_map(|vc| match vc.kind {
             VcKind::UnsupportedMir { kind, detail, .. }
@@ -635,7 +685,7 @@ fn sign_not_hop_fn() -> VerifiableFunction {
 }
 
 #[test]
-fn ok_pair_and_sign_model_var_parsers_are_strict() {
+fn ok_pair_model_var_parser_is_strict() {
     let v = parse_ok_pair_model_var(OK0).expect("tuple-bind shape parses");
     assert_eq!((v.name.as_str(), v.index), (OK0, 0));
     // Versioned copies parse to the BASE name.
@@ -645,11 +695,33 @@ fn ok_pair_and_sign_model_var_parsers_are_strict() {
     assert!(parse_ok_pair_model_var("_0__value.__trust_ok_").is_none());
     assert!(parse_ok_pair_model_var("_0__value.0").is_none());
     assert!(parse_ok_pair_model_var("x.__trust_ok_0").is_none());
-    assert_eq!(parse_sign_model_var("_0__value__sign").as_deref(), Some(SIGN));
-    assert_eq!(parse_sign_model_var("_0__value__sign#s2_1").as_deref(), Some(SIGN));
-    assert!(parse_sign_model_var("c_sign").is_none());
-    assert!(parse_sign_model_var("_0__value__sign.0").is_none());
-    assert!(parse_sign_model_var("_0__value").is_none());
+}
+
+#[test]
+fn pair_guard_on_a_type_the_compiler_did_not_establish_stays_fail_closed() {
+    // SOUNDNESS PIN (ORD-WITNESS-CONSISTENT-1): the same guarded wrapper the
+    // positive tests credit, generated with the payload type ABSENT from the
+    // compiler's order-consistent set — the default (empty) set, and a set
+    // naming only other types, one of them a prefix of the payload's own name.
+    // The `gt` guard says nothing a contract atom over the integer order may
+    // use, because nothing established that this type's `le`/`gt` agree. The
+    // pair stays uncredited: no refutable Postcondition VC, one
+    // SpecModelUngrounded row naming both terms.
+    for consistent in [&[][..], &["rational::Ra", "rational::Rat2", "other::Rat"][..]] {
+        let func = pair_wrapper_fn("gt", true, false, GT_PAIR_ENSURES);
+        assert!(
+            postcondition_vcs_under(&func, consistent).is_empty(),
+            "a type outside {consistent:?} must not reach the refutable lane"
+        );
+        let details = ungrounded_details_under(&func, consistent);
+        assert_eq!(details.len(), 1, "{consistent:?}: {details:#?}");
+        assert!(details[0].contains(OK0) && details[0].contains(OK1), "{}", details[0]);
+    }
+    // The direction-guard shape too: its {Lt} ∪ {Gt} join is a claim about the
+    // type's `lt`/`gt` agreeing with its `==`.
+    let func = direction_pair_wrapper_fn();
+    assert!(postcondition_vcs_under(&func, &[]).is_empty());
+    assert_eq!(ungrounded_details_under(&func, &[]).len(), 1);
 }
 
 #[test]
@@ -689,23 +761,26 @@ fn guarded_pair_wrapper_grounds_ordering_atom_on_guard_bool() {
     }
 }
 
+/// ARGS-FINGERPRINT-READ-1 round 3 (2026-10-07): REVERSED. This test used to pin
+/// that the duplicate-crate-name argument tag was read past ("identity-only"). Since
+/// round 2 the producer writes the tag exactly when a def in the call's generic
+/// arguments (`Self`/`Rhs` of this `PartialOrd` method) lives in a crate whose
+/// rendered name does not identify it, so the rendered `Self` this reader matches may
+/// be a same-named crate's type. A type-path reader declines on it: the guard grounds
+/// nothing and the atom stays at the fail-closed `SpecModelUngrounded` Unknown.
 #[test]
-fn monomorphized_partial_ord_callee_grounds_ordering_atom() {
+fn crate_ambiguous_tagged_partial_ord_callee_stays_ungrounded() {
     let func = pair_wrapper_fn(
         "gt::<__trust_args@0123456789abcdef0123456789abcdef>",
         true,
         false,
         GT_PAIR_ENSURES,
     );
-    assert!(ungrounded_details(&func).is_empty(), "the exact extractor tag is identity-only");
-    let vcs = postcondition_vcs(&func);
-    let ok_vc = ok_path_vc(&vcs);
-    assert!(
-        subformula_has(&ok_vc.formula, &|f| matches!(f, Formula::Le(l, r)
-            if var_is(l, OK0) && var_is(r, OK1))),
-        "the tagged PartialOrd::gt guard must pin ok_0 <= ok_1: {:#?}",
-        ok_vc.formula
-    );
+    assert!(postcondition_vcs(&func).is_empty(), "a tagged guard must not gain witness authority");
+    assert_eq!(ungrounded_details(&func).len(), 1, "the tagged guard must fail closed");
+    // Control: the untagged spelling of the same guard is credited.
+    let func = pair_wrapper_fn("gt", true, false, GT_PAIR_ENSURES);
+    assert!(ungrounded_details(&func).is_empty(), "the untagged pair must be credited");
 }
 
 #[test]
@@ -761,41 +836,32 @@ fn two_def_direction_guard_grounds_disequality() {
 }
 
 #[test]
-fn sign_guard_grounds_sign_atom_on_guard_bool() {
-    // The reshaped check_farkas shape: `is_positive(c)` with Err on the
-    // true edge — the Ok edge admits {Lt, Eq}, pinned `sign <= 0`, which
-    // contradicts the negated `!(… if c.is_positive())` obligation
-    // (`sign > 0`).
+fn sign_guard_is_not_credited() {
+    // ORD-WITNESS-CONSISTENT-1: the reshaped check_farkas shape —
+    // `is_positive(c)` with Err on the true edge — used to pin `sign <= 0`
+    // from the guard and prove the negated `!(… if c.is_positive())`. Three
+    // user inherent methods need not agree (an `is_negative` and an
+    // `is_positive` that both answer `true` made that a false proof), so the
+    // sign lane is retired: no refutable VC, the sign term stays ungrounded —
+    // even under a context that admits the payload type's ORDER.
     let func = sign_wrapper_fn();
-    assert!(ungrounded_details(&func).is_empty(), "sign term must be credited");
-    let vcs = postcondition_vcs(&func);
-    assert_eq!(vcs.len(), 3, "extract-Err + guard-Err + Ok paths: {vcs:#?}");
-    let ok_vc = ok_path_vc(&vcs);
-    assert!(
-        subformula_has(&ok_vc.formula, &|f| matches!(f, Formula::Le(l, r)
-            if var_is(l, SIGN) && matches!(&**r, Formula::Int(0)))),
-        "Ok path must pin sign <= 0: {:#?}",
-        ok_vc.formula
-    );
+    assert!(postcondition_vcs(&func).is_empty(), "the sign term must not be credited");
+    let details = ungrounded_details(&func);
+    assert_eq!(details.len(), 1, "{details:#?}");
+    assert!(details[0].contains(SIGN), "{}", details[0]);
 }
 
 #[test]
-fn not_hop_and_is_negative_defs_join_to_le() {
+fn not_hop_and_is_negative_defs_are_not_credited() {
     // The ORIGINAL check_farkas contradiction bool: one def is
-    // `Not(is_positive(c))` (statement Not over a call dest), the other
-    // the `is_negative(c)` call dest; Ok on the TRUE edge. Per-def
-    // true-edge facts complement({Gt}) = {Lt, Eq} and {Lt} join to
-    // {Lt, Eq} — pinned `sign <= 0`.
+    // `Not(is_positive(c))`, the other the `is_negative(c)` call dest; Ok on
+    // the TRUE edge. Its old {Lt, Eq} join read `is_positive` and
+    // `is_negative` as one trichotomy. Retired with the sign lane: fail closed.
     let func = sign_not_hop_fn();
-    assert!(ungrounded_details(&func).is_empty(), "sign term must be credited");
-    let vcs = postcondition_vcs(&func);
-    let ok_vc = ok_path_vc(&vcs);
-    assert!(
-        subformula_has(&ok_vc.formula, &|f| matches!(f, Formula::Le(l, r)
-            if var_is(l, SIGN) && matches!(&**r, Formula::Int(0)))),
-        "Ok path must pin sign <= 0: {:#?}",
-        ok_vc.formula
-    );
+    assert!(postcondition_vcs(&func).is_empty(), "the sign term must not be credited");
+    let details = ungrounded_details(&func);
+    assert_eq!(details.len(), 1, "{details:#?}");
+    assert!(details[0].contains(SIGN), "{}", details[0]);
 }
 
 #[test]
@@ -885,4 +951,21 @@ fn discreteness_shaped_contracts_stay_fail_closed() {
     let details = ungrounded_details(&func);
     assert_eq!(details.len(), 1, "{details:#?}");
     assert!(details[0].contains(SIGN), "{}", details[0]);
+}
+
+/// ARGS-FINGERPRINT-READ-1 round 3 (2026-10-07): `partial_ord_witness_facts` is a
+/// TYPE-PATH reader (it matches the rendered `Self` type), so a callee carrying the
+/// duplicate-crate-name argument tag — "a type in these arguments may be a
+/// same-named crate's" — is declined, never matched past. Round 2 stripped the tag
+/// here; with that strip restored this test fails on the tagged spellings.
+#[test]
+fn partial_ord_witness_declines_a_crate_ambiguous_tagged_callee() {
+    use super::witness_grounding::partial_ord_witness_facts;
+    let ty = "rational::Rat";
+    for method in ["lt", "le", "gt", "ge"] {
+        let plain = format!("<{ty} as core::cmp::PartialOrd>::{method}");
+        assert!(partial_ord_witness_facts(&plain, ty).is_some(), "{plain}");
+        let tagged = format!("{plain}{}", trust_types::render_trailing_args_fingerprint(0x1, 0x23));
+        assert!(partial_ord_witness_facts(&tagged, ty).is_none(), "{tagged}");
+    }
 }

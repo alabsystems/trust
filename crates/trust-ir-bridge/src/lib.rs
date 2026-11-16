@@ -42,7 +42,10 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
 
-mod cache_key;
+// Trust (job L1 / A-LIN): artifact-lineage attestation — the digest chain that
+// makes the per-body module the flip consumes, the assembled crate artifact a
+// proof pins, and the MIR re-derived at the flip provably the SAME OBJECT.
+pub mod artifact_lineage;
 // trust-ir-spine VERDICT FLIP: make trust-ir the verdict source of record for
 // L0 safety obligations, verdict-identically (see `flip.rs`).
 mod flip;
@@ -51,10 +54,7 @@ mod layout_evidence;
 /// local's definitions (see the module doc).
 mod local_defs;
 
-/// The bridge seam's single-value question, exposed for the PARITY row that measures
-/// it against `trust_vcgen::local_defs` (`tests/local_defs_parity.rs`). The bridge
-/// cannot depend on trust-vcgen at build time, so the two seams are two functions and
-/// the implication between them has to be measured rather than assumed.
+/// The bridge's single-value question, exposed for the shared-definition regression.
 #[doc(hidden)]
 pub fn local_defs_holds_one_value_for_test(
     func: &trust_types::VerifiableFunction,
@@ -63,10 +63,7 @@ pub fn local_defs_holds_one_value_for_test(
     local_defs::holds_one_value(func, local)
 }
 
-/// The bridge seam's RESOLVER, exposed for the same parity row. The resolver is the
-/// more dangerous of the two faces — its answer is INLINED into a formula, so a wrong
-/// one cannot be rebound by version renaming afterwards — so the two seams have to be
-/// measured against each other here too, not only on the count.
+/// The bridge's resolver, exposed for the same regression.
 #[doc(hidden)]
 pub fn local_defs_unique_value_def_is_some_for_test(
     func: &trust_types::VerifiableFunction,
@@ -74,7 +71,34 @@ pub fn local_defs_unique_value_def_is_some_for_test(
 ) -> bool {
     local_defs::unique_value_def(func, local).is_some()
 }
+
+/// Exact answers, so the regression checks the chosen definition as well as
+/// admission. Both consumers use the shared reducer while retaining their own
+/// traversal and escape classification.
+#[doc(hidden)]
+pub fn local_defs_exact_for_test(
+    func: &trust_types::VerifiableFunction,
+    local: usize,
+) -> (trust_types::ValueCount, Option<&trust_types::Rvalue>, Option<&trust_types::Terminator>) {
+    let summary = local_defs::summarize(func, local);
+    let call = summary
+        .unique_value_call_index(&func.body)
+        .map(|block| &func.body.blocks[block].terminator);
+    (summary.value_count(), summary.unique_value_def().map(|(_, value)| value), call)
+}
 mod lower;
+// Trust (C1, 2026-11-06): source reference sites recorded before type erasure.
+mod source_reference_sites;
+#[doc(hidden)]
+pub use lower::{local_stability_for_test, native_math_stability_for_test};
+mod physical_body_walk;
+#[cfg(test)]
+mod physical_enum_tests;
+#[cfg(test)]
+mod physical_struct_construction_tests;
+mod physical_types;
+#[cfg(test)]
+mod physical_types_tests;
 // Obligation-birth cutover SCORECARD (Stage C/D entry instrument): per-class
 // aggregation of the flip's NativeGenOutcome into a measured artifact. The
 // corpus walk lives in examples/ (it needs the trust-vcgen dev-dependency).
@@ -104,7 +128,14 @@ mod vcgen_proto;
 // `contract_vcgen_proto.rs` and `docs/TRUST_IR_SPINE.md` Phase 2 (L1).
 mod contract_vcgen_proto;
 
-pub use cache_key::module_stable_content_hash;
+// trust-ir v50 uniform arrays: the ONE spelling rule for `[x; N]` and a uniform array's
+// sub-array, shared with the THIR producer so the differential pairs one spelling.
+pub mod uniform_array;
+
+pub use artifact_lineage::{
+    BodyLineage, BuildIdentity, CalleeIdentity, CalleeRemap, CrateLineage, LineageError,
+    RemapCertificate, callee_ledger_digest, verify_covered_by_artifact, verify_flip_lineage,
+};
 // Phase-2 prototype: trust-ir-native L1 contract VC generation (shadow mode).
 pub use contract_vcgen_proto::{TrustIrContractVc, contract_vcs_from_trust_ir};
 pub use flip::{
@@ -112,48 +143,66 @@ pub use flip::{
     flip_contract_verdicts_to_spine, flip_contract_verdicts_with_module,
     flip_safety_verdicts_to_spine, flip_safety_verdicts_with_module,
     generate_native_or_flip_safety_vcs, generate_native_or_flip_safety_vcs_with_discharged,
-    generate_native_or_flip_safety_vcs_with_reachability,
-    l0_obligation_set_diff, l0_obligation_set_diff_with_discharged,
+    generate_native_or_flip_safety_vcs_with_module,
+    generate_native_or_flip_safety_vcs_with_reachability, l0_obligation_set_diff,
+    l0_obligation_set_diff_with_discharged,
 };
 pub use layout_evidence::{
     TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_FEATURE, TRUST_IR_LAYOUT_EVIDENCE_BLOCKER_STAGE,
     TRUST_IR_LAYOUT_EVIDENCE_COMMIT, TrustIrLayoutSensitiveCastBlocker,
     collect_layout_sensitive_cast_blockers, ensure_layout_sensitive_cast_evidence,
 };
-pub use lower::CoroutineUpvarFramesGuard;
-#[cfg(feature = "compiler-context")]
-pub use lower::lower_to_trust_ir_functions_with_compiler_context;
-// Trust (bundled-member derived preconditions — the bundled-Assert remedy):
-// the entry-prefix div/rem requires derivation and its fail-closed admission
-// classification for would-be-bundled members.
 pub use lower::{
-    BundledMemberAssertAdmission, bundled_member_assert_admission,
-    member_entry_prefix_assert_requires,
-};
-pub use lower::{
-    BinOpMapping, BridgeError, CoroutineResumeContractModuleEvidence, NativeBoolPredSummary,
-    NativeCalleeSummaryContext, NativeCalleeSummaryGuard, SYMBOLIC_AGGREGATE_ATTR_FIELD_COUNT,
+    BinOpMapping, BridgeError, CallReachWithdrawals, CompilerAllocGrowPins,
+    CoroutineResumeContractModuleEvidence, CoroutineUpvarFramesGuard, DROP_REACH_UNDECIDED,
+    InstanceHypothesisSites, ModuleContextProbe, NativeBoolPredSummary, NativeCalleeSummaryContext,
+    NativeCalleeSummaryGuard, OwnedSequenceAccess, SYMBOLIC_AGGREGATE_ATTR_FIELD_COUNT,
     SYMBOLIC_AGGREGATE_ATTR_KIND, SYMBOLIC_AGGREGATE_OP, SYMBOLIC_FORMULA_ATTR_CONTEXT,
     SYMBOLIC_FORMULA_ATTR_DEBUG, SYMBOLIC_FORMULA_ATTR_JSON, SYMBOLIC_FORMULA_ATTR_SCHEMA,
     SYMBOLIC_FORMULA_ATTR_SMTLIB, SYMBOLIC_FORMULA_ATTR_SORT, SYMBOLIC_FORMULA_DIALECT,
-    SYMBOLIC_FORMULA_OP, SYMBOLIC_MEMORY_STATE_OP, TRUST_OBLIGATION_SOURCE_SCHEMA,
-    callee_is_recognized_total_no_panic,
-    callee_is_slice_sort_comparator_family,
-    closure_body_is_total_ord_key_comparator,
-    coroutine_resume_contract_module_evidence,
-    fmt_format_call_is_total,
-    generate_native_safety_vcs,
-    generate_native_safety_vcs_with_reachability,
-    is_diverging_panic_site_obligation_description,
-    is_panicking_primitive_int_div_method,
-    lower_functions_to_trust_ir,
-    lower_to_trust_ir,
-    lower_to_trust_ir_function,
-    lower_to_trust_ir_functions,
-    lower_to_trust_ir_functions_with_abi_total_context,
+    SYMBOLIC_FORMULA_OP, SYMBOLIC_MEMORY_STATE_OP, SurvivorProbe, SurvivorProbeStats,
+    SurvivorRound, TRUST_OBLIGATION_SOURCE_SCHEMA, callee_is_recognized_total_no_panic,
+    callee_is_slice_sort_comparator_family, closure_body_is_total_ord_key_comparator,
+    closure_driving_consumer_call, coroutine_resume_contract_module_evidence,
+    fmt_format_call_is_total, generate_native_safety_vcs, generate_native_safety_vcs_with_module,
+    generate_native_safety_vcs_with_reachability, is_diverging_panic_site_obligation_description,
+    is_panicking_primitive_int_div_method, is_vec_index_removal_method_path,
+    lower_functions_to_trust_ir, lower_to_trust_ir, lower_to_trust_ir_function,
+    lower_to_trust_ir_functions, lower_to_trust_ir_functions_with_abi_total_context,
     lower_to_trust_ir_functions_with_assumed_total_context,
     lower_to_trust_ir_functions_with_context, lower_to_trust_ir_functions_with_expected_absent,
     map_binop, map_type, map_unop, pin_enum_tag_lane, verifiable_function_lowers_in_module_context,
+};
+// Trust (bundled-member derived preconditions — the bundled-Assert remedy):
+// the entry-prefix div/rem/bounds requires derivation and its fail-closed
+// admission classification for would-be-bundled members, plus the exact
+// recognizer that tells the extractor's always-true integer type-range
+// invariant apart from a DECLARED member contract (the gate's "contract-less
+// only" arm must refuse the second and only the second).
+pub use lower::{
+    BundledConstructorCallSite,
+    BundledConstructorSafetySite,
+    BundledMemberAssertAdmission,
+    // Trust (2026-09-29): the typed class of a `Refused` admission, which the
+    // compiler's bundled std-member disposition reads instead of the reason text.
+    MemberAssertRefusalClass,
+    bundled_constructor_call_sites,
+    bundled_constructor_formal_names,
+    bundled_constructor_local_safety_sites,
+    bundled_constructor_rebind_requirement,
+    bundled_member_assert_admission,
+    // Trust (BoundsCheck lane): the CALL-SITE half of the derived-charge
+    // discipline — the derived `<formal>__slice_len` spelling is substituted
+    // conditionally, not unconditionally, so the gate must check each regenerated
+    // caller-side row for a surviving member name rather than assume totality.
+    derived_member_length_var_survives,
+    member_entry_prefix_assert_requires,
+    member_precondition_is_integer_param_type_range,
+};
+#[cfg(feature = "compiler-context")]
+pub use lower::{
+    lower_compiler_relaxed_xadd_u64_body, lower_to_trust_ir_functions_with_compiler_context,
+    lower_to_trust_ir_functions_with_instance_hypothesis_context,
 };
 // Explicit names for production call sites that still require the MIR migration
 // adapter. The historical short names remain for API compatibility, but new
@@ -164,9 +213,15 @@ pub use lower::{
     lower_to_trust_ir_functions_with_context as lower_mir_compat_functions_to_trust_ir_with_context,
 };
 pub use native_request::{
-    NativeBundleOwner, NativeVerificationBundleBuildError,
-    TRUST_NATIVE_REQUEST_TRANSFORM_VERSION, native_verification_bundle_from_module,
-    native_verification_bundle_from_module_owners,
+    NativeBundleOwner, NativeVerificationBundleBuildError, TRUST_NATIVE_REQUEST_TRANSFORM_VERSION,
+    native_verification_bundle_from_module, native_verification_bundle_from_module_owners,
+    trust_mc_chc_request_options,
+};
+#[cfg(any(test, feature = "direct-contract-shadow"))]
+mod direct_contract_shadow;
+#[cfg(any(test, feature = "direct-contract-shadow"))]
+pub use direct_contract_shadow::{
+    DirectContractShadowQuestion, direct_contract_shadow_verification_bundle,
 };
 pub use native_shadow_request::{
     DIRECT_SHADOW_ADMITTED_SOURCE_ID, DIRECT_SHADOW_NON_APPLYING_CHECKS,
@@ -198,6 +253,10 @@ pub use provenance::{
     attach_decompilation_binary_provenance, canonical_binary_provenance_target_blockers,
     collect_canonical_binary_provenance, lower_decompilation_artifact_to_trust_ir,
 };
+pub use source_reference_sites::{
+    LoweredSourceReferenceSites, ReconciledSourceReferenceLoad, ReconciledSourceReferenceParameter,
+    ReconciledSourceReferenceSites, ReconciledSourceReferenceValue,
+};
 pub use trust_ir::{
     NATIVE_VERIFICATION_BUNDLE_SCHEMA_VERSION, NativeAdapterInput, NativeAssertionId,
     NativeBundleProducer, NativeDiagnosticsPolicy, NativeObligationCause, NativeObligationSource,
@@ -217,11 +276,27 @@ pub use vcgen_proto::{
 #[cfg(test)]
 mod tests;
 
-// Per-phase flat-tax measurement (lower vs vcgen) over the committed fixtures;
-// grounds the warm-rebuild artifact-cache economics. Prints under
-// TRUST_FLAT_TAX_MEASURE=1.
+// DIVERGE-ANCHOR-1 / DIVERGE-ENTRY-1: the diverging-site arm takes its encoding only
+// for a callee whose `callee_key` carries the extractor's `diverging_entry` stamp (a
+// real sysroot crate, not a trait item, the generic-free definition path). Also hosts
+// the key helpers the older diverging-site fixtures use.
 #[cfg(test)]
-mod flat_tax_measure;
+mod diverging_site_anchor_tests;
+
+// CLOSURE-ABSENT-CALLEE (fix6): a `Fn*::call*` shim whose closure body is not in
+// the bundle lowers as a fail-closed absent callee with its capture effects havocked.
+#[cfg(test)]
+mod absent_closure_body_tests;
+
+// BMC-LANE-1: the one-field newtype cast and the empty array, each one complete
+// constructor that the reference interpreter runs.
+#[cfg(test)]
+mod complete_constructor_cast_tests;
+
+// R146-SPELLING-1: the integer cast into `Option<NonZero<..>>` is one stamped
+// havoc under every spelling the extractor writes, on both lanes.
+#[cfg(test)]
+mod r146_option_nonzero_cast_tests;
 
 // Trust: curated soundness+completeness oracle for the bridge call-summary decision
 // (rung-1 precision frontier + false-proof regression guard).

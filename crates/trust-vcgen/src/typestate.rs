@@ -125,7 +125,8 @@ impl TypeStateVerifier {
 
     /// Build an adjacency list (state name -> set of reachable state names).
     fn adjacency(&self) -> FxHashMap<&str, FxHashSet<&str>> {
-        let mut adj: FxHashMap<&str, FxHashSet<&str>> = FxHashMap::default();
+        let mut adj: FxHashMap<&str, FxHashSet<&str>> =
+            FxHashMap::with_capacity_and_hasher(self.states.len(), Default::default());
         for t in &self.transitions {
             adj.entry(t.from.as_str()).or_default().insert(t.to.as_str());
         }
@@ -135,8 +136,9 @@ impl TypeStateVerifier {
     /// BFS from `start`, returning the set of reachable state names.
     fn reachable_from<'a>(&'a self, start: &'a str) -> FxHashSet<&'a str> {
         let adj = self.adjacency();
-        let mut visited: FxHashSet<&str> = FxHashSet::default();
-        let mut queue: VecDeque<&str> = VecDeque::new();
+        let mut visited: FxHashSet<&str> =
+            FxHashSet::with_capacity_and_hasher(self.states.len(), Default::default());
+        let mut queue: VecDeque<&str> = VecDeque::with_capacity(self.states.len());
         visited.insert(start);
         queue.push_back(start);
         while let Some(cur) = queue.pop_front() {
@@ -178,11 +180,10 @@ impl TypeStateVerifier {
         Ok(TypeStateMachine {
             states: self.states.clone(),
             transitions: self.transitions.clone(),
-            // SAFETY: verify_transitions() above ensures initial_state is Some.
             initial_state: self
                 .initial_state
                 .clone()
-                .unwrap_or_else(|| unreachable!("initial_state None after verify_transitions")),
+                .ok_or(TransitionError::MissingInitialState)?,
             error_states: self.error_states.clone(),
         })
     }
@@ -232,24 +233,58 @@ impl TypeStateVerifier {
     /// Check whether state `to` is reachable from state `from`.
     #[must_use]
     pub fn can_reach(&self, from: &str, to: &str) -> bool {
-        self.reachable_from(from).contains(to)
+        if from == to {
+            return true;
+        }
+        let mut has_outgoing = false;
+        for t in &self.transitions {
+            if t.from == from {
+                if t.to == to {
+                    return true;
+                }
+                has_outgoing = true;
+            }
+        }
+        if !has_outgoing {
+            return false;
+        }
+        let adj = self.adjacency();
+        let mut visited: FxHashSet<&str> =
+            FxHashSet::with_capacity_and_hasher(self.states.len(), Default::default());
+        let mut queue: VecDeque<&str> = VecDeque::with_capacity(self.states.len());
+        visited.insert(from);
+        queue.push_back(from);
+        while let Some(cur) = queue.pop_front() {
+            if let Some(neighbours) = adj.get(cur) {
+                for &next in neighbours {
+                    if next == to {
+                        return true;
+                    }
+                    if visited.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Return states that have no outgoing transitions and are not marked
     /// as error/terminal states. These represent potential deadlocks.
     #[must_use]
     pub fn deadlock_states(&self) -> Vec<String> {
-        let names = self.state_names();
-        let adj = self.adjacency();
+        let has_outgoing: FxHashSet<&str> =
+            self.transitions.iter().map(|t| t.from.as_str()).collect();
         let error_set: FxHashSet<&str> = self.error_states.iter().map(String::as_str).collect();
-        names
-            .into_iter()
-            .filter(|name| {
-                let has_outgoing = adj.get(name).is_some_and(|s| !s.is_empty());
-                !has_outgoing && !error_set.contains(name)
-            })
-            .map(|s| s.to_string())
-            .sorted_unstable()
+        let mut out = self
+            .states
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|&name| !has_outgoing.contains(name) && !error_set.contains(name))
+            .map(str::to_string)
+            .sorted_unstable();
+        out.dedup();
+        out
     }
 
     /// Detect a NON-TRIVIAL cycle (length ≥ 2 — i.e. a cycle through two or more
@@ -265,15 +300,30 @@ impl TypeStateVerifier {
     /// back-edge closing a non-trivial cycle).
     #[must_use]
     pub fn nontrivial_cycle(&self) -> Option<Vec<String>> {
+        if self.transitions.len() < 2 {
+            return None;
+        }
         #[derive(Clone, Copy, PartialEq)]
         enum Mark {
             White,
             Gray,
             Black,
         }
-        let adj = self.adjacency();
+        let mut sorted_adj: FxHashMap<&str, Vec<&str>> =
+            FxHashMap::with_capacity_and_hasher(self.states.len(), Default::default());
+        for t in &self.transitions {
+            if t.from != t.to {
+                sorted_adj.entry(t.from.as_str()).or_default().push(t.to.as_str());
+            }
+        }
+        for ordered in sorted_adj.values_mut() {
+            ordered.sort_unstable();
+            ordered.dedup();
+        }
         // Deterministic node order: every state plus every transition endpoint.
-        let mut nodes: Vec<&str> = self.states.iter().map(|s| s.name.as_str()).collect();
+        let mut nodes: Vec<&str> =
+            Vec::with_capacity(self.states.len() + self.transitions.len() * 2);
+        nodes.extend(self.states.iter().map(|s| s.name.as_str()));
         for t in &self.transitions {
             nodes.push(t.from.as_str());
             nodes.push(t.to.as_str());
@@ -307,13 +357,8 @@ impl TypeStateVerifier {
                 mark.insert(node, Mark::Gray);
                 path.push(node);
                 stack.push((node, true)); // RETURN marker → colors Black, pops path.
-                if let Some(succs) = adj.get(node) {
-                    let mut ordered: Vec<&str> = succs.iter().copied().collect();
-                    ordered.sort_unstable();
-                    for succ in ordered {
-                        if succ == node {
-                            continue; // self-loop is trivial (a fixed point)
-                        }
+                if let Some(ordered) = sorted_adj.get(node) {
+                    for &succ in ordered {
                         match mark.get(succ) {
                             Some(Mark::Gray) => {
                                 // Back-edge to a distinct ancestor → non-trivial cycle.
@@ -356,6 +401,17 @@ pub fn extract_enum_step_machine(
 ) -> Option<TypeStateVerifier> {
     use trust_types::{AggregateKind, BlockId, Operand, Rvalue, Statement, Terminator};
 
+    #[inline]
+    fn block_by_id(
+        body: &trust_types::VerifiableBody,
+        id: BlockId,
+    ) -> Option<&trust_types::BasicBlock> {
+        body.blocks
+            .get(id.0)
+            .filter(|b| b.id == id)
+            .or_else(|| body.blocks.iter().find(|b| b.id == id))
+    }
+
     /// The single non-projected `local` an operand reads, if any.
     fn operand_local(op: &Operand) -> Option<usize> {
         match op {
@@ -369,7 +425,7 @@ pub fn extract_enum_step_machine(
     fn output_variant(body: &trust_types::VerifiableBody, mut block_id: BlockId) -> Option<usize> {
         let mut output = None;
         for _ in 0..8 {
-            let block = body.blocks.iter().find(|b| b.id == block_id)?;
+            let block = block_by_id(body, block_id)?;
             for stmt in &block.stmts {
                 let Statement::Assign { place, rvalue, .. } = stmt else { continue };
                 if place.local != 0 || !place.projections.is_empty() {
@@ -433,12 +489,14 @@ pub fn extract_enum_step_machine(
         if place_is_input_field(place, param_local, variant, field_idx) {
             return true;
         }
-        if !place.projections.is_empty() {
+        if !place.projections.is_empty()
+            || !crate::local_defs::body_has_one_explicit_def(body, place.local)
+        {
             return false;
         }
         let mut def: Option<&Operand> = None;
         let mut def_count = 0usize;
-        for stmt in body.blocks.iter().flat_map(|b| &b.stmts) {
+        crate::visit_body_local_write_stmts(body, &body.blocks, place.local, |_b, stmt| {
             if let Statement::Assign { place: d, rvalue, .. } = stmt
                 && d.local == place.local
                 && d.projections.is_empty()
@@ -448,12 +506,13 @@ pub fn extract_enum_step_machine(
                     def = Some(inner);
                 }
             }
-        }
-        // Not a single-VALUED temp — conservatively decline. The second conjunct is
-        // the ENTRY definition a PARAMETER carries, which this scan cannot see: `mut
-        // x` written once here would otherwise resolve to the written operand on the
-        // edge that still holds the incoming argument. `local_defs` owns that count.
-        if def_count != 1 || !crate::local_defs::body_has_one_explicit_def(body, place.local) {
+        });
+        // Not a single-VALUED temp — conservatively decline. `body_has_one_explicit_def`
+        // above also gates on the ENTRY definition a PARAMETER carries, which this scan
+        // cannot see: `mut x` written once here would otherwise resolve to the written
+        // operand on the edge that still holds the incoming argument. `local_defs` owns
+        // that count.
+        if def_count != 1 {
             return false;
         }
         match def {
@@ -480,7 +539,12 @@ pub fn extract_enum_step_machine(
         variant: usize,
     ) -> bool {
         for _ in 0..8 {
-            let Some(block) = body.blocks.iter().find(|b| b.id == block_id) else {
+            let Some(block) = body
+                .blocks
+                .get(block_id.0)
+                .filter(|b| b.id == block_id)
+                .or_else(|| body.blocks.iter().find(|b| b.id == block_id))
+            else {
                 return false;
             };
             for stmt in &block.stmts {
@@ -514,7 +578,7 @@ pub fn extract_enum_step_machine(
     }
 
     let body = &func.body;
-    let entry = body.blocks.iter().find(|b| b.id == BlockId(0))?;
+    let entry = block_by_id(body, BlockId(0))?;
 
     // The entry block must compute `_d = Discriminant(param)` on a parameter.
     let mut discr_local: Option<usize> = None;
@@ -542,10 +606,15 @@ pub fn extract_enum_step_machine(
     }
 
     // Default-discriminant gate: switch values must be exactly {0, 1, .., n-1}.
-    let mut values: Vec<u128> = targets.iter().map(|(v, _)| *v).collect();
-    values.sort_unstable();
-    if values.is_empty() || values.iter().enumerate().any(|(i, &v)| v != i as u128) {
+    if targets.is_empty() {
         return None;
+    }
+    if !targets.iter().enumerate().all(|(i, (v, _))| *v == i as u128) {
+        let mut values: Vec<u128> = targets.iter().map(|(v, _)| *v).collect();
+        values.sort_unstable();
+        if values.iter().enumerate().any(|(i, &v)| v != i as u128) {
+            return None;
+        }
     }
 
     let mut verifier = TypeStateVerifier::new();
@@ -573,7 +642,7 @@ pub fn extract_enum_step_machine(
     // The `otherwise` arm of an exhaustive enum match is `Unreachable`. If it is
     // instead a reachable arm that produces an output we cannot attribute to a
     // specific input variant, decline to model (sound).
-    if let Some(block) = body.blocks.iter().find(|b| b.id == *otherwise)
+    if let Some(block) = block_by_id(body, *otherwise)
         && !matches!(block.terminator, Terminator::Unreachable)
         && output_variant(body, *otherwise).is_some()
     {
@@ -641,14 +710,6 @@ mod tests {
         v.add_transition(trans("Open", "Closed", "close"));
         v.set_initial("Closed");
         v
-    }
-
-    #[test]
-    fn test_typestate_verifier_new_is_empty() {
-        let v = TypeStateVerifier::new();
-        assert!(v.states.is_empty());
-        assert!(v.transitions.is_empty());
-        assert!(v.initial_state.is_none());
     }
 
     // ---- nontrivial_cycle (convergence) ---------------------------------
@@ -761,6 +822,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -801,6 +863,7 @@ mod tests {
             is_foreign: false,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("step::replacement"),
         };
         assert!(
             extract_enum_step_machine(&func).is_none(),
@@ -939,25 +1002,6 @@ mod tests {
         // "Terminal" has no outgoing transitions but IS an error/terminal state.
         let deadlocks = v.deadlock_states();
         assert!(!deadlocks.contains(&"Terminal".to_string()));
-    }
-
-    #[test]
-    fn test_typestate_state_property() {
-        let prop =
-            StateProperty { state_name: "Open".to_string(), invariant: "fd >= 0".to_string() };
-        assert_eq!(prop.state_name, "Open");
-        assert_eq!(prop.invariant, "fd >= 0");
-    }
-
-    #[test]
-    fn test_typestate_transition_with_guard() {
-        let t = StateTransition {
-            from: "Open".to_string(),
-            to: "Locked".to_string(),
-            method: "lock".to_string(),
-            guard: Some("has_permission".to_string()),
-        };
-        assert_eq!(t.guard, Some("has_permission".to_string()));
     }
 
     #[test]

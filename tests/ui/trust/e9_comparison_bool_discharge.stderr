@@ -9,6 +9,14 @@ LL | |     def le_u (a : UInt64) (b : UInt64) : Bool := decide (a <= b)
 LL | |     def in_range (a : BitVec 64) : Bool := Bool.true
    | |____________________________________________________^
 
+note: island definition `le_isl` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_comparison_bool_discharge::le_i64`
+  --> $DIR/e9_comparison_bool_discharge.rs:46:13
+   |
+LL |     ensures result == (a <= b) && result == le_isl(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
 
 === Trust Verification Report (e9_comparison_bool_discharge) ===
 
@@ -24,6 +32,14 @@ LL | | }
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
+note: island definition `le_u` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_comparison_bool_discharge::le_u64`
+  --> $DIR/e9_comparison_bool_discharge.rs:57:13
+   |
+LL |     ensures result == (b >= a) && result == le_u(a, b)
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
+
 note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e9_comparison_bool_discharge.rs:56:1
    |
@@ -35,6 +51,14 @@ LL | | }
    | |_^
    |
    = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: island definition `in_range` kernel-discharges this postcondition by definitional equality: the kernel judged this clause against the imported defining equation of `e9_comparison_bool_discharge::prop_position`
+  --> $DIR/e9_comparison_bool_discharge.rs:75:13
+   |
+LL |     ensures in_range(a)
+   |             ^^^^^^^^^^^
+   |
+   = note: this is the whole proof of the clause — change the body so it is no longer definitionally equal to the island definition and the discharge becomes a build error, not a downgraded unknown
 
 note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
   --> $DIR/e9_comparison_bool_discharge.rs:74:1

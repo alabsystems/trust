@@ -1,11 +1,14 @@
 [package]
 name = "cargo-util"
-version = "0.2.31"
-rust-version = "1.96"  # MSRV:1
+version = "0.3.0"
+rust-version = "1.99"  # MSRV:1
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Miscellaneous support code used by Cargo."
+# Trust: standalone native consumers must inherit this nested workspace,
+# rather than the surrounding compiler workspace's unrelated dependency table.
+workspace = "../.."
 
 [dependencies]
 anyhow.workspace = true
@@ -13,7 +16,7 @@ filetime.workspace = true
 hex.workspace = true
 ignore.workspace = true
 portable-atomic.workspace = true
-jobserver.workspace = true
+jobserver_utils.workspace = true
 same-file.workspace = true
 sha2.workspace = true
 shell-escape.workspace = true
@@ -25,13 +28,16 @@ walkdir.workspace = true
 core-foundation.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+# Trust: canonical original-child/group lifecycle, shared with native harnesses.
+trust-resource-provenance = { path = "../../../../../crates/trust-resource-provenance" }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 miow.workspace = true
 # Trust: `Win32_System_IO` is needed by the bounded/cancellable overlapped pipe
 # reader in `read2.rs`; upstream's reader never cancels, so it never calls it.
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Console", "Win32_System_IO"] }
+# (plus upstream's `Win32_System_ProcessStatus` for the peak-RSS reader).
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Console", "Win32_System_IO", "Win32_System_ProcessStatus"] }
 
 [lints]
 workspace = true

@@ -175,11 +175,6 @@ impl GateReport {
         self
     }
 
-    pub fn with_release_critical(mut self, release_critical: bool) -> Self {
-        self.release_critical = release_critical;
-        self
-    }
-
     pub fn exit_code_kind(&self) -> ExitCodeKind {
         match self.status {
             GateStatus::Pass => ExitCodeKind::Success,
@@ -237,8 +232,6 @@ impl EvidenceProfile {
 
 const DEFAULT_TOOL_NAME_EVIDENCE_PATHS: &[&str] = &[
     "src/version",
-    "designs/2026-04-29-trust-first-release-cli-and-trust-versioning.md",
-    "designs/2026-04-30-trust-first-release-cli-execution-plan.md",
     "scripts/build.sh",
     "scripts/record_full_verify_transcript.sh",
     "scripts/stage2_noverify_self_build.sh",
@@ -547,10 +540,6 @@ pub struct OwnedDependency {
 }
 
 impl OwnedDependency {
-    pub fn is_release_ready(&self) -> bool {
-        self.release_blockers().is_empty()
-    }
-
     fn release_blockers(&self) -> Vec<String> {
         let mut blockers = Vec::new();
 

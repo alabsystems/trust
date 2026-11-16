@@ -98,15 +98,15 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::{InlineAttr, Linkage};
+use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_hir::LangItem;
-use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathDataName;
-use rustc_middle::bug;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::exported_symbols::{SymbolExportInfo, SymbolExportLevel};
 use rustc_middle::mir::StatementKind;
@@ -119,7 +119,7 @@ use rustc_middle::ty::{self, InstanceKind, ShimKind, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_session::CodegenUnits;
 use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, bug};
 use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
 
@@ -215,6 +215,7 @@ where
 
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
     let cgu_name_cache = &mut UnordMap::default();
+    let mut reachable_inlined_items = FxIndexSet::default();
 
     for mono_item in mono_items {
         // Handle only root (GloballyShared) items directly here. Inlined (LocalCopy) items
@@ -263,13 +264,13 @@ where
         // going via another root item. This includes drop-glue, functions from
         // external crates, and local functions the definition of which is
         // marked with `#[inline]`.
-        let mut reachable_inlined_items = FxIndexSet::default();
+        reachable_inlined_items.clear();
         get_reachable_inlined_items(cx.tcx, mono_item, cx.usage_map, &mut reachable_inlined_items);
 
         // Add those inlined items. It's possible an inlined item is reachable
         // from multiple root items within a CGU, which is fine, it just means
         // the `insert` will be a no-op.
-        for inlined_item in reachable_inlined_items {
+        for inlined_item in reachable_inlined_items.drain(..) {
             // This is a CGU-private copy.
             cgu.items_mut().entry(inlined_item).or_insert_with(|| MonoItemData {
                 inlined: true,
@@ -457,6 +458,13 @@ fn merge_codegen_units<'tcx>(
                 };
                 cgu.set_name(new_cgu_name);
             }
+
+            // Assign symbol name to each CGU units.
+            cgu.set_symbol_name(Symbol::intern(&rustc_symbol_mangling::mangle_cgu(
+                cx.tcx,
+                LOCAL_CRATE,
+                Either::Right(cgu.name().as_str()),
+            )));
         }
 
         // A sorted order here ensures what follows can be deterministic.
@@ -491,6 +499,12 @@ fn merge_codegen_units<'tcx>(
             let numbered_codegen_unit_name =
                 cgu_name_builder.build_cgu_name_no_mangle(LOCAL_CRATE, &["cgu"], Some(suffix));
             cgu.set_name(numbered_codegen_unit_name);
+
+            cgu.set_symbol_name(Symbol::intern(&rustc_symbol_mangling::mangle_cgu(
+                cx.tcx,
+                LOCAL_CRATE,
+                Either::Left(index.try_into().unwrap()),
+            )));
         }
     }
 }
@@ -631,6 +645,7 @@ fn characteristic_def_id_of_mono_item<'tcx>(
             let def_id = match instance.def {
                 ty::InstanceKind::Item(def) => def,
                 ty::InstanceKind::Intrinsic(..)
+                | ty::InstanceKind::LlvmIntrinsic(..)
                 | ty::InstanceKind::Virtual(..)
                 | ty::InstanceKind::Shim(ty::ShimKind::VTable(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::Reify(..))
@@ -640,7 +655,8 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..))
-                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..))
+                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(..)) => return None,
@@ -770,6 +786,17 @@ fn static_visibility<'tcx>(
         *can_be_internalized = false;
         default_visibility(tcx, def_id, false)
     } else {
+        if tcx.def_kind(def_id).has_codegen_attrs() {
+            // Prevent EII and `rustc_std_internal_symbol` statics being internalized.
+            let attrs = tcx.codegen_fn_attrs(def_id);
+            if attrs.flags.intersects(
+                CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+                    | CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM,
+            ) {
+                *can_be_internalized = false;
+            }
+        }
+
         Visibility::Hidden
     }
 }
@@ -810,12 +837,24 @@ fn mono_item_visibility<'tcx>(
         | InstanceKind::Shim(ShimKind::FnPtr(..))
         | InstanceKind::Virtual(..)
         | InstanceKind::Intrinsic(..)
+        | InstanceKind::LlvmIntrinsic(..)
         | InstanceKind::Shim(ShimKind::ClosureOnce { .. })
         | InstanceKind::Shim(ShimKind::ConstructCoroutineInClosure { .. })
         | InstanceKind::Shim(ShimKind::DropGlue(..))
         | InstanceKind::Shim(ShimKind::Clone(..))
-        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Visibility::Hidden,
+        | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+        | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..)) => return Visibility::Hidden,
     };
+
+    let attrs = tcx.codegen_fn_attrs(def_id);
+    if attrs.flags.intersects(CodegenFnAttrFlags::OFFLOAD_KERNEL) {
+        *can_be_internalized = false;
+        return default_visibility(
+            tcx,
+            def_id,
+            instance.args.non_erasable_generics().next().is_some(),
+        );
+    }
 
     // Both the `start_fn` lang item and `main` itself should not be exported,
     // so we give them with `Hidden` visibility but these symbols are
@@ -1214,7 +1253,6 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> MonoItemPartitio
                         Linkage::WeakODR => "WeakODR",
                         Linkage::Internal => "Internal",
                         Linkage::ExternalWeak => "ExternalWeak",
-                        Linkage::Common => "Common",
                     };
 
                     output.push('[');
@@ -1232,6 +1270,7 @@ fn collect_and_partition_mono_items(tcx: TyCtxt<'_>, (): ()) -> MonoItemPartitio
         }
     }
 
+    crate::trust_instance_census::snapshot(tcx, &items, &usage_map, codegen_units);
     MonoItemPartitions { all_mono_items: tcx.arena.alloc(mono_items), codegen_units }
 }
 
@@ -1327,6 +1366,19 @@ pub(crate) fn provide(providers: &mut Providers) {
     };
 
     providers.queries.size_estimate = |tcx, instance| {
+        // Trust (plan step 3.5, docs/design/2026-10-02-step3-lean-through-trust-ir.md §5.7): on F1
+        // (`-Ztrust-cg-frontend=trust-ir`) a Clean-origin item's size is NOT read from its
+        // `clean_origin_mir` MIR, the MIR lane's spelling of a body F1 never ships: F1's codegen
+        // reads no Clean-origin MIR (the reach counter's `codegen` lane, which this read was
+        // charged to). The estimate only balances codegen-unit placement, never decides what is
+        // compiled or admitted, so a Clean-origin item counts as one statement there.
+        if tcx.sess.trust_cg_frontend_is_trust_ir()
+            && let InstanceKind::Item(def) = instance.def
+            && let Some(local) = def.as_local()
+            && tcx.resolutions(()).clean_origin_defs.iter().any(|&(clean, _, _)| clean == local)
+        {
+            return 1;
+        }
         match instance.def {
             // "Normal" functions size estimate: the number of
             // statements, plus one for the terminator.

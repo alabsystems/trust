@@ -58,15 +58,24 @@
 //   witnessed by the NEGATIVE CONTROL: the SAME internalized unification leaves the
 //   FALSE `> step` postcondition unrefuted (`result == step` stays satisfiable).
 //
-// Requires: a built Trust rustc fork (TRUST_RUSTC or build/*/stage{1,2}/bin/rustc).
-// SKIPS (does not fail) when the fork is not present.
+// Requires: a Trust rustc fork, resolved by
+// trust_integration_tests::trust_rustc::require_trust_rustc (TRUST_RUSTC, else
+// build/*/stage{1,2}/bin/rustc, stage1 first, a fork older than the flag surface
+// passed over, the selected fork capability-probed: one that fails the probe is
+// an error, never a reason to try the next). It runs with the crate's other
+// tests, and the land gate's crates-tests leg hands it this tree's stage 1 as
+// TRUST_RUSTC (TRUST_RUSTC-1, 2026-11-03; it was #[ignore]d and run only by a
+// slow harness row). Without a usable fork it
+// PANICS with how to build one. Until 2026-10-09 it searched on its own, tried
+// a stale stage2 before stage1, and printed SKIPPING and passed (libtest
+// captured the line) when it found nothing: every fresh clone and worktree.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache 2.0
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use trust_integration_tests::trust_rustc::{TrustRustc, lent_output, require_trust_rustc};
 use trust_ir::ProofEvidence;
 use trust_types::{Formula, VcKind, VerifiableFunction};
 
@@ -100,58 +109,39 @@ pub fn round_up_gt(value: u64, step: u64) -> u64 {
 }
 "#;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("repo-root grandparent")
-        .to_path_buf()
-}
-
-fn find_trust_rustc() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("TRUST_RUSTC") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let root = repo_root();
-    [
-        "build/aarch64-apple-darwin/stage2/bin/rustc",
-        "build/aarch64-apple-darwin/stage1/bin/rustc",
-        "build/x86_64-apple-darwin/stage2/bin/rustc",
-        "build/x86_64-unknown-linux-gnu/stage2/bin/rustc",
-        "build/host/stage1/bin/rustc",
-    ]
-    .iter()
-    .map(|c| root.join(c))
-    .find(|p| p.is_file())
-}
-
-fn extract_kernel_fn_mir(rustc: &Path) -> Vec<VerifiableFunction> {
+fn extract_kernel_fn_mir(rustc: &TrustRustc) -> Vec<VerifiableFunction> {
     let tmp = tempfile::tempdir().expect("tempdir");
     let src = tmp.path().join("kernel_fns.rs");
     std::fs::write(&src, KERNEL_FN_SOURCE).expect("write source");
     let dump = tmp.path().join("mir_dump");
     std::fs::create_dir_all(&dump).expect("mkdir dump");
 
-    let output = Command::new(rustc)
-        .env_remove("TRUST_DUMP_MIR")
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO")
-        .arg("-Z")
-        .arg(format!("trust-dump=mir:{}", dump.display()))
-        .args(["-Z", "trust-verify-output=json"])
-        .args(["-Z", "trust-verify-level=1"])
-        .args(["--edition", "2021", "--crate-type", "lib"])
-        .arg("-o")
-        .arg(tmp.path().join("kernel_fns.rlib"))
-        .arg(&src)
-        .output()
-        .expect("invoke trust rustc fork");
+    let output = lent_output(
+        Command::new(&rustc.path)
+            .env_remove("TRUST_DUMP_MIR")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO")
+            .arg("-Z")
+            .arg(format!("trust-dump=mir:{}", dump.display()))
+            .args(["-Z", "trust-verify-output=json"])
+            // The compile exists only to extract MIR fixtures; the fixture
+            // deliberately carries a FALSE postcondition (`round_up_gt`), so the
+            // default strict policy correctly FAILS the build. Advisory is the
+            // survey lane: the verdicts this test checks come from the in-process
+            // loop below, never from the fork's build status. (`-Ztrust-verify=off` is refused for
+            // `-Ztrust-dump=mir:<dir>`, which needs batteries-on verification.)
+            .args(["-Z", "trust-policy=advisory"])
+            .args(["-Z", "trust-verify-level=1"])
+            .args(["--edition", "2021", "--crate-type", "lib"])
+            .arg("-o")
+            .arg(tmp.path().join("kernel_fns.rlib"))
+            .arg(&src),
+    )
+    .expect("invoke trust rustc fork");
     assert!(
         output.status.success(),
-        "fork compile failed:\n{}",
+        "fork compile failed with {}:\n{}",
+        rustc.identity(),
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -172,14 +162,9 @@ fn find<'a>(funcs: &'a [VerifiableFunction], name: &str) -> &'a VerifiableFuncti
 
 #[test]
 fn functional_postcondition_trust_clean_loop_closes() {
-    let Some(rustc) = find_trust_rustc() else {
-        eprintln!(
-            "SKIPPING: no Trust rustc fork found. Build with `./x.py build --stage 2` \
-             or set TRUST_RUSTC=/path/to/rustc"
-        );
-        return;
-    };
-    eprintln!("Trust rustc fork: {}", rustc.display());
+    // The flag surface (-Ztrust-policy, -Ztrust-dump=mir) is the only revision
+    // this compile needs; the verdicts below come from the in-process loop.
+    let rustc = require_trust_rustc(None);
 
     let functions = extract_kernel_fn_mir(&rustc);
     assert!(!functions.is_empty(), "fork extraction produced no VerifiableFunction fixtures");

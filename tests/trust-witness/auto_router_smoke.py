@@ -2,7 +2,7 @@
 """Default-on + router smoke test for the managed typeck-witness lane.
 
 The lane is ON by default (`-Ztrust-witness`, default on) on non-incremental
-`--out-dir` builds, storing at `<out-dir>/trust-witness`, with a router that
+`--out-dir` builds, storing a flat `<StableCrateId>.twit` file in the out-dir, with a router that
 replays a root only when its body is large enough to beat fresh typeck. This test
 proves both properties with NO explicit witness flags:
 
@@ -13,12 +13,29 @@ proves both properties with NO explicit witness flags:
     compile), byte-identically, and faster than fresh typeck.
 
 Run after `x.py build --stage 2`:
-    TRUST_SEED_STAIRCASE=1 python3 tests/trust-witness/auto_router_smoke.py
+    python3 tests/trust-witness/auto_router_smoke.py
 """
 import subprocess, os, sys, time, glob, hashlib, shutil
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TRUSTC = os.path.join(REPO, "build", "host", "stage2", "bin", "trustc")
+def _resolve_trustc():
+    """TRUST_WITNESS_TRUSTC if set; else the stage2 build; else trustc on PATH; else refuse."""
+    override = os.environ.get("TRUST_WITNESS_TRUSTC")
+    if override:
+        return override
+    stage2 = os.path.join(REPO, "build", "host", "stage2", "bin", "trustc")
+    if os.path.exists(stage2):
+        return stage2
+    on_path = shutil.which("trustc")
+    if on_path:
+        return on_path
+    sys.exit(
+        "REFUSED: no trustc — set TRUST_WITNESS_TRUSTC or put the trust channel's "
+        "trustc on PATH; build/host/stage2/bin/trustc is absent"
+    )
+
+
+TRUSTC = _resolve_trustc()
 WORK = os.path.join(REPO, "build", "trust-witness-auto-smoke")
 
 # Many tiny fns — each well under the router's node threshold.
@@ -35,12 +52,16 @@ HEAVY = "\n".join(f"pub fn g{i}(x: i64) -> i64 {{ {nest(300)} }}" for i in range
 
 def compile(src, outdir, auto, stats=False):
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ); env["TRUST_SEED_STAIRCASE"] = "1"
+    env = dict(os.environ)
     if stats:
         env["TRUST_WITNESS_STATS"] = "1"
     cmd = [TRUSTC, "-Zthreads=1", "-Ztrust-verify=off", "--edition", "2021",
-           "--crate-type=lib", "--emit=metadata,obj", "--out-dir", outdir,
-           f"-Ztrust-witness={'auto' if auto else 'off'}", src]
+           "--crate-type=lib", "--emit=metadata,obj", "--out-dir", outdir]
+    # Trust: auto must exercise the compiler default. An explicit auto flag
+    # would hide a regression that disables the default witness lane.
+    if not auto:
+        cmd.append("-Ztrust-witness=off")
+    cmd.append(src)
     t = time.time()
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     return r, time.time() - t
@@ -81,12 +102,14 @@ for name, src_txt, expect_accept in [("trivial", TRIVIAL, False), ("heavy", HEAV
     if digests(base_dir) != digests(auto_dir):
         probs.append("warm auto output NOT byte-identical to auto-off baseline")
     acc = accepts(r2.stderr)
-    store = glob.glob(os.path.join(auto_dir, "trust-witness", "*.twit"))
+    store = glob.glob(os.path.join(auto_dir, "*.twit"))
+    if any(os.path.isdir(os.path.join(auto_dir, e)) for e in os.listdir(auto_dir)):
+        probs.append("the managed store left a directory in --out-dir (it must be a flat file)")
     if expect_accept:
         if acc == 0:
             probs.append("HEAVY: router did not auto-replay any root (expected ACCEPT)")
         if not store:
-            probs.append("HEAVY: no witness store written under <out-dir>/trust-witness")
+            probs.append("HEAVY: no flat .twit witness store written in --out-dir")
     else:
         if acc != 0:
             probs.append(f"TRIVIAL: router replayed {acc} root(s) it should have skipped")

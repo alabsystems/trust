@@ -39,6 +39,9 @@ fn workspace_feature_unification() {
                 [features]
                 a = []
                 b = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -58,6 +61,9 @@ fn workspace_feature_unification() {
 
                 [dependencies]
                 common = { path = "../common", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "")
@@ -71,6 +77,9 @@ fn workspace_feature_unification() {
 
                 [dependencies]
                 common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "")
@@ -107,6 +116,584 @@ fn workspace_feature_unification() {
         .arg("-Zfeature-unification")
         .masquerade_as_nightly_cargo(&["feature-unification"])
         .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_default_members() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "2"
+                members = ["common", "a", "b"]
+                default-members = ["common"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(not(all(feature = "a", feature = "b")))]
+                compile_error!("features were not unified");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_exclude_package() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "2"
+                members = ["common", "a", "b"]
+                default-members = ["common"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(not(all(feature = "a", feature = "b")))]
+                compile_error!("features were not unified");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .build();
+
+    p.cargo("check --workspace --exclude a --exclude b")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_v1_resolver() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "1"
+                members = ["common", "a", "b", "c"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+                c = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(not(all(feature = "a", feature = "b", feature = "c")))]
+                compile_error!("features were not unified");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [target.'cfg(false)'.dependencies]
+                common = { path = "../common", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [build-dependencies]
+                common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .file("b/build.rs", "fn main() {}")
+        .file(
+            "c/Cargo.toml",
+            r#"
+                [package]
+                name = "c"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [dev-dependencies]
+                common = { path = "../common", features = ["c"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("c/src/lib.rs", "")
+        .build();
+
+    p.cargo("check -p common")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_v2_resolver() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "2"
+                members = ["common", "a", "b", "c"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+                c = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(any(feature = "a", feature = "b", feature = "c"))]
+                compile_error!("features were unified");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [target.'cfg(false)'.dependencies]
+                common = { path = "../common", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [build-dependencies]
+                common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .file("b/build.rs", "fn main() {}")
+        .file(
+            "c/Cargo.toml",
+            r#"
+                [package]
+                name = "c"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [dev-dependencies]
+                common = { path = "../common", features = ["c"] }
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("c/src/lib.rs", "")
+        .build();
+
+    p.cargo("check -p common")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_all_features() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "2"
+                members = ["common", "a", "b"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(not(all(feature = "a", feature = "b")))]
+                compile_error!("some features weren't enabled");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [features]
+                a = ["common/a"]
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [features]
+                b = ["common/b"]
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .build();
+
+    p.cargo("check -p common --all-features")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn workspace_feature_unification_no_default_features() {
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [resolver]
+                feature-unification = "workspace"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                resolver = "2"
+                members = ["common", "a", "b"]
+            "#,
+        )
+        .file(
+            "common/Cargo.toml",
+            r#"
+                [package]
+                name = "common"
+                version = "0.1.0"
+                edition = "2021"
+
+                [features]
+                a = []
+                b = []
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file(
+            "common/src/lib.rs",
+            r#"
+                #[cfg(any(feature = "a", feature = "b"))]
+                compile_error!("default features were enabled");
+            "#,
+        )
+        .file(
+            "a/Cargo.toml",
+            r#"
+                [package]
+                name = "a"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [features]
+                default = ["common/a"]
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("a/src/lib.rs", "")
+        .file(
+            "b/Cargo.toml",
+            r#"
+                [package]
+                name = "b"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                common = { path = "../common" }
+
+                [features]
+                default = ["common/b"]
+
+                [lints.cargo]
+                default = "allow"
+            "#,
+        )
+        .file("b/src/lib.rs", "")
+        .build();
+
+    p.cargo("check -p common --no-default-features")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .with_stderr_data(str![[r#"
+[CHECKING] common v0.1.0 ([ROOT]/foo/common)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
@@ -158,6 +745,9 @@ fn package_feature_unification() {
                 [features]
                 a = []
                 b = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -182,6 +772,9 @@ fn package_feature_unification() {
                 [dependencies]
                 common = { path = "../common", features = ["a"] }
                 outside = { version = "0.1.0", features = ["a"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "pub use common::a;")
@@ -196,6 +789,9 @@ fn package_feature_unification() {
                 [dependencies]
                 common = { path = "../common", features = ["b"] }
                 outside = { version = "0.1.0", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "pub use common::b;")
@@ -206,7 +802,7 @@ fn package_feature_unification() {
         .masquerade_as_nightly_cargo(&["feature-unification"])
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] common v0.1.0 ([ROOT]/foo/common)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
@@ -428,6 +1024,9 @@ fn package_feature_unification_cli_features() {
                 [features]
                 a = []
                 b = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -455,6 +1054,9 @@ fn package_feature_unification_cli_features() {
 
                 [features]
                 a = ["common/a", "outside/a"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("a/src/lib.rs", "pub use common::a;")
@@ -472,6 +1074,9 @@ fn package_feature_unification_cli_features() {
 
                 [features]
                 b = ["common/b", "outside/b"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "pub use common::b;")
@@ -485,7 +1090,7 @@ fn package_feature_unification_cli_features() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [CHECKING] common v0.1.0 ([ROOT]/foo/common)
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] outside v0.1.0 (registry `dummy-registry`)
 [CHECKING] outside v0.1.0
@@ -678,17 +1283,7 @@ fn feature_unification_cargo_tree() {
     Package::new("outside", "0.1.0")
         .feature("a", &[])
         .feature("b", &[])
-        .file(
-            "src/lib.rs",
-            r#"
-                #[cfg(all(feature = "a", feature = "b"))]
-                compile_error!("features were unified");
-                #[cfg(feature = "a")]
-                pub fn a() {}
-                #[cfg(feature = "b")]
-                pub fn b() {}
-            "#,
-        )
+        .file("src/lib.rs", "")
         .publish();
 
     let p = project()
@@ -713,17 +1308,7 @@ fn feature_unification_cargo_tree() {
                 b = []
             "#,
         )
-        .file(
-            "common/src/lib.rs",
-            r#"
-                #[cfg(all(feature = "a", feature = "b"))]
-                compile_error!("features were unified");
-                #[cfg(feature = "a")]
-                pub fn a() {}
-                #[cfg(feature = "b")]
-                pub fn b() {}
-            "#,
-        )
+        .file("common/src/lib.rs", "")
         .file(
             "a/Cargo.toml",
             r#"
@@ -737,7 +1322,7 @@ fn feature_unification_cargo_tree() {
                 outside = { version = "0.1.0", features = ["a"] }
             "#,
         )
-        .file("a/src/lib.rs", "pub use common::a;")
+        .file("a/src/lib.rs", "")
         .file(
             "b/Cargo.toml",
             r#"
@@ -751,38 +1336,76 @@ fn feature_unification_cargo_tree() {
                 outside = { version = "0.1.0", features = ["b"] }
             "#,
         )
-        .file("b/src/lib.rs", "pub use common::b;")
+        .file("b/src/lib.rs", "")
         .build();
 
-    p.cargo("tree -e features")
+    p.cargo("tree --format")
+        .arg("{p} [{f}]")
         .arg("-Zfeature-unification")
         .masquerade_as_nightly_cargo(&["feature-unification"])
         .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "selected")
         .with_stdout_data(str![[r#"
-a v0.1.0 ([ROOT]/foo/a)
-├── common feature "a"
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── common feature "default" (command-line)
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── outside feature "a"
-│   └── outside v0.1.0
-└── outside feature "default"
-    └── outside v0.1.0
+a v0.1.0 ([ROOT]/foo/a) []
+├── common v0.1.0 ([ROOT]/foo/common) [a,b]
+└── outside v0.1.0 [a,b]
 
-b v0.1.0 ([ROOT]/foo/b)
-├── common feature "b"
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── common feature "default" (command-line) (*)
-├── outside feature "b"
-│   └── outside v0.1.0
-└── outside feature "default" (*)
+b v0.1.0 ([ROOT]/foo/b) []
+├── common v0.1.0 ([ROOT]/foo/common) [a,b]
+└── outside v0.1.0 [a,b]
 
-common v0.1.0 ([ROOT]/foo/common)
+common v0.1.0 ([ROOT]/foo/common) [a,b]
 
 "#]])
         .run();
 
-    p.cargo("tree -e features")
+    p.cargo("tree --format")
+        .arg("{p} [{f}]")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace")
+        .with_stdout_data(str![[r#"
+a v0.1.0 ([ROOT]/foo/a) []
+├── common v0.1.0 ([ROOT]/foo/common) [a,b]
+└── outside v0.1.0 [a,b]
+
+b v0.1.0 ([ROOT]/foo/b) []
+├── common v0.1.0 ([ROOT]/foo/common) [a,b]
+└── outside v0.1.0 [a,b]
+
+common v0.1.0 ([ROOT]/foo/common) [a,b]
+
+"#]])
+        .run();
+
+    p.cargo("tree --format")
+        .arg("{p} [{f}]")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "package")
+        .with_stdout_data(str![[r#"
+common v0.1.0 ([ROOT]/foo/common) []
+a v0.1.0 ([ROOT]/foo/a) []
+├── common v0.1.0 ([ROOT]/foo/common) [a]
+└── outside v0.1.0 [a]
+b v0.1.0 ([ROOT]/foo/b) []
+├── common v0.1.0 ([ROOT]/foo/common) [b]
+└── outside v0.1.0 [b]
+
+"#]])
+        .run();
+
+    p.cargo("tree -p common --format")
+        .arg("{p} [{f}]")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace")
+        .with_stdout_data(str![[r#"
+common v0.1.0 ([ROOT]/foo/common) [a,b]
+
+"#]])
+        .run();
+
+    p.cargo("tree -p a -e features")
         .arg("-Zfeature-unification")
         .masquerade_as_nightly_cargo(&["feature-unification"])
         .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace")
@@ -790,47 +1413,9 @@ common v0.1.0 ([ROOT]/foo/common)
 a v0.1.0 ([ROOT]/foo/a)
 ├── common feature "a"
 │   └── common v0.1.0 ([ROOT]/foo/common)
-├── common feature "default" (command-line)
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── outside feature "a"
-│   └── outside v0.1.0
-└── outside feature "default"
-    └── outside v0.1.0
-
-b v0.1.0 ([ROOT]/foo/b)
-├── common feature "b"
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── common feature "default" (command-line) (*)
-├── outside feature "b"
-│   └── outside v0.1.0
-└── outside feature "default" (*)
-
-common v0.1.0 ([ROOT]/foo/common)
-
-"#]])
-        .run();
-
-    p.cargo("tree -e features")
-        .arg("-Zfeature-unification")
-        .masquerade_as_nightly_cargo(&["feature-unification"])
-        .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "package")
-        .with_stdout_data(str![[r#"
-common v0.1.0 ([ROOT]/foo/common)
-a v0.1.0 ([ROOT]/foo/a)
-├── common feature "a"
-│   └── common v0.1.0 ([ROOT]/foo/common)
 ├── common feature "default"
 │   └── common v0.1.0 ([ROOT]/foo/common)
 ├── outside feature "a"
-│   └── outside v0.1.0
-└── outside feature "default"
-    └── outside v0.1.0
-b v0.1.0 ([ROOT]/foo/b)
-├── common feature "b"
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── common feature "default"
-│   └── common v0.1.0 ([ROOT]/foo/common)
-├── outside feature "b"
 │   └── outside v0.1.0
 └── outside feature "default"
     └── outside v0.1.0
@@ -855,6 +1440,9 @@ fn cargo_install_ignores_config() {
 
                 [workspace]
                 members = ["common", "b"]
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("src/main.rs", "fn main() {}")
@@ -869,6 +1457,9 @@ fn cargo_install_ignores_config() {
                 [features]
                 a = []
                 b = []
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file(
@@ -888,6 +1479,9 @@ fn cargo_install_ignores_config() {
 
                 [dependencies]
                 common = { path = "../common", features = ["b"] }
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("b/src/lib.rs", "")
@@ -1059,7 +1653,7 @@ fn edition_v2_resolver_report() {
             str![[r#"
 [MIGRATING] Cargo.toml from 2018 edition to 2021
 [UPDATING] `dummy-registry` index
-[LOCKING] 3 packages to latest compatible versions
+[LOCKING] 3 packages to highest compatible versions
 [DOWNLOADING] crates ...
 [DOWNLOADED] common v1.0.0 (registry `dummy-registry`)
 [DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
@@ -1130,6 +1724,17 @@ fn feature_unification_of_cli_features_within_workspace() {
         )
         .file("parent/src/lib.rs", "pub use child::a;")
         .build();
+
+    p.cargo("tree -p parent -F grandchild/a")
+        .arg("-Zfeature-unification")
+        .masquerade_as_nightly_cargo(&["feature-unification"])
+        .env("CARGO_RESOLVER_FEATURE_UNIFICATION", "workspace")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[ERROR] the package 'parent' does not contain this feature: grandchild/a
+
+"#]])
+        .run();
 
     p.cargo("check -p parent -F grandchild/a")
         .arg("-Zfeature-unification")

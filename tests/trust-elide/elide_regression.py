@@ -13,13 +13,29 @@ switch: elision runs wherever verification runs. This pins:
   * VALUE-PRESERVING: the arithmetic (the *WithOverflow rvalue) is ALWAYS retained.
 
 Run after `x.py build --stage 2`:
-    TRUST_SEED_STAIRCASE=1 python3 tests/trust-elide/elide_regression.py
+    python3 tests/trust-elide/elide_regression.py
 """
-import subprocess, os, sys, re, tempfile
+import subprocess, os, sys, re, tempfile, shutil
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-TRUSTC = os.environ.get("TRUST_ELIDE_TRUSTC",
-                        os.path.join(REPO, "build", "host", "stage2", "bin", "trustc"))
+def _resolve_trustc():
+    """TRUST_ELIDE_TRUSTC if set; else the stage2 build; else trustc on PATH; else refuse."""
+    override = os.environ.get("TRUST_ELIDE_TRUSTC")
+    if override:
+        return override
+    stage2 = os.path.join(REPO, "build", "host", "stage2", "bin", "trustc")
+    if os.path.exists(stage2):
+        return stage2
+    on_path = shutil.which("trustc")
+    if on_path:
+        return on_path
+    sys.exit(
+        "REFUSED: no trustc — set TRUST_ELIDE_TRUSTC or put the trust channel's "
+        "trustc on PATH; build/host/stage2/bin/trustc is absent"
+    )
+
+
+TRUSTC = _resolve_trustc()
 WORK = tempfile.mkdtemp(prefix="elide_reg_")
 
 # Kernel-certified overflow families (each must ELIDE exactly its overflow check).
@@ -41,7 +57,7 @@ def compile(src, verify, emit="metadata"):
     _N[0] += 1
     d = os.path.join(WORK, f"c{_N[0]}"); os.makedirs(d, exist_ok=True)
     p = os.path.join(WORK, f"s{_N[0]}.rs"); open(p, "w").write(src)
-    env = dict(os.environ); env["TRUST_SEED_STAIRCASE"] = "1"; env["TRUST_ELIDE_DEBUG"] = "1"
+    env = dict(os.environ); env["TRUST_ELIDE_DEBUG"] = "1"
     cmd = [TRUSTC, "-Zthreads=1", f"-Ztrust-verify={'on' if verify else 'off'}",
            "-Coverflow-checks=on",
            "--crate-type=lib", "--edition=2021", f"--emit={emit}", "--out-dir", d, p]

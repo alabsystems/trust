@@ -19,10 +19,10 @@
 use serde::{Deserialize, Serialize};
 use trust_types::{VerificationCondition, VerificationResult};
 
-use crate::canonical::canonical_vc_bytes;
+use crate::canonical::{canonical_vc_bytes, with_canonical_vc_bytes};
 use crate::clean_bridge;
 use crate::error::CertificateError;
-use crate::fingerprint::{Fingerprint, compute_vc_fingerprint};
+use crate::fingerprint::{Fingerprint, compute_vc_fingerprint, fingerprint_bytes};
 
 /// A proof certificate that can be independently verified by clean.
 ///
@@ -66,6 +66,17 @@ impl TrustProofCertificate {
     }
 }
 
+/// TINV-8 (2026-10-05): the kernel-authority gate every public certificate entry applies
+/// FIRST, so no free function can mint (or re-check) a certificate for a VC the
+/// `CertificationPipeline` wrappers would skip — a record-less `TypeInvariant` row, or a
+/// kind refused outright (`ContractInvariant`, `TypeRefinementViolation`, ...).
+fn refuse_unauthorized(vc: &VerificationCondition) -> Result<(), CertificateError> {
+    match vc.kernel_authority_refusal() {
+        Some(why) => Err(CertificateError::AuthorityRefused { reason: why.to_string() }),
+        None => Ok(()),
+    }
+}
+
 /// Generate a proof certificate for a verified VC.
 ///
 /// This is called after a constructive prover (trust-wp, clean) produces
@@ -81,6 +92,7 @@ impl TrustProofCertificate {
 ///
 /// # Errors
 ///
+/// - `AuthorityRefused` if `vc.kernel_authority_refusal()` refuses the VC
 /// - `InvalidProofTerm` if the proof term is empty or cannot be deserialized
 ///   as a clean `ProofCert`
 /// - `KernelRejected` if the clean kernel rejects the proof term against
@@ -91,15 +103,12 @@ pub fn generate_certificate(
     proof_term: Vec<u8>,
     prover_version: &str,
 ) -> Result<TrustProofCertificate, CertificateError> {
-    // Phase 1: Build the certificate structure
-    let fingerprint = compute_vc_fingerprint(vc);
-    let canonical = canonical_vc_bytes(vc);
-
+    refuse_unauthorized(vc)?;
     if proof_term.is_empty() {
         return Err(CertificateError::InvalidProofTerm { reason: "empty proof term".to_string() });
     }
 
-    // Phase 2: Validate the proof term with clean kernel
+    // Phase 1: Validate the proof term with clean kernel BEFORE allocating canonical VC bytes:
     //   1. Deserialize proof_term into clean ProofCert
     //   2. Translate the VC into a clean theorem statement
     //   3. Type-check the proof_term against the theorem
@@ -107,6 +116,10 @@ pub fn generate_certificate(
     let clean_cert = clean_bridge::deserialize_proof_cert(&proof_term)?;
     let theorem_expr = clean_bridge::translate_vc_to_clean_theorem(&vc.kind, &vc.formula);
     clean_bridge::verify_proof_cert(&clean_cert, &theorem_expr)?;
+
+    // Phase 2: Build the certificate structure (serialize canonical VC once)
+    let canonical = canonical_vc_bytes(vc);
+    let fingerprint = fingerprint_bytes(&canonical);
 
     Ok(TrustProofCertificate {
         prover: prover_version.split_whitespace().next().unwrap_or("unknown").to_string(),
@@ -130,6 +143,7 @@ pub fn generate_certificate(
 ///
 /// # Errors
 ///
+/// - `AuthorityRefused` if `vc.kernel_authority_refusal()` refuses the VC
 /// - `InvalidProofTerm` if the proof term is empty
 pub fn generate_certificate_unchecked(
     vc: &VerificationCondition,
@@ -137,12 +151,13 @@ pub fn generate_certificate_unchecked(
     proof_term: Vec<u8>,
     prover_version: &str,
 ) -> Result<TrustProofCertificate, CertificateError> {
-    let fingerprint = compute_vc_fingerprint(vc);
-    let canonical = canonical_vc_bytes(vc);
-
+    refuse_unauthorized(vc)?;
     if proof_term.is_empty() {
         return Err(CertificateError::InvalidProofTerm { reason: "empty proof term".to_string() });
     }
+
+    let canonical = canonical_vc_bytes(vc);
+    let fingerprint = fingerprint_bytes(&canonical);
 
     Ok(TrustProofCertificate {
         prover: prover_version.split_whitespace().next().unwrap_or("unknown").to_string(),
@@ -167,6 +182,7 @@ pub fn generate_certificate_unchecked(
 ///
 /// # Errors
 ///
+/// - `AuthorityRefused` if `vc.kernel_authority_refusal()` refuses the VC
 /// - `StaleCertificate` if the VC changed since the certificate was generated
 /// - `InvalidProofTerm` if the proof bytes cannot be deserialized as a clean `ProofCert`
 /// - `KernelRejected` if clean kernel rejects the proof term
@@ -174,18 +190,18 @@ pub fn verify_certificate(
     vc: &VerificationCondition,
     certificate: &TrustProofCertificate,
 ) -> Result<(), CertificateError> {
-    // Step 1: Check staleness — did the code change since certificate was generated?
-    let current_fingerprint = compute_vc_fingerprint(vc);
-    if certificate.vc_fingerprint != current_fingerprint {
-        return Err(CertificateError::StaleCertificate {
-            expected: certificate.vc_fingerprint,
-            actual: current_fingerprint,
-        });
-    }
-
-    // Step 2: Verify canonical VC matches
-    let current_canonical = canonical_vc_bytes(vc);
-    if certificate.canonical_vc != current_canonical {
+    refuse_unauthorized(vc)?;
+    // Steps 1 & 2: Compute canonical VC bytes into reusable scratch buffer, derive fingerprint,
+    // and check staleness with zero per-call canonical-byte heap allocations.
+    let (current_fingerprint, matches_canonical) = with_canonical_vc_bytes(vc, |current_canonical| {
+        let fp = fingerprint_bytes(current_canonical);
+        (
+            fp,
+            certificate.vc_fingerprint == fp
+                && certificate.canonical_vc.as_slice() == current_canonical,
+        )
+    });
+    if !matches_canonical {
         return Err(CertificateError::StaleCertificate {
             expected: certificate.vc_fingerprint,
             actual: current_fingerprint,

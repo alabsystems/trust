@@ -6,7 +6,7 @@
 #
 # Requires: a built stage2 `trustc` (see the repo root CLAUDE.md) and the
 # `arrayvec` 0.7.7 source in the local crates.io registry cache (populate it
-# with `cargo add arrayvec@=0.7.7` in a scratch crate + `cargo fetch` if it is
+# with `targo add arrayvec@=0.7.7` in a scratch crate + `targo fetch` if it is
 # not already there).
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -31,7 +31,7 @@ fi
 ARRAYVEC_SRC="$(ls -d "${HOME}"/.cargo/registry/src/*/arrayvec-0.7.7/src/lib.rs 2>/dev/null | head -1 || true)"
 if [[ -z "$ARRAYVEC_SRC" ]]; then
   echo "error: arrayvec-0.7.7 source not found under ~/.cargo/registry/src/**/arrayvec-0.7.7/" >&2
-  echo "       populate it: (cd \$(mktemp -d) && cargo init --lib && cargo add arrayvec@=0.7.7 && cargo fetch)" >&2
+  echo "       populate it: (cd \$(mktemp -d) && targo init --lib && targo add arrayvec@=0.7.7 && targo fetch)" >&2
   exit 1
 fi
 

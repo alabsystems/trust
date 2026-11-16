@@ -9,7 +9,10 @@
 //!   is debug names, and `build_debug_name_map` is last-write-wins. A body
 //!   `let x = …;` shadowing a parameter `x` makes the predicate's `x > 0`
 //!   constrain the *body* local in the formula — proving overflow obligations
-//!   about an unconstrained value (probe `t_shadow`, 2026-06-09).
+//!   about an unconstrained value (probe `t_shadow`, 2026-06-09). Since VS-1
+//!   (2026-10-04) the collapse first drops every spelling whose rows are on two
+//!   or more locals, so the shadow's spelling binds no local at all; this gate
+//!   still reads the RAW multimap and drops the assumption on that shape.
 //! * **Vacuity:** an unsatisfiable predicate (`x > 10 && x < 5`) would admit
 //!   any body under a false hypothesis. We require a concrete ground witness
 //!   before assuming; a found witness is a model, so the check cannot
@@ -35,7 +38,7 @@
 //! One shape reaching the drops above is not an ambiguity at all — it is ONE
 //! entity under TWO spellings. For
 //!
-//! ```ignore
+//! ```ignore (illustrative)
 //! #[requires(n >= 0)] #[ensures(|r| *r >= 0)] fn f(n: i32) -> i32 { let x = n; x }
 //! ```
 //!
@@ -139,7 +142,7 @@
 //! DESTINATION, and an immutably-borrowed `Freeze` local (every integer type) is
 //! deliberately kept SSA. The concrete exploit was
 //!
-//! ```rust,ignore
+//! ```rust,ignore (illustrative)
 //! const n: i32 = 5;                                  // TRUE clause
 //! #[trust::requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
 //! fn f(ref q: i32) -> i32 { let n = *q; let x = n; x }   // f(-7) == -7
@@ -195,7 +198,7 @@
 //! drops byte-identically to before.
 
 use trust_types::fx::{FxHashMap, FxHashSet};
-use trust_types::{Formula, Rvalue, Statement, Terminator, Ty, VerifiableBody};
+use trust_types::{Formula, Statement, Terminator, Ty, VerifiableBody};
 
 /// Why contract-derived preconditions were not assumed for body verification.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -304,7 +307,7 @@ pub fn gate_contract_preconditions(
     let lengths = admissible_lengths(body, debug_name_locals);
     for formula in preconditions.iter_mut() {
         for (source, canonical) in &lengths.source_rebindings {
-            if formula.free_variables().contains(source) {
+            if trust_types::any_free_variable_name(formula, &mut |name| name == source) {
                 *formula = formula.rename_var(source, canonical);
             }
         }
@@ -342,21 +345,25 @@ pub fn gate_contract_preconditions(
             reasons.push(AssumeSkipReason::UnsupportedSyntax);
             continue;
         }
-        for var in formula.free_variables() {
+        let mut seen_in_formula: FxHashSet<&str> = FxHashSet::default();
+        trust_types::for_each_free_variable_name(formula, &mut |var| {
+            if !seen_in_formula.insert(var) {
+                return;
+            }
             // Trust (piece #8): a whitelisted slice/array-parameter length symbol is
             // admissible and EXEMPT from the debug-name shadow/witness discipline —
             // it is not a debug name, so it cannot shadow a local or alias a param
             // local. Skip it before `assumable_param_base` (which would reject it as
             // a NonParamVariable). It is NOT added to `referenced`, so the shadow
             // loops below never see it.
-            if length_syms.contains(var.as_str()) {
-                continue;
+            if length_syms.contains(var) {
+                return;
             }
             // Normalize each free variable to the PARAMETER it is caller-bound to
             // (bare `a`, or a shared-ref deref `a*` → `a`); anything else is not
             // assumable. The shadow/witness checks below then operate on the base
             // parameter name, so a sound deref term binds the real parameter local.
-            match assumable_param_base(&var, &param_names, &shared_ref_params) {
+            match assumable_param_base(var, &param_names, &shared_ref_params) {
                 Some(base) => {
                     referenced.insert(base.to_string());
                 }
@@ -369,7 +376,7 @@ pub fn gate_contract_preconditions(
                     // to reject.  Classify it as shadowing and keep it in the
                     // referenced set so the multimap checks below also diagnose
                     // every colliding alias on that local.
-                    let raw_base = var.strip_suffix('*').unwrap_or(var.as_str());
+                    let raw_base = var.strip_suffix('*').unwrap_or(var);
                     // If `raw_base` is already the parameter's canonical name,
                     // rejection came from the term shape (for example `a*` on
                     // `a: &mut T`), not from a debug-name alias. Keep that as a
@@ -383,11 +390,11 @@ pub fn gate_contract_preconditions(
                         referenced.insert(raw_base.to_string());
                         reasons.push(AssumeSkipReason::ShadowedParamName(raw_base.to_string()));
                     } else {
-                        reasons.push(AssumeSkipReason::NonParamVariable(var.clone()));
+                        reasons.push(AssumeSkipReason::NonParamVariable(var.to_string()));
                     }
                 }
             }
-        }
+        });
     }
 
     // Shadow collision. The formula namespace is debug names, so an assumed
@@ -400,11 +407,11 @@ pub fn gate_contract_preconditions(
     for name in &referenced {
         match debug_name_locals.get(name.as_str()) {
             Some(locals) => {
-                let mut distinct: Vec<usize> = locals.clone();
-                distinct.sort_unstable();
-                distinct.dedup();
-                let is_unique_param =
-                    distinct.len() == 1 && distinct[0] >= 1 && distinct[0] <= body.arg_count;
+                let is_unique_param = locals.first().is_some_and(|&first| {
+                    first >= 1
+                        && first <= body.arg_count
+                        && locals[1..].iter().all(|&local| local == first)
+                });
                 if !is_unique_param {
                     reasons.push(AssumeSkipReason::ShadowedParamName(name.clone()));
                 }
@@ -458,8 +465,11 @@ pub fn gate_contract_preconditions(
             if *local >= 1 && *local <= body.arg_count {
                 // Another name aliases a param local; if any referenced name
                 // also resolves to this local the binding is ambiguous.
-                if debug_name_locals.iter().any(|(other, ls)| {
-                    other != name && referenced.contains(other) && ls.contains(local)
+                if referenced.iter().any(|other| {
+                    other != name
+                        && debug_name_locals
+                            .get(other.as_str())
+                            .is_some_and(|ls| ls.contains(local))
                 }) {
                     reasons.push(AssumeSkipReason::ShadowedParamName(name.clone()));
                 }
@@ -619,13 +629,16 @@ fn forced_parameter_alias(
     // unbindable spellings leave `k!` orderings and no ground to pick one.
     let body_names: FxHashSet<&str> =
         body.locals.iter().filter_map(|local| local.name.as_deref()).collect();
-    let mut clause_vars: FxHashSet<String> = FxHashSet::default();
+    let mut clause_vars: FxHashSet<&str> = FxHashSet::default();
     for clause in preconditions {
-        clause_vars.extend(clause.free_variables());
+        trust_types::for_each_free_variable_name(clause, &mut |name| {
+            clause_vars.insert(name);
+        });
     }
     let mut unresolved = clause_vars
         .iter()
-        .filter(|name| !body_names.contains(name.as_str()) && !length_syms.contains(name.as_str()));
+        .copied()
+        .filter(|name| !body_names.contains(*name) && !length_syms.contains(*name));
     let source = unresolved.next()?;
     if unresolved.next().is_some() {
         return None;
@@ -662,7 +675,7 @@ fn forced_parameter_alias(
     // entry (`ref q`, `_`, `q @ sub`) is a refusal: for those patterns `_p` carries
     // no row of the parameter's own, so any row found there belongs to a body
     // binding and `source` cannot be corroborated from MIR at all.
-    if hir_param_source_names.get(param_local - 1)?.as_deref() != Some(source.as_str()) {
+    if hir_param_source_names.get(param_local - 1)?.as_deref() != Some(source) {
         return None;
     }
 
@@ -697,7 +710,7 @@ fn forced_parameter_alias(
     // the first non-demoted row on `_p` is a `source` row whatever `source`'s
     // multiplicity — because a spelling that names two MIR bindings is exactly the
     // ambiguity this gate exists to refuse, and declining costs only reach.
-    let source_rows = debug_name_locals.get(source.as_str())?;
+    let source_rows = debug_name_locals.get(source)?;
     if source_rows.len() != 1 || source_rows[0] != param_local {
         return None;
     }
@@ -742,7 +755,7 @@ fn forced_parameter_alias(
         }
     }
 
-    Some(ForcedParameterAlias { source: source.clone(), body_spelling: body_spelling.to_string() })
+    Some(ForcedParameterAlias { source: source.to_string(), body_spelling: body_spelling.to_string() })
 }
 
 /// A spelling that TRUST'S OWN CONTRACT LOWERING mints and that copy-propagation
@@ -797,13 +810,9 @@ fn plain_source_binding(name: &str) -> bool {
 /// syntactic rename with no binder awareness, so a quantified clause is refused
 /// outright rather than risking capture.
 fn formula_binds_a_variable(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |node| {
-        if matches!(node, Formula::Forall(..) | Formula::Exists(..)) {
-            found = true;
-        }
-    });
-    found
+    trust_types::any_formula_node(formula, &mut |node| {
+        matches!(node, Formula::Forall(..) | Formula::Exists(..))
+    })
 }
 
 /// The single sort `name` carries across `formulas`, or `None` when it carries
@@ -812,20 +821,27 @@ fn sole_var_sort(formulas: &[Formula], name: &str) -> Option<trust_types::Sort> 
     let mut sort: Option<trust_types::Sort> = None;
     let mut ambiguous = false;
     for formula in formulas {
-        formula.visit(&mut |node| {
+        let _ = trust_types::all_formula_nodes(formula, &mut |node| {
             let found = match node {
                 Formula::Var(var, var_sort) if var == name => var_sort,
                 Formula::SymVar(symbol, var_sort) if symbol.as_str() == name => var_sort,
-                _ => return,
+                _ => return true,
             };
             match &sort {
-                Some(existing) if existing != found => ambiguous = true,
+                Some(existing) if existing != found => {
+                    ambiguous = true;
+                    return false;
+                }
                 Some(_) => {}
                 None => sort = Some(found.clone()),
             }
+            true
         });
+        if ambiguous {
+            return None;
+        }
     }
-    if ambiguous { None } else { sort }
+    sort
 }
 
 /// Whether a parameter of type `ty` can be what a clause variable of sort `sort`
@@ -1012,10 +1028,7 @@ fn admissible_lengths(
         // to identify exactly this parameter. The raw map catches copy-prop
         // aliases that one last-write-wins local name cannot represent.
         let raw_is_unique_parameter = debug_name_locals.get(name).is_some_and(|locals| {
-            let mut distinct = locals.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            distinct == [local.index]
+            !locals.is_empty() && locals.iter().all(|&idx| idx == local.index)
         });
         if name_count.get(name).copied().unwrap_or(0) != 1 || !raw_is_unique_parameter {
             continue;
@@ -1029,6 +1042,30 @@ fn admissible_lengths(
         }
     }
     AdmissibleLengths { canonical, source_rebindings }
+}
+
+/// Trust (2026-10-03): rebind each `ensures` clause's source `xs.len()` leaf
+/// (`xs__len`) to the canonical `xs__slice_len` term the body's VCs use, under the
+/// SAME admission [`admissible_lengths`] gives a `requires`: a unique, length-stable
+/// runtime-slice parameter. A postcondition reads parameters as ENTRY values, and a
+/// length-stable slice parameter's length at entry is its length at the return.
+/// Any other `__len` leaf is left as it is, a free leaf whose clause stays unproved.
+pub fn rebind_postcondition_lengths(
+    postconditions: &mut [Formula],
+    body: &VerifiableBody,
+    debug_name_locals: &FxHashMap<String, Vec<usize>>,
+) {
+    if postconditions.is_empty() {
+        return;
+    }
+    let lengths = admissible_lengths(body, debug_name_locals);
+    for post in postconditions.iter_mut() {
+        for (source, canonical) in &lengths.source_rebindings {
+            if trust_types::any_free_variable_name(post, &mut |name| name == source) {
+                *post = post.rename_var(source, canonical);
+            }
+        }
+    }
 }
 
 /// True for a parameter type whose length is a RUNTIME fat-pointer/slice length,
@@ -1072,8 +1109,12 @@ fn symarray_len_sym_of(ty: &Ty) -> Option<&trust_types::ConstLen> {
 /// pointee ELEMENTS:
 ///   * NO whole-local reassign of the parameter (`arr = &arr[..k];`) — that
 ///     installs a shorter/different fat pointer, changing the length view.
-///   * NO `&mut`/`&raw mut` reborrow of the WHOLE parameter fat pointer (the
-///     channel a reslice-of-arr flows through: `let s = &mut arr; *s = &mut …`).
+///   * NO pointer to the parameter's OWN storage — `&mut arr`, `&raw mut arr`, or
+///     `&raw const arr` (the channel a reslice-of-arr flows through: `let s = &mut
+///     arr; *s = &mut …`, or `*(&raw const arr as *mut &[T]) = …`, which Tree
+///     Borrows accepts for a `mut arr`). That is `trust_types`'
+///     `Statement::escapes_local_storage`, asked here directly; until 2026-09-30
+///     this scan spelled `&mut` / `&raw mut` only.
 ///   * NO projected store / borrow that overwrites the fat pointer VALUE itself
 ///     (a projection that does NOT go through `Deref` — e.g. a hypothetical
 ///     fat-pointer field write; exotic, rejected conservatively), and no
@@ -1108,21 +1149,17 @@ fn slice_param_length_is_stable(body: &VerifiableBody, param_local: usize) -> bo
         }
         for stmt in &block.stmts {
             match stmt {
-                Statement::Assign { place, rvalue, .. } => {
+                Statement::Assign { place, .. } => {
                     if writes_fat_pointer(place) {
                         return false;
                     }
-                    // A mutable (re)borrow of the WHOLE parameter fat pointer
-                    // (`&mut arr` / `&raw mut arr`, no leading deref) is the channel a
-                    // reslice-of-arr flows through. A mutable borrow of the POINTEE or
-                    // an ELEMENT (`&mut (*arr)[i]`, deref-leading) cannot change the
-                    // fat pointer's length, so it is allowed.
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(true, borrowed) = rvalue
-                    {
-                        if writes_fat_pointer(borrowed) {
-                            return false;
-                        }
+                    // A pointer to the WHOLE parameter fat pointer (`&mut arr`,
+                    // `&raw mut arr`, `&raw const arr`, no leading deref) is the
+                    // channel a reslice-of-arr flows through. A pointer to the
+                    // POINTEE or an ELEMENT (`&mut (*arr)[i]`, deref-leading) cannot
+                    // change the fat pointer's length, so it is allowed.
+                    if stmt.escapes_local_storage(param_local) {
+                        return false;
                     }
                 }
                 Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
@@ -1160,6 +1197,9 @@ fn in_assumable_fragment(formula: &Formula) -> bool {
         Formula::And(items) | Formula::Or(items) => items.iter().all(in_assumable_fragment),
         Formula::Implies(a, b)
         | Formula::Eq(a, b)
+        // A float contract `==` is IEEE `FpEq` (SPEC-FLOAT-EQ-STRUCTURAL-1); it is
+        // the same comparison of parameters and literals as `Eq`, one sort over.
+        | Formula::FpEq(a, b)
         | Formula::Lt(a, b)
         | Formula::Le(a, b)
         | Formula::Gt(a, b)
@@ -1182,18 +1222,63 @@ fn has_ground_witness(
     body: &VerifiableBody,
     length_symbols: &FxHashSet<String>,
 ) -> bool {
+    let domains = witness_domains(body, length_symbols, preconditions);
+    has_ground_witness_in(preconditions, &domains)
+}
+
+/// The BODY-INDEPENDENT core of [`has_ground_witness`]: is there a ground
+/// assignment, inside `domains`, that satisfies every formula?
+///
+/// Split out for A1 (design note `requires-hyps` revision 2 §2.5), which needs
+/// to ask this question about a function's PRECONDITIONS ALONE — over the
+/// signature's exact carrier ranges, with no MIR body in hand and no interest
+/// in the solver lane's shadowing or unsupported-syntax outcomes, which are
+/// about debug names in a body and say nothing about a kernel goal over
+/// signature parameters. The search itself is unchanged, so the solver lane's
+/// behaviour is byte-identical.
+///
+/// A variable with no entry in `domains` falls back to the unranged candidate
+/// list, which is what the solver lane has always done; a caller that must not
+/// accept an out-of-range witness therefore supplies an EXACT domain for every
+/// variable (see [`contract_formulas_have_ground_witness`]).
+fn has_ground_witness_in(
+    preconditions: &[Formula],
+    domains: &FxHashMap<String, WitnessDomain>,
+) -> bool {
+    matches!(search_ground_witness_in(preconditions, domains), ContractWitnessSearch::Found)
+}
+
+/// [`has_ground_witness_in`] with the TWO meanings of a negative kept apart.
+///
+/// The bool form collapses "the enumeration ran and nothing satisfied the
+/// formulas" with "the enumeration never ran" (the cross-product exceeded
+/// `MAX_ASSIGNMENTS`, or a variable had no candidate at all). That collapse is
+/// harmless for the solver lane, which only ever refuses an assumption on a
+/// negative; it is NOT harmless for a diagnostic, which would otherwise tell an
+/// author their satisfiable precondition "admits no value". A1 (design note
+/// `requires-hyps` revision 2 §2.5) therefore consumes this form.
+fn search_ground_witness_in(
+    preconditions: &[Formula],
+    domains: &FxHashMap<String, WitnessDomain>,
+) -> ContractWitnessSearch {
     const MAX_ASSIGNMENTS: usize = 4096;
 
-    let mut var_set: FxHashSet<String> = FxHashSet::default();
+    let mut var_set: FxHashSet<&str> = FxHashSet::default();
     for f in preconditions {
-        var_set.extend(f.free_variables());
+        trust_types::for_each_free_variable_name(f, &mut |name| {
+            var_set.insert(name);
+        });
     }
-    let mut vars: Vec<String> = var_set.into_iter().collect();
-    vars.sort();
+    let mut vars: Vec<&str> = var_set.into_iter().collect();
+    vars.sort_unstable();
     if vars.is_empty() {
         // Ground predicate: just evaluate it.
         let env = FxHashMap::default();
-        return preconditions.iter().all(|f| eval_bool(f, &env) == Some(true));
+        return if preconditions.iter().all(|f| eval_bool(f, &env) == Some(true)) {
+            ContractWitnessSearch::Found
+        } else {
+            ContractWitnessSearch::NoneInSearchedSet
+        };
     }
 
     let mut candidates: Vec<i128> = vec![0, 1, -1];
@@ -1213,8 +1298,6 @@ fn has_ground_witness(
     expanded.sort_unstable();
     expanded.dedup();
 
-    let domains = witness_domains(body, length_symbols, preconditions);
-
     // Fast accept: the all-zeros / all-false assignment. Per-field magnitude
     // preconditions (`|self.0| <= C && |self.1| <= C && …`, centered at 0) are
     // satisfied by it, and 0 is a representable value of every integer/float
@@ -1225,23 +1308,23 @@ fn has_ground_witness(
     // assignment, so it can never admit an unsatisfiable predicate; and it only
     // ADDS accepts — a predicate the enumeration would reject at zero simply
     // evaluates to false here and falls through to the unchanged search.
-    let zero_env: FxHashMap<&str, WitnessValue> = vars
+    let mut env: FxHashMap<&str, WitnessValue> = vars
         .iter()
-        .map(|name| {
+        .map(|&name| {
             let value = match domains.get(name) {
                 Some(WitnessDomain::Bool) => WitnessValue::Bool(false),
                 _ => WitnessValue::Int(0),
             };
-            (name.as_str(), value)
+            (name, value)
         })
         .collect();
-    if preconditions.iter().all(|f| eval_bool(f, &zero_env) == Some(true)) {
-        return true;
+    if preconditions.iter().all(|f| eval_bool(f, &env) == Some(true)) {
+        return ContractWitnessSearch::Found;
     }
 
     let candidates_by_var: Vec<Vec<WitnessValue>> = vars
         .iter()
-        .map(|name| match domains.get(name) {
+        .map(|&name| match domains.get(name) {
             Some(WitnessDomain::Bool) => vec![WitnessValue::Bool(false), WitnessValue::Bool(true)],
             Some(WitnessDomain::Int { min, max }) => {
                 let mut values = expanded
@@ -1257,41 +1340,50 @@ fn has_ground_witness(
             None => expanded.iter().copied().map(WitnessValue::Int).collect(),
         })
         .collect();
-    if candidates_by_var.iter().any(Vec::is_empty) {
-        return false;
+    if let Some(position) = candidates_by_var.iter().position(Vec::is_empty) {
+        return ContractWitnessSearch::NotRun {
+            reason: format!(
+                "`{}` has no candidate value inside its own carrier, so no assignment could be \
+                 formed",
+                vars[position]
+            ),
+        };
     }
     let total = candidates_by_var
         .iter()
         .try_fold(1usize, |product, candidates| product.checked_mul(candidates.len()))
         .unwrap_or(usize::MAX);
     if total > MAX_ASSIGNMENTS {
-        return false;
+        return ContractWitnessSearch::NotRun {
+            reason: format!(
+                "the bounded search space over {} variable(s) is {total} assignment(s), past this \
+                 lane's budget of {MAX_ASSIGNMENTS}",
+                vars.len()
+            ),
+        };
     }
 
     let mut indices = vec![0usize; vars.len()];
+    for (position, &variable) in vars.iter().enumerate() {
+        env.insert(variable, candidates_by_var[position][0]);
+    }
     loop {
-        let env: FxHashMap<&str, WitnessValue> = vars
-            .iter()
-            .zip(indices.iter())
-            .enumerate()
-            .map(|(position, (variable, &index))| {
-                (variable.as_str(), candidates_by_var[position][index])
-            })
-            .collect();
         if preconditions.iter().all(|f| eval_bool(f, &env) == Some(true)) {
-            return true;
+            return ContractWitnessSearch::Found;
         }
         // Odometer increment.
         let mut pos = 0;
         loop {
             if pos == indices.len() {
-                return false;
+                return ContractWitnessSearch::NoneInSearchedSet;
             }
             indices[pos] += 1;
             if indices[pos] < candidates_by_var[pos].len() {
+                env.insert(vars[pos], candidates_by_var[pos][indices[pos]]);
                 break;
             }
             indices[pos] = 0;
+            env.insert(vars[pos], candidates_by_var[pos][0]);
             pos += 1;
         }
     }
@@ -1341,7 +1433,7 @@ fn witness_domains(
     // body lacks a precise Ty. Formula evidence can refine Int -> Bool, never
     // widen an exact integer range.
     for formula in preconditions {
-        formula.visit(&mut |node| match node {
+        trust_types::visit_formula_nodes(formula, &mut |node| match node {
             Formula::Var(name, trust_types::Sort::Bool) => {
                 domains.insert(name.clone(), WitnessDomain::Bool);
             }
@@ -1352,6 +1444,111 @@ fn witness_domains(
         });
     }
     domains
+}
+
+/// A1 (design note `requires-hyps` revision 2 §2.5): is there a ground
+/// assignment satisfying every formula in `formulas`, where each variable ranges
+/// over the EXACT carrier the compiler query published for it?
+///
+/// WHY THIS IS NOT [`has_ground_witness`]. The solver lane's witness search is
+/// collective over ALL of a body's preconditions, computes its ranges from the
+/// MIR body, and reports failure for reasons that include debug-name shadowing
+/// — none of which is meaningful for a kernel goal over signature parameters.
+/// A1 asks a narrower question about a chosen SUBSET of clauses, so it supplies
+/// its own domains and consults none of the solver lane's outcomes.
+///
+/// WHAT A NEGATIVE MEANS, exactly — and why there are TWO of them.
+/// [`ContractWitnessSearch::NoneInSearchedSet`] is "the enumeration ran over the
+/// whole candidate set and nothing satisfied the formulas", which is still not
+/// "unsatisfiable" (the candidate set is a bounded heuristic), and
+/// [`ContractWitnessSearch::NotRun`] is "no enumeration happened at all". A
+/// caller may withhold a positive claim on EITHER, and must never turn either
+/// into a flat negative claim about the program; only `NoneInSearchedSet` may
+/// even be reported as a search that looked and found nothing. A variable with
+/// no exact domain yields `NotRun` rather than falling back to the unranged
+/// search, because an unranged witness can sit outside the carrier and would
+/// make a vacuous precondition look satisfiable (`requires c.degree > 255` on a
+/// `u8` field).
+///
+/// SOUNDNESS DIRECTION. This decides satisfiability of the FORMULA callers are
+/// charged. That coincides with satisfiability of the kernel proposition only on
+/// the fragment where the two readings agree, which is exactly the fragment
+/// `trust_spec_elab`'s hypothesis allow-list admits. Stated, not hidden.
+#[must_use]
+pub fn contract_formulas_have_ground_witness(
+    formulas: &[Formula],
+    exact_domains: &[trust_types::CompilerContractVariableDomain],
+) -> ContractWitnessSearch {
+    // An empty formula list has the all-zeros fast accept as a VACUOUS model, so
+    // the refusal lives here rather than in every caller: "nothing was offered"
+    // is not evidence that anything is satisfiable.
+    if formulas.is_empty() {
+        return ContractWitnessSearch::NotRun {
+            reason: "no precondition formula was offered to the search".to_string(),
+        };
+    }
+    let mut domains: FxHashMap<String, WitnessDomain> = FxHashMap::default();
+    for variable in exact_domains {
+        let Some(domain) = witness_domain_for_contract_value(variable.domain) else {
+            // No exact range: refuse rather than search unranged.
+            return ContractWitnessSearch::NotRun {
+                reason: format!(
+                    "`{}` is published at a carrier with no exact searchable range, and an \
+                     unranged witness could sit outside it",
+                    variable.name
+                ),
+            };
+        };
+        domains.insert(variable.name.clone(), domain);
+    }
+    let mut free: FxHashSet<&str> = FxHashSet::default();
+    for formula in formulas {
+        trust_types::for_each_free_variable_name(formula, &mut |name| {
+            free.insert(name);
+        });
+    }
+    let mut unranged: Vec<&str> = free.into_iter().filter(|n| !domains.contains_key(*n)).collect();
+    unranged.sort();
+    if let Some(name) = unranged.first() {
+        return ContractWitnessSearch::NotRun {
+            reason: format!("no carrier was published for `{name}`"),
+        };
+    }
+    search_ground_witness_in(formulas, &domains)
+}
+
+/// The outcome of [`contract_formulas_have_ground_witness`].
+///
+/// Three-valued on purpose. The bool this replaced conflated a search that RAN
+/// and found nothing with a search that never ran, and the one consumer turned
+/// that bool into a sentence about the user's program ("the carried `requires`
+/// clauses admit no value in their own carriers"). At five `u64` parameters with
+/// literal bounds the cross-product passes `MAX_ASSIGNMENTS` and the search does
+/// not run, so that sentence was false for a plainly satisfiable contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractWitnessSearch {
+    /// A ground assignment inside the exact carriers satisfies every formula.
+    Found,
+    /// The enumeration ran to exhaustion over the candidate set and found none.
+    /// Still not a proof of unsatisfiability — the candidate set is bounded.
+    NoneInSearchedSet,
+    /// No enumeration happened. `reason` says why, in the author's terms.
+    NotRun { reason: String },
+}
+
+/// The exact searchable range of one query-owned contract carrier, or `None`
+/// when this lane has no exact range for it (mathematical integers, floats).
+fn witness_domain_for_contract_value(
+    domain: trust_types::CompilerContractValueDomain,
+) -> Option<WitnessDomain> {
+    use trust_types::CompilerContractValueDomain as Value;
+    match domain {
+        Value::Bool => Some(WitnessDomain::Bool),
+        Value::MachineInt { width, signed } | Value::PointerSizedInt { width, signed } => {
+            witness_domain_for_ty(&Ty::Int { width, signed })
+        }
+        Value::MathematicalInt | Value::Float { .. } => None,
+    }
 }
 
 fn witness_domain_for_ty(ty: &Ty) -> Option<WitnessDomain> {
@@ -1435,8 +1632,36 @@ fn collect_literals(formula: &Formula, out: &mut Vec<i128>) {
             collect_literals(a, out);
             collect_literals(b, out);
         }
+        // A float contract `==` (IEEE `FpEq`, SPEC-FLOAT-EQ-STRUCTURAL-1) names an
+        // EXACT value, so the integer grid around 0 finds it only by luck: seed a
+        // float literal operand whose value is an integer (`x == 7.0` needs `7`;
+        // `eval_float` reads the integer witness `k` as the float `k`). Only
+        // equality seeds — an ordering bound is satisfied off the grid's
+        // neighbourhood anyway, and every extra candidate grows a cross product
+        // capped by `MAX_ASSIGNMENTS` (see the `Neg` arm). SOUND: candidates only;
+        // every accept still evaluates the whole set to `true` under one model.
+        Formula::FpEq(a, b) => {
+            for side in [a, b] {
+                if let Some(value) = integral_float_literal(side) {
+                    out.push(value);
+                }
+            }
+            collect_literals(a, out);
+            collect_literals(b, out);
+        }
         _ => {}
     }
+}
+
+/// The value of a float LITERAL operand when it is an integer the witness search
+/// can stand in for exactly (`|v| <= 2^53`, so `v as i128 as f64 == v`); `None`
+/// for any other node, a fractional or non-finite literal, or a huge one.
+fn integral_float_literal(formula: &Formula) -> Option<i128> {
+    if !matches!(formula, Formula::FpConst { .. }) {
+        return None;
+    }
+    let value = eval_float(formula, &FxHashMap::default())?;
+    (value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_992.0).then_some(value as i128)
 }
 
 fn eval_bool(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<bool> {
@@ -1473,6 +1698,13 @@ fn eval_bool(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<b
             }
             Some(eval_int(a, env)? == eval_int(b, env)?)
         }
+        // A float contract `==` is Rust `PartialEq` — IEEE equality
+        // (SPEC-FLOAT-EQ-STRUCTURAL-1): a concrete assignment satisfies it exactly
+        // when the two f64 values compare equal (`-0.0 == 0.0`; a NaN never
+        // equals, and `eval_float` refuses a NaN literal outright). There is no
+        // integer fallback: a float operand never reaches `eval_int`, so no
+        // structural reading can admit a witness.
+        Formula::FpEq(a, b) => Some(eval_float(a, env)? == eval_float(b, env)?),
         // Float-sorted magnitude bounds (`self.0 <= 1.0e30`) evaluate with IEEE f64
         // semantics; a non-float comparison falls through to the exact-i128 path.
         Formula::Lt(a, b) => match (eval_float(a, env), eval_float(b, env)) {
@@ -1520,6 +1752,18 @@ fn eval_float(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<
             let v = f64::from_bits(*bits as u64);
             if v.is_finite() { Some(v) } else { None }
         }
+        // binary32, since an `f32` clause's literal is narrowed to the
+        // parameter's format. Widening back to `f64` for the witness search is
+        // EXACT — every binary32 value is a binary64 value — so the evaluation
+        // is faithful and not a re-rounding. Without this arm the literal
+        // evaluated to nothing, the search found no witness, and the whole
+        // precondition set was dropped as unsatisfiable: an `f32` bound was
+        // admitted all the way to the verifier and then silently discarded
+        // before it could discharge anything.
+        Formula::FpConst { bits, eb: 8, sb: 24 } => {
+            let v = f64::from(f32::from_bits(u32::try_from(*bits).ok()?));
+            if v.is_finite() { Some(v) } else { None }
+        }
         Formula::Var(name, trust_types::Sort::Float { .. }) => match env.get(name.as_str()) {
             Some(WitnessValue::Int(value)) => Some(*value as f64),
             _ => None,
@@ -1548,6 +1792,7 @@ fn eval_bool_opt(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Opti
         | Formula::And(_)
         | Formula::Or(_)
         | Formula::Implies(..)
+        | Formula::FpEq(..)
         | Formula::Lt(..)
         | Formula::Le(..)
         | Formula::Gt(..)
@@ -1562,13 +1807,17 @@ fn eval_int(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<i1
     match formula {
         Formula::Int(v) => Some(*v),
         Formula::UInt(v) => i128::try_from(*v).ok(),
-        Formula::Var(name, sort) if *sort != trust_types::Sort::Bool => {
-            match env.get(name.as_str()) {
-                Some(WitnessValue::Int(value)) => Some(*value),
-                _ => None,
-            }
-        }
-        Formula::SymVar(symbol, sort) if *sort != trust_types::Sort::Bool => {
+        // Not a Bool and not a FLOAT variable (SPEC-FLOAT-EQ-STRUCTURAL-1). A
+        // float's witness is read as an f64 by `eval_float`; reading it here as an
+        // exact integer is the structural reading — it made `x == y` over two f64
+        // parameters an integer equation, which `x = y = 0` satisfies whatever
+        // `==` means. A float comparison that `eval_float` cannot evaluate now
+        // simply has no witness (the clause is dropped, fail-closed).
+        Formula::Var(name, sort) if integer_witness_sort(sort) => match env.get(name.as_str()) {
+            Some(WitnessValue::Int(value)) => Some(*value),
+            _ => None,
+        },
+        Formula::SymVar(symbol, sort) if integer_witness_sort(sort) => {
             match env.get(symbol.as_str()) {
                 Some(WitnessValue::Int(value)) => Some(*value),
                 _ => None,
@@ -1580,6 +1829,13 @@ fn eval_int(formula: &Formula, env: &FxHashMap<&str, WitnessValue>) -> Option<i1
         Formula::Neg(inner) => eval_int(inner, env)?.checked_neg(),
         _ => None,
     }
+}
+
+/// Whether a variable of `sort` carries an integer witness `eval_int` may read:
+/// every sort but `Bool` (read by `eval_bool`) and an IEEE float (read by
+/// `eval_float` — see the `Var` arm of [`eval_int`]).
+fn integer_witness_sort(sort: &trust_types::Sort) -> bool {
+    !matches!(sort, trust_types::Sort::Bool | trust_types::Sort::Float { .. })
 }
 
 #[cfg(test)]
@@ -2141,6 +2397,62 @@ mod tests {
         assert!(pres.is_empty());
     }
 
+    /// INT-RAWCONST-HAVOC-1 (2026-10-06): `&raw const arr` of the WHOLE parameter fat
+    /// pointer is a reslice channel too — cast to `*mut &mut [u32]`, a write through it
+    /// reseats a `mut arr` binding under Tree Borrows. Before the fix the gate counted
+    /// `&mut` and `&raw mut` only, so this precondition was admitted.
+    #[test]
+    fn length_of_raw_const_borrowed_slice_param_rejected() {
+        let mut body = fill_body();
+        body.blocks = vec![trust_types::BasicBlock {
+            id: trust_types::BlockId(0),
+            stmts: vec![trust_types::Statement::Assign {
+                place: trust_types::Place::local(3),
+                rvalue: trust_types::Rvalue::AddressOf(false, trust_types::Place::local(1)),
+                span: trust_types::SourceSpan::default(),
+            }],
+            terminator: trust_types::Terminator::Return,
+        }];
+        let names = multimap(&[("arr", &[1]), ("n", &[2])]);
+        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__slice_len")))];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert!(
+            reasons.iter().any(
+                |r| matches!(r, AssumeSkipReason::NonParamVariable(n) if n == "arr__slice_len")
+            ),
+            "a `&raw const` of the whole slice param must drop its length (INV-1): {reasons:?}"
+        );
+        assert!(pres.is_empty());
+    }
+
+    /// The control: `&raw const (*arr)` — the POINTEE, which is how the extractor spells
+    /// `arr.len()`'s fake-metadata borrow — cannot change the fat pointer's length, so
+    /// the length precondition is still admitted.
+    #[test]
+    fn raw_const_borrow_of_slice_param_pointee_keeps_length_stable() {
+        let mut body = fill_body();
+        body.blocks = vec![trust_types::BasicBlock {
+            id: trust_types::BlockId(0),
+            stmts: vec![trust_types::Statement::Assign {
+                place: trust_types::Place::local(3),
+                rvalue: trust_types::Rvalue::AddressOf(
+                    false,
+                    trust_types::Place {
+                        local: 1,
+                        projections: vec![trust_types::Projection::Deref],
+                    },
+                ),
+                span: trust_types::SourceSpan::default(),
+            }],
+            terminator: trust_types::Terminator::Return,
+        }];
+        let names = multimap(&[("arr", &[1]), ("n", &[2])]);
+        let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__slice_len")))];
+        let reasons = gate_contract_preconditions(&mut pres, &body, &names);
+        assert!(reasons.is_empty(), "a pointee borrow must not drop the length: {reasons:?}");
+        assert_eq!(pres.len(), 1);
+    }
+
     #[test]
     fn source_length_of_resliced_slice_param_rejected() {
         let body = resliced_fill_body();
@@ -2154,6 +2466,41 @@ mod tests {
             "unstable source length must not be rebound or admitted: {reasons:?}",
         );
         assert!(pres.is_empty());
+    }
+
+    /// Trust (2026-09-30): a `&raw const` pointer to the WHOLE parameter fat
+    /// pointer is a reslice channel too — `*(&raw const arr as *mut &mut [u32]) =
+    /// …` is defined under Tree Borrows for a `mut arr` — so the length symbol is
+    /// dropped exactly as for `&mut arr`. `&raw const (*arr)` (the pointee; rustc's
+    /// `PtrMetadata` idiom) keeps it.
+    #[test]
+    fn length_of_slice_param_behind_a_raw_const_pointer_rejected() {
+        let with = |place: trust_types::Place| {
+            let mut body = fill_body();
+            body.blocks = vec![trust_types::BasicBlock {
+                id: trust_types::BlockId(0),
+                stmts: vec![trust_types::Statement::Assign {
+                    place: trust_types::Place::local(3),
+                    rvalue: trust_types::Rvalue::AddressOf(false, place),
+                    span: trust_types::SourceSpan::default(),
+                }],
+                terminator: trust_types::Terminator::Return,
+            }];
+            body
+        };
+        let names = multimap(&[("arr", &[1]), ("n", &[2])]);
+        let admitted = |body: &VerifiableBody| {
+            let mut pres = vec![Formula::Le(Box::new(var("n")), Box::new(var("arr__slice_len")))];
+            let reasons = gate_contract_preconditions(&mut pres, body, &names);
+            reasons.is_empty() && pres.len() == 1
+        };
+        assert!(
+            !admitted(&with(trust_types::Place::local(1))),
+            "`&raw const arr` can reslice `arr`: its length is not stable (INV-1)"
+        );
+        let pointee =
+            trust_types::Place { local: 1, projections: vec![trust_types::Projection::Deref] };
+        assert!(admitted(&with(pointee)), "`&raw const (*arr)` points at the elements");
     }
 
     #[test]
@@ -2804,7 +3151,7 @@ mod tests {
     /// **THE REVIEWED FALSE PROOF — the explicit negative this restatement was
     /// once rejected for admitting.** For
     ///
-    /// ```ignore
+    /// ```ignore (illustrative)
     /// #[allow(non_upper_case_globals)] const n: i32 = -1;
     /// #[requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
     /// pub fn f(__trust_v: i32) -> i32 { let n = __trust_v; let x = n; x }
@@ -3127,7 +3474,7 @@ mod tests {
     /// `_p`, so the first non-demoted row there had to be the clause spelling's.
     /// That silently presumed `_p` carries a parameter row at all. For
     ///
-    /// ```rust,ignore
+    /// ```rust,ignore (illustrative)
     /// const n: i32 = 5;                                    // TRUE clause
     /// #[trust::requires(n >= 0)] #[ensures(|r: &i32| *r >= 0)]
     /// fn f(ref q: i32) -> i32 { let n = *q; let x = n; x }  // f(-7) == -7
@@ -3339,5 +3686,260 @@ mod tests {
         let reasons = gate_contract_preconditions(&mut pres, &body, &names);
         assert_eq!(reasons, vec![AssumeSkipReason::NoSatisfiableWitness]);
         assert!(pres.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 (`requires-hyps` revision 2 §2.5): the EXACT-CARRIER witness entry
+    // point, and the three-valued outcome that keeps a diagnostic honest.
+    // -----------------------------------------------------------------------
+
+    fn dom(
+        name: &str,
+        domain: trust_types::CompilerContractValueDomain,
+    ) -> trust_types::CompilerContractVariableDomain {
+        trust_types::CompilerContractVariableDomain { name: name.to_string(), domain }
+    }
+
+    fn u(width: u32) -> trust_types::CompilerContractValueDomain {
+        trust_types::CompilerContractValueDomain::MachineInt { width, signed: false }
+    }
+
+    /// N-A5, the twin that justifies refusing the unranged fallback: a bound
+    /// OUTSIDE the parameter's own carrier has no witness, and would have one if
+    /// the search fell back to the solver lane's unranged candidate list.
+    #[test]
+    fn an_out_of_carrier_bound_has_no_witness_in_its_own_carrier() {
+        let formulas = vec![Formula::Gt(Box::new(var("d")), Box::new(int(255)))];
+        assert_eq!(
+            contract_formulas_have_ground_witness(&formulas, &[dom("d", u(8))]),
+            ContractWitnessSearch::NoneInSearchedSet,
+            "`d > 255` on a u8 must find no witness inside the carrier"
+        );
+        // MUTATION CONTROL: the identical formula at a WIDER carrier does have
+        // one, so the refusal above is the CARRIER's doing and not the
+        // formula's.
+        assert_eq!(
+            contract_formulas_have_ground_witness(&formulas, &[dom("d", u(16))]),
+            ContractWitnessSearch::Found
+        );
+        // And the unranged search the entry point refuses to fall back to would
+        // have accepted it: 256 is in `expanded` (255 + 1).
+        let mut unranged: FxHashMap<String, WitnessDomain> = FxHashMap::default();
+        unranged.insert("d".to_string(), WitnessDomain::Int { min: i128::MIN, max: i128::MAX });
+        assert_eq!(
+            search_ground_witness_in(&formulas, &unranged),
+            ContractWitnessSearch::Found,
+            "the fallback this entry point refuses is exactly what would have lied"
+        );
+    }
+
+    /// A variable with no exact range, and a variable with no published carrier
+    /// at all, are both `NotRun` — never a claim that the program admits no
+    /// value.
+    #[test]
+    fn a_carrier_the_search_cannot_range_is_not_run_rather_than_negative() {
+        let formulas = vec![Formula::Gt(Box::new(var("x")), Box::new(int(3)))];
+        let unranged = contract_formulas_have_ground_witness(
+            &formulas,
+            &[dom("x", trust_types::CompilerContractValueDomain::MathematicalInt)],
+        );
+        assert!(
+            matches!(&unranged, ContractWitnessSearch::NotRun { reason } if reason.contains("x")),
+            "got {unranged:?}"
+        );
+        let unpublished = contract_formulas_have_ground_witness(&formulas, &[]);
+        assert!(
+            matches!(&unpublished, ContractWitnessSearch::NotRun { reason }
+                if reason.contains("no carrier was published for `x`")),
+            "got {unpublished:?}"
+        );
+        let nothing = contract_formulas_have_ground_witness(&[], &[]);
+        assert!(
+            matches!(nothing, ContractWitnessSearch::NotRun { .. }),
+            "an empty formula list must not be a vacuous `Found`"
+        );
+    }
+
+    /// THE DEFECT THIS ENUM EXISTS FOR. Five plainly satisfiable clauses blow
+    /// past `MAX_ASSIGNMENTS`, so the enumeration never runs. With a bool the
+    /// caller could only read that as "no witness", and the diagnostic said so —
+    /// about a contract `(100, 200, 300, 400, 500)` satisfies.
+    #[test]
+    fn a_search_space_past_the_budget_reports_not_run_not_unsatisfiable() {
+        let names = ["a", "b", "c", "d", "e"];
+        let formulas: Vec<Formula> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                Formula::Ge(
+                    Box::new(var(n)),
+                    Box::new(int(i128::try_from(100 * (i + 1)).expect("small"))),
+                )
+            })
+            .collect();
+        let domains: Vec<_> = names.iter().map(|n| dom(n, u(64))).collect();
+        let outcome = contract_formulas_have_ground_witness(&formulas, &domains);
+        assert!(
+            matches!(&outcome, ContractWitnessSearch::NotRun { reason }
+                if reason.contains("budget")),
+            "a search that never ran must not be reported as one that looked; got {outcome:?}"
+        );
+        // The contract really is satisfiable, which is what makes the old bool
+        // a lie rather than a conservative answer.
+        let env: FxHashMap<&str, WitnessValue> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, WitnessValue::Int(i128::try_from(100 * (i + 1)).expect("small"))))
+            .collect();
+        assert!(formulas.iter().all(|f| eval_bool(f, &env) == Some(true)));
+    }
+
+    /// The solver lane's bool wrapper is unchanged by the split: every outcome
+    /// other than `Found` is still `false` there.
+    #[test]
+    fn the_solver_lane_bool_is_found_and_nothing_else() {
+        let sat = vec![Formula::Ge(Box::new(var("x")), Box::new(int(0)))];
+        let unsat = vec![Formula::Lt(Box::new(var("x")), Box::new(var("x")))];
+        let mut domains: FxHashMap<String, WitnessDomain> = FxHashMap::default();
+        domains.insert("x".to_string(), WitnessDomain::Int { min: 0, max: 255 });
+        assert!(has_ground_witness_in(&sat, &domains));
+        assert!(!has_ground_witness_in(&unsat, &domains));
+    }
+}
+
+/// SPEC-FLOAT-EQ-STRUCTURAL-1: a float contract `==` is IEEE `FpEq` (Rust
+/// `PartialEq`), and the witness search evaluates it in f64 — never as an integer
+/// equation. Kept in its own module: the wave-19 gate tests own `mod tests`.
+#[cfg(test)]
+mod float_eq_ieee_tests {
+    use trust_types::{Sort, Ty};
+
+    use super::*;
+
+    const F64: Sort = Sort::Float { eb: 11, sb: 53 };
+
+    fn fvar(name: &str) -> Box<Formula> {
+        Box::new(Formula::Var(name.to_string(), F64))
+    }
+
+    fn fp(value: f64) -> Box<Formula> {
+        Box::new(Formula::FpConst { bits: u128::from(value.to_bits()), eb: 11, sb: 53 })
+    }
+
+    fn fp_eq(lhs: Box<Formula>, rhs: Box<Formula>) -> Formula {
+        Formula::FpEq(lhs, rhs)
+    }
+
+    fn search(preconditions: &[Formula]) -> ContractWitnessSearch {
+        search_ground_witness_in(preconditions, &FxHashMap::default())
+    }
+
+    /// `fn f(x: f64, i: usize)`: the q1 `mix_eq` signature.
+    fn float_and_index_body() -> VerifiableBody {
+        VerifiableBody {
+            locals: vec![
+                trust_types::LocalDecl { index: 0, ty: Ty::unit_ty(), name: None },
+                trust_types::LocalDecl {
+                    index: 1,
+                    ty: Ty::Float { width: 64 },
+                    name: Some("x".into()),
+                },
+                trust_types::LocalDecl { index: 2, ty: Ty::usize(), name: Some("i".into()) },
+            ],
+            blocks: Vec::new(),
+            arg_count: 2,
+            return_ty: Ty::unit_ty(),
+            datatype_defs: Default::default(),
+        }
+    }
+
+    fn gate(preconditions: &mut Vec<Formula>, body: &VerifiableBody) -> Vec<AssumeSkipReason> {
+        let names: FxHashMap<String, Vec<usize>> =
+            [("x".to_string(), vec![1]), ("i".to_string(), vec![2])].into_iter().collect();
+        let hir = vec![Some("x".to_string()), Some("i".to_string())];
+        gate_contract_preconditions(preconditions, body, &names, Some(&hir))
+    }
+
+    /// THE REGRESSION (q1 `mix_eq`): `requires x == 1.0` has the witness
+    /// `x = 1.0`. Before, `eval_bool` had no float equality, the search found no
+    /// model, and the collective drop took `requires i < 4` with it — correct
+    /// code was then refuted with `i = 4`.
+    #[test]
+    fn float_literal_equality_is_assumed_with_its_sibling_clause() {
+        let mut pres = vec![
+            fp_eq(fvar("x"), fp(1.0)),
+            Formula::Lt(Box::new(Formula::Var("i".into(), Sort::Int)), Box::new(Formula::Int(4))),
+        ];
+        let reasons = gate(&mut pres, &float_and_index_body());
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!(pres.len(), 2, "both clauses must reach the body");
+    }
+
+    /// The same clauses as the parser and retype now deliver them, end to end.
+    #[test]
+    fn parsed_and_retyped_contract_equality_is_assumed() {
+        let mut sorts = std::collections::BTreeMap::new();
+        sorts.insert("x".to_string(), F64);
+        let typed = |text: &str| {
+            trust_types::retype_formula_variables(
+                trust_types::parse_spec_expr(text).expect("parses"),
+                &sorts,
+            )
+        };
+        let mut pres = vec![typed("x != 0.0"), typed("i < 4")];
+        assert!(matches!(&pres[0], Formula::Not(inner) if matches!(**inner, Formula::FpEq(..))));
+        let reasons = gate(&mut pres, &float_and_index_body());
+        assert!(reasons.is_empty(), "{reasons:?}");
+        assert_eq!(pres.len(), 2);
+    }
+
+    #[test]
+    fn fp_eq_is_in_the_assumable_fragment() {
+        assert!(in_assumable_fragment(&fp_eq(fvar("x"), fp(1.0))));
+        assert!(in_assumable_fragment(&Formula::Not(Box::new(fp_eq(fvar("x"), fvar("y"))))));
+    }
+
+    /// An integer-valued literal off the `{0, ±1}` grid is seeded: `x == 7.0`.
+    #[test]
+    fn integral_float_literal_seeds_the_search() {
+        assert_eq!(search(&[fp_eq(fvar("x"), fp(7.0))]), ContractWitnessSearch::Found);
+        assert_eq!(search(&[fp_eq(fp(-12.0), fvar("x"))]), ContractWitnessSearch::Found);
+    }
+
+    /// IEEE: `-0.0 == 0.0`. The integer witness `0` is the float `0.0`, which
+    /// satisfies a clause written against `-0.0`.
+    #[test]
+    fn signed_zero_literal_has_a_witness() {
+        assert_eq!(search(&[fp_eq(fvar("x"), fp(-0.0))]), ContractWitnessSearch::Found);
+    }
+
+    /// A NaN-only predicate has NO model: nothing equals NaN, NaN included.
+    #[test]
+    fn nan_only_predicate_has_no_witness() {
+        assert_ne!(search(&[fp_eq(fvar("x"), fp(f64::NAN))]), ContractWitnessSearch::Found);
+        assert_ne!(search(&[fp_eq(fp(f64::NAN), fp(f64::NAN))]), ContractWitnessSearch::Found);
+    }
+
+    /// The structural reading can no longer admit anything: a STRUCTURAL `Eq`
+    /// between two float variables (the shape the gate used to evaluate as the
+    /// integer equation `x = y`) has no witness, while its IEEE spelling does.
+    #[test]
+    fn float_variables_never_reach_the_integer_evaluator() {
+        let structural = Formula::Eq(fvar("x"), fvar("y"));
+        assert_ne!(search(std::slice::from_ref(&structural)), ContractWitnessSearch::Found);
+        let env: FxHashMap<&str, WitnessValue> =
+            [("x", WitnessValue::Int(0)), ("y", WitnessValue::Int(0))].into_iter().collect();
+        assert_eq!(eval_int(&fvar("x"), &env), None);
+        assert_eq!(eval_bool(&structural, &env), None);
+        assert_eq!(eval_bool(&fp_eq(fvar("x"), fvar("y")), &env), Some(true));
+        assert_eq!(search(&[fp_eq(fvar("x"), fvar("y"))]), ContractWitnessSearch::Found);
+    }
+
+    /// The residual over-refusal, pinned so a change to it is visible: a
+    /// fractional literal is not on the integer grid, so `x == 0.5` still finds
+    /// no witness and the set is dropped (fail-closed, never a vacuous assume).
+    #[test]
+    fn fractional_float_literal_is_still_not_found() {
+        assert_eq!(search(&[fp_eq(fvar("x"), fp(0.5))]), ContractWitnessSearch::NoneInSearchedSet);
     }
 }

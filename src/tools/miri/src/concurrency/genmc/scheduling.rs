@@ -75,7 +75,7 @@ fn get_function_kind<'tcx>(
             // these calls are not *that* common.
             return interp_ok(MaybeAtomic(ActionKind::Load));
         }
-        // NOTE: Functions intercepted by Miri in `concurrency/genmc/intercep.rs` must also be added here.
+        // NOTE: Functions intercepted by Miri in `concurrency/genmc/shims.rs` must also be added here.
         // Such intercepted functions, like `sys::Mutex::lock`, should be treated as atomics to ensure we call the scheduler when we encounter one of them.
         // These functions must also be classified whether they may have load semantics.
         if ecx.tcx.is_diagnostic_item(sym::sys_mutex_lock, callee_def_id)
@@ -116,24 +116,20 @@ impl GenmcCtx {
         let thread_infos = self.exec_state.thread_id_manager.borrow();
         let genmc_tid = thread_infos.get_genmc_tid(active_thread_id);
 
-        let result = self.handle.borrow_mut().pin_mut().schedule_next(genmc_tid, atomic_kind);
+        let result = self.genmc.borrow_mut().pin_mut().schedule_next(genmc_tid, atomic_kind);
         // Depending on the exec_state, we either schedule the given thread, or we are finished with this execution.
         match result.exec_status {
             ExecutionStatus::Ok => interp_ok(Some(thread_infos.get_miri_tid(result.next_thread))),
             ExecutionStatus::Blocked => {
-                // This execution doesn't need further exploration. We treat this as "success, no
-                // leak check needed", which makes it a NOP in the big outer loop.
-                throw_machine_stop!(TerminationInfo::Exit {
-                    code: 0, // success
-                    leak_check: false,
-                });
+                // This execution is "moot", it doesn't need further exploration.
+                throw_machine_stop!(TerminationInfo::GenmcMoot);
             }
             ExecutionStatus::Finished => {
                 let exit_status = self.exec_state.exit_status.get().expect(
                     "If the execution is finished, we should have a return value from the program.",
                 );
                 throw_machine_stop!(TerminationInfo::Exit {
-                    code: exit_status.exit_code,
+                    exit_code: exit_status.exit_code,
                     leak_check: matches!(exit_status.exit_type, super::ExitType::MainThreadFinish),
                 });
             }

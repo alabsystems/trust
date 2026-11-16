@@ -117,6 +117,7 @@ fn call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId) -> Termi
         // authenticated identity, and `None` is what every other test-side
         // constructor uses for that.
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -231,6 +232,7 @@ fn emitted_tozero_contract() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -299,6 +301,7 @@ fn unwinding_call(callee: &str, args: Vec<Operand>, dest: Place, target: BlockId
         is_unsafe_sig: false,
         unwind: UnwindEdge::Continue,
         callee_identity: None,
+        callee_key: None,
     }
 }
 
@@ -412,6 +415,7 @@ fn emitted_tozero_as_extracted() -> VerifiableFunction {
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

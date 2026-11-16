@@ -111,10 +111,11 @@ impl SchedulerState {
             memory_used: 0,
             iterations_completed: 0,
             round_robin_index: 0,
-            candidates: candidates.clone(),
-            priority_queue: BinaryHeap::new(),
+            candidates: Vec::new(),
+            priority_queue: BinaryHeap::with_capacity(candidates.len()),
         };
         state.rebuild_priority_queue(&candidates);
+        state.candidates = candidates;
         state
     }
 
@@ -179,9 +180,10 @@ impl SchedulerState {
     /// Returns a `PauseReason` if any limit is exceeded, or `None` to continue.
     #[must_use]
     pub fn should_pause(&self) -> Option<PauseReason> {
-        if self.start_time.elapsed() >= self.budget.max_time {
+        let elapsed = self.start_time.elapsed();
+        if elapsed >= self.budget.max_time {
             return Some(PauseReason::TimeExceeded {
-                elapsed: self.start_time.elapsed(),
+                elapsed,
                 limit: self.budget.max_time,
             });
         }

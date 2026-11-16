@@ -1,25 +1,21 @@
-use rustc_ast::token::{Delimiter, Token, TokenKind};
+use rustc_ast::ast;
+use rustc_ast::token::{Delimiter, IdentKind, Token, TokenKind};
 use rustc_ast::tokenstream::{DelimSpan, Spacing, TokenStream, TokenTree};
-use rustc_ast::{AttrItem, ast};
 use rustc_expand::base::{Annotatable, ExtCtxt};
 use rustc_session::config::Offload;
-use rustc_span::{Ident, Span, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, sym};
 use thin_vec::thin_vec;
 
 use crate::diagnostics;
 
 fn compile_for_device(ecx: &mut ExtCtxt<'_>) -> bool {
-    ecx.sess.opts.unstable_opts.offload.contains(&Offload::Device)
+    ecx.sess.opts.unstable_opts.offload.iter().any(|o| matches!(o, Offload::Device(_)))
 }
 
-fn outer_normal_attr(
-    kind: &Box<rustc_ast::NormalAttr>,
-    id: rustc_ast::AttrId,
-    span: Span,
-) -> rustc_ast::Attribute {
-    let style = rustc_ast::AttrStyle::Outer;
-    let kind = rustc_ast::AttrKind::Normal(kind.clone());
-    rustc_ast::Attribute { kind, id, style, span }
+fn outer_normal_attr(normal: &Box<ast::NormalAttr>, id: ast::AttrId, span: Span) -> ast::Attribute {
+    let style = ast::AttrStyle::Outer;
+    let kind = ast::AttrKind::Normal(normal.clone());
+    ast::Attribute { kind, id, style, span }
 }
 
 fn extract_fn(
@@ -39,30 +35,41 @@ fn extract_fn(
 /// The `offload_kernel` macro expands the function into two separate definitions:
 /// one on the host to handle the call, and one on the device for executing the kernel.
 ///
+/// Trust: import and enable the macro, and make the raw-pointer write explicit.
 /// ```
+/// # #![feature(gpu_offload)]
+/// use std::offload::offload_kernel;
 /// #[offload_kernel]
-/// fn foo(a: &[f32], b: &[f32], c: *mut f32) {
-///     *c = a[0] + b[0];
+/// unsafe fn foo(a: &[f32], b: &[f32], c: *mut f32) {
+///     // SAFETY: the caller supplies a writable output pointer.
+///     unsafe { *c = a[0] + b[0]; }
 /// }
+/// # fn main() {}
 /// ```
 ///
 /// This expands to the host-side function:
 ///
+/// Trust: the internal panic entrypoint needs its feature gate; this stub is not invoked.
 /// ```
-/// #[unsafe(no_mangle)]
+/// # #![feature(panic_internals)]
+/// # #![allow(internal_features)]
 /// #[inline(never)]
-/// fn foo(_: &[f32], _: &[f32], _: *mut f32) {
+/// unsafe fn foo(_: &[f32], _: &[f32], _: *mut f32) {
 ///     ::core::panicking::panic("not implemented")
 /// }
 /// ```
 ///
 /// And the device-side kernel:
 ///
-/// ```
+/// Trust: on the native host this ABI is intentionally rejected with E0570.
+/// Device code generation is checked separately on an offload-enabled target.
+/// ```compile_fail,E0570
+/// # #![feature(rustc_attrs, abi_gpu_kernel)]
+/// # #![allow(internal_features)]
 /// #[rustc_offload_kernel]
-/// #[unsafe(no_mangle)]
 /// unsafe extern "gpu-kernel" fn foo(a: &[f32], b: &[f32], c: *mut f32) {
-///     *c = a[0] + b[0];
+///     // SAFETY: the kernel caller supplies a writable output pointer.
+///     unsafe { *c = a[0] + b[0]; }
 /// }
 /// ```
 pub(crate) fn expand_kernel(
@@ -81,16 +88,7 @@ pub(crate) fn expand_kernel(
     let span = ecx.with_def_site_ctxt(expand_span);
 
     // device function
-    let mut device_fn = Box::new(ast::Fn {
-        defaultness: ast::Defaultness::Implicit,
-        sig: sig.clone(),
-        ident,
-        generics: generics.clone(),
-        contract: None,
-        body,
-        define_opaque: None,
-        eii_impls: Default::default(),
-    });
+    let mut device_fn = ecx.item_fn(sig.clone(), ident, generics.clone(), body);
 
     let extern_gpu_kernel = ast::Extern::from_abi(
         Some(ast::StrLit {
@@ -114,24 +112,9 @@ pub(crate) fn expand_kernel(
         span,
     );
 
-    // unsafe(no_mangle) attr
-    let unsafe_item = AttrItem {
-        unsafety: ast::Safety::Unsafe(span),
-        path: ast::Path::from_ident(Ident::new(sym::no_mangle, span)),
-        args: ast::AttrItemKind::Unparsed(ast::AttrArgs::Empty),
-        tokens: None,
-    };
-
-    let no_mangle_attr = Box::new(ast::NormalAttr { item: unsafe_item, tokens: None });
-    let new_id = ecx.sess.psess.attr_id_generator.mk_attr_id();
-    let unsafe_no_mangle = outer_normal_attr(&no_mangle_attr, new_id, span);
-
     let device_item = {
-        let mut item = ecx.item(
-            span,
-            thin_vec![rustc_offload_kernel, unsafe_no_mangle],
-            ast::ItemKind::Fn(device_fn),
-        );
+        let mut item =
+            ecx.item(span, thin_vec![rustc_offload_kernel.clone()], ast::ItemKind::Fn(device_fn));
         item.vis = vis.clone();
         Annotatable::Item(item)
     };
@@ -141,10 +124,7 @@ pub(crate) fn expand_kernel(
         span,
         ecx.macro_call(
             span,
-            ecx.path_global(
-                span,
-                [sym::std, sym::unimplemented].map(|s| Ident::new(s, span)).to_vec(),
-            ),
+            ecx.std_path(span, &[sym::unimplemented]),
             Delimiter::Parenthesis,
             TokenStream::default(),
         ),
@@ -153,24 +133,15 @@ pub(crate) fn expand_kernel(
     let body = ecx.block(span, thin_vec![stmt]);
 
     // host function
-    let mut host_fn = Box::new(ast::Fn {
-        defaultness: ast::Defaultness::Implicit,
-        sig: sig.clone(),
-        ident,
-        generics: generics.clone(),
-        contract: None,
-        body: Some(body),
-        define_opaque: None,
-        eii_impls: Default::default(),
-    });
+    let mut host_fn = ecx.item_fn(sig, ident, generics, Some(body));
 
     for param in host_fn.sig.decl.inputs.iter_mut() {
-        param.pat = Box::new(ecx.pat_wild(param.pat.span));
+        *param.pat = ecx.pat_wild(param.pat.span);
     }
 
     // inline(never) attr
-    let ts: Vec<TokenTree> = vec![TokenTree::Token(
-        Token::new(TokenKind::Ident(sym::never, false.into()), span),
+    let ts = vec![TokenTree::Token(
+        Token::new(TokenKind::Ident(sym::never, IdentKind::Normal), span),
         Spacing::Joint,
     )];
 
@@ -183,21 +154,21 @@ pub(crate) fn expand_kernel(
     let inline_item = ast::AttrItem {
         unsafety: ast::Safety::Default,
         path: ast::Path::from_ident(Ident::with_dummy_span(sym::inline)),
-        args: rustc_ast::ast::AttrItemKind::Unparsed(ast::AttrArgs::Delimited(never_arg)),
-        tokens: None,
+        args: ast::AttrArgs::Delimited(never_arg),
+        span: DUMMY_SP,
     };
     let inline_never_attr = Box::new(ast::NormalAttr { item: inline_item, tokens: None });
 
     let new_id = ecx.sess.psess.attr_id_generator.mk_attr_id();
     let inline_never = outer_normal_attr(&inline_never_attr, new_id, span);
 
-    let new_id = ecx.sess.psess.attr_id_generator.mk_attr_id();
-    let unsafe_no_mangle = outer_normal_attr(&no_mangle_attr, new_id, span);
-
     let host_item = {
-        let mut item =
-            ecx.item(span, thin_vec![unsafe_no_mangle, inline_never], ast::ItemKind::Fn(host_fn));
-        item.vis = vis.clone();
+        let mut item = ecx.item(
+            span,
+            thin_vec![rustc_offload_kernel, inline_never],
+            ast::ItemKind::Fn(host_fn),
+        );
+        item.vis = vis;
         Annotatable::Item(item)
     };
 

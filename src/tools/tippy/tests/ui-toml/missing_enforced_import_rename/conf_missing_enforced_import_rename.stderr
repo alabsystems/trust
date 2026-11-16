@@ -2,40 +2,51 @@ error: this import should be renamed
   --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:5:34
    |
 LL | use std::process::{Child as Kid, exit as wrong_exit};
-   |                                  ^^^^^^^^^^^^^^^^^^ help: try: `exit as goodbye`
+   |                                  ^^^^^^^^^^^^^^^^^^
    |
+   = help: rename this import to `exit as goodbye` and update its uses
    = note: `-D clippy::missing-enforced-import-renames` implied by `-D warnings`
    = help: to override `-D warnings` add `#[allow(clippy::missing_enforced_import_renames)]`
 
 error: this import should be renamed
-  --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:7:1
+  --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:7:5
    |
 LL | use std::thread::sleep;
-   | ^^^^^^^^^^^^^^^^^^^^^^ help: try: `use std::thread::sleep as thread_sleep`
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+   = help: rename this import to `std::thread::sleep as thread_sleep` and update its uses
 
 error: this import should be renamed
   --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:11:11
    |
 LL |     any::{type_name, Any},
-   |           ^^^^^^^^^ help: try: `type_name as ident`
+   |           ^^^^^^^^^
+   |
+   = help: rename this import to `type_name as ident` and update its uses
 
 error: this import should be renamed
   --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:13:5
    |
 LL |     clone,
-   |     ^^^^^ help: try: `clone as foo`
+   |     ^^^^^
+   |
+   = help: rename this import to `clone as foo` and update its uses
 
 error: this import should be renamed
   --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:15:5
    |
 LL |     sync :: Mutex,
-   |     ^^^^^^^^^^^^^ help: try: `sync :: Mutex as StdMutie`
+   |     ^^^^^^^^^^^^^
+   |
+   = help: rename this import to `sync :: Mutex as StdMutie` and update its uses
 
 error: this import should be renamed
-  --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:21:5
+  --> tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs:21:9
    |
 LL |     use std::collections::BTreeMap as OopsWrongRename;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `use std::collections::BTreeMap as Map`
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: rename this import to `std::collections::BTreeMap as Map` and update its uses
 
 error: aborting due to 6 previous errors
 

@@ -1,0 +1,892 @@
+{
+  "name": "wait_loop",
+  "def_path": "m_transmute::wait_loop",
+  "span": {
+    "file": "m_transmute.rs",
+    "line_start": 11,
+    "col_start": 0,
+    "line_end": 20,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Dynamic": {
+                "trait_name": "m_transmute::Raw",
+                "principal_key": "m_transmute::Raw"
+              }
+            }
+          }
+        },
+        "name": "w"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "FnPtr": {
+            "sig": {
+              "params": [],
+              "ret": "Never"
+            }
+          }
+        },
+        "name": "on_signal"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Adt": {
+                    "name": "m_transmute::Signal",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "SIGHUP",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "SIGTERM",
+                        "discriminant": 15,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "m_transmute::Errno",
+                    "fields": [
+                      [
+                        "__tag",
+                        {
+                          "Int": {
+                            "width": 64,
+                            "signed": true
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [
+                      {
+                        "name": "Unknown",
+                        "discriminant": 0,
+                        "fields": []
+                      },
+                      {
+                        "name": "EPERM",
+                        "discriminant": 1,
+                        "fields": []
+                      },
+                      {
+                        "name": "EINTR",
+                        "discriminant": 4,
+                        "fields": []
+                      },
+                      {
+                        "name": "EAGAIN",
+                        "discriminant": 35,
+                        "fields": []
+                      }
+                    ],
+                    "disc_index_safe": true,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Enum"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "m_transmute::Signal",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "SIGHUP",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "SIGTERM",
+                            "discriminant": 15,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "m_transmute::Errno",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Unknown",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "EPERM",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "EINTR",
+                            "discriminant": 4,
+                            "fields": []
+                          },
+                          {
+                            "name": "EAGAIN",
+                            "discriminant": 35,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": "r"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Never",
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Array": {
+            "elem": {
+              "Adt": {
+                "name": "core::mem::maybe_uninit::MaybeUninit",
+                "fields": [
+                  [
+                    "uninit",
+                    "Unit"
+                  ],
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::mem::manually_drop::ManuallyDrop",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::mem::maybe_dangling::MaybeDangling",
+                                "fields": [
+                                  [
+                                    "0",
+                                    {
+                                      "Int": {
+                                        "width": 8,
+                                        "signed": false
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Union"
+              }
+            },
+            "len": 8
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 128,
+            "signed": false
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Goto": 1
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "<dyn m_transmute::Raw as m_transmute::Raw>::raw",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 4,
+              "projections": []
+            },
+            "target": 2,
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 13,
+              "col_start": 99,
+              "line_end": 13,
+              "col_end": 106
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 14488343136938448685,
+              "def_index": 4,
+              "substs_digest": [
+                16932101952010104274,
+                2367639092444519791
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 14488343136938448685,
+              "krate_name": "m_transmute"
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to [std::mem::MaybeUninit<u8>; 8_usize] requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 107
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to u32 requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Copy": {
+                        "local": 8,
+                        "projections": [
+                          {
+                            "Subslice": {
+                              "from": 0,
+                              "to": 4,
+                              "from_end": false
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 107
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "Cast": [
+                  {
+                    "Copy": {
+                      "local": 9,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Int": {
+                      "width": 128,
+                      "signed": false
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 107
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Copy": {
+                      "local": 10,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        4294967295,
+                        128
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 107
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Copy": {
+                "local": 11,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                7
+              ],
+              [
+                1,
+                7
+              ]
+            ],
+            "otherwise": 8,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 13,
+              "col_start": 48,
+              "line_end": 13,
+              "col_end": 107
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 3,
+                  "projections": [
+                    {
+                      "Downcast": 1
+                    },
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 14,
+                "col_start": 14,
+                "line_end": 14,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 5,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                4,
+                1
+              ]
+            ],
+            "otherwise": 5,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 14,
+              "col_start": 8,
+              "line_end": 14,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [],
+        "terminator": "Return"
+      },
+      {
+        "id": 6,
+        "stmts": [],
+        "terminator": {
+          "Opaque": {
+            "kind": "Call(indirect)",
+            "targets": [],
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 15,
+              "col_start": 21,
+              "line_end": 15,
+              "col_end": 32
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Unsupported": {
+                  "kind": "CastKind::Transmute",
+                  "detail": "transmute to std::result::Result<Signal, Errno> requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast",
+                  "operands": [
+                    {
+                      "Move": {
+                        "local": 4,
+                        "projections": []
+                      }
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 13,
+                "col_start": 48,
+                "line_end": 13,
+                "col_end": 107
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "m_transmute.rs",
+                "line_start": 14,
+                "col_start": 14,
+                "line_end": 14,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                6
+              ],
+              [
+                1,
+                4
+              ]
+            ],
+            "otherwise": 3,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 14,
+              "col_start": 8,
+              "line_end": 14,
+              "col_end": 15
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Constant": {
+                "Bool": false
+              }
+            },
+            "expected": true,
+            "msg": "InvalidEnumConstruction",
+            "target": 7,
+            "span": {
+              "file": "m_transmute.rs",
+              "line_start": 13,
+              "col_start": 48,
+              "line_end": 13,
+              "col_end": 107
+            }
+          }
+        }
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_5",
+                "Int"
+              ]
+            },
+            {
+              "Int": 35
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

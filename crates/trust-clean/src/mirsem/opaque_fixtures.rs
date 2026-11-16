@@ -112,6 +112,7 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb1: SwitchInt(_3) [0 → bb4] else bb2
@@ -160,6 +161,7 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb3: _0 = Some(_6) → bb5
@@ -208,6 +210,7 @@ pub(crate) fn abstractor_fold_fvar_opt_func() -> trust_types::VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -248,6 +251,7 @@ pub(crate) fn fvarsubst_fold_fvar_opt_func() -> trust_types::VerifiableFunction 
         is_foreign: false,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: None,
     };
     func
 }
@@ -349,6 +353,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb2: _6 = ExprKind::BVar(_7); _5 = ek(_6) → bb3
@@ -378,6 +383,7 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
                         is_foreign: false,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                     },
                 },
                 // bb3: _0 = Some(_5) → bb5
@@ -426,5 +432,6 @@ pub(crate) fn lifter_fold_bvar_opt_func() -> trust_types::VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }

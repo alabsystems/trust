@@ -34,6 +34,24 @@
 // The witness is `elem62 = 1, elem63 = 15`: t = 1<<4 = 16, then 16 + (15<<4) = 256,
 // which exceeds u8::MAX. Hand-checkable, and a real input.
 //
+// 2026-09-10 — REGRESSED AND RESTORED. Root cause pinned by bisecting two BUILT
+// compilers with the gate's exact invocation: `acb08e7616` (atpkg, 2026-08-21 14:40)
+// still prints `Level 0 summary: 1 failed` + `[overflow:add] FAILED
+// (trust-bmc-reduction-refute)` here, while `c2031f179` (2026-09-10) prints `0 failed`.
+// Exactly one commit in that range touches the lane: `4ca0cb0eac` (2026-08-21 20:51) deleted
+// the `otherwise`-edge argument in `crates/trust-vcgen/src/generate/bmc_reduction.rs`
+// (`bmc_terminator_succs`), so the `SwitchInt`'s `otherwise -> Unreachable` block
+// re-entered the reachable set and `body_is_straight_line_reduction`'s terminator
+// allowlist refused the function. Its objection was right — the deleted code keyed on
+// the caller-constructible `exhaustive_enum_unreachable` bit — and it named the bar for
+// restoring it: prune only from locally rederived, subject-bound type evidence. That is
+// what the restored `switch_otherwise_is_dead_by_declared_enum_type` supplies: the bit is
+// never read; the scrutinee must be a `Discriminant` read of a place whose DECLARED type
+// is an enum, with the case set exactly that enum's declared discriminant set. Every one
+// of the ~40 synthetic unit tests stayed green across the whole regression — the trap this
+// header already warns about — so the guard is now
+// `crates/trust-vcgen/tests/bmc_reduction_real_mir.rs`, over the compiler's OWN dumped MIR.
+//
 // NOTE for anyone re-deriving this: an earlier attempt (086b157aca) passed 20 unit
 // tests on hand-built `VerifiableFunction`s and still did NOT fire here, because two
 // recognition gates rejected the REAL extracted MIR (the always-true Option-tag

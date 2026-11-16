@@ -28,23 +28,34 @@ pub(super) fn ob_record_conjoin(vc: &mut VerificationCondition, facts: &[Formula
     }
 }
 
+pub(super) fn ob_record_conjoin_owned(vc: &mut VerificationCondition, facts: Vec<Formula>) {
+    if facts.is_empty() {
+        return;
+    }
+    if let Some(ob) = vc.obligation.as_mut() {
+        ob.wrappers.push(ObligationWrapper::ConjoinFactsLast { facts });
+    }
+}
+
 /// Apply `f` to every `Formula` stored in a wrapper (conjoin facts, or a guarded
 /// path term's guards). `Raw` terms carry no formula.
 pub(super) fn ob_map_wrapper_formulas(
     w: &mut ObligationWrapper,
-    f: &mut impl FnMut(&Formula) -> Formula,
+    f: &mut impl FnMut(Formula) -> Formula,
 ) {
     match w {
         ObligationWrapper::ConjoinFactsLast { facts } => {
             for fact in facts.iter_mut() {
-                *fact = f(fact);
+                let owned = std::mem::replace(fact, Formula::Bool(true));
+                *fact = f(owned);
             }
         }
         ObligationWrapper::PathGuardOr { paths } => {
             for p in paths.iter_mut() {
                 if let PathGuardTerm::Guarded { guards } = p {
                     for g in guards.iter_mut() {
-                        *g = f(g);
+                        let owned = std::mem::replace(g, Formula::Bool(true));
+                        *g = f(owned);
                     }
                 }
             }
@@ -69,12 +80,14 @@ pub(super) fn ob_record_rename_at(
     let Some(ob) = vc.obligation.as_mut() else {
         return;
     };
-    ob.body = version_rename_at(&ob.body, sv, func, block, stmt_idx);
+    let body = std::mem::replace(&mut ob.body, Formula::Bool(true));
+    ob.body = version_rename_owned_at(body, sv, func, block, stmt_idx);
     if let Some(s) = ob.subject.as_mut() {
-        *s = version_rename_at(s, sv, func, block, stmt_idx);
+        let subj = std::mem::replace(s, Formula::Bool(true));
+        *s = version_rename_owned_at(subj, sv, func, block, stmt_idx);
     }
     for w in &mut ob.wrappers {
-        ob_map_wrapper_formulas(w, &mut |x| version_rename_at(x, sv, func, block, stmt_idx));
+        ob_map_wrapper_formulas(w, &mut |x| version_rename_owned_at(x, sv, func, block, stmt_idx));
     }
 }
 
@@ -85,23 +98,72 @@ pub(super) fn ob_record_rename_at(
 /// guess about which sub-formula is the obligation. `after == before` is identity
 /// (no wrapper). Any shape other than `And([.., before])` records nothing, so
 /// reconstruction diverges and the consumer DECLINES (fail-closed).
+pub(super) fn extract_conjoined_facts<'a>(
+    before: &Formula,
+    after: &'a Formula,
+) -> Option<&'a [Formula]> {
+    if std::ptr::eq(before, after) {
+        return None;
+    }
+    if let Formula::And(children) = after
+        && children.len() >= 2
+        && children.last().is_some_and(|last| std::ptr::eq(last, before) || last == before)
+    {
+        Some(&children[..children.len() - 1])
+    } else {
+        None
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn ob_record_conjoin_step(
+    vc: &mut VerificationCondition,
+    f: impl FnOnce(Formula) -> (Formula, bool),
+) {
+    let formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+    let (after, wrapped) = f(formula);
+    if vc.obligation.is_some()
+        && wrapped
+        && let Formula::And(children) = &after
+        && children.len() >= 2
+    {
+        let facts = children[..children.len() - 1].to_vec();
+        if let Some(ob) = vc.obligation.as_mut()
+            && !facts.is_empty()
+        {
+            ob.wrappers.push(ObligationWrapper::ConjoinFactsLast { facts });
+        }
+    }
+    vc.formula = after;
+}
+
 pub(super) fn ob_record_conjoin_wrap(
     vc: &mut VerificationCondition,
     before: &Formula,
     after: &Formula,
 ) {
-    if vc.obligation.is_none() || after == before {
+    if vc.obligation.is_none() {
         return;
     }
-    if let Formula::And(children) = after
-        && children.last() == Some(before)
-        && children.len() >= 2
-    {
-        let facts = &children[..children.len() - 1];
+    if let Some(facts) = extract_conjoined_facts(before, after) {
         ob_record_conjoin(vc, facts);
     }
-    // Otherwise: unexpected shape — record nothing; reconstruction will mismatch
-    // and the consumer DECLINES (fail-closed).
+    // Otherwise: identity (`after == before`) or unexpected shape — record nothing;
+    // on an unexpected shape reconstruction will mismatch and the consumer DECLINES
+    // (fail-closed).
+}
+
+pub(super) fn ob_record_conjoin_wrap_in_place(vc: &mut VerificationCondition, before: &Formula) {
+    if vc.obligation.is_none() {
+        return;
+    }
+    if let Some(facts) = extract_conjoined_facts(before, &vc.formula).map(<[Formula]>::to_vec) {
+        if let Some(ob) = vc.obligation.as_mut()
+            && !facts.is_empty()
+        {
+            ob.wrappers.push(ObligationWrapper::ConjoinFactsLast { facts });
+        }
+    }
 }
 
 /// Mirror the final `normalize_ssa_version_tokens` collapse onto every recorded
@@ -113,12 +175,14 @@ pub(super) fn ob_record_normalize(vc: &mut VerificationCondition, func: &Verifia
     let Some(ob) = vc.obligation.as_mut() else {
         return;
     };
-    ob.body = normalize_ssa_version_tokens(func, &ob.body);
+    let body = std::mem::replace(&mut ob.body, Formula::Bool(true));
+    ob.body = normalize_ssa_version_tokens_owned(func, body);
     if let Some(s) = ob.subject.as_mut() {
-        *s = normalize_ssa_version_tokens(func, s);
+        let subj = std::mem::replace(s, Formula::Bool(true));
+        *s = normalize_ssa_version_tokens_owned(func, subj);
     }
     for w in &mut ob.wrappers {
-        ob_map_wrapper_formulas(w, &mut |x| normalize_ssa_version_tokens(func, x));
+        ob_map_wrapper_formulas(w, &mut |x| normalize_ssa_version_tokens_owned(func, x));
     }
 }
 
@@ -136,12 +200,13 @@ pub(super) fn ob_record_eliminate_ites(vc: &mut VerificationCondition, cap: usiz
     let Some(ob) = vc.obligation.as_mut() else {
         return;
     };
-    ob.body = eliminate_term_ites(&ob.body, cap);
+    ob.body =
+        eliminate_term_ites_owned(std::mem::replace(&mut ob.body, Formula::Bool(false)), cap);
     if let Some(s) = ob.subject.as_mut() {
-        *s = eliminate_term_ites(s, cap);
+        *s = eliminate_term_ites_owned(std::mem::replace(s, Formula::Bool(false)), cap);
     }
     for w in &mut ob.wrappers {
-        ob_map_wrapper_formulas(w, &mut |x| eliminate_term_ites(x, cap));
+        ob_map_wrapper_formulas(w, &mut |x| eliminate_term_ites_owned(x, cap));
     }
 }
 
@@ -190,7 +255,7 @@ fn v2_build_divrem_vc_raw(
     }
     VerificationCondition {
         kind,
-        function: func.name.clone().into(),
+        function: func.name.as_str().into(),
         location: span.clone(),
         formula,
         contract_metadata: None,
@@ -225,135 +290,6 @@ fn v2_build_divrem_vc_raw(
 #[cfg(test)]
 pub(super) fn generate_v2_safety_vcs(func: &VerifiableFunction) -> Vec<VerificationCondition> {
     generate_v2_safety_vcs_impl(func, None)
-}
-
-/// Trust (runtime ledger): the `(BlockId, VC)` origins for arithmetic Add/Sub/Mul
-/// overflow VCs, carrying the SAME per-VC interval discharge/augment mutation the
-/// production pipeline applies (mirrors `discharge_body_vcs`), so each returned VC
-/// is byte-identical to the one the compiler's results row carries. This is the
-/// join key the proven-overflow-check elision seam uses to map a KernelCertified
-/// overflow VC back to its MIR basic block. A fresh, pristine, multi-block-complete
-/// regeneration: identical-formula asserts in distinct blocks are surfaced
-/// separately so the seam can mark them Ambiguous (fail-closed). The result is a
-/// join table only: an entry licenses no rewrite by itself.
-///
-/// `None` means NO TABLE COULD BE PROVEN COMPLETE (the ambient verify budget cut the
-/// replay short). It is not "no rows" — that is `Some(vec![])`. The distinction is
-/// load-bearing: `Unique` is only sound relative to a COMPLETE enumeration, so a prefix
-/// must never be presented as a table. Callers turn `None` into an EMPTY
-/// `OverflowCheckOrigins` (every `resolve` misses, every check is kept) and report the
-/// overrun.
-pub fn overflow_vc_block_origins(
-    func: &VerifiableFunction,
-    summaries: Option<&crate::modular::SummaryDatabase>,
-) -> Option<Vec<(BlockId, VerificationCondition)>> {
-    overflow_vc_block_origins_inner(func, summaries, true)
-}
-
-/// The pre-memoization behaviour of [`overflow_vc_block_origins`], for A/B equivalence
-/// testing ONLY: identical code path with the generation memos left INERT (no VC-gen
-/// scope entered), exactly as this function ran before the memo scope was added.
-///
-/// The equivalence obligation this exists to discharge: the memo scope is claimed to
-/// change only the COST of the replay and not one byte of its output — and this table's
-/// output is a codegen join key, so "not one byte" is the operative standard.
-#[cfg(test)]
-pub(crate) fn overflow_vc_block_origins_unmemoized(
-    func: &VerifiableFunction,
-    summaries: Option<&crate::modular::SummaryDatabase>,
-) -> Option<Vec<(BlockId, VerificationCondition)>> {
-    overflow_vc_block_origins_inner(func, summaries, false)
-}
-
-fn overflow_vc_block_origins_inner(
-    func: &VerifiableFunction,
-    summaries: Option<&crate::modular::SummaryDatabase>,
-    memoize: bool,
-) -> Option<Vec<(BlockId, VerificationCondition)>> {
-    // This compiler-facing replay API runs independently of the ordinary
-    // `generate_vcs_impl` boundary. Keep call-result havoc and intrinsic
-    // safety recognition identical for MIR TailCall sites too.
-    //
-    // verifier-perf: run the replay inside a MEMO-LIVE, METER-DISABLED VC-gen scope.
-    // Every generation memo gates on `gen_work::scope_active()` alone, so on this path
-    // — which never entered a scope — all four were inert and the walk paid the full
-    // uncached cost of `place_to_var_name` (an `FxHashSet` over every local rebuilt at
-    // every place occurrence in every formula built or rewritten). Measured A/B on a
-    // checked-add chain: 3.7x at 16 blocks, 20.3x at 128 (112s -> 5.5s).
-    //
-    // The scope MUST be the unmetered variant. Arming the work meter here would let a
-    // trip substitute `gen_work_degraded_leaf()` into a materialized type, changing the
-    // rendered formula and therefore this table's canonical join key — which is
-    // required to be byte-identical to the production VC's. That failure is silent by
-    // construction (a changed key simply stops matching), and it is exactly the failure
-    // this function must not have. `gen_work_scope_unmetered` gives the memos and no
-    // meter; completeness is bounded and REPORTED below instead.
-    let _memo_scope = memoize.then(crate::gen_work_scope_unmetered);
-    let tail_call_expanded = func.with_tail_calls_expanded();
-    let func = tail_call_expanded.as_ref();
-    let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
-    let func = arithmetic_safe_func.as_ref();
-    // COMPLETENESS IS THE WHOLE POINT OF THIS TABLE, so a truncated walk is refused
-    // rather than returned. The consumer joins a KernelCertified row to a UNIQUE origin
-    // block and then DELETES that block's overflow `Assert`; a key maps to `Ambiguous`
-    // — and is refused — only because a SECOND block generated the same canonical
-    // string. Hand it a prefix of the enumeration and a key whose duplicate sat past
-    // the cut reads as `Unique`, licensing the deletion of a live overflow check on the
-    // authority of a proof belonging to a different block. Under-enumeration is
-    // therefore UNSOUND in a way that ordinary VC truncation is not, and `None` (no
-    // table at all, seam is a no-op, checks kept) is the only safe degradation. The
-    // caller reports the overrun.
-    let (generated, truncated) = generate_v2_safety_vcs_impl_with_origins_checked(func, summaries);
-    if truncated {
-        return None;
-    }
-    let overflow: Vec<(BlockId, VerificationCondition)> = generated
-        .into_iter()
-        .filter(|(_, vc)| {
-            // DELIBERATELY excludes `VcKind::UncheckedArithmeticOverflow`.
-            // This table is the join key for the proven-overflow-check
-            // ELISION seam, and an `unchecked_{add,sub,mul}` block has no
-            // `Assert(Overflow)` to elide — it lowers to a lone `add nsw`/
-            // `nuw`. Handing the seam a block with no check to remove is at
-            // best a no-op and at worst licenses a rewrite of a block whose
-            // shape the seam does not model. Before the kind split these
-            // rows WERE `ArithmeticOverflow` and did reach here; keeping them
-            // out is a second, independent correctness gain from the split.
-            matches!(
-                vc.kind,
-                VcKind::ArithmeticOverflow { op: BinOp::Add | BinOp::Sub | BinOp::Mul, .. }
-            )
-        })
-        .collect();
-    if overflow.is_empty() {
-        // A COMPLETE enumeration that found no Add/Sub/Mul overflow row. Distinct from
-        // the `None` above: this is an empty table, not a missing one.
-        return Some(Vec::new());
-    }
-    // Reproduce the production discharge/augment (see `discharge_body_vcs`):
-    // interval-dischargeable VCs keep their original formula; the rest are
-    // augmented with the abstract state. `try_discharge_batch` is per-VC
-    // independent, so the overflow subset yields the same per-VC decision as the
-    // full batch, and `augment_vc_with_abstract_state` uses only the VC + env.
-    let merged_env = abstract_interp::merged_interval_environment(func);
-    let candidates: Vec<VerificationCondition> =
-        overflow.iter().map(|(_, vc)| vc.clone()).collect();
-    let report = abstract_interp::try_discharge_batch(&candidates, &merged_env);
-    let discharged: FxHashSet<usize> = report.discharged.iter().map(|(i, _)| *i).collect();
-    Some(
-        overflow
-            .into_iter()
-            .enumerate()
-            .map(|(i, (bid, vc))| {
-                let final_vc = if discharged.contains(&i) {
-                    vc
-                } else {
-                    abstract_interp::augment_vc_with_abstract_state(&vc, &merged_env)
-                };
-                (bid, final_vc)
-            })
-            .collect(),
-    )
 }
 
 /// Whether an `Assert { OverflowNeg, expected: false }` somewhere in the function
@@ -409,7 +345,31 @@ fn overflow_vc_block_origins_inner(
 /// statement lane — so "the same proposition" would be an argument rather than an
 /// identity. And there is nothing to fix: `-x` on `i128` reports BOTH rows
 /// `failed`, so it over-reports and never false-proves; suppressing there could
-/// only lose a refutable row.
+/// only lose a refutable row. The exclusion is keyed on that BV constructor, not
+/// on the width (SELF-GUARDED-CONST-OPERAND-1): a SYMBOLIC constant operand
+/// (`const N: i128`) has no BV rendering, so at width 128 both lanes take the Int
+/// constructors this rule was written for, and its statement row is the same
+/// self-guarded vacuity as below 128.
+///
+/// SYMBOLIC CONSTANT OPERANDS (SELF-GUARDED-CONST-OPERAND-1). The negated value
+/// may be a const-generic parameter or a keyed opaque scalar rather than a place
+/// (`-N` extracts as `Eq(const N, const MIN)` / `Neg(const N)`); the assert lane's
+/// builder binds it by value identity (`v2_operands_structurally_equal`), and a
+/// constant has no rewrite window to check. This function needs no constant arm of
+/// its own for that: it defers to the builder, which used to refuse every constant
+/// and so left the vacuous statement row as the only `negation` row.
+///
+/// LITERAL OPERANDS (SELF-GUARDED-LITERAL-OPERAND-1). Under
+/// `#![allow(arithmetic_overflow)]` `-i32::MIN` extracts as `Eq(const MIN, const
+/// MIN)` / `Neg(const MIN)`. The builder now binds two equal literals by value, and
+/// takes a width-less literal's width from the Neg's DESTINATION; this function
+/// reads its width the same way (`checked_vcs::v2_negation_row_shape`), so the
+/// constructor test asks about the row the builder really builds. Before, the
+/// builder refused, the assert lane left a proof gap, and the statement row — built
+/// at the i64 `operand_ty` gives the literal, and self-guarded besides — was the
+/// function's only `negation` row, kernel-certified. A literal is NOT covered by the
+/// i128 exclusion above: at width 128 neither lane conjoins anything to its BV
+/// core, so the two rows are one formula (see the note at the exclusion).
 ///
 /// Same fail-closed discipline as all three twins, and it is load-bearing: bare
 /// target identity is NEVER suppression authority, the compared value must be
@@ -432,128 +392,278 @@ pub(super) fn v2_negation_assert_exactly_bound(
     operand: &Operand,
 ) -> bool {
     // The entry block has no guarding predecessor to inherit an assert from.
-    if neg_block.id.0 == 0 {
+    if neg_block.id.0 == 0 || !super::terminator_presence_for(func).has_overflow_neg_assert {
         return false;
     }
     // Id-as-index identity: `blocks[neg_block.id.0]` must be THIS block.
     if func.body.blocks.get(neg_block.id.0).is_none_or(|b| !std::ptr::eq(b, neg_block)) {
         return false;
     }
-    let Some(ty) = crate::operand_ty_cow(func, operand) else {
-        return false;
-    };
-    if !ty.is_signed() || ty.int_width().is_none_or(|width| width >= 128) {
+    // Trust (SELF-GUARDED-LITERAL-OPERAND-1, 2026-10-12): the WIDTH is the one the
+    // assert lane's builder uses (`checked_vcs::v2_negation_row_shape`), so the
+    // constructor test below asks about the row the builder really builds. For a
+    // width-less literal that is the Neg's DESTINATION width, read off this block's
+    // unique Neg (the same statement `v2_find_target_neg_operand` names below); a
+    // literal whose statement cannot be found keeps both rows. Every other operand
+    // keeps `operand_ty`, exactly as before.
+    let (signed, width, mut target_has_unique_neg) =
+        if matches!(operand, Operand::Constant(ConstValue::Int(_))) {
+            let Some((ty, width)) = v2_find_target_neg_statement(func, neg_block.id)
+                .filter(|(_, found)| v2_operands_structurally_equal(found, operand))
+                .and_then(|(dest, found)| v2_negation_row_shape(func, dest, found))
+            else {
+                return false;
+            };
+            (ty.is_signed(), width, Some(true))
+        } else {
+            let Some(ty) = crate::operand_ty_cow(func, operand) else {
+                return false;
+            };
+            let Some(width) = ty.int_width() else {
+                return false;
+            };
+            (ty.is_signed(), width, None)
+        };
+    if !signed {
         return false;
     }
+    // Trust (SELF-GUARDED-CONST-OPERAND-1, 2026-10-11): the measured i128
+    // exclusion is keyed on the CONSTRUCTOR, not on the width. Both lanes ask the
+    // same `v2_signed_bv_neg_overflow_formula(func, operand, width)` over this one
+    // operand, so they take the BV constructors together or not at all. A place
+    // or literal operand at width 128 does (the two lanes then conjoin different
+    // BV block-def sets — the measured reason this member stays out). A symbolic
+    // constant (`const N: i128`) has no BV rendering, so BOTH lanes fall back to
+    // the same Int constructors used below width 128, and its statement row is the
+    // same self-guarded vacuity: measured before the fix, `neg_c128` read `1
+    // proved … of which 1 kernel-certified` beside `1 unknown`. A width above 128
+    // (no Rust integer has one) stays out of scope outright, as before.
+    //
+    // Trust (SELF-GUARDED-LITERAL-OPERAND-1, 2026-10-12): …and an integer LITERAL
+    // operand at width 128 takes the BV constructors in BOTH lanes but conjoins
+    // NOTHING to them in either: `v2_collect_bv_shl_blockdef` reads only a place,
+    // and `v2_dominating_operand_facts` skips every constant. So both rows are the
+    // bare `Eq(BitVec(c, 128), BitVec(i128::MIN, 128))` — the identity this rule
+    // needs, not an argument — and the measured reason for the exclusion (two
+    // DIFFERENT block-def sets) does not exist for a literal. MEASURED before this
+    // fix on the stage 1 of `46e9afaf95`: `-i128::MIN` under
+    // `#![allow(arithmetic_overflow)]` read one `negation` row, PROVED and
+    // kernel-certified (the statement row, behind the assert it duplicates), beside
+    // the assert lane's proof gap; the builder now builds the BV row, and this lets
+    // it be the only one.
+    let literal = const_int_value(operand).is_some();
+    if width > 128 {
+        return false;
+    }
+    // PERF-COMPILER-VCGEN-804: the width-128 BV-constructor probe builds a whole
+    // formula just to ask `is_some`; it is a function-level exclusion, so ask it
+    // once, lazily, only after a candidate assert has passed its structural checks.
+    // The answer is identical: an excluded operand still refuses every candidate.
+    let bv_excluded: std::cell::OnceCell<bool> = std::cell::OnceCell::new();
+    let bv_excluded_now = || {
+        *bv_excluded.get_or_init(|| {
+            width == 128
+                && !literal
+                && v2_signed_bv_neg_overflow_formula(func, operand, width).is_some()
+        })
+    };
 
-    func.body.blocks.iter().any(|assert_block| {
-        let Terminator::Assert {
-            cond,
-            expected: false,
-            msg: AssertMessage::OverflowNeg,
-            target,
-            span,
-            ..
-        } = &assert_block.terminator
-        else {
-            return false;
+    let mut check_candidate =
+        |assert_block: &trust_types::BasicBlock, sole_entry_verified: bool| -> bool {
+            let Terminator::Assert {
+                cond,
+                expected: false,
+                msg: AssertMessage::OverflowNeg,
+                target,
+                span,
+                ..
+            } = &assert_block.terminator
+            else {
+                return false;
+            };
+            if *target != neg_block.id {
+                return false;
+            }
+            // PARITY with the bounds member (block_defs.rs): the assert's FAILURE /
+            // cleanup edge runs exactly when the checked condition is violated, so
+            // it must not re-enter the block whose rows this would suppress.
+            // Excluding only `assert_block.id` from the scan below leaves that edge
+            // invisible, and a row reachable through it is REFUTABLE, not vacuous.
+            if assert_block.terminator.unwind_cleanup_target() == Some(neg_block.id) {
+                return false;
+            }
+            if bv_excluded_now() {
+                return false;
+            }
+            // ONE negation, and therefore THIS one. `v2_find_target_neg_operand`
+            // yields `Some` only when `target` holds exactly one `Neg` statement, and
+            // `target` is this very block, so the assert the builder binds below is
+            // bound to the statement now being generated for — not merely to its
+            // block. A second `Neg` here makes the binder ambiguous and both rows stay.
+            if !*target_has_unique_neg
+                .get_or_insert_with(|| v2_find_target_neg_operand(func, *target).is_some())
+            {
+                return false;
+            }
+            // Sole-entry check: no OTHER block's terminator may reach the negation's
+            // block, so the surviving assert row covers every execution of the Neg.
+            if !sole_entry_verified
+                && func.body.blocks.iter().any(|b| {
+                    b.id != assert_block.id && b.terminator.has_exit_block_target(neg_block.id)
+                })
+            {
+                return false;
+            }
+            // IDENTITY, NOT REPLICATION: the assert lane's OWN builder decides whether
+            // the equivalent row really exists, so this lane cannot drift away from it.
+            v2_build_assert_negation_vc(func, assert_block, *target, cond, false, span)
+                .is_some_and(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
         };
-        if *target != neg_block.id {
-            return false;
-        }
-        // PARITY with the bounds member (block_defs.rs): the assert's FAILURE /
-        // cleanup edge runs exactly when the checked condition is violated, so
-        // it must not re-enter the block whose rows this would suppress.
-        // Excluding only `assert_block.id` from the scan below leaves that edge
-        // invisible, and a row reachable through it is REFUTABLE, not vacuous.
-        if assert_block.terminator.unwind_cleanup_target() == Some(neg_block.id) {
-            return false;
-        }
-        // Sole-entry check: no OTHER block's terminator may reach the negation's
-        // block, so the surviving assert row covers every execution of the Neg.
-        let bypassed = func.body.blocks.iter().any(|b| {
-            b.id != assert_block.id
-                && b.terminator.exit_targets().iter().any(
-                    |t| matches!(t, trust_types::ClauseTarget::Block(succ) if *succ == neg_block.id),
-                )
-        });
-        if bypassed {
-            return false;
-        }
-        // ONE negation, and therefore THIS one. `v2_find_target_neg_operand`
-        // yields `Some` only when `target` holds exactly one `Neg` statement, and
-        // `target` is this very block, so the assert the builder binds below is
-        // bound to the statement now being generated for — not merely to its
-        // block. A second `Neg` here makes the binder ambiguous and both rows stay.
-        if v2_find_target_neg_operand(func, *target).is_none() {
-            return false;
-        }
-        // IDENTITY, NOT REPLICATION: the assert lane's OWN builder decides whether
-        // the equivalent row really exists, so this lane cannot drift away from it.
-        v2_build_assert_negation_vc(func, assert_block, *target, cond, false, span)
-            .is_some_and(|vc| matches!(vc.kind, VcKind::NegationOverflow { .. }))
-    })
+
+    if let Some(unique_pred) =
+        crate::fn_memo::sole_predecessors(func).and_then(|sp| sp.unique_exit_predecessor(neg_block.id))
+    {
+        return unique_pred
+            .and_then(|pred_id| func.body.blocks.get(pred_id.0))
+            .is_some_and(|assert_block| check_candidate(assert_block, true));
+    }
+
+    func.body.blocks.iter().any(|assert_block| check_candidate(assert_block, false))
 }
 
 /// Summary-aware safety generation: the per-block semantic guard map also carries
 /// each proved callee's rebound postcondition, so body safety VCs may soundly
 /// assume them (separate-compilation boundary). The `None` path is the canonical
-/// non-summary generator.
+/// non-summary generator. Test-only since T3 C05: the production generation reads the
+/// walk with its origins ([`generate_v2_safety_vcs_impl_with_origins_checked`]).
+#[cfg(test)]
 pub(super) fn generate_v2_safety_vcs_impl(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<VerificationCondition> {
-    generate_v2_safety_vcs_impl_with_origins(func, summaries)
+    generate_v2_safety_vcs_impl_with_origins_checked(func, summaries)
+        .rows
         .into_iter()
         .map(|(_, vc)| vc)
         .collect()
 }
 
-/// Trust (runtime ledger): same as `generate_v2_safety_vcs_impl` but retains each
-/// safety VC's originating `BlockId` (== `mir::BasicBlock` index, see
-/// `trust-mir-extract/src/convert.rs`). The proven-overflow-check elision seam
-/// joins a KernelCertified overflow VC to its MIR block by this origin; output is
-/// otherwise byte-identical (the wrapper above just drops the key).
-pub(super) fn generate_v2_safety_vcs_impl_with_origins(
-    func: &VerifiableFunction,
-    summaries: Option<&crate::modular::SummaryDatabase>,
-) -> Vec<(BlockId, VerificationCondition)> {
-    generate_v2_safety_vcs_impl_with_origins_checked(func, summaries).0
+/// What the safety walk returns.
+pub(super) struct SafetyWalk {
+    /// Each row, paired with its originating `BlockId` (== `mir::BasicBlock` index, see
+    /// `trust-mir-extract/src/convert.rs`).
+    pub(super) rows: Vec<(BlockId, VerificationCondition)>,
+    /// The indices into `rows`, ascending, of the rows an `Assert(Overflow(_))`
+    /// terminator minted (T3 C05). Only such a row's block holds the overflow check the
+    /// elision seam may remove: an arithmetic STATEMENT in the same block (a plain
+    /// `BinaryOp`, e.g. inlined from a crate built without overflow checks) mints a row
+    /// of the same kind and op that guards no `Assert` at all.
+    pub(super) overflow_assert_rows: Vec<usize>,
+    /// Whether the ambient verify budget or the row cap cut the walk short.
+    pub(super) truncated: bool,
+    /// Whether the row cap ([`MAX_VC_ROWS_PER_FUNCTION`]) cut it short. Unlike a budget
+    /// trip, which latches the ambient budget and so reaches the compiler's checkpoint,
+    /// the cap latches nothing: the caller must refuse the rows itself.
+    pub(super) row_capped: bool,
 }
 
-/// As [`generate_v2_safety_vcs_impl_with_origins`], but ALSO reports whether the ambient
-/// verify budget cut the walk short.
+/// Trust (2026-10-16, S1): the ordinary splice's path terms with every `Raw`
+/// term marked [`PathGuardTerm::Collapsed`] when the block's guards were LOST —
+/// a `degraded` block, except a content-free row whose reachability summary is
+/// `Unconditional`. There the empty path is the in-edge disjunction itself
+/// (`true`): positive information that the block is reachable, which keeps a
+/// reachable `unreachable!()` a refutation; marking it would hold that genuine
+/// refutation. `Collapsed` renders exactly as `Raw`, so no formula changes.
+pub(super) fn v2_mark_lost_guards(
+    path_terms: Vec<PathGuardTerm>,
+    degraded: bool,
+    is_content_free: bool,
+    reachability: Option<&ReachSummary>,
+) -> Vec<PathGuardTerm> {
+    let guards_lost =
+        degraded && !(is_content_free && matches!(reachability, Some(ReachSummary::Unconditional)));
+    if !guards_lost {
+        return path_terms;
+    }
+    path_terms
+        .into_iter()
+        .map(|term| match term {
+            PathGuardTerm::Raw => PathGuardTerm::Collapsed,
+            other => other,
+        })
+        .collect()
+}
+
+/// The safety walk ([`SafetyWalk`]).
 ///
-/// The rows are the same rows either way; what the flag adds is the ability to tell a
-/// COMPLETE enumeration from a prefix of one. Ordinary VC generation does not need the
-/// distinction — its caller re-reads the budget at the next phase checkpoint and
-/// discards the partial inventory wholesale. The overflow-elision join table does:
-/// there, "no row for this key" and "the row that would have made this key AMBIGUOUS was
-/// never generated" are the same observation, and only the second is a licence to delete
-/// a live overflow check. See `overflow_vc_block_origins`.
+/// The rows are the same rows whether or not the walk was cut short; what the
+/// `truncated` flag adds is the ability to tell a COMPLETE enumeration from a prefix of
+/// one. The proven-overflow-check elision seam
+/// needs both halves: it joins a KernelCertified overflow row to its MIR block by the
+/// origin, and there "no row for this key" and "the row that would have made this key
+/// AMBIGUOUS was never generated" are the same observation, and only the second is a
+/// licence to delete a live overflow check. The production generation keeps both
+/// (T3 C05, `super::overflow_origins`).
 pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
-) -> (Vec<(BlockId, VerificationCondition)>, bool) {
+) -> SafetyWalk {
     // Set at every point the ambient budget cuts the generation walk short. The returned
-    // rows are then a PREFIX of the true set, not the set.
+    // rows are then a PREFIX of the true set, not the set. A trip in the later
+    // fact-decoration passes leaves the row LIST complete but some of its rows
+    // UNDECORATED — still not the true set, and still refused by every consumer that
+    // requires a complete one.
     let mut truncated = false;
-    let path_guards = v2_analyze_path_guards(func);
-    let guard_paths_map = &path_guards.paths;
-    // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = super::stmt_versions_for(func);
-    let path_definition_map = v2_build_path_definition_map(func);
-    let semantic_guards = match summaries {
-        Some(s) => build_semantic_guard_map_with_summaries(func, s),
-        None => build_semantic_guard_map(func),
-    };
+    let mut row_capped = false;
+    let path_guards = super::path_guard_analysis_for(func);
+    let guard_paths_map = &*path_guards.paths;
+    // Trust (lane-A CSE, deferred): build `StmtVersionCtx`, `path_definition_map`, and
+    // `semantic_guards` lazily only when a generated row actually needs them (matching
+    // `alloc_vcs.rs`), and query `tinv_rows::active_request` once per function rather
+    // than per block and per statement.
+    let sv_lazy: std::cell::OnceCell<std::rc::Rc<StmtVersionCtx>> = std::cell::OnceCell::new();
+    let active_tinv_req = super::tinv_rows::active_request(func);
 
     // Track the originating block id alongside each VC so we can apply the
     // correct semantic guards. Matching by span is unreliable when multiple
     // blocks share `SourceSpan::default()` (as in many synthetic test MIRs).
     let mut block_vcs: Vec<(BlockId, VerificationCondition)> = Vec::new();
+    // T3 C05: which rows an overflow `Assert` terminator minted (`SafetyWalk`). Nothing
+    // below reorders or removes `block_vcs`, so an index stays the row's index.
+    let mut overflow_assert_rows: Vec<usize> = Vec::new();
+    // The USE POINT of each row, parallel to `block_vcs`: the statement index a
+    // per-statement row reads its operands at, or the block terminal for every
+    // other row. Filled by `pad_row_points`, so a row nobody labelled gets the
+    // terminal — the pre-existing, whole-block kill.
+    //
+    // TWO passes consume it, and they must agree on the point FOR EACH ROW:
+    //   1. the path-definition conjoin (`v2_live_path_defs_at_point`), which must
+    //      not kill an entry fact on account of a write that happens AFTER the
+    //      row's own read; and
+    //   2. the whole-row version rename
+    //      (`conjoin_preconditions_versioned_at_point_recorded`), which must not
+    //      move that same read to its POST-write token.
+    // Give one row two different points and the fact and the body it is about stop
+    // naming the same value: the kept entry fact is then either name-disjoint from
+    // the read it was kept for (a false REFUTATION) or, in the other direction,
+    // re-unified with a post-write read. Both passes `zip` this vector against
+    // `block_vcs` under their own length asserts; nothing between them pushes to,
+    // removes from or reorders either side.
+    let mut row_points: Vec<usize> = Vec::new();
+    fn pad_row_points(row_points: &mut Vec<usize>, rows: usize, point: usize) {
+        if row_points.len() < rows {
+            row_points.resize(rows, point);
+        }
+    }
 
+    // Trust (G1, 2026-10-27): the documented-return-contract facts of the body's
+    // pointer-returning libc calls, computed at most once (only a body with a rustc
+    // Null/Misaligned pointer assert asks).
+    let ffi_pointer_facts: std::cell::OnceCell<Option<crate::ffi_pointer_contract::PointerFacts>> =
+        std::cell::OnceCell::new();
+    let fn_sym: trust_types::Symbol = func.name.as_str().into();
     for block in &func.body.blocks {
+        pad_row_points(&mut row_points, block_vcs.len(), usize::MAX);
         // Trust (L0 termination guarantee — VC GENERATION): poll the ambient
         // per-function budget once per block.
         //
@@ -576,7 +686,36 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // with the partial VCs DISCARDED, strict/certify/memory-safe keep the
         // located hard error. This adds a poll to an existing mechanism; it
         // does not introduce a second one.
-        if trust_types::verify_budget::budget_exhausted() {
+        if trust_types::verify_budget::budget_exhausted()
+            || block_vcs.len() >= max_vc_rows_per_function()
+        {
+            // The ROW COUNT is the second half of that bound, and it is the half
+            // that defends MEMORY rather than time. Nothing capped how many rows
+            // one function may generate, and each row's formula is rewritten up
+            // to five times by the decoration phase below (path defs,
+            // preconditions, path guards, the type-range battery, version
+            // normalization), every rewrite allocating a fresh tree. MEASURED
+            // 2026-09-10 on tla-cli: `heap -s` counted 86 MILLION live malloc
+            // nodes at a 140.6 GB peak, and the body in the log was
+            // `<ty::cli_schema::Cli as clap_builder::derive::FromArgMatches>
+            // ::from_arg_matches_mut` — what `#[derive(Parser)]` emits for a CLI
+            // with ty's number of subcommands, whose CFG no hand-written body
+            // approaches. A step budget cannot see that: the rows are cheap to
+            // produce and expensive to KEEP.
+            //
+            // The walk stops the same way for both. `truncated` tells the
+            // overflow-check origin inventory (T3 C05, `super::overflow_origins`)
+            // that its enumeration is not complete, so it gives no table. What
+            // happens to the ROWS differs. A budget trip latches the ambient budget,
+            // and the compiler's post-generation checkpoint discards the partial
+            // set (advisory substitutes one counted `Unknown`, strict keeps the
+            // located hard error). The cap latches nothing, so no checkpoint sees
+            // it: `row_capped` tells `generate_vcs_impl_with_origins` to replace
+            // the prefix with one fail-closed `Unknown` row (2026-10-11; until then
+            // a capped function shipped a prefix of its rows as its obligation set,
+            // which could report it proved by omission). No row is silently dropped
+            // from a set anyone reads as complete.
+            row_capped = block_vcs.len() >= max_vc_rows_per_function();
             truncated = true;
             break;
         }
@@ -715,7 +854,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                 ),
                 AssertMessage::Custom(message) => Some(VerificationCondition {
                     kind: VcKind::Assertion { message: message.clone() },
-                    function: func.name.clone().into(),
+                    function: fn_sym,
                     location: span.clone(),
                     formula: v2_formula_with_block_defs(
                         func,
@@ -735,7 +874,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                     kind: VcKind::Assertion {
                         message: format!("public coroutine protocol assert: {msg:?}"),
                     },
-                    function: func.name.clone().into(),
+                    function: fn_sym,
                     location: span.clone(),
                     formula: v2_formula_with_block_defs(
                         func,
@@ -770,6 +909,30 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                 {
                     None
                 }
+                // Trust (G1, 2026-10-27): a rustc Null/Misaligned pointer assert on a
+                // CONTRACT-ROOTED local — the single, never-borrowed result of a libc
+                // call with a documented pointer return contract (`__error`,
+                // `__errno_location`, `getpwuid`) — that the contract and the
+                // dominating checks make unable to fail: non-null by the contract or a
+                // dominating `is_null`-false edge / passed null assert; aligned to the
+                // assert's `K` by the contract's alignment or a dominating passed
+                // alignment assert. Mint nothing, as the std-span arm above and the
+                // extractor's `discharge_provably_safe_pointer_asserts` do for their
+                // provably-safe asserts. Every other pointer assert (an unrooted local,
+                // a nullable result with no dominating check, a larger `K`) falls
+                // through to the fail-closed arm below. The hardened twin asks the same
+                // question (`hardened::append_assert_panic_vcs`).
+                AssertMessage::NullPointerDereference
+                | AssertMessage::MisalignedPointerDereference
+                    if ffi_pointer_facts
+                        .get_or_init(|| {
+                            crate::ffi_pointer_contract::PointerFacts::for_function(func)
+                        })
+                        .as_ref()
+                        .is_some_and(|facts| facts.discharges_assert(func, block)) =>
+                {
+                    None
+                }
                 // Any safety assert that vcgen does not model above
                 // (NullPointerDereference, MisalignedPointerDereference,
                 // InvalidEnumConstruction, and any future AssertMessage) must
@@ -789,6 +952,9 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                 )),
             };
             if let Some(vc) = vc {
+                if matches!(msg, AssertMessage::Overflow(_)) {
+                    overflow_assert_rows.push(block_vcs.len());
+                }
                 block_vcs.push((block.id, vc));
             }
         }
@@ -797,7 +963,8 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // Skip blocks that the path walk proves unreachable from the entry — generating
         // an Unreachable VC for dead code would falsely refute programs whose dead
         // blocks the compiler intentionally left as Unreachable scaffolding.
-        if guard_paths_map.contains_key(&block.id)
+        if matches!(&block.terminator, Terminator::Unreachable | Terminator::Call { .. })
+            && guard_paths_map.contains_key(&block.id)
             && let Some(vc) = v2_build_terminator_vc(func, block)
         {
             block_vcs.push((block.id, vc));
@@ -813,247 +980,728 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // unguarded op FAILS. Native overflow asserts are not a suppression
         // authority: the old target-block-only set lost operation and operand
         // identity, so an unrelated predecessor could erase this obligation.
-        if let Terminator::Call { func: callee, args, dest, span, .. } = &block.terminator
-            && let Some(kind) = overflow_arith_call(callee)
-            && let Some((body, op, lhs_ty, rhs_ty, width)) =
-                v2_overflow_call_body(func, kind, args, dest)
+        if let Terminator::Call { func: callee, args, dest, span, callee_key, .. } =
+            &block.terminator
         {
-            // Trust (arith ARM, 2026-07-31): seed the authenticated obligation from the
-            // block-def-versioned body EXACTLY as the direct/checked BinaryOp Int path
-            // does — `v2_arith_overflow_seed_record` records the atomic out-of-range core
-            // and demotes the operand ranges + block-defs to ConjoinFactsLast wrappers.
-            // `.0` is byte-identical to the previous `v2_formula_with_block_defs`, so the
-            // emitted formula is UNCHANGED. Fail-closed to `None` for the Pow bodies
-            // (`Bool(true)` / 2-conjunct `And`), which are the genuinely-unmodeled shapes.
-            // The four arg/local/field/slice conjoins + every later wrapper are applied and
-            // mirrored by the shared loop below (this VC's kind is `ArithmeticOverflow`).
-            let (formula, rec_body, kept) =
-                v2_formula_with_block_defs_at_point_recorded(func, block, block.stmts.len(), body);
-            // SPLIT AT THE KIND LEVEL — `Unchecked` and `Pow` share this mint
-            // site and the identical out-of-range obligation, but they do NOT
-            // share a runtime guard, and `VcKind::has_runtime_fallback` can only
-            // tell them apart if the kind does.
-            //
-            // `pow` is an ordinary checked library op: it panics on overflow when
-            // `-C overflow-checks` is on, so `ArithmeticOverflow`'s
-            // `overflow_checks` answer is TRUE for it, exactly as for the direct
-            // `BinaryOp` path. `unchecked_{add,sub,mul}` lower to LLVM
-            // `add nsw`/`nuw` (rustc_codegen_ssa/src/mir/rvalue.rs) — no Assert,
-            // no branch, nothing gated on `overflow_checks` at ANY value.
-            // MEASURED (stage2, `--emit=llvm-ir`): with
-            // `-Coverflow-checks=off -Cdebug-assertions=off`, `u32::unchecked_add`
-            // is a lone `add nuw` while `a + b` keeps `panic_const_add_overflow`
-            // under `-Coverflow-checks=on`; and with
-            // `-Coverflow-checks=off -Zub-checks=yes` the unchecked call gains a
-            // `precondition_check` that `a + b` does not. The knobs are
-            // independent, so sharing the kind minted the wrong claim from the
-            // wrong knob.
-            //
-            // Only the KIND is split. The formula, the recorded obligation seed,
-            // and every downstream conjoin below are byte-identical, so nothing
-            // that was dischargeable stops being dischargeable here.
-            let vc_kind = match kind {
-                OverflowCall::Unchecked(_) => {
-                    VcKind::UncheckedArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) }
-                }
-                OverflowCall::Pow => VcKind::ArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) },
-            };
-            block_vcs.push((
-                block.id,
-                VerificationCondition {
-                    kind: vc_kind,
-                    function: func.name.clone().into(),
-                    location: span.clone(),
-                    formula,
-                    contract_metadata: None,
-                    obligation: v2_arith_overflow_seed_record(&rec_body, &kept, width),
-                },
-            ));
-        }
-
-        // 1c-fold. Iterator::sum / Iterator::product over an INTEGER accumulator:
-        // the fold arithmetic lives inside the library impl (no caller-visible
-        // BinaryOp), and it can overflow-panic (`(1..=n).product::<i32>()` for
-        // n >= 13). `overflow_arith_call` deliberately skips it (a REFUTABLE VC
-        // would false-FAIL an ordinary bounded `vec.sum()`), which left it a SILENT
-        // false-accept — 0 obligations, vacuously "safe". Surface it as an
-        // UnsupportedMir obligation instead (→ Unknown → runtime-checked in the
-        // default lane, exactly like the `m[&k]` map-index backstop): HONESTLY
-        // accounted and delegated to the runtime overflow check, never silently
-        // verified and never false-FAILED. Gated to an INTEGER result type — a
-        // float sum/product does not overflow-panic (it saturates to ±inf), so it
-        // is left untouched.
-        if let Terminator::Call { func: callee, dest, span, .. } = &block.terminator
-            && iterator_integer_fold_call(callee)
-            && crate::place_ty(func, dest).is_some_and(|ty| ty.int_width().is_some())
-        {
-            block_vcs.push((
-                block.id,
-                VerificationCondition {
-                    kind: VcKind::UnsupportedMir {
-                        kind: "iterator-fold-overflow".into(),
-                        detail: "Iterator::sum/product accumulates inside the library \
-                                 impl and can overflow-panic; not statically modeled \
-                                 (no accumulation invariant) — reported Unknown \
-                                 (runtime-checked), never silently verified"
-                            .into(),
-                    },
-                    function: func.name.clone().into(),
-                    location: span.clone(),
-                    formula: Formula::Bool(true),
-                    contract_metadata: None,
-                    obligation: None,
-                },
-            ));
-        }
-
-        // 1c-repeat. `str::repeat(n)` — sibling of the sum/product fold: the result
-        // capacity `s.len() * n` is computed INSIDE the library impl and
-        // overflow-panics ("capacity overflow") for large `n`, with no
-        // caller-visible BinaryOp, so it was SILENTLY accepted (0 obligations).
-        // Surface the same UnsupportedMir obligation (→ Unknown → runtime-checked)
-        // as the iterator fold, per the owner-decided runtime-checked demotion.
-        // Gated to the `str` inherent impl (`<impl str>::repeat`) so `slice`/`Vec::
-        // repeat` — which already mint a runtime-checked obligation via the
-        // bulk-alloc capacity path — are NOT double-counted or regressed.
-        if let Terminator::Call { func: callee, span, .. } = &block.terminator
-            && str_repeat_capacity_overflow_call(callee)
-        {
-            block_vcs.push((
-                block.id,
-                VerificationCondition {
-                    kind: VcKind::UnsupportedMir {
-                        kind: "str-repeat-capacity-overflow".into(),
-                        detail: "str::repeat computes its result capacity (len * n) \
-                                 inside the library impl and can overflow-panic \
-                                 (\"capacity overflow\"); not statically modeled — \
-                                 reported Unknown (runtime-checked), never silently \
-                                 verified"
-                            .into(),
-                    },
-                    function: func.name.clone().into(),
-                    location: span.clone(),
-                    formula: Formula::Bool(true),
-                    contract_metadata: None,
-                    obligation: None,
-                },
-            ));
-        }
-
-        // 1d. Division/remainder-by-zero for a dynamic divisor hidden INSIDE a
-        // library Call that produces no caller-visible `BinaryOp(Div|Rem)`:
-        // `a.checked_div(b)` / `checked_rem` / `div_euclid` / `rem_euclid` (panic
-        // / UB / `None` on a zero divisor) and `Iterator::step_by(n)` (panics when
-        // `n == 0`). Without this the divisor obligation is never emitted and the
-        // op is reported vacuously safe — a false PROVE for `a.div_euclid(b)` with
-        // a runtime-zero `b`. Reuses the exact `v2_divisor_is_zero_formula` body +
-        // const-nonzero skip the BinaryOp arms use, pushed keyed by `block.id` so
-        // it inherits the SAME block-defs / path-guard / semantic-guard /
-        // precondition machinery — a dominating `if b != 0 { … }` guard or
-        // `#[requires(b != 0)]` PROVES it, an unguarded one FAILS. Float divisors
-        // are skipped: integer division panics on zero while `f64::div_euclid(0.0)`
-        // does not, so flagging a float here would false-FAIL ordinary code.
-        if let Terminator::Call { func: callee, args, span, .. } = &block.terminator
-            && let Some((divisor_idx, kind)) = divzero_call(callee)
-            && let Some(divisor) = args.get(divisor_idx)
-            && !v2_is_float_operand(func, divisor)
-            && !v2_divisor_is_nonzero_constant(divisor)
-        {
-            // Args are evaluated BEFORE the terminator, so there are no in-block
-            // statement defs to take "before the statement" — use the same
-            // whole-block-defs builder the 1c overflow-call recognizer uses.
-            block_vcs.push((
-                block.id,
-                v2_build_divrem_vc_raw(
+            let call_tail = method_tail(callee);
+            if matches!(call_tail, "pow" | "unchecked_add" | "unchecked_sub" | "unchecked_mul")
+                && let Some(kind) = overflow_arith_call(callee)
+                && let Some((body, op, lhs_ty, rhs_ty, width)) =
+                    v2_overflow_call_body(func, kind, args, dest)
+            {
+                // Trust (arith ARM, 2026-07-31): seed the authenticated obligation from the
+                // block-def-versioned body EXACTLY as the direct/checked BinaryOp Int path
+                // does — `v2_arith_overflow_seed_record` records the atomic out-of-range core
+                // and demotes the operand ranges + block-defs to ConjoinFactsLast wrappers.
+                // `.0` is byte-identical to the previous `v2_formula_with_block_defs`, so the
+                // emitted formula is UNCHANGED. Fail-closed to `None` for the Pow bodies
+                // (`Bool(true)` / 2-conjunct `And`), which are the genuinely-unmodeled shapes.
+                // The four arg/local/field/slice conjoins + every later wrapper are applied and
+                // mirrored by the shared loop below (this VC's kind is `ArithmeticOverflow`).
+                let (formula, rec_body, kept) = v2_formula_with_block_defs_at_point_recorded(
                     func,
                     block,
-                    v2_divisor_is_zero_formula(func, divisor),
                     block.stmts.len(),
-                    span,
-                    kind,
-                ),
-            ));
-        }
+                    body,
+                );
+                // SPLIT AT THE KIND LEVEL — `Unchecked` and `Pow` share this mint
+                // site and the identical out-of-range obligation, but they do NOT
+                // share a runtime guard, and `VcKind::has_runtime_fallback` can only
+                // tell them apart if the kind does.
+                //
+                // `pow` is an ordinary checked library op: it panics on overflow when
+                // `-C overflow-checks` is on, so `ArithmeticOverflow`'s
+                // `overflow_checks` answer is TRUE for it, exactly as for the direct
+                // `BinaryOp` path. `unchecked_{add,sub,mul}` lower to LLVM
+                // `add nsw`/`nuw` (rustc_codegen_ssa/src/mir/rvalue.rs) — no Assert,
+                // no branch, nothing gated on `overflow_checks` at ANY value.
+                // MEASURED (stage2, `--emit=llvm-ir`): with
+                // `-Coverflow-checks=off -Cdebug-assertions=off`, `u32::unchecked_add`
+                // is a lone `add nuw` while `a + b` keeps `panic_const_add_overflow`
+                // under `-Coverflow-checks=on`; and with
+                // `-Coverflow-checks=off -Zub-checks=yes` the unchecked call gains a
+                // `precondition_check` that `a + b` does not. The knobs are
+                // independent, so sharing the kind minted the wrong claim from the
+                // wrong knob.
+                //
+                // Only the KIND is split. The formula, the recorded obligation seed,
+                // and every downstream conjoin below are byte-identical, so nothing
+                // that was dischargeable stops being dischargeable here.
+                let vc_kind = match kind {
+                    OverflowCall::Unchecked(_) => {
+                        VcKind::UncheckedArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) }
+                    }
+                    OverflowCall::Pow => {
+                        VcKind::ArithmeticOverflow { op, operand_tys: (lhs_ty, rhs_ty) }
+                    }
+                };
+                block_vcs.push((
+                    block.id,
+                    VerificationCondition {
+                        kind: vc_kind,
+                        function: fn_sym,
+                        location: span.clone(),
+                        formula,
+                        contract_metadata: None,
+                        obligation: v2_arith_overflow_seed_record(rec_body, kept, width),
+                    },
+                ));
+            }
 
-        // 1e. Slice-method panics whose out-of-bounds / zero-size argument lowers
-        // to a `Terminator::Call` carrying NO caller-visible `Projection::Index`,
-        // so the rvalue-safety bounds path never sees them and the op is reported
-        // vacuously safe — a false PROVE for `s.split_at(mid)` with `mid > len`,
-        // `s.chunks(0)`, or `s.swap(i, j)` with an out-of-range index. The body is
-        // the unguarded failure (`mid > len` / `n == 0` / `i >= len || j >= len`),
-        // pushed keyed by `block.id` so it inherits the SAME block-defs / path-guard
-        // / semantic-guard / precondition machinery — a dominating `if mid <= s.len()`
-        // / `if n != 0` PROVES it, an unguarded one FAILS. Unrecognized slice methods
-        // return `None` from the recognizer: NO fail-close, to keep drop-in Rust.
-        if let Terminator::Call { func: callee, args, span, .. } = &block.terminator
-            && let Some(panic) = slice_method_panic(callee)
-            // Trust (str char-boundary soundness): the `::<__trust_str_index>` marker
-            // `func_operand_name` appends to a `str` range-index callee — the Self
-            // identity that survives `str`→`[u8]` erasure. The RangeIndex body uses it
-            // to mint the UTF-8 char-boundary obligation for str receivers only.
-            && let Some((violation, kind)) =
-                slice_method_panic_body(func, &panic, args, callee.contains("__trust_str_index"))
-        {
-            // Args are evaluated BEFORE the terminator, so there are no in-block
-            // statement defs to take "before the statement" — use the same
-            // whole-block-defs builder the 1c/1d call recognizers use. Conjoin the
-            // `0 <= len` lower bound for the `__slice_len` term the `split_at`/`swap`
-            // bodies reference (a no-op for the `chunks(n)` zero-size form, which
-            // carries no length term); the bound is unconditionally true and sound.
+            // 1c-fold. Iterator::sum / Iterator::product over an INTEGER accumulator:
+            // the fold arithmetic lives inside the library impl (no caller-visible
+            // BinaryOp), and it can overflow-panic (`(1..=n).product::<i32>()` for
+            // n >= 13). `overflow_arith_call` deliberately skips it (a REFUTABLE VC
+            // would false-FAIL an ordinary bounded `vec.sum()`), which left it a SILENT
+            // false-accept — 0 obligations, vacuously "safe". Surface it as an
+            // UnsupportedMir obligation instead (→ Unknown → runtime-checked in the
+            // default lane, exactly like the `m[&k]` map-index backstop): HONESTLY
+            // accounted and delegated to the runtime overflow check, never silently
+            // verified and never false-FAILED. Gated to an INTEGER result type — a
+            // float sum/product does not overflow-panic (it saturates to ±inf), so it
+            // is left untouched.
             //
-            // `RangeIndex` is the exception: its bounds are ALREADY resolved to the
-            // underlying param symbols by `resolve_range_bound_formula`, so it needs
-            // NO block-defs — and `v2_formula_with_block_defs` would otherwise conjoin
-            // the `Range { .. }` aggregate's field equalities (`_t.0 == b`, the `@0.0`
-            // aggregate-construction twin), noise that makes the default-mode solver
-            // return Unknown on an otherwise-trivial `guard ∧ b > len` contradiction.
-            // Skipping them is sound (dropping true equalities only weakens the
-            // discharge, never the violation). NOTE: the exclusive-range violation
-            // stays a single `Or[start>end, end>len]` VC — splitting it into two
-            // single-`Gt` VCs (which the default-mode solver discharges better) is
-            // UNSOUND here because both carry the SAME (span, kind, location) and the
-            // result accounting then SHARES one verdict across them (the provable
-            // ordering VC masks an undischarged end-bound VC). So a correctly-guarded
-            // exclusive `&s[a..b]` currently fails closed (sound, incomplete); the
-            // single-`Gt` `RangeTo`/`RangeFrom` discharge precisely. Completeness for
-            // the exclusive `Or` is a follow-up (needs distinct per-disjunct VC ids).
-            // Trust (versioned-def tie for the #7c scalar `v[i]`): the skip above is
-            // scoped to TRUE range indexing only — discriminated by the presence of a
-            // panicking-range arg, the SAME `range_operand` test the RangeIndex arm
-            // itself keys on. The owned-Vec SCALAR index rides the RangeIndex arm too
-            // (no range arg) but builds its index with a bare `operand_to_formula`, so
-            // it NEEDS the block-defs: the index operand is a copy local (`_9 = copy i`)
-            // whose def `_9 == i#<version>` is the ONLY tie to the versioned loop var
-            // the `i < v.len()` guard constrains. Without it, `_9` is a free var and
-            // `while i < v.len() { v[i] }` on `&Vec` FALSE-REFUTES with `_9 = len`
-            // (observed: `_9 = 1, i#s0_0_s5_0 = 0, v = 1`) while the slice twin —
-            // whose Assert-path VC builder conjoins block-defs — proves. Conjoining
-            // defs is DROP-ONLY-in-reverse (true path equalities, monotone): it can
-            // discharge a spurious refutation but never hide a real OOB, whose
-            // counterexample satisfies the defs too (gate: `while i <= v.len()` still
-            // refutes).
-            let base = if matches!(panic, SliceMethodPanic::RangeIndex)
-                && args.iter().any(|a| operand_is_panicking_range(func, a))
+            // Trust (2026-09-25, F4): the recognizer never matched rustc's qualified
+            // spelling, so NO integer sum/product was ever charged (see
+            // `iterator_integer_fold_call`). It now fires, and the row is a CALLER-
+            // VALUE overflow — the same property `a + b` owes — with two shapes:
+            //
+            //  * the source's item COUNT is bounded (`fold_source_bound`: a range,
+            //    `take(n)`, `repeat_n`, through count-preserving/-reducing adaptors)
+            //    AND its items lie in a modelled range: an `ArithmeticOverflow` row
+            //    whose failure condition is
+            //    `count >= 1 && (count * hi > MAX || count * lo < MIN)` for `sum`
+            //    (every partial sum lies in `[min(0, count*lo), max(0, count*hi)]`),
+            //    and `count >= 2 && (hi >= 2 || lo <= -2)` for `product` (a product
+            //    of items in `[-1, 1]` stays there; anything wider is not modeled).
+            //    A dominating guard or a `min` bound on the count therefore PROVES
+            //    it, and an unguarded one is REFUTED — exactly like `a + b`;
+            //  * the count is bounded but the items are NOT MODELLED (a `map`,
+            //    `filter_map`, `map_while` or `scan` result; a repeated non-integer):
+            //    the row is kept only for a CLOSED count of at most one, which no
+            //    item can overflow. Otherwise it is the `iterator-fold-overflow`
+            //    Unknown below. Trust (CL-FOLD-MAP-FORCED-1, 2026-10-11): the items
+            //    used to default to the accumulator's full range in an ordinary
+            //    refutable row, and with a constant count of 4 `4 * MAX > MAX` folds
+            //    to true. `(0..4usize).map(|_| 1u32).sum::<u32>()` (it returns 4) was
+            //    then REFUTED, its "counterexample" holding only the range's fields,
+            //    and escalated to a "guaranteed Level 0 safety violation". An
+            //    unmodelled value is "I do not know": Unknown, never a counterexample
+            //    (the `UnmodeledCalleeReturn` rule, `havoc_decline.rs`). COST, recorded
+            //    in DECISION_QUEUE: a SYMBOLIC count that a guard bounds at one
+            //    (`if n <= 1 { (0..n).map(f).sum() }`) proved and is now Unknown;
+            //  * the count is NOT established (a slice or any other collection, a
+            //    user iterator): the `iterator-fold-overflow` UnsupportedMir row,
+            //    which carries no runtime fallback, so the default lane refuses it.
+            //    An existing collection bounds the count only by memory, and `n`
+            //    items of `u32::MAX` overflow a `u32` from `n = 2`.
+            //
+            // The accumulator is the destination's integer type, or the payload of
+            // an `Option`/`Result` destination (`Sum<Option<U>> for Option<T>` runs
+            // `T`'s own fold inside `try_process`).
+            if matches!(call_tail, "sum" | "product")
+                && let Some(fold) = iterator_integer_fold_call(callee)
+                && let Some(acc_ty) =
+                    crate::place_ty_cow(func, dest).as_deref().and_then(fold_accumulator_int_ty)
             {
-                violation
-            } else {
-                v2_formula_with_block_defs(func, block, violation)
-            };
-            let formula = conjoin_slice_len_bounds(func, base);
-            block_vcs.push((
-                block.id,
-                VerificationCondition {
+                let mut bound =
+                    args.first().map(|it| fold_source_bound(func, it, 0)).unwrap_or_default();
+                // Trust (2026-10-01): a source whose count `fold_source_bound` does not
+                // establish may still have the loop lane's yield bound: an array's length
+                // through `a.iter()` (and its length-non-increasing adapters), or
+                // `isize::MAX` for a slice of a non-zero-sized element. Both bound how many
+                // items ONE instance yields, and the fold consumes that instance (sweep A10).
+                // Only with a known item range: with the items defaulted to the
+                // accumulator's whole range a count this loose refutes correct programs,
+                // where the `iterator-fold-overflow` row below reports them unsupported.
+                // A `map` summary that bounds NEITHER side is no item model at all, so it
+                // stays `items: None` and takes the CL-FOLD-MAP-FORCED-1 arm below.
+                //
+                // Trust (merge 2026-10-14): "bounds" means TIGHTER than the accumulator's
+                // own range, and on every side the row reads: `hi` always, and `lo` too for
+                // a signed accumulator (`count * lo < MIN`, `lo <= -2`). A side that is
+                // open, or no tighter than the accumulator's own extreme, is the
+                // defaulted item CL-FOLD-MAP-FORCED-1 refuses to refute on. Measured:
+                // `(0..4u32).map(u32::from).sum::<u32>()` (it returns 6) reached this arm
+                // with core's identity `From<u32> for u32` giving `[0, u32::MAX]` on both
+                // sides (`lossless_from_mapper_items`), and the row was REFUTED with
+                // `count = 2`. Such a fold is now the `iterator-fold-overflow` Unknown,
+                // and a source-type range that is tighter (`map(u32::from)` over `u8`,
+                // `|&x| x as u64` over `u32`) keeps its row exactly as before.
+                //
+                // The PRODUCT row models only items in `[-1, 1]` and charges anything
+                // wider as an overflow, so a mapped item outside it would again be
+                // refuted on an item the row does not model:
+                // `(0..4usize).map(|_i| 2u32).product::<u32>()` (it returns 16) with the
+                // closure's `[2, 2]` summary. A mapped product keeps its row only when
+                // the summary puts every item in `[-1, 1]`.
+                if bound.items.is_none()
+                    && let Some((lo, hi)) = bound.partial_items
+                {
+                    let width = acc_ty.int_width().unwrap_or(64);
+                    let signed = acc_ty.is_signed();
+                    let min_f = crate::range::type_min_formula(width, signed);
+                    let max_f = crate::range::type_max_formula(width, signed);
+                    // `closed_formula_int_value` is `None` only for `u128::MAX`, which no
+                    // `i128` side reaches, so every side is tighter there.
+                    let hi = hi.filter(|&h| closed_formula_int_value(&max_f).is_none_or(|m| h < m));
+                    let lo = lo.filter(|&l| closed_formula_int_value(&min_f).is_none_or(|m| l > m));
+                    let modelled = match fold {
+                        IteratorFold::Sum => hi.is_some() && (!signed || lo.is_some()),
+                        IteratorFold::Product => {
+                            hi.is_some_and(|h| h <= 1) && (!signed || lo.is_some_and(|l| l >= -1))
+                        }
+                    };
+                    if modelled {
+                        bound.items =
+                            Some((lo.map_or(min_f, Formula::Int), hi.map_or(max_f, Formula::Int)));
+                    }
+                }
+                if bound.count.is_none() && bound.items.is_some() {
+                    bound.count = args
+                        .first()
+                        .and_then(|it| super::loop_bounds::iterated_source_yield_bound(func, it, 16))
+                        .map(Formula::Int);
+                }
+                let unmodelled = |detail: &str| {
+                    (
+                        block.id,
+                        VerificationCondition {
+                            kind: VcKind::UnsupportedMir {
+                                kind: "iterator-fold-overflow".into(),
+                                detail: detail.into(),
+                            },
+                            function: fn_sym,
+                            location: span.clone(),
+                            formula: Formula::Bool(true),
+                            contract_metadata: None,
+                            obligation: None,
+                        },
+                    )
+                };
+                match bound.count {
+                    None => block_vcs.push(unmodelled(
+                        "Iterator::sum/product accumulates inside the library impl and can \
+                         overflow-panic, and the number of items its source yields is not \
+                         bounded (a collection bounds it only by memory; two items of the \
+                         type's maximum already overflow) — refused unless the source is a \
+                         range, `take(n)` or `repeat_n` whose count a guard bounds",
+                    )),
+                    // CL-FOLD-MAP-FORCED-1: a bounded count over UNMODELLED items. Only a
+                    // closed count of at most one keeps the row (one item cannot overflow
+                    // a sum, and a product of one item is that item); anything else is
+                    // Unknown, never a refutation on a defaulted item.
+                    Some(count)
+                        if bound.items.is_none()
+                            && !closed_formula_int_value(&count).is_some_and(|c| c <= 1) =>
+                    {
+                        block_vcs.push(unmodelled(
+                            "Iterator::sum/product accumulates inside the library impl and can \
+                             overflow-panic; its source yields a bounded number of items, but \
+                             their values are not modelled (a `map`, `filter_map`, `map_while` \
+                             or `scan` result, or a repeated non-integer), so whether they \
+                             overflow is unknown — refused, never refuted on an assumed \
+                             maximal item",
+                        ));
+                    }
+                    Some(count) => {
+                        let width = acc_ty.int_width().unwrap_or(64);
+                        let signed = acc_ty.is_signed();
+                        let max_f = crate::range::type_max_formula(width, signed);
+                        let min_f = crate::range::type_min_formula(width, signed);
+                        // Reached with `items: None` only for a closed count of at most
+                        // one (the arm above), where the item range cannot matter.
+                        let (lo, hi) =
+                            bound.items.unwrap_or_else(|| (min_f.clone(), max_f.clone()));
+                        let at_least = |f: Formula, k: i128| {
+                            Formula::Ge(Box::new(f), Box::new(Formula::Int(k)))
+                        };
+                        // Trust (2026-09-30): `count` is an UPPER bound in general
+                        // (`take(1000)` yields at most 1000) and the item range may be the
+                        // type's whole range by default, so a ground `count`/`hi` pair
+                        // folded to a forced-true formula and the row was escalated as a
+                        // "guaranteed" violation of a correct program
+                        // (`v.iter().take(1000).map(|&b| b as u64).sum()`, sweep `r33`),
+                        // with an empty counterexample. Range over every count up to the
+                        // bound instead: the overflow condition is monotone in the count,
+                        // so satisfiability is unchanged, and the formula no longer folds.
+                        let bound_count = count;
+                        let count =
+                            Formula::Var(format!("__trust_fold_count_{}", block.id.0), Sort::Int);
+                        let within_bound =
+                            Formula::Le(Box::new(count.clone()), Box::new(bound_count));
+                        // LINEAR on purpose: `count * hi` with both symbolic is a
+                        // nonlinear product the in-process solver answers `Unknown`,
+                        // and an `Unknown` overflow row is reported runtime-checked —
+                        // measured, `(a..b).sum::<u64>()` built exit 0 that way. See
+                        // `fold_product_may_leave_range`.
+                        let mut exceeds =
+                            vec![fold_product_may_leave_range(&count, &hi, width, signed, true)];
+                        if signed {
+                            exceeds.push(fold_product_may_leave_range(
+                                &count, &lo, width, signed, false,
+                            ));
+                        }
+                        let (op, body) = match fold {
+                            IteratorFold::Sum => (
+                                BinOp::Add,
+                                Formula::And(vec![
+                                    within_bound,
+                                    at_least(count.clone(), 1),
+                                    Formula::Or(exceeds),
+                                ]),
+                            ),
+                            IteratorFold::Product => (
+                                BinOp::Mul,
+                                Formula::And(vec![
+                                    within_bound,
+                                    at_least(count, 2),
+                                    Formula::Or(vec![
+                                        at_least(hi, 2),
+                                        Formula::Le(Box::new(lo), Box::new(Formula::Int(-2))),
+                                    ]),
+                                ]),
+                            ),
+                        };
+                        let formula = v2_formula_with_block_defs_at_point(
+                            func,
+                            block,
+                            block.stmts.len(),
+                            body,
+                        );
+                        block_vcs.push((
+                            block.id,
+                            VerificationCondition {
+                                kind: VcKind::ArithmeticOverflow {
+                                    op,
+                                    operand_tys: (acc_ty.clone(), acc_ty),
+                                },
+                                function: fn_sym,
+                                location: span.clone(),
+                                formula,
+                                contract_metadata: None,
+                                obligation: None,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // 1c-repeat. `str::repeat(n)` — sibling of the sum/product fold: the result
+            // capacity `s.len() * n` is computed INSIDE the library impl and
+            // overflow-panics ("capacity overflow") for large `n`, with no
+            // caller-visible BinaryOp, so it was SILENTLY accepted (0 obligations).
+            // Surface the same UnsupportedMir obligation (→ Unknown → runtime-checked)
+            // as the iterator fold, per the default lane's disclosed runtime-checked demotion.
+            // Gated to the `str` inherent impl (`<impl str>::repeat`) so `slice`/`Vec::
+            // repeat` — which already mint a runtime-checked obligation via the
+            // bulk-alloc capacity path — are NOT double-counted or regressed.
+            if call_tail == "repeat" && str_repeat_capacity_overflow_call(callee) {
+                block_vcs.push((
+                    block.id,
+                    VerificationCondition {
+                        kind: VcKind::UnsupportedMir {
+                            kind: "str-repeat-capacity-overflow".into(),
+                            detail: "str::repeat computes its result capacity (len * n) \
+                                     inside the library impl and can overflow-panic \
+                                     (\"capacity overflow\"); not statically modeled — \
+                                     reported Unknown (runtime-checked), never silently \
+                                     verified"
+                                .into(),
+                        },
+                        function: fn_sym,
+                        location: span.clone(),
+                        formula: Formula::Bool(true),
+                        contract_metadata: None,
+                        obligation: None,
+                    },
+                ));
+            }
+
+            // 1d. Division/remainder-by-zero for a dynamic divisor hidden INSIDE a
+            // library Call that produces no caller-visible `BinaryOp(Div|Rem)`:
+            // `a.checked_div(b)` / `checked_rem` / `div_euclid` / `rem_euclid` (panic
+            // / UB / `None` on a zero divisor) and `Iterator::step_by(n)` (panics when
+            // `n == 0`). Without this the divisor obligation is never emitted and the
+            // op is reported vacuously safe — a false PROVE for `a.div_euclid(b)` with
+            // a runtime-zero `b`. Reuses the exact `v2_divisor_is_zero_formula` body +
+            // const-nonzero skip the BinaryOp arms use, pushed keyed by `block.id` so
+            // it inherits the SAME block-defs / path-guard / semantic-guard /
+            // precondition machinery — a dominating `if b != 0 { … }` guard or
+            // `#[requires(b != 0)]` PROVES it, an unguarded one FAILS. Float divisors
+            // are skipped: integer division panics on zero while `f64::div_euclid(0.0)`
+            // does not, so flagging a float here would false-FAIL ordinary code.
+            if matches!(
+                call_tail,
+                "div_euclid"
+                    | "div_ceil"
+                    | "rem_euclid"
+                    | "step_by"
+                    | "wrapping_div"
+                    | "overflowing_div"
+                    | "saturating_div"
+                    | "wrapping_div_euclid"
+                    | "overflowing_div_euclid"
+                    | "wrapping_rem"
+                    | "overflowing_rem"
+                    | "wrapping_rem_euclid"
+                    | "overflowing_rem_euclid"
+            ) && let Some((divisor_idx, kind)) = divzero_call(callee)
+                && let Some(divisor) = args.get(divisor_idx)
+                && !v2_is_float_operand(func, divisor)
+                && !v2_divisor_is_nonzero_constant(divisor)
+            {
+                // Args are evaluated BEFORE the terminator, so there are no in-block
+                // statement defs to take "before the statement" — use the same
+                // whole-block-defs builder the 1c overflow-call recognizer uses.
+                block_vcs.push((
+                    block.id,
+                    v2_build_divrem_vc_raw(
+                        func,
+                        block,
+                        v2_divisor_is_zero_formula(func, divisor),
+                        block.stmts.len(),
+                        span,
+                        kind,
+                    ),
+                ));
+            }
+
+            // 1d'. The signed `MIN / -1` overflow of a std `div_euclid`/`rem_euclid`
+            // call (Trust, 2026-09-30): its other panic, which 1d's zero-divisor row does
+            // not state. Same builder and guard machinery as 1d, so `if n > 0` proves it
+            // and `if n != 0` alone refutes it at `(MIN, -1)`.
+            if matches!(call_tail, "div_euclid" | "rem_euclid")
+                && let Some((violation, kind)) = signed_euclid_overflow_call(func, callee, args)
+            {
+                block_vcs.push((
+                    block.id,
+                    v2_build_divrem_vc_raw(func, block, violation, block.stmts.len(), span, kind),
+                ));
+            }
+
+            // 1e. Slice-method panics whose out-of-bounds / zero-size argument lowers
+            // to a `Terminator::Call` carrying NO caller-visible `Projection::Index`,
+            // so the rvalue-safety bounds path never sees them and the op is reported
+            // vacuously safe — a false PROVE for `s.split_at(mid)` with `mid > len`,
+            // `s.chunks(0)`, or `s.swap(i, j)` with an out-of-range index. The body is
+            // the unguarded failure (`mid > len` / `n == 0` / `i >= len || j >= len`),
+            // pushed keyed by `block.id` so it inherits the SAME block-defs / path-guard
+            // / semantic-guard / precondition machinery — a dominating `if mid <= s.len()`
+            // / `if n != 0` PROVES it, an unguarded one FAILS. Unrecognized slice methods
+            // return `None` from the recognizer: NO fail-close, to keep drop-in Rust.
+            if let Some(panic) = SliceMethodPanic::classify_with_tail(callee, call_tail)
+                // Trust (str char-boundary soundness): the `::<__trust_str_index>` marker
+                // `func_operand_name` appends to a `str` range-index callee — the Self
+                // identity that survives `str`→`[u8]` erasure. The RangeIndex body uses it
+                // to mint the UTF-8 char-boundary obligation for str receivers only.
+                // W4 round 3 (2026-09-29): the SplitAt body needs the same identity for
+                // `str::split_at`/`split_at_mut`, which carry no marker — see
+                // `callee_is_str_split_at`.
+                && let Some((violation, kind)) = (match panic {
+                    // Trust (VEC-INSERT, 2026-09-25): a `Vec` index mutator reached inside
+                    // its base's pre-mutation region gets the REAL index precondition over
+                    // the region length (`vec_region`); anywhere else the fail-honest
+                    // `UnsupportedMir` row below stands.
+                    SliceMethodPanic::VecPanicMethod { .. } => {
+                        vec_mutator_index_violation(func, block)
+                            .map(|violation| (violation, VcKind::SliceBoundsCheck))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    slice_method_panic_body(
+                        func,
+                        &panic,
+                        callee,
+                        args,
+                        callee.contains("__trust_str_index")
+                            || callee_is_str_split_at(callee, callee_key.as_ref()),
+                        block,
+                    )
+                })
+            {
+                // Args are evaluated BEFORE the terminator, so there are no in-block
+                // statement defs to take "before the statement" — use the same
+                // whole-block-defs builder the 1c/1d call recognizers use. Conjoin the
+                // `0 <= len` lower bound for the `__slice_len` term the `split_at`/`swap`
+                // bodies reference (a no-op for the `chunks(n)` zero-size form, which
+                // carries no length term); the bound is unconditionally true and sound.
+                //
+                // `RangeIndex` is the exception: its bounds are ALREADY resolved to the
+                // underlying param symbols by `resolve_range_bound_formula`, so it needs
+                // NO block-defs — and `v2_formula_with_block_defs` would otherwise conjoin
+                // the `Range { .. }` aggregate's field equalities (`_t.0 == b`, the `@0.0`
+                // aggregate-construction twin), noise that makes the default-mode solver
+                // return Unknown on an otherwise-trivial `guard ∧ b > len` contradiction.
+                // Skipping them is sound (dropping true equalities only weakens the
+                // discharge, never the violation). NOTE: the exclusive-range violation
+                // stays a single `Or[start>end, end>len]` VC — splitting it into two
+                // single-`Gt` VCs (which the default-mode solver discharges better) is
+                // UNSOUND here because both carry the SAME (span, kind, location) and the
+                // result accounting then SHARES one verdict across them (the provable
+                // ordering VC masks an undischarged end-bound VC). So a correctly-guarded
+                // exclusive `&s[a..b]` currently fails closed (sound, incomplete); the
+                // single-`Gt` `RangeTo`/`RangeFrom` discharge precisely. Completeness for
+                // the exclusive `Or` is a follow-up (needs distinct per-disjunct VC ids).
+                // Trust (versioned-def tie for the #7c scalar `v[i]`): the skip above is
+                // scoped to TRUE range indexing only — discriminated by the presence of a
+                // panicking-range arg, the SAME `range_operand` test the RangeIndex arm
+                // itself keys on. The owned-Vec SCALAR index rides the RangeIndex arm too
+                // (no range arg) but builds its index with a bare `operand_to_formula`, so
+                // it NEEDS the block-defs: the index operand is a copy local (`_9 = copy i`)
+                // whose def `_9 == i#<version>` is the ONLY tie to the versioned loop var
+                // the `i < v.len()` guard constrains. Without it, `_9` is a free var and
+                // `while i < v.len() { v[i] }` on `&Vec` FALSE-REFUTES with `_9 = len`
+                // (observed: `_9 = 1, i#s0_0_s5_0 = 0, v = 1`) while the slice twin —
+                // whose Assert-path VC builder conjoins block-defs — proves. Conjoining
+                // defs is DROP-ONLY-in-reverse (true path equalities, monotone): it can
+                // discharge a spurious refutation but never hide a real OOB, whose
+                // counterexample satisfies the defs too (gate: `while i <= v.len()` still
+                // refutes).
+                // Trust: 2026-09-16 (round A8) — the range-index arm now takes the
+                // same-block LENGTH TIES and nothing else (`v2_formula_with_slice_len_ties`):
+                // the obligation's length is the argument temp's own `__slice_len` name
+                // whenever the root is not licensed for the canonical one, and the tie is
+                // its only connection to the length a guard or a `min` fact bounds.
+                // Trust: 2026-09-21 — this arm now RECORDS its obligation.
+                //
+                // It pushed `obligation: None`, and that row is the one a whole
+                // investigation converged on: a bounds row with no `{body,
+                // wrappers}` is outside the authenticated-obligation invariant
+                // entirely, and it is what decides the verdict on the
+                // `closure-slice-facts` false refutations while the recorded row
+                // beside it PROVES.
+                //
+                // It could not record before, and correctly did not try. Both
+                // builders below VERSION-RENAME the body, so a record seeded with
+                // the original `violation` cannot reconstruct `formula`, and
+                // `ob_record_conjoin_wrap` is fail-closed against that shape — an
+                // unreplayable record is worse than an absent one. The `_recorded`
+                // twins return `(formula, renamed_body, kept)` precisely so the
+                // record can be seeded at the SAME point the formula was renamed
+                // at, which is the versioning reconciliation this lane needed.
+                // Trust (CONST-RANGE-INDEX-1, 2026-10-06): "is a range index" is the
+                // arm's own answer (`range_index_range_operand`), so a constant range the
+                // callee names takes the same builder as a typed one.
+                let (base, body, kept) = if matches!(panic, SliceMethodPanic::RangeIndex)
+                    && range_index_range_operand(func, callee, args).is_some()
+                {
+                    v2_formula_with_slice_len_ties_recorded(func, block, violation)
+                } else {
+                    v2_formula_with_block_defs_recorded(func, block, violation)
+                };
+                let (formula, wrapped) = conjoin_slice_len_bounds_step(func, base);
+                let mut wrappers = Vec::new();
+                if !kept.is_empty() {
+                    wrappers.push(trust_types::ObligationWrapper::ConjoinFactsLast { facts: kept });
+                }
+                // The one conjoin applied AFTER the recorded pair, recorded the same
+                // way every other post-hoc conjoin in this file is.
+                if wrapped
+                    && let Formula::And(children) = &formula
+                    && children.len() >= 2
+                {
+                    let facts = children[..children.len() - 1].to_vec();
+                    if !facts.is_empty() {
+                        wrappers.push(trust_types::ObligationWrapper::ConjoinFactsLast { facts });
+                    }
+                }
+                let vc = VerificationCondition {
                     kind,
-                    function: func.name.clone().into(),
+                    function: fn_sym,
                     location: span.clone(),
                     formula,
                     contract_metadata: None,
-                    obligation: None,
-                },
-            ));
+                    obligation: Some(trust_types::ObligationRecord {
+                        body,
+                        wrappers,
+                        subject: None,
+                        width: None,
+                    }),
+                };
+                block_vcs.push((block.id, vc));
+            }
+
+            // 1f. Trust (2026-09-25, std-numeric-family): std numeric methods that
+            // panic on a caller-supplied argument VALUE inside the library —
+            // `Ord::clamp`/`f64::clamp` bounds, `ilog*`/`isqrt` domains, a radix
+            // outside `[2, 36]`, `next_power_of_two`/`next_multiple_of` overflow, the
+            // signed `div_euclid`/`rem_euclid` `MIN / -1`, `Duration`/`Instant`
+            // arithmetic. The caller's MIR has no `Assert` for any of them, and the
+            // bundled member's internal check is reported, not failed, so the
+            // argument was never charged (see `numeric_panic`). A precise row is
+            // pushed keyed by `block.id` exactly like the 1d divisor row, so a
+            // dominating guard PROVES it and an unguarded call is REFUTED; a
+            // fail-closed `UnsupportedMir` row is pushed bare, like the 1c-fold row.
+            // The same-type `strict_add/sub/mul` and by-value `Add::add`-style calls
+            // ARE the `a op b` overflow, so they get the row the `BinaryOp` statement
+            // arm builds for `a op b` — the same builder, at the call's destination
+            // type (its bit-vector route is what refutes a product of two variables;
+            // an LIA `Assertion` over `a * b` is answered `Unknown` and reported
+            // runtime-checked, which let `i32::strict_mul` build rc=0).
+            let numeric_callee =
+                super::numeric_panic::NumericCallee::for_minting(callee, call_tail);
+            if let Some(overflow) = numeric_callee.overflow_call(func, args) {
+                match overflow {
+                    super::numeric_panic::NumericOverflow::BinOp(op) => {
+                        let operation_ty = crate::place_ty_cow(func, dest)
+                            .filter(|ty| crate::fixed_width_integer_descriptor(ty).is_some())
+                            .map(std::borrow::Cow::into_owned);
+                        if let (Some(lhs), Some(rhs)) = (args.first(), args.get(1))
+                            && let Some(vc) = v2_build_overflow_vc_for_operands_typed(
+                                func,
+                                block,
+                                op,
+                                lhs,
+                                rhs,
+                                span,
+                                None,
+                                operation_ty,
+                            )
+                        {
+                            block_vcs.push((block.id, vc));
+                        }
+                    }
+                    // `<iN as AddAssign>::add_assign(p, b)` (and Sub/Mul): the row the
+                    // `BinaryOp` arm builds for `*p + b` — the operand the operator
+                    // spelling `*p += b` reads — typed at `*p`'s own integer type (the
+                    // call's destination is `()`). With both operands typed the builder
+                    // answers `None` only through its signed-128 `Mul` suppression (a
+                    // finite corner box that provably cannot overflow), which mints
+                    // nothing exactly as for `a * b`; an operand it cannot type is
+                    // refused here rather than silently accepted.
+                    super::numeric_panic::NumericOverflow::AssignBinOp { op, lhs } => {
+                        let operation_ty = crate::operand_ty_cow(func, &lhs)
+                            .filter(|ty| crate::fixed_width_integer_descriptor(ty).is_some())
+                            .map(std::borrow::Cow::into_owned);
+                        let rhs =
+                            args.get(1).filter(|rhs| crate::operand_ty_cow(func, rhs).is_some());
+                        let typed = operation_ty.is_some() && rhs.is_some();
+                        let vc = match rhs {
+                            Some(rhs) if typed => v2_build_overflow_vc_for_operands_typed(
+                                func,
+                                block,
+                                op,
+                                &lhs,
+                                rhs,
+                                span,
+                                None,
+                                operation_ty,
+                            ),
+                            _ => None,
+                        };
+                        match vc {
+                            Some(vc) => block_vcs.push((block.id, vc)),
+                            None if typed => {}
+                            None => block_vcs.push((
+                                block.id,
+                                unsupported_mir_vc(
+                                    func,
+                                    "int-assign-op-overflow-unmodeled".to_string(),
+                                    format!(
+                                        "bb{}: `{callee}`'s receiver or right operand is not a \
+                                         typed integer place, so its overflow obligation cannot be \
+                                         built — refused, never silently verified",
+                                        block.id.0
+                                    ),
+                                    span.clone(),
+                                ),
+                            )),
+                        }
+                    }
+                    // `strict_pow`: the 1c `pow` row, byte-for-byte.
+                    super::numeric_panic::NumericOverflow::Pow => {
+                        if let Some((body, op, lhs_ty, rhs_ty, width)) =
+                            v2_overflow_call_body(func, OverflowCall::Pow, args, dest)
+                        {
+                            let (formula, rec_body, kept) =
+                                v2_formula_with_block_defs_at_point_recorded(
+                                    func,
+                                    block,
+                                    block.stmts.len(),
+                                    body,
+                                );
+                            block_vcs.push((
+                                block.id,
+                                VerificationCondition {
+                                    kind: VcKind::ArithmeticOverflow {
+                                        op,
+                                        operand_tys: (lhs_ty, rhs_ty),
+                                    },
+                                    function: fn_sym,
+                                    location: span.clone(),
+                                    formula,
+                                    contract_metadata: None,
+                                    obligation: v2_arith_overflow_seed_record(
+                                        rec_body, kept, width,
+                                    ),
+                                },
+                            ));
+                        }
+                    }
+                }
+            } else if let Some((violation, kind)) =
+                numeric_callee.value_panic_row(func, args, dest)
+            {
+                if matches!(kind, VcKind::UnsupportedMir { .. }) {
+                    block_vcs.push((
+                        block.id,
+                        VerificationCondition {
+                            kind,
+                            function: fn_sym,
+                            location: span.clone(),
+                            formula: violation,
+                            contract_metadata: None,
+                            obligation: None,
+                        },
+                    ));
+                } else {
+                    block_vcs.push((
+                        block.id,
+                        v2_build_divrem_vc_raw(
+                            func,
+                            block,
+                            violation,
+                            block.stmts.len(),
+                            span,
+                            kind,
+                        ),
+                    ));
+                }
+            }
         }
 
+        // TINV step 7.5: the requested type-invariant rows of this terminator. A no-op
+        // unless a `tinv_rows` request for THIS body is installed, so ordinary
+        // generation is byte-identical.
+        super::tinv_rows::push_tinv_terminator_rows(
+            func,
+            active_tinv_req.as_deref(),
+            || &**sv_lazy.get_or_init(|| super::stmt_versions_for(func)),
+            block,
+            &mut block_vcs,
+        );
+        // Every row pushed so far for this block is a terminator/call row.
+        pad_row_points(&mut row_points, block_vcs.len(), usize::MAX);
+        let mut stmt_point = usize::MAX;
         for (stmt_index, stmt) in block.stmts.iter().enumerate() {
+            // Every row the PREVIOUS iteration pushed reads at that iteration's
+            // statement. Labelled on entry to the next iteration (and once after
+            // the loop), so no `continue` / `break` in the arms below can leave a
+            // row unlabelled.
+            pad_row_points(&mut row_points, block_vcs.len(), stmt_point);
+            stmt_point = stmt_index;
+            // TINV step 7.5: the requested E/M rows at this statement (no-op without a
+            // request), labelled with this statement's use point on the next pad.
+            super::tinv_rows::push_tinv_statement_rows(
+                func,
+                active_tinv_req.as_deref(),
+                || &**sv_lazy.get_or_init(|| super::stmt_versions_for(func)),
+                block,
+                stmt_index,
+                &mut block_vcs,
+            );
             // Per-STATEMENT poll (see the per-block poll above). A block-level
             // bound alone is too coarse: the pathological bodies are a single
             // enormous block, so an overrun inside one block's statement walk
@@ -1248,90 +1896,49 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                             lhs,
                             rhs,
                             span,
-                            Some(stmt_index),
+                            V2ShiftSite::Statement(stmt_index),
                         )
                     {
                         block_vcs.push((block.id, vc));
                     }
                 }
-                // Float Add | Sub | Mul (float-residuals honest L1 widening:
-                // Sub joins the arm — `a - b` overflows to ±inf exactly like
-                // `a + (-b)`, and previously emitted NO obligation at all).
-                Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs)
-                    if v2_is_float_operand(func, lhs) || v2_is_float_operand(func, rhs) =>
-                {
-                    let context =
-                        V2FloatOverflowContext { func, block, span, stmt_index, summaries };
-                    if let Some(vc) = v2_build_float_overflow_vc(context, *op, lhs, rhs) {
-                        block_vcs.push((block.id, vc));
-                    }
-                }
-                // a DIRECT integer Add/Sub/Mul (not the assert-guarded
-                // CheckedBinaryOp form) still needs a solver-facing overflow
-                // obligation, else an unguarded overflowing op is silently
-                // unchecked (a false-PROVE). Float operands are handled by the
-                // arm above. An assert targeting this block is not sufficient
-                // authority to suppress the row: target identity alone does not
-                // prove that the assert guarded this operation and operands.
-                // Trust (R2/C4): `UncheckedBinaryOp` uses the dedicated arm
-                // immediately below. It builds the same arithmetic proposition
-                // under the assignment's validated integer type, but deliberately
-                // ignores the plain form's modular certificate and checked-guard
-                // suppression authorities.
-                // (An earlier note here called that defense-in-depth on the grounds
-                // that `LowerIntrinsics` "runs after this lane's extraction point".
-                // MEASURED 2026-08-20 with the shipped stage2 `trustc`: it does NOT.
-                // `unsafe { a.unchecked_shl(b) }` reaches this lane as
-                // `BinOp::ShlUnchecked` — "unsupported MIR `BinOp::ShlUnchecked`" —
-                // which is only producible by `LowerIntrinsics`. The dedicated
-                // unchecked arm below is therefore live.)
-                //
-                // THE MODULAR EXCEPTION. `LowerIntrinsics` rewrites
-                // `intrinsics::wrapping_{add,sub,mul}` into a bare
-                // `Rvalue::BinaryOp` too, and `wrapping_add` CANNOT overflow — the
-                // obligation minted for it is FALSE, and it is what makes
-                // `core::num`'s whole `wrapping_*` family unverifiable (measured: 3
-                // of the 43 failing obligations in the `core::num` leaf slice,
-                // `docs/design/2026-08-20-core-slice-blocker-histogram.md` §2.1).
-                // The wrapping identity is unrecoverable HERE — under
-                // `-Coverflow-checks=off` a source-level `a + b` extracts to the
-                // byte-identical rvalue — so the compiler carries it forward from
-                // the pass that dropped it, as a per-`(span, op)` certificate on the
-                // `VcgenContext` (`is_certified_modular_arith`). Skipping is
-                // therefore keyed on rustc's own record of the operation, never on
-                // the shape: an ordinary `+` in the same shape is NOT in the set and
-                // keeps its obligation, and so does every op reached without a
-                // compiler-installed context.
-                Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs)
-                    if !v2_is_float_operand(func, lhs)
-                        && !v2_is_float_operand(func, rhs)
-                        && !crate::is_certified_modular_arith(&func.def_path, span, *op) =>
-                {
-                    // Trust (width-soundness): the assignment DESTINATION's
-                    // validated integer type is the operation-width authority,
-                    // exactly as in the UncheckedBinaryOp arm below
-                    // (`validate_binary_assignment_types` pins both operands to
-                    // it). Without it, a public body whose operands are BOTH
-                    // widthless signed constants (`_1: i8 = Add(100, 100)` —
-                    // admitted, each literal fits i8) lets `int_op_type`
-                    // fabricate i64 and the VC proves `200 fits i64` while the
-                    // i8 operation overflows at runtime — a false PROVE. A
-                    // destination without a fixed-width descriptor falls back
-                    // to operand inference (today's behavior; unreachable on
-                    // the validated path).
-                    let operation_ty = crate::place_ty(func, place)
-                        .filter(|ty| crate::fixed_width_integer_descriptor(ty).is_some());
-                    if let Some(vc) = v2_build_overflow_vc_for_operands_typed(
-                        func,
-                        block,
-                        *op,
-                        lhs,
-                        rhs,
-                        span,
-                        Some(stmt_index),
-                        operation_ty,
-                    ) {
-                        block_vcs.push((block.id, vc));
+                // Float or direct integer Add | Sub | Mul: evaluate the float-operand
+                // check once so integer arithmetic statements do not re-query operand_ty_cow.
+                Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), lhs, rhs) => {
+                    if v2_is_float_operand(func, lhs) || v2_is_float_operand(func, rhs) {
+                        let context =
+                            V2FloatOverflowContext { func, block, span, stmt_index, summaries };
+                        if let Some(vc) = v2_build_float_overflow_vc(context, *op, lhs, rhs) {
+                            block_vcs.push((block.id, vc));
+                        }
+                    } else if !crate::is_certified_modular_arith(&func.def_path, span, *op) {
+                        // Trust (width-soundness): the assignment DESTINATION's
+                        // validated integer type is the operation-width authority,
+                        // exactly as in the UncheckedBinaryOp arm below
+                        // (`validate_binary_assignment_types` pins both operands to
+                        // it). Without it, a public body whose operands are BOTH
+                        // widthless signed constants (`_1: i8 = Add(100, 100)` —
+                        // admitted, each literal fits i8) lets `int_op_type`
+                        // fabricate i64 and the VC proves `200 fits i64` while the
+                        // i8 operation overflows at runtime — a false PROVE. A
+                        // destination without a fixed-width descriptor falls back
+                        // to operand inference (today's behavior; unreachable on
+                        // the validated path).
+                        let operation_ty = crate::place_ty_cow(func, place)
+                            .filter(|ty| crate::fixed_width_integer_descriptor(ty).is_some())
+                            .map(std::borrow::Cow::into_owned);
+                        if let Some(vc) = v2_build_overflow_vc_for_operands_typed(
+                            func,
+                            block,
+                            *op,
+                            lhs,
+                            rhs,
+                            span,
+                            Some(stmt_index),
+                            operation_ty,
+                        ) {
+                            block_vcs.push((block.id, vc));
+                        }
                     }
                 }
                 // A modular-arithmetic certificate is authority only for the
@@ -1344,7 +1951,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                     lhs,
                     rhs,
                 ) if !v2_is_float_operand(func, lhs) && !v2_is_float_operand(func, rhs) => {
-                    if let Some(operation_ty) = crate::place_ty(func, place)
+                    if let Some(operation_ty) = crate::place_ty_cow(func, place)
                         && let Some(mut vc) = v2_build_unchecked_overflow_vc_for_operands(
                             func,
                             block,
@@ -1353,7 +1960,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                             rhs,
                             span,
                             Some(stmt_index),
-                            operation_ty,
+                            operation_ty.into_owned(),
                         )
                     {
                         // The SECOND route to `unchecked_{add,sub,mul}` — and the
@@ -1416,7 +2023,14 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                 _ => {}
             }
         }
+        pad_row_points(&mut row_points, block_vcs.len(), stmt_point);
     }
+    pad_row_points(&mut row_points, block_vcs.len(), usize::MAX);
+    assert_eq!(
+        row_points.len(),
+        block_vcs.len(),
+        "every generated row must carry its use point before decoration"
+    );
 
     // THE COLLAPSE INVARIANT, capture step. Classify every row NOW, while
     // `vc.formula` is still the row's OWN violation condition: from the next
@@ -1438,24 +2052,106 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     // reordering. So each flag carries the `BlockId` it was captured for and the
     // enforcement step checks BOTH the length and the per-position identity
     // before it trusts a single flag.
+    if !block_vcs.is_empty() {
     let content_free: Vec<(BlockId, bool)> =
         block_vcs.iter().map(|(id, vc)| (*id, v2_violation_is_content_free(&vc.formula))).collect();
 
     // Conjoin predecessor definitions before guards so successor-block VCs
     // retain the boolean/int locals that made the path reachable.
-    for (block_id, vc) in &mut block_vcs {
+    let path_def_lazy: std::cell::OnceCell<std::rc::Rc<FxHashMap<BlockId, Vec<Formula>>>> =
+        std::cell::OnceCell::new();
+    let mut terminal_live_cache: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
+    // PERF-COMPILER-VCGEN-802: `v2_live_path_defs_at_point` is a pure function of
+    // `(func, block, path_defs[block], point)`, and the rows of ONE statement are
+    // pushed consecutively (a `Div` mints its zero-divisor AND its signed-overflow
+    // row at the same use point). `next_shares_point[i]` says row `i + 1` has row
+    // `i`'s `(block, point)`, so the per-statement live set is computed once and
+    // cloned only for a row that really has a same-point successor; a lone row
+    // still moves its set straight into its conjunction, as before.
+    let next_shares_point: Vec<bool> = (0..block_vcs.len())
+        .map(|i| {
+            i + 1 < block_vcs.len()
+                && block_vcs[i].0 == block_vcs[i + 1].0
+                && row_points[i] == row_points[i + 1]
+        })
+        .collect();
+    let mut point_live_carry: Option<(BlockId, usize, Vec<Formula>)> = None;
+    for (row_index, ((block_id, vc), point)) in
+        block_vcs.iter_mut().zip(row_points.iter().copied()).enumerate()
+    {
+        // BUDGET POLL, per ROW. `v2_live_path_defs` re-walks the whole block
+        // against the whole incoming fact list, so ONE row is its own overrun
+        // channel and a poll anywhere outside this loop could not interrupt it;
+        // this pass had no poll at all, so `-Ztrust-verify-function-budget-{ms,
+        // steps}` did not bound it. Degrading by `break` leaves the remaining
+        // rows WITHOUT their path-def facts, which is fail-closed: this loop
+        // only ever CONJOINS facts onto a violation formula, and a row carrying
+        // fewer hypotheses can move PROVE -> FAIL, never FAIL -> PROVE.
+        //
+        // Nor does a half-decorated row reach a consumer. `budget_exhausted`
+        // LATCHES (its step counter saturates at zero and a passed deadline
+        // never un-passes), so the poll in the type-range loop below is reached
+        // and sets `truncated`, which makes the overflow-check origin inventory
+        // give no join table; and the caller's post-generation checkpoint
+        // (`preprocessing_budget_exceeded`, "VC generation") discards this
+        // partial inventory outright — a located hard error in strict/certify/
+        // memory-safe, one synthetic `Unknown` row in advisory.
+        if trust_types::verify_budget::budget_exhausted() {
+            // Set the flag AT THE BREAK, not downstream. A step-budget trip
+            // latches (the counter saturates at zero) but a WALL-CLOCK trip does
+            // NOT: the clock is only consulted every `WALL_POLL_INTERVAL` (4096)
+            // charged steps, so up to 4096 later polls answer `false` again. So a
+            // later loop's `truncated = true` cannot be relied on to carry this
+            // trip, and the origin inventory (`RowOrigins::from_walk`) gates on
+            // `truncated` — a tail of rows missing their facts, reported as a COMPLETE
+            // enumeration, is the FAIL->PROVE direction (a twin pair stops
+            // colliding, so a live overflow check can be elided on the other
+            // twin's proof). Every break out of this decoration phase therefore
+            // carries the flag itself.
+            truncated = true;
+            break;
+        }
         if v2_is_unsupported_mir_vc(vc) {
             continue;
         }
+        let path_definition_map =
+            path_def_lazy.get_or_init(|| super::path_definition_map_for(func));
         if let Some(path_defs) = path_definition_map.get(block_id)
             && !path_defs.is_empty()
         {
-            let live = v2_live_path_defs(func, &func.body.blocks[block_id.0], path_defs);
-            if !live.is_empty() {
-                ob_record_conjoin(vc, &live);
-                let mut conjuncts = live;
-                conjuncts.push(vc.formula.clone());
-                vc.formula = Formula::And(conjuncts);
+            // A per-statement row keeps the entry facts its own read still sees
+            // (see `v2_live_path_defs_at_point`); a terminator row (`point` =
+            // `usize::MAX`) takes the whole-block kill, byte-identical to before.
+            let block = &func.body.blocks[block_id.0];
+            if point >= block.stmts.len() {
+                let live = terminal_live_cache
+                    .entry(*block_id)
+                    .or_insert_with(|| v2_live_path_defs_at_point(func, block, path_defs, point));
+                if !live.is_empty() {
+                    ob_record_conjoin(vc, live);
+                    let mut conjuncts = Vec::with_capacity(live.len() + 1);
+                    conjuncts.extend_from_slice(live);
+                    conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                    vc.formula = Formula::And(conjuncts);
+                }
+            } else {
+                let carried = point_live_carry
+                    .take()
+                    .filter(|(carry_block, carry_point, _)| {
+                        carry_block == block_id && *carry_point == point
+                    })
+                    .map(|(_, _, live)| live);
+                let live = carried
+                    .unwrap_or_else(|| v2_live_path_defs_at_point(func, block, path_defs, point));
+                if next_shares_point[row_index] {
+                    point_live_carry = Some((*block_id, point, live.clone()));
+                }
+                if !live.is_empty() {
+                    ob_record_conjoin(vc, &live);
+                    let mut conjuncts = live;
+                    conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                    vc.formula = Formula::And(conjuncts);
+                }
             }
         }
     }
@@ -1464,169 +2160,325 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     // conjoined AFTER the version rename (moved below), EXEMPT from it, so a guard's
     // bare ENTRY-param read stays name-disjoint from a reassigned body read.
 
-    // Conjoin range-iterator yield facts so `for i in start..end { a[i] }`
-    // proves: the loop variable `i` (a `Range::next` Some-payload) provably
-    // satisfies `start <= i < end`, which discharges the `a[i]` bounds
-    // obligation. Computed independently of the BFS guard map, so loop-join
-    // weakening cannot drop it. See `build_range_yield_guard_map`.
-    let range_yield_guards = build_range_yield_guard_map(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = range_yield_guards.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
+    if block_vcs.iter().any(|(_, vc)| !v2_is_unsupported_mir_vc(vc)) {
+        let tp = super::terminator_presence_for(func);
+        let has_adapter_premises =
+            !crate::adapter_yield_premises_for(&func.def_path).is_empty();
 
-    // Conjoin converging two-pointer facts so `while lo < hi { hi -= 1; … s[lo] …;
-    // lo += 1 }` proves the `s[lo]` side (`s[hi]` is handled by the downward
-    // induction fact): `lo < hi <= s.len()` at the lo-stable body blocks. See
-    // `build_converging_pointer_facts`.
-    let converging_facts = build_converging_pointer_facts(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = converging_facts.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Trust (countdown-loop piece): conjoin the countdown PRE-VALUE facts at the
-    // decrement blocks — `offset >= LEN - c*(T-1)` directly contradicts the
-    // CheckedSub underflow violation, which is expressed on the pre-value
-    // version (the global result-temp form does not reach it). Same consumption
-    // discipline as the converging two-pointer facts above; the builder emits a
-    // block's fact only when the block has no cursor store, so the bare name
-    // versions to the block-entry value. See `build_countdown_preval_facts`.
-    let countdown_preval_facts = build_countdown_preval_facts(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = countdown_preval_facts.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Conjoin enumerate index yield facts so `for (i, _) in s.iter().enumerate()
-    // { … s[i] … }` proves: the index `i` (the enumerate count) provably satisfies
-    // `0 <= i < s.len()`. Independent of the BFS guard map. See
-    // `build_enumerate_yield_guard_map`.
-    let enumerate_yield_guards = build_enumerate_yield_guard_map(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = enumerate_yield_guards.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Conjoin slice-chunking yield facts so `for w in s.windows(n) { w[k] }` /
-    // `for c in s.chunks(n) { c[k] }` prove: the yielded sub-slice's modeled
-    // length is `== n` (windows) / `in [1, n]` (chunks). See
-    // `build_slice_iter_yield_guard_map`.
-    let slice_iter_yield_guards = build_slice_iter_yield_guard_map(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = slice_iter_yield_guards.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Conjoin push-guarded nested-container element-length facts so
-    // `let mut m: Vec<Vec<T>> = Vec::new(); for .. { if row.len()<=n {return}; m.push(row) }`
-    // proves the inner access `m[r][col]`: the element `m[r]`'s modeled length is
-    // `> n` (every pushed row was guarded), which with the range `col < n` discharges
-    // `col < m[r].len()`. See `build_push_guard_elem_len_map`.
-    let push_guard_elem_len = build_push_guard_elem_len_map(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = push_guard_elem_len.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Conjoin dominating length-guard facts so `let m = self.g.len();
-    // if self.p_lo.len() != m { return }; for j in 0..m { self.p_lo[j] }` proves the
-    // struct-FIELD scalar index: the guard pins `len(self.p_lo) == m` on its
-    // fall-through edge, but through a DISTINCT `&self.p_lo` temp than the read carries,
-    // so the read's `coll_len(_recv)` is left FREE. Emit `coll_len(_recv) >= m` — the
-    // SAME var the bound reads — which with the loop range `j < m` discharges
-    // `j < m <= coll_len(_recv)`. See `build_len_guard_field_map`.
-    let len_guard_field = build_len_guard_field_map(func);
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(facts) = len_guard_field.get(block_id)
-            && !facts.is_empty()
-        {
-            ob_record_conjoin(vc, facts);
-            let mut conjuncts = facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
-        }
-    }
-
-    // Conjoin loop-invariant `Ord::min`/`max` result bounds onto EVERY VC. These
-    // are global invariants (single-assignment result, immutable args), so unlike
-    // the BFS semantic guard they survive a loop-header join and reach a body that
-    // uses the result only transitively — proving the bounded-copy idiom
-    // `let n = src.len().min(dst.len()); for i in 0..n { dst[i] = src[i]; }`.
-    // See `build_min_max_facts`. The fact is unconditionally true, so applying it
-    // everywhere is sound. Also conjoin the unsigned modulo bounds
-    // (`b != 0 ⟹ a%b < b`) — likewise global and unconditionally true — so a
-    // wrapping access `s[n % s.len()]` discharges (via the ay nonlinear-relaxation
-    // retry, which drops the `mod` term ay cannot handle).
-    let global_facts = build_global_invariant_facts(func);
-    if !global_facts.is_empty() {
-        for (_, vc) in &mut block_vcs {
-            if v2_is_unsupported_mir_vc(vc) {
-                continue;
+        // Conjoin range-iterator yield facts so `for i in start..end { a[i] }`
+        // proves: the loop variable `i` (a `Range::next` Some-payload) provably
+        // satisfies `start <= i < end`, which discharges the `a[i]` bounds
+        // obligation. Computed independently of the BFS guard map, so loop-join
+        // weakening cannot drop it. See `build_range_yield_guard_map`.
+        if tp.has_iterator_next_call || has_adapter_premises {
+            let range_yield_guards = super::range_yield_guards_for(func);
+            if !range_yield_guards.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = range_yield_guards.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
             }
-            ob_record_conjoin(vc, &global_facts);
-            let mut conjuncts = global_facts.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
+        }
+
+        // W4 STR-OFFSET (2026-09-25): conjoin the str-search payload facts —
+        // `0 <= i`, `i + m <= len(s)`, `len(s) <= isize::MAX` for `i` bound out of an
+        // authenticated `s.find(p)`/`s.rfind(p)` result — at the blocks that read
+        // `i`, so arithmetic on the offset (`i + 1` in `&s[i + 1..]`) discharges its
+        // overflow row. Same attachment discipline as the range-yield facts above.
+        // See `str_offset::build_str_search_payload_fact_map`.
+        if tp.has_str_search_item_call {
+            let str_search_payload_facts = build_str_search_payload_fact_map(func);
+            if !str_search_payload_facts.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = str_search_payload_facts.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin converging two-pointer facts so `while lo < hi { hi -= 1; … s[lo] …;
+        // lo += 1 }` proves the `s[lo]` side (`s[hi]` is handled by the downward
+        // induction fact): `lo < hi <= s.len()` at the lo-stable body blocks. See
+        // `build_converging_pointer_facts`.
+        if tp.has_switch_int {
+            let converging_facts = build_converging_pointer_facts(func);
+            if !converging_facts.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = converging_facts.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+
+            // Trust (countdown-loop piece): conjoin the countdown PRE-VALUE facts at the
+            // decrement blocks — `offset >= LEN - c*(T-1)` directly contradicts the
+            // CheckedSub underflow violation, which is expressed on the pre-value
+            // version (the global result-temp form does not reach it). Same consumption
+            // discipline as the converging two-pointer facts above; the builder emits a
+            // block's fact only when the block has no cursor store, so the bare name
+            // versions to the block-entry value. See `build_countdown_preval_facts`.
+            let countdown_facts = super::countdown_facts_for(func);
+            let countdown_preval_facts = &countdown_facts.per_block;
+            if !countdown_preval_facts.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = countdown_preval_facts.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin enumerate index yield facts so `for (i, _) in s.iter().enumerate()
+        // { … s[i] … }` proves: the index `i` (the enumerate count) provably satisfies
+        // `0 <= i < s.len()`. Independent of the BFS guard map. See
+        // `build_enumerate_yield_guard_map`.
+        if tp.has_iterator_next_call {
+            let enumerate_yield_guards = super::enumerate_yield_guards_for(func);
+            if !enumerate_yield_guards.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = enumerate_yield_guards.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin slice-chunking yield facts so `for w in s.windows(n) { w[k] }` /
+        // `for c in s.chunks(n) { c[k] }` prove: the yielded sub-slice's modeled
+        // length is `== n` (windows) / `in [1, n]` (chunks). See
+        // `build_slice_iter_yield_guard_map`.
+        if tp.has_iterator_next_call || has_adapter_premises {
+            let slice_iter_yield_guards = super::slice_iter_yield_guards_for(func);
+            if !slice_iter_yield_guards.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = slice_iter_yield_guards.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin `position` index facts so `if let Some(i) = v.iter().position(f) { v[i] }`
+        // proves: the index is below the length of the slice it searched. See
+        // `build_position_yield_guard_map`.
+        // `count` result facts, the same way: `v.len() - v.iter().filter(p).count()` needs
+        // the count below the length. See `build_count_bound_guard_map`.
+        // `str::find` / `str::rfind` payload facts, the same way: the match start is at
+        // most the string's length. See `build_str_find_guard_map`.
+        if tp.has_call {
+            let mut owned_guards = if tp.has_position_call {
+                build_position_yield_guard_map(func)
+            } else {
+                FxHashMap::default()
+            };
+            if tp.has_count_call {
+                let count_guards = build_count_bound_guard_map(func);
+                if !count_guards.is_empty() {
+                    if owned_guards.is_empty() {
+                        owned_guards = count_guards;
+                    } else {
+                        for (block_id, facts) in count_guards {
+                            owned_guards.entry(block_id).or_default().extend(facts);
+                        }
+                    }
+                }
+            }
+            let primitive_decimal_guards = super::primitive_decimal_len_guards_for(func);
+            let mut position_yield_guards: std::borrow::Cow<'_, FxHashMap<BlockId, Vec<Formula>>> =
+                if owned_guards.is_empty() {
+                    std::borrow::Cow::Borrowed(primitive_decimal_guards.as_ref())
+                } else {
+                    for (&block_id, facts) in primitive_decimal_guards.iter() {
+                        owned_guards.entry(block_id).or_default().extend(facts.iter().cloned());
+                    }
+                    std::borrow::Cow::Owned(owned_guards)
+                };
+            if tp.has_str_find_call {
+                let str_find_guards = build_str_find_guard_map(func);
+                if !str_find_guards.is_empty() {
+                    if position_yield_guards.is_empty() {
+                        position_yield_guards = std::borrow::Cow::Owned(str_find_guards);
+                    } else {
+                        let map = position_yield_guards.to_mut();
+                        for (block_id, facts) in str_find_guards {
+                            map.entry(block_id).or_default().extend(facts);
+                        }
+                    }
+                }
+            }
+            // Payload-interval facts on a `Some`/`Ok` payload of a summarized local call,
+            // directly or through `?`. See `build_payload_interval_guard_map`.
+            if tp.has_bare_dest_call {
+                let payload_guards = super::iterator_yield::build_payload_interval_guard_map(func);
+                if !payload_guards.is_empty() {
+                    if position_yield_guards.is_empty() {
+                        position_yield_guards = std::borrow::Cow::Owned(payload_guards);
+                    } else {
+                        let map = position_yield_guards.to_mut();
+                        for (block_id, facts) in payload_guards {
+                            map.entry(block_id).or_default().extend(facts);
+                        }
+                    }
+                }
+            }
+            if !position_yield_guards.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = position_yield_guards.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin push-guarded nested-container element-length facts so
+        // `let mut m: Vec<Vec<T>> = Vec::new(); for .. { if row.len()<=n {return}; m.push(row) }`
+        // proves the inner access `m[r][col]`: the element `m[r]`'s modeled length is
+        // `> n` (every pushed row was guarded), which with the range `col < n` discharges
+        // `col < m[r].len()`. See `build_push_guard_elem_len_map`.
+        if tp.has_std_scalar_index_call {
+            let push_guard_elem_len = build_push_guard_elem_len_map(func);
+            if !push_guard_elem_len.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = push_guard_elem_len.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin dominating length-guard facts so `let m = self.g.len();
+        // if self.p_lo.len() != m { return }; for j in 0..m { self.p_lo[j] }` proves the
+        // struct-FIELD scalar index: the guard pins `len(self.p_lo) == m` on its
+        // fall-through edge, but through a DISTINCT `&self.p_lo` temp than the read carries,
+        // so the read's `coll_len(_recv)` is left FREE. Emit `coll_len(_recv) >= m` — the
+        // SAME var the bound reads — which with the loop range `j < m` discharges
+        // `j < m <= coll_len(_recv)`. See `build_len_guard_field_map`.
+        if tp.has_std_scalar_index_call && tp.has_switch_int {
+            let len_guard_field = build_len_guard_field_map(func);
+            if !len_guard_field.is_empty() {
+                for (block_id, vc) in &mut block_vcs {
+                    if v2_is_unsupported_mir_vc(vc) {
+                        continue;
+                    }
+                    if let Some(facts) = len_guard_field.get(block_id)
+                        && !facts.is_empty()
+                    {
+                        ob_record_conjoin(vc, facts);
+                        let mut conjuncts = Vec::with_capacity(facts.len() + 1);
+                        conjuncts.extend_from_slice(facts);
+                        conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                        vc.formula = Formula::And(conjuncts);
+                    }
+                }
+            }
+        }
+
+        // Conjoin loop-invariant `Ord::min`/`max` result bounds onto EVERY VC. These
+        // are global invariants (single-assignment result, immutable args), so unlike
+        // the BFS semantic guard they survive a loop-header join and reach a body that
+        // uses the result only transitively — proving the bounded-copy idiom
+        // `let n = src.len().min(dst.len()); for i in 0..n { dst[i] = src[i]; }`.
+        // See `build_min_max_facts`. The fact is unconditionally true, so applying it
+        // everywhere is sound. Also conjoin the unsigned modulo bounds
+        // (`b != 0 ⟹ a%b < b`) — likewise global and unconditionally true — so a
+        // wrapping access `s[n % s.len()]` discharges (via the ay nonlinear-relaxation
+        // retry, which drops the `mod` term ay cannot handle).
+        // Each row takes the set less the element-read congruences over a read that neither
+        // the row, nor another fact, nor a conjunct it receives below (the preconditions, the
+        // path guards, the semantic guards: `value_facts::late_conjunct_names`) can name
+        // (`RowGlobalFacts::for_row`).
+        let global_facts = build_global_invariant_facts(func);
+        if !global_facts.is_empty() {
+            for (_, vc) in &mut block_vcs {
+                if v2_is_unsupported_mir_vc(vc) {
+                    continue;
+                }
+                let row_facts = global_facts.for_row(&vc.formula);
+                if row_facts.is_empty() {
+                    continue;
+                }
+                ob_record_conjoin(vc, &row_facts);
+                let mut conjuncts = row_facts;
+                conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                vc.formula = Formula::And(conjuncts);
+            }
         }
     }
+
 
     // Also conjoin the function's preconditions. Downstream tests
     // (safe_midpoint) encode invariants like `lo <= hi` in `preconditions`,
@@ -1647,20 +2499,85 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     // body left bare (the old `preconditions.is_empty()` gate) would never connect
     // to an establish-versioned def. The `killed` set is vestigial — the rename,
     // not a per-block drop, is what kills staleness now.
-    {
-        let may_reassigned = v2_may_reassigned_per_block(func);
-        let empty = FxHashSet::default();
-        for (block_id, vc) in &mut block_vcs {
+    assert_eq!(
+        row_points.len(),
+        block_vcs.len(),
+        "row use points desynchronised from the row list before the version rename"
+    );
+    if !block_vcs.is_empty() {
+        // (The per-block may-reassigned KILL set is not computed: the conjoin below
+        // takes it only for signature compatibility and ignores it — materialising it
+        // was a Θ(blocks × names) whole-CFG fixpoint.)
+        let filtered_preconditions: Vec<Formula> = if func.preconditions.is_empty() {
+            Vec::new()
+        } else {
+            super::producer_preconditions(func)
+                .into_iter()
+                .filter(|pre| {
+                    !contracts::formula_uses_unmodeled_machine_arithmetic_in_function(func, pre)
+                })
+                .collect()
+        };
+        // Trust (TINV step 10.3): the type-invariant use-site facts of this body, under
+        // the use set INSTALLED in the context (with the record every conjoin writes).
+        // `None` — the default, and always in a real compile until step 10.5 installs
+        // a set — conjoins nothing and leaves every row byte-identical.
+        let tinv_use = super::type_invariant_facts::tinv_use_facts(func);
+        let tinv_prepared: std::cell::OnceCell<
+            super::type_invariant_facts::PreparedTinvUseFacts,
+        > = std::cell::OnceCell::new();
+        // The rename runs at each row's own USE POINT, the SAME point the
+        // path-def conjoin above used (`v2_live_path_defs_at_point`): a
+        // per-statement row whose read precedes a same-block write must keep
+        // that read on the PRE-write value its entry facts describe. Nothing
+        // between the two passes pushes, removes or reorders a row (the
+        // collapse-invariant assert below checks it), and this assert keeps the
+        // `zip` from failing open.
+        for ((block_id, vc), point) in block_vcs.iter_mut().zip(row_points.iter().copied()) {
+            // BUDGET POLL, per ROW. `conjoin_preconditions_versioned_at_point_recorded`
+            // rewrites the row's ENTIRE formula through `version_rename_at` and
+            // then visits the renamed formula again for `entry_sentinel_ties`,
+            // so the cost lives inside ONE row's formula and only a per-row poll
+            // can interrupt it. Breaking leaves the remaining rows with no
+            // precondition facts and un-renamed.
+            //
+            // Dropping the preconditions drops hypotheses — PROVE -> FAIL only.
+            // The un-renamed BODY is the half that needs the rest of the
+            // argument, and it is why a tail row must never be read as a
+            // finished one: the S2c exemption conjoins path and semantic guards
+            // BARE precisely because the body is terminal-versioned here, so a
+            // body left bare would re-unify a guard's ENTRY-valued read with a
+            // reassigned body read instead of staying name-disjoint from it.
+            // Nothing consumes such a row. `budget_exhausted` latches, so the
+            // poll in the type-range loop below sets `truncated` and the
+            // overflow-check origin inventory has NO table, while the
+            // caller's post-generation checkpoint discards the partial
+            // inventory before anything is dispatched. A tail row cannot reach
+            // a solver, a cache with authority, or the elision seam.
+            if trust_types::verify_budget::budget_exhausted() {
+                // Carries the flag for the same reason as the path-def loop
+                // above: a wall-clock trip does not latch, so no later loop can
+                // be trusted to set it.
+                truncated = true;
+                break;
+            }
             if v2_is_unsupported_mir_vc(vc) {
                 continue;
             }
-            let killed = may_reassigned.get(block_id).unwrap_or(&empty);
-            let (new_formula, conjoined) = conjoin_preconditions_versioned_recorded(
+            let sv = sv_lazy.get_or_init(|| super::stmt_versions_for(func));
+            let record_ob = vc.obligation.is_some();
+            // INTRINSIC-RESIDUAL-1: the producer's preconditions, without the
+            // generator's 128-bit parameter facts (`producer_preconditions` says why).
+            let old_formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+            let (new_formula, conjoined) = conjoin_preconditions_versioned_at_point_inner(
                 func,
+                sv,
                 *block_id,
-                &func.preconditions,
-                killed,
-                vc.formula.clone(),
+                point,
+                &filtered_preconditions,
+                old_formula,
+                record_ob,
+                true,
             );
             vc.formula = new_formula;
             // Mirror the whole-formula version rename this step applies onto the
@@ -1668,15 +2585,45 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
             // copies in `formula`), THEN record the filtered preconditions as the
             // outer ConjoinFactsLast wrapper (they are conjoined bare, after the
             // rename). No-op when the VC carries no obligation.
-            if vc.obligation.is_some() {
-                let terminal = func
-                    .body
-                    .blocks
-                    .get(block_id.0)
-                    .filter(|b| b.id == *block_id)
-                    .map_or(0, |b| b.stmts.len());
-                ob_record_rename_at(vc, &sv, func, *block_id, terminal);
-                ob_record_conjoin(vc, &conjoined);
+            if record_ob {
+                let rename_point = row_rename_point(func, *block_id, point);
+                ob_record_rename_at(vc, sv, func, *block_id, rename_point);
+                ob_record_conjoin_owned(vc, conjoined);
+            }
+            // Trust (TINV step 10.3): the type-invariant use-site facts, as a SECOND
+            // recorded `ConjoinFactsLast` at the SAME point, after the rename (entry
+            // facts bare, post-call facts sealed at their call target; nothing renamed
+            // again). They then sit inside the later path-guard and semantic-guard
+            // wrappers exactly as `requires` do. Never in a `TypeInvariant` row (the
+            // mint's own rows, which must not assume what they prove) and never in a
+            // row with no obligation record (TINV-25: the record is what the consumer
+            // replays). Every row that receives a fact is RECORDED with its tags in the
+            // generation's recording scope: the second disclosure channel.
+            if let Some(tinv_facts) = tinv_use.as_ref()
+                && vc.obligation.is_some()
+                && !matches!(vc.kind, VcKind::TypeInvariant { .. })
+            {
+                let prepared = tinv_prepared.get_or_init(|| tinv_facts.prepare(func, sv));
+                let old_formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+                let (new_formula, facts, tags) =
+                    prepared.conjoin_at_point_recorded(func, sv, *block_id, point, old_formula);
+                vc.formula = new_formula;
+                if !facts.is_empty() {
+                    ob_record_conjoin_owned(vc, facts);
+                    // The scope admitted these facts for this body, so it records.
+                    let recorded = crate::type_invariant::record_assumed_row(
+                        crate::type_invariant::TinvAssumedRow {
+                            def_path: func.def_path.clone(),
+                            kind: vc.kind.clone(),
+                            location: vc.location.clone(),
+                            tags,
+                        },
+                    );
+                    assert!(
+                        recorded,
+                        "a TINV use-site fact was conjoined outside its recording scope"
+                    );
+                }
             }
         }
     }
@@ -1702,6 +2649,32 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     for ((block_id, vc), (flag_block, is_content_free)) in
         block_vcs.iter_mut().zip(content_free.iter().copied())
     {
+        // BUDGET POLL, per ROW. `v2_formula_with_path_guards_recorded` CLONES
+        // the row's whole accumulated formula once per guard path and flattens
+        // it into each disjunct (see `ReachSummary::Guards`, "What it costs"),
+        // so a single high-in-degree row is the entire overrun and no poll
+        // outside this loop reaches it. Breaking leaves the remaining rows
+        // un-spliced, i.e. WITHOUT their path guards.
+        //
+        // Fail-closed, and that holds for the CONTENT-FREE rows this step is
+        // here to decide. Content-free is `v2_formula_is_tautology`, so such a
+        // row's violation is `true`: left unguarded it is trivially SAT and
+        // REFUTES. Dropping conjuncts from an `And` can only make a formula
+        // easier to satisfy, so no abandoned row can turn vacuously discharged
+        // — the degradation over-reports (PROVE -> FAIL), never under-reports.
+        // It does not ship either: the trip latches, the type-range loop below
+        // sets `truncated` (so the origin inventory has no table) and the
+        // caller's post-generation checkpoint discards the partial inventory.
+        //
+        // The poll precedes the positional identity assert deliberately. On the
+        // exhausted path no remaining row's flag is consulted at all, so there
+        // is no flag-to-row pairing left for that assert to protect; on the
+        // non-exhausted path every row still takes it first, unchanged.
+        if trust_types::verify_budget::budget_exhausted() {
+            // Carries the flag for the same reason as the two loops above.
+            truncated = true;
+            break;
+        }
         assert_eq!(
             *block_id, flag_block,
             "collapse-invariant classification desynchronised from the row list: the \
@@ -1728,17 +2701,30 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
                 // ordinary path list takes — one single-guard path per in-edge,
                 // so `Or([And([g_e, body]) ..])` = `(⋁ g_e) ∧ body`.
                 Some(ReachSummary::Guards(edges)) => {
+                    let sv = sv_lazy.get_or_init(|| super::stmt_versions_for(func));
                     let restored: Vec<Vec<(BlockId, GuardCondition)>> =
                         edges.iter().map(|edge| vec![edge.clone()]).collect();
-                    let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
-                        func,
-                        &sv,
-                        &restored,
-                        vc.formula.clone(),
-                    );
-                    vc.formula = new_formula;
-                    if let Some(ob) = vc.obligation.as_mut() {
-                        ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+                    let old_formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+                    if vc.obligation.is_some() {
+                        let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
+                            func,
+                            sv,
+                            *block_id,
+                            &restored,
+                            old_formula,
+                        );
+                        vc.formula = new_formula;
+                        if let Some(ob) = vc.obligation.as_mut() {
+                            ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+                        }
+                    } else {
+                        vc.formula = v2_formula_with_path_guards(
+                            func,
+                            sv,
+                            *block_id,
+                            &restored,
+                            old_formula,
+                        );
                     }
                     continue;
                 }
@@ -1770,30 +2756,88 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // every row of a block that kept its path list — takes the ordinary
         // splice below, unchanged by the invariant.
         if let Some(block_guard_paths) = guard_paths_map.get(block_id) {
-            let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
-                func,
-                &sv,
-                block_guard_paths,
-                vc.formula.clone(),
-            );
-            vc.formula = new_formula;
-            // The dominating path-guard map is the sole non-conjoining wrapper.
-            if let Some(ob) = vc.obligation.as_mut() {
-                ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+            let sv = sv_lazy.get_or_init(|| super::stmt_versions_for(func));
+            let old_formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+            if vc.obligation.is_some() {
+                let (new_formula, path_terms) = v2_formula_with_path_guards_recorded(
+                    func,
+                    sv,
+                    *block_id,
+                    block_guard_paths,
+                    old_formula,
+                );
+                vc.formula = new_formula;
+                // Trust (2026-10-16, S1): a DEGRADED block's single empty path is not
+                // "reachable with no guard" but "the guards were lost" — record that, so
+                // the generic refutation scope can withhold a counterexample that the
+                // missing dominating guards would have excluded (the refutation-polarity
+                // caveat on the path-guard helper below: "a collapsed empty guard path is
+                // indistinguishable from a genuinely unconditional path").
+                // `Collapsed` renders exactly as `Raw`, so the formula is unchanged.
+                //
+                // NOT for a content-free row whose reachability summary is
+                // `Unconditional`: there the empty path is the in-edge disjunction
+                // itself (`true`), positive information that the block is reachable —
+                // the arm above that keeps a reachable `unreachable!()` a refutation.
+                // Marking it collapsed would hold that genuine refutation.
+                let path_terms = v2_mark_lost_guards(
+                    path_terms,
+                    degraded,
+                    is_content_free,
+                    path_guards.reachability.get(block_id),
+                );
+                // The dominating path-guard map is the sole non-conjoining wrapper.
+                if let Some(ob) = vc.obligation.as_mut() {
+                    ob.wrappers.push(ObligationWrapper::PathGuardOr { paths: path_terms });
+                }
+            } else {
+                vc.formula = v2_formula_with_path_guards(
+                    func,
+                    sv,
+                    *block_id,
+                    block_guard_paths,
+                    old_formula,
+                );
             }
         }
     }
-    for (block_id, vc) in &mut block_vcs {
-        if v2_is_unsupported_mir_vc(vc) {
-            continue;
-        }
-        if let Some(sem_guards) = semantic_guards.get(block_id)
-            && !sem_guards.is_empty()
-        {
-            ob_record_conjoin(vc, sem_guards);
-            let mut conjuncts = sem_guards.clone();
-            conjuncts.push(vc.formula.clone());
-            vc.formula = Formula::And(conjuncts);
+    assert_eq!(
+        row_points.len(),
+        block_vcs.len(),
+        "row-point pairing desynchronised before the semantic-guard conjoin"
+    );
+    if block_vcs.iter().any(|(_, vc)| !v2_is_unsupported_mir_vc(vc)) {
+        let semantic_guards = super::semantic_guard_map_for(func, summaries);
+        if !semantic_guards.is_empty() {
+            let sv = sv_lazy.get_or_init(|| super::stmt_versions_for(func));
+            for ((block_id, vc), point) in block_vcs.iter_mut().zip(row_points.iter().copied()) {
+                if v2_is_unsupported_mir_vc(vc) {
+                    continue;
+                }
+                if let Some(sem_guards) = semantic_guards.get(block_id)
+                    && !sem_guards.is_empty()
+                {
+                    // Trust (2026-09-30, vac Phase 1.1 follow-up): a semantic guard is stamped
+                    // at its OWN point and conjoined after the row's rename, so an entry read
+                    // inside it is sealed `n#e` and the precondition conjoin — which ties only
+                    // the `#e` names of the renamed body — never saw it. Tie those too, under
+                    // the SAME consumer clause (`entry_sentinel_ties_for_exempt_facts`).
+                    let ties = entry_sentinel_ties_for_exempt_facts(
+                        func,
+                        sv,
+                        *block_id,
+                        point,
+                        sem_guards,
+                        &vc.formula,
+                    );
+                    let mut conjuncts = Vec::with_capacity(sem_guards.len() + ties.len() + 1);
+                    conjuncts.extend_from_slice(sem_guards);
+                    conjuncts.extend(ties);
+                    ob_record_conjoin(vc, &conjuncts);
+                    conjuncts.push(std::mem::replace(&mut vc.formula, Formula::Bool(true)));
+                    vc.formula = Formula::And(conjuncts);
+                }
+            }
         }
     }
 
@@ -1809,7 +2853,32 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
     // lane; the UNSAT-premise hazard (see the countdown B1 note) is guarded at
     // its emitter (negative constant bounds are never emitted), and an
     // UNguarded OOB index still refutes with an in-range counterexample.
+    let has_back_edges: std::cell::OnceCell<bool> = std::cell::OnceCell::new();
     for (_, vc) in &mut block_vcs {
+        // BUDGET POLL, per ROW. The battery below rebuilds this row's formula up
+        // to five times over (`conjoin_length_nonneg_bounds`,
+        // `conjoin_arg_type_ranges`, `conjoin_local_type_ranges_excluding`,
+        // `conjoin_datatype_field_ranges_excluding`, `conjoin_slice_len_bounds`),
+        // each a full rewrite of an already fact-laden formula plus a `clone` of
+        // it for the obligation mirror, so ONE row can be the whole overrun.
+        //
+        // Degrades exactly as the generation loop above does — set `truncated`,
+        // stop — and the flag is the point. Dropping the ranges only drops
+        // DROP-ONLY true facts (PROVE -> FAIL), but `truncated` is what tells
+        // the overflow-check origin inventory that this walk was cut short, so
+        // it has NO join table and every proven-overflow check is KEPT;
+        // `Unique` is only sound relative to a walk that ran to the end.
+        //
+        // The three earlier passes (path defs, preconditions, path guards)
+        // degrade by `break` alone and RELY ON REACHING THIS POLL to latch the
+        // flag: `budget_exhausted` latches, and a trip in any of them implies
+        // `block_vcs` is non-empty, so this loop runs at least one iteration and
+        // sets it. Do not move this poll off the loop head, and do not reorder
+        // this loop above them — either would silently un-fail-close all three.
+        if trust_types::verify_budget::budget_exhausted() {
+            truncated = true;
+            break;
+        }
         // Trust (scope refinement after the falsification-gate sweep): BOUNDS
         // VCs take the range conjoins ONLY when the function has a BACK EDGE —
         // exactly the loop-carried-SSA class the extension exists for: a
@@ -1822,23 +2891,22 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // fail-closed, but a real falsification-gate regression; the
         // shape-sensitive ay proof-emission bug is the root cause to fix
         // separately, ay-side).
-        let bounds_kind = matches!(vc.kind, VcKind::SliceBoundsCheck | VcKind::IndexOutOfBounds);
+        // Trust (2026-09-29): the battery itself — which facts, in which order, with
+        // which exclusion — is `generate::type_ranges::conjoin_type_range_battery`,
+        // stated ONCE and shared with the `unix_hardened` twin of the same assert
+        // (`hardened_twin_type_ranges`), which used to carry only the parameter
+        // ranges and was refuted where this lane proved (`args__slice_len = 2^64`
+        // on `while i < args.len() { i += 1 }`). What stays HERE is this lane's
+        // own admission rule, byte-identical to before:
+        //
         // `UncheckedArithmeticOverflow` is the SAME out-of-range obligation as
         // `ArithmeticOverflow` (`v2_overflow_call_body` builds both from the same
         // builder) — only the runtime-guard answer differs. It must therefore
         // keep the identical DROP-ONLY type-range strengthening, or splitting the
         // kind would silently make every `unchecked_{add,sub,mul}` LESS
         // dischargeable than the `a + b` it models: a widened decline, not a fix.
-        //
-        // It is folded into `range_kind` for the same reason: the two kinds must
-        // enter the range battery below TOGETHER and be held out of the
-        // length-nonneg conjoin below TOGETHER, or "identical treatment" would
-        // hold on one side of this function and not the other.
-        let arith_kind = matches!(
-            vc.kind,
-            VcKind::ArithmeticOverflow { .. } | VcKind::UncheckedArithmeticOverflow { .. }
-        );
-        let range_kind = arith_kind || bounds_kind;
+        // `RangeBatteryClass::of_kind` folds the two into one class for that reason.
+        let class = RangeBatteryClass::of_kind(&vc.kind);
         // Trust (NEGATIVE-LENGTH class): the kinds the range battery below does
         // NOT reach — `Unreachable`, `Assertion`, the panic-path rows — got NO
         // length bound at all, so the merged `Unreachable` sink of
@@ -1848,9 +2916,9 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // element type (`0 <= len`; see `conjoin_length_nonneg_bounds` for why
         // the `isize::MAX` half stays behind its non-ZST gate in
         // `conjoin_slice_len_bounds`). Applied ONLY to the kinds the battery
-        // skips, so every `ArithmeticOverflow`/bounds formula stays byte-identical
-        // to what it was — this cannot perturb the lane the sweep tuned. The
-        // `!range_kind` gate is what makes that true and is asserted directly:
+        // skips (class `Other`), so every `ArithmeticOverflow`/bounds formula stays
+        // byte-identical to what it was — this cannot perturb the lane the sweep
+        // tuned. The class gate is what makes that true and is asserted directly:
         // `excluded_kind_ub_rows_still_refute`
         // (`tests/slice_length_nonneg_real_mir.rs`) requires the two loop-free
         // BOUNDS fixtures to carry no `0 <= *__slice_len` conjunct at all, and that
@@ -1871,58 +2939,40 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         // enforcement step earlier in this function — re-conditioned on its in-edge
         // disjunction, left on the ordinary splice when the block is unconditionally
         // reachable, or turned into an `UnsupportedMir` decline, which the
-        // `!v2_is_unsupported_mir_vc` gate below then skips. Adding `0 <= len` to a
+        // `v2_is_unsupported_mir_vc` gate below then skips. Adding `0 <= len` to a
         // formula that no longer states where it applies would not have helped;
         // supplying the missing reachability condition is a different repair.
-        if !range_kind && !v2_is_unsupported_mir_vc(vc) {
-            let before = vc.formula.clone();
-            vc.formula = conjoin_length_nonneg_bounds(func, vc.formula.clone());
-            let after = vc.formula.clone();
-            ob_record_conjoin_wrap(vc, &before, &after);
-        }
-        if bounds_kind && count_back_edges(func) == 0 {
+        // A TINV row (class `TypeInvariant`) takes the SAME admission rule as an
+        // `Other` row here: skipped only when it is an `UnsupportedMir` decline.
+        if matches!(class, RangeBatteryClass::Other | RangeBatteryClass::TypeInvariant)
+            && v2_is_unsupported_mir_vc(vc)
+        {
             continue;
         }
-        if range_kind {
-            // Trust (bounds ARM): each of these four conjoins is a pure
-            // `And([facts.., formula])` push (facts LAST) or identity when it has no
-            // facts, so mirror each onto the recorded obligation as a `ConjoinFactsLast`
-            // read back from the before/after pair (`ob_record_conjoin_wrap`). No-op
-            // when the VC carries no obligation; the UNSIGNED var*var mul
-            // `ArithmeticOverflow` arm carries a record (the UMUL RECORD), so these
-            // mirrors are load-bearing for it as well as for the bounds VCs.
-            let before = vc.formula.clone();
-            vc.formula = conjoin_arg_type_ranges(func, vc.formula.clone());
-            let after = vc.formula.clone();
-            ob_record_conjoin_wrap(vc, &before, &after);
-            // Trust (unsigned-sub vacuous-UNSAT false-accept fix): on an
-            // ArithmeticOverflow VC, EXCLUDE the checked-op result copy closure's
-            // type-ranges — `0 <= X` for an X tied to `a - b` conjoined onto the
-            // subtraction's own underflow VC assumes the very property it checks
-            // (see `checked_arith_result_value_vars`). Bounds VCs keep all ranges
-            // (an index var's range is not the checked op's own result claim).
-            let excl = if arith_kind { checked_arith_result_value_vars(func) } else {
-                FxHashSet::default()
-            };
-            // verifier-precision: bound NON-parameter integer locals/temps too (the
-            // sibling of arg ranges) — a `u32`/`i8` temp lowered to unbounded
-            // `Sort::Int` otherwise lets the solver false-refute an overflow with an
-            // out-of-type-range value. SOUNDNESS: DROP-ONLY (true range fact).
-            let before = vc.formula.clone();
-            vc.formula = conjoin_local_type_ranges_excluding(func, vc.formula.clone(), &excl);
-            let after = vc.formula.clone();
-            ob_record_conjoin_wrap(vc, &before, &after);
-            // Lever A: bound fixed-width-integer datatype FIELDS too (the modeled
-            // `Expr`/`Level`/`Name` cluster), same sound Rust-type invariant. DROP-ONLY.
-            let before = vc.formula.clone();
-            vc.formula = conjoin_datatype_field_ranges_excluding(func, vc.formula.clone(), &excl);
-            let after = vc.formula.clone();
-            ob_record_conjoin_wrap(vc, &before, &after);
-            let before = vc.formula.clone();
-            vc.formula = conjoin_slice_len_bounds(func, vc.formula.clone());
-            let after = vc.formula.clone();
-            ob_record_conjoin_wrap(vc, &before, &after);
+        if class == RangeBatteryClass::Bounds
+            && !*has_back_edges.get_or_init(|| {
+                super::terminator_presence_for(func).has_back_edge && count_back_edges(func) > 0
+            })
+        {
+            continue;
         }
+        // Trust (bounds ARM): each battery step is a pure `And([facts.., formula])`
+        // push (facts LAST) or identity when it has no facts, so mirror each onto the
+        // recorded obligation as a `ConjoinFactsLast` read back from the before/after
+        // pair (`ob_record_conjoin_wrap`), in step order. No-op when the VC carries no
+        // obligation; the UNSIGNED var*var mul `ArithmeticOverflow` arm carries a
+        // record (the UMUL RECORD), so these mirrors are load-bearing for it as well
+        // as for the bounds VCs.
+        let formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+        let mut ob = vc.obligation.as_mut();
+        vc.formula = conjoin_type_range_battery(func, formula, class, &mut |before, after| {
+            if let Some(ob) = ob.as_deref_mut()
+                && let Some(facts) = extract_conjoined_facts(before, after)
+                && !facts.is_empty()
+            {
+                ob.wrappers.push(ObligationWrapper::ConjoinFactsLast { facts: facts.to_vec() });
+            }
+        });
     }
 
     // FINAL pass: collapse SSA locals' version tokens to the bare name so
@@ -1933,20 +2983,294 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
         if v2_is_unsupported_mir_vc(vc) {
             continue;
         }
-        vc.formula = normalize_ssa_version_tokens(func, &vc.formula);
+        let formula = std::mem::replace(&mut vc.formula, Formula::Bool(true));
+        vc.formula = normalize_ssa_version_tokens_owned(func, formula);
         // Mirror the same token collapse onto the recorded body/subject/wrappers so
         // reconstruction stays byte-identical to the normalized `formula`.
         ob_record_normalize(vc, func);
     }
+    }
 
-    (block_vcs, truncated)
+    // THE FRONTIER BUDGET MUST SPEAK. `v2_analyze_path_guards` bounds its own
+    // work by abandoning the walk (COLLAPSE MODE 3) and handing back the
+    // all-`true` map. That is fail-closed — it strictly REMOVES proof hypotheses
+    // — but on its own it is INVISIBLE: every row of the function is spliced
+    // with an empty path list and emitted looking exactly like a row that had no
+    // path condition to begin with. MEASURED 2026-09-09 (seal-line 28aee49dd8),
+    // before this row existed: `ay-arrays::final_check` tripped this budget and
+    // emitted 20 VCs with a byte-identical `kind`/`formula`/`location` digest to
+    // the run with the cap switched off.
+    //
+    // So the cap is paid for with one explicit Unknown row, the shape this
+    // pipeline already uses for a bounded-out function (`entry.rs`'s and
+    // `discharge.rs`'s `TrustVcGenWorkBudgetExceeded`). Mode 3 ONLY: mode 2
+    // (`BudgetTripped`) degrades identically and its silence predates this row;
+    // reporting it too would be a verdict change with no measurement behind it.
+    //
+    // SOUNDNESS: ADD-ONLY, and the added row is preclassified Unknown
+    // (`UnsupportedMir` is never dispatched to a solver) carrying a SAT
+    // `Bool(true)` violation formula, so a direct solver caller cannot read it as
+    // a proof either. It can only cost this function a verdict, never grant one.
+    // Appended after every pass that zips `row_points` or reads
+    // `overflow_assert_rows`, so no parallel index moves.
+    if path_guards.collapse == PathGuardCollapse::FrontierBudgetTripped {
+        block_vcs.push((BlockId(0), v2_frontier_budget_vc(func)));
+    }
+
+    // Trust (DIAGNOSTIC ONLY, 2026-09-19): `TRUST_SLICE_VC_TRACE=1` prints the
+    // finished formula of every slice-bounds row. Added because the black-box
+    // characterisation of the loop-assigned-slice class stops here: measured, a
+    // guard on a loop-assigned INTEGER survives while a guard on the LENGTH of a
+    // loop-assigned SLICE does not, and routing the length through an integer
+    // (`let n = w.len()`) does not help either. What is left to see is which
+    // length TERM the guard constrains and which one the `assert` reads — and
+    // three attributions in this class died on reading one more file, so it is
+    // printed rather than guessed. Verdict-neutral: no branch depends on it.
+    static SLICE_VC_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SLICE_VC_TRACE.get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_SLICE_VC_TRACE")) {
+        for (bid, vc) in &block_vcs {
+            if matches!(vc.kind, VcKind::SliceBoundsCheck | VcKind::IndexOutOfBounds) {
+                eprintln!(
+                    "[slicevc] block={:?} kind={:?}\n[slicevc]   {:?}",
+                    bid, vc.kind, vc.formula
+                );
+            }
+        }
+    }
+    // A trip in a walk this function calls but does not own — the path-definition
+    // fixpoint, the block-definition extraction — reaches none of the `truncated = true`
+    // sites above: that walk hands back fewer facts and generation carries on with rows
+    // that look complete. The budget is sticky — the step counter saturates at zero and a
+    // passed deadline stays passed — so one non-charging read here reports every trip this
+    // walk made, wherever it happened — including a trip inside the extraction the
+    // statement-version oracle's write index is built from: the SSA resolution has no
+    // truncated state of its own, but gen-sets extracted after a trip may be short.
+    truncated |= trust_types::verify_budget::exhausted_readonly();
+    SafetyWalk { rows: block_vcs, overflow_assert_rows, truncated, row_capped }
+}
+
+/// The report [`PathGuardCollapse::FrontierBudgetTripped`] owes its reader.
+///
+/// One row per function, naming the bound (the walk's frontier), the two
+/// constants that set it, and the consequence (every block of this function lost
+/// its per-path guards). The kind tag is a public constant so the compiler's
+/// reporting seams and the tests that pin them match on the TAG, not on this
+/// prose. The kind and the detail are byte-identical to the published seal's
+/// (trust 321aaeda75), so a gate comparing the two finds the same row.
+fn v2_frontier_budget_vc(func: &VerifiableFunction) -> VerificationCondition {
+    unsupported_mir_vc(
+        func,
+        crate::VCGEN_PATH_GUARD_FRONTIER_BUDGET_KIND.to_string(),
+        format!(
+            "function `{}` ({} blocks): the path-guard walk hit its FRONTIER budget \
+             ({} pops / {} live queue entries) and every block of this function lost its \
+             per-path guard list. The remaining obligations were generated WITHOUT path \
+             conditions, which can only weaken them; this row records that the pre-pass \
+             was bounded by memory rather than finished, so the absence of a refutation \
+             here is not a proof",
+            func.name,
+            func.body.blocks.len(),
+            MAX_PATH_WALK_STEPS,
+            MAX_PATH_WALK_QUEUE,
+        ),
+        func.span.clone(),
+    )
 }
 
 /// The per-block path cap of [`v2_build_path_guard_map`]. A block that is
 /// reached by more routes than this keeps ONE unguarded path instead
 /// (`COLLAPSE MODE 1`); [`v2_reachability_for_collapsed`] is what stops that
 /// from becoming an unconditional accusation.
+
+// ---------------------------------------------------------------------------
+// Structurally-shared paths
+// ---------------------------------------------------------------------------
+
+/// One node of an IMMUTABLE path prefix, shared by every extension of it.
+///
+/// The path walk below explores root-to-block paths, and it used to carry each
+/// one as its own `Vec`, cloned in full for every successor pushed. That makes
+/// the frontier cost O(paths x depth) in BYTES: a queue entry for a path of
+/// depth d owns d guards, and a block with k successors immediately owns k more
+/// copies of the same prefix. MEASURED on first-party/ty's tla-cli, whose
+/// `<ty::cli_schema::Cli as clap_builder::derive::FromArgMatches>
+/// ::from_arg_matches_mut` — the body `#[derive(Parser)]` emits for a large CLI —
+/// drove the compiler to a 137.8 GB and then a 140.6 GB peak footprint on a
+/// 128 GB box, with `heap -s` counting 86 million live malloc nodes.
+///
+/// A cons list fixes it at the root: extending a path ALLOCATES ONE NODE and
+/// shares the entire prefix, so the frontier costs O(nodes pushed) instead of
+/// O(paths x depth), and pushing to a second successor is an `Rc` refcount bump
+/// rather than a copy. The enumeration is UNCHANGED — same paths, same order,
+/// same output type — so this costs no precision anywhere downstream. It is the
+/// representation that was wrong, not the analysis.
+struct PathNode<T> {
+    item: T,
+    tail: Option<std::rc::Rc<PathNode<T>>>,
+    /// Cached so length is O(1) rather than a walk; the list is immutable, so
+    /// it cannot go stale.
+    len: usize,
+}
+
+/// ITERATIVE teardown of the `tail` chain.
+///
+/// The derived drop glue for a cons list is RECURSIVE: dropping the last handle
+/// on a node drops its `tail`, which drops ITS `tail`, one stack frame per node.
+/// The chain is as long as the acyclic path the walk is on, bounded by the BLOCK
+/// COUNT and by nothing else. Neither of the walk's bounds limits DEPTH: the
+/// local `n*n` step `cap` in [`v2_analyze_path_guards`] bounds DEQUEUES, and
+/// [`MAX_TOTAL_PATH_GUARD_ENTRIES`] bounds retained guard ENTRIES — and the
+/// visited-block chain (`path_blocks`), which grows by one node per block on
+/// every path including unguarded straight-line edges, is never charged to it at
+/// all. So a straight-line body long enough overflows the stack whatever those
+/// bounds say. That is an uncatchable SIGSEGV of the whole compiler, strictly
+/// worse than the budget exit this walk takes.
+///
+/// MEASURED 2026-09-09 on an exact structural replica (`Option<Rc<Node>>` chain,
+/// no manual `Drop`, 8 MiB main-thread stack): a release build dropped depth
+/// 250_000 fine and ABORTED at 300_000 with `fatal runtime error: stack
+/// overflow`; a debug build aborted between 40_000 and 50_000.
+///
+/// The loop unlinks one node at a time and only ever holds ONE owned node, so
+/// teardown is O(depth) time and O(1) stack. `Rc::try_unwrap` returning `Err`
+/// means another path still shares this suffix — whichever handle is last runs
+/// this same loop.
+impl<T> Drop for PathNode<T> {
+    fn drop(&mut self) {
+        let mut cursor = self.tail.take();
+        while let Some(node) = cursor {
+            match std::rc::Rc::try_unwrap(node) {
+                Ok(mut owned) => cursor = owned.tail.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// A shared path prefix. `None` is the empty path.
+type SharedPath<T> = Option<std::rc::Rc<PathNode<T>>>;
+
+/// Extend `tail` by `item`, sharing all of `tail`. One allocation.
+fn path_cons<T>(tail: &SharedPath<T>, item: T) -> SharedPath<T> {
+    let len = tail.as_ref().map_or(0, |node| node.len) + 1;
+    Some(std::rc::Rc::new(PathNode { item, tail: tail.clone(), len }))
+}
+
+fn path_len<T>(path: &SharedPath<T>) -> usize {
+    path.as_ref().map_or(0, |node| node.len)
+}
+
+/// Does `path` already contain `needle`? The walk uses this to keep paths
+/// SIMPLE (no repeated block), exactly as the old `Vec::contains` did.
+fn path_contains<T: PartialEq>(path: &SharedPath<T>, needle: &T) -> bool {
+    let mut cursor = path.as_deref();
+    while let Some(node) = cursor {
+        if node.item == *needle {
+            return true;
+        }
+        cursor = node.tail.as_deref();
+    }
+    false
+}
+
+/// Materialize root-first, which is the order the old `Vec` carried (it pushed
+/// as it descended). Called ONLY when a path is recorded into the result map,
+/// so the O(depth) copy happens once per STORED path instead of once per queue
+/// push.
+fn path_to_vec<T: Clone>(path: &SharedPath<T>) -> Vec<T> {
+    let mut out = Vec::with_capacity(path_len(path));
+    let mut cursor = path.as_deref();
+    while let Some(node) = cursor {
+        out.push(node.item.clone());
+        cursor = node.tail.as_deref();
+    }
+    out.reverse();
+    out
+}
+
 const MAX_PATHS_PER_BLOCK: usize = 64;
+
+/// Total retained path-guard entries — across the result map AND the pending
+/// queue — before the walk takes its global collapse.
+///
+/// `MAX_PATHS_PER_BLOCK` bounds how many paths ONE BLOCK keeps and the step cap
+/// bounds how many dequeues happen; NEITHER bounds BYTES. Every
+/// `queue.push_back` clones the whole path (`next_guards`, `path_blocks`), so a
+/// wide CFG can hold O(dequeue-cap x depth) entries in the queue before the step
+/// cap is ever reached. MEASURED 2026-09-10 on `first-party/ty`'s tla-cli
+/// (seal trust-3206ff37): one `trustc` reached a PEAK PHYSICAL FOOTPRINT of
+/// 137.8 GB on a 128 GB box — past physical RAM, so the machine thrashed — with
+/// `vmmap` naming this walk and `sample` catching it in
+/// `v2_build_path_guard_map` / `v2_analyze_path_guards`. The ambient budget
+/// bounds TIME and STEPS; this is the byte bound it never had.
+///
+/// FOUR MILLION WAS FAR TOO HIGH, and the second measurement is why this number
+/// is now small. With that cap the same tla-cli run peaked at 140.6 GB — worse
+/// than the 137.8 GB it was meant to fix — and `heap` counted 86 MILLION live
+/// malloc nodes. An entry is a `(BlockId, GuardCondition)` whose guard owns a
+/// formula tree, so a cap counting ENTRIES buys roughly an order of magnitude
+/// more NODES, and 4e6 entries is tens of gigabytes. The bound has to be set
+/// against the memory it is defending, not against what looks like a large CFG.
+///
+/// The function that provoked it is worth naming, because it is not a hand
+/// written body at all: `<ty::cli_schema::Cli as clap_builder::derive::
+/// FromArgMatches>::from_arg_matches_mut`. `#[derive(Parser)]` over a CLI with
+/// ty's number of subcommands and options emits ONE function whose match arms
+/// give it a CFG no human body approaches, and every path through it is
+/// enumerated here.
+///
+/// 250 000 entries still admits any hand-written function comfortably (a
+/// 500-block body at the full 64 paths per block sits an order below it) while
+/// capping this walk's retention in the low hundreds of megabytes. Past it the
+/// walk takes the same sound collapse the step budget takes.
+const MAX_TOTAL_PATH_GUARD_ENTRIES: usize = 250_000;
+
+/// Safety-VC rows one function may generate before the walk truncates.
+///
+/// The companion to [`MAX_TOTAL_PATH_GUARD_ENTRIES`], defending the same
+/// resource from the other side: that one bounds the guard ENUMERATION, this
+/// one bounds the ROWS the enumeration decorates. Both had only time bounds,
+/// and time is the wrong unit for memory — rows are cheap to produce and
+/// expensive to keep, since each is rewritten up to five times downstream.
+///
+/// 50 000 rows is far more than any hand-written function emits (one row per
+/// panic-capable operation) and holds this phase's retention to a few hundred
+/// megabytes even at the widest.
+pub(super) const MAX_VC_ROWS_PER_FUNCTION: usize = 50_000;
+
+/// [`MAX_VC_ROWS_PER_FUNCTION`], or a test's own cap ([`TestRowCap`]): no test can
+/// afford a body that reaches fifty thousand rows.
+fn max_vc_rows_per_function() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_ROW_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_VC_ROWS_PER_FUNCTION
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ROW_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A row cap for this test thread until the guard drops.
+#[cfg(test)]
+pub(super) struct TestRowCap;
+
+#[cfg(test)]
+impl TestRowCap {
+    pub(super) fn install(cap: usize) -> Self {
+        TEST_ROW_CAP.with(|slot| slot.set(Some(cap)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestRowCap {
+    fn drop(&mut self) {
+        TEST_ROW_CAP.with(|slot| slot.set(None));
+    }
+}
 
 /// Which collapse [`v2_build_path_guard_map`] took, if any. Reported so a test
 /// can assert that a fixture still exercises the mode it was captured for: both
@@ -1963,6 +3287,55 @@ pub(super) enum PathGuardCollapse {
     /// COLLAPSE MODE 2: the global step budget tripped and EVERY block of the
     /// function lost its per-path guards at once.
     BudgetTripped,
+    /// COLLAPSE MODE 3: the walk's FRONTIER budget tripped —
+    /// [`MAX_PATH_WALK_STEPS`] pops or [`MAX_PATH_WALK_QUEUE`] live queue
+    /// entries. Same degradation as [`Self::BudgetTripped`] (every block loses
+    /// its per-path guards, every block is `degraded`, and
+    /// [`v2_reachability_for_collapsed`] restores the in-edge disjunction for
+    /// all of them) — a SEPARATE variant so the cause can be REPORTED rather
+    /// than silently borrowing mode 2's name.
+    ///
+    /// # Where the name surfaces
+    ///
+    /// Through [`v2_frontier_budget_vc`]: ONE extra function-level
+    /// `UnsupportedMir` row (kind [`crate::VCGEN_PATH_GUARD_FRONTIER_BUDGET_KIND`])
+    /// that `generate_v2_safety_vcs_impl_with_origins_checked` appends whenever
+    /// this variant is the collapse. Not through the `PathConditionDegraded` row:
+    /// [`v2_path_condition_degraded_vc`]'s only caller is the
+    /// `ReachSummary::Unavailable | None` arm of the collapse invariant, which
+    /// fired on none of the 1269 `ay-arrays` bodies measured 2026-09-09.
+    ///
+    /// # Why a third cliff exists at all
+    ///
+    /// Mode 2's cap is `16n^2 + 16n + 4096` POPS. Prefix sharing
+    /// ([`SharedPath`]) made a pop O(1) in memory, but the pop COUNT is still
+    /// quadratic in the block count, and every pop charges one step of the
+    /// ambient per-function budget (`verify_budget::budget_exhausted`). MEASURED
+    /// on the 2026-10-16 candidate gate (trust 7f3690ed73, which did not carry
+    /// this mode): `astream_broker::broker::serve_conn` (1202 blocks) walks
+    /// toward a 23.1 M-pop cap per call, the walk runs once per lane that asks
+    /// for path guards, and the function's VC generation stopped on the
+    /// 64,000,000-step budget (`[stop:steps]`) with EVERY row discarded — while
+    /// the published seal (321aaeda75, which carries this mode) collapsed at
+    /// 2,000,000 pops and still proved the guard-free obligations. Replayed
+    /// through `generate_vcs` on the candidate's MIR of `serve_conn`, one walk
+    /// without this mode needs more than 32,000,000 steps; with it, under
+    /// 16,000,000.
+    ///
+    /// What this mode does NOT explain: the 365-652 block bodies whose every VC
+    /// timed out against the 120 s function clock on that gate
+    /// (`aterm_conformance::measure::scan::scan_frames`, `aterm_forge::check::
+    /// report_over`, `aterm_render::compute_dirty_rows`). MEASURED 2026-10-17 on
+    /// `scan_frames`: with this mode the walk trips (the function carries the
+    /// frontier row) and the function still publishes 21 timeouts and 0 proved
+    /// rows in 4,680,000 ms, exactly as without it. Those timeouts come from the
+    /// lanes sharing one per-function clock after VC generation, not from the
+    /// walk.
+    ///
+    /// Mode 3 can only fire where mode 2's cap is above it: 2,000,000 pops is
+    /// below `16n^2 + 16n + 4096` exactly when `n > 353`, so it stops only bodies
+    /// whose walk was allowed more than two million pops.
+    FrontierBudgetTripped,
 }
 
 /// What the path walk was able to say about each block's reachability.
@@ -1974,7 +3347,7 @@ pub(super) enum PathGuardCollapse {
 /// restored condition.
 pub(super) struct PathGuardAnalysis {
     /// Root-to-block guard paths; a degraded block holds `vec![Vec::new()]`.
-    pub(super) paths: FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>>,
+    pub(super) paths: std::rc::Rc<FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>>>,
     /// Which collapse (if any) the walk took.
     pub(super) collapse: PathGuardCollapse,
     /// The blocks whose path condition was DEGRADED by a collapse — the ones
@@ -2021,7 +3394,7 @@ pub(super) enum ReachSummary {
     ///
     /// `body` here is the row's formula AT THIS POINT, not the emitter's bare
     /// violation core: between the content-free capture step and this splice
-    /// `generate_v2_safety_vcs_impl_with_origins` conjoins its fact sets onto
+    /// `generate_v2_safety_vcs_impl_with_origins_checked` conjoins its fact sets onto
     /// `vc.formula` in place, and whatever they conjoined is what gets cloned.
     /// So the per-in-edge slope is `|g_e| + |accumulated fact set|` — it belongs
     /// to the BODY, is constant in the in-degree, and is not a property of this
@@ -2054,7 +3427,78 @@ pub(super) enum ReachSummary {
 pub(super) fn v2_build_path_guard_map(
     func: &VerifiableFunction,
 ) -> FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>> {
-    v2_analyze_path_guards(func).paths
+    let paths = v2_analyze_path_guards(func).paths;
+    std::rc::Rc::unwrap_or_clone(paths)
+}
+
+/// The walk's FRONTIER budget: pops. See [`PathGuardCollapse::FrontierBudgetTripped`]
+/// for why a pop cap that is a CONSTANT is needed on top of mode 2's `16n^2` one.
+///
+/// After the prefix sharing ([`SharedPath`]) one pop allocates at most one
+/// [`PathNode`] per pushed successor, so the bound is a memory bound and a step
+/// bound at once: `MAX_PATH_WALK_STEPS` pops charge at most that many steps of
+/// the ambient per-function budget, per call of the walk.
+///
+/// MEASURED 2026-09-09 over the 1269 `VerifiableFunction`s `-Ztrust-dump=mir`
+/// extracts from `ay-arrays` (seal-line 28aee49dd8, re-run by a second reader
+/// with identical digests): **1263 of them COMPLETE the walk** (mode 2 never
+/// trips), and the largest of those spends **389_003 pops** (`check_self_store`,
+/// 165 blocks; it saturates a block — mode 1 — which lets the walk run on). Of
+/// the 1263, the 1138 that reach no cap at all spend at most 386 pops. The
+/// remaining six trip mode 2 and so already return the all-`true` map. The 5.1x
+/// margin over 389_003 is the whole safety story of this constant: raise it,
+/// never lower it, without re-running that census.
+pub(super) const MAX_PATH_WALK_STEPS: usize = 2_000_000;
+
+/// The walk's FRONTIER budget: live queue entries. Needed alongside
+/// [`MAX_PATH_WALK_STEPS`] because ONE pop of a wide `SwitchInt` pushes one entry
+/// per arm, so a pop bound alone does not bound the queue. Observed maximum over
+/// the same 1269-function census, among the walks that COMPLETE: **21_799**
+/// entries (`check_self_store`), a 22.9x margin.
+pub(super) const MAX_PATH_WALK_QUEUE: usize = 500_000;
+
+/// Visited-block set for `v2_analyze_path_guards` simple-path cycle detection.
+/// Uses an inline `[u64; 4]` bitset when `num_blocks <= 256` (zero heap allocations,
+/// zero `Rc` refcount churn, O(1) membership and insert) and falls back to
+/// `SharedPath<BlockId>` on larger CFGs.
+#[derive(Clone)]
+enum VisitedBlocks {
+    Bits([u64; 4]),
+    Chain(SharedPath<BlockId>),
+}
+
+impl VisitedBlocks {
+    #[inline]
+    fn empty(num_blocks: usize) -> Self {
+        if num_blocks <= 256 { Self::Bits([0; 4]) } else { Self::Chain(None) }
+    }
+
+    #[inline]
+    fn contains(&self, block_id: BlockId) -> bool {
+        match self {
+            Self::Bits(words) => {
+                let word_idx = block_id.0 >> 6;
+                let mask = 1u64 << (block_id.0 & 63);
+                words.get(word_idx).is_some_and(|w| (w & mask) != 0)
+            }
+            Self::Chain(chain) => path_contains(chain, &block_id),
+        }
+    }
+
+    #[inline]
+    fn insert(&self, block_id: BlockId) -> Self {
+        match self {
+            Self::Bits(words) => {
+                let mut next = *words;
+                let word_idx = block_id.0 >> 6;
+                if let Some(w) = next.get_mut(word_idx) {
+                    *w |= 1u64 << (block_id.0 & 63);
+                }
+                Self::Bits(next)
+            }
+            Self::Chain(chain) => Self::Chain(path_cons(chain, block_id)),
+        }
+    }
 }
 
 /// The full walk: the path map, which collapse (if any) it took, and — for every
@@ -2067,7 +3511,7 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
     let mut result: FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>> = FxHashMap::default();
     if func.body.blocks.is_empty() {
         return PathGuardAnalysis {
-            paths: result,
+            paths: std::rc::Rc::new(result),
             collapse: PathGuardCollapse::None,
             degraded: FxHashSet::default(),
             reachability: FxHashMap::default(),
@@ -2078,14 +3522,40 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
     let cap = n.saturating_mul(n).saturating_add(n).saturating_mul(16).saturating_add(4096);
     let mut steps = 0usize;
     let mut saturated_blocks: FxHashSet<BlockId> = FxHashSet::default();
+    // The frontier carries SHARED prefixes (`SharedPath`) for guards and an inline
+    // bitset (`VisitedBlocks::Bits`) for visited blocks when `n <= 256` (falling back
+    // to `SharedPath<BlockId>` when `n > 256`). Same paths, same order, same output.
     let mut queue: std::collections::VecDeque<(
         BlockId,
-        Vec<(BlockId, GuardCondition)>,
-        Vec<BlockId>,
-    )> = std::collections::VecDeque::from([(BlockId(0), Vec::new(), Vec::new())]);
+        SharedPath<(BlockId, GuardCondition)>,
+        VisitedBlocks,
+    )> = std::collections::VecDeque::from([(BlockId(0), None, VisitedBlocks::empty(n))]);
 
-    while let Some((block_id, path_guards, mut path_blocks)) = queue.pop_front() {
+    // Every whole-function collapse returns the SAME thing: one unguarded path
+    // for every block, every block degraded, and the in-edge disjunction
+    // restored for all of them. Only the reported CAUSE differs, so the
+    // construction is named once here rather than written out at each `return`.
+    let collapse_whole_function = |collapse: PathGuardCollapse| -> PathGuardAnalysis {
+        let collapsed_map: FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>> =
+            func.body.blocks.iter().map(|block| (block.id, vec![Vec::new()])).collect();
+        let every_block: FxHashSet<BlockId> =
+            func.body.blocks.iter().map(|block| block.id).collect();
+        let reachability = v2_reachability_for_collapsed(func, &every_block);
+        PathGuardAnalysis {
+            paths: std::rc::Rc::new(collapsed_map),
+            collapse,
+            degraded: every_block,
+            reachability,
+        }
+    };
+
+    // Retained path-guard entries, counted where they are actually held: every
+    // guard stored in `result` and every guard sitting in a pending queue entry.
+    // See `MAX_TOTAL_PATH_GUARD_ENTRIES`.
+    let mut retained_entries = 0usize;
+    while let Some((block_id, path_guards, path_blocks)) = queue.pop_front() {
         steps += 1;
+        retained_entries = retained_entries.saturating_sub(path_len(&path_guards));
         // Trust (L0 termination guarantee): consult the AMBIENT per-function
         // budget alongside this walk's own local `cap`. Measured 2026-08-31,
         // `budget_exhausted()` appeared in exactly ONE file of this crate
@@ -2095,7 +3565,10 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
         // function already reaches and `path_guard_collapse_tests` already
         // pins: every block degrades to the unguarded `[Vec::new()]` path, which
         // strictly REMOVES hypotheses and so can only turn a PROVE into a FAIL.
-        if steps > cap || trust_types::verify_budget::budget_exhausted() {
+        if steps > cap
+            || retained_entries > MAX_TOTAL_PATH_GUARD_ENTRIES
+            || trust_types::verify_budget::budget_exhausted()
+        {
             // COLLAPSE MODE 2 — the GLOBAL STEP BUDGET. This is the SECOND path
             // to an unguarded block formula, and it is the more dangerous one:
             // mode 1 (`MAX_PATHS_PER_BLOCK`, below) collapses the blocks that
@@ -2107,25 +3580,30 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
             // two modes hand over. Run the SAME repair here, over every block —
             // sound by the same theorem, and fail-closed per block exactly as it
             // is below.
-            let collapsed_map: FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>> =
-                func.body.blocks.iter().map(|block| (block.id, vec![Vec::new()])).collect();
-            let every_block: FxHashSet<BlockId> =
-                func.body.blocks.iter().map(|block| block.id).collect();
-            let reachability = v2_reachability_for_collapsed(func, &every_block);
-            return PathGuardAnalysis {
-                paths: collapsed_map,
-                collapse: PathGuardCollapse::BudgetTripped,
-                degraded: every_block,
-                reachability,
-            };
+            return collapse_whole_function(PathGuardCollapse::BudgetTripped);
+        }
+        // COLLAPSE MODE 3 — the FRONTIER budget. Checked AFTER mode 2 so that a
+        // body small enough for mode 2's `16n^2` cap to bind still reports mode
+        // 2, which is what the fixtures in `path_guard_collapse_tests` pin. The
+        // degradation is mode 2's, so it is sound by the same theorem: every
+        // block's path guards are REMOVED (hypotheses only ever disappear, which
+        // can turn a PROVE into a FAIL and never the reverse), the in-edge
+        // disjunction is restored for every block through the degraded set, and
+        // the refutation lane declines on every degraded block
+        // (`assert_refutation`, `guard_analysis.degraded`). Reported by
+        // `v2_frontier_budget_vc`, the one function-level row
+        // `generate_v2_safety_vcs_impl_with_origins_checked` appends when it sees
+        // this variant. See `PathGuardCollapse::FrontierBudgetTripped`.
+        if steps > MAX_PATH_WALK_STEPS || queue.len() > MAX_PATH_WALK_QUEUE {
+            return collapse_whole_function(PathGuardCollapse::FrontierBudgetTripped);
         }
         if block_id.0 >= n {
             continue;
         }
-        if path_blocks.contains(&block_id) {
+        if path_blocks.contains(block_id) {
             continue;
         }
-        path_blocks.push(block_id);
+        let path_blocks = path_blocks.insert(block_id);
 
         let block = &func.body.blocks[block_id.0];
 
@@ -2154,8 +3632,13 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
         if saturated_blocks.contains(&block_id) {
             // Already weakened to an unguarded block formula.
         } else if paths.len() < MAX_PATHS_PER_BLOCK {
-            paths.push(path_guards.clone());
+            retained_entries = retained_entries.saturating_add(path_len(&path_guards));
+            // The ONLY O(depth) copy left, and it happens once per RECORDED
+            // path rather than once per queue push.
+            paths.push(path_to_vec(&path_guards));
         } else {
+            retained_entries =
+                retained_entries.saturating_sub(paths.iter().map(Vec::len).sum::<usize>());
             paths.clear();
             paths.push(Vec::new());
             saturated_blocks.insert(block_id);
@@ -2168,12 +3651,19 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
 
         for guarded in block.terminator.discovered_clauses(block_id) {
             if let trust_types::ClauseTarget::Block(target) = guarded.target {
-                let mut next_guards = succ_guards.clone();
-                next_guards.push((block_id, guarded.guard));
+                // One node, prefix shared. `path_blocks.clone()` is an `Rc`
+                // refcount bump, not a copy of the visited-block list.
+                let next_guards = path_cons(&succ_guards, (block_id, guarded.guard));
+                // Charge the NODE this push allocates. Under sharing the
+                // frontier's cost is the number of nodes, not the sum of the
+                // path lengths, which is the whole point of the change.
+                retained_entries = retained_entries.saturating_add(1);
                 queue.push_back((target, next_guards, path_blocks.clone()));
             }
         }
         for target in block.terminator.unguarded_successors() {
+            // An unguarded edge extends no guard list at all, so this shares
+            // BOTH prefixes outright — two refcount bumps, zero allocation.
             queue.push_back((target, succ_guards.clone(), path_blocks.clone()));
         }
     }
@@ -2186,7 +3676,12 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
     } else {
         PathGuardCollapse::SaturatedBlocks
     };
-    PathGuardAnalysis { paths: result, collapse, degraded: saturated_blocks, reachability }
+    PathGuardAnalysis {
+        paths: std::rc::Rc::new(result),
+        collapse,
+        degraded: saturated_blocks,
+        reachability,
+    }
 }
 
 /// Trust (collapse false REFUTATION): the weakest still-valid reachability
@@ -2194,12 +3689,17 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
 ///
 /// # The defect
 ///
-/// [`v2_build_path_guard_map`] has TWO collapse modes, and each leaves a block
+/// [`v2_build_path_guard_map`] has THREE collapse modes, and each leaves a block
 /// with ONE UNGUARDED path whose term lowers to an unconditional `true` — i.e.
 /// NO reachability condition at all:
 ///
 ///  1. a block reached by more than `MAX_PATHS_PER_BLOCK` routes;
-///  2. the whole function, when the global step budget trips.
+///  2. the whole function, when the global step budget trips;
+///  3. the whole function, when the walk's FRONTIER budget trips
+///     ([`MAX_PATH_WALK_STEPS`] / [`MAX_PATH_WALK_QUEUE`]).
+///
+/// This repair is keyed on the DEGRADED SET, not on a list of modes, which is
+/// why mode 3 needed no change here: a new mode arrives already covered.
 ///
 /// For an obligation whose formula carries its own violation condition that is
 /// merely imprecise. For an obligation whose formula IS `Bool(true)` the path
@@ -2277,15 +3777,15 @@ fn v2_reachability_for_collapsed(
     if collapsed.is_empty() {
         return restored;
     }
-    let in_edges = v2_build_in_edge_guard_map(func);
+    let mut in_edges = v2_build_in_edge_guard_map(func, collapsed);
     for block_id in collapsed {
-        let summary = match in_edges.get(block_id) {
+        let summary = match in_edges.remove(block_id) {
             // The disjunction is `true` — entry, or an unguarded in-edge.
             Some(None) => ReachSummary::Unconditional,
             // A real condition, at ANY in-degree. There is deliberately no size
             // budget here: a big disjunction is inconvenient, not undecidable,
             // and declining on size demotes genuinely reachable UB to Unknown.
-            Some(Some(edges)) if !edges.is_empty() => ReachSummary::Guards(edges.clone()),
+            Some(Some(edges)) if !edges.is_empty() => ReachSummary::Guards(edges),
             // An empty edge list (an empty `Or` is `false` and would vacuously
             // prove every row — refused explicitly), or no entry in the map at
             // all.
@@ -2316,36 +3816,39 @@ fn v2_reachability_for_collapsed(
 /// walk found. `ClauseTarget::Panic` is not a block and contributes no in-edge.
 fn v2_build_in_edge_guard_map(
     func: &VerifiableFunction,
+    collapsed: &FxHashSet<BlockId>,
 ) -> FxHashMap<BlockId, Option<Vec<(BlockId, GuardCondition)>>> {
-    let mut map: FxHashMap<BlockId, Option<Vec<(BlockId, GuardCondition)>>> = FxHashMap::default();
+    let mut map: FxHashMap<BlockId, Option<Vec<(BlockId, GuardCondition)>>> =
+        FxHashMap::with_capacity_and_hasher(collapsed.len(), Default::default());
     // Both spellings of "the entry": the walk's root `BlockId(0)` and the first
     // declared block, which coincide on well-formed MIR but need not on a
     // hand-built or adversarial body.
-    let mut entries: Vec<BlockId> = vec![BlockId(0)];
-    if let Some(first) = func.body.blocks.first().map(|b| b.id)
-        && first != BlockId(0)
+    let first = func.body.blocks.first().map(|b| b.id);
+    if collapsed.contains(&BlockId(0)) {
+        map.insert(BlockId(0), None);
+    }
+    if let Some(first_id) = first
+        && first_id != BlockId(0)
+        && collapsed.contains(&first_id)
     {
-        entries.push(first);
+        map.insert(first_id, None);
     }
-    for entry in &entries {
-        map.insert(*entry, None);
-    }
-    let is_entry = |id: BlockId| entries.contains(&id);
+    let is_entry = |id: BlockId| id == BlockId(0) || first == Some(id);
     for block in &func.body.blocks {
+        for target in block.terminator.unguarded_successors() {
+            if !collapsed.contains(&target) || is_entry(target) {
+                continue;
+            }
+            map.insert(target, None);
+        }
         for guarded in block.terminator.discovered_clauses(block.id) {
             let trust_types::ClauseTarget::Block(target) = guarded.target else { continue };
-            if is_entry(target) {
+            if !collapsed.contains(&target) || is_entry(target) {
                 continue;
             }
             if let Some(edges) = map.entry(target).or_insert_with(|| Some(Vec::new())) {
                 edges.push((block.id, guarded.guard));
             }
-        }
-        for target in block.terminator.unguarded_successors() {
-            if is_entry(target) {
-                continue;
-            }
-            map.insert(target, None);
         }
     }
     map
@@ -2354,10 +3857,13 @@ fn v2_build_in_edge_guard_map(
 // ---------------------------------------------------------------------------
 // THE COLLAPSE INVARIANT
 // ---------------------------------------------------------------------------
-// Two collapse cliffs have been found in `v2_build_path_guard_map` — the
-// per-block path cap and the global step budget — and each one produced the
-// IDENTICAL false REFUTATION, each was closed by a local repair, and the next
-// reviewer got past each repair. Patching a third cap would only move the cliff.
+// Three collapse cliffs exist in `v2_build_path_guard_map` — the per-block path
+// cap, the global step budget, and the frontier budget — and the first two each
+// produced the IDENTICAL false REFUTATION, each was closed by a local repair, and
+// the next reviewer got past each repair. Patching another cap would only move
+// the cliff. The third is why the invariant below is keyed on
+// `degraded`/`ReachSummary` rather than on a list of collapse modes: adding
+// `FrontierBudgetTripped` required NO change here.
 //
 // The root cause is a missing INVARIANT, stated once and enforced at the single
 // point where such a row is decided:
@@ -2367,7 +3873,7 @@ fn v2_build_in_edge_guard_map(
 //     whenever the path condition is ABSENT or DEGRADED.
 //
 // "I have no reachability information" is not "this is reachable". The invariant
-// subsumes both known collapse modes and any future one, because it is keyed on
+// subsumes every known collapse mode and any future one, because it is keyed on
 // the DEGRADATION, not on the mechanism that caused it.
 //
 // It must not weaken detection where the path condition IS present and sound:
@@ -2494,10 +4000,15 @@ pub(super) fn v2_formula_with_path_guards(
     // Verdict-identical: the entry map is byte-identical to `StmtVersionCtx::build(func)`,
     // so `version_rename_at` output and every emitted VC are unchanged.
     sv: &StmtVersionCtx,
+    // Trust (PATH-GUARD-VALUE-1): the block the guarded row lives in — the paths in
+    // `guard_paths` end there. A guard keeps its reaching-set spelling only where that
+    // spelling names, at this block, the value the guard tested
+    // (`guard_value_spelling`).
+    at: BlockId,
     guard_paths: &[Vec<(BlockId, GuardCondition)>],
     formula: Formula,
 ) -> Formula {
-    v2_formula_with_path_guards_recorded(func, sv, guard_paths, formula).0
+    v2_formula_with_path_guards_inner(func, sv, at, guard_paths, formula, false).0
 }
 
 /// Refutation-polarity counterpart of [`v2_formula_with_path_guards`].
@@ -2508,41 +4019,127 @@ pub(super) fn v2_formula_with_path_guards(
 /// on an absent source block, an unmodeled guard, or an empty path set.  The
 /// caller must separately reject path-map collapse, because a collapsed empty
 /// guard path is indistinguishable from a genuinely unconditional path here.
+///
+/// Trust (PATH-GUARD-VALUE-1): it also returns `None` when a guard's reaching-set
+/// spelling would name, at `at`, a value other than the one the guard tested
+/// (`guard_value_spelling::guard_needs_value_spelling`). The proof polarity gives such
+/// a read a guard-local name, which WEAKENS the path condition — harmless for a proof,
+/// but a weakened path condition can manufacture a witness, so this lane declines.
+fn operand_place_eq(a: &Operand, b: &Operand) -> bool {
+    match (a, b) {
+        (Operand::Copy(pa), Operand::Copy(pb)) | (Operand::Move(pa), Operand::Move(pb)) => pa == pb,
+        _ => false,
+    }
+}
+
+pub(super) fn guard_cache_key(src: BlockId, g: &GuardCondition) -> Option<(BlockId, u8, u128)> {
+    match g {
+        GuardCondition::SwitchIntMatch { discr: Operand::Copy(_) | Operand::Move(_), value } => {
+            Some((src, 0, *value))
+        }
+        GuardCondition::SwitchIntOtherwise {
+            discr: Operand::Copy(_) | Operand::Move(_),
+            excluded_values,
+        } => Some((src, 1, excluded_values.len() as u128)),
+        GuardCondition::AssertHolds { cond: Operand::Copy(_) | Operand::Move(_), expected } => {
+            Some((src, 2, u128::from(*expected)))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn guard_condition_eq(a: &GuardCondition, b: &GuardCondition) -> bool {
+    match (a, b) {
+        (
+            GuardCondition::SwitchIntMatch { discr: da, value: va },
+            GuardCondition::SwitchIntMatch { discr: db, value: vb },
+        ) => va == vb && operand_place_eq(da, db),
+        (
+            GuardCondition::SwitchIntOtherwise { discr: da, excluded_values: ea },
+            GuardCondition::SwitchIntOtherwise { discr: db, excluded_values: eb },
+        ) => ea == eb && operand_place_eq(da, db),
+        (
+            GuardCondition::AssertHolds { cond: ca, expected: ea },
+            GuardCondition::AssertHolds { cond: cb, expected: eb },
+        ) => ea == eb && operand_place_eq(ca, db_or_cb(cb)),
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn db_or_cb(op: &Operand) -> &Operand {
+    op
+}
+
 pub(super) fn v2_formula_with_refutation_path_guards(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
+    at: BlockId,
     guard_paths: &[Vec<(BlockId, GuardCondition)>],
     formula: Formula,
 ) -> Option<Formula> {
     if guard_paths.is_empty() {
         return None;
     }
+    if guard_paths.len() == 1 && guard_paths[0].is_empty() {
+        return Some(formula);
+    }
 
     let mut terms = Vec::with_capacity(guard_paths.len());
-    for path in guard_paths {
+    let mut formula_opt = Some(formula);
+    let mut edge_cache: FxHashMap<(BlockId, u8, u128), (&GuardCondition, Formula)> =
+        FxHashMap::default();
+    let use_edge_cache = guard_paths.len() > 1;
+    let formula_conjunct_count = match formula_opt.as_ref() {
+        Some(Formula::And(inner)) => inner.len(),
+        _ => 1,
+    };
+    for (idx, path) in guard_paths.iter().enumerate() {
         if path.is_empty() {
-            terms.push(formula.clone());
+            let row_formula = if idx + 1 == guard_paths.len() {
+                formula_opt.take()?
+            } else {
+                formula_opt.as_ref()?.clone()
+            };
+            terms.push(row_formula);
             continue;
         }
 
-        let mut conjuncts = Vec::with_capacity(path.len() + 1);
+        let mut conjuncts = Vec::with_capacity(path.len() + formula_conjunct_count);
         for (source, guard) in path {
+            let cache_key = use_edge_cache.then(|| guard_cache_key(*source, guard)).flatten();
+            if let Some(key) = cache_key
+                && let Some((cached_g, cached_f)) = edge_cache.get(&key)
+                && guard_condition_eq(cached_g, guard)
+            {
+                conjuncts.push(cached_f.clone());
+                continue;
+            }
             let source_block =
                 func.body.blocks.get(source.0).filter(|block| block.id == *source)?;
-            let guard = guards::guard_to_refutation_formula(func, guard)?;
-            conjuncts.push(version_rename_at(&guard, sv, func, *source, source_block.stmts.len()));
+            let gf = guards::guard_to_refutation_formula(func, guard)?;
+            if super::guard_value_spelling::guard_needs_value_spelling(func, sv, &gf, *source, at) {
+                return None;
+            }
+            let renamed = version_rename_owned_at(gf, sv, func, *source, source_block.stmts.len());
+            if let Some(key) = cache_key {
+                edge_cache.entry(key).or_insert_with(|| (guard, renamed.clone()));
+            }
+            conjuncts.push(renamed);
         }
-        match formula.clone() {
+        let row_formula = if idx + 1 == guard_paths.len() {
+            formula_opt.take()?
+        } else {
+            formula_opt.as_ref()?.clone()
+        };
+        match row_formula {
             Formula::And(inner) => conjuncts.extend(inner),
             other => conjuncts.push(other),
         }
         terms.push(Formula::And(conjuncts));
     }
 
-    Some(match terms.len() {
-        1 => terms.pop().expect("length checked"),
-        _ => Formula::Or(terms),
-    })
+    if terms.len() == 1 { terms.pop() } else { Some(Formula::Or(terms)) }
 }
 
 /// As [`v2_formula_with_path_guards`], but also returns the per-path terms the
@@ -2554,65 +4151,261 @@ pub(super) fn v2_formula_with_refutation_path_guards(
 pub(super) fn v2_formula_with_path_guards_recorded(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
+    at: BlockId,
     guard_paths: &[Vec<(BlockId, GuardCondition)>],
     formula: Formula,
 ) -> (Formula, Vec<PathGuardTerm>) {
-    let mut path_terms: Vec<PathGuardTerm> = Vec::new();
+    v2_formula_with_path_guards_inner(func, sv, at, guard_paths, formula, true)
+}
+
+pub(super) fn spell_guard_paths_uncached(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    at: BlockId,
+    guard_paths: &[Vec<(BlockId, GuardCondition)>],
+) -> Vec<Vec<Formula>> {
+    // Trust (2026-09-27, class `v-refuted-unreachable`): the discriminant temps the
+    // CSE ties, each rendered through its group's anchor (memoized per function).
+    let anchors = super::discriminant_cse_anchor_map(func);
+    let mut edge_cache: FxHashMap<(BlockId, u8, u128), (&GuardCondition, Formula)> =
+        FxHashMap::default();
+    let use_edge_cache = guard_paths.len() > 1;
+    let mut out = Vec::with_capacity(guard_paths.len());
+    for guards in guard_paths {
+        if guards.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        let renamed_guards: Vec<Formula> = guards
+            .iter()
+            .map(|(src, g)| {
+                let cache_key = use_edge_cache.then(|| guard_cache_key(*src, g)).flatten();
+                if let Some(key) = cache_key
+                    && let Some((cached_g, cached_f)) = edge_cache.get(&key)
+                    && guard_condition_eq(cached_g, g)
+                {
+                    return cached_f.clone();
+                }
+                let gf = guards::guard_to_formula(func, g);
+                let gf = render_through_discriminant_cse_anchors(gf, &anchors, |anchor, _sort| {
+                    !super::guard_value_spelling::guard_var_needs_value_spelling_at(
+                        func, sv, *src, at, anchor,
+                    )
+                });
+                let spelled =
+                    super::guard_value_spelling::spell_path_guard_owned(func, sv, gf, *src, at);
+                if let Some(key) = cache_key {
+                    edge_cache.entry(key).or_insert_with(|| (g, spelled.clone()));
+                }
+                spelled
+            })
+            .collect();
+        out.push(renamed_guards);
+    }
+    out
+}
+
+fn v2_formula_with_path_guards_inner(
+    func: &VerifiableFunction,
+    sv: &StmtVersionCtx,
+    at: BlockId,
+    guard_paths: &[Vec<(BlockId, GuardCondition)>],
+    formula: Formula,
+    record_path_terms: bool,
+) -> (Formula, Vec<PathGuardTerm>) {
+    if guard_paths.is_empty() {
+        return (formula, Vec::new());
+    }
+    if guard_paths.len() == 1 && guard_paths[0].is_empty() {
+        return (
+            formula,
+            if record_path_terms { vec![PathGuardTerm::Raw] } else { Vec::new() },
+        );
+    }
+    let mut path_terms: Vec<PathGuardTerm> = if record_path_terms {
+        Vec::with_capacity(guard_paths.len())
+    } else {
+        Vec::new()
+    };
     // Trust S2c: version each guard at ITS SOURCE block before conjoining (the
     // facts are conjoined EXEMPT from the whole-VC rename). An IN-BLOCK read in the
     // guard (`k = n%4` in `if k >= 4`) renames to `k#sSRC` and matches the renamed
     // body's `k#sSRC` (so `k>=4 ∧ k<4` is UNSAT → dead branch proved); an
     // ENTRY-param read (`n`) gets `version_token_at == None` and stays BARE, so a
     // stale `n <= 100` is still name-disjoint from a reassigned body `n#s2_0`.
-    let mut terms = Vec::new();
-    for guards in guard_paths {
-        if guards.is_empty() {
-            terms.push(formula.clone());
-            path_terms.push(PathGuardTerm::Raw);
-            continue;
+    //
+    // Trust (PATH-GUARD-VALUE-1): a token spells a reaching-def SET, not a value, so
+    // the source-terminal spelling alone let a loop-head guard pin a value written
+    // after it (`match len { 3 => {} _ => return } if c { len = n } buf[len]` PROVED
+    // and certified). Each guard is spelled by `guard_value_spelling::spell_path_guard`,
+    // which keeps the token exactly where it names, at `at`, the value the guard
+    // tested and gives the read a guard-local name everywhere else.
+    let mut terms = Vec::with_capacity(guard_paths.len());
+    let cached_spelled = sv.spelled_guard_paths_for(func, at, guard_paths);
+    let owned_spelled;
+    let spelled_slice: &[Vec<Formula>] = match &cached_spelled {
+        Some((rc, start, len)) => &rc[*start..*start + *len],
+        None => {
+            owned_spelled = spell_guard_paths_uncached(func, sv, at, guard_paths);
+            &owned_spelled
         }
-        let renamed_guards: Vec<Formula> = guards
-            .iter()
-            .map(|(src, g)| {
-                let gf = guards::guard_to_formula(func, g);
-                // Trust (lane-A CSE): id==index invariant → O(1) indexed lookup;
-                // the `.filter` keeps the `map_or(0, ..)` fallback identical when
-                // the slot is missing or the invariant were violated.
-                let terminal = func
-                    .body
-                    .blocks
-                    .get(src.0)
-                    .filter(|b| b.id == *src)
-                    .map_or(0, |b| b.stmts.len());
-                version_rename_at(&gf, sv, func, *src, terminal)
-            })
-            .collect();
-        path_terms.push(PathGuardTerm::Guarded { guards: renamed_guards.clone() });
-        let mut conj: Vec<Formula> = renamed_guards;
-        // Trust: restore R1 recursion inductive-bound fact (regression from 52b31a7d2a,
-        // which conjoined same-block statement defs into `formula` BEFORE this splice). When
-        // the attributed callsite producer already wrapped `formula` as `And([defs…, ¬P[σ]])`
-        // (e.g. an argument temp `Eq(_13, i)` conjoined with the callee-precondition negation),
-        // pushing that whole `And` as one nested conjunct BURIES `¬P[σ]` a level deep. The R1
-        // discharge gate (`is_admissible_caller_discharge`) and the inductive-step sanity check
-        // both require `¬P[σ]` to be a DIRECT conjunct of a flat `And`, so a GUARDED recursive
-        // call (`if n > 0 { walk(a, n-1, i) }`) then fails to certify (CallerFormulaMismatch)
-        // even though the invariant is jointly inductive. FLATTEN the `And` so the block-defs
-        // and `¬P[σ]` become flat siblings of the path guards — identical conjunction, but the
-        // gate's direct-conjunct check now holds. A non-`And` `formula` is pushed whole. Sound:
-        // pure associativity of `∧`, no solver-visible change (mirrors the sem-guard /
-        // global-fact / own-precondition flatten-splices in the attributed producer).
-        match formula.clone() {
-            Formula::And(inner) => conj.extend(inner),
-            other => conj.push(other),
+    };
+    if let Some((last_guards, prefix_guards)) = spelled_slice.split_last() {
+        for renamed_guards in prefix_guards {
+            let row_formula = formula.clone();
+            if renamed_guards.is_empty() {
+                terms.push(row_formula);
+                if record_path_terms {
+                    path_terms.push(PathGuardTerm::Raw);
+                }
+                continue;
+            }
+            if record_path_terms {
+                path_terms.push(PathGuardTerm::Guarded { guards: renamed_guards.clone() });
+            }
+            let extra_len = match &row_formula {
+                Formula::And(inner) => inner.len(),
+                _ => 1,
+            };
+            let mut conj: Vec<Formula> = Vec::with_capacity(renamed_guards.len() + extra_len);
+            conj.extend_from_slice(renamed_guards);
+            match row_formula {
+                Formula::And(inner) => conj.extend(inner),
+                other => conj.push(other),
+            }
+            terms.push(Formula::And(conj));
         }
-        terms.push(Formula::And(conj));
+        if last_guards.is_empty() {
+            terms.push(formula);
+            if record_path_terms {
+                path_terms.push(PathGuardTerm::Raw);
+            }
+        } else {
+            if record_path_terms {
+                path_terms.push(PathGuardTerm::Guarded { guards: last_guards.clone() });
+            }
+            let extra_len = match &formula {
+                Formula::And(inner) => inner.len(),
+                _ => 1,
+            };
+            let mut conj: Vec<Formula> = Vec::with_capacity(last_guards.len() + extra_len);
+            conj.extend_from_slice(last_guards);
+            // Trust: restore R1 recursion inductive-bound fact (regression from 52b31a7d2a,
+            // which conjoined same-block statement defs into `formula` BEFORE this splice). When
+            // the attributed callsite producer already wrapped `formula` as `And([defs…, ¬P[σ]])`
+            // (e.g. an argument temp `Eq(_13, i)` conjoined with the callee-precondition negation),
+            // pushing that whole `And` as one nested conjunct BURIES `¬P[σ]` a level deep. The R1
+            // discharge gate (`is_admissible_caller_discharge`) and the inductive-step sanity check
+            // both require `¬P[σ]` to be a DIRECT conjunct of a flat `And`, so a GUARDED recursive
+            // call (`if n > 0 { walk(a, n-1, i) }`) then fails to certify (CallerFormulaMismatch)
+            // even though the invariant is jointly inductive. FLATTEN the `And` so the block-defs
+            // and `¬P[σ]` become flat siblings of the path guards — identical conjunction, but the
+            // gate's direct-conjunct check now holds. A non-`And` `formula` is pushed whole. Sound:
+            // pure associativity of `∧`, no solver-visible change (mirrors the sem-guard /
+            // global-fact / own-precondition flatten-splices in the attributed producer).
+            match formula {
+                Formula::And(inner) => conj.extend(inner),
+                other => conj.push(other),
+            }
+            terms.push(Formula::And(conj));
+        }
+    } else {
+        return (formula, path_terms);
     }
 
-    let result = match terms.len() {
-        0 => formula,
-        1 => terms.pop().unwrap_or_else(|| unreachable!("len checked above")),
-        _ => Formula::Or(terms),
+    let result = if terms.len() == 1 {
+        terms.into_iter().next().unwrap_or(Formula::Bool(true))
+    } else {
+        Formula::Or(terms)
     };
     (result, path_terms)
+}
+
+/// `guard` with every variable the discriminant CSE ties (`anchors`: temp -> anchor)
+/// replaced by its anchor where `use_anchor(anchor, sort)` allows it, conjoined with
+/// each tie `anchor == temp` the replacement used — so the result is equivalent to
+/// `guard ∧ ties`. An empty map, or a guard naming no usable tied temp, comes back
+/// unchanged.
+fn render_through_discriminant_cse_anchors(
+    guard: Formula,
+    anchors: &trust_types::fx::FxHashMap<String, String>,
+    mut use_anchor: impl FnMut(&str, &Sort) -> bool,
+) -> Formula {
+    if anchors.is_empty()
+        || !trust_types::any_free_variable_name(&guard, &mut |name| anchors.contains_key(name))
+    {
+        return guard;
+    }
+    let mut ties: Vec<Formula> = Vec::new();
+    let rendered = guard.map(&mut |node| match node {
+        Formula::Var(name, sort) => match anchors.get(&name) {
+            Some(anchor) if use_anchor(anchor, &sort) => {
+                let tie = Formula::Eq(
+                    Box::new(Formula::Var(anchor.clone(), sort.clone())),
+                    Box::new(Formula::Var(name, sort.clone())),
+                );
+                if !ties.contains(&tie) {
+                    ties.push(tie);
+                }
+                Formula::Var(anchor.clone(), sort)
+            }
+            _ => Formula::Var(name, sort),
+        },
+        other => other,
+    });
+    if ties.is_empty() {
+        rendered
+    } else {
+        let mut out = Vec::with_capacity(ties.len() + 1);
+        out.push(rendered);
+        out.extend(ties);
+        Formula::And(out)
+    }
+}
+
+#[cfg(test)]
+mod path_node_drop_tests {
+    use super::*;
+
+    /// Extend `path` by `range`, one node per item, and return the new head.
+    fn extend(mut path: SharedPath<usize>, range: std::ops::Range<usize>) -> SharedPath<usize> {
+        for item in range {
+            path = path_cons(&path, item);
+        }
+        path
+    }
+
+    /// A chain far past the measured recursive-drop overflow depth (release
+    /// 300_000, debug 40_000-50_000 on an 8 MiB stack; test threads get less)
+    /// must tear down without overflowing the stack.
+    #[test]
+    fn dropping_a_million_node_path_does_not_overflow_the_stack() {
+        let path = extend(None, 0..1_000_000);
+        assert_eq!(path_len(&path), 1_000_000);
+        drop(path);
+    }
+
+    /// The `Err(_) => break` branch: dropping the head must stop at a suffix
+    /// another handle still shares, leaving that suffix intact — same length,
+    /// same items — and releasing exactly the head's reference to it.
+    #[test]
+    fn dropping_the_head_leaves_a_shared_suffix_intact() {
+        let suffix = extend(None, 0..500_000);
+        let head = extend(suffix.clone(), 500_000..1_000_000);
+        assert_eq!(path_len(&head), 1_000_000);
+        let Some(suffix_node) = suffix.clone() else {
+            unreachable!("a 500_000-node path is non-empty");
+        };
+        // `suffix`, `suffix_node`, and the head chain's last owned node.
+        assert_eq!(std::rc::Rc::strong_count(&suffix_node), 3);
+
+        drop(head);
+
+        assert_eq!(std::rc::Rc::strong_count(&suffix_node), 2);
+        drop(suffix_node);
+        assert_eq!(path_len(&suffix), 500_000);
+        assert_eq!(path_to_vec(&suffix), (0..500_000).collect::<Vec<usize>>());
+        // The surviving suffix is itself long; its own teardown is iterative too.
+        drop(suffix);
+    }
 }

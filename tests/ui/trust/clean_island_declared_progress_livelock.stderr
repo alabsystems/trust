@@ -1,0 +1,19 @@
+error: progress claim `HarnessPolicy.MutantCatchesUp` fails: a fair run of `HarnessPolicyOneWriter` leaves the goal for good. It reaches { disk = 0, edits = 0, has_posted = 1, last_posted = 0, queued = 0, queued_val = 0, in_force = 1, committed = 1, forget_pending = 0 } and stutters there forever (no fair action can change that state), and the goal never holds again. Trust checks every `ScalarProgress` an island declares; the kernel replayed the run and evaluates the goal false and the fairness conditions met on the loop (below). Fix the model, the fairness it assumes, or the system it describes.
+  --> $DIR/clean_island_declared_progress_livelock.rs:108:5
+   |
+LL |     def HarnessPolicy.MutantCatchesUp : Trust.Temporal.FiniteModel.ScalarProgress :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: a fair run of `HarnessPolicyOneWriter` that leaves the goal of `HarnessPolicy.MutantCatchesUp` for good; the kernel replayed each step and evaluated the goal and the fairness conditions on the loop:
+        0: (initial)            disk = 0, edits = 0, has_posted = 0, last_posted = 0, queued = 0, queued_val = 0, in_force = 1, committed = 0, forget_pending = 0
+        1: Poll                 has_posted = 1, queued = 1
+        2: Deliver              queued = 0
+        3: CommitWithoutForget  committed = 1
+        then it stutters there forever: no fair action can change that state
+  --> $DIR/clean_island_declared_progress_livelock.rs:108:5
+   |
+LL |     def HarnessPolicy.MutantCatchesUp : Trust.Temporal.FiniteModel.ScalarProgress :=
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

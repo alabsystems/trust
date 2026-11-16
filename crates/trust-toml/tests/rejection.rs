@@ -86,7 +86,10 @@ const MALFORMED: &[(&str, &str)] = &[
 /// the rule "right" by refusing both would look green here without this table.
 const WELL_FORMED: &[(&str, &str)] = &[
     ("[a.b]\nx = 1\n[a]\ny = 2\n", "a header promoting an implicit ancestor"),
-    ("[f]\napple.color = 'red'\n[f.apple.texture]\nsmooth = true\n", "a sub-table under a dotted-key table"),
+    (
+        "[f]\napple.color = 'red'\n[f.apple.texture]\nsmooth = true\n",
+        "a sub-table under a dotted-key table",
+    ),
     ("[[t]]\nn = 1\n[[t]]\nn = 2\n", "an array of tables appended twice"),
     ("[[t]]\n[t.inner]\nk = 1\n", "a sub-table of the newest array element"),
     ("a = [1, 2, ]\n", "a trailing comma in an array (legal, unlike an inline table)"),

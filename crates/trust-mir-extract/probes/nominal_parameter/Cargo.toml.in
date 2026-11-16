@@ -1,0 +1,18 @@
+# OWN standalone component workspace; replace @TRUST_ROOT@ with source root.
+[workspace]
+[package]
+name = "nominal-parameter-probe"
+version = "0.0.0"
+edition = "2021"
+[[bin]]
+name = "nominal-parameter-probe"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_parameter/observer.rs"
+[[bin]]
+name = "constructor_refusal"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_parameter/constructor_refusal.rs"
+[[bin]]
+name = "clone_refusal"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_parameter/clone_refusal.rs"
+[[bin]]
+name = "cross_context_refusal"
+path = "@TRUST_ROOT@/crates/trust-mir-extract/probes/nominal_parameter/cross_context_refusal.rs"

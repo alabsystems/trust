@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib
 // wave-PO3: a CAPTURING closure literal at the body's DIRECT TAIL, when the
 // declared return maps to the opaque-alias sort (`-> impl Fn*`), takes the
 // wave-PO2b posture: the value is the fact-free opaque-alias const (the

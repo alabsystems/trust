@@ -4,4 +4,4 @@ expression: test targo-trust
 ---
 [Test] test::TCargoTrust
     targets: [x86_64-unknown-linux-gnu]
-    - Set({test::targo-trust})
+    - Set({targo-trust})

@@ -1,20 +1,32 @@
 //! This module contains shared utilities for bootstrap tests.
 
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use tempfile::TempDir;
 
-use crate::core::builder::Builder;
-use crate::core::config::DryRun;
-use crate::utils::helpers::get_host_target;
-use crate::{Build, Config, Flags, t};
+use crate::core::config::Config;
+use crate::core::config::flags::Flags;
 
 pub mod git;
-
-// Note: tests for `shared_helpers` is separate here, as otherwise shim binaries that include the
-// `shared_helpers` via `#[path]` would fail to find it, breaking `./x check bootstrap`.
-mod shared_helpers_tests;
+// Trust: blessed env_mutation — these tests serialize process-env mutation
+// behind a lock and restore on drop (see EnvVarGuard in the file).
+#[allow(unknown_lints)]
+#[allow(env_mutation)]
+mod shim_utils_tests;
+// Trust: compile the compiler crates' actual feature declarations with the seed.
+mod seed_feature_tests;
+// Trust: exercise the actual build-script compiler selection in this owner.
+#[allow(dead_code)]
+#[path = "../../../build.rs"]
+pub(crate) mod bootstrap_build_script;
+// Trust: compile the actual LLVM build-script integration in this maintained
+// owner too; helper-only tests cannot detect type errors in its link loop.
+#[allow(dead_code)]
+#[allow(unexpected_cfgs, reason = "Trust: check_only is a feature of the actual LLVM crate")]
+#[path = "../../../../../compiler/rustc_llvm/build.rs"]
+pub(crate) mod rustc_llvm_build_script;
 
 /// Holds temporary state of a bootstrap test.
 /// Right now it is only used to redirect the build directory of the bootstrap
@@ -56,6 +68,8 @@ pub struct ConfigBuilder {
     override_download_ci_llvm: bool,
     dry_run: bool,
     explicit_config: bool,
+    // Trust: isolated admission variables; tests never inherit an outer share.
+    environment: HashMap<OsString, OsString>,
 }
 
 impl ConfigBuilder {
@@ -66,14 +80,15 @@ impl ConfigBuilder {
             override_download_ci_llvm: true,
             dry_run: true,
             explicit_config: true,
+            environment: HashMap::new(),
         }
     }
 
-    pub fn path(mut self, path: &str) -> Self {
+    pub fn path(self, path: &str) -> Self {
         self.arg(path)
     }
 
-    pub fn paths(mut self, paths: &[&str]) -> Self {
+    pub fn paths(self, paths: &[&str]) -> Self {
         self.args(paths)
     }
 
@@ -89,8 +104,14 @@ impl ConfigBuilder {
         self
     }
 
+    /// Trust: inject a bootstrap admission variable without process-env mutation.
+    pub fn env(mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.environment.insert(name.as_ref().to_owned(), value.as_ref().to_owned());
+        self
+    }
+
     /// Set the specified target to be treated as a no_std target.
-    pub fn override_target_no_std(mut self, target: &str) -> Self {
+    pub fn override_target_no_std(self, target: &str) -> Self {
         self.args(&["--set", &format!("target.{target}.no-std=true")])
     }
 
@@ -131,7 +152,11 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn create_config(mut self) -> Config {
+    pub fn create_config(self) -> Config {
+        self.create_config_with_fixed_budget(None)
+    }
+
+    pub fn create_config_with_fixed_budget(mut self, fixed_jobs: Option<u32>) -> Config {
         if self.dry_run {
             // Run in dry-check, otherwise the test would be too slow
             self.args.push("--dry-run".to_string());
@@ -157,6 +182,93 @@ impl ConfigBuilder {
         self.args.push("--build-dir".to_string());
         self.args.push(self.directory.join("build").display().to_string());
 
-        Config::parse(Flags::parse(&self.args))
+        Config::parse_with_env_and_fixed_budget(
+            Flags::parse(&self.args),
+            |name| self.environment.get(OsStr::new(name)).cloned(),
+            fixed_jobs,
+        )
     }
+}
+
+const ISOLATED: &str = "TRUST_BOOTSTRAP_ISOLATED_TEST";
+
+/// Trust: runs `body` as the only test in a child process of this test binary.
+/// A flock lock belongs to the open file description, and a process another
+/// test thread starts holds descriptors for this process's open descriptions,
+/// close-on-exec or not: a forked child until it exits, or until it execs for a
+/// close-on-exec descriptor, as Rust opens every file (Command forks on its
+/// fallbacks, among them a pre_exec closure, uid, gid or groups, chroot and a
+/// changed PATH with a bare program name, which tests in this binary take), and
+/// on macOS a posix_spawn for the spawn itself (measured on macOS only; the
+/// commit that wrote this sentence describes the measurement and gives its
+/// counts). So a lock a test released can still look held to that test's next
+/// take. Isolate a test before its first fixture descriptor when it takes a lock
+/// it released.
+/// One exact test and a post-assert marker exclude an ignored, filtered-out or
+/// early-success child; the bound is a watchdog, never another completion
+/// condition. The child's output is read as it is written, so a long report
+/// cannot fill a pipe and stall it (LAND-GATE-EW1-FOLLOWUP-REVIEW-4 (12)).
+pub(crate) fn isolated(body: impl FnOnce()) {
+    isolated_with_env(&[], body)
+}
+
+/// Use the same isolated actor with explicit child-only environment observations.
+pub(crate) fn isolated_with_env(environment: &[(OsString, Option<OsString>)], body: impl FnOnce()) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const COMPLETE: &str = "TRUST-ISOLATED-TEST-ASSERTIONS-COMPLETE:";
+    let name = std::thread::current().name().expect("named test").to_owned();
+    if std::env::var_os(ISOLATED).as_deref() == Some(OsStr::new(&name)) {
+        body();
+        eprintln!("{COMPLETE}{name}");
+        return;
+    }
+    let mut command =
+        crate::test_entry::uncaptured_actor(Command::new(std::env::current_exe().unwrap()));
+    command
+        .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+        .env(ISOLATED, &name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in environment {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command.spawn().unwrap();
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let until = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (stdout, stderr) = (stdout.join().unwrap(), stderr.join().unwrap());
+    let status = status.unwrap_or_else(|| panic!("{name} timed out: {stdout}{stderr}"));
+    assert!(status.success(), "{name}: {stdout}{stderr}");
+    assert!(stdout.contains("test result: ok. 1 passed;"), "{name}: {stdout}{stderr}");
+    assert!(stderr.contains(&format!("{COMPLETE}{name}")), "{name}: {stdout}{stderr}");
+}
+
+/// Trust: whether this process is an `isolated` test's child.
+pub(crate) fn in_isolated_child() -> bool {
+    std::env::var_os(ISOLATED).is_some()
 }

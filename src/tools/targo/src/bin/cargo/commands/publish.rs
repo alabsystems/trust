@@ -1,8 +1,8 @@
 use crate::command_prelude::*;
 
-use cargo::ops::{self, PublishOpts};
 use cargo_credential::Secret;
 use clap_complete::ArgValueCandidates;
+use targo::ops::{self, PublishOpts};
 
 pub fn cli() -> Command {
     subcommand("publish")
@@ -32,7 +32,7 @@ pub fn cli() -> Command {
         )
         .arg_features()
         .arg_parallel()
-        .arg_target_triple("Build for the target triple")
+        .arg_target_tuple("Build for the target tuple")
         .arg_target_dir()
         .arg_manifest_path()
         // Trust: the footer names the binary the user actually invoked; see

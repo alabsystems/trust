@@ -13,27 +13,25 @@
 
 use std::time::Instant;
 
+use rustc_attr_ir::Linkage;
 use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::base::maybe_create_entry_wrapper;
 use rustc_codegen_ssa::mono_item::MonoItemExt;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::small_c_str::SmallCStr;
-use rustc_hir::attrs::Linkage;
 use rustc_middle::dep_graph;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrs, SanitizerFnAttrs};
 use rustc_middle::mono::Visibility;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{DebugInfo, Offload};
 use rustc_span::Symbol;
-use rustc_target::spec::{LlvmAbi, SanitizerSet};
+use rustc_target::spec::SanitizerSet;
 
-use super::ModuleLlvm;
-use crate::attributes;
 use crate::builder::Builder;
 use crate::builder::gpu_offload::OffloadGlobals;
-use crate::common::pauth_fn_attrs;
 use crate::context::CodegenCx;
 use crate::llvm::{self, Value};
+use crate::{ModuleLlvm, attributes};
 
 pub(crate) struct ValueIter<'ll> {
     cur: Option<&'ll Value>,
@@ -52,13 +50,20 @@ impl<'ll> Iterator for ValueIter<'ll> {
     }
 }
 
-pub(crate) fn iter_globals(llmod: &llvm::Module) -> ValueIter<'_> {
+pub(crate) fn iter_globals<'ll>(llmod: llvm::Module<'ll>) -> ValueIter<'ll> {
     unsafe { ValueIter { cur: llvm::LLVMGetFirstGlobal(llmod), step: llvm::LLVMGetNextGlobal } }
+}
+
+pub(crate) fn iter_global_aliases<'ll>(llmod: llvm::Module<'ll>) -> ValueIter<'ll> {
+    unsafe {
+        ValueIter { cur: llvm::LLVMGetFirstGlobalAlias(llmod), step: llvm::LLVMGetNextGlobalAlias }
+    }
 }
 
 pub(crate) fn compile_codegen_unit(
     tcx: TyCtxt<'_>,
     cgu_name: Symbol,
+    bitcode_needed: bool,
 ) -> (ModuleCodegen<ModuleLlvm>, u64) {
     let start_time = Instant::now();
 
@@ -66,7 +71,7 @@ pub(crate) fn compile_codegen_unit(
     let (module, _) = tcx.dep_graph.with_task(
         dep_node,
         tcx,
-        || module_codegen(tcx, cgu_name),
+        || module_codegen(tcx, cgu_name, bitcode_needed),
         Some(dep_graph::hash_result),
     );
     let time_to_codegen = start_time.elapsed();
@@ -75,7 +80,11 @@ pub(crate) fn compile_codegen_unit(
     // the time we needed for codegenning it.
     let cost = time_to_codegen.as_nanos() as u64;
 
-    fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<ModuleLlvm> {
+    fn module_codegen(
+        tcx: TyCtxt<'_>,
+        cgu_name: Symbol,
+        needs_bitcode: bool,
+    ) -> ModuleCodegen<ModuleLlvm> {
         let cgu = tcx.codegen_unit(cgu_name);
         let _prof_timer =
             tcx.prof.generic_activity_with_arg_recorder("codegen_module", |recorder| {
@@ -84,8 +93,8 @@ pub(crate) fn compile_codegen_unit(
             });
         // Instantiate monomorphizations without filling out definitions yet...
         let llvm_module = ModuleLlvm::new(tcx, cgu_name.as_str());
-        {
-            let mut cx = CodegenCx::new(tcx, cgu, &llvm_module);
+        llvm_module.with_module_refs(|module_refs| {
+            let mut cx = CodegenCx::new(tcx, cgu, module_refs, needs_bitcode);
 
             // Declare and store globals shared by all offload kernels
             //
@@ -124,15 +133,17 @@ pub(crate) fn compile_codegen_unit(
             if let Some(entry) =
                 maybe_create_entry_wrapper::<Builder<'_, '_, '_>>(&cx, cx.codegen_unit)
             {
-                let mut attrs = attributes::sanitize_attrs(&cx, tcx, SanitizerFnAttrs::default());
+                let mut attrs =
+                    attributes::sanitize_attrs(&cx, tcx, SanitizerFnAttrs::default(), None, None);
                 // When pointer authentication is enabled, ensure that the ptrauth-* attributes are
                 // also attached to the entry wrapper.
                 //
                 // FIXME(jchlanda) If it ever becomes necessary to ensure that all compiler
                 // generated functions receive the ptrauth-* attributes, `declare_fn` or
                 // `declare_raw_fn` could be used to provide those.
-                if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
-                    for &ptrauth_attr in pauth_fn_attrs() {
+                if cx.sess().pointer_authentication() {
+                    let cfg = cx.sess().pointer_auth_config.as_ref().unwrap();
+                    for ptrauth_attr in cfg.fn_attrs() {
                         attrs.push(llvm::CreateAttrString(cx.llcx, ptrauth_attr));
                     }
                 }
@@ -152,28 +163,22 @@ pub(crate) fn compile_codegen_unit(
                 cx.add_objc_module_flags();
             }
 
-            if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
-                // FIXME(jchlanda): In LLVM/Clang, there are also `aarch64-elf-pauthabi-platform`
-                // and `aarch64-elf-pauthabi-version` module flags. These are emitted into the
-                // PAuth core info section of the resulting ELF, which the linker uses to enforce
-                // binary compatibility.
-                //
-                // We intentionally do not emit these flags now, since only a subset of features
-                // included in clang's pauthtest is currently supported. By default, the absence of
-                // this info is treated as compatible with any binary.
-                //
-                // Please note, that this would cause compatibility issues, specifically runtime
-                // crashes due to authentication failures (while compiling and linking
-                // successfully) when linking against binaries that support larger set of features
-                // (for example, signing of C++ member function pointers, virtual function
-                // pointers, virtual table pointers).
-                //
-                // Link to PAuth core info documentation:
-                // <https://github.com/ARM-software/abi-aa/blob/2025Q4/pauthabielf64/pauthabielf64.rst#core-information>
-                if cx.sess().opts.unstable_opts.ptrauth_elf_got {
+            if cx.sess().pointer_authentication() {
+                let cfg = cx.sess().pointer_auth_config.as_ref().unwrap();
+
+                let aarch64_elf_pauthabi_version =
+                    cfg.calculate_pauth_abi_version(&cx.sess().target);
+                if aarch64_elf_pauthabi_version != 0 {
+                    cx.add_ptrauth_pauthabi_version_and_platform_flags(
+                        aarch64_elf_pauthabi_version,
+                    );
+                }
+                if cfg.elf_got {
                     cx.add_ptrauth_elf_got_flag();
                 }
-                cx.add_ptrauth_sign_personality_flag();
+                if cx.sess().pointer_authentication_functions().is_some() {
+                    cx.add_ptrauth_sign_personality_flag();
+                }
             }
 
             // Finalize code coverage by injecting the coverage map. Note, the coverage map will
@@ -208,7 +213,7 @@ pub(crate) fn compile_codegen_unit(
             if cx.sess().opts.debuginfo != DebugInfo::None {
                 cx.debuginfo_finalize();
             }
-        }
+        });
 
         ModuleCodegen::new_regular(cgu_name.to_string(), llvm_module)
     }
@@ -232,7 +237,6 @@ pub(crate) fn linkage_to_llvm(linkage: Linkage) -> llvm::Linkage {
         Linkage::WeakODR => llvm::Linkage::WeakODRLinkage,
         Linkage::Internal => llvm::Linkage::InternalLinkage,
         Linkage::ExternalWeak => llvm::Linkage::ExternalWeakLinkage,
-        Linkage::Common => llvm::Linkage::CommonLinkage,
     }
 }
 

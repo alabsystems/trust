@@ -11,19 +11,20 @@
 use std::mem;
 use std::ops::ControlFlow;
 
+use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::ExtendUnord;
 use rustc_errors::{E0720, ErrorGuaranteed};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, InferKind, Visitor};
-use rustc_hir::{self as hir, AmbigArg, HirId, find_attr};
+use rustc_hir::{self as hir, AmbigArg, HirId};
 use rustc_infer::traits::solve::Goal;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
 use rustc_middle::ty::{
-    self, DefiningScopeKind, DefinitionSiteHiddenType, Flags, Ty, TyCtxt, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
-    Unnormalized, fold_regions,
+    self, DefiningScopeKind, DefinitionSiteHiddenType, Flags, PredicateProxy, Ty, TyCtxt,
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor, Unnormalized, fold_regions,
 };
 use rustc_span::Span;
 use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
@@ -76,6 +77,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         wbcx.visit_user_provided_sigs();
         wbcx.visit_coroutine_interior();
         wbcx.visit_transmutes();
+        wbcx.visit_offloads();
         wbcx.visit_offset_of_container_types();
         wbcx.visit_potentially_region_dependent_goals();
 
@@ -375,6 +377,9 @@ impl<'cx, 'tcx> Visitor<'tcx> for WritebackCx<'cx, 'tcx> {
 
 impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     fn eval_closure_size(&mut self) {
+        if self.fcx.typeck_results.borrow().closure_size_eval.is_empty() {
+            return;
+        }
         self.tcx().with_stable_hashing_context(|mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
@@ -392,6 +397,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     }
 
     fn visit_min_capture_map(&mut self) {
+        if self.fcx.typeck_results.borrow().closure_min_captures.is_empty() {
+            return;
+        }
         self.tcx().with_stable_hashing_context(|mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
@@ -423,6 +431,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     }
 
     fn visit_fake_reads_map(&mut self) {
+        if self.fcx.typeck_results.borrow().closure_fake_reads.is_empty() {
+            return;
+        }
         self.tcx().with_stable_hashing_context(move |mut hcx| {
             let fcx_typeck_results = self.fcx.typeck_results.borrow();
 
@@ -498,7 +509,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             }
 
             if !errors_buffer.is_empty() {
-                errors_buffer.sort_by_key(|diag| diag.span.primary_span());
+                errors_buffer.sort_by_key(|diag| diag.span.primary_span().map(Span::lo_hi));
                 for err in errors_buffer {
                     err.emit();
                 }
@@ -541,6 +552,21 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             let from = self.resolve(from, &span);
             let to = self.resolve(to, &span);
             self.typeck_results.transmutes_to_check.push((from, to, hir_id));
+        }
+    }
+
+    fn visit_offloads(&mut self) {
+        let tcx = self.tcx();
+        let fcx_typeck_results = self.fcx.typeck_results.borrow();
+        assert_eq!(fcx_typeck_results.hir_owner, self.typeck_results.hir_owner);
+        for &(kernel_ty, args_ty, ret_ty, hir_id) in
+            self.fcx.deferred_offload_checks.borrow().iter()
+        {
+            let span = tcx.hir_span(hir_id);
+            let kernel_ty = self.resolve(kernel_ty, &span);
+            let args_ty = self.resolve(args_ty, &span);
+            let ret_ty = self.resolve(ret_ty, &span);
+            self.typeck_results.offloads_to_check.push((kernel_ty, args_ty, ret_ty, hir_id));
         }
     }
 
@@ -603,7 +629,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
                         guar
                     } else {
                         let (Ok(guar) | Err(guar)) =
-                            prev.build_mismatch_error(&hidden_type, tcx).map(|d| d.emit());
+                            prev.build_mismatch_error(&hidden_type, tcx).map(|d| d.emit_err());
                         guar
                     };
                     *entry = DefinitionSiteHiddenType::new_error(tcx, guar);
@@ -615,35 +641,37 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             }
         }
 
-        let recursive_opaques: Vec<_> = self
-            .typeck_results
-            .hidden_types
-            .iter()
-            .filter(|&(&def_id, hidden_ty)| {
-                hidden_ty
-                    .ty
-                    .instantiate_identity()
-                    .skip_norm_wip()
-                    .visit_with(&mut HasRecursiveOpaque {
-                        def_id,
-                        seen: Default::default(),
-                        opaques: &self.typeck_results.hidden_types,
-                        tcx,
-                    })
-                    .is_break()
-            })
-            .map(|(def_id, hidden_ty)| (*def_id, hidden_ty.span))
-            .collect();
-        for (def_id, span) in recursive_opaques {
-            let guar = self
-                .fcx
-                .dcx()
-                .struct_span_err(span, "cannot resolve opaque type")
-                .with_code(E0720)
-                .emit();
-            self.typeck_results
+        if !self.typeck_results.hidden_types.is_empty() {
+            let recursive_opaques: Vec<_> = self
+                .typeck_results
                 .hidden_types
-                .insert(def_id, DefinitionSiteHiddenType::new_error(tcx, guar));
+                .iter()
+                .filter(|&(&def_id, hidden_ty)| {
+                    hidden_ty
+                        .ty
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .visit_with(&mut HasRecursiveOpaque {
+                            def_id,
+                            seen: Default::default(),
+                            opaques: &self.typeck_results.hidden_types,
+                            tcx,
+                        })
+                        .is_break()
+                })
+                .map(|(def_id, hidden_ty)| (*def_id, hidden_ty.span))
+                .collect();
+            for (def_id, span) in recursive_opaques {
+                let guar = self
+                    .fcx
+                    .dcx()
+                    .struct_span_err(span, "cannot resolve opaque type")
+                    .with_code(E0720)
+                    .emit_err();
+                self.typeck_results
+                    .hidden_types
+                    .insert(def_id, DefinitionSiteHiddenType::new_error(tcx, guar));
+            }
         }
     }
 
@@ -791,8 +819,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
         let obligations = self.fcx.take_hir_typeck_potentially_region_dependent_goals();
         if self.fcx.tainted_by_errors().is_none() {
             for obligation in obligations {
-                let (predicate, mut cause) =
-                    self.fcx.resolve_vars_if_possible((obligation.predicate, obligation.cause));
+                let (predicate, mut cause) = self
+                    .fcx
+                    .deeply_resolve_ignoring_regions((obligation.predicate, obligation.cause));
                 if predicate.has_non_region_infer() {
                     self.fcx.dcx().span_delayed_bug(
                         cause.span,
@@ -817,7 +846,18 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let value = self.fcx.resolve_vars_if_possible(value);
+        let value = self.fcx.deeply_resolve_ignoring_regions(value);
+        if !value.has_non_region_infer()
+            && !value.has_erasable_regions()
+            && (!self.fcx.next_trait_solver()
+                || (!self.fcx.tcx.renormalize_rigid_aliases() && !value.has_non_rigid_aliases()))
+            && !self.fcx.tcx.features().generic_const_exprs()
+        {
+            if let Err(guar) = value.error_reported() {
+                self.typeck_results.tainted_by_errors = Some(guar);
+            }
+            return value;
+        }
 
         let mut goals = vec![];
         let value =
@@ -831,7 +871,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             goals
                 .into_iter()
                 .map(|pred| {
-                    self.fcx.resolve_vars_if_possible(pred).fold_with(&mut Resolver::new(
+                    self.fcx.deeply_resolve_ignoring_regions(pred).fold_with(&mut Resolver::new(
                         self.fcx,
                         span,
                         self.body,
@@ -860,7 +900,7 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let value = self.fcx.resolve_vars_if_possible(value);
+        let value = self.fcx.deeply_resolve_ignoring_regions(value);
 
         let mut goals = vec![];
         let value =
@@ -930,7 +970,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
                     TypeAnnotationNeeded::E0282,
                     false,
                 )
-                .emit()
+                .emit_err()
         }
     }
 
@@ -947,7 +987,10 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         let tcx = self.fcx.tcx;
         // We must deeply normalize in the new solver, since later lints expect
         // that types that show up in the typeck are fully normalized.
-        let mut value = if self.should_normalize && self.fcx.next_trait_solver() {
+        let mut value = if self.should_normalize
+            && self.fcx.next_trait_solver()
+            && (tcx.renormalize_rigid_aliases() || value.has_non_rigid_aliases())
+        {
             let body_def_id = tcx.hir_body_owner_def_id(self.body.id());
             let cause = ObligationCause::misc(self.span.to_span(tcx), body_def_id);
             let at = self.fcx.at(&cause, self.fcx.param_env);
@@ -985,7 +1028,9 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         //
         // We're not using `tcx.erase_and_anonymize_regions` as that also
         // anonymizes bound variables, regressing borrowck diagnostics.
-        value = fold_regions(tcx, value, |_, _| tcx.lifetimes.re_erased);
+        if value.has_erasable_regions() {
+            value = fold_regions(tcx, value, |_, _| tcx.lifetimes.re_erased);
+        }
 
         // Normalize consts in writeback, because GCE doesn't normalize eagerly.
         if tcx.features().generic_const_exprs() {
@@ -1016,7 +1061,7 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
         self.handle_term(ct, ty::Const::outer_exclusive_binder, ty::Const::new_error)
     }
 
-    fn fold_predicate(&mut self, predicate: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
+    fn fold_predicate<P: PredicateProxy<TyCtxt<'tcx>>>(&mut self, predicate: P) -> P {
         assert!(
             !self.should_normalize,
             "normalizing predicates in writeback is not generally sound"
@@ -1060,6 +1105,9 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for HasRecursiveOpaque<'_, 'tcx> {
     type Result = ControlFlow<()>;
 
     fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
+        if !t.has_opaque_types() {
+            return ControlFlow::Continue(());
+        }
         if let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) = *t.kind()
             && let Some(def_id) = def_id.as_local()
         {

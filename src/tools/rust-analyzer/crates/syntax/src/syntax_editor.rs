@@ -1,6 +1,6 @@
 //! Syntax Tree editor
 //!
-//! Inspired by Roslyn's [`SyntaxEditor`], but is temporarily built upon mutable syntax tree editing.
+//! Inspired by Roslyn's [`SyntaxEditor`].
 //!
 //! [`SyntaxEditor`]: https://github.com/dotnet/roslyn/blob/43b0b05cc4f492fd5de00f6f6717409091df8daa/src/Workspaces/Core/Portable/Editing/SyntaxEditor.cs
 
@@ -39,13 +39,12 @@ impl SyntaxEditor {
     /// Creates a syntax editor from `root`.
     ///
     /// The returned `root` is guaranteed to be a detached, immutable node.
-    /// If the provided node is not a root (i.e., has a parent) or is already
-    /// mutable, it is cloned into a fresh subtree to satisfy syntax editor
-    /// invariants.
+    /// If the provided node is not a root (i.e., has a parent), it is cloned
+    /// into a fresh subtree to satisfy syntax editor invariants.
     pub fn new(root: SyntaxNode) -> (Self, SyntaxNode) {
         let mut root = root;
 
-        if root.parent().is_some() || root.is_mutable() {
+        if root.parent().is_some() {
             root = root.clone_subtree()
         };
 
@@ -292,9 +291,13 @@ impl Position {
     pub(crate) fn place(&self) -> (SyntaxNode, usize) {
         match &self.repr {
             PositionRepr::FirstChild(parent) => (parent.clone(), 0),
-            PositionRepr::After(child) => (child.parent().unwrap(), child.index() + 1),
+            PositionRepr::After(child) => (child.parent().unwrap(), index_no_trivia(child) + 1),
         }
     }
+}
+
+pub fn index_no_trivia(element: &SyntaxElement) -> usize {
+    element.index().expect("the parser emits trivia as standalone tokens")
 }
 
 #[derive(Debug)]
@@ -603,7 +606,7 @@ mod tests {
         let to_replace = root.syntax().descendants().find_map(ast::BinExpr::cast).unwrap();
 
         let name = make::name("var_name");
-        let name_ref = make::name_ref("var_name").clone_for_update();
+        let name_ref = make::name_ref("var_name");
 
         let placeholder_snippet = SyntaxAnnotation::default();
         editor.add_annotation(name.syntax(), placeholder_snippet);
@@ -884,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_more_times_replace_node_to_mutable_token() {
+    fn test_more_times_replace_node_to_same_token() {
         let arg_list =
             make::arg_list([make::expr_literal("1").into(), make::expr_literal("2").into()]);
 
@@ -903,13 +906,13 @@ mod tests {
     }
 
     #[test]
-    fn test_more_times_replace_node_to_mutable() {
+    fn test_more_times_replace_node_to_same_node() {
         let arg_list =
             make::arg_list([make::expr_literal("1").into(), make::expr_literal("2").into()]);
 
         let (editor, arg_list) = SyntaxEditor::with_ast_node(&arg_list);
 
-        let target_expr = make::expr_literal("3").clone_for_update();
+        let target_expr = make::expr_literal("3");
 
         for arg in arg_list.args() {
             editor.replace(arg.syntax(), target_expr.syntax());
@@ -922,13 +925,13 @@ mod tests {
     }
 
     #[test]
-    fn test_more_times_insert_node_to_mutable() {
+    fn test_more_times_insert_node_to_same_node() {
         let arg_list =
             make::arg_list([make::expr_literal("1").into(), make::expr_literal("2").into()]);
 
         let (editor, arg_list) = SyntaxEditor::with_ast_node(&arg_list);
 
-        let target_expr = make::ext::expr_unit().clone_for_update();
+        let target_expr = make::ext::expr_unit();
 
         for arg in arg_list.args() {
             editor.insert(Position::before(arg.syntax()), target_expr.syntax());

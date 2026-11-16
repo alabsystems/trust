@@ -2,16 +2,26 @@
 
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    io::Read as _,
+    os::fd::{AsRawFd as _, FromRawFd as _},
+};
 
 use serde_json::{Value, json};
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
 use trust_version::{BoundToolIdentity, TrustVersionIdentity};
 
 use super::identity::{
-    bound_file_sha256, build_version_identity, discover_repo_root, generated_at_unix_seconds,
-    is_executable_file, option_value, trustd_version_output_is_bound,
+    TOOL_IDENTITY_PROBE_HANG_GUARD, bound_file_sha256, build_version_identity, discover_repo_root,
+    generated_at_unix_seconds, is_executable_file, option_value, trustd_version_output_is_bound,
 };
 use super::product_proof::PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS;
 use super::types::CANDIDATE_COMMAND_VERSION;
@@ -28,6 +38,9 @@ const SMOKE_LABEL: &str = "product-proof-live-smoke";
 const DEFAULT_OUTPUT_ROOT: &str = "build/product-proof";
 const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GIT_INDEX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(unix)]
+const MAX_PUBLISHED_ARTIFACT_BYTES: u64 =
+    crate::input_limits::MAX_RELEASE_TRANSCRIPT_REPORT_BYTES as u64;
 
 #[derive(Default)]
 struct Options {
@@ -194,8 +207,11 @@ fn collect(
 
     let transcript = render_transcript(&smoke)?;
     let transcript_sha256 = trust_types::digest::stable_sha256_hex(transcript.as_bytes());
-    let transcript_relative = format!(
-        "{DEFAULT_OUTPUT_ROOT}/transcripts/trustd-protocol-smoke-sha256-{transcript_sha256}.txt"
+    let transcript_relative = physical_repo_relative(
+        root,
+        &format!(
+            "{DEFAULT_OUTPUT_ROOT}/transcripts/trustd-protocol-smoke-sha256-{transcript_sha256}.txt"
+        ),
     );
     if output_relative == transcript_relative {
         return Err("--out must be distinct from the content-addressed transcript".to_string());
@@ -208,9 +224,7 @@ fn collect(
             transcript_path.display()
         )
     })?;
-    if bound_file_sha256(&transcript_path).as_deref() != Some(transcript_sha256.as_str()) {
-        return Err("content-addressed transcript did not read back with its SHA-256".to_string());
-    }
+    require_published_artifact(root, &transcript_relative, &transcript_sha256)?;
 
     require_exact_clean_candidate(root, candidate_commit)?;
     require_candidate_unchanged(&candidate)?;
@@ -220,17 +234,17 @@ fn collect(
     if generated_at < PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS {
         return Err("system clock cannot produce an admissible evidence timestamp".to_string());
     }
-    let evidence = build_evidence(
+    let evidence = build_evidence(EvidenceBuildInput {
         candidate_commit,
-        &candidate,
-        &runtime_closure,
-        &smoke,
+        candidate: &candidate,
+        runtime_closure: &runtime_closure,
+        smoke: &smoke,
         generated_at,
         clean_metadata,
-        git_identity.clone(),
-        &transcript_relative,
-        &transcript_sha256,
-    );
+        git_identity: git_identity.clone(),
+        transcript_path: &transcript_relative,
+        transcript_sha256: &transcript_sha256,
+    });
     let rendered = serde_json::to_string_pretty(&evidence)
         .map_err(|error| format!("could not render trustd evidence JSON: {error}"))?;
     let evidence_bytes = format!("{rendered}\n");
@@ -238,14 +252,15 @@ fn collect(
     atomic_write_private(output_path, evidence_bytes.as_bytes()).map_err(|error| {
         format!("could not publish {} atomically: {error}", output_path.display())
     })?;
-    if bound_file_sha256(output_path).as_deref() != Some(evidence_sha256.as_str()) {
-        return Err("evidence JSON did not read back with its publication SHA-256".to_string());
-    }
+    require_published_artifact(root, output_relative, &evidence_sha256)?;
     require_exact_clean_candidate(root, candidate_commit)?;
     require_candidate_unchanged(&candidate)?;
+    runtime_closure.validate_for_candidate(&candidate.path)?;
     if controlled_git_identity(root)? != git_identity {
         return Err("controlled Git executable changed during evidence publication".to_string());
     }
+    require_published_artifact(root, &transcript_relative, &transcript_sha256)?;
+    require_published_artifact(root, output_relative, &evidence_sha256)?;
 
     Ok(Collection {
         evidence,
@@ -349,7 +364,7 @@ fn verify_cleared_version_probe(
             &mut command,
             "canonical trustd evidence identity probe",
             64 * 1024,
-            Duration::from_secs(10),
+            TOOL_IDENTITY_PROBE_HANG_GUARD,
         )?;
         if !output.status.success() {
             return Err(format!("canonical trustd --version exited {}", output.status));
@@ -386,13 +401,17 @@ fn verify_cleared_version_probe(
 struct TrustdChild {
     child: std::process::Child,
     pid: u32,
+    _ownership: crate::process_lifecycle::Ownership,
 }
 
 #[cfg(unix)]
 impl Drop for TrustdChild {
     fn drop(&mut self) {
-        let _ = bounded_process::terminate_process_group(self.pid);
-        let _ = self.child.kill();
+        // The private daemon runs until it is stopped; the smoke is done with it.
+        let _ = crate::process_lifecycle::stop_tree(
+            self.pid,
+            crate::process_lifecycle::StopCause::Released,
+        );
         let _ = self.child.wait();
     }
 }
@@ -404,11 +423,17 @@ fn capture_live_smoke(
 ) -> Result<trust_router::coordinator::DaemonSmoke, String> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(
+            "trustd live-smoke peer-PID binding is implemented only on macOS and Linux".to_string()
+        );
+    }
     require_candidate_unchanged(candidate)?;
     let socket_root =
-        tempfile::Builder::new().prefix("trust-product-proof-collector-").tempdir().map_err(
-            |error| format!("could not create private trustd socket directory: {error}"),
-        )?;
+        crate::smoke_socket_root::create(crate::smoke_socket_root::Purpose::EvidenceCollector)
+            .map_err(|error| {
+                format!("could not create private trustd socket directory: {error}")
+            })?;
     fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700)).map_err(
         |error| format!("could not make trustd socket directory owner-private: {error}"),
     )?;
@@ -441,9 +466,8 @@ fn capture_live_smoke(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     apply_trustd_runtime_closure(&mut command, &candidate.path, runtime_closure)?;
-    bounded_process::configure_process_group(&mut command);
-    let child = match command.spawn() {
-        Ok(child) => child,
+    let (child, ownership) = match crate::process_lifecycle::spawn_owned(&mut command) {
+        Ok(owned) => owned,
         Err(error) => {
             require_candidate_unchanged(candidate)?;
             runtime_closure.validate_for_candidate(&candidate.path)?;
@@ -451,7 +475,7 @@ fn capture_live_smoke(
         }
     };
     let pid = child.id();
-    let mut child = TrustdChild { child, pid };
+    let mut child = TrustdChild { child, pid, _ownership: ownership };
 
     let smoke_result = (|| -> Result<trust_router::coordinator::DaemonSmoke, String> {
         // Same wall-clock/contention hazard as a bounded probe deadline, so it
@@ -466,7 +490,11 @@ fn capture_live_smoke(
             {
                 return Err("canonical candidate trustd exited before readiness".to_string());
             }
-            if trust_router::coordinator::daemon_matches_executable(&socket, &candidate.path) {
+            if trust_router::coordinator::daemon_matches_executable_from_pid(
+                &socket,
+                &candidate.path,
+                child.pid,
+            ) {
                 break;
             }
             if Instant::now() >= ready_deadline {
@@ -489,8 +517,12 @@ fn capture_live_smoke(
             );
         }
 
-        let smoke =
-            trust_router::coordinator::exercise_daemon_at(&socket, &candidate.path, SMOKE_LABEL)?;
+        let smoke = trust_router::coordinator::exercise_daemon_at_from_pid(
+            &socket,
+            &candidate.path,
+            SMOKE_LABEL,
+            child.pid,
+        )?;
         if bounded_process::exited_without_reaping(&mut child.child)
             .map_err(|error| format!("could not poll candidate trustd: {error}"))?
         {
@@ -562,18 +594,31 @@ fn render_transcript(_smoke: &()) -> Result<String, String> {
     Err("trustd product-proof evidence collection requires a Unix-domain socket host".to_string())
 }
 
-#[cfg(unix)]
-fn build_evidence(
-    candidate_commit: &str,
-    candidate: &CandidateDaemon,
-    runtime_closure: &TrustdRuntimeClosure,
-    smoke: &trust_router::coordinator::DaemonSmoke,
+struct EvidenceBuildInput<'a, Smoke> {
+    candidate_commit: &'a str,
+    candidate: &'a CandidateDaemon,
+    runtime_closure: &'a TrustdRuntimeClosure,
+    smoke: &'a Smoke,
     generated_at: u64,
     clean_metadata: Value,
     git_identity: Value,
-    transcript_path: &str,
-    transcript_sha256: &str,
-) -> Value {
+    transcript_path: &'a str,
+    transcript_sha256: &'a str,
+}
+
+#[cfg(unix)]
+fn build_evidence(input: EvidenceBuildInput<'_, trust_router::coordinator::DaemonSmoke>) -> Value {
+    let EvidenceBuildInput {
+        candidate_commit,
+        candidate,
+        runtime_closure,
+        smoke,
+        generated_at,
+        clean_metadata,
+        git_identity,
+        transcript_path,
+        transcript_sha256,
+    } = input;
     json!({
         "schema_version": EVIDENCE_SCHEMA,
         "evidence_kind": EVIDENCE_KIND,
@@ -626,17 +671,18 @@ fn build_evidence(
 }
 
 #[cfg(not(unix))]
-fn build_evidence(
-    _candidate_commit: &str,
-    _candidate: &CandidateDaemon,
-    _runtime_closure: &TrustdRuntimeClosure,
-    _smoke: &(),
-    _generated_at: u64,
-    _clean_metadata: Value,
-    _git_identity: Value,
-    _transcript_path: &str,
-    _transcript_sha256: &str,
-) -> Value {
+fn build_evidence(input: EvidenceBuildInput<'_, ()>) -> Value {
+    let EvidenceBuildInput {
+        candidate_commit: _candidate_commit,
+        candidate: _candidate,
+        runtime_closure: _runtime_closure,
+        smoke: _smoke,
+        generated_at: _generated_at,
+        clean_metadata: _clean_metadata,
+        git_identity: _git_identity,
+        transcript_path: _transcript_path,
+        transcript_sha256: _transcript_sha256,
+    } = input;
     Value::Null
 }
 
@@ -725,7 +771,31 @@ fn repo_relative_json_output(root: &Path, path_text: &str) -> Result<(String, Pa
                 .to_string(),
         );
     }
-    Ok((path_text.to_string(), root.join(path)))
+    let relative = physical_repo_relative(root, path_text);
+    let path = root.join(&relative);
+    Ok((relative, path))
+}
+
+/// The spelling of a repo-relative output that the checks below can address.
+///
+/// Under the Spotlight layout (docs/BUILD_AND_INSTALL.md, "Keeping Spotlight out
+/// of build/") `build` is a symlink to `build.noindex`, and a path spelled
+/// `build/...` crosses it. Both halves of this collector refuse that on
+/// purpose: Git answers a pathspec "beyond a symbolic link" with a fatal error
+/// (`check-ignore` exits 128, so the ignore-policy probe fails), and
+/// `atomic_write_private` and the publication readback open every component
+/// without following links. Only the one link
+/// [`crate::stage2_tools::is_sanctioned_build_link`] accepts is looked
+/// through: the same file is addressed by its real directory, and the evidence
+/// records that link-free `build.noindex/...` path. Every other spelling, and
+/// every other link, is returned unchanged and is still refused where it was.
+fn physical_repo_relative(root: &Path, relative: &str) -> String {
+    match relative.split_once('/') {
+        Some(("build", rest)) if crate::stage2_tools::is_sanctioned_build_link(root) => {
+            format!("{}/{rest}", crate::stage2_tools::BUILD_NOINDEX)
+        }
+        _ => relative.to_string(),
+    }
 }
 
 fn require_ignored_untracked_output(
@@ -812,6 +882,12 @@ fn require_tracked_ignore_rule(root: &Path, relative: &str) -> Result<(), String
 }
 
 fn repo_relative_exact_regular_file(root: &Path, relative: &Path) -> bool {
+    let Ok(root_metadata) = fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !root_metadata.file_type().is_dir() {
+        return false;
+    }
     let components = relative.components().collect::<Vec<_>>();
     if components.is_empty() {
         return false;
@@ -834,6 +910,174 @@ fn repo_relative_exact_regular_file(root: &Path, relative: &Path) -> bool {
         }
     }
     true
+}
+
+fn require_published_artifact(
+    root: &Path,
+    relative: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let actual = opened_published_artifact_sha256(root, Path::new(relative), || {}).map_err(
+            |detail| {
+                format!(
+                    "published artifact `{relative}` is not an exact repo-local regular file or changed during readback: {detail}"
+                )
+            },
+        )?;
+        if actual == expected_sha256 {
+            return Ok(());
+        }
+        Err(format!("published artifact `{relative}` changed or does not match its SHA-256"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, expected_sha256);
+        Err(format!("published artifact `{relative}` requires Unix descriptor-anchored readback"))
+    }
+}
+
+#[cfg(unix)]
+struct OpenedPathComponent {
+    parent: fs::File,
+    name: CString,
+    dev: u64,
+    ino: u64,
+    is_dir: bool,
+}
+
+#[cfg(unix)]
+fn opened_published_artifact_sha256(
+    root: &Path,
+    relative: &Path,
+    before_leaf_open: impl FnOnce(),
+) -> Result<String, String> {
+    if !root.is_absolute() || relative.as_os_str().is_empty() {
+        return Err("publication path is not an absolute root plus a relative file".to_string());
+    }
+    let mut names = Vec::new();
+    for component in root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => names.push(name),
+            _ => return Err("publication root contains a non-normal component".to_string()),
+        }
+    }
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            _ => {
+                return Err("publication relative path contains a non-normal component".to_string());
+            }
+        }
+    }
+    let last = names.len() - 1;
+    let mut current =
+        fs::File::open("/").map_err(|error| format!("could not open filesystem root: {error}"))?;
+    // Retain parent fds so a post-hash fstatat can detect a replaced ancestor.
+    let mut opened = Vec::with_capacity(names.len());
+    let mut before_leaf_open = Some(before_leaf_open);
+    for (index, name) in names.into_iter().enumerate() {
+        let leaf = index == last;
+        if leaf {
+            before_leaf_open.take().expect("leaf hook is called once")();
+        }
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| "publication path contains a NUL byte".to_string())?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if leaf { libc::O_NONBLOCK } else { libc::O_DIRECTORY };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(format!(
+                "could not open exact publication path component: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let child = unsafe { fs::File::from_raw_fd(fd) };
+        let metadata = child
+            .metadata()
+            .map_err(|error| format!("could not inspect opened publication component: {error}"))?;
+        if (leaf && !metadata.file_type().is_file()) || (!leaf && !metadata.file_type().is_dir()) {
+            return Err("publication path component has the wrong file type".to_string());
+        }
+        opened.push(OpenedPathComponent {
+            parent: current,
+            name,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            is_dir: !leaf,
+        });
+        current = child;
+    }
+
+    let before = current
+        .metadata()
+        .map_err(|error| format!("could not inspect opened artifact: {error}"))?;
+    if before.len() > MAX_PUBLISHED_ARTIFACT_BYTES {
+        return Err("published artifact exceeds the publication readback byte limit".to_string());
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = current
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read opened artifact: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or("published artifact length overflowed")?;
+        if total > before.len() || total > MAX_PUBLISHED_ARTIFACT_BYTES {
+            return Err(
+                "published artifact changed or exceeded its byte limit during readback".to_string()
+            );
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = current
+        .metadata()
+        .map_err(|error| format!("could not re-inspect opened artifact: {error}"))?;
+    if total != before.len() || !same_opened_artifact_snapshot(&before, &after) {
+        return Err("published artifact changed during readback".to_string());
+    }
+    for component in &opened {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                component.parent.as_raw_fd(),
+                component.name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err("published artifact path changed during readback".to_string());
+        }
+        let stat = unsafe { stat.assume_init() };
+        let expected_type = if component.is_dir { libc::S_IFDIR } else { libc::S_IFREG };
+        if stat.st_dev as u64 != component.dev
+            || i128::from(stat.st_ino) != i128::from(component.ino)
+            || stat.st_mode & libc::S_IFMT != expected_type
+        {
+            return Err("published artifact path changed during readback".to_string());
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+fn same_opened_artifact_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mode() == right.mode()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -988,6 +1232,167 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn publication_rechecks_both_artifacts_after_other_probes() {
+        let repository = tempfile::tempdir().expect("temporary publication root");
+        let canonical_root =
+            fs::canonicalize(repository.path()).expect("canonical publication root");
+        let root = canonical_root.as_path();
+        let transcript_relative = "build/product-proof/transcript.txt";
+        let evidence_relative = "build/product-proof/evidence.json";
+        let output_dir = root.join("build/product-proof");
+        fs::create_dir_all(&output_dir).expect("create publication directory");
+        let transcript = b"observed transcript\n";
+        let evidence = b"{\"status\":\"passed\"}\n";
+        fs::write(root.join(transcript_relative), transcript).expect("write transcript");
+        fs::write(root.join(evidence_relative), evidence).expect("write evidence");
+        let transcript_sha256 = trust_types::digest::stable_sha256_hex(transcript);
+        let evidence_sha256 = trust_types::digest::stable_sha256_hex(evidence);
+
+        require_published_artifact(root, transcript_relative, &transcript_sha256)
+            .expect("initial transcript readback");
+        require_published_artifact(root, evidence_relative, &evidence_sha256)
+            .expect("initial evidence readback");
+
+        fs::write(root.join(transcript_relative), b"replaced transcript\n")
+            .expect("replace transcript after first readback");
+        assert!(
+            require_published_artifact(root, transcript_relative, &transcript_sha256)
+                .unwrap_err()
+                .contains("changed")
+        );
+        fs::write(root.join(transcript_relative), transcript).expect("restore transcript");
+        fs::write(root.join(evidence_relative), b"{\"status\":\"failed\"}\n")
+            .expect("replace evidence after first readback");
+        assert!(
+            require_published_artifact(root, evidence_relative, &evidence_sha256)
+                .unwrap_err()
+                .contains("changed")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_rejects_same_byte_parent_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempfile::tempdir().expect("temporary publication root");
+        let canonical_root =
+            fs::canonicalize(repository.path()).expect("canonical publication root");
+        let root = canonical_root.as_path();
+        let mut init = Command::new(controlled_git::executable().expect("controlled Git"));
+        init.env_clear().env("LC_ALL", "C").args(["init", "--quiet"]).arg(root);
+        assert!(init.status().expect("initialize Git repository").success());
+        fs::write(root.join(".gitignore"), "/build/\n").expect("write ignored output policy");
+        let mut add = controlled_git::command(root).expect("controlled Git");
+        add.args(["add", "--", ".gitignore"]);
+        assert!(add.status().expect("index ignore rule").success());
+        let mut commit = controlled_git::command(root).expect("controlled Git");
+        commit.args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        assert!(commit.status().expect("commit ignore rule").success());
+        let head = controlled_git::canonical_head(
+            root,
+            "test candidate HEAD",
+            MAX_GIT_OUTPUT_BYTES,
+            Duration::from_secs(30),
+        )
+        .expect("candidate HEAD");
+        let output_dir = root.join("build/product-proof");
+        fs::create_dir_all(&output_dir).expect("create publication directory");
+        let bytes = b"same bytes\n";
+        let relative = "build/product-proof/transcript.txt";
+        let digest = trust_types::digest::stable_sha256_hex(bytes);
+        fs::write(root.join(relative), bytes).expect("write original transcript");
+        require_published_artifact(root, relative, &digest).expect("initial readback");
+        require_exact_clean_candidate(root, &head).expect("initial clean candidate");
+
+        let moved_dir = root.join("build/moved-output");
+        fs::rename(&output_dir, &moved_dir).expect("move published directory");
+        symlink(&moved_dir, &output_dir).expect("substitute parent symlink");
+        require_exact_clean_candidate(root, &head).expect("alias stays hidden under ignored build");
+        assert_eq!(
+            bound_file_sha256(&root.join(relative)).as_deref(),
+            Some(digest.as_str()),
+            "the former leaf-only readback accepted the aliased parent"
+        );
+        assert!(
+            require_published_artifact(root, relative, &digest)
+                .unwrap_err()
+                .contains("not an exact repo-local regular file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_swap_between_parent_open_and_leaf_read_is_refused() {
+        let repository = tempfile::tempdir().expect("temporary publication root");
+        let canonical_root =
+            fs::canonicalize(repository.path()).expect("canonical publication root");
+        let root = canonical_root.as_path();
+        let output_dir = root.join("build/product-proof");
+        let substitute_dir = root.join("build/substitute");
+        fs::create_dir_all(&output_dir).expect("create original output directory");
+        fs::create_dir_all(&substitute_dir).expect("create substitute output directory");
+        let relative = Path::new("build/product-proof/transcript.txt");
+        let bytes = b"same bytes\n";
+        let digest = trust_types::digest::stable_sha256_hex(bytes);
+        fs::write(root.join(relative), bytes).expect("write original artifact");
+        fs::write(substitute_dir.join("transcript.txt"), bytes)
+            .expect("write same-byte substitute");
+
+        let error = opened_published_artifact_sha256(root, relative, || {
+            fs::rename(&output_dir, root.join("build/moved-original"))
+                .expect("move opened ancestor");
+            fs::rename(&substitute_dir, &output_dir)
+                .expect("replace ancestor by another directory");
+        })
+        .expect_err("an ancestor swapped after fd open must be refused");
+        assert!(error.contains("path changed during readback"), "unexpected error: {error}");
+        assert_eq!(
+            bound_file_sha256(&root.join(relative)).as_deref(),
+            Some(digest.as_str()),
+            "the old pathname hash would accept the substitute's equal bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_readback_refuses_oversized_artifact() {
+        let repository = tempfile::tempdir().expect("temporary publication root");
+        let canonical_root =
+            fs::canonicalize(repository.path()).expect("canonical publication root");
+        let root = canonical_root.as_path();
+        let relative = "oversized.json";
+        let file = fs::File::create(root.join(relative)).expect("create sparse artifact");
+        file.set_len(MAX_PUBLISHED_ARTIFACT_BYTES + 1)
+            .expect("extend sparse artifact beyond readback limit");
+        assert!(
+            require_published_artifact(root, relative, &"0".repeat(64))
+                .unwrap_err()
+                .contains("readback byte limit")
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn publication_without_descriptor_walk_fails_closed() {
+        assert!(
+            require_published_artifact(Path::new("/candidate"), "evidence.json", "0")
+                .unwrap_err()
+                .contains("requires Unix descriptor-anchored readback")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn output_policy_accepts_only_ignored_untracked_paths() {
         let repository = tempfile::tempdir().expect("temporary Git repository");
         let mut init = Command::new(controlled_git::executable().expect("controlled Git"));
@@ -1052,6 +1457,66 @@ mod tests {
         );
     }
 
+    /// The default output, `build/product-proof/...`, under the Spotlight layout
+    /// (`build -> build.noindex`, docs/BUILD_AND_INSTALL.md): the ignore-policy
+    /// probe, the no-follow atomic write and the descriptor readback must all
+    /// succeed, through the link-free `build.noindex/...` spelling the evidence
+    /// records. Git refuses the `build/...` spelling outright ("beyond a
+    /// symbolic link"), and any other `build` link is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn default_output_under_the_build_noindex_link_is_published_by_its_real_path() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempfile::tempdir().expect("temporary Git repository");
+        let root = fs::canonicalize(repository.path()).expect("canonical repository root");
+        let root = root.as_path();
+        let mut init = Command::new(controlled_git::executable().expect("controlled Git"));
+        init.env_clear()
+            .env("LC_ALL", "C")
+            .args(["init", "--quiet"])
+            .arg(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        assert!(init.status().expect("initialize Git repository").success());
+        // The repository's own rules: `/build` (no trailing slash, so it also
+        // matches the symlink) and `/build.noindex`.
+        fs::write(root.join(".gitignore"), "/build\n/build.noindex\n").expect("write ignores");
+        let mut add = controlled_git::command(root).expect("controlled Git");
+        add.args(["add", "--", ".gitignore"]).stdout(Stdio::null()).stderr(Stdio::null());
+        assert!(add.status().expect("index .gitignore").success());
+        fs::create_dir(root.join("build.noindex")).expect("create build.noindex");
+        symlink("build.noindex", root.join("build")).expect("link build");
+
+        let requested = "build/product-proof/trustd-protocol-smoke.json";
+        let (relative, path) =
+            repo_relative_json_output(root, requested).expect("default output shape");
+        assert_eq!(relative, "build.noindex/product-proof/trustd-protocol-smoke.json");
+        assert_eq!(path, root.join(&relative));
+        require_ignored_untracked_output(root, &relative, "--out")
+            .expect("the real path is an ignored, untracked output");
+        let bytes = b"{\"status\":\"passed\"}\n";
+        atomic_write_private(&path, bytes).expect("atomic publication beneath build.noindex");
+        require_published_artifact(root, &relative, &trust_types::digest::stable_sha256_hex(bytes))
+            .expect("descriptor readback of the published artifact");
+        assert_eq!(
+            fs::read(root.join(requested)).expect("same file through the link"),
+            bytes.to_vec()
+        );
+        // Git itself refuses the lexical spelling, which is why it is not used.
+        let error = require_ignored_untracked_output(root, requested, "--out")
+            .expect_err("Git refuses a pathspec beyond the build link");
+        assert!(error.contains("Git check-ignore wrote to stderr"), "{error}");
+
+        // Any other `build` link is left alone, and so still refused.
+        fs::remove_file(root.join("build")).expect("remove build link");
+        fs::create_dir(root.join("elsewhere")).expect("create other tree");
+        symlink("elsewhere", root.join("build")).expect("unsanctioned build link");
+        let (relative, _) = repo_relative_json_output(root, requested).expect("output shape");
+        assert_eq!(relative, requested);
+        assert!(require_ignored_untracked_output(root, &relative, "--out").is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn transcript_uses_the_same_canonical_json_as_the_evidence_values() {
@@ -1059,6 +1524,8 @@ mod tests {
             ActiveReservation, DaemonIdentity, DaemonSmoke, DaemonStatus, IDENTITY_VERSION,
             STATUS_VERSION,
         };
+
+        use crate::pipeline::probe::runtime_closure_fixture::RuntimeClosureFixture;
 
         let before = DaemonStatus {
             version: STATUS_VERSION.to_string(),
@@ -1124,22 +1591,21 @@ mod tests {
             commit_hash: "a".repeat(40),
             rust_compat_version: Some("1.0.0".to_string()),
         };
-        let runtime_closure = inspect_trustd_runtime_closure(
-            &std::env::current_exe().expect("current test executable"),
-        )
-        .expect("inspect test executable runtime closure");
+        let fixture = RuntimeClosureFixture::new();
+        let runtime_closure = inspect_trustd_runtime_closure(fixture.candidate())
+            .expect("inspect real thin native fixture runtime closure");
         let transcript = render_transcript(&smoke).expect("render canonical transcript");
-        let evidence = build_evidence(
-            &"a".repeat(40),
-            &candidate,
-            &runtime_closure,
-            &smoke,
-            PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
-            json!({"available": true, "dirty": false, "porcelain_v1": []}),
-            json!({"path": "/usr/bin/git", "clean": true, "dirty": false}),
-            "build/product-proof/transcript.txt",
-            &trust_types::digest::stable_sha256_hex(transcript.as_bytes()),
-        );
+        let evidence = build_evidence(EvidenceBuildInput {
+            candidate_commit: &"a".repeat(40),
+            candidate: &candidate,
+            runtime_closure: &runtime_closure,
+            smoke: &smoke,
+            generated_at: PRODUCT_PROOF_TIMESTAMP_MIN_UNIX_SECONDS,
+            clean_metadata: json!({"available": true, "dirty": false, "porcelain_v1": []}),
+            git_identity: json!({"path": "/usr/bin/git", "clean": true, "dirty": false}),
+            transcript_path: "build/product-proof/transcript.txt",
+            transcript_sha256: &trust_types::digest::stable_sha256_hex(transcript.as_bytes()),
+        });
         assert_eq!(
             evidence["runtime_closure"],
             serde_json::to_value(&runtime_closure).expect("serialize runtime closure")

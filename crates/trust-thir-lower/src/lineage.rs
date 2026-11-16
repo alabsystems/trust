@@ -126,7 +126,7 @@ use crate::{CalleeRef, SiteArg, SiteConst, SiteTy, SiteValTree};
 /// bump the suffix so old and new digests can never collide silently. `v3` adds the
 /// stable concrete-callee key and replaces DefIndex-derived callee ids with body-local
 /// interned ids.
-pub const BODY_LINEAGE_DOMAIN: &str = "trust_thir_lower.body_lineage.v3";
+pub const BODY_LINEAGE_DOMAIN: &str = "trust_thir_lower.body_lineage.v4";
 
 /// Collision-checked, cross-session identity of the definition whose body is
 /// being attested. The components are exactly rustc's `DefPathHash` halves.
@@ -237,6 +237,10 @@ pub enum ConcreteInstanceTy {
     ClosureLike(crate::SiteClosureKind, DefinitionIdentity, Vec<ConcreteInstanceArg>),
     /// Trust (wave-DY): a trait object as its predicate list, region erased.
     Dynamic(Vec<ConcreteExistentialPredicate>),
+    /// Trust (2026-09-14): the never type — a leaf, see `SiteTy::Never`.
+    Never,
+    /// Trust (2026-09-14): an extern type by identity — a leaf, see `SiteTy::Foreign`.
+    Foreign(DefinitionIdentity),
     FnPtr {
         inputs_and_output: Vec<ConcreteInstanceTy>,
         abi: String,
@@ -294,6 +298,43 @@ impl ConcreteCalleeKey {
         !self.args.is_empty()
     }
 
+    /// Trust (WS5.2): which rustc instance category this key denotes. Only an
+    /// [`ConcreteInstanceKind::Item`] names a symbol `crate_module` can compute from the key's
+    /// args alone; a reify shim's symbol also depends on its `ReifyReason`, which the key does
+    /// not carry, so such a declaration keeps a reserved never-linkable name.
+    pub(crate) fn instance_kind(&self) -> ConcreteInstanceKind {
+        self.kind
+    }
+
+    /// Trust (v41 `RustAbiVararg`): this resolved instance's generic arguments,
+    /// rendered the way rustc renders them (`[u32]`, `['{erased}]`), or `None`
+    /// when any argument falls outside the fragment that can be spelled EXACTLY.
+    ///
+    /// DIAGNOSTIC ONLY, and that is the whole contract. This renders the key the
+    /// declaration's identity is already built from; it is never a new fact,
+    /// never part of a key, a digest or an emitted module, and nothing resolves
+    /// through it. It is read by the producer's unsignable-declaration refusal
+    /// (`crate_module::unsignable_declaration_refusals`) so the user is told
+    /// WHICH instance could not be signed, in the same spelling the trust-cg
+    /// trust-ir frontend uses for the same instance.
+    ///
+    /// IT DECLINES RATHER THAN APPROXIMATES. An ADT/fn-item/closure argument is
+    /// stored here as a collision-checked [`DefinitionIdentity`] with no path
+    /// inside it, so there is no honest name to print for one; a plausible
+    /// invented name inside a refusal reads as a fact. The refusal still names
+    /// the declaration and still says the instance is generic when this returns
+    /// `None`.
+    pub(crate) fn render_generic_args(&self) -> Option<String> {
+        if self.args.is_empty() {
+            return None;
+        }
+        let mut rendered = Vec::with_capacity(self.args.len());
+        for arg in &self.args {
+            rendered.push(render_instance_arg(arg)?);
+        }
+        Some(format!("[{}]", rendered.join(", ")))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only(
         definition: DefinitionIdentity,
@@ -306,6 +347,72 @@ impl ConcreteCalleeKey {
             args,
         }
     }
+}
+
+/// Render one instance argument for [`ConcreteCalleeKey::render_generic_args`],
+/// or `None` for anything outside the exactly-spellable fragment.
+///
+/// The scalar names come from rustc's own `name_str` — the same source
+/// `encode_concrete_callee_key` uses for these very variants — so the rendering
+/// and the identity encoding cannot drift apart.
+fn render_instance_arg(arg: &ConcreteInstanceArg) -> Option<String> {
+    match arg {
+        // What rustc prints for a region argument that reached codegen.
+        ConcreteInstanceArg::ErasedRegion => Some("'{erased}".to_string()),
+        ConcreteInstanceArg::Ty(ty) => render_instance_ty(ty),
+        // A const argument prints as `7_u8` and is stored as a valtree this
+        // renderer would have to interpret bit-width-correctly to reproduce.
+        // Decline: the refusal still says the instance is generic.
+        ConcreteInstanceArg::Const(_) => None,
+    }
+}
+
+/// The type half of [`render_instance_arg`]. Structural shapes recurse; every
+/// NOMINAL shape declines, because its payload is a path-free identity.
+fn render_instance_ty(ty: &ConcreteInstanceTy) -> Option<String> {
+    Some(match ty {
+        ConcreteInstanceTy::Bool => "bool".to_string(),
+        ConcreteInstanceTy::Char => "char".to_string(),
+        ConcreteInstanceTy::Str => "str".to_string(),
+        ConcreteInstanceTy::Never => "!".to_string(),
+        ConcreteInstanceTy::Int(value) => value.name_str().to_string(),
+        ConcreteInstanceTy::Uint(value) => value.name_str().to_string(),
+        ConcreteInstanceTy::Float(value) => value.name_str().to_string(),
+        ConcreteInstanceTy::Ref(pointee, mutability) => format!(
+            "&{}{}",
+            match mutability {
+                rustc_middle::ty::Mutability::Not => "",
+                rustc_middle::ty::Mutability::Mut => "mut ",
+            },
+            render_instance_ty(pointee)?
+        ),
+        ConcreteInstanceTy::RawPtr(pointee, mutability) => format!(
+            "*{} {}",
+            match mutability {
+                rustc_middle::ty::Mutability::Not => "const",
+                rustc_middle::ty::Mutability::Mut => "mut",
+            },
+            render_instance_ty(pointee)?
+        ),
+        ConcreteInstanceTy::Slice(elem) => format!("[{}]", render_instance_ty(elem)?),
+        ConcreteInstanceTy::Array(elem, len) => {
+            format!("[{}; {len}]", render_instance_ty(elem)?)
+        }
+        ConcreteInstanceTy::Tuple(elems) => {
+            let mut parts = Vec::with_capacity(elems.len());
+            for elem in elems {
+                parts.push(render_instance_ty(elem)?);
+            }
+            match parts.as_slice() {
+                [] => "()".to_string(),
+                [single] => format!("({single},)"),
+                _ => format!("({})", parts.join(", ")),
+            }
+        }
+        // Adt / FnDef / ClosureLike / Dynamic / Foreign / FnPtr: identity without
+        // a path, so there is no name to print. See the method's doc.
+        _ => return None,
+    })
 }
 
 fn stable_arg(tcx: TyCtxt<'_>, arg: &SiteArg) -> ConcreteInstanceArg {
@@ -338,6 +445,10 @@ fn stable_ty(tcx: TyCtxt<'_>, ty: &SiteTy) -> ConcreteInstanceTy {
         SiteTy::Bool => ConcreteInstanceTy::Bool,
         SiteTy::Char => ConcreteInstanceTy::Char,
         SiteTy::Str => ConcreteInstanceTy::Str,
+        SiteTy::Never => ConcreteInstanceTy::Never,
+        SiteTy::Foreign(did) => {
+            ConcreteInstanceTy::Foreign(DefinitionIdentity::from_def_id(tcx, *did))
+        }
         SiteTy::Int(value) => ConcreteInstanceTy::Int(*value),
         SiteTy::Uint(value) => ConcreteInstanceTy::Uint(*value),
         SiteTy::Float(value) => ConcreteInstanceTy::Float(*value),
@@ -422,15 +533,26 @@ fn stable_ty(tcx: TyCtxt<'_>, ty: &SiteTy) -> ConcreteInstanceTy {
 /// thing framed: content alone does not identify a body (measured — see the module docs),
 /// so a digest that omitted it could name several functions of one artifact at once.
 ///
-/// Fails closed (`Err`) when the module does not carry exactly one function: a
-/// body-less or multi-function module is not a per-body lowering, and attesting it
-/// would name the wrong object.
+/// Fails closed for an absent body or arbitrary auxiliary functions. Canonical
+/// typed closure adapters are part of the per-body image and remain in its digest;
+/// every other multi-function module keeps the prior refusal.
 pub fn body_lineage_digest(
     definition: DefinitionIdentity,
     module: &Module,
     callees: &[CalleeRef],
 ) -> Result<ProofDigest, String> {
-    if module.functions.len() != 1 {
+    // Typed FnOnce adapters are part of this source body's semantic image,
+    // never dropped from its digest. Every auxiliary function must be the
+    // canonical constructor/call protocol, so existing fn-pointer shims and
+    // arbitrary second functions keep the prior refusal.
+    let canonical_adapters = !module.functions.is_empty()
+        && module.functions[1..].iter().all(|function| {
+            crate::is_adapter_func_id(function.id.index())
+                && crate::closure_adapter::inspect(function, &module.closure_types, &module.func_types).is_some_and(|shape| {
+                    callees.iter().filter(|callee| callee.func_id == shape.body && callee.is_local && !callee.force_havoc).count() == 1
+                })
+        });
+    if module.functions.len() != 1 && !canonical_adapters {
         return Err(format!(
             "per-body lineage digest requires exactly one function in the mini-module, found {}",
             module.functions.len()
@@ -533,6 +655,12 @@ fn encode_concrete_ty(out: &mut Vec<u8>, ty: &ConcreteInstanceTy) {
         ConcreteInstanceTy::Bool => out.push(0),
         ConcreteInstanceTy::Char => out.push(1),
         ConcreteInstanceTy::Str => out.push(2),
+        // Trust (2026-09-14): tags 18/19, appended (see `encode_site_ty`).
+        ConcreteInstanceTy::Never => out.push(18),
+        ConcreteInstanceTy::Foreign(definition) => {
+            out.push(19);
+            encode_definition_identity(out, *definition);
+        }
         ConcreteInstanceTy::Int(value) => {
             out.push(3);
             encode_str(out, value.name_str());
@@ -719,13 +847,15 @@ fn encode_callee(out: &mut Vec<u8>, callee: &CalleeRef) {
         def_id,
         definition,
         concrete_key,
+        instance_args,
         def_path,
         force_havoc,
         site_def_id,
         site_args,
         ret_ty,
         ret_ty_conflict,
-        is_rust_abi,
+        abi,
+        params,
     } = callee;
     encode_u32(out, func_id.index());
     encode_bool(out, *is_local);
@@ -765,8 +895,58 @@ fn encode_callee(out: &mut Vec<u8>, callee: &CalleeRef) {
         }
     }
     encode_bool(out, *ret_ty_conflict);
-    // Trust (#180): picks the declaration's `calling_conv`, so it changes the emitted module.
-    encode_bool(out, *is_rust_abi);
+    // v4 binds the complete typed source ABI, varargs, adaptation and target mapping, not a
+    // Boolean projection. Debug is injective over this closed enum/Bool/Option record.
+    encode_str(out, "function-abi.v1");
+    encode_str(out, &format!("{abi:?}"));
+    // Trust (v41): the recovered parameter types pick the bodyless declaration's
+    // `params`, so two inputs differing only here produce different modules and
+    // must not share a lineage digest. Same `{:?}` framing and same restriction to
+    // the table-free fragment as `ret_ty` above, with a length prefix so an empty
+    // recovered list (a genuinely nullary callee) is distinguishable from `None`
+    // (unrecoverable).
+    match params.signature() {
+        None => out.push(0),
+        Some(tys) => {
+            out.push(1);
+            encode_u64(out, tys.len() as u64);
+            for t in tys {
+                encode_str(out, &format!("{t:?}"));
+            }
+        }
+    }
+    // Trust (v41 coherence): the STICKY cross-body withdrawal. It is not
+    // recoverable from the signature — `None` is also the ordinary "no signature
+    // available" state — and it changes the emitted module, because a withdrawn
+    // declaration stays unsigned even when another body would have signed it.
+    // Two inputs differing only here therefore produce different modules and
+    // must not share a lineage digest.
+    //
+    // FRAMING UNCHANGED BY THE `ParamSignature` MERGE. The two chunks above and
+    // below are byte-for-byte what the old `param_tys: Option<Vec<Ty>>` +
+    // `params_withdrawn: bool` pair wrote, on every state the pair could reach:
+    // `Unsigned` is `0x00, 0x00`, `Signed(tys)` is `0x01 <len> <tys…>, 0x00`,
+    // `Withdrawn` is `0x00, 0x01`. The fourth combination the pair could spell
+    // but never reach — signed AND withdrawn — is the one the enum deletes, so
+    // no existing digest moves. `encode_callee` READS the value and cannot
+    // construct one, which is why the ledger's wire form is not a way back into
+    // the withdrawn state.
+    encode_bool(out, params.is_withdrawn());
+    // Trust (WS5.2): the resolved instance's re-materializable args. They pick the bodyless
+    // declaration's LINK-TIME SYMBOL (`tcx.symbol_name` at crate finalization), so two inputs
+    // that differ only here would name different symbols and must not share a digest. Appended
+    // LAST so every earlier chunk keeps its framing; the key above is built from exactly these
+    // args, so on any input the producer can construct this chunk is a function of the key.
+    match instance_args {
+        None => out.push(0),
+        Some(args) => {
+            out.push(1);
+            encode_u64(out, args.len() as u64);
+            for arg in args {
+                encode_site_arg(out, arg);
+            }
+        }
+    }
 }
 
 fn encode_site_arg(out: &mut Vec<u8>, arg: &SiteArg) {
@@ -821,6 +1001,13 @@ fn encode_site_ty(out: &mut Vec<u8>, t: &SiteTy) {
         SiteTy::Bool => out.push(0),
         SiteTy::Char => out.push(1),
         SiteTy::Str => out.push(2),
+        // Trust (2026-09-14): tags 18/19 are APPENDED after the highest tag in use (17,
+        // `Dynamic`); every existing encoding stays byte-identical.
+        SiteTy::Never => out.push(18),
+        SiteTy::Foreign(did) => {
+            out.push(19);
+            encode_def_id(out, *did);
+        }
         SiteTy::Int(i) => {
             out.push(3);
             encode_str(out, i.name_str());
@@ -1004,12 +1191,17 @@ mod tests {
 
     fn probe_module(fn_name: &str) -> Module {
         let mut module = Module::new("lineage_probe");
-        let ty = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        module.add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)));
+        let ty = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        module
+            .try_add_function(Function::new(FuncId::new(0), fn_name, ty, BlockId::new(0)))
+            .expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -1036,6 +1228,8 @@ mod tests {
                 ConcreteInstanceKind::Item,
                 Vec::new(),
             )),
+            // WS5.2: the key's own args (none), re-materializable.
+            instance_args: Some(Vec::new()),
             def_path: "lineage_probe::callee".to_string(),
             force_havoc,
             site_def_id: def_id,
@@ -1048,9 +1242,10 @@ mod tests {
             ret_ty: None,
             ret_ty_conflict: false,
             // Trust (#180): `is_local: true` above, so the producer's own rule
-            // (`is_rust_abi: !def_id.is_local() && ..`, `lib.rs`) writes `false`
+            // (`abi: !def_id.is_local() && ..`, `lib.rs`) writes `false`
             // here too — the probe must not invent an ABI the digest depends on.
-            is_rust_abi: false,
+            abi: crate::calling_convention::FunctionAbi::C,
+            params: crate::ParamSignature::Unsigned,
         }
     }
 
@@ -1134,6 +1329,20 @@ mod tests {
         assert_ne!(base, empty, "dropping a ledger row must change the digest");
     }
 
+    /// WS5.2: the resolved instance's re-materializable args pick the declaration's LINK-TIME
+    /// SYMBOL, so two ledgers differing only there must not share a digest.
+    #[test]
+    fn test_lineage_digest_binds_the_callee_instance_args() {
+        let module = probe_module("probe");
+        let base = body_lineage_digest(probe_definition(3), &module, &[probe_callee(false)])
+            .expect("digest");
+        let mut unencodable = probe_callee(false);
+        unencodable.instance_args = None;
+        let dropped =
+            body_lineage_digest(probe_definition(3), &module, &[unencodable]).expect("digest");
+        assert_ne!(base, dropped, "the callee's instance args must be bound by the digest");
+    }
+
     /// Fail-closed: a module that is not a single-body lowering refuses to digest.
     #[test]
     fn test_lineage_digest_bodyless_module_fails_closed() {
@@ -1190,4 +1399,25 @@ mod tests {
             body_lineage_digest(DefinitionIdentity::test_only(2, 7), &module, &[]).expect("digest");
         assert_ne!(local, foreign, "the same index in a different crate is a different body");
     }
+    #[test]
+    fn exact_source_abi_alias_unwind_and_unknown_states_change_lineage() {
+        use crate::calling_convention::FunctionAbi;
+        use rustc_abi::{CanonAbi, ExternAbi};
+        let module = probe_module("probe");
+        let mut callee = probe_callee(false);
+        callee.abi = FunctionAbi::C;
+        let digest = body_lineage_digest(probe_definition(3), &module, &[callee.clone()]).unwrap();
+        let mut seen = vec![digest];
+        for abi in [
+            FunctionAbi::test_only(ExternAbi::System { unwind: false }, Some(CanonAbi::C)),
+            FunctionAbi::test_only(ExternAbi::C { unwind: true }, Some(CanonAbi::C)),
+            FunctionAbi::UNKNOWN, FunctionAbi::CONFLICT,
+        ] {
+            callee.abi = abi;
+            let changed = body_lineage_digest(probe_definition(3), &module, &[callee.clone()]).unwrap();
+            assert!(!seen.contains(&changed), "the full typed ABI is lineage input");
+            seen.push(changed);
+        }
+    }
+
 }

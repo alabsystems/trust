@@ -34,46 +34,60 @@ find_trustc() {
 }
 
 if ! TRUSTC_BIN="$(find_trustc)"; then
-    echo "SKIP: built trustc compiler not found (run ./x.py build first)"
+    echo "SKIPPED: NOT RUN: no built trustc (run ./x.py build first)"
     exit 0
 fi
 
-# The e2e harness prepends the stage2 bin dir to PATH, so a bare `rustc`
-# lookup can resolve to the Trust toolchain's same-sysroot compatibility
-# alias. That is not an upstream compiler; reject it below.
+# STOCK-AS-ORACLE (owner ruling 2026-09-29, docs/DECISION_QUEUE.md D16): this
+# row compares trustc against an UPSTREAM rustc, so the oracle is stock by
+# design. It is pinned to ONE toolchain, rustup's `1.97.1`, and nothing else:
+# never a PATH `rustc` (in the e2e harness that is the Trust compatibility
+# alias, and on an aterm host the reroute stub) and never an install.
+# `rustup which` downloads a missing toolchain unless RUSTUP_AUTO_INSTALL=0
+# (docs/KNOWN_HAZARDS.md, the seal-9192 entry, item (e)). An absent oracle is
+# `SKIPPED:`, which the harness grades SKIP: never a pass, never a block. With
+# the oracle present, a mismatch is a real FAIL.
+# VERSION SKEW: trustc aligns with the rust-lang/rust revision and rustc_version
+# that release/trust-version.toml [rust_alignment] names (read it there; a copy
+# here goes stale at every pin move), a nightly ahead of 1.97.1, the newest
+# stock release installed. A program whose upstream behaviour changed between
+# the two fails here too, so rule the skew out before filing a mismatch against
+# Trust.
+ORACLE_TOOLCHAIN=1.97.1
 HOST_RUSTUP_BIN="$(command -v rustup 2>/dev/null || true)"
 if [ -z "$HOST_RUSTUP_BIN" ] && [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
     HOST_RUSTUP_BIN="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
 fi
-
-if [ -n "${UPSTREAM_RUSTC:-}" ]; then
-    UPSTREAM_BIN=("$UPSTREAM_RUSTC")
-elif [ -n "$HOST_RUSTUP_BIN" ] && "$HOST_RUSTUP_BIN" which --toolchain stable rustc >/dev/null 2>&1; then
-    UPSTREAM_BIN=("$HOST_RUSTUP_BIN" run stable rustc)
-elif command -v rustc >/dev/null 2>&1; then
-    UPSTREAM_BIN=(rustc)
-else
-    echo "SKIP: no external upstream rustc found (set UPSTREAM_RUSTC or install stable)"
+UPSTREAM_RUSTC=""
+if [ -n "$HOST_RUSTUP_BIN" ]; then
+    UPSTREAM_RUSTC="$(RUSTUP_AUTO_INSTALL=0 "$HOST_RUSTUP_BIN" which --toolchain "$ORACLE_TOOLCHAIN" rustc 2>/dev/null || true)"
+fi
+if [ -z "$UPSTREAM_RUSTC" ] || [ ! -x "$UPSTREAM_RUSTC" ]; then
+    echo "SKIPPED: NOT RUN: oracle $ORACLE_TOOLCHAIN not installed (rustup toolchain $ORACLE_TOOLCHAIN)"
     exit 0
 fi
+UPSTREAM_BIN=("$UPSTREAM_RUSTC")
 
-UPSTREAM_IDENTITY="$("${UPSTREAM_BIN[@]}" --version 2>/dev/null || true)"
+UPSTREAM_IDENTITY="$("$UPSTREAM_RUSTC" -vV 2>/dev/null || true)"
 case "$UPSTREAM_IDENTITY" in
     *trustc*)
-        echo "SKIP: discovered rustc is the Trust toolchain alias, not an upstream compiler (set UPSTREAM_RUSTC or install stable)"
-        exit 0
-        ;;
-    rustc\ *) ;;
-    *)
-        echo "SKIP: discovered upstream rustc did not report a usable identity: ${UPSTREAM_IDENTITY:-<none>}"
-        exit 0
+        echo "FAIL: the $ORACLE_TOOLCHAIN oracle at $UPSTREAM_RUSTC is a Trust toolchain, not upstream rustc"
+        exit 1
         ;;
 esac
+if ! printf '%s\n' "$UPSTREAM_IDENTITY" | grep -qx "release: $ORACLE_TOOLCHAIN"; then
+    echo "FAIL: the oracle at $UPSTREAM_RUSTC does not report release $ORACLE_TOOLCHAIN: ${UPSTREAM_IDENTITY:-<none>}"
+    exit 1
+fi
 
 echo "trust compiler: $TRUSTC_BIN"
 echo "upstream rustc: ${UPSTREAM_BIN[*]}"
 echo
-TRUSTC_PARITY_CMD=("$TRUSTC_BIN" -Z trust-verify=off)
+# This row announces that it compiles without verification, so it quiets
+# trustc's once-per-crate "compiled WITHOUT Trust verification" note the way
+# compiletest and bootstrap do (TRUST_VANILLA_ANNOUNCED): the note is Trust's
+# disclosure, not program behaviour, and upstream prints nothing there.
+TRUSTC_PARITY_CMD=(env TRUST_VANILLA_ANNOUNCED=1 "$TRUSTC_BIN" -Z trust-verify=off)
 
 TMP_DIR="$(mktemp -d /tmp/trust_parity_XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT

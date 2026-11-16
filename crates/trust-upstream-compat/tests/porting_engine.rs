@@ -6,14 +6,138 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use trust_upstream_compat::porting::{PortOptions, ProofMode, run_porting};
+use trust_upstream_compat::porting::{
+    PortOptions, ProofMode, ProofScope, run_porting, run_porting_with_scope,
+    validate_scoped_test_proof_bundle,
+};
 use trust_upstream_compat::{
     ExceptionStatus, TestException, TestExceptionKind, TestExceptionLedger, TestInventory,
-    TestProofTotals, TestResultReport,
+    TestInventoryEntry, TestKind, TestOutcome, TestProofBundle, TestProofTotals, TestResult,
+    TestResultReport, TestSource, TrustAddedTestCommand, TrustAddedTestManifest,
 };
 
 const PORTING_FIXTURE: &str =
     include_str!("../../../tests/upstream-rust/fixtures/porting-cli-rust.seed.toml");
+const BOUNDED_CLI_PRIMARY: &str = "tests/ui/demo.rs";
+/// Every path of [`bounded_cli_upstream`]: the auxiliary input and the primary.
+const BOUNDED_CLI_IMPORT_LIMIT: &str = "2";
+
+#[test]
+fn upstream_rust_release_bundle_accepts_only_upstream_rows_without_manifest() {
+    let revision = "a".repeat(40);
+    let test_id = "upstream.00000000.tests.ui.proof.rs";
+    let inventory = TestInventory {
+        schema_version: "0.1.0".to_string(),
+        upstream_revision: revision.clone(),
+        local_revision: "b".repeat(40),
+        host: None,
+        tests: vec![TestInventoryEntry {
+            id: test_id.to_string(),
+            suite: "ui".to_string(),
+            path: "tests/ui/proof.rs".to_string(),
+            revision: Some(revision),
+            source_git_blob: Some("c".repeat(40)),
+            source: TestSource::UpstreamRust,
+            kind: TestKind::Compiletest,
+            applicable: true,
+            inapplicable_reason: None,
+            source_sha256: None,
+        }],
+    };
+    let results = TestResultReport {
+        schema_version: "0.1.0".to_string(),
+        inventory_id: "upstream-scope-fixture".to_string(),
+        generated_on: "2026-09-23".to_string(),
+        command: "bootstrap test --trust-vanilla".to_string(),
+        results: vec![TestResult {
+            test_id: test_id.to_string(),
+            outcome: TestOutcome::Passed,
+            exception_id: None,
+            observed: Some("named terminal pass".to_string()),
+            artifact: None,
+        }],
+    };
+    let exceptions =
+        TestExceptionLedger { schema_version: "0.1.0".to_string(), exceptions: vec![] };
+    let bundle = TestProofBundle {
+        inventory: &inventory,
+        results: &results,
+        exceptions: &exceptions,
+        trust_added_tests: None,
+        validation_date: "2026-09-23",
+        release: true,
+    };
+    let totals = validate_scoped_test_proof_bundle(bundle, ProofScope::UpstreamRust)
+        .expect("upstream-only release bundle should not require a Trust-added manifest");
+    assert_eq!(totals.total, 1);
+    assert_eq!(totals.upstream, 1);
+    assert_eq!(totals.trust_added, 0);
+    assert_eq!(totals.unaccounted, 0);
+    assert!(
+        validate_scoped_test_proof_bundle(bundle, ProofScope::Combined)
+            .expect_err("Combined release bundle must still require a Trust-added manifest")
+            .iter()
+            .any(|finding| finding.field == "trust_added_tests")
+    );
+
+    let mut forged_inventory = inventory.clone();
+    let mut forged_row = forged_inventory.tests[0].clone();
+    forged_row.id = "trust.added.forged".to_string();
+    forged_row.path = "tests/trust-added/manifest.toml".to_string();
+    forged_row.source = TestSource::TrustAdded;
+    forged_row.kind = TestKind::Shell;
+    forged_inventory.tests.push(forged_row);
+    let mut forged_results = results.clone();
+    let mut forged_result = forged_results.results[0].clone();
+    forged_result.test_id = "trust.added.forged".to_string();
+    forged_results.results.push(forged_result);
+    let findings = validate_scoped_test_proof_bundle(
+        TestProofBundle { inventory: &forged_inventory, results: &forged_results, ..bundle },
+        ProofScope::UpstreamRust,
+    )
+    .expect_err("Trust-added proof row must fail upstream-only scope");
+    assert!(findings.iter().any(|finding| finding.field == "tests.source"));
+
+    let forged_manifest = TrustAddedTestManifest {
+        schema_version: "0.1.0".to_string(),
+        commands: vec![TrustAddedTestCommand {
+            id: "trust.added.forged-command".to_string(),
+            command: "targo trust domination trust-added --release quick".to_string(),
+            covers: vec![test_id.to_string()],
+            required: true,
+            local_command: None,
+        }],
+    };
+    let findings = validate_scoped_test_proof_bundle(
+        TestProofBundle { trust_added_tests: Some(&forged_manifest), ..bundle },
+        ProofScope::UpstreamRust,
+    )
+    .expect_err("Trust-added manifest must fail upstream-only scope");
+    assert!(findings.iter().any(|finding| {
+        finding.field == "trust_added_tests"
+            && finding.message.contains("cannot contain a Trust-added manifest")
+    }));
+
+    let mut unknown_results = results.clone();
+    unknown_results.results[0].outcome = TestOutcome::Unknown;
+    let findings = validate_scoped_test_proof_bundle(
+        TestProofBundle { results: &unknown_results, ..bundle },
+        ProofScope::UpstreamRust,
+    )
+    .expect_err("release-only unknown-outcome check must remain active");
+    assert!(findings.iter().any(|finding| {
+        finding.field == "results.outcome" && finding.message.contains("release proof")
+    }));
+
+    let mut missing_blob_inventory = inventory.clone();
+    missing_blob_inventory.tests[0].source_git_blob = None;
+    let findings = validate_scoped_test_proof_bundle(
+        TestProofBundle { inventory: &missing_blob_inventory, ..bundle },
+        ProofScope::UpstreamRust,
+    )
+    .expect_err("release-only source blob check must remain active");
+    assert!(findings.iter().any(|finding| finding.field == "tests.source_git_blob"));
+}
 
 #[test]
 fn smoke_porting_imports_fixture_files_and_records_audit_and_missing_proof() {
@@ -461,7 +585,7 @@ fn scorecard_log_mode_reports_seeded_failures_and_reviewed_drift() {
 
 #[cfg(unix)]
 #[test]
-fn full_proof_mode_accepts_complete_local_artifacts_from_fake_bootstrap() {
+fn full_proof_mode_accepts_complete_observed_case_artifacts_from_fake_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 
     let repo = TestRepo::new("full-proof");
@@ -489,9 +613,9 @@ fn full_proof_mode_accepts_complete_local_artifacts_from_fake_bootstrap() {
         run_id: None,
         target_arch: None,
         target: None,
-        target_triple: None,
+        target_triple: Some("aarch64-apple-darwin".to_string()),
         host: None,
-        host_triple: None,
+        host_triple: Some("aarch64-apple-darwin".to_string()),
         test_exception_validation_date: None,
         upstream_revision: qualified_revision(&current),
         upstream_remote: "missing-upstream.invalid".to_string(),
@@ -514,6 +638,7 @@ fn full_proof_mode_accepts_complete_local_artifacts_from_fake_bootstrap() {
     assert_eq!(scorecard["execution_exit_status"].as_i64(), Some(0));
     assert_eq!(scorecard["execution_telemetry"]["executor"].as_str(), Some("rust-bootstrap"));
     assert_eq!(scorecard["proof_mode"].as_str(), Some("full"));
+    assert_eq!(scorecard["proof_scope"].as_str(), Some("combined"));
     assert_eq!(scorecard["proof_required_for_exit"].as_bool(), Some(true));
     assert_eq!(scorecard["proof_accounting_status"].as_str(), Some("complete"));
     assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(true));
@@ -571,6 +696,181 @@ fn full_proof_mode_accepts_complete_local_artifacts_from_fake_bootstrap() {
     assert!(capture.contains("RUSTFLAGS_BOOTSTRAP=\n"));
     assert!(capture.contains("RUSTFLAGS_NOT_BOOTSTRAP=\n"));
     assert_no_legacy_execution_path(&capture);
+
+    let summary = read_json(&report.compatibility_summary_path);
+    assert_eq!(summary["runner"]["proof_scope"].as_str(), Some("combined"));
+    assert_eq!(summary["runner"]["proof_totals"]["trust_added"].as_u64(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn upstream_rust_scope_release_keeps_diagnostics_but_refuses_unauthenticated_execution() {
+    let repo = TestRepo::new("upstream-rust-scope-release");
+    repo.write("tests/ui/proof.rs", "fn proof() {}\n");
+    repo.write("tests/ui/second.rs", "fn second() {}\n");
+    let upstream = repo.commit_all("upstream proof fixtures");
+    let fake_targo = install_fake_targo(&repo, "must not execute", 42);
+    write_trust_added_manifest(
+        &repo,
+        "trust.added.must-not-run",
+        "targo trust domination trust-added --release quick",
+        "trust.added.must-not-run",
+    );
+    let bootstrap = install_two_case_fake_bootstrap(&repo.root, false);
+    let baseline = write_baseline(&repo, &upstream);
+    let upstream_fixes = write_empty_upstream_fixes(&repo);
+    let options = PortOptions {
+        repo_root: repo.root.clone(),
+        baseline,
+        upstream_fixes,
+        test_exceptions: None,
+        patch_manifest: None,
+        llm_directives: None,
+        summary_out: Some(PathBuf::from("reports/upstream-rust/compat-summary.json")),
+        run_id: Some("upstream-rust-scope-release".to_string()),
+        target_arch: Some("aarch64".to_string()),
+        target: Some("aarch64-apple-darwin".to_string()),
+        target_triple: Some("aarch64-apple-darwin".to_string()),
+        host: Some("aarch64-apple-darwin".to_string()),
+        host_triple: Some("aarch64-apple-darwin".to_string()),
+        test_exception_validation_date: None,
+        upstream_revision: qualified_revision(&upstream),
+        upstream_remote: "missing-upstream.invalid".to_string(),
+        out_dir: PathBuf::from("reports/upstream-rust"),
+        execute: true,
+        apply: false,
+        fetch: false,
+        scorecard_log: None,
+        bootstrap_args: String::new(),
+        max_files: None,
+        release: true,
+        proof_mode: ProofMode::Full,
+    };
+    let report = run_porting_with_scope(options.clone(), ProofScope::UpstreamRust)
+        .expect("upstream-only run should retain its diagnostic report");
+    assert_eq!(report.exit_code, 1, "{}", report.render_terminal(&repo.root));
+    assert!(!fake_targo_marker_path(&fake_targo).exists());
+
+    let proof_dir = repo.root.join("reports/upstream-rust/proof");
+    assert!(!proof_dir.join("trust-added.log").exists());
+    assert!(!proof_dir.join("trust-added-manifest.json").exists());
+    let inventory = read_json(&proof_dir.join("inventory.json"));
+    let results = read_json(&proof_dir.join("results.json"));
+    let proof_summary = read_json(&proof_dir.join("proof-summary.json"));
+    assert_port_proof_artifacts_are_schema_compatible(&inventory, &results, &proof_summary);
+    assert_eq!(proof_summary["total"].as_u64(), Some(2));
+    assert_eq!(proof_summary["upstream"].as_u64(), Some(2));
+    assert_eq!(proof_summary["trust_added"].as_u64(), Some(0));
+    assert_eq!(proof_summary["passed"].as_u64(), Some(2));
+    assert!(inventory["tests"].as_array().is_some_and(|tests| {
+        tests.len() == 2 && tests.iter().all(|test| test["source"] == "upstream_rust")
+    }));
+    assert!(!results["command"].as_str().unwrap_or_default().contains("trust-added"));
+    let capture = fs::read_to_string(fake_bootstrap_capture_path(&bootstrap))
+        .expect("bootstrap invocation should be captured");
+    assert!(!capture.contains("tests/ui/proof.rs"));
+    assert!(!capture.contains("tests/ui/second.rs"));
+
+    let scorecard = read_json(&repo.root.join("reports/upstream-rust/scorecard.json"));
+    assert_eq!(scorecard["proof_scope"].as_str(), Some("upstream_rust"));
+    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(true));
+    assert_eq!(scorecard["execution_authenticated"], false);
+    assert!(scorecard["validation_failures"].as_array().is_some_and(|failures| {
+        failures.iter().any(|failure| failure["kind"] == "unauthenticated-upstream-execution")
+    }));
+    assert_eq!(
+        scorecard["execution_telemetry"]["trust_added_manifest_executed"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        scorecard["execution_telemetry"]["trust_added_proof_inventory_tests"].as_u64(),
+        Some(0)
+    );
+    let summary = read_json(&report.compatibility_summary_path);
+    assert_eq!(summary["runner"]["proof_scope"].as_str(), Some("upstream_rust"));
+    assert_eq!(summary["runner"]["proof_totals"]["total"].as_u64(), Some(2));
+    assert_eq!(summary["runner"]["proof_totals"]["trust_added"].as_u64(), Some(0));
+    assert_eq!(
+        summary["runner"]["release_evidence_contract"]["proof_scope"].as_str(),
+        Some("upstream_rust")
+    );
+    let argv = string_array(&summary["runner"]["argv"]);
+    assert_eq!(flag_value(&argv, "--proof-scope"), Some("upstream-rust"));
+    assert_eq!(summary["totals"]["compatible"].as_u64(), Some(0));
+    assert_eq!(summary["totals"]["unknown"].as_u64(), Some(1));
+    assert_eq!(summary["runner"]["execution_authenticated"], false);
+
+    let bounded = PortOptions { max_files: Some(1), ..options.clone() };
+    let error = run_porting_with_scope(bounded, ProofScope::UpstreamRust)
+        .expect_err("upstream-only scope must reject bounded inventories");
+    assert!(error.to_string().contains("entire upstream suite"));
+
+    install_two_case_fake_bootstrap(&repo.root, true);
+    let injected = PortOptions {
+        out_dir: PathBuf::from("reports/upstream-rust-injected"),
+        summary_out: Some(PathBuf::from("reports/upstream-rust-injected/compat-summary.json")),
+        ..options
+    };
+    let report = run_porting_with_scope(injected, ProofScope::UpstreamRust)
+        .expect("injected proof artifact should be reported, not crash the runner");
+    assert_ne!(report.exit_code, 0);
+    let scorecard = read_json(&repo.root.join("reports/upstream-rust-injected/scorecard.json"));
+    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(false));
+    assert!(
+        string_array(&scorecard["invalid_proof_artifacts"]).contains(&"trust-added-manifest.json")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_auxiliary_only_import_refuses_execution_but_keeps_source_input() {
+    let repo = TestRepo::new("bounded-auxiliary-only");
+    let source = "pub fn support() {}\n";
+    repo.write("tests/auxiliary/minicore.rs", source);
+    let current = repo.commit_all("auxiliary-only upstream fixture");
+    let bootstrap =
+        install_fake_bootstrap_command(&repo.root.join("build/bootstrap/debug/bootstrap"));
+    let baseline = write_baseline(&repo, &current);
+    let upstream_fixes = write_empty_upstream_fixes(&repo);
+
+    let error = run_porting(PortOptions {
+        repo_root: repo.root.clone(),
+        baseline,
+        upstream_fixes,
+        test_exceptions: None,
+        patch_manifest: None,
+        llm_directives: None,
+        summary_out: None,
+        run_id: None,
+        target_arch: None,
+        target: None,
+        target_triple: None,
+        host: None,
+        host_triple: None,
+        test_exception_validation_date: None,
+        upstream_revision: qualified_revision(&current),
+        upstream_remote: "missing-upstream.invalid".to_string(),
+        out_dir: PathBuf::from("reports/auxiliary-only"),
+        execute: true,
+        apply: false,
+        fetch: false,
+        scorecard_log: None,
+        bootstrap_args: String::new(),
+        max_files: Some(1),
+        release: false,
+        proof_mode: ProofMode::Smoke,
+    })
+    .expect_err("an auxiliary input cannot satisfy an executable-case roster");
+    assert!(error.to_string().contains("no independently executable primary cases"));
+    assert_eq!(
+        fs::read_to_string(
+            repo.root.join("reports/auxiliary-only/imported/tests/auxiliary/minicore.rs")
+        )
+        .unwrap(),
+        source
+    );
+    assert!(!repo.root.join("reports/auxiliary-only/execution.log").exists());
+    assert!(!fake_bootstrap_capture_path(&bootstrap).exists());
 }
 
 #[cfg(unix)]
@@ -588,6 +888,19 @@ fn executed_porting_passes_host_and_target_triples_to_bootstrap() {
     );
     let bootstrap =
         install_fake_bootstrap_command(&repo.root.join("build/bootstrap/debug/bootstrap"));
+    let mut script = fs::read_to_string(&bootstrap).unwrap();
+    script.push_str(
+        r#"
+cat > "$TRUST_UPSTREAM_RUST_PROOF_DIR/compiletest-events-42-0.jsonl" <<'SIDECAR'
+{"schema":"trust.compiletest.case-events/v1","type":"invocation","argv":["--suite","ui","--mode","ui","--host","x86_64-unknown-linux-gnu","--target","x86_64-unknown-linux-gnu"]}
+{"schema":"trust.compiletest.case-events/v1","type":"suite","event":"started","test_count":1,"selected_count":1}
+{"schema":"trust.compiletest.case-events/v1","type":"test","event":"started","name":"[ui] tests/ui/proof.rs"}
+{"schema":"trust.compiletest.case-events/v1","type":"test","event":"ok","name":"[ui] tests/ui/proof.rs","message":null,"stdout":null}
+{"schema":"trust.compiletest.case-events/v1","type":"suite","event":"ok","selected_count":1,"executed_count":1,"terminal_count":1,"protocol_valid":true,"protocol_error":null,"passed":1,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.1}
+SIDECAR
+"#,
+    );
+    fs::write(&bootstrap, script).unwrap();
     let baseline = write_baseline(&repo, &current);
     let upstream_fixes = write_empty_upstream_fixes(&repo);
 
@@ -613,7 +926,7 @@ fn executed_porting_passes_host_and_target_triples_to_bootstrap() {
         apply: false,
         fetch: false,
         scorecard_log: None,
-        bootstrap_args: String::new(),
+        bootstrap_args: "--force-rerun --force-rerun".to_string(),
         max_files: None,
         release: false,
         proof_mode: ProofMode::Full,
@@ -624,6 +937,11 @@ fn executed_porting_passes_host_and_target_triples_to_bootstrap() {
 
     let capture = fs::read_to_string(fake_bootstrap_capture_path(&bootstrap))
         .expect("fake bootstrap capture should be readable");
+    assert_eq!(
+        capture.matches("<--force-rerun>").count(),
+        1,
+        "single-value bootstrap flag must occur exactly once: {capture}"
+    );
     assert!(
         capture.contains("argv: <test> <--src>")
             && capture.contains("<--host> <x86_64-unknown-linux-gnu>")
@@ -635,6 +953,14 @@ fn executed_porting_passes_host_and_target_triples_to_bootstrap() {
     let driver = scorecard["trust_cargo_driver"].as_str().expect("trust_cargo_driver");
     assert!(driver.contains("--host x86_64-unknown-linux-gnu"), "{driver}");
     assert!(driver.contains("--target x86_64-unknown-linux-gnu"), "{driver}");
+    let evidence =
+        read_json(&repo.root.join("reports/proof-target-triple/proof/case-evidence.json"));
+    let sidecars = &evidence["structured_sidecars"];
+    assert_eq!(sidecars["streams_valid"], true);
+    assert_eq!(sidecars["ui"]["context_reconciled"], true);
+    assert_eq!(sidecars["ui"]["roster_reconciled"], true);
+    assert_eq!(sidecars["ui"]["renderer_reconciled"], true);
+    assert!(sidecars["authority"].as_str().unwrap().contains("not independently authenticated"));
 }
 
 #[cfg(unix)]
@@ -713,7 +1039,7 @@ fn full_proof_uses_supplied_test_exceptions_for_failed_artifacts() {
 
 #[cfg(unix)]
 #[test]
-fn full_proof_artifacts_include_trust_added_manifest_rows() {
+fn full_proof_preserves_trust_added_results_with_unbound_local_inputs() {
     let repo = TestRepo::new("full-proof-trust-added");
     repo.write("tests/ui/proof.rs", "fn proof() {}\n");
     let upstream = repo.commit_all("upstream proof fixture");
@@ -741,9 +1067,9 @@ fn full_proof_artifacts_include_trust_added_manifest_rows() {
         run_id: None,
         target_arch: None,
         target: None,
-        target_triple: None,
+        target_triple: Some("aarch64-apple-darwin".to_string()),
         host: None,
-        host_triple: None,
+        host_triple: Some("aarch64-apple-darwin".to_string()),
         test_exception_validation_date: None,
         upstream_revision: qualified_revision(&upstream),
         upstream_remote: "missing-upstream.invalid".to_string(),
@@ -759,7 +1085,7 @@ fn full_proof_artifacts_include_trust_added_manifest_rows() {
     })
     .expect("full proof run with trust-added manifest should complete");
 
-    assert_eq!(report.exit_code, 0, "{}", report.render_terminal(&repo.root));
+    assert_ne!(report.exit_code, 0, "{}", report.render_terminal(&repo.root));
     assert!(
         fake_targo_marker_path(&fake_targo).exists(),
         "Trust-added manifest command should be executed"
@@ -773,8 +1099,18 @@ fn full_proof_artifacts_include_trust_added_manifest_rows() {
     assert_eq!(summary["total"].as_u64(), Some(2));
     assert_eq!(summary["upstream"].as_u64(), Some(1));
     assert_eq!(summary["trust_added"].as_u64(), Some(1));
-    assert_eq!(summary["passed"].as_u64(), Some(2));
-    assert_eq!(summary["unaccounted"].as_u64(), Some(0));
+    assert_eq!(summary["passed"].as_u64(), Some(1));
+    assert_eq!(summary["unaccounted"].as_u64(), Some(1));
+    let upstream_result = json_array_object_with_str(
+        &results["results"],
+        "test_id",
+        "upstream.00000000.tests.ui.proof.rs",
+    );
+    assert_eq!(
+        upstream_result["outcome"].as_str(),
+        Some("unknown"),
+        "local-only fixture input cannot inherit pristine pass credit"
+    );
 
     let trust_added_inventory =
         json_array_object_with_str(&inventory["tests"], "id", "trust.added.fixture");
@@ -830,7 +1166,7 @@ fn full_proof_artifacts_include_trust_added_manifest_rows() {
     );
 
     let scorecard = read_json(&repo.root.join("reports/proof-trust-added/scorecard.json"));
-    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(true));
+    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(false));
     assert_eq!(scorecard["proof_artifact_validation"]["summary_totals"]["total"].as_u64(), Some(2));
     assert_eq!(
         scorecard["proof_artifact_validation"]["summary_totals"]["trust_added"].as_u64(),
@@ -1057,9 +1393,9 @@ fn full_proof_fails_closed_when_trust_added_manifest_command_fails() {
         run_id: None,
         target_arch: None,
         target: None,
-        target_triple: None,
+        target_triple: Some("aarch64-apple-darwin".to_string()),
         host: None,
-        host_triple: None,
+        host_triple: Some("aarch64-apple-darwin".to_string()),
         test_exception_validation_date: None,
         upstream_revision: qualified_revision(&upstream),
         upstream_remote: "missing-upstream.invalid".to_string(),
@@ -1092,8 +1428,14 @@ fn full_proof_fails_closed_when_trust_added_manifest_command_fails() {
     assert_eq!(summary["total"].as_u64(), Some(2));
     assert_eq!(summary["upstream"].as_u64(), Some(1));
     assert_eq!(summary["trust_added"].as_u64(), Some(1));
-    assert_eq!(summary["passed"].as_u64(), Some(1));
-    assert_eq!(summary["unaccounted"].as_u64(), Some(1));
+    assert_eq!(summary["passed"].as_u64(), Some(0));
+    assert_eq!(summary["unaccounted"].as_u64(), Some(2));
+    let upstream_result = json_array_object_with_str(
+        &results["results"],
+        "test_id",
+        "upstream.00000000.tests.ui.proof.rs",
+    );
+    assert_eq!(upstream_result["outcome"].as_str(), Some("unknown"));
     let trust_added_result =
         json_array_object_with_str(&results["results"], "test_id", "trust.added.fixture");
     assert_eq!(trust_added_result["outcome"].as_str(), Some("failed"));
@@ -1112,17 +1454,22 @@ fn full_proof_fails_closed_when_trust_added_manifest_command_fails() {
 
 #[cfg(unix)]
 #[test]
-fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
+fn port_cli_dispatch_does_not_certify_unsupported_bounded_case_roster() {
     let repo = TestRepo::new("port-cli-proof");
     let workspace_root = workspace_root();
     let current =
         run_git(&workspace_root, ["rev-parse", "--verify", "HEAD^{commit}"]).trim().to_string();
-    let baseline = write_baseline(&repo, &current);
+    let upstream = bounded_cli_upstream();
+    let upstream_revision = upstream.commit_all("bounded CLI upstream");
+    assert_ne!(upstream_revision, current, "upstream and local identities are distinct");
+    import_fixture_objects(&workspace_root, &upstream, &upstream_revision);
+    let baseline = write_baseline(&repo, &upstream_revision);
     let upstream_fixes = write_empty_upstream_fixes(&repo);
     let patch_manifest = write_empty_patch_manifest(&repo);
+    let test_exceptions = write_empty_test_exceptions(&repo);
     let fake_bootstrap = install_fake_bootstrap_command(&repo.root.join("bin/bootstrap"));
     let out_dir = repo.root.join("reports/cli-proof");
-    let requested_revision = qualified_revision(&current);
+    let requested_revision = qualified_revision(&upstream_revision);
 
     let output = Command::new(trust_upstream_compat_bin())
         .args([
@@ -1133,6 +1480,8 @@ fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
             upstream_fixes.to_str().expect("upstream fixes path should be UTF-8"),
             "--patch-manifest",
             patch_manifest.to_str().expect("patch manifest path should be UTF-8"),
+            "--test-exceptions",
+            test_exceptions.to_str().expect("test exception path should be UTF-8"),
             "--upstream-revision",
             requested_revision.as_str(),
             "--upstream-remote",
@@ -1143,7 +1492,7 @@ fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
             "--no-apply",
             "--no-fetch",
             "--max-files",
-            "1",
+            BOUNDED_CLI_IMPORT_LIMIT,
             "--proof-mode",
             "smoke",
         ])
@@ -1167,9 +1516,27 @@ fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
     assert_eq!(scorecard["execution_exit_status"].as_i64(), Some(0));
     assert_eq!(scorecard["proof_mode"].as_str(), Some("smoke"));
     assert_eq!(scorecard["proof_required_for_exit"].as_bool(), Some(false));
-    assert_eq!(scorecard["proof_accounting_status"].as_str(), Some("complete"));
-    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(true));
+    // This fixture tests dispatch, not a complete case roster: its bounded
+    // import and unnamed host/target must not fabricate per-test proof.
+    assert_eq!(scorecard["proof_accounting_status"].as_str(), Some("smoke_proof_incomplete"));
+    assert_eq!(scorecard["proof_artifacts_complete"].as_bool(), Some(false));
     assert_eq!(scorecard["proof_artifact_validation"]["summary_totals"]["total"].as_u64(), Some(1));
+    let proof_dir = out_dir.join("proof");
+    let inventory = read_json(&proof_dir.join("inventory.json"));
+    let results = read_json(&proof_dir.join("results.json"));
+    let summary = read_json(&proof_dir.join("proof-summary.json"));
+    assert_port_proof_artifacts_are_schema_compatible(&inventory, &results, &summary);
+    assert_eq!(inventory["tests"].as_array().map(Vec::len), Some(1));
+    assert_eq!(inventory["tests"][0]["path"].as_str(), Some(BOUNDED_CLI_PRIMARY));
+    let expected_blob = run_git(
+        &workspace_root,
+        ["rev-parse", &format!("{upstream_revision}:{BOUNDED_CLI_PRIMARY}")],
+    );
+    assert_eq!(inventory["tests"][0]["source_git_blob"].as_str(), Some(expected_blob.trim()));
+    assert_eq!(results["results"].as_array().map(Vec::len), Some(1));
+    assert_eq!(results["results"][0]["outcome"].as_str(), Some("unknown"));
+    assert_eq!(summary["passed"].as_u64(), Some(0));
+    assert_eq!(summary["unaccounted"].as_u64(), Some(1));
     let fake_bootstrap_display = fake_bootstrap.to_string_lossy();
     assert!(
         scorecard["trust_cargo_driver"]
@@ -1190,7 +1557,15 @@ fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
         scorecard["requested_upstream_revision"].as_str(),
         Some(requested_revision.as_str())
     );
-    assert_eq!(scorecard["resolved_upstream_revision"].as_str(), Some(current.as_str()));
+    assert_eq!(scorecard["resolved_upstream_revision"].as_str(), Some(upstream_revision.as_str()));
+    assert_eq!(scorecard["local_repository_revision"].as_str(), Some(current.as_str()));
+    let imported = read_json(&out_dir.join("upstream-inventory.json"));
+    assert_eq!(imported["tests"].as_array().expect("all imported inputs").len(), 2);
+    assert_eq!(
+        fs::read_to_string(out_dir.join("imported/tests/ui/auxiliary/helper.rs")).unwrap(),
+        "pub fn value() {}\n",
+        "the auxiliary remains an input dependency"
+    );
 
     let execution_log = fs::read_to_string(out_dir.join("execution.log"))
         .expect("execution log should be readable");
@@ -1202,7 +1577,7 @@ fn port_cli_execute_uses_configured_fake_bootstrap_without_legacy_shell_path() {
         .expect("capture should exist");
     assert!(capture.contains("argv: <test>"));
     assert!(capture.contains("TRUST_UPSTREAM_RUST_EXECUTOR=rust-bootstrap"));
-    assert!(capture.contains(&format!("TRUST_UPSTREAM_RUST_CURRENT_REVISION={current}")));
+    assert!(capture.contains(&format!("TRUST_UPSTREAM_RUST_CURRENT_REVISION={upstream_revision}")));
     assert!(capture.contains("TRUST_STRICT=1"));
     assert!(capture.contains("TRUST_RELEASE_GATE=0"));
     assert!(capture.contains("TRUST_UPSTREAM_RUST_PROOF_DIR="));
@@ -1256,6 +1631,7 @@ fn port_cli_summary_out_preserves_x86_64_and_aarch64_provenance_fail_closed() {
     let baseline = write_baseline(&repo, &current);
     let upstream_fixes = write_empty_upstream_fixes(&repo);
     let patch_manifest = write_empty_patch_manifest(&repo);
+    let test_exceptions = write_empty_test_exceptions(&repo);
     let requested_revision = qualified_revision(&current);
 
     for case in cases {
@@ -1274,6 +1650,7 @@ fn port_cli_summary_out_preserves_x86_64_and_aarch64_provenance_fail_closed() {
             push_value("--baseline", baseline.to_string_lossy().into_owned());
             push_value("--upstream-fixes", upstream_fixes.to_string_lossy().into_owned());
             push_value("--patch-manifest", patch_manifest.to_string_lossy().into_owned());
+            push_value("--test-exceptions", test_exceptions.to_string_lossy().into_owned());
             push_value("--summary-out", summary_out.to_string_lossy().into_owned());
             push_value("--run-id", case.run_id.to_string());
             push_value("--target-arch", case.target_arch.to_string());
@@ -1385,6 +1762,74 @@ fn port_cli_summary_out_preserves_x86_64_and_aarch64_provenance_fail_closed() {
 }
 
 #[test]
+fn port_cli_release_retains_unknown_report_and_rejects_ambient_git_context() {
+    let repo = TestRepo::new("release-ambient-git");
+    let workspace = workspace_root();
+    let current = run_git(&workspace, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    let current = current.trim();
+    let baseline = write_baseline(&repo, current);
+    let upstream_fixes = write_empty_upstream_fixes(&repo);
+    let patch_manifest = write_empty_patch_manifest(&repo);
+    let test_exceptions = write_empty_test_exceptions(&repo);
+    let out_dir = repo.root.join("reports/release");
+    let summary_out = out_dir.join("compat-summary.json");
+    let output = Command::new(trust_upstream_compat_bin())
+        .args([
+            "port",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--upstream-fixes",
+            upstream_fixes.to_str().unwrap(),
+            "--patch-manifest",
+            patch_manifest.to_str().unwrap(),
+            "--test-exceptions",
+            test_exceptions.to_str().expect("test exception path should be UTF-8"),
+            "--summary-out",
+            summary_out.to_str().unwrap(),
+            "--upstream-revision",
+            &qualified_revision(current),
+            "--upstream-remote",
+            "missing-upstream.invalid",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--max-files",
+            "1",
+            "--proof-mode",
+            "smoke",
+            "--release",
+            "--no-execute",
+            "--no-apply",
+            "--no-fetch",
+        ])
+        .env("GIT_DIR", repo.root.join(".git"))
+        .env("GIT_WORK_TREE", &repo.root)
+        .env("GIT_INDEX_FILE", repo.root.join("missing-index"))
+        .env("GIT_NO_REPLACE_OBJECTS", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.quotePath")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .current_dir(&workspace)
+        .output()
+        .expect("port CLI should run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scorecard = read_json(&out_dir.join("scorecard.json"));
+    assert_eq!(scorecard["resolved_upstream_revision"], current);
+    assert_eq!(scorecard["execution_authenticated"], false);
+    assert!(scorecard["validation_failures"].as_array().is_some_and(|failures| {
+        failures.iter().any(|failure| failure["kind"] == "unauthenticated-upstream-execution")
+    }));
+    let summary = read_json(&summary_out);
+    assert_eq!(summary["totals"]["compatible"], 0);
+    assert_eq!(summary["totals"]["unknown"], 1);
+}
+
+#[test]
 fn port_cli_rejects_expired_test_exception_ledger_before_porting() {
     let repo = TestRepo::new("port-cli-expired-test-exception");
     let test_exceptions = repo.write(
@@ -1437,13 +1882,16 @@ allowed_patterns = ["fixture"]
 fn port_cli_rejects_python_bootstrap_launcher_before_launch() {
     let repo = TestRepo::new("port-cli-python-bootstrap");
     let workspace_root = workspace_root();
-    let current =
-        run_git(&workspace_root, ["rev-parse", "--verify", "HEAD^{commit}"]).trim().to_string();
-    let baseline = write_baseline(&repo, &current);
+    let upstream = bounded_cli_upstream();
+    let upstream_revision = upstream.commit_all("bounded CLI upstream");
+    import_fixture_objects(&workspace_root, &upstream, &upstream_revision);
+    let baseline = write_baseline(&repo, &upstream_revision);
     let upstream_fixes = write_empty_upstream_fixes(&repo);
     let patch_manifest = write_empty_patch_manifest(&repo);
+    let test_exceptions = write_empty_test_exceptions(&repo);
     let out_dir = repo.root.join("reports/python-bootstrap");
-    let requested_revision = qualified_revision(&current);
+    let requested_revision = qualified_revision(&upstream_revision);
+    let rejected_launcher = install_fake_bootstrap_command(&repo.root.join("bin/python"));
 
     let output = Command::new(trust_upstream_compat_bin())
         .args([
@@ -1454,6 +1902,8 @@ fn port_cli_rejects_python_bootstrap_launcher_before_launch() {
             upstream_fixes.to_str().expect("upstream fixes path should be UTF-8"),
             "--patch-manifest",
             patch_manifest.to_str().expect("patch manifest path should be UTF-8"),
+            "--test-exceptions",
+            test_exceptions.to_str().expect("test exception path should be UTF-8"),
             "--upstream-revision",
             requested_revision.as_str(),
             "--upstream-remote",
@@ -1464,11 +1914,11 @@ fn port_cli_rejects_python_bootstrap_launcher_before_launch() {
             "--no-apply",
             "--no-fetch",
             "--max-files",
-            "1",
+            BOUNDED_CLI_IMPORT_LIMIT,
             "--proof-mode",
             "smoke",
         ])
-        .env("TRUST_UPSTREAM_RUST_BOOTSTRAP", "python x.py")
+        .env("TRUST_UPSTREAM_RUST_BOOTSTRAP", format!("{} x.py", rejected_launcher.display()))
         .env_remove("TRUST_UPSTREAM_COMPAT_CARGO")
         .env_remove("TRUST_TARGO_BIN")
         .current_dir(&workspace_root)
@@ -1482,6 +1932,99 @@ fn port_cli_rejects_python_bootstrap_launcher_before_launch() {
         "{stderr}"
     );
     assert!(!fake_bootstrap_capture_path(&repo.root.join("python")).exists());
+    assert!(
+        !fake_bootstrap_capture_path(&rejected_launcher).exists(),
+        "Python-named trap must be rejected before it can write its capture"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn port_cli_rejects_metadata_only_bounded_import_before_bootstrap_launch() {
+    let repo = TestRepo::new("port-cli-no-primary-case");
+    let workspace_root = workspace_root();
+    let current =
+        run_git(&workspace_root, ["rev-parse", "--verify", "HEAD^{commit}"]).trim().to_string();
+    let paths = run_git(&workspace_root, ["ls-tree", "-r", "--name-only", &current, "--", "tests"]);
+    assert_eq!(paths.lines().next(), Some("tests/COMPILER_TESTS.md"));
+    let baseline = write_baseline(&repo, &current);
+    let upstream_fixes = write_empty_upstream_fixes(&repo);
+    let patch_manifest = write_empty_patch_manifest(&repo);
+    let test_exceptions = write_empty_test_exceptions(&repo);
+    let bootstrap = install_fake_bootstrap_command(&repo.root.join("bin/bootstrap"));
+    let out_dir = repo.root.join("reports/no-primary-case");
+    let requested_revision = qualified_revision(&current);
+
+    let output = Command::new(trust_upstream_compat_bin())
+        .args([
+            "port",
+            "--baseline",
+            baseline.to_str().expect("baseline path should be UTF-8"),
+            "--upstream-fixes",
+            upstream_fixes.to_str().expect("upstream fixes path should be UTF-8"),
+            "--patch-manifest",
+            patch_manifest.to_str().expect("patch manifest path should be UTF-8"),
+            "--test-exceptions",
+            test_exceptions.to_str().expect("test exception path should be UTF-8"),
+            "--upstream-revision",
+            &requested_revision,
+            "--upstream-remote",
+            "missing-upstream.invalid",
+            "--out-dir",
+            out_dir.to_str().expect("out dir path should be UTF-8"),
+            "--execute",
+            "--no-apply",
+            "--no-fetch",
+            "--max-files",
+            "1",
+            "--proof-mode",
+            "smoke",
+        ])
+        .env("TRUST_UPSTREAM_RUST_BOOTSTRAP", &bootstrap)
+        .env_remove("TRUST_UPSTREAM_COMPAT_CARGO")
+        .env_remove("TRUST_TARGO_BIN")
+        .current_dir(&workspace_root)
+        .output()
+        .expect("metadata-only port CLI should be runnable");
+
+    assert!(!output.status.success(), "metadata alone cannot become a primary case");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no independently executable primary cases"), "{stderr}");
+    assert!(!fake_bootstrap_capture_path(&bootstrap).exists(), "no-case import must not launch");
+    assert!(!out_dir.join("proof/inventory.json").exists());
+    assert!(!out_dir.join("scorecard.json").exists());
+}
+
+/// Two imported files, one primary case. The first two paths in Trust's own
+/// moving HEAD can both be auxiliary inputs, which must refuse execution before
+/// these CLI dispatch tests reach the behavior they intend to inspect. The CLI
+/// tests request THIS revision and import BOUNDED_CLI_IMPORT_LIMIT of its paths:
+/// merge 37799e5bae combined it with the other side's live-HEAD request (and a
+/// live-tree primary), so the scorecard saw the local HEAD as unreviewed
+/// upstream drift and the roster assertions contradicted each other.
+fn bounded_cli_upstream() -> TestRepo {
+    let upstream = TestRepo::new("bounded-cli-upstream");
+    upstream.write("tests/ui/auxiliary/helper.rs", "pub fn value() {}\n");
+    upstream.write(
+        "tests/ui/demo.rs",
+        "#[path = \"auxiliary/helper.rs\"] mod helper;\nfn main() { helper::value(); }\n",
+    );
+    upstream
+}
+
+/// Make the exact fixture revision available to the CLI's --no-fetch resolver.
+/// Import objects only: no refs, source files, config or FETCH_HEAD are changed.
+fn import_fixture_objects(workspace: &Path, upstream: &TestRepo, revision: &str) {
+    run_git(
+        workspace,
+        [
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            upstream.root.to_str().expect("fixture path should be UTF-8"),
+            revision,
+        ],
+    );
 }
 
 fn porting_seed() -> toml::Value {
@@ -1490,6 +2033,12 @@ fn porting_seed() -> toml::Value {
 
 fn qualified_revision(revision: &str) -> String {
     format!("rust-lang/rust:{revision}")
+}
+
+fn write_empty_test_exceptions(repo: &TestRepo) -> PathBuf {
+    // These CLI fixtures have no waived cases. Keep their inputs independent of
+    // production exception reviews and expiry; the expiry control supplies its own ledger.
+    repo.write("accounting/test-exceptions.toml", "schema_version = \"0.1.0\"\nexceptions = []\n")
 }
 
 fn write_baseline(repo: &TestRepo, upstream_revision: &str) -> PathBuf {
@@ -1578,6 +2127,36 @@ fn install_fake_bootstrap(root: &Path) {
 }
 
 #[cfg(unix)]
+fn install_two_case_fake_bootstrap(root: &Path, inject_manifest: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bootstrap = root.join("build/bootstrap/debug/bootstrap");
+    fs::create_dir_all(bootstrap.parent().expect("bootstrap parent"))
+        .expect("bootstrap parent should be creatable");
+    let injection = if inject_manifest {
+        r#"printf '%s\n' '{"schema_version":"0.1.0","commands":[{"id":"trust.added.injected-command","command":"targo trust domination trust-added --release quick","covers":["trust.added.injected"],"required":true}]}' > "$TRUST_UPSTREAM_RUST_PROOF_DIR/trust-added-manifest.json""#
+    } else {
+        ""
+    };
+    fs::write(
+        &bootstrap,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" > "$0.capture"
+{injection}
+printf 'running 2 tests\ntest [ui] tests/ui/proof.rs ... ok\ntest [ui] tests/ui/second.rs ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+"#
+        ),
+    )
+    .expect("two-case bootstrap should be writable");
+    let mut permissions = fs::metadata(&bootstrap).expect("bootstrap metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&bootstrap, permissions).expect("bootstrap permissions");
+    bootstrap
+}
+
+#[cfg(unix)]
 fn install_failing_fake_bootstrap(root: &Path, exit_code: i32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1590,7 +2169,7 @@ fn install_failing_fake_bootstrap(root: &Path, exit_code: i32) -> PathBuf {
         format!(
             r#"#!/bin/sh
 set -eu
-printf '[ui] tests/ui/proof.rs ... ok\n'
+printf 'running 1 tests\ntest [ui] tests/ui/proof.rs ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n'
 exit {exit_code}
 "#
         ),
@@ -1638,18 +2217,25 @@ case " $* " in
     exit 97
     ;;
 esac
+count=0
+for arg in "$@"; do
+  case "$arg" in tests/*) count=$((count + 1));; esac
+done
+[ "$count" -gt 0 ] || count=1
+printf 'running %s tests\n' "$count"
 printed=0
 for arg in "$@"; do
   case "$arg" in
     tests/*)
-      printf '[ui] %s ... ok\n' "$arg"
+      printf 'test [ui] %s ... ok\n' "$arg"
       printed=1
       ;;
   esac
 done
 if [ "$printed" = "0" ]; then
-  printf '[ui] tests/ui/proof.rs ... ok\n'
+  printf 'test [ui] tests/ui/proof.rs ... ok\n'
 fi
+printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' "$count"
 "#,
     )
     .expect("fake bootstrap should be writable");
@@ -1714,18 +2300,73 @@ fn main() {{
     )
     .expect("Trust-added native command source should be writable");
 
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let status = Command::new(rustc)
+    // The fixture must be a native binary (shebang commands are rejected on
+    // purpose), so it is compiled with `RUSTC` if set, else `trustc`. targo
+    // does not export RUSTC to test processes (measured), and a bare `rustc`
+    // is the aterm reroute stub or a rustup shim that may resolve stock Rust.
+    // The Trust compiler verifies every unit by default and refuses this
+    // helper under the strict policy. The helper is test scaffolding with no
+    // proof claim, so it is built in the vanilla-comparison lane
+    // (`-Ztrust-verify=off`, docs/TOOLCHAIN_POSTURE.md §4.3). An explicit
+    // non-Trust RUSTC rejects `-Z` flags, so the flag is added only when the
+    // `-vV` probe identifies a Trust compiler.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "trustc".to_string());
+    let version = Command::new(&rustc)
+        .arg("-vV")
+        .env("ATERM_REROUTE_QUIET", "1")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("fixture compiler `{rustc}` (from RUSTC, else `trustc`) failed to launch: {err}")
+        });
+    let version_text = String::from_utf8_lossy(&version.stdout).into_owned();
+    assert!(
+        version.status.success(),
+        "fixture compiler `{rustc}` -vV failed ({}):\n{}{}",
+        version.status,
+        version_text,
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let mut compile = Command::new(&rustc);
+    compile.env("ATERM_REROUTE_QUIET", "1");
+    if is_trust_compiler_version(&version_text) {
+        compile.arg("-Ztrust-verify=off");
+    }
+    let output = compile
         .args([
             "--edition=2021",
             source.to_str().expect("native command source path should be UTF-8"),
             "-o",
             command.to_str().expect("native command output path should be UTF-8"),
         ])
-        .status()
-        .expect("rustc should compile native Trust-added fixture command");
-    assert!(status.success(), "rustc should compile native Trust-added fixture command");
+        .output()
+        .unwrap_or_else(|err| panic!("fixture compiler `{rustc}` failed to launch: {err}"));
+    assert!(
+        output.status.success(),
+        "fixture compiler `{rustc}` could not compile the native Trust-added fixture command \
+         ({}).\n-vV:\n{}\nstderr:\n{}",
+        output.status,
+        version_text,
+        String::from_utf8_lossy(&output.stderr)
+    );
     command
+}
+
+/// A Trust compiler reports a `trust: <version>` line in `rustc -vV`; stock
+/// rustc does not.
+#[cfg(unix)]
+fn is_trust_compiler_version(verbose_version: &str) -> bool {
+    verbose_version.lines().any(|line| line.starts_with("trust:"))
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_compiler_probe_distinguishes_trust_from_stock_rustc() {
+    let trust = "rustc 1.99.0-dev (43f8b339f 2026-09-12)\nbinary: rustc\nhost: aarch64-apple-darwin\n\
+                 release: 1.99.0-dev\ntrust: 0.1.0\nLLVM version: 22.1.2\n";
+    let stock = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\nhost: aarch64-apple-darwin\n\
+                 release: 1.97.1\nLLVM version: 22.1.6\n";
+    assert!(is_trust_compiler_version(trust));
+    assert!(!is_trust_compiler_version(stock));
 }
 
 #[cfg(unix)]

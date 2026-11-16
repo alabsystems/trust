@@ -1,0 +1,22 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-lean_oracle",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (6f70bdb69 2026-09-19) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@4338e7923763 sha256:ece53b053817beaf",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.unit.lean_oracle.native": {
+   "verdict": "PASS",
+   "audit": "PASS"
+  },
+  "a.unit.lean_oracle.symbol_collision": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "DuplicateFunctionName:name=program",
+   "audit": "GAP"
+  }
+ }
+}

@@ -1,10 +1,10 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //! Trust: Query provider for compiler-native Trust contracts.
 //!
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_ast::ast::{BinOpKind, LitKind, UnOp};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{
@@ -27,6 +27,111 @@ use rustc_span::{Span, Symbol};
 
 const LOWERED_COMPILER_CONTRACT_PREFIX: &str = "__trust_lowered_compiler_contract__:";
 const ENSURES_RESULT_BINDING: &str = "result";
+
+/// Trust: B0 (design revision 2 `requires-hyps` §3.7) — did this clause's
+/// refusal name a Clean island DECLARATION of this crate?
+///
+/// A `requires` / `invariant` / `decreases` payload is validated against the
+/// CLOSED source-contract predicate vocabulary, and an island definition is not
+/// in it, so `requires small(a)` is refused as `unsupported source-contract
+/// call \`small\`` with no indication that `small` is a real, kernel-checked
+/// definition the author can see three lines above. The author's reasonable
+/// reading is "the compiler cannot see my island"; the truth is "this clause
+/// ROLE has no island lane yet, while `ensures` does". Saying which one it is
+/// costs nothing and changes no verdict.
+///
+/// The match is on the RENDERED refusal, deliberately: it fires only when the
+/// validator's own message names exactly this declaration, so if that message
+/// ever changes the note stops appearing rather than attaching itself to an
+/// unrelated refusal. The crate HIR is consulted only once the refusal already
+/// contains the marker, so an ordinary clause pays nothing.
+///
+/// Returns the declaration name and its Clean surface kind.
+fn island_declaration_named_in_refusal(
+    tcx: TyCtxt<'_>,
+    reason: &str,
+) -> Option<(String, rustc_ast::CleanDeclKind)> {
+    const MARKER: &str = "unsupported source-contract call `";
+    if !reason.contains(MARKER) {
+        return None;
+    }
+    for item_id in tcx.hir_crate_items(()).free_items() {
+        if tcx.def_kind(item_id.owner_id) != DefKind::GlobalAsm {
+            continue;
+        }
+        let item = tcx.hir_item(item_id);
+        let rustc_hir::ItemKind::CleanIsland { decls, .. } = item.kind else { continue };
+        for decl in decls {
+            let name = decl.name.as_str();
+            if name.is_empty() {
+                continue;
+            }
+            if reason.contains(&format!("{MARKER}{name}`")) {
+                return Some((name.to_string(), decl.kind));
+            }
+        }
+    }
+    None
+}
+
+/// Trust: B0 — attach the island-aware explanation to a refused native clause.
+///
+/// Options follow v7/D3 (what was refused, why, what to do instead) and are the
+/// ones that exist TODAY: restate the predicate in the clause grammar and derive
+/// the island fact inside a Lean theorem, or keep the definition for `ensures`,
+/// which does have an island lane.
+fn note_island_definition_in_native_clause(
+    tcx: TyCtxt<'_>,
+    diag: &mut rustc_errors::Diag<'_>,
+    keyword: &str,
+    reason: &str,
+) {
+    use rustc_ast::CleanDeclKind;
+
+    let Some((name, kind)) = island_declaration_named_in_refusal(tcx, reason) else {
+        return;
+    };
+    match kind {
+        CleanDeclKind::Def
+        | CleanDeclKind::Codef
+        | CleanDeclKind::Opaque
+        | CleanDeclKind::Instance => {
+            diag.note(format!(
+                "`{name}` is a Clean island definition in this crate, not an unknown name: a \
+                 `{keyword}` payload is validated against the closed source-contract predicate \
+                 vocabulary, which no island definition (and no Rust function) is a member of"
+            ));
+            diag.note(
+                "`ensures` is the one clause role with an island lane today — the kernel judges \
+                 an island-calling postcondition against this function's imported defining \
+                 equation — so the two sides of a signature are not governed by the same \
+                 admission rule",
+            );
+            diag.help(format!(
+                "state the predicate in the clause grammar (comparisons, `&& || !`) and derive \
+                 `{name} … = true` from it inside the Lean theorem, or keep `{name}` for an \
+                 `ensures` clause"
+            ));
+        }
+        CleanDeclKind::Theorem | CleanDeclKind::Axiom => {
+            diag.note(format!(
+                "`{name}` is a Clean island {}, which is a PROOF, not a predicate: a clause \
+                 payload names a proposition to check, never a proof of one",
+                if matches!(kind, CleanDeclKind::Axiom) { "axiom" } else { "theorem" }
+            ));
+            diag.help(format!(
+                "cite it instead — `{keyword} <predicate> by {name}` — or state the predicate in \
+                 the clause grammar"
+            ));
+        }
+        _ => {
+            diag.note(format!(
+                "`{name}` is a Clean island declaration of this crate, but its surface kind \
+                 cannot denote a verifier predicate"
+            ));
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct LoweredCollectionDomain {
@@ -202,7 +307,7 @@ pub(crate) fn trust_contracts<'tcx>(
             tcx,
             local_def_id,
             typeck_results,
-            body.value,
+            &body.value,
             clause.predicate_hir_id,
             clause.span,
             clause.payload,
@@ -282,7 +387,7 @@ pub(crate) fn trust_contracts<'tcx>(
             tcx,
             local_def_id,
             typeck_results,
-            body.value,
+            &body.value,
             None,
             clause.payload_span,
             Some(clause.payload),
@@ -465,7 +570,15 @@ fn lower_predicate<'tcx>(
                         TrustContractKind::Decreases => "decreases",
                         _ => "invariant",
                     };
-                    tcx.dcx().span_err(span, format!("invalid `{keyword}` clause: {reason}"));
+                    // Trust: B0 — the headline is unchanged; when the refused
+                    // call names a Clean island declaration of this crate, the
+                    // notes say which lane is missing rather than leaving the
+                    // author to read it as "the compiler cannot see my island".
+                    let mut diag = tcx
+                        .dcx()
+                        .struct_span_err(span, format!("invalid `{keyword}` clause: {reason}"));
+                    note_island_definition_in_native_clause(tcx, &mut diag, keyword, &reason);
+                    diag.emit();
                     Some(TrustContractPredicateKind::Unsupported {
                         reason: Symbol::intern(&reason),
                     })
@@ -513,7 +626,7 @@ fn lower_predicate<'tcx>(
             );
             None
         };
-        if std::env::var_os("TRUST_CONTRACT_INLINE_TRACE").is_some() {
+        if crate::trust_verify::trust_env_var_present("TRUST_CONTRACT_INLINE_TRACE") {
             eprintln!(
                 "TRUST_CONTRACT_INLINE_TRACE: path=exact-HIR present={}",
                 exact_expr.is_some()
@@ -529,7 +642,7 @@ fn lower_predicate<'tcx>(
         // expression identity. A successfully validated native parser-island
         // payload wins; every other span-only clause stays in the
         // origin-exact snippet lane.
-        if std::env::var_os("TRUST_CONTRACT_INLINE_TRACE").is_some() {
+        if crate::trust_verify::trust_env_var_present("TRUST_CONTRACT_INLINE_TRACE") {
             eprintln!("TRUST_CONTRACT_INLINE_TRACE: path=snippet (no HIR expression identity)");
         }
         let mut projection_refusal = None;
@@ -552,6 +665,47 @@ fn lower_predicate<'tcx>(
                 &mut projection_refusal,
                 is_primary_lane,
             )
+        });
+        // Trust (2026-10-03): a native `ensures` is typed by the snippet lane, which
+        // refuses every method call, so `ensures result <= xs.len()` over a slice
+        // parameter was always unsupported while the same `xs.len()` types in a
+        // `requires`. Offer a clause the snippet lane REFUSED to the exact-native
+        // lane, with the function's output sort added as `_0` (the binding `result`
+        // denotes; its domain is the signature's `_0`). Only a fully typed proposition is kept, and every
+        // clause the snippet lane accepts keeps its lane and meaning.
+        let lowered = lowered.or_else(|| match context {
+            ContractPayloadContext::Function {
+                source_sorts,
+                variable_domains,
+                collection_domains,
+            } if origin == ContractClauseOrigin::Native
+                && contract_kind == TrustContractKind::Ensures
+                && deferred_native_refusal.is_none() =>
+            {
+                let output =
+                    tcx.fn_sig(owner.to_def_id()).instantiate_identity().skip_binder().output();
+                // The return sort travels as `_0`, the key
+                // `validate_source_spec_expr` reads `result`'s sort from.
+                let (_, result_sort) =
+                    loop_source_binding_from_ty(tcx, "result".to_string(), output)?;
+                if source_sorts.contains_key("_0") {
+                    return None;
+                }
+                let mut sorts = source_sorts.clone();
+                sorts.insert("_0".to_string(), result_sort);
+                lower_native_clause(
+                    tcx,
+                    span,
+                    payload,
+                    contract_kind,
+                    &sorts,
+                    variable_domains,
+                    collection_domains,
+                )
+                .ok()
+                .filter(|kind| matches!(kind, TrustContractPredicateKind::Typed { .. }))
+            }
+            ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => None,
         });
         match (lowered, deferred_native_refusal) {
             // Either the exact-native lane admitted it, or the projection lane
@@ -583,6 +737,10 @@ fn lower_predicate<'tcx>(
                          reference-typed fields below the head, and method calls are refused",
                     );
                 }
+                // Trust: B0 — see `note_island_definition_in_native_clause`.
+                // This is the lane a native function `requires` actually takes,
+                // so an island-calling precondition is refused here.
+                note_island_definition_in_native_clause(tcx, &mut diag, "requires", &reason);
                 diag.emit();
                 TrustContractPredicateKind::Unsupported { reason: Symbol::intern(&reason) }
             }
@@ -712,6 +870,7 @@ fn typed_native_clause_with_collection_domains(
         PropositionClass::Bool
     };
     let formula = trust_types::parse_spec_expr(body)?;
+    let formula = reconcile_float_literal_formats(formula, source_sorts);
     let variable_domains = native_clause_variable_domains(
         &formula,
         source_sorts,
@@ -813,6 +972,11 @@ fn native_clause_variable_domains(
         let domain = collection.element;
         let domain_sort = match domain {
             TrustContractPropositionDomain::Bool => trust_types::Sort::Bool,
+            // A float's sort is its BIT VECTOR, the same spelling
+            // `sort_for_ty` gives a float place in the body. `FpFromBits` lifts
+            // it where IEEE semantics are needed, so the variable itself must
+            // stay at the bit width or the clause names a different symbol.
+            TrustContractPropositionDomain::Float { width } => trust_types::Sort::BitVec(width),
             TrustContractPropositionDomain::MathematicalInt
             | TrustContractPropositionDomain::PointerSizedInt { .. }
             | TrustContractPropositionDomain::MachineInt { .. } => trust_types::Sort::Int,
@@ -864,6 +1028,9 @@ fn signature_source_sorts(
     for variable in signature_domains {
         let sort = match variable.domain {
             TrustContractPropositionDomain::Bool => trust_types::Sort::Bool,
+            // See the collection-element arm above: the bit width, not
+            // `Sort::Float`, because that is how the body spells the place.
+            TrustContractPropositionDomain::Float { width } => trust_types::Sort::BitVec(width),
             TrustContractPropositionDomain::MathematicalInt
             | TrustContractPropositionDomain::PointerSizedInt { .. }
             | TrustContractPropositionDomain::MachineInt { .. } => trust_types::Sort::Int,
@@ -894,16 +1061,19 @@ fn validate_native_clause_body(
     contract_kind: TrustContractKind,
     source_sorts: &BTreeMap<String, trust_types::Sort>,
 ) -> Result<String, String> {
-    if let Some(name) = source_sorts
-        .keys()
-        .find(|name| trust_types::source_contract_synthetic_name_collision(name).is_some())
-    {
+    // `_0` in an `ensures` environment is the return sort the caller inserted (a
+    // parameter spelled `_0` is rejected before any clause is lowered).
+    if let Some(name) = source_sorts.keys().find(|name| {
+        trust_types::source_contract_synthetic_name_collision(name).is_some()
+            && !(contract_kind == TrustContractKind::Ensures && name.as_str() == "_0")
+    }) {
         return Err(format!(
             "visible binding `{name}` collides with the synthetic contract-variable namespace"
         ));
     }
     let clause = match contract_kind {
         TrustContractKind::Requires => trust_types::SourceContractClause::Requires,
+        TrustContractKind::Ensures => trust_types::SourceContractClause::Ensures,
         TrustContractKind::LoopInvariant => trust_types::SourceContractClause::Invariant,
         TrustContractKind::Decreases => trust_types::SourceContractClause::Decreases,
         _ => return Err("unsupported native clause role".to_string()),
@@ -934,6 +1104,24 @@ fn validate_native_clause_body(
 /// binding. Quantifier binders are guarded by the shared `trust-types` parser
 /// rule, and loop-local bindings are guarded by `validate_native_clause_body`
 /// using the exact visible environment.
+/// Trust (review round 41, 2026-10-02): whether `span` carries a LOCAL hygiene
+/// mark (opaque `def_site`, or `macro_rules` semi-transparent). Source-contract propositions are plain
+/// text matched by name, which is faithful for transparent and `macro_rules`
+/// (semi-transparent) spans but not for def-site hygiene: a `pub macro` emitting
+/// `fn f(lim: u8) .. invariant $inv` bound the CALL-site clause `lim <= 127` (a
+/// static of 200) to the DEF-site parameter, and a def-site block `const lim` was
+/// replaced by a call-site `let lim` the macro's own clause cannot see. Both were
+/// proved and kernel-certified.
+///
+/// Review round 42 widened it to `macro_rules` LOCAL hygiene (semi-transparent
+/// marks): a macro's own `let lim = 200` was recorded as an unsupported shadow, a
+/// narrower call-site `let lim` pasted into the macro replaced it, and the macro's
+/// clause was proved about the call-site value. Only transparent marks (a proc
+/// macro's `Span::call_site()`) resolve exactly like unexpanded code.
+fn has_local_hygiene(span: rustc_span::Span) -> bool {
+    !span.normalize_to_macro_rules().ctxt().is_root()
+}
+
 fn reject_unrepresentable_contract_parameter_names<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &'tcx rustc_hir::Body<'tcx>,
@@ -943,6 +1131,12 @@ fn reject_unrepresentable_contract_parameter_names<'tcx>(
         rejected: bool,
         parameter_ids: BTreeMap<String, u32>,
         ambiguous_names: BTreeSet<String>,
+        // Review rounds 41-42: the `macro_rules`-normalized syntax context of every
+        // clause payload. A parameter is bindable by displayed name only when it
+        // shares that context: a def-site parameter does not see a call-site
+        // clause's `lim` (a static), nor does a call-site parameter see a clause
+        // written inside the macro.
+        clause_ctxts: Vec<rustc_span::SyntaxContext>,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
@@ -952,6 +1146,26 @@ fn reject_unrepresentable_contract_parameter_names<'tcx>(
             {
                 let name = ident.name.to_string();
                 let id = canonical_id.local_id.as_u32();
+                // A clause span need not carry its PAYLOAD's context (a native
+                // clause's span can start at a macro-written keyword while the
+                // payload is a call-site `$post` fragment, measured on round 41's
+                // h4), so a macro-local parameter is refused outright; the context
+                // comparison additionally refuses a call-site parameter under a
+                // clause written inside a macro.
+                let param_ctxt = ident.span.normalize_to_macro_rules().ctxt();
+                if has_local_hygiene(ident.span)
+                    || self.clause_ctxts.iter().any(|clause_ctxt| *clause_ctxt != param_ctxt)
+                {
+                    self.tcx.dcx().span_err(
+                        pat.span,
+                        format!(
+                            "parameter `{name}` and a contract clause of this function have \
+                             different macro hygiene; source-contract propositions are matched \
+                             by displayed name and cannot respect it"
+                        ),
+                    );
+                    self.rejected = true;
+                }
                 if let Some(previous_id) = self.parameter_ids.get(&name).copied()
                     && previous_id != id
                     && self.ambiguous_names.insert(name.clone())
@@ -1002,11 +1216,26 @@ fn reject_unrepresentable_contract_parameter_names<'tcx>(
         }
     }
 
+    let clause_ctxts = body
+        .contract
+        .map(|contract| {
+            contract
+                .requires
+                .iter()
+                .chain(contract.ensures)
+                .chain(contract.decreases)
+                .map(|clause| clause.span)
+                .chain(contract.loop_clauses.iter().map(|clause| clause.payload_span))
+                .map(|span| span.normalize_to_macro_rules().ctxt())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut collector = Collector {
         tcx,
         rejected: false,
         parameter_ids: BTreeMap::new(),
         ambiguous_names: BTreeSet::new(),
+        clause_ctxts,
     };
     for param in body.params {
         collector.visit_pat(param.pat);
@@ -1015,7 +1244,7 @@ fn reject_unrepresentable_contract_parameter_names<'tcx>(
 }
 
 /// Every source binding introduced by the function signature, including
-/// bindings whose type is outside the scalar proposition vocabulary.  The
+/// bindings whose type is outside the scalar proposition vocabulary. The
 /// native contract surface is text, so a bare `f(...)` cannot be resolved as a
 /// module function when a parameter named `f` would win ordinary Rust name
 /// resolution (notably a function-pointer parameter).
@@ -1071,8 +1300,13 @@ fn lower_expr<'tcx>(
         }
     }
 
-    let lowerer =
-        ExprLowerer { tcx, typeck_results, result_binding: None, pat_bindings: Vec::new(), inline_depth: 0 };
+    let lowerer = ExprLowerer {
+        tcx,
+        typeck_results,
+        result_binding: None,
+        pat_bindings: Vec::new(),
+        inline_depth: 0,
+    };
     lowerer.lower_predicate(expr)
 }
 
@@ -1099,9 +1333,14 @@ fn lower_requires_closure<'tcx>(
         return None;
     }
     let typeck_results = tcx.typeck_body(closure.body);
-    let lowerer =
-        ExprLowerer { tcx, typeck_results, result_binding: None, pat_bindings: Vec::new(), inline_depth: 0 };
-    lowerer.lower_predicate(body.value)
+    let lowerer = ExprLowerer {
+        tcx,
+        typeck_results,
+        result_binding: None,
+        pat_bindings: Vec::new(),
+        inline_depth: 0,
+    };
+    lowerer.lower_predicate(&body.value)
 }
 
 fn ensures_value_closure<'tcx>(expr: &'tcx Expr<'tcx>) -> Option<&'tcx Closure<'tcx>> {
@@ -1137,7 +1376,7 @@ fn lower_ensures_closure<'tcx>(
         pat_bindings: Vec::new(),
         inline_depth: 0,
     };
-    lowerer.lower_predicate(body.value)
+    lowerer.lower_predicate(&body.value)
 }
 
 /// The token-rendered payload spelling, exactly when it must be the text
@@ -1201,14 +1440,7 @@ fn lower_contract_snippet(
         body.to_string()
     } else {
         let shadowed_names = contract_parameter_binding_names(tcx, owner);
-        expand_contract_helper_calls(
-            tcx,
-            owner,
-            body,
-            0,
-            signature_domains,
-            &shadowed_names,
-        )
+        expand_contract_helper_calls(tcx, owner, body, 0, signature_domains, &shadowed_names)
     };
     let mut literal_refusal = None;
     let lowered = lower_contract_snippet_body_with_domains(
@@ -1373,9 +1605,7 @@ fn protected_contract_token_end(text: &str, start: usize) -> Option<usize> {
     }
 
     // Raw Rust strings: r"...", r#"..."#, br#"..."#, and cr#"..."#.
-    let prefix_len = if bytes[start..].starts_with(b"br")
-        || bytes[start..].starts_with(b"cr")
-    {
+    let prefix_len = if bytes[start..].starts_with(b"br") || bytes[start..].starts_with(b"cr") {
         2
     } else if bytes[start] == b'r' {
         1
@@ -1392,7 +1622,8 @@ fn protected_contract_token_end(text: &str, start: usize) -> Option<usize> {
             let mut idx = quote + 1;
             while idx < bytes.len() {
                 if bytes[idx] == b'"'
-                    && bytes.get(idx + 1..idx + 1 + hashes) == Some(&bytes[start + prefix_len..quote])
+                    && bytes.get(idx + 1..idx + 1 + hashes)
+                        == Some(&bytes[start + prefix_len..quote])
                 {
                     return Some(idx + 1 + hashes);
                 }
@@ -1556,7 +1787,19 @@ fn lower_contract_snippet_body_with_domains(
     // attach an exact MIR place and state epoch. This is deliberately uniform
     // across clause kinds: primes are not meaningful in requires, invariants,
     // or other one-state predicates either.
-    if primed_identifier_in_contract_snippet(expr.trim()).is_some() {
+    //
+    // Trust (D2 primes, 2026-09-30): one exception. In a NATIVE, uncited
+    // `ensures`, a prime on a `&mut` parameter's pointee is bound to an exact
+    // place: the projection environment resolves `self'.storage.detached` (and
+    // `x'` for a scalar `&mut`) to the canonical place today's lane reads at exit
+    // (see `LeafEpoch`). Every other primed spelling has no entry there and still
+    // fails the clause closed, as does a clause mixing a primed and an unprimed
+    // `&mut` pointee read. Requires, invariants, cited and attribute clauses keep
+    // the uniform refusal.
+    let primes_bindable = contract_kind == TrustContractKind::Ensures
+        && origin == ContractClauseOrigin::Native
+        && citation == ClauseCitation::Absent;
+    if !primes_bindable && primed_identifier_in_contract_snippet(expr.trim()).is_some() {
         return None;
     }
     let lowered = SnippetParser::parse(
@@ -1615,30 +1858,35 @@ fn native_function_clause_is_source_typed(
     .is_ok()
 }
 
-/// Return the first ASCII identifier carrying one or more trailing prime
-/// marks. Native contract identifiers are ASCII today, matching the snippet
-/// tokenizer. This small scanner remains usable for diagnostics even when the
-/// rest of a malformed clause cannot be tokenized.
+/// Return the first identifier carrying one or more trailing prime marks. This
+/// small scanner remains usable for diagnostics even when the rest of a
+/// malformed clause cannot be tokenized.
+///
+/// Trust (CITE-PRIME-NONASCII-1, 2026-10-05): identifiers are lexed on whole
+/// characters with rustc's own predicates (`rustc_lexer::is_id_start` /
+/// `is_id_continue`), not as ASCII byte runs. Rust identifiers may be
+/// non-ASCII; the byte scanner reported `éa'` as `a'` and did not see `δ'` at
+/// all. Both readers downstream of this gate (the snippet tokenizer and
+/// `trust_types::parse_spec_expr`) refuse non-ASCII input, so the miss failed
+/// closed, but this is the first boundary that must see the prime, and the
+/// diagnostic must name the identifier the author wrote.
 fn primed_identifier_in_contract_snippet(input: &str) -> Option<&str> {
-    let bytes = input.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
+    let mut chars = input.char_indices().peekable();
+    while let Some((start, first)) = chars.next() {
+        if !rustc_lexer::is_id_start(first) {
+            continue;
+        }
+        let mut end = start + first.len_utf8();
+        while let Some(&(index, next)) = chars.peek() {
+            if !rustc_lexer::is_id_continue(next) {
+                break;
             }
-            if index < bytes.len() && bytes[index] == b'\'' {
-                while index < bytes.len() && bytes[index] == b'\'' {
-                    index += 1;
-                }
-                return Some(&input[start..index]);
-            }
-        } else {
-            index += 1;
+            end = index + next.len_utf8();
+            chars.next();
+        }
+        let primes = input[end..].bytes().take_while(|&byte| byte == b'\'').count();
+        if primes > 0 {
+            return Some(&input[start..end + primes]);
         }
     }
     None
@@ -2809,12 +3057,11 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
         args: &'tcx [Expr<'tcx>],
     ) -> Option<LoweredExpr> {
         let outcome = self.lower_inlined_call_reasoned(callee, args);
-        if std::env::var_os("TRUST_CONTRACT_INLINE_TRACE").is_some() {
+        if crate::trust_verify::trust_env_var_present("TRUST_CONTRACT_INLINE_TRACE") {
             match &outcome {
-                Ok(lowered) => eprintln!(
-                    "TRUST_CONTRACT_INLINE_TRACE: inlined -> `{}`",
-                    lowered.text
-                ),
+                Ok(lowered) => {
+                    eprintln!("TRUST_CONTRACT_INLINE_TRACE: inlined -> `{}`", lowered.text)
+                }
                 Err(reason) => {
                     eprintln!("TRUST_CONTRACT_INLINE_TRACE: refused ({reason})")
                 }
@@ -2845,8 +3092,8 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
         };
 
         // The emitted helper body is text, so any Rust coercion applied at the
-        // call boundary would otherwise disappear.  Require each actual's
-        // original and adjusted type to be byte-for-byte the formal type.  The
+        // call boundary would otherwise disappear. Require each actual's
+        // original and adjusted type to be byte-for-byte the formal type. The
         // ordinary HIR resolver has already authenticated the callee `Res`;
         // this gate authenticates the exact instantiation that the text stands
         // for.
@@ -3034,8 +3281,8 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
 /// verifier's E9 discharge trace so a single rebuild confirms which lowering
 /// path fired; `TRUST_CONTRACT_LOWER_DEBUG` enables it in isolation.
 fn contract_lower_debug() -> bool {
-    std::env::var_os("TRUST_E9_DEBUG").is_some()
-        || std::env::var_os("TRUST_CONTRACT_LOWER_DEBUG").is_some()
+    crate::trust_verify::trust_env_var_present("TRUST_E9_DEBUG")
+        || crate::trust_verify::trust_env_var_present("TRUST_CONTRACT_LOWER_DEBUG")
 }
 
 fn expr_is_bool_lit(expr: &Expr<'_>, value: bool) -> bool {
@@ -3087,15 +3334,43 @@ fn lowered_contract_text_with_domains(
     lowered_contract_text_with_domains_for_class(text, variable_domains, PropositionClass::Bool)
 }
 
+/// The formula sort a contract proposition domain denotes. Shared so the
+/// re-parse reconciliation above and the domain-to-sort mappings elsewhere cannot
+/// drift on what a float domain means.
+fn proposition_domain_sort(domain: TrustContractPropositionDomain) -> trust_types::Sort {
+    match domain {
+        TrustContractPropositionDomain::Bool => trust_types::Sort::Bool,
+        TrustContractPropositionDomain::Float { width } => {
+            trust_types::Sort::float_for_width(width).unwrap_or(trust_types::Sort::BitVec(width))
+        }
+        TrustContractPropositionDomain::MathematicalInt
+        | TrustContractPropositionDomain::PointerSizedInt { .. }
+        | TrustContractPropositionDomain::MachineInt { .. } => trust_types::Sort::Int,
+    }
+}
+
 fn lowered_contract_text_with_domains_for_class(
     text: String,
     variable_domains: &[LoweredVariableDomain],
     expected_class: PropositionClass,
 ) -> TrustContractPredicateKind {
     let canonical = Symbol::intern(&format!("{LOWERED_COMPILER_CONTRACT_PREFIX}{text}"));
-    if let Some(proposition) = trust_types::parse_spec_expr(&text).as_ref().and_then(|formula| {
-        query_proposition_from_formula(formula, variable_domains, expected_class)
-    }) {
+    // This re-parses the canonical TEXT, so it gets a fresh binary64 float
+    // literal and must reconcile it the same way every other consumer does.
+    // Without this the proposition carried a binary64 constant against an `f32`
+    // variable's domain, the sorts failed to merge, and the clause fell out as
+    // Opaque — well-typed at the source and still never reaching a typed formula.
+    let declared: BTreeMap<String, trust_types::Sort> = variable_domains
+        .iter()
+        .map(|variable| (variable.name.clone(), proposition_domain_sort(variable.domain)))
+        .collect();
+    if let Some(proposition) = trust_types::parse_spec_expr(&text)
+        .map(|formula| reconcile_float_literal_formats(formula, &declared))
+        .as_ref()
+        .and_then(|formula| {
+            query_proposition_from_formula(formula, variable_domains, expected_class)
+        })
+    {
         TrustContractPredicateKind::Typed { text: canonical, proposition }
     } else {
         TrustContractPredicateKind::Opaque { text: canonical }
@@ -3217,16 +3492,60 @@ fn query_proposition_from_formula_inner(
         }
         Formula::Implies(lhs, rhs) => {
             let ((lhs, lhs_sort), (rhs, rhs_sort)) = binary(lhs, rhs)?;
-            (lhs_sort == PropositionSort::Bool && rhs_sort == PropositionSort::Bool).then_some(
-                (Proposition::Implies(Box::new(lhs), Box::new(rhs)), PropositionSort::Bool),
-            )
+            (lhs_sort == PropositionSort::Bool && rhs_sort == PropositionSort::Bool).then_some((
+                Proposition::Implies(Box::new(lhs), Box::new(rhs)),
+                PropositionSort::Bool,
+            ))
         }
         Formula::Eq(lhs, rhs) => {
             let ((lhs, lhs_sort), (rhs, rhs_sort)) = binary(lhs, rhs)?;
-            let compatible = (lhs_sort == PropositionSort::Bool && rhs_sort == PropositionSort::Bool)
+            let compatible = (lhs_sort == PropositionSort::Bool
+                && rhs_sort == PropositionSort::Bool)
                 || merge_numeric_sorts(lhs_sort, rhs_sort).is_some();
             compatible
                 .then_some((Proposition::Eq(Box::new(lhs), Box::new(rhs)), PropositionSort::Bool))
+        }
+        // Trust (SPEC-FLOAT-EQ-STRUCTURAL-1): the parser spells a `==` with a
+        // float literal operand as IEEE `FpEq` (Rust `PartialEq` on floats, never
+        // structural `=`). It is the same `Proposition::Eq` the arm above builds —
+        // over float domains that proposition denotes `PartialEq`, and the static
+        // lowering (`trust_mir_extract::trust_contract_proposition_to_formula`)
+        // rebuilds `FpEq` from it — but only between two NUMERIC operands whose
+        // domains agree, exactly like the IEEE ordering arms below.
+        Formula::FpEq(lhs, rhs) => {
+            let ((lhs, lhs_sort), (rhs, rhs_sort)) = binary(lhs, rhs)?;
+            merge_numeric_sorts(lhs_sort, rhs_sort)?;
+            Some((Proposition::Eq(Box::new(lhs), Box::new(rhs)), PropositionSort::Bool))
+        }
+        // The IEEE literal the spec parser builds for `1.0`. Carried by BITS,
+        // which is what the proposition stores, so the round trip is exact
+        // through both zeroes and any NaN payload.
+        Formula::FpConst { bits, eb: 11, sb: 53 } => Some((
+            Proposition::Float { bits: *bits as u64, width: 64 },
+            PropositionSort::Numeric(Some(TrustContractPropositionDomain::Float { width: 64 })),
+        )),
+        Formula::FpConst { bits, eb: 8, sb: 24 } => Some((
+            Proposition::Float { bits: *bits as u64, width: 32 },
+            PropositionSort::Numeric(Some(TrustContractPropositionDomain::Float { width: 32 })),
+        )),
+        // The IEEE comparisons. Kept as their own arms rather than folded into
+        // the integer ones below, because `merge_numeric_sorts` has to see two
+        // FLOAT domains agree: a float compared against an integer domain is
+        // ill-sorted and must decline, not silently pick one.
+        Formula::FpLt(lhs, rhs)
+        | Formula::FpLe(lhs, rhs)
+        | Formula::FpGt(lhs, rhs)
+        | Formula::FpGe(lhs, rhs) => {
+            let ((lhs, lhs_sort), (rhs, rhs_sort)) = binary(lhs, rhs)?;
+            merge_numeric_sorts(lhs_sort, rhs_sort)?;
+            let proposition = match formula {
+                Formula::FpLt(..) => Proposition::Lt(Box::new(lhs), Box::new(rhs)),
+                Formula::FpLe(..) => Proposition::Le(Box::new(lhs), Box::new(rhs)),
+                Formula::FpGt(..) => Proposition::Gt(Box::new(lhs), Box::new(rhs)),
+                Formula::FpGe(..) => Proposition::Ge(Box::new(lhs), Box::new(rhs)),
+                _ => unreachable!(),
+            };
+            Some((proposition, PropositionSort::Bool))
         }
         Formula::Lt(lhs, rhs)
         | Formula::Le(lhs, rhs)
@@ -3374,11 +3693,8 @@ fn inline_helper_call_reasoned<'tcx>(
     {
         return Err("callee tail expression reaches its result through a dropped coercion");
     }
-    let mut only_params = InlinedBodyNamesOnlyParams {
-        typeck_results: callee_typeck,
-        params: &param_ids,
-        ok: true,
-    };
+    let mut only_params =
+        InlinedBodyNamesOnlyParams { typeck_results: callee_typeck, params: &param_ids, ok: true };
     intravisit::Visitor::visit_expr(&mut only_params, tail);
     if !only_params.ok {
         return Err("callee body names something other than its own parameters");
@@ -3387,11 +3703,8 @@ fn inline_helper_call_reasoned<'tcx>(
     // Parenthesize each actual: it is spliced into the callee's expression,
     // where a bare `a + b` would otherwise re-associate against the callee's
     // own operators.
-    let pat_bindings = param_ids
-        .iter()
-        .zip(actual_texts)
-        .map(|(id, text)| (*id, format!("({text})")))
-        .collect();
+    let pat_bindings =
+        param_ids.iter().zip(actual_texts).map(|(id, text)| (*id, format!("({text})"))).collect();
 
     // The callee's body is typed by ITS OWN typeck results, and `result` is
     // meaningless inside it.
@@ -3414,9 +3727,9 @@ fn inline_helper_call_reasoned<'tcx>(
 
 /// Resolve a bare snippet name through rustc's completed module binding table.
 /// The table contains the actual `Res` selected by name resolution (including
-/// imports and constructors), unlike a crate-wide string scan.  This lane is
+/// imports and constructors), unlike a crate-wide string scan. This lane is
 /// intentionally narrower than Rust: only one DIRECT same-module free function
-/// is admitted.  Aliases/reexports are refused because their textual spelling
+/// is admitted. Aliases/reexports are refused because their textual spelling
 /// no longer identifies the function body, and a signature binding with the
 /// same name wins expression resolution over the module item.
 fn resolved_direct_local_fn_named(
@@ -3471,7 +3784,7 @@ fn exact_formula_domain(
         PropositionSort::Bool => Some(TrustContractPropositionDomain::Bool),
         PropositionSort::Numeric(Some(domain)) => Some(domain),
         // A bare numeric literal has no authenticated machine width or
-        // signedness.  The caller may not supply one by textual context.
+        // signedness. The caller may not supply one by textual context.
         PropositionSort::Numeric(None) => None,
     }
 }
@@ -3488,7 +3801,7 @@ fn inline_snippet_helper_call_reasoned<'tcx>(
     let callee = resolved_direct_local_fn_named(tcx, owner, shadowed_names, name)?;
     if actual_texts.is_empty() {
         // With no typed actual there is no source-domain anchor after the
-        // function name is erased.  In particular a numeric literal return
+        // function name is erased. In particular a numeric literal return
         // could silently acquire the surrounding result's width/signedness.
         return Err("zero-argument helper has no exact snippet-domain anchor");
     }
@@ -3554,7 +3867,7 @@ fn expand_contract_helper_calls(
             actual_texts,
             depth,
         );
-        if std::env::var_os("TRUST_CONTRACT_INLINE_TRACE").is_some() {
+        if crate::trust_verify::trust_env_var_present("TRUST_CONTRACT_INLINE_TRACE") {
             match &outcome {
                 Ok(lowered) => {
                     eprintln!("TRUST_CONTRACT_INLINE_TRACE: snippet `{name}` -> `{}`", lowered.text)
@@ -3638,9 +3951,7 @@ fn rewrite_contract_helper_calls(
             };
             parts
                 .into_iter()
-                .map(|arg| {
-                    rewrite_contract_helper_calls(arg.trim(), depth + 1, inline)
-                })
+                .map(|arg| rewrite_contract_helper_calls(arg.trim(), depth + 1, inline))
                 .collect()
         };
 
@@ -3651,7 +3962,7 @@ fn rewrite_contract_helper_calls(
                 i = close + 1;
             }
             None => {
-                // A refused candidate is byte-identical to the source.  Do not
+                // A refused candidate is byte-identical to the source. Do not
                 // opportunistically expand a nested call under an unresolved
                 // outer call: that would contradict this pre-pass's fail-closed
                 // contract even if the parser later refused the outer name.
@@ -3782,6 +4093,8 @@ fn exact_predicate_source_place_bindings(
             Proposition::Var { name, .. } => {
                 names.insert(name.to_string());
             }
+            // A literal binds no name.
+            Proposition::Float { .. } => {}
             Proposition::Not(inner) | Proposition::Neg(inner) => collect_names(inner, names),
             Proposition::And(terms) | Proposition::Or(terms) => {
                 for term in terms {
@@ -3864,6 +4177,8 @@ fn exact_predicate_source_bindings(
             Proposition::Var { name, .. } => {
                 names.insert(name.to_string());
             }
+            // A literal binds no name.
+            Proposition::Float { .. } => {}
             Proposition::Not(inner) | Proposition::Neg(inner) => collect_names(inner, names),
             Proposition::And(terms) | Proposition::Or(terms) => {
                 for term in terms {
@@ -3960,6 +4275,21 @@ fn proposition_domain_from_ty(
             },
             false,
         ),
+        // A float PARAMETER gets a domain so it is in scope for a clause at all.
+        // Without one `signature_variable_domains` skips it, the lowerer resolves
+        // the name to nothing, and every `requires`/`ensures` mentioning it is a
+        // hard error — which is what blocked the magnitude bound that
+        // `float_range::contract_range` is written to consume.
+        ty::Float(kind) => {
+            return Some(TrustContractPropositionDomain::Float {
+                width: match kind {
+                    ty::FloatTy::F16 => 16,
+                    ty::FloatTy::F32 => 32,
+                    ty::FloatTy::F64 => 64,
+                    ty::FloatTy::F128 => 128,
+                },
+            });
+        }
         _ => return None,
     };
     Some(TrustContractPropositionDomain::MachineInt { width, signed })
@@ -3998,9 +4328,7 @@ fn collection_element_domain_from_ty<'tcx>(
         // would also fire on any user type whose path ends in `Vec`
         // (`mod fake { pub struct Vec<T>(T); }`), and admitting a look-alike
         // as a sequence is precisely the confusion this gate exists to avoid.
-        ty::Adt(adt_def, args)
-            if tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did()) =>
-        {
+        ty::Adt(adt_def, args) if tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did()) => {
             (args.type_at(0), None)
         }
         _ => return None,
@@ -4047,13 +4375,26 @@ fn opaque_sort_name(ty: Ty<'_>) -> String {
 /// element sort for indexing and collection accessors. Other aggregates stay
 /// opaque: their names remain in scope, but ordinary fields are rejected until
 /// exact source layouts are available.
-fn loop_source_sort_from_ty<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    ty: Ty<'tcx>,
-) -> Option<trust_types::Sort> {
+fn loop_source_sort_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<trust_types::Sort> {
     match ty.kind() {
         ty::Bool => Some(trust_types::Sort::Bool),
         ty::Int(_) | ty::Uint(_) | ty::Char => Some(trust_types::Sort::Int),
+        // A float binds at its IEEE sort, which is what the source validator
+        // already gives a float LITERAL (`SpecExpr::FloatLit` sorts as
+        // `Float { eb: 11, sb: 53 }`). Without this arm the parameter had no
+        // source sort at all, so `requires x <= 1.0` reported `x` out of scope —
+        // the variable was missing, not the literal.
+        //
+        // This is the SOURCE sort and is deliberately not the place sort: the
+        // body spells a float local as its bit vector, and the proposition
+        // translator lifts it with `FpFromBits`. The two layers agree through
+        // that lift, not by sharing a spelling.
+        ty::Float(kind) => trust_types::Sort::float_for_width(match kind {
+            ty::FloatTy::F16 => 16,
+            ty::FloatTy::F32 => 32,
+            ty::FloatTy::F64 => 64,
+            ty::FloatTy::F128 => 128,
+        }),
         ty::Array(element, _) | ty::Slice(element) => Some(trust_types::Sort::Array(
             Box::new(trust_types::Sort::Int),
             Box::new(loop_source_sort_from_ty(tcx, *element).unwrap_or_else(|| {
@@ -4280,6 +4621,7 @@ fn visible_loop_source_sorts<'tcx>(
         // must still shadow an outer supported integer `x` rather than
         // accidentally resurrecting the outer verifier binding.
         bindings: BTreeMap<String, (Scope, u32, Option<(String, trust_types::Sort)>)>,
+        opaque_item_in_scope: bool,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
@@ -4292,6 +4634,9 @@ fn visible_loop_source_sorts<'tcx>(
                 && let Some(scope) = self.scope_tree.var_scope(canonical_id.local_id)
                 && self.scope_tree.is_subscope_of(self.target, scope)
             {
+                if has_local_hygiene(ident.span) {
+                    self.opaque_item_in_scope = true;
+                }
                 // Contract desugaring and macros can inject LOCAL bindings
                 // whose hygiene cannot be represented by the verifier's
                 // plain-text names. Retain such a name as an unsupported
@@ -4310,7 +4655,11 @@ fn visible_loop_source_sorts<'tcx>(
                 let source_binding = if hygienic_non_parameter {
                     None
                 } else {
-                    loop_source_binding_from_ty(self.tcx, rust_name.clone(), self.typeck_results.pat_ty(pat))
+                    loop_source_binding_from_ty(
+                        self.tcx,
+                        rust_name.clone(),
+                        self.typeck_results.pat_ty(pat),
+                    )
                 };
                 use std::collections::btree_map::Entry;
                 match self.bindings.entry(rust_name) {
@@ -4337,6 +4686,49 @@ fn visible_loop_source_sorts<'tcx>(
             }
             intravisit::walk_pat(self, pat);
         }
+
+        // Trust (review round 39, 2026-10-02): an item declared in a block
+        // (`const lim: u8 = 200;`, a `static`, a `fn`) is visible in that whole
+        // block and shadows an outer `let lim`, but it is no pattern binding, so
+        // the outer `let` was accepted and a loop `invariant lim <= 127` was
+        // proved about it while the `lim` in scope is 200. Record such an item as
+        // an unsupported binding at the block's scope: the narrower-scope rule
+        // below then shadows an outer `let` with it, and a `let` in a narrower
+        // block still wins.
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            let block_scope = Scope { local_id: block.hir_id.local_id, data: ScopeData::Node };
+            if self.scope_tree.is_subscope_of(self.target, block_scope) {
+                for stmt in block.stmts {
+                    let rustc_hir::StmtKind::Item(item_id) = stmt.kind else { continue };
+                    // An item whose names are not one syntactic ident (a glob
+                    // `use m::*`, an `extern { static lim: u8; }` block) can shadow
+                    // ANY name, a parameter included (review round 40): no name is
+                    // bindable at this loop.
+                    let Some(ident) = self.tcx.hir_item(item_id).kind.ident() else {
+                        self.opaque_item_in_scope = true;
+                        continue;
+                    };
+                    if has_local_hygiene(ident.span) {
+                        self.opaque_item_in_scope = true;
+                    }
+                    use std::collections::btree_map::Entry;
+                    match self.bindings.entry(ident.name.to_string()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert((block_scope, u32::MAX, None));
+                        }
+                        Entry::Occupied(mut entry) => {
+                            let (previous_scope, _, _) = entry.get();
+                            if block_scope == *previous_scope
+                                || self.scope_tree.is_subscope_of(block_scope, *previous_scope)
+                            {
+                                entry.insert((block_scope, u32::MAX, None));
+                            }
+                        }
+                    }
+                }
+            }
+            intravisit::walk_block(self, block);
+        }
     }
 
     let scope_tree = tcx.region_scope_tree(local_def_id);
@@ -4348,8 +4740,12 @@ fn visible_loop_source_sorts<'tcx>(
         target: Scope { local_id: loop_id.local_id, data: ScopeData::Node },
         unique_parameter_hir_local_ids: &unique_parameter_hir_local_ids,
         bindings: BTreeMap::new(),
+        opaque_item_in_scope: has_local_hygiene(tcx.hir_span(loop_id)),
     };
     collector.visit_body(body);
+    if collector.opaque_item_in_scope {
+        return BTreeMap::new();
+    }
     let visible_rust_names = collector.bindings.keys().cloned().collect::<BTreeSet<_>>();
     let mut sorts = collector
         .bindings
@@ -4427,6 +4823,7 @@ fn visible_loop_variable_domains<'tcx>(
         target: Scope,
         unique_parameter_hir_local_ids: &'a BTreeMap<String, u32>,
         bindings: BTreeMap<String, (Scope, u32, Option<BindingDomains>)>,
+        opaque_item_in_scope: bool,
     }
 
     impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
@@ -4436,6 +4833,9 @@ fn visible_loop_variable_domains<'tcx>(
                 && let Some(scope) = self.scope_tree.var_scope(canonical_id.local_id)
                 && self.scope_tree.is_subscope_of(self.target, scope)
             {
+                if has_local_hygiene(ident.span) {
+                    self.opaque_item_in_scope = true;
+                }
                 // Mirror the source-sort collector exactly: a hygienic local
                 // is an unsupported shadow, not permission to fall through to
                 // an outer same-named scalar domain. An exact function
@@ -4476,6 +4876,49 @@ fn visible_loop_variable_domains<'tcx>(
             }
             intravisit::walk_pat(self, pat);
         }
+
+        // Trust (review round 39, 2026-10-02): an item declared in a block
+        // (`const lim: u8 = 200;`, a `static`, a `fn`) is visible in that whole
+        // block and shadows an outer `let lim`, but it is no pattern binding, so
+        // the outer `let` was accepted and a loop `invariant lim <= 127` was
+        // proved about it while the `lim` in scope is 200. Record such an item as
+        // an unsupported binding at the block's scope: the narrower-scope rule
+        // below then shadows an outer `let` with it, and a `let` in a narrower
+        // block still wins.
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            let block_scope = Scope { local_id: block.hir_id.local_id, data: ScopeData::Node };
+            if self.scope_tree.is_subscope_of(self.target, block_scope) {
+                for stmt in block.stmts {
+                    let rustc_hir::StmtKind::Item(item_id) = stmt.kind else { continue };
+                    // An item whose names are not one syntactic ident (a glob
+                    // `use m::*`, an `extern { static lim: u8; }` block) can shadow
+                    // ANY name, a parameter included (review round 40): no name is
+                    // bindable at this loop.
+                    let Some(ident) = self.tcx.hir_item(item_id).kind.ident() else {
+                        self.opaque_item_in_scope = true;
+                        continue;
+                    };
+                    if has_local_hygiene(ident.span) {
+                        self.opaque_item_in_scope = true;
+                    }
+                    use std::collections::btree_map::Entry;
+                    match self.bindings.entry(ident.name.to_string()) {
+                        Entry::Vacant(entry) => {
+                            entry.insert((block_scope, u32::MAX, None));
+                        }
+                        Entry::Occupied(mut entry) => {
+                            let (previous_scope, _, _) = entry.get();
+                            if block_scope == *previous_scope
+                                || self.scope_tree.is_subscope_of(block_scope, *previous_scope)
+                            {
+                                entry.insert((block_scope, u32::MAX, None));
+                            }
+                        }
+                    }
+                }
+            }
+            intravisit::walk_block(self, block);
+        }
     }
 
     let scope_tree = tcx.region_scope_tree(local_def_id);
@@ -4487,8 +4930,12 @@ fn visible_loop_variable_domains<'tcx>(
         target: Scope { local_id: loop_id.local_id, data: ScopeData::Node },
         unique_parameter_hir_local_ids: &unique_parameter_hir_local_ids,
         bindings: BTreeMap::new(),
+        opaque_item_in_scope: has_local_hygiene(tcx.hir_span(loop_id)),
     };
     collector.visit_body(body);
+    if collector.opaque_item_in_scope {
+        return (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
+    }
     let visible_rust_names = collector.bindings.keys().cloned().collect::<BTreeSet<_>>();
     let mut domains = Vec::new();
     let mut collection_domains = BTreeMap::new();
@@ -4591,6 +5038,31 @@ struct ProjectedLeaf {
     /// (`(*_1).0.3` with local 1 named `self` renders `self*.0.3`).
     canonical_var: String,
     domain: TrustContractPropositionDomain,
+    /// Which STATE of the place the authored spelling names. See [`LeafEpoch`].
+    epoch: LeafEpoch,
+}
+
+/// Trust (D2 primes, M0(b1) of
+/// docs/design/2026-09-29-descriptor-protocols-as-compiler-errors.md, 2026-09-30):
+/// which state of a projected place an AUTHORED spelling denotes.
+///
+/// A primed head (`self'.storage.detached`, or `x'` for a scalar `x: &mut T`) is the
+/// ratified D2 spelling of a `&mut` parameter's FINAL value
+/// (docs/design/2026-07-09-two-language-spec-surface.md §3, D2). It resolves to the
+/// same canonical place as the unprimed spelling, which today's native lane reads at
+/// EXIT, so the prime binds exactly the value vcgen already reads there. It is only
+/// ever admitted in an `ensures`. While the unprimed spelling of a `&mut` pointee
+/// still means the exit value too, a clause may not mix the two: `*x' == *x` over
+/// `*x += 1` would compare exit with exit and prove. D2's entry reading of the
+/// unprimed spelling lifts that refusal.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LeafEpoch {
+    /// A by-value parameter's field, or a shared reference's pointee.
+    Plain,
+    /// A `&mut` parameter's pointee, spelled without a prime.
+    MutPointeeUnprimed,
+    /// A `&mut` parameter's pointee, spelled with a prime: its final value.
+    Primed,
 }
 
 /// Authored projection chains resolved to their exact canonical spelling.
@@ -4602,20 +5074,29 @@ struct ProjectedLeaf {
 #[derive(Default)]
 struct ProjectionEnvironment {
     canonical_text: FxHashMap<String, String>,
+    /// The [`LeafEpoch`] of every admitted authored spelling.
+    epochs: FxHashMap<String, LeafEpoch>,
+    /// The `&mut` parameters, by source name: `*x` over one is an unprimed read of
+    /// its pointee, which the mixed-epoch refusal must see.
+    mut_params: FxHashSet<String>,
 }
 
 impl ProjectionEnvironment {
     fn resolve(&self, authored: &str) -> Option<&str> {
         self.canonical_text.get(authored).map(String::as_str)
     }
+
+    fn epoch(&self, authored: &str) -> LeafEpoch {
+        self.epochs.get(authored).copied().unwrap_or(LeafEpoch::Plain)
+    }
 }
 
 /// Enumerate the scalar leaves reachable from each parameter through struct
 /// and tuple fields.
 ///
-/// This is the compiler-query twin of
-/// `trust_mir_extract::insert_projected_scalar_leaf_sorts`, which already
-/// publishes the identical positional spelling on the extraction side. ENUMS
+/// This is the compiler-query twin of `trust_mir_extract::projected_leaf_sort`,
+/// which resolves the identical positional spelling on the extraction side
+/// (one chain at a time, from the chain names a contract spells). ENUMS
 /// and UNIONS are never walked (their field view is variant-dependent, so a
 /// chain name would be ambiguous); references below the head, generic
 /// parameters, arrays, and every other shape stop the walk at that node.
@@ -4631,11 +5112,14 @@ fn signature_projection_leaves<'tcx>(
         // The head follows `signature_variable_domains`: a reference parameter
         // is dereferenced, which `place_to_var_name` renders as a POSTFIX star
         // on the var and which must be written `(*name)` as text.
-        let (head_var, head_text, aggregate_ty) = match ty.kind() {
-            ty::Ref(_, inner, _) => {
-                (format!("{}*", ident.name), format!("(*{})", ident.name), *inner)
-            }
-            _ => (ident.name.to_string(), ident.name.to_string(), ty),
+        let (head_var, head_text, aggregate_ty, mutable) = match ty.kind() {
+            ty::Ref(_, inner, mutability) => (
+                format!("{}*", ident.name),
+                format!("(*{})", ident.name),
+                *inner,
+                mutability.is_mut(),
+            ),
+            _ => (ident.name.to_string(), ident.name.to_string(), ty, false),
         };
         let mut budget = CONTRACT_PROJECTION_ENTRY_BUDGET;
         push_projected_leaves(
@@ -4647,7 +5131,34 @@ fn signature_projection_leaves<'tcx>(
             aggregate_ty,
             CONTRACT_PROJECTION_DEPTH_LIMIT,
             &mut budget,
+            if mutable { LeafEpoch::MutPointeeUnprimed } else { LeafEpoch::Plain },
         );
+        // Trust (D2 primes, 2026-09-30): the primed spellings of a `&mut`
+        // parameter's pointee, to the SAME canonical places. See `LeafEpoch`.
+        if mutable {
+            let primed_head = format!("{}'", ident.name);
+            if let Some(domain) = proposition_domain_from_ty(tcx, aggregate_ty) {
+                leaves.push(ProjectedLeaf {
+                    authored: primed_head.clone(),
+                    canonical_text: head_text.clone(),
+                    canonical_var: head_var.clone(),
+                    domain,
+                    epoch: LeafEpoch::Primed,
+                });
+            }
+            let mut primed_budget = CONTRACT_PROJECTION_ENTRY_BUDGET;
+            push_projected_leaves(
+                tcx,
+                &mut leaves,
+                &primed_head,
+                &head_var,
+                &head_text,
+                aggregate_ty,
+                CONTRACT_PROJECTION_DEPTH_LIMIT,
+                &mut primed_budget,
+                LeafEpoch::Primed,
+            );
+        }
     }
     leaves
 }
@@ -4661,6 +5172,7 @@ fn push_projected_leaves<'tcx>(
     ty: Ty<'tcx>,
     depth: u32,
     budget: &mut u32,
+    epoch: LeafEpoch,
 ) {
     if depth == 0 || *budget == 0 {
         return;
@@ -4713,6 +5225,7 @@ fn push_projected_leaves<'tcx>(
                     canonical_text: child_text,
                     canonical_var: child_var,
                     domain,
+                    epoch,
                 });
             }
             // No exact domain: recurse in case this is a nested aggregate.
@@ -4728,6 +5241,7 @@ fn push_projected_leaves<'tcx>(
                 field_ty,
                 depth - 1,
                 budget,
+                epoch,
             ),
         }
     }
@@ -4735,6 +5249,8 @@ fn push_projected_leaves<'tcx>(
 
 fn signature_projection_environment(leaves: &[ProjectedLeaf]) -> ProjectionEnvironment {
     let mut canonical_text: FxHashMap<String, String> = FxHashMap::default();
+    let mut epochs: FxHashMap<String, LeafEpoch> = FxHashMap::default();
+    let mut mut_params: FxHashSet<String> = FxHashSet::default();
     let mut ambiguous: BTreeSet<String> = BTreeSet::new();
     for leaf in leaves {
         if let Some(previous) =
@@ -4746,11 +5262,141 @@ fn signature_projection_environment(leaves: &[ProjectedLeaf]) -> ProjectionEnvir
             // place. Drop the entry entirely.
             ambiguous.insert(leaf.authored.clone());
         }
+        epochs.insert(leaf.authored.clone(), leaf.epoch);
+        // Every `&mut` parameter with a projectable leaf has a primed spelling, and
+        // its head is the source name before the prime.
+        if leaf.epoch == LeafEpoch::Primed
+            && let Some((head, _)) = leaf.authored.split_once('\'')
+        {
+            mut_params.insert(head.to_string());
+        }
     }
     for name in ambiguous {
         canonical_text.remove(&name);
+        epochs.remove(&name);
     }
-    ProjectionEnvironment { canonical_text }
+    ProjectionEnvironment { canonical_text, epochs, mut_params }
+}
+
+/// Put a float comparison into ONE IEEE format, using the parameter's declared
+/// sort rather than the literal's.
+///
+/// The spec lexer builds every float literal as binary64, and the parser then
+/// re-sorts a bare variable compared against one to binary64 as well. That is
+/// right for `f64` and wrong for `f32`: the variable's real format is its
+/// parameter's, so `requires x <= 1.0` on an `f32` produced a binary32 variable
+/// against a binary64 constant and was refused as ill-typed operands.
+///
+/// This runs where BOTH the parsed formula and the declared source sorts are in
+/// hand, which is the only place the reconciliation can be made. The parser has
+/// no sorts; and doing it in the sort CHECK instead would let the clause validate
+/// while the formula still carried the wide literal, handing the solver a
+/// silently ill-sorted query — exactly what the refusal prevents.
+///
+/// EXACTNESS GATES THE NARROWING, and it is the whole safety of this. `1.0` and
+/// `0.5` are the same number in binary32 and binary64, so rewriting them changes
+/// nothing. `0.1` is NOT, and narrowing it would move the author's bound to a
+/// number they did not write — so a literal that does not survive the round trip
+/// is left alone and the clause keeps its honest refusal.
+///
+/// Only a comparison's own two operands are touched, only a LITERAL is rewritten,
+/// and a variable is re-sorted to its DECLARED format and never to its peer's.
+fn reconcile_float_literal_formats(
+    formula: trust_types::Formula,
+    source_sorts: &BTreeMap<String, trust_types::Sort>,
+) -> trust_types::Formula {
+    use trust_types::{Formula, Sort};
+
+    fn declared_float(expr: &Formula, sorts: &BTreeMap<String, Sort>) -> Option<(u32, u32)> {
+        let name = match expr {
+            Formula::Var(name, _) => name.clone(),
+            Formula::SymVar(sym, _) => sym.as_str().to_string(),
+            _ => return None,
+        };
+        match sorts.get(&name) {
+            Some(Sort::Float { eb, sb }) => Some((*eb, *sb)),
+            _ => None,
+        }
+    }
+
+    fn reformat(expr: Formula, eb: u32, sb: u32, sorts: &BTreeMap<String, Sort>) -> Formula {
+        if declared_float(&expr, sorts) == Some((eb, sb)) {
+            return match expr {
+                Formula::Var(name, _) => Formula::Var(name, Sort::Float { eb, sb }),
+                Formula::SymVar(sym, _) => {
+                    Formula::Var(sym.as_str().to_string(), Sort::Float { eb, sb })
+                }
+                other => other,
+            };
+        }
+        match expr {
+            // THE SAME RULE the source sort checker applies, called rather than
+            // restated: if those two ever disagreed, a clause would validate
+            // while the solver received a wide literal against a narrow
+            // variable.
+            Formula::FpConst { bits, eb: 11, sb: 53 } if (eb, sb) != (11, 53) => {
+                match u64::try_from(bits)
+                    .ok()
+                    .and_then(|wide| trust_types::float_literal_narrowed_bits(wide, eb, sb))
+                {
+                    Some(narrowed) => Formula::FpConst { bits: u128::from(narrowed), eb, sb },
+                    None => Formula::FpConst { bits, eb: 11, sb: 53 },
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn walk(expr: Formula, sorts: &BTreeMap<String, Sort>) -> Formula {
+        let pair = |lhs: Box<Formula>, rhs: Box<Formula>| -> (Box<Formula>, Box<Formula>) {
+            let (lhs, rhs) = (walk(*lhs, sorts), walk(*rhs, sorts));
+            match declared_float(&lhs, sorts).or_else(|| declared_float(&rhs, sorts)) {
+                Some((eb, sb)) => {
+                    (Box::new(reformat(lhs, eb, sb, sorts)), Box::new(reformat(rhs, eb, sb, sorts)))
+                }
+                None => (Box::new(lhs), Box::new(rhs)),
+            }
+        };
+        match expr {
+            Formula::Lt(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::Lt(lhs, rhs)
+            }
+            Formula::Le(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::Le(lhs, rhs)
+            }
+            Formula::Gt(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::Gt(lhs, rhs)
+            }
+            Formula::Ge(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::Ge(lhs, rhs)
+            }
+            Formula::Eq(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::Eq(lhs, rhs)
+            }
+            // Trust (SPEC-FLOAT-EQ-STRUCTURAL-1): `x == 1.0` parses as IEEE `FpEq`;
+            // its literal narrows onto an `f32` peer by the same rule as `Eq`.
+            Formula::FpEq(lhs, rhs) => {
+                let (lhs, rhs) = pair(lhs, rhs);
+                Formula::FpEq(lhs, rhs)
+            }
+            Formula::Not(inner) => Formula::Not(Box::new(walk(*inner, sorts))),
+            Formula::And(terms) => {
+                Formula::And(terms.into_iter().map(|t| walk(t, sorts)).collect())
+            }
+            Formula::Or(terms) => Formula::Or(terms.into_iter().map(|t| walk(t, sorts)).collect()),
+            Formula::Implies(lhs, rhs) => {
+                Formula::Implies(Box::new(walk(*lhs, sorts)), Box::new(walk(*rhs, sorts)))
+            }
+            other => other,
+        }
+    }
+
+    walk(formula, source_sorts)
 }
 
 fn signature_variable_domains<'tcx>(
@@ -4776,6 +5422,11 @@ fn signature_variable_domains<'tcx>(
     // `projected_chain_sort` in the exact-projection validator is satisfied
     // with the real layout rather than by weakening the gate.
     for leaf in signature_projection_leaves(tcx, body, typeck_results) {
+        // A primed spelling names a place an unprimed leaf already carries; it adds a
+        // spelling, never a domain (see `LeafEpoch`).
+        if leaf.epoch == LeafEpoch::Primed {
+            continue;
+        }
         domains.push(LoweredVariableDomain { name: leaf.canonical_var, domain: leaf.domain });
     }
     let output = tcx.fn_sig(def_id).instantiate_identity().skip_binder().output();
@@ -4816,18 +5467,11 @@ fn lowered_constant_expr<'tcx>(
     // The contract grammar's integer token is an `i128`, so a `u128` above
     // `i128::MAX` has no exact literal. Refuse it rather than emit text that
     // would re-lex to a different number.
-    let value = if signed {
-        scalar.to_int(size)
-    } else {
-        i128::try_from(scalar.to_uint(size)).ok()?
-    };
+    let value =
+        if signed { scalar.to_int(size) } else { i128::try_from(scalar.to_uint(size)).ok()? };
     // The grammar has no negative literal token; `-` is the unary-minus
     // operator, spelled here exactly as the `UnOp::Neg` arm spells it.
-    let text = if value < 0 {
-        format!("-({})", value.unsigned_abs())
-    } else {
-        value.to_string()
-    };
+    let text = if value < 0 { format!("-({})", value.unsigned_abs()) } else { value.to_string() };
     Some(LoweredExpr::literal(text, LoweredExprTy::Int))
 }
 
@@ -5171,7 +5815,10 @@ enum SnippetToken<'a> {
     /// downstream formula parser, which reads decimal digits only. The spelling
     /// is kept because ONE use — a tuple-field index — must be the canonical
     /// spelling and not merely the right number.
-    Int { spelling: &'a str, value: u128 },
+    Int {
+        spelling: &'a str,
+        value: u128,
+    },
     Gt,
     Ge,
     Lt,
@@ -5223,6 +5870,11 @@ struct SnippetParser<'a> {
     /// names the chain's HEAD — a real parameter — as "not in scope", which
     /// points the author at the wrong token. Never proof authority.
     projection_refusal: Option<String>,
+    /// A primed spelling (a `&mut` pointee's FINAL value) was read. See [`LeafEpoch`].
+    saw_primed: bool,
+    /// An unprimed `&mut` pointee was read (`self.x` or `*x` over a `&mut`
+    /// parameter). Beside a primed read, the clause is refused: see [`LeafEpoch`].
+    saw_unprimed_mut_pointee: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -5251,6 +5903,8 @@ impl<'a> SnippetParser<'a> {
             syntax,
             projections,
             projection_refusal: None,
+            saw_primed: false,
+            saw_unprimed_mut_pointee: false,
         };
         let expr = parser.parse_implies();
         // Reported whether or not the parse survived: an unresolvable chain
@@ -5260,6 +5914,11 @@ impl<'a> SnippetParser<'a> {
             *projection_refusal = parser.projection_refusal.take();
         }
         let expr = expr?;
+        // Mixed epochs: while an unprimed `&mut` pointee still reads the EXIT value,
+        // a clause that also reads a primed one would compare exit with exit.
+        if parser.saw_primed && parser.saw_unprimed_mut_pointee {
+            return None;
+        }
         if parser.is_eof() && expr.ty.can_be_bool() { Some(expr.into_bool()) } else { None }
     }
 
@@ -5485,6 +6144,11 @@ impl<'a> SnippetParser<'a> {
             }
             return None;
         };
+        match self.projections.epoch(&authored) {
+            LeafEpoch::Primed => self.saw_primed = true,
+            LeafEpoch::MutPointeeUnprimed => self.saw_unprimed_mut_pointee = true,
+            LeafEpoch::Plain => {}
+        }
         Some(SnippetExpr {
             text: canonical.to_string(),
             // The leaf's exact sort is enforced downstream from the signature
@@ -5496,6 +6160,18 @@ impl<'a> SnippetParser<'a> {
     }
 
     fn parse_ident(&mut self, name: &'a str) -> Option<SnippetExpr> {
+        // `x'` for a scalar `x: &mut T` names its final value, through the same
+        // resolution as a primed chain (see `LeafEpoch`). Any other primed name has no
+        // place and fails the clause closed.
+        if name.ends_with('\'') {
+            let canonical = self.projections.resolve(name)?;
+            self.saw_primed = true;
+            return Some(SnippetExpr {
+                text: canonical.to_string(),
+                ty: SnippetExprTy::Ambiguous,
+                bool_literal: None,
+            });
+        }
         if self.syntax == SnippetSyntax::AttributeCompatibility
             && name == "old"
             && self.eat(&SnippetToken::LParen)
@@ -5538,6 +6214,31 @@ impl<'a> SnippetParser<'a> {
                 ty: SnippetExprTy::Bool,
                 bool_literal: Some(false),
             }),
+            // The return-place vocabulary (`result`, `_0`) denotes a value that
+            // exists only where a result binding is in scope, i.e. an `ensures`
+            // clause. With no binding — a `requires` clause — the generic
+            // identifier arm below would hand the reserved spelling to
+            // `trust_types::parse_spec_expr`, which maps it to `_0`, so
+            // `#[trust::requires(result == 0)]` became a definition-ENTRY
+            // assumption over the return place. `requires` is the ONLY clause
+            // that is assumed, so that is the one place the reserved spelling
+            // must not reach.
+            //
+            // The rule is on the BINDING, not on the origin or the clause
+            // keyword, so it also covers every other bindingless kind that
+            // reaches this parser (`Invariant`, `Assumes`, `Asserts`, ...) —
+            // each of them is assumption-shaped, and none of them has a return
+            // value for `result` to denote. The native `requires` path never
+            // reaches here in production: `lower_predicate` routes it through
+            // `lower_native_clause` / `validate_native_clause_body`, which
+            // already errors with "`result` is only allowed in an ensures
+            // clause" (tests/ui/trust/typed_citation_result_scope.rs).
+            _ if self.result_binding.is_none()
+                && trust_types::source_contract_synthetic_name_collision(name)
+                    == Some(trust_types::SourceContractSyntheticNameCollision::ReturnPlace) =>
+            {
+                None
+            }
             _ if matches!(
                 self.result_binding,
                 Some(SnippetResultBinding::ClosureReference(binding)) if name == binding
@@ -5662,11 +6363,19 @@ impl<'a> SnippetParser<'a> {
             {
                 None
             }
-            SnippetToken::Ident(name) => Some(SnippetExpr {
-                text: format!("*{name}"),
-                ty: SnippetExprTy::Ambiguous,
-                bool_literal: None,
-            }),
+            // `*x'` is not a D2 spelling: the prime already names the pointee's final
+            // value (`x'`).
+            SnippetToken::Ident(name) if name.ends_with('\'') => None,
+            SnippetToken::Ident(name) => {
+                if self.projections.mut_params.contains(name) {
+                    self.saw_unprimed_mut_pointee = true;
+                }
+                Some(SnippetExpr {
+                    text: format!("*{name}"),
+                    ty: SnippetExprTy::Ambiguous,
+                    bool_literal: None,
+                })
+            }
             _ => None,
         }
     }
@@ -6038,18 +6747,17 @@ fn island_cited_callee(tcx: TyCtxt<'_>, snippet: &str) -> Option<String> {
     if candidates.is_empty() {
         return None;
     }
-    tcx.sess.with_trust_compiler_state::<crate::trust_verify::SessionIslandEnv, _>(|state| {
-        if std::env::var_os("TRUST_ISLAND_CITE_TRACE").is_some() {
-            eprintln!(
-                "TRUST_ISLAND_CITE_TRACE: stash_populated={} candidates={candidates:?}",
-                state.env.is_some()
-            );
-        }
-        let env = state.env.as_ref()?;
-        candidates
-            .into_iter()
-            .find(|name| trust_certify::clean_island::island_definition_value(env, name).is_some())
-    })
+    let env = crate::trust_verify::session_island_env(tcx.sess);
+    if crate::trust_verify::trust_env_var_present("TRUST_ISLAND_CITE_TRACE") {
+        eprintln!(
+            "TRUST_ISLAND_CITE_TRACE: stash_populated={} candidates={candidates:?}",
+            env.is_some()
+        );
+    }
+    let env = env?;
+    candidates
+        .into_iter()
+        .find(|name| trust_certify::clean_island::island_definition_value(&env, name).is_some())
 }
 
 fn unsupported_predicate_reason(tcx: TyCtxt<'_>, span: Span) -> Symbol {
@@ -6058,8 +6766,14 @@ fn unsupported_predicate_reason(tcx: TyCtxt<'_>, span: Span) -> Symbol {
         Ok(snippet) => {
             let snippet = snippet.trim();
             if let Some(identifier) = primed_identifier_in_contract_snippet(snippet) {
+                // Trust (D2 primes, 2026-09-30): name the whole rule. From the snippet
+                // alone it cannot be told which part refused the clause.
                 format!(
-                    "primed post-state identifier `{identifier}` has no verified MIR state binding"
+                    "primed post-state identifier `{identifier}` has no verified MIR state \
+                     binding here: a prime is bound only in an uncited native `ensures`, on a \
+                     `&mut` parameter's pointee (`self'.field`, or `x'` for a scalar \
+                     `x: &mut T`), and never beside an unprimed read of a `&mut` pointee, \
+                     which still reads the final value too"
                 )
             } else if let Some(name) = island_cited_callee(tcx, snippet) {
                 format!(
@@ -6073,11 +6787,37 @@ fn unsupported_predicate_reason(tcx: TyCtxt<'_>, span: Span) -> Symbol {
         Err(_) => {
             format!(
                 "unsupported contract predicate expression at {}",
-                source_map.span_to_diagnostic_string(span)
+                embeddable_span_location(source_map, span)
             )
         }
     };
     Symbol::intern(&detail)
+}
+
+/// Trust (WS5.9 review, F-117): the `file:line:col: line:col` location of `span`, in the
+/// shape of `SourceMap::span_to_diagnostic_string` but with the file rendered
+/// `prefer_remapped_unconditionally` — the ONE rendering every file string that reaches a
+/// published module takes.
+///
+/// `unsupported_predicate_reason` needs it because its text is not a diagnostic only: an
+/// `Unsupported { reason }` clause is carried into the published trust-ir module as the
+/// contract-disclosure `SpecModule` row (`trust_thir_lower::contract_disclosure`,
+/// `{"unsupported":{"reason":...}}`). `span_to_diagnostic_string` follows the DIAGNOSTICS
+/// component of `--remap-path-scope`, so under cargo's `trim-paths` default (`object`)
+/// that row kept the checkout path while `Module.files` lost it: one module, two
+/// renderings, and G8 byte identity lost on exactly the crates whose contract clause has no
+/// snippet. Without any `--remap-path-prefix` the rendering is the local name, so the text
+/// is unchanged. The sibling of `crate_module.rs::embeddable_span_string`, which renders
+/// `SpecAnchor.span` the same way.
+fn embeddable_span_location(source_map: &rustc_span::source_map::SourceMap, span: Span) -> String {
+    let (source_file, lo_line, lo_col, hi_line, hi_col) = source_map.span_to_location_info(span);
+    match source_file {
+        Some(sf) => format!(
+            "{}:{lo_line}:{lo_col}: {hi_line}:{hi_col}",
+            sf.name.prefer_remapped_unconditionally()
+        ),
+        None => "no-location".to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@
 //! The current `MirRouter` producer emits only `Unknown` for its retained
 //! TrustWP compatibility label. This generic result adapter records supplied
 //! results but does not authenticate a solver name or confer authority itself.
+//! DataRace results remain Unknown until the race model can authenticate its
+//! location, runtime-thread, and happens-before identities. InsufficientOrdering
+//! results remain Unknown until a memory model backs their formula (v6/D2).
 //!
 //! `VerificationObligation` is the bridge: it captures the function identity,
 //! source span, strategy used, and the resulting `VerificationResult` in a
@@ -25,10 +28,11 @@
 use trust_types::fx::FxHashMap;
 use trust_types::{SourceSpan, VcKind, VerificationResult};
 
-use crate::mir_router::MirStrategy;
+use crate::MirStrategy;
 use crate::verifier_result::{
     ObligationDescriptor, ObligationEvidenceProvenance, ObligationProofEvidence,
     StableObligationId, VerifierFunctionResult, descriptors_for_vcs,
+    fail_closed_concurrency_result,
 };
 
 /// A verification obligation with its result, produced by the v2 pipeline.
@@ -89,6 +93,7 @@ impl VerificationObligation {
     /// Attach a verification result to this obligation.
     #[must_use]
     pub fn with_result(mut self, result: VerificationResult) -> Self {
+        let result = fail_closed_concurrency_result(&self.kind, result);
         self.evidence = ObligationProofEvidence::from_result(
             result.solver_name(),
             ObligationEvidenceProvenance::RouterAttributed,
@@ -154,6 +159,7 @@ impl VerificationObligation {
             .map(|(name, strategy, result)| {
                 let span = spans.get(&name).cloned().unwrap_or_default();
                 let kind = vc_kind_for_strategy(&strategy);
+                let result = fail_closed_concurrency_result(&kind, result);
                 Self {
                     id: StableObligationId::for_function_placeholder(&name, Some(&strategy), &kind),
                     def_path: name.clone(),
@@ -223,6 +229,9 @@ impl VerificationObligation {
         result: VerificationResult,
         evidence: Option<ObligationProofEvidence>,
     ) -> Self {
+        let is_unmodeled_concurrency =
+            crate::backend_trait::is_unmodeled_concurrency_kind(&descriptor.kind);
+        let result = fail_closed_concurrency_result(&descriptor.kind, result);
         Self {
             id: descriptor.id,
             def_path: descriptor.def_path,
@@ -230,7 +239,7 @@ impl VerificationObligation {
             span: descriptor.span,
             kind: descriptor.kind,
             strategy: descriptor.strategy,
-            evidence,
+            evidence: if is_unmodeled_concurrency { None } else { evidence },
             result,
         }
     }
@@ -414,6 +423,102 @@ mod tests {
         assert!(obligations[1].is_failed());
         assert_eq!(obligations[1].strategy, Some(MirStrategy::ContractVerification));
         assert!(obligations[1].evidence().is_none());
+    }
+
+    #[test]
+    fn data_race_legacy_adapters_refuse_external_verdicts() {
+        let race_kind = VcKind::DataRace {
+            variable: "shared".to_string(),
+            thread_a: "worker_a".to_string(),
+            thread_b: "worker_b".to_string(),
+        };
+        for supplied in [
+            VerificationResult::Proved {
+                solver: "test".into(),
+                time_ms: 1,
+                strength: ProofStrength::smt_unsat(),
+                proof_certificate: None,
+                solver_warnings: None,
+                native_proof_envelope: None,
+            },
+            VerificationResult::Failed { solver: "test".into(), time_ms: 1, counterexample: None },
+        ] {
+            let direct = VerificationObligation::new(
+                "m::racy".to_string(),
+                "racy".to_string(),
+                SourceSpan::default(),
+                race_kind.clone(),
+            )
+            .with_result(supplied.clone());
+            let from_mir = VerificationObligation::from_mir_results(
+                vec![("m::racy".to_string(), MirStrategy::DataRace, supplied.clone())],
+                &FxHashMap::default(),
+            );
+            let from_v1 = VerificationObligation::from_v1_results(vec![(
+                trust_types::VerificationCondition {
+                    kind: race_kind.clone(),
+                    function: "m::racy".into(),
+                    location: SourceSpan::default(),
+                    formula: trust_types::Formula::Bool(false),
+                    contract_metadata: None,
+                    obligation: None,
+                },
+                supplied,
+            )]);
+            for row in [&direct, &from_mir[0], &from_v1[0]] {
+                assert!(matches!(row.result(), VerificationResult::Unknown { reason, .. }
+                    if reason.contains("data-race verification unsupported")));
+                assert!(!row.is_proved());
+                assert!(!row.is_failed());
+                assert!(row.evidence().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn insufficient_ordering_legacy_adapters_refuse_external_verdicts() {
+        let ordering_kind = VcKind::InsufficientOrdering {
+            variable: "_1".to_string(),
+            actual: "Release".to_string(),
+            required: "L1: load cannot use Release ordering (loads cannot release)".to_string(),
+        };
+        for supplied in [
+            VerificationResult::Proved {
+                solver: "test".into(),
+                time_ms: 1,
+                strength: ProofStrength::smt_unsat(),
+                proof_certificate: None,
+                solver_warnings: None,
+                native_proof_envelope: None,
+            },
+            VerificationResult::Failed { solver: "test".into(), time_ms: 1, counterexample: None },
+        ] {
+            let direct = VerificationObligation::new(
+                "m::load_release".to_string(),
+                "load_release".to_string(),
+                SourceSpan::default(),
+                ordering_kind.clone(),
+            )
+            .with_result(supplied.clone());
+            let from_v1 = VerificationObligation::from_v1_results(vec![(
+                trust_types::VerificationCondition {
+                    kind: ordering_kind.clone(),
+                    function: "m::load_release".into(),
+                    location: SourceSpan::default(),
+                    formula: trust_types::Formula::Bool(false),
+                    contract_metadata: None,
+                    obligation: None,
+                },
+                supplied,
+            )]);
+            for row in [&direct, &from_v1[0]] {
+                assert!(matches!(row.result(), VerificationResult::Unknown { reason, .. }
+                    if reason.contains("memory-ordering VC unsupported")));
+                assert!(!row.is_proved());
+                assert!(!row.is_failed());
+                assert!(row.evidence().is_none());
+            }
+        }
     }
 
     #[test]

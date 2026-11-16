@@ -364,6 +364,15 @@ impl Registry {
         self.thread_infos.len()
     }
 
+    /// Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): the workers counted as asleep.
+    /// The count rises before a worker blocks and falls when another thread
+    /// wakes it, so while it equals `num_threads` and nothing injects a job,
+    /// no worker is on its way back from a wake.
+    #[cfg(test)]
+    pub(super) fn sleeping_threads(&self) -> usize {
+        self.sleep.sleeping_threads()
+    }
+
     pub(super) fn catch_unwind(&self, f: impl FnOnce()) {
         if let Err(err) = unwind::halt_unwinding(f) {
             // If there is no handler, or if that handler itself panics, then we abort.
@@ -392,6 +401,10 @@ impl Registry {
         for info in &self.thread_infos {
             info.stopped.wait();
         }
+        // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): every worker gives its thread
+        // slot back before it sets `stopped` (see `main_loop`), so
+        // this takes back the slot released above and never has to ask the
+        // jobserver for a token on the way out of the pool.
         self.acquire_thread();
     }
 
@@ -615,14 +628,17 @@ impl Registry {
 }
 
 /// Mark a Rayon worker thread as blocked. This triggers the deadlock handler
-/// if no other worker thread is active
+/// if no other worker thread is active. Then wait for the user-specified condition.
 #[inline]
-pub fn mark_blocked() {
+pub fn mark_blocked_and_wait(wait: impl FnOnce()) {
     let worker_thread = WorkerThread::current();
     assert!(!worker_thread.is_null());
     unsafe {
         let registry = &(*worker_thread).registry;
-        registry.sleep.mark_blocked(&registry.deadlock_handler)
+        registry.sleep.mark_blocked(&registry.deadlock_handler);
+        registry.release_thread();
+        wait();
+        registry.acquire_thread();
     }
 }
 
@@ -686,6 +702,11 @@ pub(super) struct WorkerThread {
     /// A weak random number generator.
     rng: XorShift64Star,
 
+    // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): whether this worker still owes the
+    // release that pairs with its last `acquire_thread`. A worker woken only to
+    // terminate does not take a thread slot back, and so owes none.
+    owes_release: Cell<bool>,
+
     pub(crate) registry: Arc<Registry>,
 }
 
@@ -706,6 +727,8 @@ impl From<ThreadBuilder> for WorkerThread {
             fifo: JobFifo::new(),
             index: thread.index,
             rng: XorShift64Star::new(),
+            // Trust: nothing is acquired until `wait_until_out_of_work`.
+            owes_release: Cell::new(false),
             registry: thread.registry,
         }
     }
@@ -936,14 +959,39 @@ impl WorkerThread {
         let registry = &*self.registry;
         let index = self.index;
 
-        registry.acquire_thread();
+        // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): a worker that starts after the
+        // pool was told to terminate runs no job (the wait below returns at
+        // once on the set latch), so it takes no thread slot. Waiting for one
+        // would make a pool that is already going away, as after a failed
+        // spawn of a later worker, wait for a jobserver token.
+        if !registry.thread_infos[index].terminate.as_core_latch().probe() {
+            registry.acquire_thread();
+            // See `owes_release`.
+            self.owes_release.set(true);
+        }
         unsafe { self.wait_or_steal_until(&registry.thread_infos[index].terminate, true) };
 
         // Should not be any work left in our queue.
         debug_assert!(self.take_local_job().is_none());
 
-        // Let registry know we are done
-        unsafe { Latch::set(&registry.thread_infos[index].stopped) };
+        // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): the thread slot is given back,
+        // and `stopped` set, by `main_loop`, outside its abort guard.
+    }
+
+    /// Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): called by `Sleep::sleep` when this
+    /// worker wakes, having released its thread slot to sleep, with the latch
+    /// it waits on. A worker waiting in its top-level loop that finds its
+    /// terminate latch set runs no more jobs: that loop exits on the set latch,
+    /// which is never reset, before it looks for work. Acquiring here would
+    /// make an exiting compiler wait for, and take, a jobserver token only to
+    /// return it. Every other wake takes the slot back as before.
+    pub(super) fn acquire_thread_after_sleep(&self, latch: &CoreLatch) {
+        let terminate = self.registry.thread_infos[self.index].terminate.as_core_latch();
+        if ptr::eq(latch, terminate) && latch.probe() {
+            self.owes_release.set(false);
+        } else {
+            self.registry.acquire_thread();
+        }
     }
 
     fn find_work(&self) -> Option<JobRef> {
@@ -1043,13 +1091,35 @@ unsafe fn main_loop(thread: ThreadBuilder) {
     // Normal termination, do not abort.
     mem::forget(abort_guard);
 
+    // Trust (RUSTC-FRONTEND-TOKEN-LEAK-1): give the thread slot back before
+    // announcing that this worker stopped, and only if it still holds one. The
+    // thread that waits for `stopped` (`Registry::wait_until_stopped`) takes a
+    // slot again as soon as the last worker announces it. While a worker was
+    // still counted, that thread had to ask the jobserver for a token it had no
+    // work for, and the release that used to come last in this function then
+    // left the request stale. The release handler can panic, and as before
+    // that unwinds this thread instead of aborting the process, so the thread
+    // that joins it can still settle its tokens; `stopped` is set on the way
+    // out either way, or `wait_until_stopped` would never return.
+    {
+        struct AnnounceStopped<'a>(&'a LockLatch);
+        impl Drop for AnnounceStopped<'_> {
+            fn drop(&mut self) {
+                // Let registry know we are done
+                unsafe { Latch::set(self.0) };
+            }
+        }
+        let _stopped = AnnounceStopped(&registry.thread_infos[index].stopped);
+        if worker_thread.owes_release.replace(false) {
+            registry.release_thread();
+        }
+    }
+
     // Inform a user callback that we exited a thread.
     if let Some(ref handler) = registry.exit_handler {
         registry.catch_unwind(|| handler(index));
         // We're already exiting the thread, there's nothing else to do.
     }
-
-    registry.release_thread();
 }
 
 /// If already in a worker-thread, just execute `op`. Otherwise,

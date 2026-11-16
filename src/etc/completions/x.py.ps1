@@ -341,6 +341,7 @@ Register-ArgumentCompleter -Native -CommandName 'x.py' -ScriptBlock {
             [CompletionResult]::new('--reproducible-artifact', '--reproducible-artifact', [CompletionResultType]::ParameterName, 'Additional reproducible artifacts that should be added to the reproducible artifacts archive')
             [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'override options in bootstrap.toml')
             [CompletionResult]::new('--ci', '--ci', [CompletionResultType]::ParameterName, 'Make bootstrap to behave as it''s running on the CI environment or not')
+            [CompletionResult]::new('--allow-dirty', '--allow-dirty', [CompletionResultType]::ParameterName, 'Pass `--allow-dirty` to `cargo fix`, allowing it to run even if the current git checkout has uncommitted changes')
             [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'use verbose output (-vv for very verbose)')
             [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'use verbose output (-vv for very verbose)')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'use quiet output')
@@ -500,8 +501,10 @@ Register-ArgumentCompleter -Native -CommandName 'x.py' -ScriptBlock {
             break
         }
         'x.py;test' {
+            [CompletionResult]::new('--trust-repo-wp-installation', '--trust-repo-wp-installation', [CompletionResultType]::ParameterName, 'Immutable current Trust installation for the stage-2 first-party/trust-wp selection')
             [CompletionResult]::new('--test-args', '--test-args', [CompletionResultType]::ParameterName, 'extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)')
             [CompletionResult]::new('--compiletest-rustc-args', '--compiletest-rustc-args', [CompletionResultType]::ParameterName, 'extra options to pass the compiler when running compiletest tests')
+            [CompletionResult]::new('--compiler-test-fixture', '--compiler-test-fixture', [CompletionResultType]::ParameterName, 'Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)')
             [CompletionResult]::new('--extra-checks', '--extra-checks', [CompletionResultType]::ParameterName, 'comma-separated list of other files types to check (accepts py, py:lint, py:fmt, shell, cpp, cpp:fmt, js, js:lint, js:typecheck, spellcheck)')
             [CompletionResult]::new('--compare-mode', '--compare-mode', [CompletionResultType]::ParameterName, 'mode describing what file the actual ui output will be compared to')
             [CompletionResult]::new('--pass', '--pass', [CompletionResultType]::ParameterName, 'force {check,build,run}-pass tests to this mode')
@@ -531,8 +534,11 @@ Register-ArgumentCompleter -Native -CommandName 'x.py' -ScriptBlock {
             [CompletionResult]::new('--reproducible-artifact', '--reproducible-artifact', [CompletionResultType]::ParameterName, 'Additional reproducible artifacts that should be added to the reproducible artifacts archive')
             [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'override options in bootstrap.toml')
             [CompletionResult]::new('--ci', '--ci', [CompletionResultType]::ParameterName, 'Make bootstrap to behave as it''s running on the CI environment or not')
+            [CompletionResult]::new('--trust-repo-check', '--trust-repo-check', [CompletionResultType]::ParameterName, 'Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim')
+            [CompletionResult]::new('--trust-repo-parent-release-v1', '--trust-repo-parent-release-v1', [CompletionResultType]::ParameterName, 'Require the validated native parent''s version-1 release handoff')
             [CompletionResult]::new('--no-fail-fast', '--no-fail-fast', [CompletionResultType]::ParameterName, 'run all tests regardless of failure')
             [CompletionResult]::new('--trust-vanilla', '--trust-vanilla', [CompletionResultType]::ParameterName, 'run upstream vanilla compiletest by disabling Trust verification')
+            [CompletionResult]::new('--trust-verified', '--trust-verified', [CompletionResultType]::ParameterName, 'run the VERIFIED compiletest lane: compile every test at the shipping default (`-Ztrust-verify=on -Ztrust-policy=strict`) instead of the harness''s `-Ztrust-verify=off`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with `--trust-vanilla`')
             [CompletionResult]::new('--all-targets', '--all-targets', [CompletionResultType]::ParameterName, 'Run all test targets (no doc tests)')
             [CompletionResult]::new('--doc', '--doc', [CompletionResultType]::ParameterName, 'Only run doc tests')
             [CompletionResult]::new('--tests', '--tests', [CompletionResultType]::ParameterName, 'Only run unit and integration tests')
@@ -566,8 +572,10 @@ Register-ArgumentCompleter -Native -CommandName 'x.py' -ScriptBlock {
             break
         }
         'x.py;t' {
+            [CompletionResult]::new('--trust-repo-wp-installation', '--trust-repo-wp-installation', [CompletionResultType]::ParameterName, 'Immutable current Trust installation for the stage-2 first-party/trust-wp selection')
             [CompletionResult]::new('--test-args', '--test-args', [CompletionResultType]::ParameterName, 'extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)')
             [CompletionResult]::new('--compiletest-rustc-args', '--compiletest-rustc-args', [CompletionResultType]::ParameterName, 'extra options to pass the compiler when running compiletest tests')
+            [CompletionResult]::new('--compiler-test-fixture', '--compiler-test-fixture', [CompletionResultType]::ParameterName, 'Retain a validated Trust compiler fixture for explicit compiler library tests (no docs)')
             [CompletionResult]::new('--extra-checks', '--extra-checks', [CompletionResultType]::ParameterName, 'comma-separated list of other files types to check (accepts py, py:lint, py:fmt, shell, cpp, cpp:fmt, js, js:lint, js:typecheck, spellcheck)')
             [CompletionResult]::new('--compare-mode', '--compare-mode', [CompletionResultType]::ParameterName, 'mode describing what file the actual ui output will be compared to')
             [CompletionResult]::new('--pass', '--pass', [CompletionResultType]::ParameterName, 'force {check,build,run}-pass tests to this mode')
@@ -597,8 +605,11 @@ Register-ArgumentCompleter -Native -CommandName 'x.py' -ScriptBlock {
             [CompletionResult]::new('--reproducible-artifact', '--reproducible-artifact', [CompletionResultType]::ParameterName, 'Additional reproducible artifacts that should be added to the reproducible artifacts archive')
             [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'override options in bootstrap.toml')
             [CompletionResult]::new('--ci', '--ci', [CompletionResultType]::ParameterName, 'Make bootstrap to behave as it''s running on the CI environment or not')
+            [CompletionResult]::new('--trust-repo-check', '--trust-repo-check', [CompletionResultType]::ParameterName, 'Check compiler targets and one tests/ui/trust file, or qualify first-party/trust-wp. Stores completed execution facts only; makes no proof claim')
+            [CompletionResult]::new('--trust-repo-parent-release-v1', '--trust-repo-parent-release-v1', [CompletionResultType]::ParameterName, 'Require the validated native parent''s version-1 release handoff')
             [CompletionResult]::new('--no-fail-fast', '--no-fail-fast', [CompletionResultType]::ParameterName, 'run all tests regardless of failure')
             [CompletionResult]::new('--trust-vanilla', '--trust-vanilla', [CompletionResultType]::ParameterName, 'run upstream vanilla compiletest by disabling Trust verification')
+            [CompletionResult]::new('--trust-verified', '--trust-verified', [CompletionResultType]::ParameterName, 'run the VERIFIED compiletest lane: compile every test at the shipping default (`-Ztrust-verify=on -Ztrust-policy=strict`) instead of the harness''s `-Ztrust-verify=off`. Requires a locally-built stage1+ Trust compiler; mutually exclusive with `--trust-vanilla`')
             [CompletionResult]::new('--all-targets', '--all-targets', [CompletionResultType]::ParameterName, 'Run all test targets (no doc tests)')
             [CompletionResult]::new('--doc', '--doc', [CompletionResultType]::ParameterName, 'Only run doc tests')
             [CompletionResult]::new('--tests', '--tests', [CompletionResultType]::ParameterName, 'Only run unit and integration tests')

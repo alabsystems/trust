@@ -26,7 +26,9 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, sig: &FnSig<'_>, body: Option<
             .collect();
         if let Some(args_immut_refs) = args_immut_refs
             && !args_immut_refs.is_empty()
-            && body.is_none_or(|body| sig.header.is_unsafe() || contains_unsafe_block(cx, body.value))
+            && body.is_none_or(|body| {
+                sig.header.is_unsafe() || contains_unsafe_block(cx, &cx.tcx.hir_body(body.id()).value)
+            })
         {
             span_lint_and_then(
                 cx,
@@ -48,8 +50,8 @@ struct LifetimeVisitor<'tcx> {
 
 impl<'tcx> Visitor<'tcx> for LifetimeVisitor<'tcx> {
     fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, hir::AmbigArg>) {
-        if let TyKind::Ref(lt, ref m) = ty.kind {
-            self.result.push((lt, Some(m.mutbl), ty.span));
+        if let TyKind::Ref(lt, _, mutbl) = ty.kind {
+            self.result.push((lt, Some(mutbl), ty.span));
         }
         hir::intravisit::walk_ty(self, ty);
     }
@@ -67,8 +69,6 @@ impl<'tcx> Visitor<'tcx> for LifetimeVisitor<'tcx> {
 /// The second field of the vector's elements indicate if the lifetime is attached to a
 /// shared reference, a mutable reference, or neither.
 fn get_lifetimes<'tcx>(ty: &'tcx hir::Ty<'tcx>) -> Vec<(&'tcx Lifetime, Option<Mutability>, Span)> {
-    use hir::intravisit::VisitorExt as _;
-
     let mut visitor = LifetimeVisitor { result: Vec::new() };
     visitor.visit_ty_unambig(ty);
     visitor.result

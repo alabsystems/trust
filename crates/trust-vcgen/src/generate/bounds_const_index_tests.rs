@@ -102,6 +102,7 @@ fn array_read_fn(index_def: Option<u128>) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -237,6 +238,7 @@ fn call_written_index_local_keeps_the_bounds_vc() {
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_unsafe_sig: false,
                 callee_identity: None,
+                callee_key: crate::sep_engine::tests::fixture_key("test::pick"),
                 is_foreign: false,
                 func: "test::pick".to_string(),
                 args: vec![],

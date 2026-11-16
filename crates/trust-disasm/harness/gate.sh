@@ -71,8 +71,8 @@ if [ "$rc" = 0 ]; then
     echo "  MACHINE-MODEL GATE: PASS"
     echo "  Both harnesses proved their own non-vacuity on this run:"
     echo "  the invariant sweep still reports known-refused words as"
-    echo "  violations, and the differential still catches all seven"
-    echo "  injected model bugs. A green run from a blind oracle is the"
+    echo "  violations, and the differential still catches every"
+    echo "  injected model bug (counts above). A green run from a blind oracle is the"
     echo "  failure this gate is built to prevent."
 else
     echo "  MACHINE-MODEL GATE: FAIL — see above, and README.md."

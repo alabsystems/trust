@@ -22,6 +22,16 @@ impl<K, V> Default for DelayedMap<K, V> {
 }
 
 impl<K: Hash + Eq, V> DelayedMap<K, V> {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cache.capacity()
+    }
+
     #[inline(always)]
     pub fn insert(&mut self, key: K, value: V) -> bool {
         if self.count >= CACHE_CUTOFF {
@@ -47,6 +57,12 @@ impl<K: Hash + Eq, V> DelayedMap<K, V> {
     #[inline(never)]
     fn cold_get(&self, key: &K) -> Option<&V> {
         self.cache.get(key)
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.count = 0;
     }
 }
 
@@ -88,5 +104,11 @@ impl<T: Hash + Eq> DelayedSet<T> {
     #[inline(never)]
     fn cold_contains(&self, value: &T) -> bool {
         self.cache.contains(value)
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.count = 0;
     }
 }

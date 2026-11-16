@@ -170,9 +170,11 @@ RUSTUP=$(command -v rustup 2>/dev/null || true)
 if [ -z "$RUSTUP" ]; then
     if [ -x "$HOME/.cargo/bin/rustup" ]; then
         warn "rustup is installed at $HOME/.cargo/bin/rustup but $HOME/.cargo/bin is NOT on PATH."
-        warn "Using it for this run. Add it permanently or every future +$TOOLCHAIN_NAME lookup fails:"
-        warn "    export PATH=\"\$HOME/.cargo/bin:\$PATH\"    # in ~/.zshrc or ~/.bashrc"
-        PATH="$HOME/.cargo/bin:$PATH"
+        warn "Using it for this run. Add it permanently or every future +$TOOLCHAIN_NAME lookup fails."
+        warn "APPEND it, so targo/trustc and aterm's reroute stubs stay ahead of rustup's cargo/rustc"
+        warn "(the same advice, and reasoning, as scripts/prove-trust-frontend-gate.sh):"
+        warn "    export PATH=\"\$PATH:\$HOME/.cargo/bin\"    # in ~/.zprofile or ~/.bash_profile"
+        PATH="$PATH:$HOME/.cargo/bin"
         export PATH
         PATH_REPAIRED=1
         RUSTUP="$HOME/.cargo/bin/rustup"
@@ -186,20 +188,30 @@ say "  rustup:  $RUSTUP"
 
 RUSTUP_BIN_DIR=$(CDPATH='' cd -- "$(dirname -- "$RUSTUP")" && pwd)
 RUSTC_ON_PATH=$(command -v rustc 2>/dev/null || true)
+# aterm's reroute stub is not a compiler and reads no pin, so it shadows nothing
+# (prove-trust-frontend-gate.sh identifies it the same way). Only a REAL rustc
+# ahead of the shim does.
+if [ -n "$RUSTC_ON_PATH" ] && [ -f "$(dirname -- "$RUSTC_ON_PATH")/.atpkg-reroute-dir" ]; then
+    RUSTC_ON_PATH=
+fi
 if [ -n "$RUSTC_ON_PATH" ]; then
     RUSTC_DIR=$(CDPATH='' cd -- "$(dirname -- "$RUSTC_ON_PATH")" && pwd)
     if [ "$RUSTC_DIR" != "$RUSTUP_BIN_DIR" ]; then
         warn "\`rustc\` on PATH is $RUSTC_ON_PATH, not the rustup shim in $RUSTUP_BIN_DIR."
         warn "A non-shim rustc SHADOWS the pin: rust-toolchain.toml is read by the shim and"
         warn "by nothing else, so gates in clean/trust-vc/aterm would resolve a different"
-        warn "compiler than the one this script is about to link. Put the shim first:"
-        warn "    export PATH=\"$RUSTUP_BIN_DIR:\$PATH\""
+        warn "compiler than the one this script is about to link. Put the shim's directory"
+        warn "($RUSTUP_BIN_DIR) ahead of $(dirname -- "$RUSTC_ON_PATH"), but behind"
+        warn "targo/trustc and aterm's reroute stubs."
     fi
 fi
 
 command -v python3 >/dev/null 2>&1 || die "python3 not found — x.py is a Python program"
 command -v git >/dev/null 2>&1 || die "git not found — the first-party/ submodules cannot be initialised"
 
+# GENESIS ADAPTER (developer adapter, never release evidence; retiring it is
+# decided separately): stage0 here is a host Rust BY DESIGN. The
+# Trust-from-Trust path is scripts/recreate_bootstrap.py --require-seed.
 # The host Rust that plays stage0. Probed with cwd=/ so a rust-toolchain.toml in
 # any repo cannot make the probe resolve through the very toolchain we are here
 # to build (which would fail, misleadingly, before it exists).
@@ -543,8 +555,8 @@ fi
 # against Homebrew's libzstd/libxml2; without it the build fails at link time
 # with a missing -lzstd rather than anything that mentions LLVM.
 #
-# The build takes the repo's build-tree lock itself — the lock lives inside x.py
-# (scripts/trust_build_lock.sh, CLAUDE.md "Build"), so a concurrent measurement
+# The build takes the repo's native build-tree lease itself through x.py and
+# Bootstrap (CLAUDE.md "Build"), so a concurrent measurement
 # sweep refuses this build rather than racing it. Set TRUST_BUILD_LOCK_WAIT to
 # block instead of refusing.
 # ---------------------------------------------------------------------------
@@ -648,10 +660,12 @@ build tree, not a copy. Deleting the tree (or running \`git worktree remove\` on
 it) breaks every repository that pins channel = "$TOOLCHAIN_NAME" — clean,
 trust-vc, aterm — with a rustup lookup failure that names none of this.
 
-Make sure the rustup shim stays first on PATH, or the pin resolves to whatever
-rustc happens to be ahead of it:
+Make sure no other REAL rustc (Homebrew's, say) is ahead of the rustup shim on
+PATH, or the pin resolves to that rustc. APPEND ~/.cargo/bin, so targo/trustc
+and aterm's reroute stubs stay ahead of rustup's cargo/rustc (the reroute stub
+reads no pin and shadows nothing; prove-trust-frontend-gate.sh step 1):
 
-    export PATH="\$HOME/.cargo/bin:\$PATH"
+    export PATH="\$PATH:\$HOME/.cargo/bin"
 
 Re-running this script is safe and cheap: it re-verifies, re-links and re-proves,
 and rebuilds nothing that is already built.
@@ -663,7 +677,7 @@ if [ "$STAGE" = 1 ]; then
 stage1 is a DEVELOPER artifact. It carries the whole tool surface the pinned
 repositories need — that is why it is linked here — but it is not release
 evidence, and `rustup default` should not point at it
-(docs/rustup-toolchain-link.md).
+(docs/TOOLCHAIN_POSTURE.md).
 STAGE1
 fi
 
@@ -685,10 +699,10 @@ if [ "$PATH_REPAIRED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
 ## inherited. It was added for this process only, which is how the steps above
 ## were able to run at all. That repair is gone the moment this script exits.
 ##
-## Until this line is in your shell rc, every gate in clean, trust-vc and aterm
-## still starts in the state this whole script exists to cure:
+## Until this line is in your login profile, every gate in clean, trust-vc and
+## aterm still starts in the state this whole script exists to cure:
 ##
-##     echo 'export PATH="\$HOME/.cargo/bin:\$PATH"' >> ~/.zshrc
+##     echo 'export PATH="\$PATH:\$HOME/.cargo/bin"' >> ~/.zprofile
 ##
 ## Then, in a NEW shell, confirm it with the proof on its own — it will refuse
 ## to repair PATH for you, so a pass there is a statement about your machine:

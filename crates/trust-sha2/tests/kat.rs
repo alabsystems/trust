@@ -16,7 +16,7 @@
 //! written down, so a mis-transcribed *vector* fails here at authoring time
 //! rather than being mistaken for a mis-implemented *hash* later.
 
-use trust_sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+use trust_sha2::{Digest, NativeSha256, Sha224, Sha256, Sha384, Sha512};
 
 /// FIPS 180-4 Appendix A/B two-block message: 56 bytes.
 ///
@@ -81,6 +81,26 @@ fn sha256_million_a() {
     let message = vec![b'a'; 1_000_000];
     assert_eq!(
         hex::<Sha256>(&message),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+}
+
+#[test]
+fn native_sha256_published_vectors_cover_padding_and_streaming() {
+    for (input, expected) in [
+        (&b""[..], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (&b"abc"[..], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (TWO_BLOCK_448, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"),
+        (TWO_BLOCK_896, "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"),
+    ] {
+        assert_eq!(hex::<NativeSha256>(input), expected);
+    }
+    let mut hasher = NativeSha256::new();
+    for _ in 0..1000 {
+        hasher.update([b'a'; 1000]);
+    }
+    assert_eq!(
+        format!("{:x}", hasher.finalize()),
         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
     );
 }

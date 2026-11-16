@@ -22,7 +22,7 @@ and compares the emitted objects:
 
 Corpus: the exact seeded tests/ui sample selection of trust_ir_producer_scorecard.py
 (imported, not copied — same filters, same rng discipline) + any `--corpus NAME=PATH`
-single-file corpora (default: the realcode corpora).
+single-file corpora (none by default; Usage below passes the realcode corpus).
 
 Compile shape (both sides identical): O0, no debuginfo, `--crate-type lib
 -C link-dead-code=yes -C codegen-units=1 --emit=obj`. link-dead-code forces eager
@@ -59,13 +59,14 @@ Output: <out-dir>/data.json + <out-dir>/BURNIN.md. Deterministic data body (sort
 files/histograms, no timestamps); provenance block carries trustc version + seed;
 wall-clock timings live in a separate, explicitly nondeterministic `timing` block.
 
-Usage (defaults reproduce the 2026-07-01 burn-in):
+Usage (the flags of the 2026-07-01 burn-in, which also ran a closure-free
+variant of realcode.rs; that variant worked around a -Z trust-ir-lower ICE on
+closure bodies and was retired once closure bodies lowered cleanly):
   python3 scripts/trust_ir_flip_burnin.py \
       --trustc build/aarch64-apple-darwin/stage1/bin/trustc \
       --out-dir reports/trust-ir-flip-burnin-2026-07-01 \
       --seed 20260701 --sample-size 300 --jobs 8 \
-      --corpus realcode=reports/2026-06-29-honest-real-code-coverage/corpus/realcode.rs \
-      --corpus realcode_no_closure_bodies=reports/trust-ir-producer-baseline-2026-07-01/corpus-variant/realcode_no_closure_bodies.rs
+      --corpus realcode=scripts/realcode-coverage/corpus/realcode.rs
 
 Self-test (no trustc/objdump needed; hand-written disasm fixtures):
   python3 scripts/trust_ir_flip_burnin.py --selftest

@@ -67,7 +67,7 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
         return None;
     }
 
-    let fn_name = &*name_ref.text();
+    let fn_name = name_ref.text();
     let TargetInfo { target_module, adt_info, target, file } =
         fn_target_info(ctx, path, &call, fn_name)?;
 
@@ -126,6 +126,11 @@ fn fn_target_info(
             }
             Some(hir::PathResolution::SelfType(impl_)) => {
                 let adt = impl_.self_ty(ctx.db()).as_adt()?;
+                if let hir::Adt::Enum(_) = adt
+                    && fn_name.starts_with(char::is_uppercase)
+                {
+                    return None;
+                }
                 assoc_fn_target_info(ctx, call, adt, fn_name)
             }
             _ => None,
@@ -159,7 +164,7 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let (impl_, file) = if let Some(impl_) = cursor_impl {
         (Some(impl_), ctx.vfs_file_id())
     } else {
-        get_adt_source(ctx, &adt, fn_name.text().as_str())?
+        get_adt_source(ctx, &adt, fn_name.text())?
     };
     let target = get_method_target(ctx, &impl_, &adt)?;
 
@@ -269,7 +274,7 @@ impl FunctionBuilder {
         // If generated function has the name "new" and is an associated function, we generate fn body
         // as a constructor and assume a "Self" return type.
         if let Some(body) =
-            make_fn_body_as_new_function(make, ctx, &fn_name.text(), adt_info, target_edition)
+            make_fn_body_as_new_function(make, ctx, fn_name.text(), adt_info, target_edition)
         {
             ret_type = Some(make.ret_type(make.ty_path(make.ident_path("Self")).into()));
             should_focus_return_type = false;
@@ -491,7 +496,7 @@ fn get_fn_target(
     let mut file = ctx.vfs_file_id();
     let target = match target_module {
         Some(target_module) => {
-            let (in_file, target) = next_space_for_fn_in_module(ctx.db(), target_module);
+            let (in_file, target) = next_space_for_fn_in_module(ctx.db(), target_module)?;
             file = in_file;
             target
         }
@@ -1310,7 +1315,7 @@ fn next_space_for_fn_after_call_site(expr: ast::CallableExpr) -> Option<Generate
 fn next_space_for_fn_in_module(
     db: &dyn hir::db::HirDatabase,
     target_module: hir::Module,
-) -> (FileId, GeneratedFunctionTarget) {
+) -> Option<(FileId, GeneratedFunctionTarget)> {
     let module_source = target_module.definition_source(db);
     let file = module_source.file_id.original_file(db);
     let assist_item = match &module_source.value {
@@ -1318,14 +1323,13 @@ fn next_space_for_fn_in_module(
             Some(last_item) => GeneratedFunctionTarget::AfterItem(last_item.syntax().clone()),
             None => GeneratedFunctionTarget::AfterItem(it.syntax().clone()),
         },
-        hir::ModuleSource::Module(it) => match it.item_list().and_then(|it| it.items().last()) {
-            Some(last_item) => GeneratedFunctionTarget::AfterItem(last_item.syntax().clone()),
-            None => {
-                let item_list =
-                    it.item_list().expect("module definition source should have an item list");
-                GeneratedFunctionTarget::InEmptyItemList(item_list.syntax().clone())
+        hir::ModuleSource::Module(it) => {
+            let item_list = it.item_list()?;
+            match item_list.items().last() {
+                Some(last_item) => GeneratedFunctionTarget::AfterItem(last_item.syntax().clone()),
+                None => GeneratedFunctionTarget::InEmptyItemList(item_list.syntax().clone()),
             }
-        },
+        }
         hir::ModuleSource::BlockExpr(it) => {
             if let Some(last_item) =
                 it.statements().take_while(|stmt| matches!(stmt, ast::Stmt::Item(_))).last()
@@ -1337,7 +1341,7 @@ fn next_space_for_fn_in_module(
         }
     };
 
-    (file.file_id(db), assist_item)
+    Some((file.file_id(db), assist_item))
 }
 
 #[derive(Clone, Copy)]
@@ -2460,6 +2464,20 @@ pub(crate) fn bar() {
     }
 
     #[test]
+    fn add_function_not_applicable_in_unresolved_module() {
+        check_assist_not_applicable(
+            generate_function,
+            r"
+mod foo;
+
+fn main() {
+    foo::bar$0();
+}
+",
+        )
+    }
+
+    #[test]
     fn add_function_with_return_type() {
         check_assist(
             generate_function,
@@ -3448,5 +3466,45 @@ impl Foo for Bar {
 }
 ",
         )
+    }
+    #[test]
+    fn not_applicable_for_self_enum_variant() {
+        check_assist_not_applicable(
+            generate_function,
+            r"
+enum Foo {}
+impl Foo {
+  fn foo() {
+    Self::Bar$0(true)
+  }
+}
+",
+        );
+    }
+    #[test]
+    fn applicable_for_self_enum_method() {
+        check_assist(
+            generate_function,
+            r"
+enum Foo {}
+impl Foo {
+  fn foo() {
+    Self::bar$0()
+  }
+}
+",
+            r"
+enum Foo {}
+impl Foo {
+  fn foo() {
+    Self::bar()
+  }
+
+    fn bar() {
+        ${0:todo!()}
+    }
+}
+",
+        );
     }
 }

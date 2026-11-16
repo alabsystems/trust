@@ -51,6 +51,7 @@ fn machine_fn(
         preconditions,
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -292,4 +293,164 @@ fn machine_tautology_negation_translates_to_refutable_bv() {
         count_nodes(&translated, &|f| matches!(f, Formula::BvAdd(_, _, 64))) >= 1,
         "the negated clause still wraps at 64: {translated:?}"
     );
+}
+
+/// Every arithmetic node of `formula` is exactly `x % 2` over the Int-sorted
+/// parameter `x`, and there is at least one.
+fn only_exact_int_remainder_of_x(formula: &Formula) -> bool {
+    let exact = |f: &Formula| {
+        matches!(f, Formula::Rem(n, d)
+            if matches!(n.as_ref(), Formula::Var(name, trust_types::Sort::Int) if name == "x")
+                && d.as_ref() == &Formula::Int(2))
+    };
+    int_arith_nodes(formula) > 0 && count_nodes(formula, &exact) == int_arith_nodes(formula)
+}
+
+fn admitted(func: &VerifiableFunction, clause: &str) -> bool {
+    contracts::machine_faithful_clause_admissible(
+        func,
+        &trust_types::parse_spec_expr(clause).expect("clause parses"),
+    )
+}
+
+/// Authored `%` by a literal has exactly two refutable readings, and every
+/// other divisor keeps a visible refusal (VCGEN-LIB-REDS-1 records how the
+/// three 2026-10 remainder lines compose):
+///
+/// * a BARE unsigned variable modulo a positive in-domain literal is exact over
+///   the integers and keeps its `Int` spelling (CRC-REM-POSITIVE-LITERAL): that
+///   row's only arithmetic is the remainder itself, never wrapping `+`/`-`/`*`;
+/// * any other total remainder (a positive literal that fits the domain, signed
+///   included per the 2026-11-05 signed-remainder ruling, computed numerator
+///   included) is read at the DECLARED width: `bvurem`/`bvsrem`, no `Int`
+///   arithmetic anywhere;
+/// * a zero, negative, symbolic or out-of-domain divisor, spec `/`, and a
+///   declared-width clause over two domains are refused.
+#[test]
+fn literal_remainder_clause_lanes_are_exact_and_refuse_undefined_domains() {
+    for width in [8, 16, 32, 64, 128] {
+        let ty = Ty::Int { width, signed: false };
+        let bare =
+            machine_fn(ty.clone(), "result == x % 2", vec![assign_ret_from_x()], vec![], vec![]);
+        let rows = postcondition_rows(&bare);
+        assert_eq!(rows.len(), 1, "width {width}: {rows:#?}");
+        assert!(unsupported_rows(&bare).is_empty(), "width {width}");
+        assert!(
+            only_exact_int_remainder_of_x(&rows[0].formula),
+            "width {width}: the exact bare remainder is the row's only Int arithmetic: {:?}",
+            rows[0].formula
+        );
+        assert_eq!(
+            count_nodes(&rows[0].formula, &|f| matches!(
+                f,
+                Formula::BvAdd(..) | Formula::BvURem(..)
+            )),
+            0,
+            "width {width}: the exact Int lane carries no declared-width encoding"
+        );
+
+        let nested =
+            machine_fn(ty, "result == x % 2 + 1", vec![assign_ret_from_x()], vec![], vec![]);
+        assert!(admitted(&nested, "result == x % 2 + 1"), "width {width}");
+        let rows = postcondition_rows(&nested);
+        assert_eq!(rows.len(), 1, "width {width}: {rows:#?}");
+        assert!(unsupported_rows(&nested).is_empty(), "width {width}");
+        let formula = &rows[0].formula;
+        assert_eq!(int_arith_nodes(formula), 0, "width {width}: {formula:?}");
+        assert!(
+            count_nodes(formula, &|f| matches!(f, Formula::BvURem(_, _, w) if *w == width)) > 0,
+            "width {width}: {formula:?}"
+        );
+        assert!(
+            count_nodes(formula, &|f| matches!(f, Formula::BvAdd(_, _, w) if *w == width)) > 0,
+            "width {width}: {formula:?}"
+        );
+    }
+
+    // A computed numerator is read at the declared width, exactly as the
+    // Machine{w} lane reads every authored `+`.
+    let computed =
+        machine_fn(Ty::u8(), "result == (x + 1) % 2", vec![assign_ret_from_x()], vec![], vec![]);
+    assert!(admitted(&computed, "result == (x + 1) % 2"));
+    let rows = postcondition_rows(&computed);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(int_arith_nodes(&rows[0].formula), 0, "{:?}", rows[0].formula);
+    assert!(count_nodes(&rows[0].formula, &|f| matches!(f, Formula::BvURem(_, _, 8))) > 0);
+    assert!(count_nodes(&rows[0].formula, &|f| matches!(f, Formula::BvAdd(_, _, 8))) > 0);
+
+    // Signed remainder by a positive literal is Rust's truncated remainder:
+    // `bvsrem`, never `bvurem` and never the Int (Euclidean) spelling.
+    let signed = machine_fn(i32_ty(), "result == x % 2", vec![assign_ret_from_x()], vec![], vec![]);
+    assert!(admitted(&signed, "result == x % 2"));
+    let rows = postcondition_rows(&signed);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert!(unsupported_rows(&signed).is_empty());
+    assert_eq!(int_arith_nodes(&rows[0].formula), 0, "{:?}", rows[0].formula);
+    assert!(count_nodes(&rows[0].formula, &|f| matches!(f, Formula::BvSRem(_, _, 32))) > 0);
+    assert_eq!(count_nodes(&rows[0].formula, &|f| matches!(f, Formula::BvURem(..))), 0);
+
+    for (ty, clause) in [
+        (Ty::u8(), "result == x % 0"),
+        (Ty::u8(), "result == x % result"),
+        (Ty::u8(), "result == x % -1"),
+        (Ty::u8(), "result == x % 256"),
+        (Ty::u8(), "result == x / 2"),
+        (i32_ty(), "result == x % 0"),
+        // `i32::MIN % -1` overflows.
+        (i32_ty(), "result == x % -1"),
+        (i32_ty(), "result == x % 2147483648"),
+    ] {
+        let func = machine_fn(ty, clause, vec![assign_ret_from_x()], vec![], vec![]);
+        assert!(!admitted(&func, clause), "{clause}");
+        assert!(postcondition_rows(&func).is_empty(), "{clause}");
+        assert!(!unsupported_rows(&func).is_empty(), "{clause}");
+    }
+
+    // Two declared domains: the exact bare remainder needs no common width and
+    // keeps its Int row; the declared-width reading has no single width and is
+    // refused.
+    let mixed = |clause: &str| {
+        let mut func = machine_fn(Ty::u8(), clause, vec![assign_ret_from_x()], vec![], vec![]);
+        func.body.locals[0].ty = u64_ty();
+        func.body.return_ty = u64_ty();
+        func
+    };
+    let bare = mixed("result == x % 2");
+    let rows = postcondition_rows(&bare);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert!(only_exact_int_remainder_of_x(&rows[0].formula), "{:?}", rows[0].formula);
+    let nested = mixed("result == x % 2 + 1");
+    assert!(!admitted(&nested, "result == x % 2 + 1"));
+    assert!(postcondition_rows(&nested).is_empty());
+    assert!(!unsupported_rows(&nested).is_empty());
+}
+
+#[test]
+fn unsigned_remainder_selector_translates_without_generic_ite_admission() {
+    let func = machine_fn(Ty::u32(), "result == x % 2", vec![assign_ret_from_x()], vec![], vec![]);
+    let x = || Box::new(Formula::Var("x".into(), trust_types::Sort::Int));
+    let literal = |n| Box::new(Formula::Int(n));
+    let selector = |dividend: Box<Formula>, divisor: Box<Formula>, arm: Box<Formula>| {
+        Formula::Eq(
+            Box::new(Formula::Var("_0".into(), trust_types::Sort::Int)),
+            Box::new(Formula::Ite(
+                Box::new(Formula::Eq(Box::new(Formula::Rem(dividend, divisor)), literal(0))),
+                literal(0),
+                arm,
+            )),
+        )
+    };
+    let exact = selector(x(), literal(2), literal(3_988_292_384));
+    let translated = contracts::machine_faithful_vc_formula(&func, &exact).expect("typed selector");
+    assert_eq!(int_arith_nodes(&translated), 0);
+    assert_eq!(count_nodes(&translated, &|f| matches!(f, Formula::BvURem(_, _, 32))), 1);
+    for bad in [
+        selector(x(), literal(0), literal(1)),
+        selector(x(), x(), literal(1)),
+        selector(x(), literal(1_i128 << 32), literal(1)),
+        selector(Box::new(Formula::Add(x(), literal(1))), literal(2), literal(1)),
+        selector(x(), literal(2), Box::new(Formula::Add(x(), literal(1)))),
+    ] {
+        assert_eq!(contracts::machine_faithful_vc_formula(&func, &bad), None, "{bad:?}");
+    }
 }

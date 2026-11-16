@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 mod xtask;
 
 fn main() {
@@ -6,12 +8,12 @@ fn main() {
     let cli = xtask::cli();
     let matches = cli.get_matches();
 
-    let mut gctx = cargo::util::context::GlobalContext::default().unwrap_or_else(|e| {
+    let mut gctx = targo::context::GlobalContext::default().unwrap_or_else(|e| {
         let mut eval = cargo_util_terminal::Shell::new();
-        cargo::exit_with_error(e.into(), &mut eval)
+        targo::exit_with_error(e.into(), &mut eval)
     });
     if let Err(e) = xtask::exec(&matches, &mut gctx) {
-        cargo::exit_with_error(e, &mut gctx.shell())
+        targo::exit_with_error(e, &mut gctx.shell())
     }
 }
 

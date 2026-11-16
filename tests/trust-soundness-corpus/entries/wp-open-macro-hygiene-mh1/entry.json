@@ -1,0 +1,23 @@
+{
+  "id": "wp-open-macro-hygiene-mh1",
+  "class": "trust-wp OPEN: macro hygiene (mh1)",
+  "title": "a binding a macro introduces was read as the caller's binding of the same name",
+  "origin": [
+    "r24-wpv-probes (2026-10-14 trust-wp verifier probe), zz_vfy_probe_a.rs mh1",
+    "FIXED: trust-wp D-238 2f3738026 (resolve a name with its hygiene) and D-239 08ce51305 (a binding's hygiene is its identifier's); refused on trust-wp origin/main 08ce51305 (2026-10-14), the known-open marker retired. It was: OPEN 2026-10-14: r24 trust-wp verifier probe (zz_vfy_probe_a/b, run on trust-wp with and without aee6e8f2, transcripts in this entry's probe-2026-10-14.verdicts.txt): the proof_assert reading the caller's `x` VERIFIED although a macro-introduced `let x` is a different binding. No trust-wp fix exists yet; D-237 names bindings apart by HIR pattern, which does not separate a macro-hygiene binding from the caller's binding of the same name."
+  ],
+  "lang": "creusot",
+  "source": "src.rs",
+  "reproducer": {
+    "function": "mh1"
+  },
+  "twin": {
+    "function": "mh1_ok"
+  },
+  "witness": {
+    "input": "x = 5",
+    "observed": "proof_assert!(x@ == 0) is false",
+    "exit": 101,
+    "main": "witness.rs"
+  }
+}

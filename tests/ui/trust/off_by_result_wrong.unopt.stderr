@@ -1,0 +1,26 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (refl_u64)
+  --> $DIR/off_by_result_wrong.rs:19:5
+   |
+LL |     theorem refl_u64 : forall (x : UInt64), Eq x x := fun x => Eq.refl x
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: citation `refl_u64` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_ok`, with a clean certification audit
+  --> $DIR/off_by_result_wrong.rs:23:28
+   |
+LL |     ensures result == x by refl_u64
+   |                            ^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; authority is installed only by the separately gated in-walk or deferred post-walk discharge over exact matching result rows
+
+error: citation `refl_u64` failed the strict Clean statement/certification audit against this postcondition with `result` bound to the imported definition of `keep_bad`: strict certification audit failed: [TermRejected { error: "TypeMismatch { expected: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(App(Const(Name { depth: 1, suffix: [\"Eq\"], lean4_hash: dfbff609f865258f }, [Succ(Zero)]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), App(Const(Name { depth: 1, suffix: [\"trust_import_off_by_result_wrong\"…], lean4_hash: f1436002c61191cb }, []), BVar(0))), BVar(0))), inferred: Pi(BinderData { info: Default, mult: Many }, Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, []), App(App(App(Const(Name { depth: 1, suffix: [\"Eq\"], lean4_hash: dfbff609f865258f }, [Succ(Zero)]), Const(Name { depth: 1, suffix: [\"UInt64\"], lean4_hash: 2900e467962d713a }, [])), BVar(0)), BVar(0))), location: None }" }]
+  --> $DIR/off_by_result_wrong.rs:30:28
+   |
+LL |     ensures result == x by refl_u64
+   |                            ^^^^^^^^
+   |
+   = note: statement drift and authority/provenance failures are hard citation errors; there is no router fallback (E9)
+   = note: the clause was also graded with `result` universally quantified (the reading used when no function body is imported), and the cited theorem does not prove that reading either
+   = help: options: (1) if the theorem states the intended rule, the body of `keep_bad` disagrees with it: fix the body; (2) if the body is intended, restate the theorem so it proves the clause with `result` replaced by `keep_bad`'s imported definition; (3) drop the `by` citation and let the solver lanes prove the clause; `TRUST_E9_DEBUG=1` prints the goal verbatim
+
+error: aborting due to 1 previous error
+

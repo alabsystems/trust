@@ -14,7 +14,8 @@ use std::{env, hint, mem, panic, thread};
 
 use camino::Utf8PathBuf;
 
-use crate::common::{Config, TestPaths};
+use crate::common::{Config, Debugger, TestPaths};
+use crate::directives::AuxProps;
 use crate::output_capture::{self, ConsoleOut};
 use crate::panic_hook;
 
@@ -22,8 +23,15 @@ mod deadline;
 mod json;
 
 pub(crate) fn run_tests(config: &Config, tests: Vec<CollectedTest>) -> bool {
+    // Trust: retain every discovered case before ordinary filtering/ignoring.
+    if let Some(census) = &config.trust_invocation_census {
+        census.plan(config, &tests).expect("retain planned compiletest cases");
+    }
     let tests_len = tests.len();
     let filtered = filter_tests(config, tests);
+    if let Some(census) = &config.trust_invocation_census {
+        census.selected(config, &filtered).expect("retain selected compiletest cases");
+    }
     // Iterator yielding tests that haven't been started yet.
     let mut fresh_tests = (0..).map(TestId).zip(&filtered);
 
@@ -79,6 +87,14 @@ pub(crate) fn run_tests(config: &Config, tests: Vec<CollectedTest>) -> bool {
         }
 
         listener.test_finished(test, &completion);
+        if let Some(census) = &config.trust_invocation_census {
+            let outcome = match &completion.outcome {
+                TestOutcome::Succeeded => "ok",
+                TestOutcome::Failed { .. } => "failed",
+                TestOutcome::Ignored => "ignored",
+            };
+            census.case_finished(config, test, outcome).expect("retain compiletest case terminal");
+        }
 
         if completion.outcome.is_failed() && config.fail_fast {
             // Prevent any other in-flight threads from panicking when they
@@ -89,6 +105,9 @@ pub(crate) fn run_tests(config: &Config, tests: Vec<CollectedTest>) -> bool {
     }
 
     let suite_passed = listener.suite_finished();
+    if let Some(census) = &config.trust_invocation_census {
+        census.finish(suite_passed).expect("finish compiletest observation record");
+    }
     suite_passed
 }
 
@@ -100,7 +119,7 @@ fn spawn_test_thread(
     test: &CollectedTest,
     completion_sender: mpsc::Sender<TestCompletion>,
 ) -> Option<thread::JoinHandle<()>> {
-    if test.desc.ignore && !test.config.run_ignored {
+    if test.desc.is_ignored() && !test.config.run_ignored {
         completion_sender
             .send(TestCompletion { id, outcome: TestOutcome::Ignored, stdout: None })
             .unwrap();
@@ -111,7 +130,7 @@ fn spawn_test_thread(
         id,
         config: Arc::clone(&test.config),
         testpaths: test.testpaths.clone(),
-        revision: test.revision.clone(),
+        variant: test.variant.clone(),
         should_fail: test.desc.should_fail,
         completion_sender,
     };
@@ -126,7 +145,7 @@ struct TestThreadArgs {
 
     config: Arc<Config>,
     testpaths: TestPaths,
-    revision: Option<String>,
+    variant: TestVariant,
     should_fail: ShouldFail,
 
     completion_sender: mpsc::Sender<TestCompletion>,
@@ -152,13 +171,7 @@ fn test_thread_main(args: TestThreadArgs) {
     // require a major overhaul of error handling in the test runners.
     let panic_payload = panic::catch_unwind(|| {
         __rust_begin_short_backtrace(|| {
-            crate::runtest::run(
-                &args.config,
-                stdout,
-                stderr,
-                &args.testpaths,
-                args.revision.as_deref(),
-            );
+            crate::runtest::run(&args.config, stdout, stderr, &args.testpaths, &args.variant);
         });
     })
     .err();
@@ -324,21 +337,43 @@ fn get_concurrency() -> usize {
     }
 }
 
+/// Data related to a specific variant of a test.
+#[derive(Clone, Debug)]
+pub(crate) struct TestVariant {
+    pub(crate) revision: Option<String>,
+    pub(crate) debugger: Option<Debugger>,
+}
+
+impl TestVariant {
+    pub(crate) fn revision(&self) -> Option<&str> {
+        self.revision.as_deref()
+    }
+}
+
 /// Information that was historically needed to create a libtest `TestDescAndFn`.
 pub(crate) struct CollectedTest {
     pub(crate) desc: CollectedTestDesc,
     pub(crate) config: Arc<Config>,
     pub(crate) testpaths: TestPaths,
-    pub(crate) revision: Option<String>,
+    pub(crate) variant: TestVariant,
+    // Trust: retain collection metadata without running execution-time directive
+    // handlers while the passive census enumerates expected-failure self-tests.
+    pub(crate) revisions: Vec<String>,
+    pub(crate) auxiliary_inputs: AuxProps,
 }
 
 /// Information that was historically needed to create a libtest `TestDesc`.
 pub(crate) struct CollectedTestDesc {
     pub(crate) name: String,
     pub(crate) filterable_path: Utf8PathBuf,
-    pub(crate) ignore: bool,
     pub(crate) ignore_message: Option<Cow<'static, str>>,
     pub(crate) should_fail: ShouldFail,
+}
+
+impl CollectedTestDesc {
+    pub(crate) fn is_ignored(&self) -> bool {
+        self.ignore_message.is_some()
+    }
 }
 
 /// Tests with `//@ should-fail` are tests of compiletest itself, and should

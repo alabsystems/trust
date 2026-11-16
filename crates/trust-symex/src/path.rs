@@ -75,26 +75,23 @@ impl PathConstraint {
     /// and all are ANDed together, along with any auxiliary formulas.
     #[must_use]
     pub fn to_formula(&self) -> Formula {
-        let mut clauses: Vec<Formula> = self
-            .decisions
-            .iter()
-            .map(|d| {
-                let f = symbolic_to_formula(&d.condition);
-                if d.taken { f } else { Formula::Not(Box::new(f)) }
-            })
-            .collect();
+        let total = self.decisions.len() + self.auxiliary.len();
+        if total == 0 {
+            return Formula::Bool(true);
+        }
+        let mut clauses: Vec<Formula> = Vec::with_capacity(total);
+        clauses.extend(self.decisions.iter().map(|d| {
+            let f = symbolic_to_formula(&d.condition);
+            if d.taken { f } else { Formula::Not(Box::new(f)) }
+        }));
 
         // Include auxiliary formulas (e.g., merge disjunctions).
         clauses.extend(self.auxiliary.iter().cloned());
 
-        if clauses.is_empty() {
-            Formula::Bool(true)
-        } else if clauses.len() == 1 {
-            // SAFETY: len == 1 guarantees .next() returns Some.
-            clauses
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("empty iter despite len == 1"))
+        if clauses.len() == 1
+            && let Some(single) = clauses.pop()
+        {
+            single
         } else {
             Formula::And(clauses)
         }
@@ -124,11 +121,7 @@ impl PathConstraint {
             return None;
         }
         let mut new = self.clone();
-        // SAFETY: We checked is_empty() above and returned None.
-        let last = new
-            .decisions
-            .last_mut()
-            .unwrap_or_else(|| unreachable!("decisions empty after non-empty check"));
+        let last = new.decisions.last_mut()?;
         last.taken = !last.taken;
         Some(new)
     }

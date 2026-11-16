@@ -47,8 +47,10 @@
 //     be clean) — stale artifacts = stale semantics = the gate is meaningless,
 //     so it refuses to run rather than certify against the wrong pin.
 //   * IMPORT HYGIENE: the loaded module set must equal the manifested set, and
-//     the imported TrustIr constants must pass a full `add_decl`-equivalent
-//     kernel recheck with 0 failures.
+//     the imported TrustIr constants must pass local type/value consistency
+//     checks with 0 failures in that imported environment. This is NOT fresh
+//     `add_decl` replay: a populated context can supply self references or
+//     unchecked dependencies. The imported closure remains part of the TCB.
 //   * AXIOM RESIDUE: every proven theorem must have `axiom_deps = ∅` (no
 //     domain axioms, no sorry/trust markers; only the foundational trio is
 //     filtered by `Environment::axiom_deps`) — the "modulo exactly 3"
@@ -67,9 +69,11 @@
 // bridge_line`): (1) builder trust on the vendored oleans is mitigated by the
 // behavioral pinning above (every BRIDGED arm of the imported definition is
 // constrained by at least one kernel-checked theorem) + the manifest + the
-// regeneration audit lane (scripts/regen-trustir-oleans.sh); (2) the Init
-// closure's trusted-load residue is the quantified UInt64/USize
-// platform-width cluster, outside the arithmetic cone; (3) the bridge equates
+// regeneration audit lane (scripts/regen-trustir-oleans.sh); (2) the complete
+// imported Init/TrustIr closure is an assumed environment, not independently
+// reconstructed by fresh dependency-closed declaration replay. Local checks
+// cannot reduce that trust boundary to a selected diagnostic failure cluster;
+// (3) the bridge equates
 // constants IN THE IMPORTED Lean-core environment with the same-named
 // constants the shipped witness grounds to in clean's prelude environment —
 // a name-keyed identification of ~6 basic constants (`Int`, `Int.add/sub/mul`,
@@ -109,16 +113,13 @@
 //     the Lemma's textbook spelling, via the shared `overflow_threshold_*`
 //     shift lemmas — a genuine arithmetic fact, `a ≥ b ↔ (b-1) < a` for `Int`,
 //     proven from imported Lean-core `Int.lt_iff_add_one_le` +
-//     `Int.sub_add_cancel` + `decide_eq_decide`, NOT assumed). Bridged for 5
-//     of the 6 combinations — unsigned-Add (Lemma 2), unsigned-Sub (Lemma 8,
-//     GUARDED: takes the documented `lhs,rhs ∈ [0,2^w)` residue precondition
-//     `semOverflowOp` itself states as hypotheses, to discharge the vacuous
-//     `exact ≥ modulus` disjunct), and signed-Add/Sub/Mul (Lemma 5).
-//     Unsigned-Mul's FLAG is honestly UN-BRIDGED: Clean's safety-VC tier
-//     models NO unsigned-multiply-overflow Lemma (Lemma 2 is unsigned-ADD
-//     only, Lemma 8 is unsigned-SUB only) — no agreement claim is made for
-//     it (mirrors the `UnOp::CtPop` precedent); its VALUE component IS still
-//     bridged.
+//     `Int.sub_add_cancel` + `decide_eq_decide`, NOT assumed). All six generic
+//     Int flags bridge: unsigned-Add (Lemma 2), unsigned-Sub (Lemma 8, with
+//     its existing residue guard), unsigned-Mul (#53), and signed Add/Sub/Mul.
+//     Unsigned-Mul additionally connects all four actual registered production
+//     Int predicates through their ONE shared constructor. The separate BV
+//     predicates are not proved equivalent. Foundational footprints are reported;
+//     empty axiom residue means no non-foundational axioms, not no axioms.
 //   * A NOTATIONAL SUBTLETY DISCOVERED HERE (real finding, like the
 //     `Int.sub (Int.ofNat 0) ·` one for `Neg`): a bare `decide` identifier is
 //     NOT resolvable by clean's elaborator when writing NEW source against
@@ -182,7 +183,7 @@
 //     with Clean's one comparison denotation at the right operand values, NOT
 //     a re-statement of trust-ir's own `def`. Because this is a real
 //     agreement, there is NO honestly-un-bridged ICmp residue (contrast
-//     `UnOp::CtPop` / unsigned-`MulOverflow`): all 10 arms bridge.
+//     `UnOp::CtPop`): all 10 arms bridge.
 //   * SAME NOTATIONAL SUBTLETY as EXTENSION 2: a bare `decide` is unresolvable
 //     in clean's elaborator against the imported env; every ICmp arm below
 //     uses the FULLY QUALIFIED `Decidable.decide`, def-eq to what the compiled
@@ -258,7 +259,7 @@
 // `PtrToInt`/`IntToPtr`/`Bitcast`/`PtrToPtr`/`Transmute`/`ReifyFnPointer` —
 // pointer/closure reinterpretation with no Clean denotation to agree
 // against) are surfaced honestly as un-bridged (see [`CAST_UNBRIDGED`]),
-// exactly like `UnOp::CtPop` / unsigned-`MulOverflow`'s flag. Never faked.
+// exactly like `UnOp::CtPop`. Never faked.
 //
 // EXTENSION 5 (this increment) — THE STATEMENT-LEVEL BREAKTHROUGH: `TrustIr.
 // stepInst`, the FIRST bridged INSTRUCTION (not operation-VALUE) agreement.
@@ -290,38 +291,19 @@
 // semCast's pinned widths, so the `w1 != w2` / `ValueId ==` equality checks
 // inside `semBinOp`/`ValueMap.get` are never stuck on a free variable) —
 // pinning the otherwise-stuck free-variable state while leaving the
-// operands' integer PAYLOADS fully symbolic. Two theorems per op:
-//   * `stepinst_binop_<op>_chain` — the READ→COMPUTE→WRITE chain itself, an
-//     UNCONDITIONAL `rfl`: `Sem.run (stepInst (.BinOp <op> …)) state` equals
-//     a `match TrustIr.semIntBinOp <op> 8 v_l v_r with | .ok result => …
-//     (binding result at the fresh ValueId) | .error e => Except.error e`.
-//     This is the generic monadic-chain identity, stated GENERICALLY in
-//     terms of the ALREADY-BRIDGED `semIntBinOp` (not a hand-inlined
-//     wrap formula) — it is what proves the chain agrees with the value
-//     semantics at all, independent of any side condition.
-//   * `bridge_stepInst_binop_<op>` — the CONNECT theorem: composes the chain
-//     lemma with the ALREADY-PROVEN `bridge_add`/`bridge_sub`/`bridge_mul`
-//     arm (from [`ARMS`] — REUSED via `Eq.trans` + `congrArg`, NOT
-//     re-proven) to eliminate the wrap layer under the same no-overflow/
-//     in-range side condition ARMS already state, yielding the exact value
-//     `Value.int 8 (Int.add v_l v_r)` / `(Int.sub v_l v_r)` / `(Int.mul v_l
-//     v_r)` — BYTE-IDENTICAL to `int_binop_expr`'s `Int.add`/`Int.sub`/
-//     `Int.mul` head (`trustir_anchor.rs`, the Clean BinOp-STATEMENT
-//     denotation `IrRvalue::Bin(op, a, b) => Int.<op> (denotation a)
-//     (denotation b)` a `dst := lhs op rhs` trust-ir assignment grounds to).
-//     So the stepInst-level agreement, via this connect step, lands on
-//     EXACTLY the same Clean term the statement-level model already uses —
-//     a genuine three-way tie (imported Lean stepInst ≡ imported Lean
-//     semIntBinOp ≡ Clean statement denotation), not an independent claim.
+// operands' integer PAYLOADS fully symbolic. The proof-only transport first
+// splits the actual Except result, preserving failure and the full fresh-SSA
+// state. A generic chain theorem then connects the imported stepInst/semBinOp
+// dispatch to that transport, requiring op.isMinMax = false. Each operation's
+// connect theorem consumes its existing ARMS value proof; no arithmetic is
+// reimplemented by the instruction bridge.
 //
-// BRIDGED (3, the "form-a-ish" arith arms named in the mission): `Add`,
-// `Sub`, `Mul` — chosen because their VALUE arms ([`ARMS`]) are UNGUARDED
-// beyond the shared no-overflow/in-range side condition (no ÷0 / shift-range
-// / INT_MIN guard to additionally thread through the chain). `Add` is the
-// mission-critical deliverable; `Sub`/`Mul` are the same shape, proven as a
-// genuine bonus (not merely asserted by analogy) — each checked independently
-// against a real Lean 4.8.0 toolchain before being pinned here. The composed
-// `bridge_stepInst_binop_agreement_all` conjoins all 3.
+// Seven arms are composed: Add/Sub/Mul/UDiv/SDiv/URem/SRem. The division and
+// remainder theorems retain the exact value-layer nonzero and signed-overflow
+// guards, as well as the existing nonnegative/in-range result premises.
+// Signed results outside those premises are not newly covered. Width remains
+// the concrete I8 fixture; this does not prove every integer width or state.
+// The composed bridge_stepInst_binop_agreement_all conjoins all seven.
 //
 // ANTI-FORGERY: (1) wrong-op-agreement — `stepInst`'s `.BinOp .Add` chain
 // claimed to agree with `semIntBinOp .Sub` instead of `.Add` (a same-shape
@@ -518,20 +500,15 @@
 //     composed with `bridge_add`, PLUS a second connect corollary composing
 //     with `bridge_neg_sub_zero_form` (the `Int.sub (Int.ofNat 0) operand`
 //     spelling) — both reused, neither re-proven.
-//   * `.Overflow` (unsigned `AddOverflow`) — `semOverflow` binds a SINGLE
-//     fresh `ValueId` to a `Value.aggregate [Value.int w result, Value.bool
-//     flag]` (the checked-arithmetic `(result, overflowed)` pair, packed as
-//     one aggregate value — NOT two separate results). The connect composes
-//     with the ALREADY-PROVEN `bridge_overflow_uadd_flag` (EXTENSION 2, the
-//     FULL-pair FLAG arm — itself unconditional, no side condition), landing
-//     on the exact concrete `(wrap(l+r), threshold-decide)` pair; the VALUE
-//     component this writes into the aggregate's first field is, BY
-//     `bridge_overflow_uadd_value` (also EXTENSION 2, already proven), the
-//     same formula that arm already equates with `semIntBinOp BinOp.Add` —
-//     documented here rather than re-proven as a SEPARATE stepInst-level
-//     theorem (the pair-shape's flag component fully commits the instruction
-//     result; a value-only projection would need an existential over the
-//     untouched flag, out of scope for this increment's one-dispatch budget).
+//   * `.Overflow` (unsigned `AddOverflow`) — `semOverflow` binds TWO
+//     fresh SSA values, the wrapped integer then the boolean overflow flag,
+//     and `stepInst` returns their ordered identities in `InstrResult.values`.
+//     The state advances `nextValueId` twice (TrustIR WS2.24). The connect
+//     composes with the ALREADY-PROVEN `bridge_overflow_uadd_flag`
+//     (EXTENSION 2's unconditional full-pair arm), retaining both separate
+//     bindings and the complete resulting machine state. The integer binding
+//     is the same wrapped-add formula established by
+//     `bridge_overflow_uadd_value`; there is no packed aggregate convention.
 //   * `.ICmp` (`Ult`) — `semICmpInst` binds a fresh `ValueId` to `Value.bool
 //     (semICmp op w l r)`; `semICmp` is TOTAL (a `Bool`, not `Except`), so
 //     the connect is a direct `congrArg` over `Bool` (no `Except`-match
@@ -570,7 +547,7 @@
 // comparison arms; Cast's `ZExt`/`SExt`) are honestly reported as un-chained
 // — the identical technique generalizes, but was not executed for them (the
 // SAME discipline [`STEPINST_BINOP_UNBRIDGED`] already applies to BinOp's
-// other 15 ops). Beyond these 5 categories: `FCmp` has no VALUE-level bridge
+// other 11 ops). Beyond these 5 categories: `FCmp` has no VALUE-level bridge
 // yet (so no chain is possible for it); the other 51 `Inst` variants remain
 // entirely unbridged, as before; `evalBody`/`evalCfg`'s WHOLE-PROGRAM
 // evaluator (beyond the concrete single-block/branch/loop fixtures EXTENSIONS
@@ -584,45 +561,18 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use clean_kernel::{Environment, Name, TypeChecker};
-use clean_olean::load_modules_with_deps;
+
+mod unsigned_mul;
+use clean_olean::replay_census::{replay_declaration_census, DeclarationReplayVerdict};
 use clean_olean::verify_batch_full::typecheck_constants_full;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The root module whose transitive `.olean` closure is vendored: trust-ir's
-/// COMPARISON semantics (`semICmp`), which imports the arithmetic semantics
-/// (`semIntBinOp`/`semIntUnOp`/`semOverflowOp` + their whole import cone). Was
-/// `TrustIr.Semantics.Arith` through the OverflowOp increment; RETARGETED to
-/// `TrustIr.Semantics.Compare` when the semICmp bridge was added — `Compare`
-/// imports `Arith`, so its closure is a strict superset (11 TrustIr modules
-/// vs. 9), at the SAME trust-ir pin (`26379f8`). Kept as a named constant
-/// (rather than folded into [`BRIDGE_ROOT_MODULES`]) because several
-/// diagnostics still cite it as "the" comparison root.
-pub const BRIDGE_ROOT_MODULE: &str = "TrustIr.Semantics.Compare";
+// One root set drives bridge replay and the lightweight regeneration utility.
+pub use trust_bridge_closure::{BRIDGE_ROOT_MODULE, BRIDGE_ROOT_MODULES};
 
-/// The FULL set of root modules whose UNION transitive `.olean` closure is
-/// vendored. EXTENSION 4 (the semCast increment) adds `TrustIr.Semantics.Cast`
-/// alongside [`BRIDGE_ROOT_MODULE`]: `Cast` imports `CastOp` + `Arith`, but —
-/// unlike every prior extension — NEITHER `Compare` nor `Cast` imports the
-/// other (`Compare` imports `Arith`; `Cast` imports `CastOp` + `Arith`), so a
-/// single-root retarget cannot cover both. The two roots are loaded together
-/// via `clean_olean::load_modules_with_deps` (the shared-`visited` multi-root
-/// loader), whose closure is the UNION of both cones: the previous 11
-/// TrustIr modules plus exactly 2 new ones (`CastOp`, `Semantics.Cast`) — 13
-/// total, at the SAME trust-ir pin (`26379f8`). The vendored oleans +
-/// manifest were regenerated (scripts/regen-trustir-oleans.sh --write) to
-/// match this wider closure.
-/// EXTENSION 6 (this increment) adds `TrustIr.Semantics.Eval` — the FIRST
-/// WHOLE-BLOCK (`stepBlock`/`stepN`, terminator-inclusive) agreement, one
-/// layer above `stepInst`. `Eval` `import`s `Step` directly, so its closure
-/// is Step's closure PLUS `Eval` itself (a strict superset, 27 TrustIr
-/// modules vs. 26) — no other root retarget is needed.
-pub const BRIDGE_ROOT_MODULES: &[&str] = &[
-    BRIDGE_ROOT_MODULE,
-    "TrustIr.Semantics.Cast",
-    "TrustIr.Semantics.Step",
-    "TrustIr.Semantics.Eval",
-];
+mod runtime_frontier;
+pub use runtime_frontier::RuntimeFrontier;
 
 /// Manifest schema ids (versioned, one per vendored tree).
 // v2 partitions the file table by build platform (see `ManifestDoc`). The
@@ -640,6 +590,48 @@ pub const LEAN_CORE_MANIFEST_SCHEMA: &str = "trust.vendor.lean-core-oleans.manif
 // live grounder emits (`clean_ground.rs`), and it is the Lean-faithful
 // spelling clean's elaborator handles uniformly.
 // ---------------------------------------------------------------------------
+
+/// Checked source instance aliases for this bridge's integer arithmetic/order,
+/// natural width subtraction, numeric literals, and integer/Bool/Ty equality.
+/// Every value is the exact instance term synthesized by the vendored Lean 4.8
+/// artifacts. Carrier class metadata must come from the manifest-verified
+/// imported closure; redeclaring a restored class correctly refuses. This
+/// bounded notation setup does not qualify generic Lean-v1 class/instance
+/// extension decoding.
+///
+/// Retain the source's reducibility declarations and checked aliases:
+/// `GE.ge` and `GT.gt` are `@[reducible]` defs in
+/// `Init/Prelude.lean`, and `Int.instLEInt`/`Int.instLTInt` are `instance`
+/// defs, which Lean makes reducible. Clean's instance search and `rw`'s
+/// closing `rfl` run at Lean's `.instances`/reducible transparency (Clean G47),
+/// so without it `Decidable (half - 1 < exact)` stops at
+/// `Int.instLTInt.1 (half - 1) exact`, never reaching `bridgeIntDecLt`, and
+/// `decide (x ≥ y)` never meets `decide (y ≤ x)`.
+/// Keep decidability available for both canonical `Int.le`/`Int.lt` and the
+/// `LE`/`LT` projections and reversed comparison notation: elaboration may
+/// retain any of these heads, while the kernel checks the same imported procedure.
+const BRIDGE_INSTANCE_SRC: &str = r#"instance bridgeIntLE : LE Int := Int.instLEInt
+instance bridgeIntLT : LT Int := Int.instLTInt
+attribute [reducible] GE.ge GT.gt Int.instLEInt Int.instLTInt
+instance bridgeIntDecLe (a b : Int) : Decidable (Int.le a b) := Int.decLe a b
+instance bridgeIntDecLt (a b : Int) : Decidable (Int.lt a b) := Int.decLt a b
+instance bridgeIntDecLeNotation (a b : Int) : Decidable (a ≤ b) := Int.decLe a b
+instance bridgeIntDecLtNotation (a b : Int) : Decidable (a < b) := Int.decLt a b
+instance bridgeIntDecGeNotation (a b : Int) : Decidable (a ≥ b) := Int.decLe b a
+instance bridgeIntAdd : HAdd Int Int Int := @instHAdd Int Int.instAdd
+instance bridgeIntSub : HSub Int Int Int := @instHSub Int Int.instSub
+instance bridgeNatSub : HSub Nat Nat Nat := @instHSub Nat instSubNat
+instance bridgeIntMul : HMul Int Int Int := @instHMul Int Int.instMul
+instance bridgeIntMod : HMod Int Int Int := @instHMod Int Int.instMod
+instance bridgeIntPow : HPow Int Nat Int := Int.instHPowNat
+instance bridgeIntNeg : Neg Int := Int.instNegInt
+instance bridgeIntOfNat (n : Nat) : OfNat Int n := @instOfNat n
+instance bridgeNatOfNat (n : Nat) : OfNat Nat n := instOfNatNat n
+instance bridgeIntDecEq (a b : Int) : Decidable (a = b) := Int.instDecidableEq a b
+instance bridgeBoolDecEq (a b : Bool) : Decidable (a = b) := instDecidableEqBool a b
+instance bridgeIntBEq : BEq Int := @instBEqOfDecidableEq Int Int.instDecidableEq
+instance bridgeTyBEq : BEq TrustIr.Ty := TrustIr.instBEqTy
+"#;
 
 /// The wrap-elision prelude: `wrap v = v` exactly when `0 ≤ v < m` — the one
 /// conditional-rewrite lemma every form-(b) arm composes with. Proven from
@@ -1309,7 +1301,8 @@ const OVERFLOW_THRESHOLD_PRELUDE_SRC: &str = r#"theorem overflow_threshold_iff2 
     (fun (h : half ≤ exact) => Int.sub_one_lt_of_le h)
 theorem overflow_threshold_decide_eq (half exact : Int) :
     Decidable.decide (half - 1 < exact) = Decidable.decide (half ≤ exact) :=
-  (decide_eq_decide (half - 1 < exact) (half ≤ exact)).mpr (overflow_threshold_iff2 half exact)
+  (@decide_eq_decide (half - 1 < exact) (half ≤ exact)
+    (Int.decLt (half - 1) exact) (Int.decLe half exact)).mpr (overflow_threshold_iff2 half exact)
 "#;
 
 /// One overflow-op VALUE arm: the `.1` (Lean `Prod.fst`) component of
@@ -1419,6 +1412,8 @@ struct OverflowFlagArmSpec {
     connect_src: &'static str,
 }
 
+// With the imported notation decisions, these connecting rewrites close their
+// equality goals. A subsequent `rfl` is an error because no goal remains.
 const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
     OverflowFlagArmSpec {
         op: "AddOverflow",
@@ -1471,8 +1466,8 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
     (hl1 : l < (2:Int)^w) (hr0 : (0:Int) ≤ r) :
     (Decidable.decide (l - r ≥ (2:Int)^w) || @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)) =
       @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0) := by
-  rw [decide_eq_false (l - r ≥ (2:Int)^w)
-        ((Int.not_le ((2:Int)^w) (l - r)).mpr (Int.lt_of_le_of_lt (Int.sub_le_self l r hr0) hl1)),
+  rw [@decide_eq_false (l - r ≥ (2:Int)^w) (Int.decLe ((2:Int)^w) (l - r))
+        ((@Int.not_le ((2:Int)^w) (l - r)).mpr (Int.lt_of_le_of_lt (@Int.sub_le_self l r hr0) hl1)),
       Bool.false_or]
 "#,
         connect_theorem: "bridge_overflow_usub_flag",
@@ -1484,6 +1479,7 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
   rw [overflow_usub_flag_reduces, overflow_usub_flag_vacuous w l r hl1 hr0]
 "#,
     },
+    unsigned_mul::FLAG_ARM,
     OverflowFlagArmSpec {
         op: "AddOverflow",
         signed: true,
@@ -1552,10 +1548,9 @@ const OVERFLOW_FLAG_ARMS: &[OverflowFlagArmSpec] = &[
     },
 ];
 
-/// The COMPOSED overflow agreement theorem: one proposition, the conjunction
-/// of all 6 VALUE arms + all 5 FLAG arms (11 conjuncts total; unsigned-Mul's
-/// flag is excluded — it is not bridged), proved by the already-kernel-checked
-/// arm theorems.
+/// The COMPOSED overflow agreement theorem: all 6 VALUE and all 6 FLAG
+/// statements (12 conjuncts), composed from the actual checked arm theorems.
+/// The gate also requires the four registered unsigned-Mul Int predicate links.
 const OVERFLOW_COMPOSED_NAME: &str = "bridge_semOverflowOp_agreement_all";
 const OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_semOverflowOp_agreement_all :
     (∀ (w : Nat) (l r : Int),
@@ -1592,6 +1587,11 @@ const OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_semOverflowOp_agreement_al
         Except.ok ((((l - r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
                    @Decidable.decide (l - r < 0) (Int.decLt (l - r) 0)))
   ∧ (∀ (w : Nat) (l r : Int),
+      TrustIr.semOverflowOp TrustIr.OverflowOp.MulOverflow w false l r =
+        Except.ok ((((l * r) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
+                   @Decidable.decide (l * r < 0) (Int.decLt (l * r) 0) ||
+                   Decidable.decide (((2:Int)^w - 1) < (l * r))))
+  ∧ (∀ (w : Nat) (l r : Int),
       TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow w true l r =
         Except.ok (((((TrustIr.toSigned l w) + (TrustIr.toSigned r w)) % ((2:Int)^w) + (2:Int)^w) % ((2:Int)^w)),
                    Decidable.decide (((2:Int)^(w-1) - 1) < ((TrustIr.toSigned l w) + (TrustIr.toSigned r w))) ||
@@ -1608,8 +1608,9 @@ const OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_semOverflowOp_agreement_al
                    Decidable.decide ((TrustIr.toSigned l w) * (TrustIr.toSigned r w) < -((2:Int)^(w-1))))) :=
   And.intro bridge_overflow_uadd_value (And.intro bridge_overflow_usub_value (And.intro bridge_overflow_umul_value
     (And.intro bridge_overflow_sadd_value (And.intro bridge_overflow_ssub_value (And.intro bridge_overflow_smul_value
-      (And.intro bridge_overflow_uadd_flag (And.intro bridge_overflow_usub_flag (And.intro bridge_overflow_sadd_flag
-        (And.intro bridge_overflow_ssub_flag bridge_overflow_smul_flag)))))))))
+      (And.intro bridge_overflow_uadd_flag (And.intro bridge_overflow_usub_flag
+        (And.intro bridge_overflow_umul_flag (And.intro bridge_overflow_sadd_flag
+          (And.intro bridge_overflow_ssub_flag bridge_overflow_smul_flag))))))))))
 "#;
 
 /// Overflow forgery probes: deliberately-WRONG claims that must be
@@ -1637,18 +1638,9 @@ const OVERFLOW_FORGERY_PROBES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Un-bridged overflow-flag arms, reported honestly (never faked): `(op,
-/// reason)`. Unsigned-Mul is the one — Clean's safety-VC tier models NO
-/// unsigned-multiply-overflow Lemma (Lemma 2 is unsigned-ADD only, Lemma 8 is
-/// unsigned-SUB only), so no agreement claim is made for its flag. Its VALUE
-/// component IS still bridged (`bridge_overflow_umul_value`).
-const OVERFLOW_FLAG_UNBRIDGED: &[(&str, &str)] = &[(
-    "MulOverflow[unsigned]",
-    "Clean's safety-VC tier models no unsigned-multiply-overflow Lemma (Lemma 2 \
-     is unsigned-ADD only, Lemma 8 is unsigned-SUB only) — no overflow-flag \
-     agreement claim is made; faking one would be dishonest. The VALUE \
-     component is still bridged (bridge_overflow_umul_value).",
-)];
+/// All six generic Int overflow flags now have bridges. This empty roster says
+/// nothing about BV-predicate equivalence or unregistered u128 safety predicates.
+const OVERFLOW_FLAG_UNBRIDGED: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------
 // semICmp — the ICmp agreement arms (extends the bridge to trust-ir's
@@ -1866,7 +1858,7 @@ const ICMP_FORGERY_PROBES: &[(&str, &str)] = &[
 /// Clean's one `Int.lt`/`Int.le` comparison denotation at the `toSigned`
 /// operand images (the established SDiv/SRem/AShr precedent), NOT a faked
 /// claim against a non-existent "signed comparison" primitive — so unlike
-/// `UnOp::CtPop` / unsigned-`MulOverflow`, there is no honest residue here.
+/// `UnOp::CtPop`, there is no honest residue here.
 const ICMP_UNBRIDGED: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------------
@@ -1890,29 +1882,13 @@ const ICMP_UNBRIDGED: &[(&str, &str)] = &[];
 /// ARMS ARE CONCRETE-STATE" note) at one representative width pair
 /// (Trunc 16→8, ZExt 8→16 unsigned, SExt 8→16 signed).
 ///
-/// TRUNC SIDE CONDITION (trust-ir pin b1af6b8 / 833a85ce, 2026-07-22): the
-/// `.Trunc` arm of `semCast` gained a leading `if dstTy == .Bool then
-/// <materialize low bit as Value.bool> else <the old width truncation>`
-/// guard (Cast.lean:100). For our pinned destination `Ty.I8` this guard is
-/// FALSE (`I8 ≠ Bool`), so the value content is UNCHANGED. But the guard's
-/// condition is `dstTy == .Bool` under trust-ir's `Ty deriving BEq`
-/// (Basic.lean:307) — a STRUCTURAL `beqTy` compiled with `brecOn`, and
-/// clean-elab's kernel def-eq does NOT reduce that derived function even on
-/// nullary constructors (isolated + reproducible: `(Ty.I8 == Ty.I8) = true
-/// := rfl` ALSO fails to reduce; `rfl`/`simp`/`decide`/`native_decide` all
-/// refuse, and no `LawfulBEq Ty` instance exists to bridge `Ty.noConfusion`'s
-/// `I8 ≠ Bool` to `(I8 == Bool) = false`). This is the SAME class of
-/// clean-elaborator def-eq limitation documented for the SExt widening
-/// corollary below — clean correctly REFUSES rather than mis-accepts. So the
-/// Trunc arm now carries the trivially-true typing side condition
-/// `hbool : (Ty.I8 == Ty.Bool) = false` (real-Lean `rfl`), reducing the guard
-/// via `rw [hbool]` after `simp only [semCast]`. This is a form-(b)-style
-/// CONDITIONAL agreement (cf. the no-overflow side-condition arms), NOT a
-/// weaker/dishonest substitute: the full truncation VALUE content is proven,
-/// the side condition is an always-true type tautology, and every Trunc
-/// forgery probe stays kernel-REJECTED (the side condition never rescues a
-/// wrong-width claim). ZExt/SExt are unaffected (no `.Bool` guard in their
-/// arms) and remain unconditional `:= rfl`.
+/// The shared model's Trunc guard uses `Ty.isBool`, whose concrete `I8`
+/// case reduces definitionally. The old theorem's `hbool` premise remains
+/// part of its original statement and downstream compositions, but the proof
+/// no longer rewrites the retired structural-BEq guard. `rfl` checks the whole
+/// monadic result, including the original destination value and state, against
+/// the imported model. It introduces no assumption about the guard or result.
+/// ZExt/SExt retain their original unconditional statements and proofs.
 struct CastArmSpec {
     op: &'static str,
     theorem: &'static str,
@@ -1934,9 +1910,7 @@ const CAST_ARMS: &[CastArmSpec] = &[
           locals :=
             (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 16 v)).set
               (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 (TrustIr.truncateUnsigned v 8)),
-          nextValueId := 2 }) := by
-  simp only [TrustIr.semCast]
-  rw [hbool]
+          nextValueId := 2 }) := rfl
 "#,
     },
     CastArmSpec {
@@ -2100,8 +2074,14 @@ const CAST_COMPOSED_SRC: &str = r#"theorem bridge_semCast_agreement_all :
             nextValueId := 2 }))
   ∧ (∀ (v : Int) (dstW : Nat) (h0 : 0 ≤ v) (h1 : v < (2:Int) ^ dstW),
       TrustIr.truncateUnsigned v dstW = v) :=
-  And.intro bridge_cast_trunc (And.intro bridge_cast_zext (And.intro bridge_cast_sext
-    bridge_cast_zext_widening_identity))
+  by
+    constructor
+    exact bridge_cast_trunc
+    constructor
+    exact bridge_cast_zext
+    constructor
+    exact bridge_cast_sext
+    exact bridge_cast_zext_widening_identity
 "#;
 
 /// Cast forgery probes: deliberately-WRONG claims that must be
@@ -2259,26 +2239,117 @@ const CAST_UNBRIDGED: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 
 /// One stepInst-BinOp agreement arm: `(op, chain theorem, chain src, connect
-/// theorem, connect src)`. Ordered `Add`/`Sub`/`Mul` — the 3 "form-a-ish"
-/// arith ops named in the mission brief (unguarded beyond the shared
-/// no-overflow/in-range side condition; no ÷0/shift-range/INT_MIN guard to
-/// additionally thread). Each pair was checked against a real Lean 4.8.0
-/// toolchain before being pinned here.
+/// theorem, connect src)`. The seven integer arithmetic
+/// arms preserve each existing value theorem's exact side conditions. Division
+/// and remainder additionally require their original nonzero and signed
+/// overflow guards; none of those premises is discharged by the transport.
 struct StepBinOpArmSpec {
     op: &'static str,
-    /// The unconditional READ->COMPUTE->WRITE chain identity (rfl), stated
+    /// The READ->COMPUTE->WRITE chain identity, stated
     /// generically in terms of the already-bridged `semIntBinOp` (not a
     /// hand-inlined wrap formula).
     chain_theorem: &'static str,
     chain_src: &'static str,
     /// The CONNECT theorem: composes the chain lemma with the
-    /// already-proven `bridge_add`/`bridge_sub`/`bridge_mul` (from [`ARMS`]
-    /// — REUSED, not re-proven) to land on the exact value
-    /// `int_binop_expr`'s `Int.add`/`Int.sub`/`Int.mul` head denotes
-    /// (`trustir_anchor.rs`'s Clean BinOp-statement denotation).
+    /// already-proven matching value theorem from [`ARMS`]. The arithmetic
+    /// operation and its guards remain exactly those of the shared semantics.
     connect_theorem: &'static str,
     connect_src: &'static str,
 }
+
+/// Shared proof-only transport: actual Sem.bindFresh, full state and error preservation.
+/// No operation is evaluated by this helper; each connect consumes an existing value theorem.
+const STEPINST_BINOP_TRANSPORT_SRC: &str = r#"theorem stepinst_binop_result_transport (r : Except TrustIr.SemError Int) (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (@StateT.bind TrustIr.MachineState (Except TrustIr.SemError) (@Except.instMonad TrustIr.SemError)
+        TrustIr.ValueId TrustIr.InstrResult
+        (match Except.bind r (fun result => Except.ok (TrustIr.Value.int 8 result)) with
+          | .ok value => TrustIr.Sem.bindFresh value
+          | .error e => (fun _ => Except.error e))
+        (fun vid => @StateT.pure TrustIr.MachineState (Except TrustIr.SemError)
+          (@Except.instMonad TrustIr.SemError) TrustIr.InstrResult
+          (TrustIr.InstrResult.value (some vid))))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e)  := Except.rec
+  (fun e => @Eq.refl (Except TrustIr.SemError (TrustIr.InstrResult × TrustIr.MachineState)) (Except.error e))
+  (fun result => @Eq.refl (Except TrustIr.SemError (TrustIr.InstrResult × TrustIr.MachineState))
+    (Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 }))) r
+
+theorem stepinst_binop_int_chain (op : TrustIr.BinOp) (hnot : op.isMinMax = false) (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp op TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match TrustIr.semIntBinOp op 8 v_l v_r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e)  := Eq.trans
+  (congrArg (fun flag : Bool => TrustIr.Sem.run
+      (@StateT.bind TrustIr.MachineState (Except TrustIr.SemError) (@Except.instMonad TrustIr.SemError)
+        TrustIr.ValueId TrustIr.InstrResult
+        (@ite (TrustIr.Sem TrustIr.ValueId) (flag = Bool.true) (instDecidableEqBool flag Bool.true)
+          (TrustIr.semFloatMinMax op TrustIr.Ty.I8 (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1))
+          (TrustIr.semBinOpDeterministic op TrustIr.Ty.I8 (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+        (fun vid => @StateT.pure TrustIr.MachineState (Except TrustIr.SemError)
+          (@Except.instMonad TrustIr.SemError) TrustIr.InstrResult
+          (TrustIr.InstrResult.value (some vid))))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 }) hnot)
+  (stepinst_binop_result_transport (TrustIr.semIntBinOp op 8 v_l v_r) v_l v_r)
+
+theorem stepinst_binop_int_of_value (op : TrustIr.BinOp) (hnot : op.isMinMax = false)
+    (v_l v_r result : Int) (hvalue : TrustIr.semIntBinOp op 8 v_l v_r = Except.ok result) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp op TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (result)),
+          nextValueId := 3 }) := by
+  rw [stepinst_binop_int_chain op hnot v_l v_r, hvalue]
+"#;
 
 const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
     StepBinOpArmSpec {
@@ -2303,7 +2374,7 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                     (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
                   (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
               nextValueId := 3 })
-      | .error e => Except.error e) := rfl
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.Add rfl v_l v_r
 "#,
         connect_theorem: "bridge_stepInst_binop_add",
         connect_src: r#"theorem bridge_stepInst_binop_add (v_l v_r : Int)
@@ -2324,8 +2395,8 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
               (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.add v_l v_r)),
           nextValueId := 3 }) :=
-  by
-    rw [stepinst_binop_add_chain v_l v_r, bridge_add 8 v_l v_r h0 h1]
+  stepinst_binop_int_of_value TrustIr.BinOp.Add rfl v_l v_r (Int.add v_l v_r)
+    (bridge_add 8 v_l v_r h0 h1)
 "#,
     },
     StepBinOpArmSpec {
@@ -2350,7 +2421,7 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                     (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
                   (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
               nextValueId := 3 })
-      | .error e => Except.error e) := rfl
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.Sub rfl v_l v_r
 "#,
         connect_theorem: "bridge_stepInst_binop_sub",
         connect_src: r#"theorem bridge_stepInst_binop_sub (v_l v_r : Int)
@@ -2371,8 +2442,8 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
               (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.sub v_l v_r)),
           nextValueId := 3 }) :=
-  by
-    rw [stepinst_binop_sub_chain v_l v_r, bridge_sub 8 v_l v_r h0 h1]
+  stepinst_binop_int_of_value TrustIr.BinOp.Sub rfl v_l v_r (Int.sub v_l v_r)
+    (bridge_sub 8 v_l v_r h0 h1)
 "#,
     },
     StepBinOpArmSpec {
@@ -2397,7 +2468,7 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                     (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
                   (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
               nextValueId := 3 })
-      | .error e => Except.error e) := rfl
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.Mul rfl v_l v_r
 "#,
         connect_theorem: "bridge_stepInst_binop_mul",
         connect_src: r#"theorem bridge_stepInst_binop_mul (v_l v_r : Int)
@@ -2418,69 +2489,344 @@ const STEPINST_BINOP_ARMS: &[StepBinOpArmSpec] = &[
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
               (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.mul v_l v_r)),
           nextValueId := 3 }) :=
-  by
-    rw [stepinst_binop_mul_chain v_l v_r, bridge_mul 8 v_l v_r h0 h1]
+  stepinst_binop_int_of_value TrustIr.BinOp.Mul rfl v_l v_r (Int.mul v_l v_r)
+    (bridge_mul 8 v_l v_r h0 h1)
+"#,
+    },
+    StepBinOpArmSpec {
+        op: "UDiv",
+        chain_theorem: "stepinst_binop_udiv_chain",
+        chain_src: r#"theorem stepinst_binop_udiv_chain (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match TrustIr.semIntBinOp TrustIr.BinOp.UDiv 8 v_l v_r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.UDiv rfl v_l v_r
+"#,
+        connect_theorem: "bridge_stepInst_binop_udiv",
+        connect_src: r#"theorem bridge_stepInst_binop_udiv (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (h0 : 0 ≤ Int.ediv v_l v_r) (h1 : Int.ediv v_l v_r < (2 : Int) ^ 8) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.ediv v_l v_r)),
+          nextValueId := 3 }) :=
+  stepinst_binop_int_of_value TrustIr.BinOp.UDiv rfl v_l v_r (Int.ediv v_l v_r)
+    (bridge_udiv 8 v_l v_r hz h0 h1)
+"#,
+    },
+    StepBinOpArmSpec {
+        op: "SDiv",
+        chain_theorem: "stepinst_binop_sdiv_chain",
+        chain_src: r#"theorem stepinst_binop_sdiv_chain (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match TrustIr.semIntBinOp TrustIr.BinOp.SDiv 8 v_l v_r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.SDiv rfl v_l v_r
+"#,
+        connect_theorem: "bridge_stepInst_binop_sdiv",
+        connect_src: r#"theorem bridge_stepInst_binop_sdiv (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (hmin : ((TrustIr.toSigned v_l 8 == -((2 : Int) ^ (8 - 1))) && (TrustIr.toSigned v_r 8 == -1)) = false)
+    (h0 : 0 ≤ Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8)) (h1 : Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8) < (2 : Int) ^ 8) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))),
+          nextValueId := 3 }) :=
+  stepinst_binop_int_of_value TrustIr.BinOp.SDiv rfl v_l v_r (Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))
+    (bridge_sdiv 8 v_l v_r hz hmin h0 h1)
+"#,
+    },
+    StepBinOpArmSpec {
+        op: "URem",
+        chain_theorem: "stepinst_binop_urem_chain",
+        chain_src: r#"theorem stepinst_binop_urem_chain (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.URem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match TrustIr.semIntBinOp TrustIr.BinOp.URem 8 v_l v_r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.URem rfl v_l v_r
+"#,
+        connect_theorem: "bridge_stepInst_binop_urem",
+        connect_src: r#"theorem bridge_stepInst_binop_urem (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (h0 : 0 ≤ Int.emod v_l v_r) (h1 : Int.emod v_l v_r < (2 : Int) ^ 8) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.URem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.emod v_l v_r)),
+          nextValueId := 3 }) :=
+  stepinst_binop_int_of_value TrustIr.BinOp.URem rfl v_l v_r (Int.emod v_l v_r)
+    (bridge_urem 8 v_l v_r hz h0 h1)
+"#,
+    },
+    StepBinOpArmSpec {
+        op: "SRem",
+        chain_theorem: "stepinst_binop_srem_chain",
+        chain_src: r#"theorem stepinst_binop_srem_chain (v_l v_r : Int) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    (match TrustIr.semIntBinOp TrustIr.BinOp.SRem 8 v_l v_r with
+      | .ok result =>
+        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+          { TrustIr.MachineState.empty with
+              locals :=
+                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                    (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 result),
+              nextValueId := 3 })
+      | .error e => Except.error e) := stepinst_binop_int_chain TrustIr.BinOp.SRem rfl v_l v_r
+"#,
+        connect_theorem: "bridge_stepInst_binop_srem",
+        connect_src: r#"theorem bridge_stepInst_binop_srem (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (hmin : ((TrustIr.toSigned v_l 8 == -((2 : Int) ^ (8 - 1))) && (TrustIr.toSigned v_r 8 == -1)) = false)
+    (h0 : 0 ≤ Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8)) (h1 : Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8) < (2 : Int) ^ 8) :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))),
+          nextValueId := 3 }) :=
+  stepinst_binop_int_of_value TrustIr.BinOp.SRem rfl v_l v_r (Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))
+    (bridge_srem 8 v_l v_r hz hmin h0 h1)
 "#,
     },
 ];
 
 /// The COMPOSED stepInst-BinOp agreement theorem: one proposition, the
-/// conjunction of the 3 CONNECT theorems (Add ∧ Sub ∧ Mul), proved by the
+/// conjunction of the seven CONNECT theorems, proved by the
 /// already-kernel-checked theorems above.
 const STEPINST_BINOP_COMPOSED_NAME: &str = "bridge_stepInst_binop_agreement_all";
 const STEPINST_BINOP_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_binop_agreement_all :
-    (∀ (v_l v_r : Int) (h0 : 0 ≤ Int.add v_l v_r) (h1 : Int.add v_l v_r < (2 : Int) ^ 8),
-      TrustIr.Sem.run
-        (TrustIr.stepInst
-          (TrustIr.Inst.BinOp TrustIr.BinOp.Add TrustIr.Ty.I8
-            (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
-        { TrustIr.MachineState.empty with
-            locals :=
-              (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
-            nextValueId := 2 } =
-      Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
-        { TrustIr.MachineState.empty with
-            locals :=
-              ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                  (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.add v_l v_r)),
-            nextValueId := 3 }))
-  ∧ (∀ (v_l v_r : Int) (h0 : 0 ≤ Int.sub v_l v_r) (h1 : Int.sub v_l v_r < (2 : Int) ^ 8),
-      TrustIr.Sem.run
-        (TrustIr.stepInst
-          (TrustIr.Inst.BinOp TrustIr.BinOp.Sub TrustIr.Ty.I8
-            (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
-        { TrustIr.MachineState.empty with
-            locals :=
-              (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
-            nextValueId := 2 } =
-      Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
-        { TrustIr.MachineState.empty with
-            locals :=
-              ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                  (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.sub v_l v_r)),
-            nextValueId := 3 }))
-  ∧ (∀ (v_l v_r : Int) (h0 : 0 ≤ Int.mul v_l v_r) (h1 : Int.mul v_l v_r < (2 : Int) ^ 8),
-      TrustIr.Sem.run
-        (TrustIr.stepInst
-          (TrustIr.Inst.BinOp TrustIr.BinOp.Mul TrustIr.Ty.I8
-            (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
-        { TrustIr.MachineState.empty with
-            locals :=
-              (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
-            nextValueId := 2 } =
-      Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
-        { TrustIr.MachineState.empty with
-            locals :=
-              ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
-                  (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.mul v_l v_r)),
-            nextValueId := 3 })) :=
-  And.intro bridge_stepInst_binop_add (And.intro bridge_stepInst_binop_sub bridge_stepInst_binop_mul)
+    (∀ (v_l v_r : Int)
+    (h0 : 0 ≤ Int.add v_l v_r) (h1 : Int.add v_l v_r < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.Add TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.add v_l v_r)),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (h0 : 0 ≤ Int.sub v_l v_r) (h1 : Int.sub v_l v_r < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.Sub TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.sub v_l v_r)),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (h0 : 0 ≤ Int.mul v_l v_r) (h1 : Int.mul v_l v_r < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.Mul TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.mul v_l v_r)),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (h0 : 0 ≤ Int.ediv v_l v_r) (h1 : Int.ediv v_l v_r < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.ediv v_l v_r)),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (hmin : ((TrustIr.toSigned v_l 8 == -((2 : Int) ^ (8 - 1))) && (TrustIr.toSigned v_r 8 == -1)) = false)
+    (h0 : 0 ≤ Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8)) (h1 : Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8) < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.div (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (h0 : 0 ≤ Int.emod v_l v_r) (h1 : Int.emod v_l v_r < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.URem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.emod v_l v_r)),
+          nextValueId := 3 }))
+  ∧ (∀ (v_l v_r : Int)
+    (hz : (v_r == 0) = false)
+    (hmin : ((TrustIr.toSigned v_l 8 == -((2 : Int) ^ (8 - 1))) && (TrustIr.toSigned v_r 8 == -1)) = false)
+    (h0 : 0 ≤ Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8)) (h1 : Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8) < (2 : Int) ^ 8),
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.mod (TrustIr.toSigned v_l 8) (TrustIr.toSigned v_r 8))),
+          nextValueId := 3 })) :=
+  And.intro bridge_stepInst_binop_add (And.intro bridge_stepInst_binop_sub (And.intro bridge_stepInst_binop_mul (And.intro bridge_stepInst_binop_udiv (And.intro bridge_stepInst_binop_sdiv (And.intro bridge_stepInst_binop_urem (bridge_stepInst_binop_srem))))))
 "#;
 
 /// stepInst-BinOp forgery probes: deliberately-WRONG claims that must be
@@ -2548,17 +2894,288 @@ const STEPINST_BINOP_FORGERY_PROBES: &[(&str, &str)] = &[
       (bridge_sub 8 v_l v_r h0 h1))
 "#,
     ),
+    ("UDiv false result", r#"theorem stepinst_udiv_false_result :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (4)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("SDiv false result", r#"theorem stepinst_sdiv_false_result :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 249)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 249)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (4)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("URem false result", r#"theorem stepinst_urem_false_result :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.URem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (0)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("SRem false result", r#"theorem stepinst_srem_false_result :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (0)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("zero divisor cannot succeed", r#"theorem stepinst_udiv_zero_divisor :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 0),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 0)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (0)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("signed INT_MIN / -1 cannot succeed", r#"theorem stepinst_sdiv_overflow_guard :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 128)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 255),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 128)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 255)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (128)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("signed INT_MIN % -1 cannot succeed", r#"theorem stepinst_srem_overflow_guard :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 128)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 255),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 128)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 255)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (0)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("wrong divisor in result", r#"theorem stepinst_udiv_wrong_divisor :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (Int.ediv 7 3)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("wrong result destination", r#"theorem stepinst_udiv_wrong_destination :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 3)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 3) (TrustIr.Value.int 8 (3)),
+          nextValueId := 3 }) := rfl
+"#),
+    ("wrong allocation cursor", r#"theorem stepinst_udiv_wrong_cursor :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (3)),
+          nextValueId := 4 }) := rfl
+"#),
+    ("input operand must be preserved", r#"theorem stepinst_udiv_wrong_preserved_input :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 9)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (3)),
+          nextValueId := 3 }) := rfl
+"#),
 ];
 
+const STEPINST_DIVREM_CONCRETE_SRC: &str = r#"theorem stepinst_divrem_concrete_udiv :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.UDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (3)),
+          nextValueId := 3 }) := rfl
+
+theorem stepinst_divrem_concrete_sdiv :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SDiv TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 249)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 249)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (3)),
+          nextValueId := 3 }) := rfl
+
+theorem stepinst_divrem_concrete_urem :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.URem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (1)),
+          nextValueId := 3 }) := rfl
+
+theorem stepinst_divrem_concrete_srem :
+    TrustIr.Sem.run
+      (TrustIr.stepInst
+        (TrustIr.Inst.BinOp TrustIr.BinOp.SRem TrustIr.Ty.I8
+          (TrustIr.ValueId.mk 0) (TrustIr.ValueId.mk 1)))
+      { TrustIr.MachineState.empty with
+          locals :=
+            (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+              (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254),
+          nextValueId := 2 } =
+    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      { TrustIr.MachineState.empty with
+          locals :=
+            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 7)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 254)).set
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 (1)),
+          nextValueId := 3 }) := rfl
+"#;
+
 /// Un-bridged stepInst-BinOp ops, reported honestly (never faked): `(op,
-/// reason)`. The other 15 `semIntBinOp` ops reachable through this SAME
+/// reason)`. The other 11 `semIntBinOp` ops reachable through this SAME
 /// `stepInst` `.BinOp` arm — bridged at the VALUE level ([`ARMS`]) but not
 /// yet chained through `stepInst` (the technique generalizes directly; not
 /// yet executed for these).
 const STEPINST_BINOP_UNBRIDGED: &[(&str, &str)] = &[(
-    "UDiv/SDiv/URem/SRem/FAdd/FSub/FMul/FDiv/FRem/And/Or/Xor/Shl/LShr/AShr",
-    "these 15 semIntBinOp ops are already bridged at the VALUE level (ARMS); the \
-     stepInst chain+connect technique demonstrated for Add/Sub/Mul generalizes \
+    "FAdd/FSub/FMul/FDiv/FRem/And/Or/Xor/Shl/LShr/AShr",
+    "these 11 semIntBinOp ops are already bridged at the VALUE level (ARMS); the \
+     stepInst chain+connect transport used by the seven integer arithmetic arms generalizes \
      directly (reuse the corresponding bridge_* arm) but has not yet been executed \
      for them — named as concrete next work, not faked",
 )];
@@ -2755,10 +3372,10 @@ const STEPINST_UNOP_UNBRIDGED: &[(&str, &str)] = &[(
 )];
 
 /// stepInst-Overflow: unsigned `.Overflow AddOverflow` — `semOverflow` binds
-/// ONE fresh `ValueId` to `Value.aggregate [Value.int w result, Value.bool
-/// flag]` (the checked-arithmetic pair, packed as a single aggregate value —
-/// see the module-level "EXTENSION 9" doc for what this honestly means for
-/// the instruction-level result). The connect composes with the
+/// TWO fresh SSA values in order: the integer result, then the boolean flag.
+/// `InstrResult.values` carries both identities and the allocation cursor
+/// advances twice, matching TrustIR WS2.24 and the Rust interpreter.
+/// The connect composes with the
 /// ALREADY-PROVEN `bridge_overflow_uadd_flag` (EXTENSION 2's FULL-pair FLAG
 /// arm, itself UNCONDITIONAL — no side condition), so this connect is
 /// unconditional too.
@@ -2775,14 +3392,15 @@ const STEPINST_OVERFLOW_CHAIN_SRC: &str = r#"theorem stepinst_overflow_add_unsig
           nextValueId := 2 } =
     (match TrustIr.semOverflowOp TrustIr.OverflowOp.AddOverflow 8 false v_l v_r with
       | .ok p =>
-        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+        Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
           { TrustIr.MachineState.empty with
               locals :=
-                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0)
+                      (TrustIr.Value.int 8 v_l)).set
                     (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                  (TrustIr.ValueId.mk 2)
-                  (TrustIr.Value.aggregate [TrustIr.Value.int 8 p.1, TrustIr.Value.bool p.2]),
-              nextValueId := 3 })
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 p.1)).set
+                  (TrustIr.ValueId.mk 3) (TrustIr.Value.bool p.2),
+              nextValueId := 4 })
       | .error e => Except.error e) := rfl
 "#;
 const STEPINST_OVERFLOW_CONNECT_THEOREM: &str = "bridge_stepInst_overflow_add_unsigned";
@@ -2796,19 +3414,19 @@ const STEPINST_OVERFLOW_CONNECT_SRC: &str = r#"theorem bridge_stepInst_overflow_
             (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
               (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
           nextValueId := 2 } =
-    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+    Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
       { TrustIr.MachineState.empty with
           locals :=
-            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+            (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0)
+                  (TrustIr.Value.int 8 v_l)).set
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-              (TrustIr.ValueId.mk 2)
-              (TrustIr.Value.aggregate [TrustIr.Value.int 8
-                  ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
-                TrustIr.Value.bool
-                  (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
-                      (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
-                    @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
-          nextValueId := 3 }) :=
+              (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8
+                    ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))))).set
+              (TrustIr.ValueId.mk 3) (TrustIr.Value.bool
+                    (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
+                        (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
+                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))),
+          nextValueId := 4 }) :=
   by
     rw [stepinst_overflow_add_unsigned_chain v_l v_r, bridge_overflow_uadd_flag 8 v_l v_r]
 "#;
@@ -2825,19 +3443,19 @@ const STEPINST_OVERFLOW_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_overflow
               (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
             nextValueId := 2 } =
-      Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
         { TrustIr.MachineState.empty with
             locals :=
-              ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0)
+                    (TrustIr.Value.int 8 v_l)).set
                   (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                (TrustIr.ValueId.mk 2)
-                (TrustIr.Value.aggregate [TrustIr.Value.int 8
-                    ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
-                  TrustIr.Value.bool
-                    (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
-                        (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
-                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
-            nextValueId := 3 }) :=
+                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8
+                      ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))))).set
+                (TrustIr.ValueId.mk 3) (TrustIr.Value.bool
+                      (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
+                          (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
+                        @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))),
+            nextValueId := 4 }) :=
   bridge_stepInst_overflow_add_unsigned
 "#;
 
@@ -2857,14 +3475,14 @@ const STEPINST_OVERFLOW_FORGERY_PROBES: &[(&str, &str)] = &[
           nextValueId := 2 } =
     (match TrustIr.semOverflowOp TrustIr.OverflowOp.SubOverflow 8 false v_l v_r with
       | .ok p =>
-        Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+        Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
           { TrustIr.MachineState.empty with
               locals :=
-                ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+                (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
                     (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
-                  (TrustIr.ValueId.mk 2)
-                  (TrustIr.Value.aggregate [TrustIr.Value.int 8 p.1, TrustIr.Value.bool p.2]),
-              nextValueId := 3 })
+                  (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 p.1)).set
+                  (TrustIr.ValueId.mk 3) (TrustIr.Value.bool p.2),
+              nextValueId := 4 })
       | .error e => Except.error e) := rfl
 "#,
     ),
@@ -2880,18 +3498,19 @@ const STEPINST_OVERFLOW_FORGERY_PROBES: &[(&str, &str)] = &[
             (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
               (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
           nextValueId := 2 } =
-    Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+    Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
       { TrustIr.MachineState.empty with
           locals :=
-            ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+            (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
               (TrustIr.ValueId.mk 2)
-              (TrustIr.Value.aggregate [TrustIr.Value.int 8
-                  ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
-                TrustIr.Value.bool
+              (TrustIr.Value.int 8
+                  ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))))).set
+              (TrustIr.ValueId.mk 3)
+              (TrustIr.Value.bool
                   (Decidable.decide (v_l + v_r ≥ (2:Int)^(8-1)) ||
-                    Decidable.decide (v_l + v_r < 0))]),
-          nextValueId := 3 }) := rfl
+                    Decidable.decide (v_l + v_r < 0))),
+          nextValueId := 4 }) := rfl
 "#,
     ),
 ];
@@ -2901,9 +3520,8 @@ const STEPINST_OVERFLOW_FORGERY_PROBES: &[(&str, &str)] = &[
 /// `(combo, reason)`.
 const STEPINST_OVERFLOW_UNBRIDGED: &[(&str, &str)] = &[(
     "SubOverflow[u]/MulOverflow[u]/AddOverflow[s]/SubOverflow[s]/MulOverflow[s]",
-    "all 5 are already bridged at the VALUE level (OVERFLOW_VALUE_ARMS) and 4 of the 5 \
-     additionally at the FLAG level (OVERFLOW_FLAG_ARMS; unsigned-Mul's flag is itself \
-     un-bridged, see OVERFLOW_FLAG_UNBRIDGED); the stepInst chain+connect technique \
+    "all 5 are already bridged at both VALUE and FLAG levels \
+     (OVERFLOW_VALUE_ARMS / OVERFLOW_FLAG_ARMS); the stepInst chain+connect technique \
      demonstrated for unsigned-AddOverflow generalizes directly but has not yet been \
      executed for them",
 )];
@@ -3201,19 +3819,20 @@ const STEPINST_CATEGORIES_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_catego
               (TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
                 (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r),
             nextValueId := 2 } =
-      Except.ok (TrustIr.InstrResult.value (some (TrustIr.ValueId.mk 2)),
+      Except.ok (TrustIr.InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3],
         { TrustIr.MachineState.empty with
             locals :=
-              ((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
+              (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 v_l)).set
                   (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 v_r)).set
                 (TrustIr.ValueId.mk 2)
-                (TrustIr.Value.aggregate [TrustIr.Value.int 8
-                    ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))),
-                  TrustIr.Value.bool
+                (TrustIr.Value.int 8
+                    ((((v_l + v_r) % ((2:Int)^8) + (2:Int)^8) % ((2:Int)^8))))).set
+                (TrustIr.ValueId.mk 3)
+                (TrustIr.Value.bool
                     (@Decidable.decide (((2:Int)^8 - 1) < (v_l + v_r))
                         (Int.decLt ((2:Int)^8 - 1) (v_l + v_r)) ||
-                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))]),
-            nextValueId := 3 }))
+                      @Decidable.decide (v_l + v_r < 0) (Int.decLt (v_l + v_r) 0))),
+            nextValueId := 4 }))
   ∧ (∀ (v_l v_r : Int),
       TrustIr.Sem.run
         (TrustIr.stepInst
@@ -3297,6 +3916,9 @@ const STEPINST_CATEGORIES_COMPOSED_SRC: &str = r#"theorem bridge_stepInst_catego
 //     three-layer tie: imported Lean `stepN`/`stepBlock` ≡ imported Lean
 //     `stepInst` (via the outer-chain's own LHS-matching factoring) ≡
 //     Clean's whole-body denotation — composed, not independently reproven.
+//     A closing `rfl` evaluates the remaining `Except.bind` of the `.ok`
+//     step result into the `Return` continuation: Clean's `rw`, like Lean's,
+//     closes a goal only by REDUCIBLE `rfl`.
 //
 // Both theorems were checked against a REAL Lean 4.8.0 toolchain AND against
 // clean's own elaborator (machine-imported vendored oleans) before being
@@ -3389,6 +4011,7 @@ const STEPBLOCK_ARMS: &[StepBlockArmSpec] = &[StepBlockArmSpec {
           nextValueId := 3 }) :=
   by
     rw [stepblock_add_return_outer_chain v_l v_r, bridge_stepInst_binop_add v_l v_r h0 h1]
+    rfl
 "#,
 }];
 
@@ -3533,8 +4156,8 @@ def branchCfg : TrustIr.CFG := fun bb =>
   | 1 => some branchBlockThen
   | 2 => some branchBlockElse
   | _ => none
-theorem bool_rec_true (e t : Int) : (Bool.rec (fun _ => Int) e t true : Int) = t := rfl
-theorem bool_rec_false (e t : Int) : (Bool.rec (fun _ => Int) e t false : Int) = e := rfl
+theorem bool_rec_true (e t : Int) : (@Bool.rec (fun _ => Int) e t true : Int) = t := rfl
+theorem bool_rec_false (e t : Int) : (@Bool.rec (fun _ => Int) e t false : Int) = e := rfl
 "#;
 
 /// One stepN-branch agreement arm: `(guard label, chain theorem, chain src,
@@ -3558,7 +4181,7 @@ const STEPBRANCH_ARMS: &[StepBranchArmSpec] = &[
         [TrustIr.Value.bool true, TrustIr.Value.int 8 a, TrustIr.Value.int 8 b])
       TrustIr.MachineState.empty
     =
-    Except.ok ([TrustIr.Value.int 8 (Bool.rec (fun _ => Int) b a true)],
+    Except.ok ([TrustIr.Value.int 8 (@Bool.rec (fun _ => Int) b a true)],
       { TrustIr.MachineState.empty with
           locals :=
             (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.bool true)).set
@@ -3595,7 +4218,7 @@ const STEPBRANCH_ARMS: &[StepBranchArmSpec] = &[
         [TrustIr.Value.bool false, TrustIr.Value.int 8 a, TrustIr.Value.int 8 b])
       TrustIr.MachineState.empty
     =
-    Except.ok ([TrustIr.Value.int 8 (Bool.rec (fun _ => Int) b a false)],
+    Except.ok ([TrustIr.Value.int 8 (@Bool.rec (fun _ => Int) b a false)],
       { TrustIr.MachineState.empty with
           locals :=
             (((TrustIr.ValueMap.empty.set (TrustIr.ValueId.mk 0) (TrustIr.Value.bool false)).set
@@ -4355,7 +4978,8 @@ const STEPLOOP_UNBRIDGED: &[(&str, &str)] = &[
 // state by name, never re-inlining earlier history, and mirroring the TRUE
 // reduct exactly — including the bindFresh+bindResultDests DOUBLE `.set`
 // when the fresh id coincides with the pinned dest (visits 1-2) and the
-// separate fresh-id/pinned-id sets when it does not (visits 3-5).
+// separate fresh-id/pinned-id sets followed by retirement of the private
+// fresh id when it does not (visits 3-5), matching bindInstrResultDests.
 //
 // THE COMPOSITION WALL (measured 2026-07-07, three independent kills at the
 // 12GB watchdog ceiling): composing the 6 proven visit lemmas into the
@@ -4460,29 +5084,35 @@ def dloopState2 : TrustIr.MachineState :=
 def dloopState3 : TrustIr.MachineState :=
   { dloopState2 with
       locals :=
-        ((((dloopState2.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 1)).set
-            (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
-            (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
-            (TrustIr.ValueId.mk 5) (TrustIr.Value.bool true)).set
-            (TrustIr.ValueId.mk 3) (TrustIr.Value.bool true),
+        let afterResult :=
+            ((((dloopState2.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 1)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
+                (TrustIr.ValueId.mk 5) (TrustIr.Value.bool true)).set
+                (TrustIr.ValueId.mk 3) (TrustIr.Value.bool true)
+        fun id => if @BEq.beq TrustIr.ValueId (@instBEqOfDecidableEq TrustIr.ValueId TrustIr.instDecidableEqValueId) id (TrustIr.ValueId.mk 5) then none else afterResult id,
       nextValueId := 6 }
 def dloopState4 : TrustIr.MachineState :=
   { dloopState3 with
       locals :=
-        ((((dloopState3.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 1)).set
-            (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
-            (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
-            (TrustIr.ValueId.mk 6) (TrustIr.Value.int 8 2)).set
-            (TrustIr.ValueId.mk 4) (TrustIr.Value.int 8 2),
+        let afterResult :=
+            ((((dloopState3.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 1)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
+                (TrustIr.ValueId.mk 6) (TrustIr.Value.int 8 2)).set
+                (TrustIr.ValueId.mk 4) (TrustIr.Value.int 8 2)
+        fun id => if @BEq.beq TrustIr.ValueId (@instBEqOfDecidableEq TrustIr.ValueId TrustIr.instDecidableEqValueId) id (TrustIr.ValueId.mk 6) then none else afterResult id,
       nextValueId := 7 }
 def dloopState5 : TrustIr.MachineState :=
   { dloopState4 with
       locals :=
-        ((((dloopState4.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 2)).set
-            (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
-            (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
-            (TrustIr.ValueId.mk 7) (TrustIr.Value.bool false)).set
-            (TrustIr.ValueId.mk 3) (TrustIr.Value.bool false),
+        let afterResult :=
+            ((((dloopState4.locals.set (TrustIr.ValueId.mk 0) (TrustIr.Value.int 8 2)).set
+                (TrustIr.ValueId.mk 1) (TrustIr.Value.int 8 2)).set
+                (TrustIr.ValueId.mk 2) (TrustIr.Value.int 8 1)).set
+                (TrustIr.ValueId.mk 7) (TrustIr.Value.bool false)).set
+                (TrustIr.ValueId.mk 3) (TrustIr.Value.bool false)
+        fun id => if @BEq.beq TrustIr.ValueId (@instBEqOfDecidableEq TrustIr.ValueId TrustIr.instDecidableEqValueId) id (TrustIr.ValueId.mk 7) then none else afterResult id,
       nextValueId := 8 }
 def dloopState6 : TrustIr.MachineState :=
   { dloopState5 with
@@ -4774,7 +5404,7 @@ const DATALOOP_FORGERY_PROBES: &[(&str, &str)] = &[
 
 /// Fail-closed gate failures. An `Err` means the gate REFUSED to certify —
 /// missing/tampered/stale artifacts, broken import, axiom residue, or an
-/// accepted forgery. (An arm that merely fails to prove is NOT an `Err`; it
+/// accepted or unqualified forgery probe. (An arm that merely fails to prove is NOT an `Err`; it
 /// is reported in [`BridgeAgreement::ops_pinned`].)
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeGateError {
@@ -4808,6 +5438,8 @@ pub enum BridgeGateError {
     DirtyLeanSources { status: String },
     #[error("olean import failed: {detail}")]
     Import { detail: String },
+    #[error("source-bound runtime disclosure refused: {detail}")]
+    RuntimeBoundary { detail: String },
     #[error("loaded module {module} maps to {rel}, which is not listed in any manifest")]
     UnmanifestedModule { module: String, rel: String },
     #[error("manifested olean {rel} was never loaded by the {root} closure (vendored-set drift)")]
@@ -4825,6 +5457,8 @@ pub enum BridgeGateError {
     AxiomResidue { name: String, deps: String },
     #[error("FORGERY PROBE ACCEPTED ({probe}): the bridge accepted a wrong claim — soundness bug")]
     ForgeryAccepted { probe: String },
+    #[error("forgery probe {probe} did not establish a semantic refutation (budget exhausted: {incomplete}): {detail}")]
+    ForgeryUnqualified { probe: String, incomplete: bool, detail: String },
     #[error(
         "M4 generated family {family:?} REFUSED by the static envelope checker (plan time, \
          before any Lean was emitted or loaded): {detail}"
@@ -4839,6 +5473,37 @@ pub enum BridgeGateError {
          which is the exact thing the manifest exists to prevent."
     )]
     PlatformNotVendored { manifest: PathBuf, available: String, wanted: String },
+    #[error(
+        "vendored oleans for {triple} in {manifest} were built from trust-ir {built_from} but \
+         the manifest's trustir_commit is {manifest_commit}: this platform's bytes were CARRIED \
+         FORWARD, not rebuilt, so replaying them under {manifest_commit}'s name would state a \
+         false provenance. Rebuild on {triple} with scripts/regen-trustir-oleans.sh --write."
+    )]
+    PlatformStale { manifest: PathBuf, triple: String, built_from: String, manifest_commit: String },
+    #[error(
+        "TIMEOUT: bridge gate step {steps_begun} ({step}) did not finish within its \
+         {budget_secs}s wall-clock step budget. This is neither a proof nor a refutation: the \
+         gate did not complete, so NO Lean↔Clean agreement is claimed"
+    )]
+    BudgetExceeded { budget_secs: u64, step: String, steps_begun: u64 },
+    #[error(
+        "the budgeted bridge gate could not run its bounded worker ({detail}); running it \
+         unbounded instead would silently drop the --budget-secs bound, so NO Lean↔Clean \
+         agreement is claimed"
+    )]
+    BudgetWorkerUnavailable { detail: String },
+}
+
+impl BridgeGateError {
+    /// Whether the gate stopped WITHOUT a verdict — its wall-clock budget ran
+    /// out ([`Self::BudgetExceeded`], a TIMEOUT), its worker could not run, or
+    /// a required forgery probe did not establish a semantic refutation.
+    /// Nothing is claimed; this distinguishes an unknown from a rejection.
+    #[must_use]
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self, Self::BudgetExceeded { .. } | Self::BudgetWorkerUnavailable { .. }
+            | Self::ForgeryUnqualified { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4857,12 +5522,20 @@ struct ManifestDoc {
     /// tree, which is why it defaults rather than being required.
     #[serde(default)]
     platforms: BTreeMap<String, ManifestPlatform>,
+    #[serde(default)]
+    source_reuse: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManifestPlatform {
     #[serde(default)]
     files: BTreeMap<String, String>,
+    /// The trust-ir revision THIS platform's bytes were built from. A
+    /// regeneration on one platform carries every other platform's bytes
+    /// forward unchanged, so this can lag `[provenance] trustir_commit`; the
+    /// gate refuses such a platform rather than replay it under the newer name.
+    #[serde(default)]
+    built_from_trustir_commit: Option<String>,
     // (lean_version / built_on are recorded per platform for humans; the gate
     // does not read them.)
 }
@@ -4907,8 +5580,13 @@ struct VerifiedTree {
     /// with no platform-specific files.
     platform_dir: PathBuf,
     files: BTreeSet<String>,
+    // Typed logical module -> the exact physical file selected by this host.
+    selected: BTreeMap<Name, manifest_inputs::SelectedModule>,
     trustir_commit: Option<String>,
     lean_toolchain: String,
+    source_reuse: bool,
+    /// Complete bytes actually parsed above; includes the optional reuse record.
+    manifest_sha256: String,
 }
 
 impl VerifiedTree {
@@ -4930,6 +5608,8 @@ fn verify_manifest(
     expected_schema: &str,
     require_commit: bool,
 ) -> Result<VerifiedTree, BridgeGateError> {
+    let root = manifest_inputs::canonical_root(dir)?;
+    let dir = root.as_path();
     let manifest_path = dir.join("MANIFEST.toml");
     let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
         BridgeGateError::ManifestUnreadable { path: manifest_path.clone(), detail: e.to_string() }
@@ -4964,15 +5644,46 @@ fn verify_manifest(
         });
     }
 
+    // The host platform's bytes must have been BUILT from the manifest's
+    // trust-ir revision. A platform table that does not say what it was built
+    // from is refused too when a commit is required: absent provenance cannot
+    // be told apart from carried-forward bytes.
+    if let (Some(platform), Some(manifest_commit)) = (mine, &doc.provenance.trustir_commit) {
+        match &platform.built_from_trustir_commit {
+            Some(built_from) if built_from == manifest_commit => {}
+            Some(built_from) => {
+                return Err(BridgeGateError::PlatformStale {
+                    manifest: manifest_path,
+                    triple,
+                    built_from: built_from.clone(),
+                    manifest_commit: manifest_commit.clone(),
+                });
+            }
+            None if require_commit => {
+                return Err(BridgeGateError::ManifestProvenance {
+                    path: manifest_path,
+                    field: format!("platforms.\"{triple}\".built_from_trustir_commit"),
+                });
+            }
+            None => {}
+        }
+    }
+
     let mut files = BTreeSet::new();
+    let mut selected = BTreeMap::new();
     let shared = doc.files.iter().map(|(r, s)| (r, s, false));
     let specific = mine.into_iter().flat_map(|p| p.files.iter().map(|(r, s)| (r, s, true)));
     for (rel, expected_sha, is_platform) in shared.chain(specific) {
+        let module = manifest_inputs::module_key(rel)?;
         // A platform-specific artifact lives under platform/<triple>/, so that
         // two platforms can vendor the same logical module without one
         // overwriting the other at a shared path.
         let full =
             if is_platform { dir.join("platform").join(&triple).join(rel) } else { dir.join(rel) };
+        if std::fs::symlink_metadata(&full).is_err() {
+            return Err(BridgeGateError::OleanMissing { rel:rel.clone(),manifest:manifest_path.clone() });
+        }
+        let selection = manifest_inputs::select(dir, full.clone(), expected_sha)?;
         let actual = sha256_file(&full).map_err(|_| BridgeGateError::OleanMissing {
             rel: rel.clone(),
             manifest: manifest_path.clone(),
@@ -4987,13 +5698,19 @@ fn verify_manifest(
         // Keyed by LOGICAL module path in both cases — callers look modules up
         // by name and must not have to know which platform provided the bytes.
         files.insert(rel.clone());
+        // Declared platform overrides intentionally win over the shared row.
+        selected.insert(module, selection);
     }
+    manifest_inputs::require_unambiguous_paths(&selected)?;
     Ok(VerifiedTree {
         dir: dir.to_path_buf(),
         platform_dir: dir.join("platform").join(&triple),
         files,
+        selected,
         trustir_commit: doc.provenance.trustir_commit,
         lean_toolchain: doc.provenance.lean_toolchain,
+        source_reuse: doc.source_reuse.is_some(),
+        manifest_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
     })
 }
 
@@ -5071,14 +5788,393 @@ fn check_lean_sources_clean(repo_root: &Path) -> Result<(), BridgeGateError> {
 /// clean-elab / clean-kernel keep GLOBAL counters (sorry, kernel-check
 /// failures) that are not reentrant; serialize bridge elaboration exactly as
 /// clean's own check pipeline does.
+///
+/// # This lock is why a stalled bridge test names the wrong test
+///
+/// The lock is held for the WHOLE parse+elaborate+kernel-recheck of a source
+/// fragment, and several `#[test]`s in this module call
+/// [`load_bridge_source`]; libtest runs them concurrently and names each OS
+/// thread after its test. So `sample <pid>` on a slow run prints a fat,
+/// *idle* stack under the name of whichever test is BLOCKED in
+/// `__psynch_mutexwait`, while the kernel frames in the same sample belong to
+/// the other thread — the one actually holding this lock. Measured
+/// 2026-09-19: `imported_int_order_instances_preserve_relations` takes 3.7 s
+/// alone, 53.8 s beside its module, 205 s in the full suite, and 3265 of 3265
+/// samples of that delta are lock wait, not work. Read the OWNER of the lock
+/// before attributing time to a test name.
 fn elab_lock() -> &'static Mutex<()> {
     static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Ambient per-declaration kernel budget armed around every bridge
+/// declaration (see [`load_bridge_source`]).
+///
+/// # Why a bound is needed here at all
+///
+/// clean-kernel's own guards do not bound a bridge declaration:
+///
+/// * `TypeChecker::set_heartbeat_limit` bounds ONE checker, and the tactic
+///   engine, the unifier, instance resolution and `add_decl` each mint their
+///   own at `DEFAULT_HEARTBEAT_LIMIT`; a declaration that keeps minting
+///   checkers runs forever while no heartbeat is ever exceeded. That is the
+///   hole `clean_kernel::tc::decl_budget` exists to close, and it is DISABLED
+///   by default (limit `0` = unlimited) on every thread.
+/// * `MAX_LAZY_DELTA_ITERATIONS = 10_000` in
+///   `clean-kernel/src/tc/def_eq/delta.rs` counts iterations of ONE
+///   `lazy_delta_reduction` call. The structure-eta path re-enters
+///   `is_def_eq_impl`, which starts a fresh delta loop with a fresh counter,
+///   so on a mutually recursive defeq query the cap never binds — measured
+///   60 289 nested `is_def_eq_inner` frames on `bridge_cast_zext`
+///   (`docs/issues/2026-09-19-clean-defeq-structure-eta-escapes-delta-cap.md`).
+///
+/// This ambient counter is thread-local and every checker on the thread draws
+/// from the same pot, so it bounds the DECLARATION rather than a step.
+///
+/// # How this number was chosen (measured 2026-09-19 at 86fdb2ff19)
+///
+/// Armed at `u64::MAX` — counted, unreachable — over the whole
+/// `trustir_bridge::` module, single threaded, debug build, on a 14-core
+/// arm64 box. Peak ticks spent by any ONE bridge declaration: **13 714 632**,
+/// spent by one of the two `:= rfl` cast arms (`bridge_cast_zext` 107.4 s,
+/// `bridge_cast_sext` 95.3 s); every other declaration in the corpus is
+/// orders of magnitude cheaper — `bridge_cast_trunc` 8.8 s, the 17 notation
+/// instances 0.22 s together. This constant clears that peak by ~4.7x.
+///
+/// The counter is deterministic — the same input spends the same ticks on any
+/// machine at any load — so the headroom is for a bridge corpus that GROWS,
+/// not for a slow box. At the measured tick rate (~10^5/s on the pathological
+/// arms) this bounds one runaway declaration at roughly 10 minutes of wall
+/// clock.
+///
+/// Re-measure by setting this to `u64::MAX` and reading
+/// [`bridge_peak_decl_ticks`], which the deadlined bridge tests print on
+/// every run: it is the calibration instrument, not a knob.
+///
+/// # What it does and does not bound
+///
+/// Exhaustion is neither a pass nor a refutation: clean-kernel raises its own
+/// `TypeError::DeclarationBudgetExhausted`, and [`load_bridge_source`] turns
+/// it into a named per-declaration ERROR. A resource bound can only refuse a
+/// declaration, never accept one, so this is TCB-neutral. It does NOT bound a
+/// pathology whose cost is per-tick ALLOCATION SIZE rather than tick count —
+/// `clean-kernel/src/tc/decl_budget.rs` is explicit about that, and it is why
+/// the heavy bridge tests also carry a wall-clock deadline
+/// ([`run_with_bridge_deadline`]).
+const BRIDGE_DECL_BUDGET: u64 = 64_000_000;
+
+/// Peak ambient ticks any single bridge declaration has spent in this
+/// process — the calibration reading behind [`BRIDGE_DECL_BUDGET`].
+static BRIDGE_PEAK_DECL_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The peak ambient tick count observed by [`load_bridge_source`] so far.
+///
+/// Public because it is the calibration instrument for
+/// [`BRIDGE_DECL_BUDGET`]: re-measure by raising that constant to `u64::MAX`
+/// (counted, unreachable), running the bridge corpus, and reading this.
+#[must_use]
+pub fn bridge_peak_decl_ticks() -> u64 {
+    BRIDGE_PEAK_DECL_TICKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The bridge declaration currently being elaborated, for the deadline
+/// diagnosis: a wall-clock timeout must be able to NAME what did not finish,
+/// and the elaborating thread cannot report that about itself.
+fn bridge_decl_in_flight() -> &'static Mutex<String> {
+    static IN_FLIGHT: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new("(no bridge declaration started)".to_owned()))
+}
+
+/// The declaration [`load_bridge_source`] most recently began, as a label.
+///
+/// Public so an out-of-process or integration-level watchdog can name what
+/// did not finish; the elaborating thread cannot report that about itself.
+#[must_use]
+pub fn bridge_decl_in_flight_label() -> String {
+    bridge_decl_in_flight()
+        .lock()
+        .map_or_else(|poisoned| poisoned.into_inner().clone(), |guard| guard.clone())
+}
+
+/// Surface name of a parsed declaration, before elaboration can report one.
+fn bridge_decl_label(decl: &clean_parser::SurfaceDecl) -> String {
+    use clean_parser::SurfaceDecl;
+    fn spelled(name: &clean_parser::SurfaceName) -> String {
+        name.source_spelling().unwrap_or_else(|| format!("{:?}", name.name()))
+    }
+    match decl {
+        SurfaceDecl::Def { name, .. }
+        | SurfaceDecl::Theorem { name, .. }
+        | SurfaceDecl::Axiom { name, .. }
+        | SurfaceDecl::Opaque { name, .. }
+        | SurfaceDecl::Inductive { name, .. }
+        | SurfaceDecl::Structure { name, .. } => spelled(name),
+        SurfaceDecl::Instance { name, .. } => {
+            name.as_ref().map_or_else(|| "(anonymous instance)".to_owned(), spelled)
+        }
+        _ => "(unnamed declaration)".to_owned(),
+    }
+}
+
+/// Arms the ambient per-declaration budget for the current thread and
+/// disarms it on drop.
+///
+/// The budget is thread-local and latching, so leaving it armed would apply
+/// this crate's limit to unrelated later work on the same libtest thread.
+/// Restores the previous LIMIT; nothing in trust-clean arms an outer budget,
+/// so the previous limit is `0` (disabled) at every call site today — a
+/// future nested caller would find its own declaration refilled rather than
+/// resumed, which is why this is a scope guard and not a bare pair of calls.
+struct BridgeDeclBudgetScope {
+    previous_limit: u64,
+}
+
+impl BridgeDeclBudgetScope {
+    fn enter(limit: u64) -> Self {
+        let previous_limit = clean_kernel::tc::declaration_budget_limit();
+        clean_kernel::tc::set_declaration_budget(limit);
+        Self { previous_limit }
+    }
+}
+
+impl Drop for BridgeDeclBudgetScope {
+    fn drop(&mut self) {
+        clean_kernel::tc::set_declaration_budget(self.previous_limit);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The per-step WALL-CLOCK budget of a budgeted gate run
+// ---------------------------------------------------------------------------
+
+/// Where one budgeted gate run stands: which step it is in and when that step
+/// began. Shared between the gate's worker thread (which advances it) and the
+/// watchdog on the calling thread (which reads it).
+struct BridgeStepState {
+    /// Steps begun so far (the gate's prologue is step 1).
+    index: u64,
+    /// When the CURRENT step began.
+    started: Instant,
+    /// What the current step is doing, so a timeout NAMES what did not finish.
+    label: String,
+    /// The slowest step completed so far, for `TRUST_PROVE_TIMING`.
+    peak: (std::time::Duration, String),
+}
+
+/// The step clock of one budgeted gate run (see [`run_bridge_gate_with_step_budget`]).
+struct BridgeStepClock {
+    state: Mutex<BridgeStepState>,
+    /// Print each completed step's wall time to stderr (`TRUST_PROVE_TIMING`,
+    /// the prove driver's existing localization switch). Diagnostics only: it
+    /// never changes which step runs or what it proves.
+    timing: bool,
+}
+
+impl BridgeStepClock {
+    fn new(label: &str) -> Self {
+        Self {
+            state: Mutex::new(BridgeStepState {
+                index: 1,
+                started: Instant::now(),
+                label: label.to_owned(),
+                peak: (std::time::Duration::ZERO, String::new()),
+            }),
+            timing: std::env::var_os("TRUST_PROVE_TIMING").is_some(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BridgeStepState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin(&self, label: String) {
+        let mut state = self.lock();
+        let now = Instant::now();
+        let spent = now.duration_since(state.started);
+        if self.timing {
+            eprintln!("  [bridge-gate step {:>4}] {:>10.2?}  {}", state.index, spent, state.label);
+        }
+        if spent > state.peak.0 {
+            let finished = std::mem::replace(&mut state.label, label);
+            state.peak = (spent, finished);
+        } else {
+            state.label = label;
+        }
+        state.index += 1;
+        state.started = now;
+    }
+}
+
+thread_local! {
+    /// The step clock of the budgeted gate run executing on THIS thread, if
+    /// any. Thread-local so concurrent gate runs (libtest) never see each
+    /// other's progress: a stalled run cannot be kept alive by a sibling's
+    /// ticks.
+    static BRIDGE_STEP_CLOCK: std::cell::RefCell<Option<std::sync::Arc<BridgeStepClock>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Mark the start of a new unit of gate work. Every unit that can take
+/// noticeable time — each manifest verification, the olean import, the
+/// imported-constant recheck, every elaborated declaration, every axiom-residue
+/// walk — begins with this call, so a budgeted run bounds EACH of them by the
+/// step budget. A no-op (the label is never built) outside a budgeted run.
+fn bridge_gate_step(label: impl FnOnce() -> String) {
+    BRIDGE_STEP_CLOCK.with(|slot| {
+        if let Some(clock) = slot.borrow().as_ref() {
+            clock.begin(label());
+        }
+    });
+}
+
+/// Stack for the budgeted gate's worker. The gate ran on `targo trust
+/// prove`'s 512 MiB main worker before it was budgeted; keep that headroom
+/// (a reservation, not a commitment) so moving it cannot change its depth
+/// behavior.
+const BRIDGE_GATE_WORKER_STACK: usize = 512 * 1024 * 1024;
+
+/// How many per-function budgets (`targo trust prove --budget-secs`) ONE
+/// bridge-gate step may spend.
+///
+/// # Why the gate's unit is not the function's unit
+///
+/// The gate is ~600 steps (measured 2026-09-25, Full mode), nearly all far
+/// cheaper than a function; one is not. The `wrong_threshold` stepInst-Overflow
+/// forgery probe (`bridge_stepInst_overflow_add_unsigned_wrong_threshold`) is
+/// genuinely rejected by the kernel after 108.7 s and 133.5 s in two runs of an
+/// opt-level-2 clean build, and after 129.6 s in a release `targo-trust`, on a
+/// loaded 18-core host (no declaration of the run spent more than 5.4 M ticks,
+/// far inside [`BRIDGE_DECL_BUDGET`] — slow, not runaway); the next slowest
+/// step took 5.8–10.7 s. Bounding each gate step by the bare per-function
+/// default (30 s) would therefore time the default gate out on that probe and
+/// leave every default scorecard without its bridge evidence — a capability
+/// loss, not a bound.
+///
+/// At this scale the default per-function budget gives each gate step 600 s,
+/// ~4.5x that peak (the same calibration discipline as `BRIDGE_DECL_BUDGET`),
+/// while an explicit tight budget still stops a gate step promptly
+/// (`--budget-secs=1` gives each step 20 s). Re-measure with
+/// `TRUST_PROVE_TIMING=1`, which prints every step's wall time, before
+/// changing it: it is a calibration, not a knob.
+pub const BRIDGE_STEP_BUDGET_SCALE: u64 = 20;
+
+/// [`run_bridge_gate`] under a per-step WALL-CLOCK budget of
+/// `step_budget_secs` seconds — how `targo trust prove --budget-secs` bounds
+/// the bridge gate.
+///
+/// `targo trust prove` gives each function in the dump population
+/// `--budget-secs` of wall clock; it gives each unit of bridge-gate work (see
+/// [`bridge_gate_step`]) [`BRIDGE_STEP_BUDGET_SCALE`] times that. The gate is
+/// ~600 such units, so the bound is per unit, exactly as it is per function: a
+/// unit that exceeds it ends the run with [`BridgeGateError::BudgetExceeded`]
+/// naming the unit. That outcome is a TIMEOUT — neither proved nor refuted —
+/// and attaches NO agreement: it can only withhold the bridge claim, never
+/// mint one. Without this, `prove --budget-secs=1` waited on the whole
+/// unbudgeted gate (measured 2026-09-25: 116 s in a release build, and more
+/// than 8 minutes, unfinished, in a debug build, both on a loaded 18-core
+/// host).
+///
+/// `step_budget_secs == 0` runs the gate inline with no wall-clock bound, as
+/// `prove_dump_dir_with_budget(_, 0)` does for functions.
+///
+/// Rust cannot stop a running thread, so on a timeout the worker is DETACHED:
+/// it keeps computing, and keeps holding the elaboration lock, until it
+/// finishes or the process exits. A process that timed a gate out should not
+/// run bridge work again; `targo trust prove` exits right after reporting.
+///
+/// # Errors
+///
+/// Every [`run_bridge_gate`] error, plus [`BridgeGateError::BudgetExceeded`]
+/// and [`BridgeGateError::BudgetWorkerUnavailable`]. A panic inside the gate is
+/// re-raised on the calling thread, exactly as the unbudgeted call would raise
+/// it.
+pub fn run_bridge_gate_with_step_budget(
+    config: &BridgeGateConfig,
+    step_budget_secs: u64,
+) -> Result<BridgeAgreement, BridgeGateError> {
+    if step_budget_secs == 0 {
+        return run_bridge_gate(config);
+    }
+    let config = config.clone();
+    run_with_step_budget(step_budget_secs, "bridge gate start", move || run_bridge_gate(&config))?
+}
+
+/// Run `work` on a worker thread, bounding every step it begins (via
+/// [`bridge_gate_step`]) by `step_budget_secs` of wall clock. The first step
+/// begins at spawn, labeled `first_step`.
+fn run_with_step_budget<T: Send + 'static>(
+    step_budget_secs: u64,
+    first_step: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, BridgeGateError> {
+    use std::sync::Arc;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
+    let budget = std::time::Duration::from_secs(step_budget_secs);
+    let clock = Arc::new(BridgeStepClock::new(first_step));
+    let worker_clock = Arc::clone(&clock);
+    let (done_tx, done_rx) = channel();
+    let worker = std::thread::Builder::new()
+        .name("trust-bridge-gate".to_owned())
+        .stack_size(BRIDGE_GATE_WORKER_STACK)
+        .spawn(move || {
+            BRIDGE_STEP_CLOCK.with(|slot| *slot.borrow_mut() = Some(worker_clock));
+            // A send error means the watchdog already timed this run out and
+            // stopped listening: the late result is discarded, never counted.
+            let _ = done_tx.send(work());
+        })
+        .map_err(|error| BridgeGateError::BudgetWorkerUnavailable { detail: error.to_string() })?;
+    loop {
+        let (index, deadline) = {
+            let state = clock.lock();
+            (state.index, state.started + budget)
+        };
+        match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(value) => {
+                // The worker sent its result as its last act; reap it.
+                let _ = worker.join();
+                if clock.timing {
+                    clock.begin("(end)".to_owned());
+                    let state = clock.lock();
+                    eprintln!(
+                        "  [bridge-gate] {} steps; slowest {:.2?} ({}); budget {budget:?} per step",
+                        state.index - 1,
+                        state.peak.0,
+                        state.peak.1
+                    );
+                }
+                return Ok(value);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let state = clock.lock();
+                if state.index != index {
+                    // A new step began while we waited; its own deadline applies.
+                    continue;
+                }
+                return Err(BridgeGateError::BudgetExceeded {
+                    budget_secs: step_budget_secs,
+                    step: state.label.clone(),
+                    steps_begun: state.index,
+                });
+            }
+            // The worker ended without sending: `work` panicked. Surface that
+            // panic here, as the unbudgeted call would have.
+            Err(RecvTimeoutError::Disconnected) => {
+                return match worker.join() {
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    Ok(()) => Err(BridgeGateError::BudgetWorkerUnavailable {
+                        detail: "the gate worker ended without reporting a result".to_owned(),
+                    }),
+                };
+            }
+        }
+    }
+}
+
 fn elab_result_name(result: &clean_elab::ElabResult) -> String {
     use clean_elab::ElabResult;
     match result {
+        ElabResult::Diagnosed { result, .. } => elab_result_name(result),
         ElabResult::Definition { name, .. }
         | ElabResult::Theorem { name, .. }
         | ElabResult::Axiom { name, .. }
@@ -5106,6 +6202,9 @@ fn typecheck_elab_result(
 ) -> Result<(), String> {
     use clean_elab::ElabResult;
     match result {
+        // Source diagnostics do not revoke registration. This mathematical
+        // bridge must still recheck the actual enclosed declaration.
+        ElabResult::Diagnosed { result, .. } => typecheck_elab_result(result, tc, env),
         ElabResult::Skipped | ElabResult::Command(_) | ElabResult::Multiple(_) => Ok(()),
         ElabResult::Failed { name, error, .. } => Err(format!("{name}: {error}")),
         // Trust: `Example` claims its `val` was already kernel-checked against
@@ -5161,9 +6260,37 @@ fn typecheck_elab_result(
 /// environment. Returns the registered declaration names, or the per-decl
 /// failure report. `sorry` is a failure (there is no allow_sorry here: a
 /// bridge theorem with a hole is not a bridge theorem).
+///
+/// Every declaration is bounded by [`BRIDGE_DECL_BUDGET`]; a declaration that
+/// spends it is reported as NOT FINISHED, which is neither a pass nor a
+/// refutation.
 pub(crate) fn load_bridge_source(
     env: &mut Environment,
     source: &str,
+) -> Result<Vec<String>, String> {
+    load_bridge_source_with_budget(env, source, BRIDGE_DECL_BUDGET)
+}
+
+/// [`load_bridge_source`] with the per-declaration budget spelled out, so the
+/// bound itself can be tested: a test passes a deliberately tiny budget and
+/// asserts the refusal is a NAMED non-convergence report rather than a pass.
+fn load_bridge_source_with_budget(
+    env: &mut Environment,
+    source: &str,
+    budget: u64,
+) -> Result<Vec<String>, String> {
+    load_bridge_source_with_budget_observed(env, source, budget, |_, _| {})
+}
+
+/// Observe the original typed elaboration failure before rendering it. The
+/// observer runs under the same elaboration lock and receives the declaration
+/// budget latch, so tests can distinguish a semantic refutation from an
+/// incomplete check without parsing diagnostics or changing admission.
+fn load_bridge_source_with_budget_observed(
+    env: &mut Environment,
+    source: &str,
+    budget: u64,
+    mut observe_error: impl FnMut(&clean_elab::ElabError, bool),
 ) -> Result<Vec<String>, String> {
     use clean_elab::{
         FileContext, elaborate_decl_and_register_with_warning, kernel_check_failure_count,
@@ -5176,6 +6303,10 @@ pub(crate) fn load_bridge_source(
     reset_sorry_counter();
     clean_elab::register::reset_kernel_check_counter();
 
+    bridge_gate_step(|| {
+        let head = source.trim_start().lines().next().unwrap_or_default();
+        format!("parse bridge source `{}`", head.chars().take(80).collect::<String>())
+    });
     let patterns = clean_elab::tactic::builtins::builtin_tactic_patterns();
     let decls = match parse_file_with_tactics(source, &patterns) {
         Ok(d) => d,
@@ -5185,13 +6316,28 @@ pub(crate) fn load_bridge_source(
     let mut file_ctx = FileContext::new();
     let mut names = Vec::new();
     let mut errors = Vec::new();
+    // Bound each declaration. See `BRIDGE_DECL_BUDGET`: without this, a defeq
+    // query that does not converge is an unbounded hang with no diagnosis,
+    // because every guard clean-kernel arms by default is per-checker or
+    // per-call and this work spans many of both.
+    let _budget = BridgeDeclBudgetScope::enter(budget);
     for decl in &decls {
+        clean_kernel::tc::reset_declaration_budget();
+        let label = bridge_decl_label(decl);
+        bridge_gate_step(|| format!("elaborate + kernel-check `{label}`"));
+        if let Ok(mut in_flight) = bridge_decl_in_flight().lock() {
+            label.clone_into(&mut in_flight);
+        }
         let kernel_failures_before = kernel_check_failure_count();
         let processed = preprocess_decl_with_context(decl, &mut file_ctx);
         match elaborate_decl_and_register_with_warning(env, &processed) {
             Ok(registered) => {
                 let name = elab_result_name(&registered.result);
+                if let Some(error) = registered.result.source_error_message() {
+                    errors.push(format!("{name}: source diagnostics: {error}"));
+                }
                 if name == "(skipped)" {
+                    note_declaration_budget(&label, &mut errors);
                     continue;
                 }
                 let tc = TypeChecker::with_mode(env, env.mode());
@@ -5219,14 +6365,81 @@ pub(crate) fn load_bridge_source(
                     Err(e) => errors.push(format!("{name}: {e}")),
                 }
             }
-            Err(e) => errors.push(format!("(elaboration): {e:?}")),
+            Err(e) => {
+                observe_error(&e, clean_kernel::tc::declaration_budget_exhausted());
+                errors.push(format!("(elaboration): {e:?}"));
+            }
         }
+        note_declaration_budget(&label, &mut errors);
     }
 
     reset_sorry_counter();
     clean_elab::register::reset_kernel_check_counter();
 
     if errors.is_empty() { Ok(names) } else { Err(errors.join(" | ")) }
+}
+
+fn semantic_type_mismatch(error: &clean_elab::ElabError) -> bool {
+    use clean_elab::{ElabError, tactic::TacticError};
+    match error {
+        ElabError::TypeMismatch { .. } | ElabError::ProofTypeMismatch { .. } => true,
+        ElabError::InTactic { source, .. }
+        | ElabError::TacticFailed(TacticError::UpstreamElabError { source }) => {
+            semantic_type_mismatch(source)
+        }
+        ElabError::TacticFailed(TacticError::TypeMismatch { .. }) => true,
+        _ => false,
+    }
+}
+
+/// These fixed probes have checked positive premises and a false proof term.
+/// Missing input, trust debt, or spent budgets cannot count as their refutation.
+fn check_semantic_forgery_with_budget(
+    env: &mut Environment,
+    label: &str,
+    source: &str,
+    budget: u64,
+) -> Result<(), BridgeGateError> {
+    let mut classified = Vec::new();
+    let result = load_bridge_source_with_budget_observed(env, source, budget, |error, incomplete| {
+        classified.push((semantic_type_mismatch(error), incomplete));
+    });
+    match result {
+        Ok(_) => Err(BridgeGateError::ForgeryAccepted { probe: label.to_owned() }),
+        Err(_) if classified == [(true, false)] => Ok(()),
+        Err(detail) => Err(BridgeGateError::ForgeryUnqualified {
+            probe: label.to_owned(),
+            incomplete: classified.iter().any(|(_, incomplete)| *incomplete),
+            detail,
+        }),
+    }
+}
+
+/// Close out one declaration's ambient budget: record its cost, and report
+/// non-convergence as a named error.
+///
+/// Asked AFTER the fact and unconditionally, because the ambient budget
+/// LATCHES: even when the kernel's typed `DeclarationBudgetExhausted` was
+/// swallowed on the way up and the declaration reported an ordinary pass, the
+/// latch still says the work was cut short, and that reading wins over both a
+/// pass and a refutation.
+fn note_declaration_budget(label: &str, errors: &mut Vec<String>) {
+    use std::sync::atomic::Ordering;
+
+    let spent = clean_kernel::tc::declaration_budget_used();
+    BRIDGE_PEAK_DECL_TICKS.fetch_max(spent, Ordering::Relaxed);
+    if clean_kernel::tc::declaration_budget_exhausted() {
+        errors.push(format!(
+            "{label}: DID NOT FINISH — spent the whole per-declaration kernel budget of {} \
+             operations without converging. This is neither proved nor refuted: the \
+             declaration's kernel query did not terminate inside the bound. Either it \
+             diverges (see BRIDGE_DECL_BUDGET and \
+             docs/issues/2026-09-19-clean-defeq-structure-eta-escapes-delta-cap.md), or \
+             the bridge corpus has grown past what that budget was calibrated on — \
+             re-measure with bridge_peak_decl_ticks() before raising it.",
+            clean_kernel::tc::declaration_budget_limit()
+        ));
+    }
 }
 
 /// The non-foundational axiom residue of `name`, rendered for reporting.
@@ -5246,6 +6459,7 @@ pub(crate) fn require_empty_axiom_deps(
     env: &Environment,
     name: &str,
 ) -> Result<(), BridgeGateError> {
+    bridge_gate_step(|| format!("axiom residue of `{name}`"));
     let deps = axiom_deps_str(env, name);
     if deps == "[]" {
         Ok(())
@@ -5282,11 +6496,9 @@ pub enum BridgeGateMode {
     /// all 3 bridged UnOp arms (Neg/Not/FNeg), Neg's connecting corollary,
     /// the 2 UnOp concrete rows, the composed UnOp conjunction, and both
     /// UnOp forgery probes. Also proves all 6 Overflow VALUE arms
-    /// (unsigned/signed × Add/Sub/Mul), all 5 bridged Overflow FLAG arms
-    /// (unsigned-Add [Lemma 2], unsigned-Sub [Lemma 8, guarded],
-    /// signed-Add/Sub/Mul [Lemma 5] — unsigned-Mul's flag is honestly
-    /// un-bridged), the composed Overflow conjunction, and both Overflow
-    /// forgery probes. Also proves all 10 ICmp arms (Eq/Ne/Ult/Ule/Ugt/Uge/
+    /// (unsigned/signed × Add/Sub/Mul), all 6 Overflow FLAG arms, four
+    /// actual unsigned-Mul Int predicate links, the twelve-statement composed
+    /// Overflow conjunction, and five qualified Overflow forgery probes. Also proves all 10 ICmp arms (Eq/Ne/Ult/Ule/Ugt/Uge/
     /// Slt/Sle/Sgt/Sge — each an unconditional rfl agreement), the 4 ICmp
     /// concrete pin rows, the composed ICmp conjunction, and all 3 ICmp
     /// forgery probes. Also proves all 3 Cast arms (Trunc/ZExt/SExt — each
@@ -5365,9 +6577,18 @@ pub struct BridgeAgreement {
     /// (`bridge_semIntBinOp_agreement_all18`) kernel-checked with empty
     /// residue (Full mode only; requires all 18 arms).
     pub composed_all18: bool,
-    /// The trust-ir commit the vendored oleans were built from — verified
-    /// equal to the checked-out submodule (pin drift is a hard failure).
+    /// Original trust-ir producer commit. Reuse never rewrites this origin.
     pub trustir_commit: String,
+    /// Actual selected revision, either identical or checked input-equivalent.
+    #[serde(default)]
+    pub selected_trustir_commit: String,
+    /// Original artifact commit used by the checked source-reuse path.
+    #[serde(default)]
+    pub source_reuse_anchor: Option<String>,
+    /// Open runtime obligations from the selected immutable producer input.
+    /// None means unreported, never zero obligations or runtime certification.
+    #[serde(default)]
+    pub runtime_frontier: Option<RuntimeFrontier>,
     /// The pinned Lean toolchain that built the artifacts.
     pub lean_toolchain: String,
     /// Both manifests verified: schema, provenance, per-file sha256, and
@@ -5378,10 +6599,19 @@ pub struct BridgeAgreement {
     /// Modules / constants machine-imported from the vendored oleans.
     pub modules_loaded: usize,
     pub constants_loaded: usize,
-    /// Full `add_decl`-equivalent kernel recheck of the imported TrustIr
-    /// constants (Full mode; Spot rechecks the bridge-input slice).
+    /// Safe declarations admitted by local type/value replay (Full mode;
+    /// Spot checks the bridge-input slice), under the assumed imported
+    /// environment. Not fresh dependency-closed kernel admission.
     pub trustir_recheck_pass: usize,
+    /// Fatal declaration or census-accounting failures, never runtime refusals.
+    /// A successful gate always reports zero.
     pub trustir_recheck_fail: usize,
+    /// Entire selected declaration roster, including explicitly refused runtime
+    /// implementations. These are not all kernel admissions.
+    pub trustir_recheck_seen: usize,
+    /// Original artifact unsafe/partial declarations explicitly refused by the
+    /// same replay graph. They supply no kernel admission or proof authority.
+    pub trustir_runtime_refused: usize,
     /// Every proven theorem this run had `axiom_deps = ∅`. Always true on
     /// `Ok` (a nonempty residue is a hard failure).
     pub axiom_deps_empty: bool,
@@ -5441,8 +6671,7 @@ pub struct BridgeAgreement {
     /// The proven Overflow VALUE ops, as `op[u]`/`op[s]` (unsigned/signed).
     pub overflow_value_bridged_list: Vec<String>,
     /// Overflow FLAG arms whose `reduces` PIN + `connect` theorem BOTH
-    /// kernel-checked THIS RUN with empty axiom residue (5 = unsigned-Add
-    /// [Lemma 2], unsigned-Sub [Lemma 8], signed-Add/Sub/Mul [Lemma 5] in
+    /// kernel-checked THIS RUN with empty NON-FOUNDATIONAL residue (6 in
     /// Full mode; Spot attempts 1: unsigned AddOverflow).
     pub overflow_flag_bridged: usize,
     /// Overflow FLAG arms attempted but NOT proven — never silently dropped.
@@ -5457,17 +6686,34 @@ pub struct BridgeAgreement {
     /// just unsigned-Sub's Lemma 8 arm, to discharge its vacuous disjunct).
     pub overflow_flag_guarded: usize,
     /// Whether the COMPOSED `bridge_semOverflowOp_agreement_all` conjunction
-    /// (6 VALUE arms ∧ 5 FLAG arms) kernel-checked with empty residue (Full
-    /// mode only; requires all 6 VALUE + all 5 FLAG arms proven).
+    /// (6 VALUE ∧ 6 FLAG statements) checked with empty non-foundational residue.
+    /// Full only; also requires the four actual unsigned-Mul Int predicate links.
     pub overflow_composed: bool,
-    /// Overflow deliberately-wrong claims kernel-REJECTED this run (2 in
-    /// Full mode, 1 in Spot). An accepted forgery is a hard failure.
+    /// Qualified semantic Overflow refusals (5 in Full, 1 in Spot).
+    /// Missing inputs, parser errors and spent budgets cannot count as refutations.
     pub overflow_fail_closed_controls: usize,
     /// Overflow-flag arms Clean intentionally does NOT bridge, honestly
-    /// reported as `"op: reason"` (currently just unsigned MulOverflow — no
-    /// unsigned-multiply-overflow Lemma exists to agree against; its VALUE
-    /// component IS still bridged).
+    /// reported as `"op: reason"` (none for the six generic Int flags).
+    /// This does not grant a BV-equivalence or unregistered-width claim.
     pub overflow_flag_unbridged: Vec<String>,
+    /// Actual canonical production Int predicates registered/checked this run
+    /// (four in Full, none in Spot); this does not bind the separate BV family.
+    #[serde(default)]
+    pub overflow_umul_predicates_bound: Vec<String>,
+    /// Per-width universal flag theorems checked against those actual declarations.
+    #[serde(default)]
+    pub overflow_umul_predicate_bridged: Vec<String>,
+    /// Per-width Int predicate links not proved; never silently dropped.
+    #[serde(default)]
+    pub overflow_umul_predicate_pinned: Vec<String>,
+    /// Actual foundational axiom closure of the proved four predicate links.
+    /// Empty non-foundational residue does not imply this set is empty.
+    #[serde(default)]
+    pub overflow_umul_foundational_axioms: Vec<String>,
+    /// Actual foundational closure consumed by checked overflow statements/prelude.
+    /// Existing canonical foundational policy is unchanged.
+    #[serde(default)]
+    pub overflow_foundational_axioms: Vec<String>,
 
     // -- semICmp (the ICmp extension: trust-ir's INTEGER-COMPARISON
     //    semantics — the pure Int×Int→Bool predicate under every branch
@@ -5558,7 +6804,7 @@ pub struct BridgeAgreement {
     //    `.BinOp` instruction, connected to the ALREADY-BRIDGED semIntBinOp --
     //    value arms). --
     /// stepInst-BinOp arms whose chain+connect theorems BOTH kernel-checked
-    /// THIS RUN with empty axiom residue (3 = Add/Sub/Mul in Full mode; Spot
+    /// THIS RUN with empty axiom residue (7 = Add/Sub/Mul/UDiv/SDiv/URem/SRem in Full mode; Spot
     /// attempts 1: Add).
     pub stepinst_binop_bridged: usize,
     /// stepInst-BinOp arms attempted but NOT proven — never silently dropped.
@@ -5566,17 +6812,18 @@ pub struct BridgeAgreement {
     /// `op: chain|connect: failure head` for every pinned stepInst-BinOp arm.
     pub stepinst_binop_pinned_list: Vec<String>,
     /// The proven stepInst-BinOp ops, in `semIntBinOp` arm order (`["Add",
-    /// "Sub", "Mul"]` in Full mode).
+    /// "Sub", "Mul", "UDiv", "SDiv", "URem", "SRem"]` in Full mode).
     pub stepinst_binop_bridged_list: Vec<String>,
     /// Whether the COMPOSED `bridge_stepInst_binop_agreement_all` conjunction
-    /// (Add ∧ Sub ∧ Mul) kernel-checked with empty residue (Full mode only;
-    /// requires all 3 arms proven).
+    /// (all seven integer arithmetic arms) kernel-checked with empty residue
+    /// (Full mode only; requires all seven arms proven).
     pub stepinst_binop_composed: bool,
-    /// stepInst-BinOp deliberately-wrong claims kernel-REJECTED this run (2
-    /// in Full mode: wrong-op-agreement + swapped-operand; 1 in Spot). An
-    /// accepted forgery is a hard failure.
+    /// stepInst-BinOp deliberately-wrong claims semantically REJECTED this run
+    /// (13 in Full mode; 1 in Spot). Includes result, guard, divisor and
+    /// full-state/SSA mutations. Missing input or exhausted budget is incomplete;
+    /// an accepted forgery is a hard failure.
     pub stepinst_binop_fail_closed_controls: usize,
-    /// The other 15 `semIntBinOp` ops reachable through this same `stepInst`
+    /// The other 11 `semIntBinOp` ops reachable through this same `stepInst`
     /// `.BinOp` arm, honestly reported as un-chained (value-bridged via
     /// ARMS; the technique generalizes but was not executed for them).
     pub stepinst_binop_unbridged: Vec<String>,
@@ -5855,7 +7102,33 @@ pub struct BridgeAgreement {
 // The gate
 // ---------------------------------------------------------------------------
 
+/// Import the actual manifest-verified package pair. Production and focused
+/// input-boundary tests share this exact consumer; no theorem/proof is minted.
+fn load_verified_modules(
+    env: &mut Environment,
+    roots: &[String],
+    trustir_tree: &VerifiedTree,
+    core_tree: &VerifiedTree,
+) -> Result<Vec<clean_olean::LoadSummary>, BridgeGateError> {
+    manifest_inputs::load(env, roots, trustir_tree, core_tree)
+}
+
 /// Run the Lean↔Clean bridge gate over the VENDORED artifacts. Fail-closed:
+fn bind_source_reuse(
+    selected: trust_bridge_closure::source_reuse::Selection,
+    trustir_tree: &VerifiedTree,
+    core_tree: &VerifiedTree,
+) -> Result<trust_bridge_closure::source_reuse::Selection, BridgeGateError> {
+    if selected.trustir_manifest_sha256 != trustir_tree.manifest_sha256
+        || selected.core_manifest_sha256 != core_tree.manifest_sha256
+    {
+        return Err(BridgeGateError::PinUnresolvable {
+            detail: "source reuse manifests differ from the exact runtime captures".to_owned(),
+        });
+    }
+    Ok(selected)
+}
+
 /// any tampered/missing/stale artifact, import failure, recheck failure,
 /// axiom residue, or accepted forgery returns `Err`. Arms that fail to prove
 /// are returned honestly in the summary (`ops_pinned`), never silently.
@@ -5863,34 +7136,66 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     let t0 = Instant::now();
 
     // -- 1. Manifests: schema + provenance + per-file sha256 (fail-closed). --
+    bridge_gate_step(|| "verify the vendored TrustIr olean manifest".to_owned());
     let trustir_tree = verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)?;
+    bridge_gate_step(|| "verify the vendored Lean-core olean manifest".to_owned());
     let core_tree = verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)?;
     let manifest_commit = trustir_tree.trustir_commit.clone().unwrap_or_default();
 
     // -- 2. Pin drift: manifest commit must equal the checked-out submodule. --
-    let checkout_commit = match &config.expected_trustir_commit {
+    bridge_gate_step(|| "resolve the checked-out trust-ir pin".to_owned());
+    let mut source_reuse_anchor = None;
+    let checkout_commit = if trustir_tree.source_reuse {
+        if config.expected_trustir_commit.is_some() {
+            return Err(BridgeGateError::PinUnresolvable {
+                detail: "source reuse requires actual source repositories, not an expected-pin override".to_owned(),
+            });
+        }
+        let root = std::fs::canonicalize(&config.repo_root).map_err(|e| BridgeGateError::PinUnresolvable { detail: e.to_string() })?;
+        if std::fs::canonicalize(&config.trustir_olean_dir).ok()
+            != Some(root.join("crates/trust-clean/fixtures/trustir-oleans"))
+            || std::fs::canonicalize(&config.lean_core_olean_dir).ok()
+                != Some(root.join("vendor/lean-core-oleans"))
+        {
+            return Err(BridgeGateError::PinUnresolvable { detail: "source reuse requires the actual source-bound artifact locations".to_owned() });
+        }
+        let selected = trust_bridge_closure::source_reuse::verify(
+            &root, trust_bridge_closure::source_reuse::Subject::Checkout,
+        ).map_err(|e| BridgeGateError::PinUnresolvable { detail: format!("source reuse refused: {e}") })?
+            .ok_or_else(|| BridgeGateError::PinUnresolvable { detail: "source reuse record disappeared".to_owned() })?;
+        let selected = bind_source_reuse(selected, &trustir_tree, &core_tree)?;
+        source_reuse_anchor = Some(selected.anchor_commit);
+        selected.trustir_commit
+    } else { match &config.expected_trustir_commit {
         Some(c) => c.clone(),
         None => {
             let c = resolve_trustir_checkout(&config.repo_root)?;
             check_lean_sources_clean(&config.repo_root)?;
             c
         }
-    };
-    if manifest_commit != checkout_commit {
+    }};
+    if source_reuse_anchor.is_none() && manifest_commit != checkout_commit {
         return Err(BridgeGateError::PinDrift { manifest_commit, checkout_commit });
     }
+    // An expected-pin override supplies no source authority for runtime data.
+    // Such a diagnostic reports the frontier as unreported, never certified.
+    let runtime_frontier = if config.expected_trustir_commit.is_none() {
+        RuntimeFrontier::read(&config.repo_root.join("first-party/trust-ir"), &checkout_commit)
+            .map_err(|detail| BridgeGateError::RuntimeBoundary { detail })?
+    } else {
+        None
+    };
 
     // -- 3. Machine-import the vendored closure (the UNION of both roots). --
+    bridge_gate_step(|| "import the vendored olean closure".to_owned());
     let mut env = Environment::default();
     env.ensure_native_reducers();
-    let mut search_paths = trustir_tree.search_dirs();
-    search_paths.extend(core_tree.search_dirs());
     let root_modules: Vec<String> = BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
-    let summaries = load_modules_with_deps(&mut env, &root_modules, &search_paths)
-        .map_err(|e| BridgeGateError::Import { detail: format!("{e:?}") })?;
+    let summaries = load_verified_modules(&mut env, &root_modules, &trustir_tree, &core_tree)?;
 
     // Import hygiene: the loaded module set must EQUAL the manifested set.
     let mut trustir_names: BTreeSet<String> = BTreeSet::new();
+    let mut trustir_modules: BTreeSet<String> = BTreeSet::new();
     let mut loaded_rels: BTreeSet<(bool, String)> = BTreeSet::new();
     let mut constants_loaded = 0usize;
     for s in &summaries {
@@ -5908,6 +7213,7 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         }
         loaded_rels.insert((is_trustir, rel));
         if is_trustir {
+            trustir_modules.insert(module.to_owned());
             for n in &s.added_names {
                 trustir_names.insert(n.to_string());
             }
@@ -5930,7 +7236,11 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         }
     }
 
-    // -- 4. Bridge inputs present + kernel recheck of imported constants. --
+    // -- 4. Bridge inputs present + local checks under the imported TCB. --
+    // The proofs below intentionally continue in this imported environment.
+    // Replacing only this counter with fresh replay would NOT change their
+    // basis: a future closed-replay mode must use the newly checked environment
+    // for every downstream proof and retain its complete dependency inventory.
     for c in BRIDGE_INPUTS {
         let present = Name::from_str(c).ok().and_then(|n| env.get_const(&n).map(|_| ())).is_some();
         if !present {
@@ -5941,19 +7251,60 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         BridgeGateMode::Full => trustir_names.clone(),
         BridgeGateMode::Spot => BRIDGE_INPUTS.iter().map(|s| (*s).to_string()).collect(),
     };
-    let (recheck_pass, recheck_fail, recheck_errors) =
-        typecheck_constants_full(&env, &recheck_targets, 0);
+    // The third argument is `max_heartbeats`, and `0` there means UNLIMITED:
+    // this re-check was the one gate path with no per-constant bound AND no
+    // ambient declaration budget (the budget covers `load_bridge_source`, not
+    // this batch). `typecheck_constants_full` resets the heartbeat per
+    // constant (clean-olean `local_check_roster`), so the kernel's own
+    // default is a per-constant bound here, not a whole-batch one, and the
+    // gate's constants check well inside it — no verdict moves.
+    bridge_gate_step(|| match config.mode {
+        BridgeGateMode::Full => format!("replay census of {} imported TrustIr declarations", recheck_targets.len()),
+        BridgeGateMode::Spot => format!("strict kernel recheck of {} imported TrustIr constants", recheck_targets.len()),
+    });
+    let (recheck_pass, recheck_fail, recheck_seen, runtime_refused, first) = match config.mode {
+        BridgeGateMode::Full => {
+            // Every original/requested name stays in the SAME replay graph.
+            // Only artifact-backed unsafe/partial rows with an exact typed
+            // NotReplayable refusal are non-authoritative runtime outcomes.
+            // Safe stubs, missing rows and refused dependencies remain fatal.
+            let census = replay_declaration_census(
+                &env, &summaries, &trustir_modules, &recheck_targets,
+                clean_kernel::tc::DEFAULT_HEARTBEAT_LIMIT,
+            );
+            let first = census.verdicts().iter().find_map(|(name, verdict)| match verdict {
+                DeclarationReplayVerdict::Failed(reason) => Some(format!("{name}: {reason:?}")),
+                _ => None,
+            }).or_else(|| census.accounting_errors().first().map(|error| format!("{error:?}")))
+                .unwrap_or_default();
+            (census.admitted(), census.failures(), census.seen(), census.not_replayable(), first)
+        }
+        BridgeGateMode::Spot => {
+            // Spot remains a strict check of the requested mathematical inputs;
+            // it cannot classify a partial population as a complete census.
+            let (pass, fail, errors) = typecheck_constants_full(
+                &env, &recheck_targets, clean_kernel::tc::DEFAULT_HEARTBEAT_LIMIT,
+            );
+            let first = errors.iter().next().map(|(name, error)| format!("{name}: {error}"))
+                .unwrap_or_default();
+            (pass, fail, pass + fail, 0, first)
+        }
+    };
     if recheck_fail != 0 {
-        let first = recheck_errors
-            .iter()
-            .next()
-            .map(|(n, e)| format!("{n}: {}", e.chars().take(200).collect::<String>()))
-            .unwrap_or_default();
         return Err(BridgeGateError::RecheckFailed {
             fail: recheck_fail,
-            total: recheck_pass + recheck_fail,
-            first,
+            total: recheck_seen,
+            first: first.chars().take(200).collect(),
         });
+    }
+
+    // Trust: checked, bridge-owned aliases supply the exact imported notation
+    // instances. This does not infer any missing v1 extension entries.
+    let instance_names = load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC).map_err(|detail| {
+        BridgeGateError::PreludeFailed { detail: format!("bridge notation instances: {detail}") }
+    })?;
+    for name in &instance_names {
+        require_empty_axiom_deps(&env, name)?;
     }
 
     // -- 5. Wrap-elision prelude (the gate's own machinery: hard failure). --
@@ -6158,135 +7509,26 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     let unop_unbridged: Vec<String> =
         UNOP_UNBRIDGED.iter().map(|(op, reason)| format!("{op}: {reason}")).collect();
 
-    // -- 17. Overflow threshold-shift prelude (unconditional, both modes: --
-    // -- every Overflow FLAG connect proof cites it). --
-    let overflow_prelude_names = load_bridge_source(&mut env, OVERFLOW_THRESHOLD_PRELUDE_SRC)
-        .map_err(|detail| BridgeGateError::PreludeFailed { detail })?;
-    for n in &overflow_prelude_names {
-        require_empty_axiom_deps(&env, n)?;
-    }
-
-    // -- 18. The Overflow VALUE arms. Failure to prove is PINNED, not fatal. --
-    let overflow_value_arm_set: Vec<&OverflowValueArmSpec> = match config.mode {
-        BridgeGateMode::Full => OVERFLOW_VALUE_ARMS.iter().collect(),
-        BridgeGateMode::Spot => {
-            OVERFLOW_VALUE_ARMS.iter().filter(|a| a.op == "AddOverflow" && !a.signed).collect()
-        }
-    };
-    let mut overflow_value_bridged_list: Vec<String> = Vec::new();
-    let mut overflow_value_pinned_list: Vec<String> = Vec::new();
-    let mut overflow_value_proved: BTreeSet<&str> = BTreeSet::new();
-    for arm in &overflow_value_arm_set {
-        match load_bridge_source(&mut env, arm.src) {
-            Ok(_) => {
-                require_empty_axiom_deps(&env, arm.theorem)?;
-                overflow_value_bridged_list.push(format!(
-                    "{}[{}]",
-                    arm.op,
-                    if arm.signed { "s" } else { "u" }
-                ));
-                overflow_value_proved.insert(arm.theorem);
-            }
-            Err(e) => overflow_value_pinned_list.push(format!(
-                "{}[{}]: {}",
-                arm.op,
-                if arm.signed { "s" } else { "u" },
-                e.chars().take(200).collect::<String>()
-            )),
-        }
-    }
-
-    // -- 19. The Overflow FLAG arms: reduces PIN + (guarded arms') extra --
-    // -- helper lemma + connect theorem. Failure to prove is PINNED. --
-    let overflow_flag_arm_set: Vec<&OverflowFlagArmSpec> = match config.mode {
-        BridgeGateMode::Full => OVERFLOW_FLAG_ARMS.iter().collect(),
-        BridgeGateMode::Spot => {
-            OVERFLOW_FLAG_ARMS.iter().filter(|a| a.op == "AddOverflow" && !a.signed).collect()
-        }
-    };
-    let mut overflow_flag_bridged_list: Vec<String> = Vec::new();
-    let mut overflow_flag_pinned_list: Vec<String> = Vec::new();
-    let mut overflow_flag_proved: BTreeSet<&str> = BTreeSet::new();
-    let mut overflow_flag_guarded = 0usize;
-    for arm in &overflow_flag_arm_set {
-        let label = format!("{}[{}]", arm.op, if arm.signed { "s" } else { "u" });
-        // Step (a): the `reduces` PIN (rfl over the imported constant).
-        let reduces_ok = match load_bridge_source(&mut env, arm.reduces_src) {
-            Ok(_) => {
-                require_empty_axiom_deps(&env, arm.reduces_theorem)?;
-                true
-            }
-            Err(e) => {
-                overflow_flag_pinned_list
-                    .push(format!("{label}: reduces: {}", e.chars().take(200).collect::<String>()));
-                false
-            }
-        };
-        // Step (b): the guarded arms' extra helper lemma (empty for the rest).
-        let extra_ok = reduces_ok
-            && if arm.extra_src.is_empty() {
-                true
-            } else {
-                match load_bridge_source(&mut env, arm.extra_src) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        overflow_flag_pinned_list.push(format!(
-                            "{label}: extra: {}",
-                            e.chars().take(200).collect::<String>()
-                        ));
-                        false
-                    }
-                }
-            };
-        // Step (c): the `connect` theorem (the Lemma-textbook-spelling identity).
-        if extra_ok {
-            match load_bridge_source(&mut env, arm.connect_src) {
-                Ok(_) => {
-                    require_empty_axiom_deps(&env, arm.connect_theorem)?;
-                    overflow_flag_bridged_list.push(format!("{label}:{}", arm.lemma));
-                    overflow_flag_proved.insert(arm.connect_theorem);
-                    if arm.form == ArmForm::BGuarded {
-                        overflow_flag_guarded += 1;
-                    }
-                }
-                Err(e) => overflow_flag_pinned_list
-                    .push(format!("{label}: connect: {}", e.chars().take(200).collect::<String>())),
-            }
-        }
-    }
-
-    // -- 20. The composed Overflow conjunction (Full mode, all 11 proven). --
-    let mut overflow_composed = false;
-    if config.mode == BridgeGateMode::Full
-        && overflow_value_proved.len() == OVERFLOW_VALUE_ARMS.len()
-        && overflow_flag_proved.len() == OVERFLOW_FLAG_ARMS.len()
-    {
-        match load_bridge_source(&mut env, OVERFLOW_COMPOSED_SRC) {
-            Ok(_) => {
-                require_empty_axiom_deps(&env, OVERFLOW_COMPOSED_NAME)?;
-                overflow_composed = true;
-            }
-            Err(e) => overflow_flag_pinned_list
-                .push(format!("composed: {}", e.chars().take(200).collect::<String>())),
-        }
-    }
-
-    // -- 21. Overflow forgery probes: wrong claims MUST be rejected. --
-    let overflow_probes: &[(&str, &str)] = match config.mode {
-        BridgeGateMode::Full => OVERFLOW_FORGERY_PROBES,
-        BridgeGateMode::Spot => &OVERFLOW_FORGERY_PROBES[..1],
-    };
-    let mut overflow_fail_closed_controls = 0usize;
-    for (label, src) in overflow_probes {
-        match load_bridge_source(&mut env, src) {
-            Ok(_) => {
-                return Err(BridgeGateError::ForgeryAccepted { probe: (*label).to_string() });
-            }
-            Err(_) => overflow_fail_closed_controls += 1,
-        }
-    }
-    let overflow_flag_unbridged: Vec<String> =
-        OVERFLOW_FLAG_UNBRIDGED.iter().map(|(op, reason)| format!("{op}: {reason}")).collect();
+    // One actual implementation for Full/Spot and the focused overflow test.
+    let unsigned_mul::OverflowEvidence {
+        overflow_value_bridged,
+        overflow_value_pinned,
+        overflow_value_pinned_list,
+        overflow_value_bridged_list,
+        overflow_flag_bridged,
+        overflow_flag_pinned,
+        overflow_flag_pinned_list,
+        overflow_flag_bridged_list,
+        overflow_flag_guarded,
+        overflow_composed,
+        overflow_fail_closed_controls,
+        overflow_flag_unbridged,
+        overflow_umul_predicates_bound,
+        overflow_umul_predicate_bridged,
+        overflow_umul_predicate_pinned,
+        overflow_umul_foundational_axioms,
+        overflow_foundational_axioms,
+    } = unsigned_mul::check_overflow_layer(&mut env, config.mode)?;
 
     // -- 22. The ICmp agreement arms. Failure to prove is PINNED, not fatal. --
     let icmp_arm_set: Vec<&IcmpArmSpec> = match config.mode {
@@ -6465,21 +7707,22 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     };
     let mut cast_fail_closed_controls = 0usize;
     for (label, src) in cast_probes {
-        match load_bridge_source(&mut env, src) {
-            Ok(_) => {
-                return Err(BridgeGateError::ForgeryAccepted { probe: (*label).to_string() });
-            }
-            Err(_) => cast_fail_closed_controls += 1,
-        }
+        check_semantic_forgery_with_budget(&mut env, label, src, BRIDGE_DECL_BUDGET)?;
+        cast_fail_closed_controls += 1;
     }
     let cast_unbridged: Vec<String> =
         CAST_UNBRIDGED.iter().map(|(op, reason)| format!("{op}: {reason}")).collect();
 
     // -- 31. The stepInst-BinOp chain+connect arms (the FIRST statement/ --
     // -- instruction-level extension). Each arm is TWO theorems: the --
-    // -- unconditional chain (rfl) then the connect (reuses the --
-    // -- already-proven bridge_add/bridge_sub/bridge_mul from ARMS). Failure --
+    // -- shared state transport then the connect (reuses the matching --
+    // -- already-proven value theorem from ARMS). Failure --
     // -- to prove either half is PINNED, not fatal. --
+    let transport_names = load_bridge_source(&mut env, STEPINST_BINOP_TRANSPORT_SRC)
+        .map_err(|detail| BridgeGateError::PreludeFailed { detail })?;
+    for name in transport_names {
+        require_empty_axiom_deps(&env, &name)?;
+    }
     let stepinst_binop_arm_set: Vec<&StepBinOpArmSpec> = match config.mode {
         BridgeGateMode::Full => STEPINST_BINOP_ARMS.iter().collect(),
         BridgeGateMode::Spot => STEPINST_BINOP_ARMS.iter().filter(|a| a.op == "Add").collect(),
@@ -6518,7 +7761,7 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         }
     }
 
-    // -- 32. The composed stepInst-BinOp conjunction (Full mode, all 3 --
+    // -- 32. The composed stepInst-BinOp conjunction (Full mode, all 7 --
     // -- arms proven). --
     let mut stepinst_binop_composed = false;
     if config.mode == BridgeGateMode::Full
@@ -6541,12 +7784,8 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     };
     let mut stepinst_binop_fail_closed_controls = 0usize;
     for (label, src) in stepinst_binop_probes {
-        match load_bridge_source(&mut env, src) {
-            Ok(_) => {
-                return Err(BridgeGateError::ForgeryAccepted { probe: (*label).to_string() });
-            }
-            Err(_) => stepinst_binop_fail_closed_controls += 1,
-        }
+        check_semantic_forgery_with_budget(&mut env, label, src, BRIDGE_DECL_BUDGET)?;
+        stepinst_binop_fail_closed_controls += 1;
     }
     let stepinst_binop_unbridged: Vec<String> =
         STEPINST_BINOP_UNBRIDGED.iter().map(|(op, reason)| format!("{op}: {reason}")).collect();
@@ -6792,12 +8031,8 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
     };
     let mut stepinst_cast_fail_closed_controls = 0usize;
     for (label, src) in stepinst_cast_probes {
-        match load_bridge_source(&mut env, src) {
-            Ok(_) => {
-                return Err(BridgeGateError::ForgeryAccepted { probe: (*label).to_string() });
-            }
-            Err(_) => stepinst_cast_fail_closed_controls += 1,
-        }
+        check_semantic_forgery_with_budget(&mut env, label, src, BRIDGE_DECL_BUDGET)?;
+        stepinst_cast_fail_closed_controls += 1;
     }
     let stepinst_cast_unbridged: Vec<String> =
         STEPINST_CAST_UNBRIDGED.iter().map(|(op, reason)| format!("{op}: {reason}")).collect();
@@ -7185,14 +8420,8 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
                 dataloop_bridged = visits_ok;
                 if dataloop_bridged {
                     for (label, src) in DATALOOP_FORGERY_PROBES {
-                        match load_bridge_source(&mut env, src) {
-                            Ok(_) => {
-                                return Err(BridgeGateError::ForgeryAccepted {
-                                    probe: (*label).to_string(),
-                                });
-                            }
-                            Err(_) => dataloop_fail_closed_controls += 1,
-                        }
+                        check_semantic_forgery_with_budget(&mut env, label, src, BRIDGE_DECL_BUDGET)?;
+                        dataloop_fail_closed_controls += 1;
                     }
                 }
             }
@@ -7228,7 +8457,10 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         reduction_lemmas,
         characterization_rows,
         composed_all18,
-        trustir_commit: checkout_commit,
+        trustir_commit: manifest_commit,
+        selected_trustir_commit: checkout_commit,
+        source_reuse_anchor,
+        runtime_frontier,
         lean_toolchain: trustir_tree.lean_toolchain,
         manifest_ok: true,
         manifest_files: trustir_tree.files.len() + core_tree.files.len(),
@@ -7236,6 +8468,8 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         constants_loaded,
         trustir_recheck_pass: recheck_pass,
         trustir_recheck_fail: recheck_fail,
+        trustir_recheck_seen: recheck_seen,
+        trustir_runtime_refused: runtime_refused,
         axiom_deps_empty: true,
         fail_closed_controls,
         mode: match config.mode {
@@ -7254,18 +8488,23 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
         unop_composed,
         unop_fail_closed_controls,
         unop_unbridged,
-        overflow_value_bridged: overflow_value_bridged_list.len(),
-        overflow_value_pinned: overflow_value_arm_set.len() - overflow_value_bridged_list.len(),
+        overflow_value_bridged,
+        overflow_value_pinned,
         overflow_value_pinned_list,
         overflow_value_bridged_list,
-        overflow_flag_bridged: overflow_flag_bridged_list.len(),
-        overflow_flag_pinned: overflow_flag_arm_set.len() - overflow_flag_bridged_list.len(),
+        overflow_flag_bridged,
+        overflow_flag_pinned,
         overflow_flag_pinned_list,
         overflow_flag_bridged_list,
         overflow_flag_guarded,
         overflow_composed,
         overflow_fail_closed_controls,
         overflow_flag_unbridged,
+        overflow_umul_predicates_bound,
+        overflow_umul_predicate_bridged,
+        overflow_umul_predicate_pinned,
+        overflow_umul_foundational_axioms,
+        overflow_foundational_axioms,
         icmp_ops_bridged: icmp_bridged.len(),
         icmp_ops_pinned: icmp_arm_set.len() - icmp_bridged.len(),
         icmp_pinned,
@@ -7367,16 +8606,93 @@ pub fn run_bridge_gate(config: &BridgeGateConfig) -> Result<BridgeAgreement, Bri
 mod tests {
     use super::*;
 
+    /// The step budget bounds EACH step, not the run: six steps of 0.5 s under a
+    /// 2 s per-step budget spend 3 s in total and still complete. (A whole-run
+    /// bound would time this out; the gate is hundreds of steps, so it must
+    /// not be one.)
+    #[test]
+    fn step_budget_bounds_each_step_not_the_whole_run() {
+        let started = Instant::now();
+        let steps = run_with_step_budget(2, "step 0", || {
+            for step in 1..=6 {
+                bridge_gate_step(|| format!("step {step}"));
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            6
+        })
+        .expect("no single step came near the per-step budget");
+        assert_eq!(steps, 6);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    }
+
+    /// A step that outlives the budget ends the run as a named TIMEOUT —
+    /// promptly, while the stalled work is still running — and the outcome is
+    /// incomplete, never a verdict.
+    #[test]
+    fn step_budget_times_out_a_stalled_step_by_name() {
+        let started = Instant::now();
+        let outcome = run_with_step_budget(1, "prologue", || {
+            bridge_gate_step(|| "a step that stalls".to_owned());
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            "late verdict"
+        });
+        let elapsed = started.elapsed();
+        let Err(error) = outcome else {
+            panic!("a 60 s step under a 1 s budget must time out, got {outcome:?}");
+        };
+        assert!(
+            matches!(
+                &error,
+                BridgeGateError::BudgetExceeded { budget_secs: 1, step, steps_begun: 2 }
+                    if step == "a step that stalls"
+            ),
+            "the timeout must name the stalled step, got {error:?}"
+        );
+        assert!(error.is_incomplete(), "a spent budget is an unknown outcome, not a refusal");
+        assert!(error.to_string().starts_with("TIMEOUT"));
+        // Reported at the 1 s budget, not after the 60 s step; the slack is for
+        // a loaded host.
+        assert!(elapsed < std::time::Duration::from_secs(30), "timed out only after {elapsed:?}");
+    }
+
+    /// A panic inside budgeted work surfaces on the caller exactly as the
+    /// unbudgeted call would raise it — never as a timeout or a verdict.
+    #[test]
+    #[should_panic(expected = "gate work panicked")]
+    fn step_budget_reraises_a_panic_in_the_work() {
+        let _ = run_with_step_budget(30, "prologue", || -> u8 { panic!("gate work panicked") });
+    }
+
+    /// Outside a budgeted run a step mark is a no-op: its label is never even
+    /// built, so the unbudgeted gate pays nothing for the instrumentation.
+    #[test]
+    fn step_mark_is_inert_outside_a_budgeted_run() {
+        let built = std::cell::Cell::new(false);
+        bridge_gate_step(|| {
+            built.set(true);
+            String::new()
+        });
+        assert!(!built.get());
+    }
+
     /// GAP-CROSS-SIGN-WIDEN isolation probe (gated behind `TRUST_SIGNCROSS_PROBE=1`
     /// to keep the default suite fast): set up the bridge env exactly like
     /// `run_bridge_gate` and TIME-load ONLY the sign-cross corollary + its forgery
     /// probe, so the corollary's elaboration cost can be measured without running
     /// the whole (multi-minute) Full-mode gate. Prints timings + outcomes.
+    /// `#[ignore]`d, and it panics without `TRUST_SIGNCROSS_PROBE=1`, so a bare
+    /// `--ignored` run cannot pass having measured nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_SIGNCROSS_PROBE=1 and run with --ignored --nocapture"]
     fn signcross_corollary_probe() {
         if std::env::var("TRUST_SIGNCROSS_PROBE").as_deref() != Ok("1") {
-            eprintln!("signcross_corollary_probe: SKIP (set TRUST_SIGNCROSS_PROBE=1)");
-            return;
+            panic!(
+                "signcross_corollary_probe is a measurement driver and TRUST_SIGNCROSS_PROBE \
+                 is not 1, so it measured nothing. Run: TRUST_SIGNCROSS_PROBE=1 \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 trustir_bridge::tests::signcross_corollary_probe --nocapture"
+            );
         }
         let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
         let trustir_tree =
@@ -7387,11 +8703,10 @@ mod tests {
                 .expect("core manifest");
         let mut env = Environment::default();
         env.ensure_native_reducers();
-        let mut search_paths = trustir_tree.search_dirs();
-        search_paths.extend(core_tree.search_dirs());
         let root_modules: Vec<String> =
             BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
-        load_modules_with_deps(&mut env, &root_modules, &search_paths).expect("closure import");
+        load_verified_modules(&mut env, &root_modules, &trustir_tree, &core_tree).expect("closure import");
+        load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC).expect("bridge order instances");
 
         // The NEW sign-cross corollary MUST kernel-check with empty axiom residue.
         let t = std::time::Instant::now();
@@ -7422,6 +8737,538 @@ mod tests {
             }
         );
         assert!(f.is_err(), "sign-cross forgery MUST be rejected (fail-closed)");
+    }
+
+    /// Stack for a deadlined bridge worker.
+    ///
+    /// clean-kernel wraps its defeq recursion in `stacker::maybe_grow`, so it
+    /// grows past whatever it is given; this only keeps the common depth off
+    /// the growth path, matching what libtest hands an ordinary test thread.
+    const BRIDGE_WORKER_STACK: usize = 64 * 1024 * 1024;
+
+    /// Run a heavy bridge test body under a wall-clock deadline, so that a
+    /// kernel query which does not converge FAILS WITH A DIAGNOSIS instead of
+    /// hanging the suite with no verdict and no name.
+    ///
+    /// # Why this exists on top of `BRIDGE_DECL_BUDGET`
+    ///
+    /// The ambient per-declaration budget is the real bound and is
+    /// deterministic; this is the net under the one case the budget's own
+    /// documentation excludes — a pathology whose cost is per-tick
+    /// ALLOCATION SIZE rather than tick count (measured here once as 1.4 GB
+    /// RSS at 49 s growing to 3.8 GB at 4 min).
+    ///
+    /// # What it can and cannot do
+    ///
+    /// A synchronous Rust call cannot be interrupted from outside, so on
+    /// expiry the body's thread is DETACHED, not stopped: it keeps running
+    /// and keeps holding `elab_lock`. Any later bridge test then blocks on
+    /// that lock — which is why the diagnosis below reports the declaration
+    /// in flight and the tick peak, and why a deadline expiry should be read
+    /// as "this process is now unreliable for bridge work", not as one
+    /// isolated failure. The worker is NAMED after the test so that `sample`
+    /// attributes its stack correctly (see `elab_lock`: libtest's own thread
+    /// naming is exactly what once misattributed this module's stall to the
+    /// test that was merely blocked).
+    ///
+    /// The deadline is wall clock, so it is contention-sensitive: these two
+    /// tests spend most of a full-suite run waiting on `elab_lock`, not
+    /// working. The bounds below are therefore set at several times the
+    /// measured contended wall time, and the failure text tells the reader
+    /// how to tell a genuine divergence from a loaded machine.
+    fn run_with_bridge_deadline(
+        test: &'static str,
+        deadline: std::time::Duration,
+        body: impl FnOnce() + Send + 'static,
+    ) {
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name(test.to_owned())
+            .stack_size(BRIDGE_WORKER_STACK)
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+                let _ = done_tx.send(());
+                outcome
+            })
+            .expect("spawn the deadlined bridge worker");
+        if done_rx.recv_timeout(deadline).is_err() {
+            panic!(
+                "{test}: DID NOT FINISH within {deadline:?}.\n  \
+                 declaration in flight: {in_flight}\n  \
+                 peak per-declaration kernel ticks so far: {peak} of a budget of \
+                 {budget}\n  \
+                 Reading it: a peak at the budget means a declaration was CUT OFF \
+                 (non-convergence, neither proved nor refuted — see \
+                 docs/issues/2026-09-19-clean-defeq-structure-eta-escapes-delta-cap.md). \
+                 A peak far below it means the work was progressing and this box is \
+                 either heavily loaded or hit the allocation-size pathology the tick \
+                 budget cannot bound. Either way the worker thread is still running \
+                 and still holds elab_lock, so later bridge tests in this process are \
+                 no longer meaningful.",
+                in_flight = bridge_decl_in_flight_label(),
+                peak = bridge_peak_decl_ticks(),
+                budget = BRIDGE_DECL_BUDGET,
+            );
+        }
+        let elapsed = started.elapsed();
+        let outcome = worker.join().expect("the bridge worker thread must not vanish");
+        eprintln!(
+            "{test}: finished in {elapsed:?}; peak per-declaration kernel ticks {} of {}",
+            bridge_peak_decl_ticks(),
+            BRIDGE_DECL_BUDGET
+        );
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Deadline for [`imported_int_order_instances_preserve_relations`].
+    ///
+    /// Measured 2026-09-19: 4.2 s alone, 53.8 s beside its own module, 205 s
+    /// in a full contended suite run — and ~100 % of that delta is
+    /// `elab_lock` wait, not work (see `elab_lock`). The bound is set on the
+    /// contended figure, not the isolated one, because contention is the
+    /// normal case for this test.
+    const IMPORTED_INT_ORDER_DEADLINE: std::time::Duration =
+        std::time::Duration::from_secs(20 * 60);
+
+    /// Deadline for [`cast_composition_rechecks_every_conjunct`].
+    ///
+    /// Measured 2026-09-19: 368 s alone (of which `bridge_cast_zext` 107 s
+    /// and `bridge_cast_sext` 95 s), 357 s in a full contended suite run.
+    /// Sized above `BRIDGE_DECL_BUDGET`'s own worst case (~10 min for one
+    /// runaway declaration) so the budget, which names the declaration,
+    /// reports first whenever it can.
+    const CAST_COMPOSITION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// The deadline is the net under the budget; prove it reports rather
+    /// than hangs. The body outlives the deadline on purpose.
+    #[test]
+    #[should_panic(expected = "DID NOT FINISH within")]
+    fn bridge_deadline_diagnoses_instead_of_hanging() {
+        run_with_bridge_deadline(
+            "bridge_deadline_diagnoses_instead_of_hanging",
+            std::time::Duration::from_millis(50),
+            || std::thread::sleep(std::time::Duration::from_secs(2)),
+        );
+    }
+
+    /// The per-declaration budget must refuse a declaration it cut off, by
+    /// NAME, and must never round a cut-off declaration up into a pass. Run
+    /// at a budget of 1 tick so the cut-off is certain and cheap.
+    #[test]
+    fn bridge_decl_budget_refuses_by_name_instead_of_passing() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir_tree =
+            verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+                .expect("trust-ir manifest");
+        let core_tree =
+            verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+                .expect("core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir_tree, &core_tree).expect("actual vendored import");
+
+        // Deliberately instance-free and notation-free: this test is about the
+        // BOUND, so the declaration must not depend on the bridge's own
+        // notation aliases (`BRIDGE_INSTANCE_SRC`) being loaded first.
+        let source =
+            "theorem bridge_decl_budget_probe (a b : Int) : Int.le a b = Int.le a b := rfl";
+        let starved = load_bridge_source_with_budget(&mut env, source, 1)
+            .expect_err("a declaration cut off by the budget must never report a pass");
+        assert!(
+            starved.contains("bridge_decl_budget_probe") && starved.contains("DID NOT FINISH"),
+            "the refusal must name the declaration that did not converge, got: {starved}"
+        );
+        // ... and the same declaration under the real budget is a pass, so
+        // the bound refuses only what it actually cut off.
+        let names = load_bridge_source(&mut env, source)
+            .expect("the same declaration converges inside the production budget");
+        assert_eq!(names, vec!["bridge_decl_budget_probe".to_owned()]);
+    }
+
+    #[test]
+    fn stepinst_overflow_binds_two_ssa_results() {
+        run_with_bridge_deadline(
+            "stepinst_overflow_binds_two_ssa_results",
+            IMPORTED_INT_ORDER_DEADLINE,
+            stepinst_overflow_binds_two_ssa_results_body,
+        );
+    }
+
+    fn stepinst_overflow_binds_two_ssa_results_body() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir_tree =
+            verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+                .expect("trust-ir manifest");
+        let core_tree =
+            verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+                .expect("core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir_tree, &core_tree).expect("actual vendored import");
+        load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC).expect("checked notation instances");
+
+        let names = load_bridge_source(&mut env, STEPINST_OVERFLOW_CHAIN_SRC)
+            .expect("the actual instruction binds result and overflow as separate SSA values");
+        assert_eq!(names, vec![STEPINST_OVERFLOW_CHAIN_THEOREM.to_owned()]);
+        require_empty_axiom_deps(&env, STEPINST_OVERFLOW_CHAIN_THEOREM)
+            .expect("the chain theorem has no axiom residue");
+
+        // Every mutant still parses the same instruction and initial state.
+        // The kernel must notice each wrong component of its complete result.
+        for (index, (from, to)) in [
+            (
+                "InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3]",
+                "InstrResult.value (some (TrustIr.ValueId.mk 2))",
+            ),
+            (
+                "InstrResult.values [TrustIr.ValueId.mk 2, TrustIr.ValueId.mk 3]",
+                "InstrResult.values [TrustIr.ValueId.mk 3, TrustIr.ValueId.mk 2]",
+            ),
+            ("nextValueId := 4", "nextValueId := 3"),
+            ("(TrustIr.Value.bool p.2)", "(TrustIr.Value.bool true)"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(STEPINST_OVERFLOW_CHAIN_SRC.matches(from).count(), 1);
+            let mutant = STEPINST_OVERFLOW_CHAIN_SRC.replace(from, to).replace(
+                STEPINST_OVERFLOW_CHAIN_THEOREM,
+                &format!("stepinst_overflow_wrong_result_{index}"),
+            );
+            let err = load_bridge_source(&mut env, &mutant)
+                .expect_err("an incorrect result identity, cursor or value must refuse");
+            assert!(err.contains("TypeMismatch"), "mutation {index}: {err}");
+        }
+    }
+
+    #[test]
+    fn imported_int_order_instances_preserve_relations() {
+        run_with_bridge_deadline(
+            "imported_int_order_instances_preserve_relations",
+            IMPORTED_INT_ORDER_DEADLINE,
+            imported_int_order_instances_preserve_relations_body,
+        );
+    }
+
+    fn imported_int_order_instances_preserve_relations_body() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir_tree =
+            verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+                .expect("trust-ir manifest");
+        let core_tree =
+            verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+                .expect("core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir_tree, &core_tree).expect("actual vendored import");
+
+        // Per-source probes, same as `cast_composition_rechecks_every_conjunct`:
+        // a regression here must be localisable to a source fragment without a
+        // debugger, and these numbers are what distinguishes real work from
+        // `elab_lock` wait when the module runs concurrently.
+        let started = Instant::now();
+        let instance_names = load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC)
+            .expect("checked aliases of the actual imported order instances");
+        eprintln!(
+            "notation instances: {} checked declarations in {:?}",
+            instance_names.len(),
+            started.elapsed()
+        );
+        // Check the actual declaration roster, including the three notation
+        // decisions added beside the canonical Int.le/Int.lt instances. A
+        // count alone could miss a removed alias replaced by an unrelated one.
+        assert_eq!(
+            instance_names.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "bridgeIntLE",
+                "bridgeIntLT",
+                "bridgeIntDecLe",
+                "bridgeIntDecLt",
+                "bridgeIntDecLeNotation",
+                "bridgeIntDecLtNotation",
+                "bridgeIntDecGeNotation",
+                "bridgeIntAdd",
+                "bridgeIntSub",
+                "bridgeNatSub",
+                "bridgeIntMul",
+                "bridgeIntMod",
+                "bridgeIntPow",
+                "bridgeIntNeg",
+                "bridgeIntOfNat",
+                "bridgeNatOfNat",
+                "bridgeIntDecEq",
+                "bridgeBoolDecEq",
+                "bridgeIntBEq",
+                "bridgeTyBEq",
+            ]
+        );
+        for name in &instance_names {
+            require_empty_axiom_deps(&env, name).expect("instance alias has no axiom residue");
+        }
+        let started = Instant::now();
+        let names = load_bridge_source(
+            &mut env,
+            r#"theorem bridge_imported_le_identity (a b : Int) :
+                (@LE.le Int Int.instLEInt a b) = Int.le a b := rfl
+            theorem bridge_order_le_identity (a b : Int) : (a ≤ b) = Int.le a b := rfl
+            theorem bridge_order_lt_identity (a b : Int) : (a < b) = Int.lt a b := rfl
+            theorem bridge_order_dec_le_identity (a b : Int) :
+                Decidable.decide (a ≤ b) = @Decidable.decide (Int.le a b) (Int.decLe a b) := rfl
+            theorem bridge_order_dec_lt_identity (a b : Int) :
+                Decidable.decide (a < b) = @Decidable.decide (Int.lt a b) (Int.decLt a b) := rfl
+            theorem bridge_order_dec_ge_identity (a b : Int) :
+                Decidable.decide (a ≥ b) = @Decidable.decide (Int.le b a) (Int.decLe b a) := rfl
+            theorem bridge_int_add_identity (a b : Int) : (a + b) = Int.add a b := rfl
+            theorem bridge_int_sub_identity (a b : Int) : (a - b) = Int.sub a b := rfl
+            theorem bridge_nat_sub_identity (a b : Nat) : (a - b) = Nat.sub a b := rfl
+            theorem bridge_int_mul_identity (a b : Int) : (a * b) = Int.mul a b := rfl
+            theorem bridge_int_mod_identity (a b : Int) : (a % b) = Int.emod a b := rfl
+            theorem bridge_int_pow_identity (a : Int) (n : Nat) : (a ^ n) = Int.pow a n := rfl
+            theorem bridge_int_neg_identity (a : Int) : (-a) = Int.neg a := rfl
+            theorem bridge_int_literal_identity (n : Nat) :
+                @OfNat.ofNat Int n (bridgeIntOfNat n) = @OfNat.ofNat Int n (@instOfNat n) := rfl
+            theorem bridge_nat_literal_identity (n : Nat) :
+                @OfNat.ofNat Nat n (bridgeNatOfNat n) = n := rfl
+            theorem bridge_int_dec_eq_identity (a b : Int) :
+                Decidable.decide (a = b) = @Decidable.decide (a = b) (Int.decEq a b) := rfl
+            theorem bridge_bool_dec_eq_identity (a b : Bool) :
+                Decidable.decide (a = b) = @Decidable.decide (a = b) (Bool.decEq a b) := rfl
+            theorem bridge_int_beq_identity (a b : Int) :
+                (a == b) = @Decidable.decide (a = b) (Int.decEq a b) := rfl
+            theorem bridge_ty_beq_identity (a b : TrustIr.Ty) :
+                (a == b) = @BEq.beq TrustIr.Ty TrustIr.instBEqTy a b := rfl
+            "#,
+        )
+        .expect("bridge notation and decisions must denote the exact imported functions");
+        eprintln!(
+            "int/order identities: {} checked declarations in {:?}",
+            names.len(),
+            started.elapsed()
+        );
+        assert_eq!(names.len(), 19);
+        for name in &names {
+            require_empty_axiom_deps(&env, name).expect("identity proof has no axiom residue");
+        }
+        let started = Instant::now();
+        let reversed = load_bridge_source(
+            &mut env,
+            "theorem bridge_imported_le_reversed (a b : Int) : \
+             (a ≤ b) = Int.le b a := rfl",
+        );
+        eprintln!("reversed-relation refusal probe in {:?}", started.elapsed());
+        assert!(reversed.is_err(), "reversing the relation must not be definitionally equal");
+        let wrong_ge = load_bridge_source(
+            &mut env,
+            "theorem bridge_order_dec_ge_wrong_direction (a b : Int) : \
+             Decidable.decide (a ≥ b) = \
+             @Decidable.decide (Int.le a b) (Int.decLe a b) := rfl",
+        );
+        assert!(wrong_ge.is_err(), "the reversed notation must retain its argument order");
+    }
+
+
+    #[test]
+    fn multi_scrutinee_decidable_or() {
+        run_with_bridge_deadline(
+            "multi_scrutinee_decidable_or",
+            IMPORTED_INT_ORDER_DEADLINE,
+            unsigned_mul::check_imported_multi_scrutinee_decidable_or_for_test,
+        );
+    }
+
+    #[test]
+    fn unsigned_mul_int_predicates_and_overflow_composition_are_kernel_checked() {
+        run_with_bridge_deadline(
+            "unsigned_mul_int_predicates_and_overflow_composition",
+            IMPORTED_INT_ORDER_DEADLINE,
+            unsigned_mul::check_imported_overflow_layer_for_test,
+        );
+    }
+
+    #[test]
+    fn stepinst_divrem_composition_rechecks_state_guards_and_identity() {
+        run_with_bridge_deadline(
+            "stepinst_divrem_composition",
+            CAST_COMPOSITION_DEADLINE,
+            stepinst_divrem_composition_body,
+        );
+    }
+
+    fn stepinst_divrem_composition_body() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir = verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+            .expect("original TrustIR manifest");
+        let core = verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+            .expect("original Lean-core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir, &core).expect("actual shared model import");
+        let check = |env: &mut Environment, label: &str, source: &str| {
+            let names = load_bridge_source(env, source)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            for name in names {
+                require_empty_axiom_deps(env, &name)
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+            }
+        };
+        check(&mut env, "original instances", BRIDGE_INSTANCE_SRC);
+        check(&mut env, "original value prelude", PRELUDE_SRC);
+        for (name, source) in REDUCTION_SRCS { check(&mut env, name, source); }
+        for arm in ARMS.iter().take(7) { check(&mut env, arm.theorem, arm.src); }
+        check(&mut env, "shared state transport", STEPINST_BINOP_TRANSPORT_SRC);
+        for arm in STEPINST_BINOP_ARMS {
+            check(&mut env, arm.chain_theorem, arm.chain_src);
+            check(&mut env, arm.connect_theorem, arm.connect_src);
+            eprintln!("{}: original value proof composed with exact state/SSA transport", arm.op);
+        }
+        check(&mut env, "all seven composed", STEPINST_BINOP_COMPOSED_SRC);
+        check(&mut env, "actual concrete division and remainder", STEPINST_DIVREM_CONCRETE_SRC);
+        for (label, source) in STEPINST_BINOP_FORGERY_PROBES {
+            check_semantic_forgery_with_budget(&mut env, label, source, BRIDGE_DECL_BUDGET)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            eprintln!("{label}: typed semantic mismatch, budget not exhausted");
+        }
+        let honest = check_semantic_forgery_with_budget(&mut env, "accepted control",
+            "theorem stepinst_honest_control : True := True.intro", BRIDGE_DECL_BUDGET)
+            .expect_err("an accepted proof is not a refutation");
+        assert!(matches!(honest, BridgeGateError::ForgeryAccepted { .. }));
+        let missing = check_semantic_forgery_with_budget(&mut env, "missing input",
+            "theorem stepinst_missing_control : True := stepinst_absent_input", BRIDGE_DECL_BUDGET)
+            .expect_err("missing input is not a semantic refutation");
+        assert!(matches!(missing, BridgeGateError::ForgeryUnqualified { incomplete: false, .. }));
+        let budget_source = STEPINST_BINOP_ARMS[3].connect_src.replace(
+            "bridge_stepInst_binop_udiv", "stepinst_budget_control");
+        let exhausted = check_semantic_forgery_with_budget(&mut env, "budget", &budget_source, 1)
+            .expect_err("budget exhaustion is not a semantic refutation");
+        assert!(matches!(exhausted, BridgeGateError::ForgeryUnqualified { incomplete: true, .. }));
+    }
+
+    #[test]
+    fn cast_composition_rechecks_every_conjunct() {
+        run_with_bridge_deadline(
+            "cast_composition_rechecks_every_conjunct",
+            CAST_COMPOSITION_DEADLINE,
+            cast_composition_rechecks_every_conjunct_body,
+        );
+    }
+
+    fn cast_composition_rechecks_every_conjunct_body() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir_tree =
+            verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+                .expect("trust-ir manifest");
+        let core_tree =
+            verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+                .expect("core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir_tree, &core_tree).expect("actual vendored import");
+
+        // Replay the actual Cast sources in their production order, preserving
+        // every theorem statement. This isolates a composition refusal from
+        // the other bridge families and reports its complete diagnostic.
+        let sources = std::iter::once(("notation instances", BRIDGE_INSTANCE_SRC))
+            .chain(CAST_ARMS.iter().map(|arm| (arm.theorem, arm.src)))
+            .chain([
+                ("cast concrete rows", CAST_CONC_SRC),
+                (CAST_ZEXT_WIDENING_NAME, CAST_ZEXT_WIDENING_SRC),
+                (CAST_ZEXT_SIGNCROSS_NAME, CAST_ZEXT_SIGNCROSS_SRC),
+                (CAST_COMPOSED_NAME, CAST_COMPOSED_SRC),
+                (STEPINST_CAST_CHAIN_THEOREM, STEPINST_CAST_CHAIN_SRC),
+                (STEPINST_CAST_CONNECT_THEOREM, STEPINST_CAST_CONNECT_SRC),
+                (STEPINST_CAST_COMPOSED_NAME, STEPINST_CAST_COMPOSED_SRC),
+            ]);
+        for (label, source) in sources {
+            let started = std::time::Instant::now();
+            let names = load_bridge_source(&mut env, source)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            for name in &names {
+                require_empty_axiom_deps(&env, name)
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            }
+            eprintln!("{label}: {} checked declarations in {:?}", names.len(), started.elapsed());
+        }
+        require_empty_axiom_deps(&env, CAST_COMPOSED_NAME)
+            .expect("the exact composed Cast theorem must be registered and checked");
+        require_empty_axiom_deps(&env, STEPINST_CAST_COMPOSED_NAME)
+            .expect("the exact composed stepInst Cast theorem must be registered and checked");
+        // Positive premises are registered first: a missing agreement lemma
+        // cannot masquerade as rejection of a wrong width or result value.
+        for (label, source) in CAST_FORGERY_PROBES.iter().chain(STEPINST_CAST_FORGERY_PROBES) {
+            check_semantic_forgery_with_budget(&mut env, label, source, BRIDGE_DECL_BUDGET)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            eprintln!("{label}: typed semantic mismatch; declaration budget not exhausted");
+        }
+
+        let honest_result = check_semantic_forgery_with_budget(
+            &mut env,
+            "honest proof",
+            "theorem bridge_honest_probe : True := True.intro",
+            BRIDGE_DECL_BUDGET,
+        ).expect_err("an accepted proof cannot qualify as a refutation");
+        assert!(matches!(honest_result, BridgeGateError::ForgeryAccepted { .. }));
+        assert!(!honest_result.is_incomplete());
+
+        let missing_result = check_semantic_forgery_with_budget(
+            &mut env,
+            "missing input",
+            "theorem bridge_missing_input_probe : True := absent_bridge_input",
+            BRIDGE_DECL_BUDGET,
+        ).expect_err("missing input is not a semantic refutation");
+        assert!(matches!(missing_result, BridgeGateError::ForgeryUnqualified { incomplete: false, .. }));
+        assert!(missing_result.is_incomplete());
+
+        let budget_source = CAST_ARMS[0].src.replace("bridge_cast_trunc", "bridge_cast_budget_probe");
+        let budget_result = check_semantic_forgery_with_budget(&mut env, "budget", &budget_source, 1)
+            .expect_err("a truncated check cannot qualify a semantic refutation");
+        assert!(matches!(budget_result, BridgeGateError::ForgeryUnqualified { incomplete: true, .. }));
+        assert!(budget_result.is_incomplete());
+    }
+
+    #[test]
+    fn dataloop_visits_follow_exact_current_ssa_bindings() {
+        let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
+        let trustir = verify_manifest(&config.trustir_olean_dir, TRUSTIR_MANIFEST_SCHEMA, true)
+            .expect("current TrustIR manifest");
+        let core = verify_manifest(&config.lean_core_olean_dir, LEAN_CORE_MANIFEST_SCHEMA, false)
+            .expect("current core manifest");
+        let mut env = Environment::default();
+        env.ensure_native_reducers();
+        let roots = BRIDGE_ROOT_MODULES.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>();
+        load_verified_modules(&mut env, &roots, &trustir, &core).expect("current complete import");
+        load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC).expect("original notation");
+        load_bridge_source(&mut env, PRELUDE_SRC).expect("original prelude");
+        load_bridge_source(&mut env, DATALOOP_FIXTURES_SRC).expect("original loop and current states");
+        for (label, source) in DATALOOP_VISITS {
+            let names = load_bridge_source(&mut env, source)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            for name in names {
+                require_empty_axiom_deps(&env, &name).expect("visit adds no axiom residue");
+            }
+            eprintln!("{label}: current whole-state transition checked");
+        }
+        let retired = r#"theorem dloop_retired3 : dloopState3.locals (TrustIr.ValueId.mk 5) = none := rfl
+theorem dloop_retired4 : dloopState4.locals (TrustIr.ValueId.mk 6) = none := rfl
+theorem dloop_retired5 : dloopState5.locals (TrustIr.ValueId.mk 7) = none := rfl
+"#;
+        for name in load_bridge_source(&mut env, retired).expect("private temporaries are absent") {
+            require_empty_axiom_deps(&env, &name).expect("retirement adds no axiom residue");
+        }
+        for (label, source) in DATALOOP_FORGERY_PROBES {
+            check_semantic_forgery_with_budget(&mut env, label, source, BRIDGE_DECL_BUDGET)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        check_semantic_forgery_with_budget(&mut env, "old temporary remains defined",
+            "theorem dloop_retained_temp_wrong : dloopState3.locals (TrustIr.ValueId.mk 5) = some (TrustIr.Value.bool true) := rfl",
+            BRIDGE_DECL_BUDGET).expect("old state must fail by semantic mismatch");
     }
 
     #[test]
@@ -7464,6 +9311,87 @@ mod tests {
             .expect_err("missing trustir_commit must fail closed");
         assert!(matches!(err, BridgeGateError::ManifestProvenance { .. }), "got {err:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A manifest whose HOST platform table names the trust-ir revision its
+    /// bytes were built from; files are empty so only provenance is judged.
+    fn platform_provenance_manifest(dir: &Path, built_from: Option<&str>) {
+        let triple = host_triple();
+        let built_from = built_from
+            .map(|c| format!("built_from_trustir_commit = \"{c}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            dir.join("MANIFEST.toml"),
+            format!(
+                "schema = \"{TRUSTIR_MANIFEST_SCHEMA}\"\n[provenance]\n\
+                 trustir_commit = \"{new}\"\nlean_toolchain = \"x\"\n[files]\n\
+                 [platforms.\"{triple}\"]\n{built_from}",
+                new = "a".repeat(40),
+            ),
+        )
+        .expect("write manifest");
+    }
+
+    /// 2026-09-24: a regeneration on one platform carried the other platform's
+    /// bytes forward under the NEW trustir_commit (Linux oleans built from
+    /// trust-ir 00180257 were labelled 29744d5f). The host platform must name
+    /// what it was built from, and must have been built from the manifest's
+    /// commit; otherwise the bridge refuses instead of replaying stale semantics.
+    #[test]
+    fn a_platform_built_from_another_trustir_commit_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("bridge-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        platform_provenance_manifest(&dir, Some(&"b".repeat(40)));
+        let err = verify_manifest(&dir, TRUSTIR_MANIFEST_SCHEMA, true)
+            .expect_err("carried-forward bytes must not replay under the new commit");
+        assert!(matches!(err, BridgeGateError::PlatformStale { .. }), "got {err:?}");
+
+        platform_provenance_manifest(&dir, None);
+        let err = verify_manifest(&dir, TRUSTIR_MANIFEST_SCHEMA, true)
+            .expect_err("a platform that does not say what it was built from fails closed");
+        assert!(matches!(err, BridgeGateError::ManifestProvenance { .. }), "got {err:?}");
+
+        platform_provenance_manifest(&dir, Some(&"a".repeat(40)));
+        verify_manifest(&dir, TRUSTIR_MANIFEST_SCHEMA, true)
+            .expect("bytes built from the manifest's own commit are admitted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_reuse_binds_the_exact_captured_manifests() {
+        let root = std::env::temp_dir().join(format!("bridge-reuse-capture-{}", std::process::id()));
+        let ir = root.join("ir");
+        let core = root.join("core");
+        std::fs::create_dir_all(&ir).unwrap();
+        std::fs::create_dir_all(&core).unwrap();
+        platform_provenance_manifest(&ir, Some(&"a".repeat(40)));
+        let mut ir_b = std::fs::read_to_string(ir.join("MANIFEST.toml")).unwrap();
+        ir_b.push_str("\n[source_reuse]\nschema='binding-test'\n");
+        std::fs::write(ir.join("MANIFEST.toml"), &ir_b).unwrap();
+        let core_b = format!("schema='{LEAN_CORE_MANIFEST_SCHEMA}'\n[provenance]\nlean_toolchain='x'\n[files]\n");
+        std::fs::write(core.join("MANIFEST.toml"), &core_b).unwrap();
+        let selected = trust_bridge_closure::source_reuse::Selection {
+            trustir_commit: "c".repeat(40), clean_commit: "d".repeat(40), anchor_commit: "e".repeat(40),
+            trustir_manifest_sha256: format!("{:x}", Sha256::digest(ir_b.as_bytes())),
+            core_manifest_sha256: format!("{:x}", Sha256::digest(core_b.as_bytes())),
+        };
+        let ir_tree_b = verify_manifest(&ir, TRUSTIR_MANIFEST_SCHEMA, true).unwrap();
+        let core_tree_b = verify_manifest(&core, LEAN_CORE_MANIFEST_SCHEMA, false).unwrap();
+        assert!(bind_source_reuse(selected.clone(), &ir_tree_b, &core_tree_b).is_ok());
+        // Capture A, then restore B. No timing or mathematical checker is
+        // involved: the association must reject the retained A parse.
+        for ir_a in [ir_b.replace(&"a".repeat(40), &"b".repeat(40)), ir_b.replace("binding-test", "changed-record")] {
+            std::fs::write(ir.join("MANIFEST.toml"), ir_a).unwrap();
+            let captured_a = verify_manifest(&ir, TRUSTIR_MANIFEST_SCHEMA, true).unwrap();
+            std::fs::write(ir.join("MANIFEST.toml"), &ir_b).unwrap();
+            assert!(bind_source_reuse(selected.clone(), &captured_a, &core_tree_b).is_err());
+        }
+        std::fs::write(core.join("MANIFEST.toml"), core_b.replace("='x'", "='changed'")).unwrap();
+        let core_a = verify_manifest(&core, LEAN_CORE_MANIFEST_SCHEMA, false).unwrap();
+        std::fs::write(core.join("MANIFEST.toml"), &core_b).unwrap();
+        assert!(bind_source_reuse(selected, &ir_tree_b, &core_a).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7514,7 +9442,7 @@ mod tests {
     }
 
     #[test]
-    fn overflow_flag_arm_table_covers_the_5_modeled_combinations_mul_u_excluded() {
+    fn overflow_flag_arm_table_covers_all_6_int_combinations() {
         let combos: Vec<(&str, bool)> =
             OVERFLOW_FLAG_ARMS.iter().map(|a| (a.op, a.signed)).collect();
         assert_eq!(
@@ -7522,20 +9450,16 @@ mod tests {
             vec![
                 ("AddOverflow", false),
                 ("SubOverflow", false),
+                ("MulOverflow", false),
                 ("AddOverflow", true),
                 ("SubOverflow", true),
                 ("MulOverflow", true),
             ],
-            "unsigned MulOverflow is intentionally absent — no Lemma models it"
+            "all six generic Int flags have actual connecting statements"
         );
         let guarded = OVERFLOW_FLAG_ARMS.iter().filter(|a| a.form == ArmForm::BGuarded).count();
         assert_eq!(guarded, 1, "unsigned SubOverflow (Lemma 8) is the one guarded flag arm");
-        assert_eq!(
-            OVERFLOW_FLAG_UNBRIDGED.len(),
-            1,
-            "unsigned MulOverflow is the one honest residue"
-        );
-        assert_eq!(OVERFLOW_FLAG_UNBRIDGED[0].0, "MulOverflow[unsigned]");
+        assert!(OVERFLOW_FLAG_UNBRIDGED.is_empty(), "no generic Int overflow-flag residue");
     }
 
     #[test]
@@ -7593,13 +9517,14 @@ mod tests {
     }
 
     #[test]
-    fn stepinst_binop_arm_table_covers_the_3_form_a_ish_arith_ops() {
+    fn stepinst_binop_arm_table_preserves_all_eighteen_operations() {
         let ops: Vec<&str> = STEPINST_BINOP_ARMS.iter().map(|a| a.op).collect();
-        assert_eq!(ops, vec!["Add", "Sub", "Mul"], "the 3 bridged stepInst-BinOp arms");
+        assert_eq!(ops, vec!["Add", "Sub", "Mul", "UDiv", "SDiv", "URem", "SRem"]);
+        assert_eq!(ops.len() + STEPINST_BINOP_UNBRIDGED[0].0.split('/').count(), 18);
         assert_eq!(
             STEPINST_BINOP_UNBRIDGED.len(),
             1,
-            "the other 15 semIntBinOp ops are grouped in one honest-residue entry"
+            "the other 11 semIntBinOp ops remain in the honest-residue entry"
         );
         assert_eq!(
             STEPINST_CATEGORIES_UNBRIDGED.len(),
@@ -7662,16 +9587,22 @@ mod tests {
     // to load DATALOOP_COMPOSED_STEPS and assert
     // `bridge_dataloop_counter_reaches_2`.
     //
-    // Default (no env var): prints a SKIP note and passes, so the default
-    // suite never OOMs by design.
+    // `#[ignore]`d, so the default suite never OOMs by design; and without
+    // TRUST_DATALOOP_WALL_REPRO=1 it panics with the recipe, so a bare
+    // `--ignored` run cannot pass having reproduced nothing.
     #[test]
+    #[ignore = "measurement driver: set TRUST_DATALOOP_WALL_REPRO=1 and run with --ignored \
+                under an RSS watchdog"]
     fn dataloop_composed_wall_reproducer() {
         if std::env::var("TRUST_DATALOOP_WALL_REPRO").as_deref() != Ok("1") {
-            eprintln!(
-                "dataloop_composed_wall_reproducer: SKIP (set TRUST_DATALOOP_WALL_REPRO=1 \
-                 and run under an RSS watchdog to exercise the clean ground-normalization wall)"
+            panic!(
+                "dataloop_composed_wall_reproducer is a reproducer and \
+                 TRUST_DATALOOP_WALL_REPRO is not 1, so it reproduced nothing. Run, under an \
+                 RSS watchdog (earlier runs used 12GB/50min): TRUST_DATALOOP_WALL_REPRO=1 \
+                 targo --unverified test --manifest-path crates/Cargo.toml -p trust-clean \
+                 --lib -- --ignored --exact \
+                 trustir_bridge::tests::dataloop_composed_wall_reproducer --nocapture"
             );
-            return;
         }
         let config = BridgeGateConfig::locate(BridgeGateMode::Spot);
         let trustir_tree =
@@ -7682,11 +9613,10 @@ mod tests {
                 .expect("core manifest");
         let mut env = Environment::default();
         env.ensure_native_reducers();
-        let mut search_paths = trustir_tree.search_dirs();
-        search_paths.extend(core_tree.search_dirs());
         let root_modules: Vec<String> =
             BRIDGE_ROOT_MODULES.iter().map(|s| (*s).to_string()).collect();
-        load_modules_with_deps(&mut env, &root_modules, &search_paths).expect("closure import");
+        load_verified_modules(&mut env, &root_modules, &trustir_tree, &core_tree).expect("closure import");
+        load_bridge_source(&mut env, BRIDGE_INSTANCE_SRC).expect("bridge order instances");
         load_bridge_source(&mut env, PRELUDE_SRC).expect("prelude");
 
         let t_fixtures = std::time::Instant::now();
@@ -7740,3 +9670,18 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "trustir_bridge/manifest_binding_tests.rs"]
+mod manifest_binding_tests;
+
+#[cfg(test)]
+#[path = "trustir_bridge/elab_result_tests.rs"]
+mod elab_result_tests;
+
+#[cfg(test)]
+#[path = "trustir_bridge/notation_class_tests.rs"]
+mod notation_class_tests;
+
+#[path = "trustir_bridge/manifest_inputs.rs"]
+mod manifest_inputs;

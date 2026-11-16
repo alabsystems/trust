@@ -128,9 +128,12 @@
 //!     ORIGINAL amount operand in the shift (MIR permits a differently-typed amount; the
 //!     module-side value cast exists only for trust-ir's same-type `eval_binop` contract and is
 //!     value-preserving under the just-asserted range, so it has no MIR counterpart). With
-//!     overflow checks OFF the pair `Cast + BinOp(shift)` maps to the bare `Shl|Shr(l, amt)`
-//!     (`shift_value_cast_pair`; out-of-range is UB on both sides, so discarding the
-//!     value-preserving cast cannot change a defined execution).
+//!     overflow checks OFF the producer's masked unit `Const(BITS - 1) + [Cast] + And +
+//!     BinOp(shift)` maps to the bare `Shl|Shr(l, amt)` (`shift_masked_unit`): a plain MIR
+//!     shift takes its count `rem_euclid(BITS)` itself, so the explicit retype and mask —
+//!     needed only because a trust-ir shift is undefined at or above BITS — have no MIR
+//!     counterpart. The older unmasked pair `Cast + BinOp(shift)` (`shift_value_cast_pair`)
+//!     maps the same way.
 //!   * `Inst::CondBr` (edge args always empty in the producer's `lower_if`/`lower_logical_op`)
 //!     becomes `TerminatorKind::if_(cond, then, else)` — the identical
 //!     `SwitchTargets::static_if(0, else, then)` encoding the MIR builder produces.
@@ -216,8 +219,8 @@ use rustc_span::{Span, Spanned, sym};
 // so import it from its defining module.
 use trust_ir::value::GlobalId;
 use trust_ir::{
-    BinOp, BlockId, CastOp, Constant, FuncId, ICmpOp, Inst, InstrNode, Module, OverflowOp, Ty,
-    UnOp, ValueId,
+    AssertKind as IrAssertKind, AssertOverflowOp, BinOp, BlockId, CastOp, Constant, FuncId, ICmpOp,
+    Inst, InstrNode, Module, OverflowOp, Ty, UnOp, ValueId,
 };
 
 use crate::{CalleeRef, SiteArg, SiteConst, SiteTy, SiteValTree};
@@ -501,7 +504,7 @@ fn source_form_gate<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId, stmts: StatementRu
         return false;
     };
     let mut gate = SourceFormGate { typeck: tcx.typeck(root), ok: true, stmts };
-    rustc_hir::intravisit::Visitor::visit_expr(&mut gate, body.value);
+    rustc_hir::intravisit::Visitor::visit_expr(&mut gate, &body.value);
     gate.ok
 }
 
@@ -3238,7 +3241,7 @@ fn chain_fwd_source_admits<'tcx>(
             }
             b.expr?
         }
-        _ => body.value,
+        _ => &body.value,
     };
     // An adjustment on the FINAL call itself (an autoderef of the result, a coercion) is a
     // temp this plan does not model.
@@ -3513,7 +3516,7 @@ impl MfCheckedPlan {
 /// Returns `(result, overflowed, ty, lhs, rhs)`; the unit is always exactly five nodes.
 fn checked_unit(nodes: &[InstrNode], i: usize) -> Option<(ValueId, ValueId, Ty, ValueId, ValueId)> {
     let n0 = nodes.get(i)?;
-    let Inst::Overflow { ty, lhs, rhs, .. } = &n0.inst else { return None };
+    let Inst::Overflow { op, ty, lhs, rhs } = &n0.inst else { return None };
     let (&res, &of) = match n0.results.as_slice() {
         [r, o] => (r, o),
         _ => return None,
@@ -3538,11 +3541,33 @@ fn checked_unit(nodes: &[InstrNode], i: usize) -> Option<(ValueId, ValueId, Ty, 
         }
         _ => return None,
     };
-    match &nodes.get(i + 4)?.inst {
-        Inst::Assert { cond } if *cond == ok => {}
-        _ => return None,
+    if !is_idiom_assert(&nodes.get(i + 4)?.inst, ok, overflow_assert_kind(*op)) {
+        return None;
     }
     Some((res, of, ty.clone(), *lhs, *rhs))
+}
+
+/// Trust (trust-ir v52, plan item P): the kind of the overflow check MIR's checked `op` asserts.
+fn overflow_assert_kind(op: OverflowOp) -> IrAssertKind {
+    IrAssertKind::Overflow(match op {
+        OverflowOp::AddOverflow => AssertOverflowOp::Add,
+        OverflowOp::SubOverflow => AssertOverflowOp::Sub,
+        OverflowOp::MulOverflow => AssertOverflowOp::Mul,
+    })
+}
+
+/// Trust (trust-ir v52/v54): whether `inst` is the assert of `cond` an idiom recognizer below
+/// rebuilds as a MIR `Assert` carrying `expected`'s message. The MIR message is chosen by the
+/// idiom, and the trust-ir kind names WHICH panic a failure is, so the two must agree: the
+/// producer's own kind, or `Unspecified` (an assert of unknown identity — every pre-v52 assert —
+/// which the idiom names). Any other kind is a different panic, and a SITED assert (v54) names a
+/// panic entry and location this shim does not lower: both fall to the fail-closed arms.
+fn is_idiom_assert(inst: &Inst, cond: ValueId, expected: IrAssertKind) -> bool {
+    matches!(
+        inst,
+        Inst::Assert { cond: c, kind, site: None }
+            if *c == cond && (*kind == expected || kind.is_unspecified())
+    )
 }
 
 /// Trust (wave-CK, 2026-08-17): **THE CHECKED-ARITHMETIC-CHAIN MARKER PLAN** — the sixth
@@ -5709,7 +5734,7 @@ fn agg_call_source_admits<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId, n: usize) ->
                 None => return false,
             }
         }
-        _ => body.value,
+        _ => &body.value,
     };
     if !typeck.expr_adjustments(tail).is_empty() {
         return false;
@@ -5872,7 +5897,7 @@ fn emit_enum_variant<'tcx>(
         return unsup("enum construction: variant arity != produced payload arity");
     }
     if let Some(op) = &payload {
-        let fty = adt_def.variant(vidx).fields[FieldIdx::ZERO].ty(tcx, args).skip_normalization();
+        let fty = adt_def.variant(vidx).fields[FieldIdx::ZERO].ty(tcx, *args).skip_normalization();
         // Region-erase + normalize both sides (wave-P idiom, to_mir.rs:2554): a semantically-equal
         // but lifetime-differing field type must not FALSE-reject, while isize/usize vs i64/u64 stay
         // DISTINCT so the real ill-typed-aggregate ICE hazard is still caught. `unwrap_or(t)` never
@@ -5896,7 +5921,7 @@ fn emit_enum_variant<'tcx>(
     if cx.sat_perturb == Some(SatPerturb::EnumPayload) {
         if let Some(orig) = payload.as_ref() {
             let fty =
-                adt_def.variant(vidx).fields[FieldIdx::ZERO].ty(tcx, args).skip_normalization();
+                adt_def.variant(vidx).fields[FieldIdx::ZERO].ty(tcx, *args).skip_normalization();
             let width: Option<u64> = match fty.kind() {
                 ty::Bool => Some(1),
                 ty::Int(i) => i.bit_width(),
@@ -5932,7 +5957,7 @@ fn emit_enum_variant<'tcx>(
         cur,
         place,
         Rvalue::Aggregate(
-            Box::new(AggregateKind::Adt(adt_def.did(), vidx, args, None, None)),
+            Box::new(AggregateKind::Adt(adt_def.did(), vidx, *args, None, None)),
             fields,
         ),
     );
@@ -5948,6 +5973,13 @@ fn global_str_bytes(module: &Module, global: GlobalId) -> Option<Vec<u8>> {
     let g = module.globals.get(global.as_usize())?;
     let elems = match g.initializer.as_ref()? {
         Constant::Array(e) | Constant::Aggregate(e) => e,
+        // v50: a UNIFORM literal (`"aa"`) is spelled `Splat` (§3.1). A string literal's bytes
+        // are its source text, so spelling them out here costs what the program wrote.
+        Constant::Splat { elem, len } => {
+            let Constant::Int(v) = **elem else { return None };
+            let byte = u8::try_from(v).ok()?;
+            return Some(vec![byte; usize::try_from(*len).ok()?]);
+        }
         _ => return None,
     };
     elems
@@ -6135,7 +6167,7 @@ fn variant_field_at_offset<'tcx>(
     tcx: TyCtxt<'tcx>,
     enum_rty: RustcTy<'tcx>,
     adt: ty::AdtDef<'tcx>,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
     vidx: rustc_abi::VariantIdx,
     off: u64,
 ) -> Option<(FieldIdx, RustcTy<'tcx>)> {
@@ -6293,7 +6325,7 @@ fn interior_field_at_offset<'tcx>(
     for (idx, fdef) in variant.fields.iter().enumerate() {
         // Trust: rust 1.99 — `FieldDef::ty` returns `Unnormalized<Ty>`; unwrap with
         // `.skip_normalization()` (the offset-0 scalar-field match below is structural).
-        let fty = fdef.ty(tcx, args).skip_normalization();
+        let fty = fdef.ty(tcx, *args).skip_normalization();
         if fty != t_ty {
             continue;
         }
@@ -6342,6 +6374,8 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::InsertField { .. } => "InsertField",
         Inst::ExtractElement { .. } => "ExtractElement",
         Inst::InsertElement { .. } => "InsertElement",
+        // v50 `[value; n]`: named so a refusal says what it refused.
+        Inst::ArraySplat { .. } => "ArraySplat",
         Inst::Const { .. } => "Const",
         Inst::Undef { .. } => "Undef",
         Inst::Assume { .. } => "Assume",
@@ -6408,7 +6442,7 @@ const SCALAR_CANDS: [Ty; 16] = [
 ];
 
 /// Trust (wave-C): re-materialize the lifetime-free `SiteArg` encoding into an intern-equal
-/// `GenericArgsRef` — the SITE args built MIR spells in the `FnDef(site_def_id, _)` func operand.
+/// `GenericArgs` — the SITE args built MIR spells in the `FnDef(site_def_id, _)` func operand.
 /// The encoder (`crate::encode_site_args`) preserved every arg 1:1 (types and, since #197's
 /// follow-up, consts; a region rebuilds as `ReErased` — see below), so this rebuild yields the
 /// exact interned args, which
@@ -6420,7 +6454,7 @@ const SCALAR_CANDS: [Ty; 16] = [
 /// honest way to do that — the alternative is an `unwrap` on a value that came from an encoder in
 /// a different crate. `None` declines the site (the caller returns `unsup`), which is the same
 /// outcome the encoder's own `None` produces: miss a flip, never make a wrong one.
-pub(crate) fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::GenericArgsRef<'tcx>> {
+pub(crate) fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::GenericArgs<'tcx>> {
     let mut out = Vec::with_capacity(enc.len());
     for a in enc {
         out.push(match a {
@@ -6471,7 +6505,7 @@ fn rebuild_site_valtree<'tcx>(tcx: TyCtxt<'tcx>, vt: &SiteValTree) -> Option<ty:
 fn rebuild_positional_args<'tcx>(
     tcx: TyCtxt<'tcx>,
     args: &[SiteArg],
-) -> Option<ty::GenericArgsRef<'tcx>> {
+) -> Option<ty::GenericArgs<'tcx>> {
     let mut v = Vec::with_capacity(args.len());
     for a in args {
         v.push(match a {
@@ -6491,6 +6525,8 @@ fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> Option<RustcTy<'tcx>>
         SiteTy::Bool => tcx.types.bool,
         SiteTy::Char => tcx.types.char,
         SiteTy::Str => tcx.types.str_,
+        SiteTy::Never => tcx.types.never,
+        SiteTy::Foreign(did) => RustcTy::new_foreign(tcx, *did),
         SiteTy::Int(i) => RustcTy::new_int(tcx, *i),
         SiteTy::Uint(u) => RustcTy::new_uint(tcx, *u),
         SiteTy::Float(f) => RustcTy::new_float(tcx, *f),
@@ -6527,7 +6563,7 @@ fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> Option<RustcTy<'tcx>>
         }
         // Trust (wave-FD): the fn-item twin, same positional rebuild.
         SiteTy::FnDef(did, args) => {
-            RustcTy::new_fn_def(tcx, *did, rebuild_positional_args(tcx, args)?)
+            RustcTy::new_fn_def(tcx, *did, rustc_middle::ty::Binder::dummy(rebuild_positional_args(tcx, args)?))
         }
         // Trust (wave-DY): rebuild a trait object from its predicate list at a DUMMY binder and
         // an ERASED region — both were erased at encode for the standing reason, and the
@@ -11969,9 +12005,10 @@ struct ShimCx<'tcx> {
     tcx: TyCtxt<'tcx>,
     span: Span,
     source_info: SourceInfo,
-    /// Trust (C2-spans, consumption): the Module's file table, for resolving each
-    /// `InstrNode.span` back to a rustc `Span`. See `set_span_from_node`.
-    files: Vec<String>,
+    /// Trust (C2-spans, consumption): the Module's file table, resolved against the
+    /// `SourceMap` once per body ([`ResolvedFiles`]), for resolving each `InstrNode.span`
+    /// back to a rustc `Span`. See `set_span_from_node`.
+    files: ResolvedFiles,
     /// Trust (C2-scopes): how many entries the rebuilt `source_scopes` table has, so a node's
     /// stamped index can be range-checked before it becomes a `SourceScope`. Always >= 1 (the
     /// outermost scope always exists), which is why a producer that stamps nothing still
@@ -14335,7 +14372,12 @@ fn plan_loop_markers(func: &trust_ir::Function, rot_let_source: bool) -> Option<
             // Trust (lane ROT): admitted ONLY as the recognized div-guard idiom's assert — the
             // rotation section below sweeps every assert in the body against [`div_idiom`]
             // BEFORE this census runs, so an assert anywhere else has already refused the plan.
-            Inst::Assert { cond } => vec![*cond],
+            // A kind's operands (trust-ir v52) are reads too; a sited assert is refused below.
+            Inst::Assert { cond, kind, site: None } => {
+                let mut v = vec![*cond];
+                v.extend(kind.operands().into_iter().flatten());
+                v
+            }
             _ => return None,
         })
     }
@@ -14741,11 +14783,274 @@ pub(crate) fn parallel_move_snapshots<P: PartialEq + Copy>(moves: &[(P, Option<P
     out
 }
 
+/// Source spelling selects the rustc `const_continue` construction convention.
+/// This is not proof authority: the IR-only plan below independently proves the
+/// skipped header is a pure boolean decision on this edge's exact constant.
+fn record_bool_const_continue_site(
+    points: &mut HashMap<u32, Option<bool>>,
+    span: Span,
+    value: bool,
+) {
+    if span.is_dummy() || span.from_expansion() {
+        return;
+    }
+    points.entry(span.lo().0).and_modify(|v| *v = None).or_insert(Some(value));
+}
+
+fn bool_const_continue_at_source(sites: &HashMap<u32, bool>, span: Option<Span>) -> Option<bool> {
+    let span = span?;
+    // span_from_source_span returns a zero-width, root-context source point.
+    // Do not reinterpret an unresolved, expanded or whole-expression span.
+    if span.is_dummy() || span.from_expansion() || span.lo() != span.hi() {
+        return None;
+    }
+    sites.get(&span.lo().0).copied()
+}
+
+fn bool_const_continue_sites(tcx: TyCtxt<'_>, def: LocalDefId) -> HashMap<u32, bool> {
+    struct Sites<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        points: HashMap<u32, Option<bool>>,
+        remaining: usize,
+        depth: usize,
+        exhausted: bool,
+    }
+    impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for Sites<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.remaining == 0 || self.depth == 256 {
+                self.exhausted = true;
+                return;
+            }
+            self.remaining -= 1;
+            self.depth += 1;
+            if !expr.span.from_expansion()
+                && self.tcx.hir_attrs(expr.hir_id).iter().any(|attr| {
+                    matches!(
+                        attr,
+                        rustc_attr_ir::Attribute::Parsed(
+                            rustc_attr_ir::AttributeKind::ConstContinue(_)
+                        )
+                    )
+                })
+            {
+                if let rustc_hir::ExprKind::Break(destination, Some(value)) = expr.kind {
+                    if destination.label.is_some() && destination.target_id.is_ok() {
+                        if let rustc_hir::ExprKind::Lit(literal) = value.kind {
+                            if let rustc_ast::LitKind::Bool(value) = literal.node {
+                                record_bool_const_continue_site(&mut self.points, expr.span, value);
+                            }
+                        }
+                    }
+                }
+            }
+            rustc_hir::intravisit::walk_expr(self, expr);
+            self.depth -= 1;
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(def) else { return HashMap::new() };
+    let mut sites =
+        Sites { tcx, points: HashMap::new(), remaining: 100_000, depth: 0, exhausted: false };
+    rustc_hir::intravisit::Visitor::visit_expr(&mut sites, &body.value);
+    if sites.exhausted {
+        return HashMap::new();
+    }
+    sites
+        .points
+        .into_iter()
+        .filter_map(|(point, value)| value.map(|value| (point, value)))
+        .collect()
+}
+
+/// One-hop jump threading after the existing MIR parallel parameter copies.
+/// No IR block/SSA use is rewritten: target header locals have already received
+/// every edge argument before the new goto is emitted. The header has no work
+/// other than its Bool CondBr, whose decision is independently known here.
+/// Entry, ordinary continues and unsupported source constants never select this
+/// helper. A miss preserves the original translation and strict comparison.
+fn bool_const_continue_target(
+    func: &trust_ir::Function,
+    dominance: &trust_ir::analysis::DominatorTree,
+    source: BlockId,
+    source_value: bool,
+) -> Option<BlockId> {
+    if source == func.entry || !dominance.is_well_formed() {
+        return None;
+    }
+    let mut block_ids = HashSet::new();
+    let mut values = HashSet::new();
+    for block in &func.blocks {
+        if !block_ids.insert(block.id) {
+            return None;
+        }
+        for (value, _) in &block.params {
+            if !values.insert(*value) {
+                return None;
+            }
+        }
+        for node in &block.body {
+            for value in &node.results {
+                if !values.insert(*value) {
+                    return None;
+                }
+            }
+        }
+    }
+    let block = func.blocks.iter().find(|block| block.id == source)?;
+    let (edge, prefix) = block.body.split_last()?;
+    let Inst::Br { target: header_id, args } = &edge.inst else { return None };
+    if !edge.results.is_empty() || !dominance.strictly_dominates(*header_id, source) {
+        return None;
+    }
+    let header = func.blocks.iter().find(|block| block.id == *header_id)?;
+    let [decision] = header.body.as_slice() else { return None };
+    let Inst::CondBr { cond, then_target, then_args, else_target, else_args } = &decision.inst
+    else {
+        return None;
+    };
+    if !decision.results.is_empty()
+        || !then_args.is_empty()
+        || !else_args.is_empty()
+        || header.params.len() != args.len()
+    {
+        return None;
+    }
+    let position = header.params.iter().position(|(param, ty)| param == cond && *ty == Ty::Bool)?;
+    let value = *args.get(position)?;
+    // A literal ConstContinue lowers its value immediately before this edge.
+    // Do not infer constants through other definitions or a last-write-wins map.
+    let constant = prefix.last()?;
+    if constant.results.as_slice() != [value] {
+        return None;
+    }
+    let Inst::Const { ty: Ty::Bool, value: Constant::Bool(value) } = &constant.inst else {
+        return None;
+    };
+    if *value != source_value {
+        return None;
+    }
+    for target in [then_target, else_target] {
+        if *target == *header_id || *target == func.entry {
+            return None;
+        }
+        if !func.blocks.iter().find(|block| block.id == *target)?.params.is_empty() {
+            return None;
+        }
+    }
+    Some(if *value { *then_target } else { *else_target })
+}
+
+/// Trust (WS5.9/WS8.9, F-117): the Module's file table, resolved ONCE per body against the
+/// session's `SourceMap` — index-aligned with `Module.files`, `None` where the name resolves
+/// to no loaded file (that span drops, as before).
+///
+/// The producer (`lib.rs::to_source_span`) interns `prefer_remapped_unconditionally()`, the
+/// `--remap-path-prefix` rendering, so a published module no longer embeds the checkout
+/// path. The consumer therefore resolves by the SAME projection: a map from each loaded
+/// file's remapped rendering to the file. Two properties are load-bearing:
+///
+/// * **A non-injective remap is REFUSED, never guessed.** If two distinct loaded files
+///   render to one remapped name and the module's table names it, the old `.find` would
+///   have silently bound every span in that file to whichever file the `SourceMap` holds
+///   first — a plausible, wrong DWARF location. This builder fails the body closed with a
+///   named reason instead ([`Unsupported`], so the differential reports it per body), with
+///   ONE disambiguation that is sound by construction: a per-body module's spans were
+///   stamped from THIS crate's THIR, so they can only name a file with a LOCAL path — if
+///   exactly one of the colliding files is local (the others imported from a dependency
+///   that was remapped onto the same virtual root, `new_imported_source_file` keeps those
+///   under their own stable ids), that one is the span's file. Two LOCAL files rendering
+///   alike is the case this cannot reach: `SourceMap::load_file` refuses it at load time
+///   (`refuse_remap_collision`, `rustc_span/src/source_map.rs`), because rustc's stable
+///   file id ignores the local path of a fully remapped file and the second file would
+///   otherwise be compiled from the first's text — measured 2026-09-21, and the reason the
+///   refusal had to move UPSTREAM of this resolver, which only ever sees the survivor.
+///   A collision the table never references is harmless by construction and is not
+///   refused, so a stray sysroot-side collision cannot fail every body in the crate.
+/// * **The local rendering is the FALLBACK.** A name that matches no remapped rendering is
+///   retried against `prefer_local_unconditionally()` — the spelling an older producer, or
+///   the external `frontend/src/span_map.rs` in the trust-ir submodule (which still interns
+///   the local name), wrote. Without any remap both renderings are one string and the
+///   fallback is unreachable.
+struct ResolvedFiles {
+    files: Vec<Option<std::sync::Arc<rustc_span::SourceFile>>>,
+}
+
+impl ResolvedFiles {
+    /// Refusal reason prefix for a non-injective remap; pinned by the `trust-ir-remap-path-identity`
+    /// run-make control, which asserts this exact text.
+    const NON_INJECTIVE_REMAP: &'static str = "non-injective --remap-path-prefix";
+    /// Refusal reason prefix for a collision that involves a VIRTUAL file name (WS5.9
+    /// review): `FileName::DocTest` renders as its host path, so merged doctests of one file
+    /// all spell it, and `<anon>` / `<proc-macro source code>` repeat without any remap.
+    /// Naming `--remap-path-prefix` there would send the user to the wrong knob.
+    const AMBIGUOUS_VIRTUAL: &'static str = "ambiguous virtual file name";
+
+    fn resolve(tcx: TyCtxt<'_>, files: &[String]) -> Result<Self, Unsupported> {
+        let sm = tcx.sess.source_map();
+        let loaded = sm.files();
+        let mut by_remapped: HashMap<String, Vec<std::sync::Arc<rustc_span::SourceFile>>> =
+            HashMap::new();
+        for f in loaded.iter() {
+            by_remapped
+                .entry(f.name.prefer_remapped_unconditionally().to_string())
+                .or_default()
+                .push(f.clone());
+        }
+        let mut out = Vec::with_capacity(files.len());
+        for (index, path) in files.iter().enumerate() {
+            let resolved = match by_remapped.get(path).map(Vec::as_slice) {
+                Some([one]) => Some(one.clone()),
+                Some(many) => {
+                    let local: Vec<_> = many
+                        .iter()
+                        .filter(|f| match &f.name {
+                            rustc_span::FileName::Real(real) => real.local_path().is_some(),
+                            _ => false,
+                        })
+                        .collect();
+                    if let [one] = local.as_slice() {
+                        Some((*one).clone())
+                    } else {
+                        let mut names: Vec<String> = many
+                            .iter()
+                            .map(|f| f.name.prefer_local_unconditionally().to_string())
+                            .collect();
+                        names.sort();
+                        // Name the cause by WHAT collided: two REAL files sharing a rendering
+                        // can only come from the remap, while a virtual name collides without
+                        // one. Both are refused (an ambiguous name binds no span), each by its
+                        // own cause.
+                        let cause = if many.iter().all(|f| f.name.is_real()) {
+                            Self::NON_INJECTIVE_REMAP
+                        } else {
+                            Self::AMBIGUOUS_VIRTUAL
+                        };
+                        return unsup(format!(
+                            "{cause}: {} source files render as `{path}` (files[{index}], {} local): {}",
+                            many.len(),
+                            local.len(),
+                            names.join(", "),
+                        ));
+                    }
+                }
+                Some([]) | None => loaded
+                    .iter()
+                    .find(|f| f.name.prefer_local_unconditionally().to_string() == *path)
+                    .cloned(),
+            };
+            out.push(resolved);
+        }
+        Ok(Self { files: out })
+    }
+
+    fn get(&self, index: u32) -> Option<&std::sync::Arc<rustc_span::SourceFile>> {
+        self.files.get(index as usize)?.as_ref()
+    }
+}
+
 fn build_source_scopes<'tcx>(
-    tcx: TyCtxt<'tcx>,
     hir_id: rustc_hir::HirId,
     body_span: Span,
-    files: &[String],
+    files: &ResolvedFiles,
     scopes: Option<&[trust_ir::ScopeData]>,
 ) -> Result<IndexVec<SourceScope, SourceScopeData<'tcx>>, Unsupported> {
     let mk = |span: Span, parent: Option<SourceScope>| SourceScopeData {
@@ -14776,7 +15081,7 @@ fn build_source_scopes<'tcx>(
         // span there is no "current location" to keep, and a `DUMMY_SP` scope would make
         // codegen mint a lexical block at line 0.
         let span =
-            sc.span.and_then(|s| span_from_source_span(tcx, files, s)).unwrap_or(out[parent].span);
+            sc.span.and_then(|s| span_from_source_span(files, s)).unwrap_or(out[parent].span);
         out.push(mk(span, Some(parent)));
     }
     Ok(out)
@@ -14805,18 +15110,8 @@ fn build_source_scopes<'tcx>(
 /// most common end-of-line span into "no span", and `llvm-dwarfdump` immediately showed
 /// derived epilogue rows collapsing onto the previous statement's line. Reject what is out
 /// of range; resolve what is merely at the edge.
-fn span_from_source_span(
-    tcx: TyCtxt<'_>,
-    files: &[String],
-    sp: trust_ir::SourceSpan,
-) -> Option<Span> {
-    let path = files.get(sp.file as usize)?;
-    let sm = tcx.sess.source_map();
-    let file = sm
-        .files()
-        .iter()
-        .find(|f| f.name.prefer_local_unconditionally().to_string() == *path)
-        .cloned()?;
+fn span_from_source_span(files: &ResolvedFiles, sp: trust_ir::SourceSpan) -> Option<Span> {
+    let file = files.get(sp.file)?;
     if sp.line == 0 {
         return None;
     }
@@ -14840,6 +15135,30 @@ fn span_from_source_span(
     Some(Span::with_root_ctxt(lo, lo))
 }
 
+/// Trust (platform protocols, plan L1a; design Part 3 §3.4): the public face of
+/// [`span_from_source_span`] for consumers outside the derived-MIR shim. The platform pass
+/// (plan L1e) lifts each step of a replayed counterexample trace from the producer's stamped
+/// `trust_ir::SourceSpan` to a rustc `Span` with it, as the label's fallback when its own HIR
+/// call-span index has no entry.
+///
+/// Same contract, unchanged: `files` is the module's file table, the result is a zero-width
+/// point span at the stamped (line, char column), and anything that does not resolve to a
+/// position inside a file this session loaded is `None` — never an approximated position. A
+/// caller that gets `None` keeps its own span; it must not invent one.
+///
+/// The file table is resolved through [`ResolvedFiles`], the same remap-aware resolver the
+/// shim uses, so a stamped name binds the file it binds there. A table that resolver refuses
+/// (a non-injective `--remap-path-prefix`, an ambiguous virtual file name) binds no span at
+/// all: the result is `None`, never a guess at which colliding file was meant.
+pub fn rustc_span_of(
+    tcx: TyCtxt<'_>,
+    files: &[String],
+    sp: trust_ir::SourceSpan,
+) -> Option<Span> {
+    let files = ResolvedFiles::resolve(tcx, files).ok()?;
+    span_from_source_span(&files, sp)
+}
+
 impl<'tcx> ShimCx<'tcx> {
     /// Trust (C2-spans, consumption): re-point `source_info` at an instruction's stamped
     /// location. Unstamped nodes (terminators; pre-span producers) keep the CURRENT span —
@@ -14861,7 +15180,7 @@ impl<'tcx> ShimCx<'tcx> {
             }
         }
         let Some(sp) = node.span else { return };
-        let Some(span) = span_from_source_span(self.tcx, &self.files, sp) else { return };
+        let Some(span) = span_from_source_span(&self.files, sp) else { return };
         self.source_info.span = span;
     }
 
@@ -15089,7 +15408,6 @@ impl<'tcx> ShimCx<'tcx> {
         self.blocks[bb].terminator = Some(Terminator {
             source_info: self.source_info,
             kind,
-            attributes: Default::default(),
         });
         Ok(())
     }
@@ -15658,7 +15976,7 @@ pub enum SigSource<'tcx> {
     /// ABI gate then compares this derivation against rustc's own instantiation of its own
     /// body, so the two-independent-derivations property that makes the gate evidence is
     /// preserved at the instance seam.
-    Instance(ty::GenericArgsRef<'tcx>),
+    Instance(ty::GenericArgs<'tcx>),
 }
 
 /// Trust (C1/M1): compute the ABI-boundary rustc types from `tcx` alone — the same recipe
@@ -15689,8 +16007,7 @@ fn rederive_abi_sig<'tcx>(
         DefKind::Const { .. }
         | DefKind::AssocConst { .. }
         | DefKind::Static { .. }
-        | DefKind::AnonConst { .. }
-        | DefKind::InlineConst { .. } => {
+        | DefKind::AnonConst { .. } => {
             let ty = tcx.type_of(def).instantiate_identity().skip_normalization();
             if ty.has_non_region_param() {
                 return Err(Unsupported { reason: "abi rederive: generic const type".into() });
@@ -15757,7 +16074,7 @@ fn rederive_abi_sig<'tcx>(
 pub(crate) fn rederive_abi_sig_at_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     def: LocalDefId,
-    args: ty::GenericArgsRef<'tcx>,
+    args: ty::GenericArgs<'tcx>,
 ) -> Result<(Vec<RustcTy<'tcx>>, RustcTy<'tcx>), Unsupported> {
     use rustc_hir::def::DefKind;
     let typing_env = ty::TypingEnv::fully_monomorphized();
@@ -15843,6 +16160,9 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
         Some(f) => f,
         None => return unsup("module has no FuncId(0) function"),
     };
+    let const_continue_sites = bool_const_continue_sites(tcx, def);
+    let const_continue_dominance =
+        (!const_continue_sites.is_empty()).then(|| trust_ir::analysis::DominatorTree::new(func));
     let source_provenance = crate::source_provenance::validated_source_provenance(tcx, def, module)
         .map_err(|reason| Unsupported { reason: format!("source provenance: {reason}") })?;
     let sig = match module.func_type(func.ty) {
@@ -16025,11 +16345,97 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             && adt.variants().iter().all(|v| v.fields.len() <= 1))
                         && !built_ret_ty.has_non_region_param()
                         && !built_ret_ty.has_non_region_infer()
-                        && !built_ret_ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized())
+                        && !crate::needs_drop_unrevealed(
+                            tcx,
+                            built_ret_ty,
+                            ty::TypingEnv::fully_monomorphized(),
+                        )
                         // Trust (B3-3): DIRECT-only — see enum_flip_direct_only.
                         && enum_flip_direct_only(module, *eid) =>
                 {
                     built_ret_ty
+                }
+                // Trust (diagnostics 2026-09-19): SPLIT the causes, exactly as the
+                // `Ty::Struct(_)` arm above was split on 2026-08-11 and for the same
+                // reason. Every enum return refusal collapsed into `non-scalar return
+                // type {t:?}` below, so an artifact could not tell Drop-bearing from
+                // wrong-shape from generic from NICHE-ENCODED.
+                //
+                // REPORT EVERY FAILING CONDITION, NOT THE FIRST. Measured 2026-09-19:
+                // `Result<Expr, TypeError>` (clean-kernel's `infer_type` return) fails
+                // BOTH `!needs_drop` AND `enum_flip_direct_only`, because a <=1-field
+                // enum needs_drop precisely when a variant owns a heap pointer -- and
+                // that same pointer is the NICHE rustc encodes the tag into. A
+                // first-failure report would name Drop alone and send the next reader to
+                // relax the Drop conjunct, which is +0 BY CONSTRUCTION since the encoding
+                // test refuses the whole class two lines later. That is the exact
+                // misattribution this split exists to prevent, so it must not be rebuilt
+                // into the split itself.
+                //
+                // STRICTLY ADDITIVE: the guarded arm above is untouched, so the admitted
+                // set is byte-identical; only the refusal path gains reasons.
+                Ty::Enum(eid) => {
+                    let te = ty::TypingEnv::fully_monomorphized();
+                    let mut why: Vec<String> = Vec::new();
+                    match built_ret_ty.kind() {
+                        ty::Adt(adt, _) if !adt.is_enum() => {
+                            why.push(format!("built sibling is not an enum ({built_ret_ty:?})"));
+                        }
+                        ty::Adt(adt, _) => {
+                            if adt.variants().is_empty() {
+                                why.push("uninhabited (no variants)".to_string());
+                            } else if !adt.variants().iter().all(|v| v.fields.len() <= 1) {
+                                why.push("has a multi-field variant (general model)".to_string());
+                            }
+                            if built_ret_ty.has_non_region_param()
+                                || built_ret_ty.has_non_region_infer()
+                            {
+                                why.push("has generic params (concrete-only slice)".to_string());
+                            }
+                            if crate::needs_drop_unrevealed(tcx, built_ret_ty, te) {
+                                why.push("is Drop-bearing".to_string());
+                            }
+                            // `enum_flip_direct_only`'s own two refusing reads. Its third,
+                            // `layout: None`, is the documented FAIL-OPEN and is admitted
+                            // by the guarded arm above, so it cannot arrive here.
+                            match module.enum_def(*eid) {
+                                None => why.push("def unresolvable in module".to_string()),
+                                Some(def) => match &def.layout {
+                                    Some(desc) => {
+                                        let enc = match desc.encoding {
+                                            trust_ir::ty::EnumTagEncoding::Direct { .. } => None,
+                                            trust_ir::ty::EnumTagEncoding::Niche { .. } => {
+                                                Some("Niche")
+                                            }
+                                            trust_ir::ty::EnumTagEncoding::Untagged => {
+                                                Some("Untagged")
+                                            }
+                                            // Trust: IR65 does not widen the Direct-only flip.
+                                            trust_ir::ty::EnumTagEncoding::SingleInhabited { .. } => {
+                                                Some("SingleInhabited")
+                                            }
+                                        };
+                                        if let Some(enc) = enc {
+                                            why.push(format!(
+                                                "is not Direct-tagged (flip lane is \
+                                                 Direct-only): {enc}"
+                                            ));
+                                        }
+                                    }
+                                    None => why.push("has no layout descriptor".to_string()),
+                                },
+                            }
+                        }
+                        _ => {
+                            why.push(format!("built sibling is not an ADT ({built_ret_ty:?})"));
+                        }
+                    }
+                    if why.is_empty() {
+                        // Unreachable: the guarded arm admits exactly the negation of the
+                        // conditions tested above. Fail closed rather than claim a cause.
+                        why.push("refused by the guarded arm for no tested reason".to_string());
+                    }
+                    return unsup(format!("enum return type {}", why.join("; ")));
                 }
                 // Trust (B2-2): the producer's `-> &str` spelling is now first-class
                 // `Ty::FatPtr(Str)`. Same rule as the former tuple-branch arm: declare
@@ -16067,13 +16473,12 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
     // Trust (C2-scopes): built BEFORE the walk, because `set_span_from_node` range-checks
     // every stamped index against it — a scope table assembled afterwards could only be
     // checked afterwards, i.e. never on the path that uses it.
-    let mut source_scopes = build_source_scopes(
-        tcx,
-        tcx.local_def_id_to_hir_id(def),
-        span,
-        &module.files,
-        func.scopes.as_deref(),
-    )?;
+    // Trust (WS5.9/WS8.9): the file table is resolved ONCE, before the scope table and the
+    // walk that both consume it, and a non-injective remap fails the body here — closed,
+    // with its reason — rather than binding spans to the first file that happened to match.
+    let files = ResolvedFiles::resolve(tcx, &module.files)?;
+    let mut source_scopes =
+        build_source_scopes(tcx.local_def_id_to_hir_id(def), span, &files, func.scopes.as_deref())?;
     let mut provenance_scopes = HashMap::<BlockId, SourceScope>::new();
     if let Some(provenance) = &source_provenance {
         let owner = tcx.local_def_id_to_hir_id(def).owner;
@@ -16112,7 +16517,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
         tcx,
         span,
         source_info,
-        files: module.files.clone(),
+        files,
         scope_count: u32::try_from(source_scopes.len()).unwrap_or(u32::MAX),
         local_decls: IndexVec::new(),
         blocks: IndexVec::new(),
@@ -16943,7 +17348,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     if let ty::Adt(adt, args) = enum_rty.kind() {
                         if adt.is_enum() && vidx.as_usize() < adt.variants().len() {
                             if let Some((fidx, field_ty)) =
-                                variant_field_at_offset(tcx, enum_rty, *adt, args, vidx, off)
+                                variant_field_at_offset(tcx, enum_rty, *adt, *args, vidx, off)
                             {
                                 // The loaded trust-ir type must be exactly the field's scalar
                                 // spelling — a width/signedness disagreement is a different read.
@@ -17042,7 +17447,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         if let ty::Adt(adt, args) = enum_rty.kind() {
                             if adt.is_enum() && vidx.as_usize() < adt.variants().len() {
                                 if let Some((fidx, field_ty)) =
-                                    variant_field_at_offset(tcx, enum_rty, *adt, args, vidx, off)
+                                    variant_field_at_offset(tcx, enum_rty, *adt, *args, vidx, off)
                                 {
                                     if !field_ty.has_non_region_param()
                                         && !field_ty.has_non_region_infer()
@@ -17328,10 +17733,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             }
                             _ => return None,
                         };
-                        match &n4.inst {
-                            Inst::Assert { cond } if *cond == ok => Some(ok),
-                            _ => None,
-                        }
+                        is_idiom_assert(&n4.inst, ok, overflow_assert_kind(*op)).then_some(ok)
                     })();
                     if idiom.is_none() {
                         return unsup("Overflow outside the canonical assert idiom");
@@ -17510,6 +17912,25 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     cx.assign(cur, tmp, Rvalue::BinaryOp(mir_op, Box::new((l, r))));
                     cx.env.insert(result, VOp::Plc(tmp));
                     i += 2;
+                }
+                // ---- checks-OFF shifts with Rust's count mask: Const + [Cast] + And + BinOp ----
+                // The producer's `emit_masked_shift_count` unit, re-emitted as the bare
+                // `Shl`/`Shr(l, amt)` built MIR carries (a plain MIR shift masks its own count;
+                // see `shift_masked_unit`).
+                Inst::Const { .. }
+                    if !cx.overflow_checks && shift_masked_unit(nodes, i).is_some() =>
+                {
+                    let unit = shift_masked_unit(nodes, i).expect("guard checked");
+                    let l = cx.operand(unit.lhs)?;
+                    let r = cx.operand(unit.amt)?;
+                    let rty = match cx.scalar_ty(&unit.ty) {
+                        Some(t) => t,
+                        None => return unsup("shift on non-scalar type"),
+                    };
+                    let tmp = cx.temp(rty);
+                    cx.assign(cur, tmp, Rvalue::BinaryOp(unit.mir_op, Box::new((l, r))));
+                    cx.env.insert(unit.result, VOp::Plc(tmp));
+                    i += unit.len;
                 }
                 // ---- general integer / bool → integer cast (MIR `IntToInt`) ----
                 // A STANDALONE `x as T` (or `bool as T`) the producer lowered to a single
@@ -18080,7 +18501,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                     AggregateKind::Adt(
                                         adt_def.did(),
                                         FIRST_VARIANT,
-                                        args,
+                                        *args,
                                         None,
                                         None,
                                     ),
@@ -18191,7 +18612,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                     field_ops.iter().zip(adt_def.non_enum_variant().fields.iter())
                                 {
                                     if norm(op.ty(&cx.local_decls, tcx))
-                                        != norm(fdef.ty(tcx, args).skip_normalization())
+                                        != norm(fdef.ty(tcx, *args).skip_normalization())
                                     {
                                         return unsup(
                                             "struct return: field operand type != field type (isize/usize respell divergence)",
@@ -18535,7 +18956,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     };
                     if swr_split {
                         let r = cx.new_block();
-                        cx.terminate(cur, TerminatorKind::Goto { target: r })?;
+                        cx.terminate(cur, TerminatorKind::Goto { target: r, loop_hint_attrs: Default::default() })?;
                         cx.terminate(r, TerminatorKind::Return)?;
                     } else {
                         cx.terminate(cur, TerminatorKind::Return)?;
@@ -18851,14 +19272,36 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                 Some(h) => h,
                                 None => {
                                     let h = cx.new_block();
-                                    cx.terminate(h, TerminatorKind::Goto { target: target_bb })?;
+                                    cx.terminate(h, TerminatorKind::Goto { target: target_bb, loop_hint_attrs: Default::default() })?;
                                     cx.mf_loop_hdr = Some(h);
                                     h
                                 }
                             };
                         }
                     }
-                    cx.terminate(cur, TerminatorKind::Goto { target: target_bb })?;
+                    // rustc's ConstContinue stores the new state and jumps to
+                    // the statically selected arm. Preserve every edge copy and
+                    // marker above; only bypass a proven pure Bool decision.
+                    if cx.mf_loop_sites().is_none() {
+                        if let Some(dominance) = &const_continue_dominance {
+                            if let Some(value) = bool_const_continue_at_source(
+                                &const_continue_sites,
+                                nodes[i]
+                                    .span
+                                    .and_then(|sp| span_from_source_span(&cx.files, sp)),
+                            ) {
+                                if let Some(arm) =
+                                    bool_const_continue_target(func, dominance, blk.id, value)
+                                {
+                                    target_bb =
+                                        *cx.block_map.get(&arm).ok_or_else(|| Unsupported {
+                                            reason: "ConstContinue target missing MIR block".into(),
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                    cx.terminate(cur, TerminatorKind::Goto { target: target_bb, loop_hint_attrs: Default::default() })?;
                     i += 1;
                 }
                 Inst::CondBr { cond, then_target, then_args, else_target, else_args } => {
@@ -18955,7 +19398,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         //     `Goto` block onto its incoming edges (LEDGER L3), so the extra
                         //     block is invisible there — it can cost no `agreed`.
                         let tramp = cx.new_block();
-                        cx.terminate(tramp, TerminatorKind::Goto { target: else_bb })?;
+                        cx.terminate(tramp, TerminatorKind::Goto { target: else_bb, loop_hint_attrs: Default::default() })?;
                         false_edge = tramp;
                     }
                     // Trust (wave-DR): the same two halves lane K needs, for the same two
@@ -18980,7 +19423,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         }
                         c = Operand::Move(res);
                         let tramp = cx.new_block();
-                        cx.terminate(tramp, TerminatorKind::Goto { target: else_bb })?;
+                        cx.terminate(tramp, TerminatorKind::Goto { target: else_bb, loop_hint_attrs: Default::default() })?;
                         false_edge = tramp;
                     }
                     // Same encoding as the MIR builder: SwitchTargets::static_if(0, else, then).
@@ -19275,13 +19718,13 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         for (_, tbb) in targets.iter_mut() {
                             if *tbb == want {
                                 let tramp = cx.new_block();
-                                cx.terminate(tramp, TerminatorKind::Goto { target: want })?;
+                                cx.terminate(tramp, TerminatorKind::Goto { target: want, loop_hint_attrs: Default::default() })?;
                                 *tbb = tramp;
                             }
                         }
                         if default_bb == want {
                             let tramp = cx.new_block();
-                            cx.terminate(tramp, TerminatorKind::Goto { target: want })?;
+                            cx.terminate(tramp, TerminatorKind::Goto { target: want, loop_hint_attrs: Default::default() })?;
                             default_bb = tramp;
                         }
                     }
@@ -19345,7 +19788,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                     let mut t = want;
                                     for _ in 0..k {
                                         let nb = cx.new_block();
-                                        cx.terminate(nb, TerminatorKind::Goto { target: t })?;
+                                        cx.terminate(nb, TerminatorKind::Goto { target: t, loop_hint_attrs: Default::default() })?;
                                         t = nb;
                                     }
                                     *tbb = t;
@@ -19417,7 +19860,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             let mut redirect = want;
                             for _ in 0..k {
                                 let nb = cx.new_block();
-                                cx.terminate(nb, TerminatorKind::Goto { target: redirect })?;
+                                cx.terminate(nb, TerminatorKind::Goto { target: redirect, loop_hint_attrs: Default::default() })?;
                                 redirect = nb;
                             }
                             for (_, tbb) in targets.iter_mut() {
@@ -19464,7 +19907,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                             let mut redirect = want;
                             for _ in 0..k {
                                 let nb = cx.new_block();
-                                cx.terminate(nb, TerminatorKind::Goto { target: redirect })?;
+                                cx.terminate(nb, TerminatorKind::Goto { target: redirect, loop_hint_attrs: Default::default() })?;
                                 redirect = nb;
                             }
                             for (_, tbb) in targets.iter_mut() {
@@ -19479,7 +19922,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     }
                     if targets.is_empty() {
                         // An irrefutable-only match (`match k { n => .. }`) — built emits no switch.
-                        cx.terminate(cur, TerminatorKind::Goto { target: default_bb })?;
+                        cx.terminate(cur, TerminatorKind::Goto { target: default_bb, loop_hint_attrs: Default::default() })?;
                     } else {
                         let switch_targets =
                             rustc_middle::mir::SwitchTargets::new(targets.into_iter(), default_bb);
@@ -19791,7 +20234,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         // +2 agreed, 0 agreed lost, 0 markers_exact lost, 0 new mismatches.
                         let reconstructs = node
                             .span
-                            .and_then(|sp| span_from_source_span(tcx, &cx.files, sp))
+                            .and_then(|sp| span_from_source_span(&cx.files, sp))
                             .is_some();
                         if !reconstructs {
                             return unsup(
@@ -19850,11 +20293,10 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     {
                         sig
                     } else {
-                        tcx.try_normalize_erasing_regions(
-                            ty::TypingEnv::fully_monomorphized(),
-                            ty::Unnormalized::new_wip(sig),
-                        )
-                        .unwrap_or(sig)
+                        // And inside `mir_built` in the analysis mode, where a projection
+                        // chain that ends at an opaque leaves it an alias.
+                        let te = ty::TypingEnv::fully_monomorphized();
+                        crate::producer_try_normalize(tcx, te, sig).unwrap_or(sig)
                     };
                     if sig.c_variadic() {
                         return unsup("Call(variadic callee)");
@@ -20266,16 +20708,27 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     // Empty outside the class, so every other body is byte-identical.
                     let cf_fields_plan = cx.mf_call_fwd_fields();
                     let cf_pairs_plan = cx.mf_call_fwd_pairs();
+                    // Trust (F7, 2026-09-30): forwarded `&mut` params that must be reborrowed
+                    // rather than moved, as `(argument index, param place, reborrow, type)`.
+                    // Finished just before the terminator; see the `Reborrow` arm below.
+                    let mut f7_reborrows: Vec<(usize, Place<'tcx>, Rvalue<'tcx>, RustcTy<'tcx>)> =
+                        Vec::new();
                     for (a, &want) in args.iter().zip(sig.inputs().iter()) {
                         let cf_field = cf_fields_plan.contains(a) || cf_pairs_plan.contains(a);
                         // Trust (wave-8a): a forwarded opaque `"Ptr"` param (`g(r)`, `s.method()`
-                        // receiver) — pass its arg place directly. Built spells this
-                        // `_x = &(*_p); call(move _x)`; forwarding `_p` with `move` is congruent
-                        // under the differential's `ref-alias`/`move-as-copy` normalizations, and
-                        // `move` is valid for both `&T` (Copy — reads it) and `&mut T`. Its
-                        // declared type IS the built ref type (`param_rty` threaded it), so the
-                        // exact type check below still proves fidelity; a respell can't touch a
-                        // ref. Any NON-forward use of a `Ptr` param already failed in `operand()`.
+                        // receiver) — pass its arg place directly. Built reborrows it at the
+                        // coercion site, `_x = &(*_p); g(move _x)` (`&mut (*_p)` for a unique
+                        // one; measured with `-Zdump-mir=built` on
+                        // tests/run-make/trust-flip-forwarded-ptr-param); the differential's
+                        // `ref-alias`/`move-as-copy` normalizations make the direct forward
+                        // congruent. Its declared type IS the built ref type
+                        // (`param_rty` threaded it), so the exact type check below still proves
+                        // fidelity; a respell can't touch a ref. Any NON-forward use of a `Ptr`
+                        // param already failed in `operand()`. The OPERAND KIND is chosen by
+                        // `forwarded_ptr_arg` (F7): wave-8a passed `move _p` unconditionally,
+                        // arguing that `move` "is valid for both `&T` (Copy — reads it) and
+                        // `&mut T`". It is not: MIR forbids any read of a place after
+                        // `Operand::Move`, and the same body may read `_p` again.
                         let op = match cx.fwd_ptr_params.get(a).copied() {
                             Some(place) => {
                                 // Trust (wave-30, interior-borrow-as-ARG FLIP): a forwarded ptr param
@@ -20304,7 +20757,34 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                         None => Operand::Move(place),
                                     }
                                 } else {
-                                    Operand::Move(place)
+                                    // Trust (F7, 2026-09-30): the forward `g(_p)` must leave
+                                    // `_p` readable for every later use — see
+                                    // `forwarded_ptr_arg`. Liveness, not a use count, decides
+                                    // whether a unique reference may still be moved: one call in
+                                    // a loop is one lexical use and many dynamic ones. It is
+                                    // asked only where the answer changes the spelling.
+                                    let read_after = || value_read_after_node(func, blk, i, *a);
+                                    match forwarded_ptr_arg(tcx, place, got, read_after) {
+                                        ForwardedPtrArg::Operand(op) => op,
+                                        // The reborrow temp is NOT minted here: a plan-owned
+                                        // site below (wave-CF, lane SC, lane G21, wave-WB8,
+                                        // lane G17) may take this argument as a bare place and
+                                        // mint built's own marked `t = &mut (*_p)` for it, and
+                                        // a temp minted here would be reborrowed a second time
+                                        // (two temps where built has one). The place is held
+                                        // here and `f7_reborrows` finishes it, after every such
+                                        // site, only if no site replaced it.
+                                        ForwardedPtrArg::Reborrow(rv) => {
+                                            f7_reborrows.push((mir_args.len(), place, rv, got));
+                                            Operand::Move(place)
+                                        }
+                                        ForwardedPtrArg::Refuse => {
+                                            return unsup(
+                                                "F7: a forwarded non-Copy pointer param read \
+                                                 again after the call",
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             None => match str_operand.get(a) {
@@ -21545,6 +22025,24 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         .filter(|ci| cx.mf_unit_chain().is_some_and(|p| ci + 1 == p.calls.len()))
                         .and_then(|_| cx.uc_unit);
                     let dest = cf_unit.or(cf_ret).or(seq_unit).or(uc_final_unit).unwrap_or(dest);
+                    // Trust (F7, 2026-09-30): finish each forwarded `&mut` param that is read
+                    // again after this call. Every plan-owned argument site has run by now; one
+                    // that took the argument replaced the held `move _p` with its own reborrow
+                    // temp, and nothing more is done for it. Any argument still holding that
+                    // `move _p` is reborrowed here — built's `_t = &mut (*_p); g(move _t)` — so
+                    // no read of `_p` follows a move of it. The temp comes after the
+                    // destination's, which is built's order (`as_temp` opens the destination
+                    // before it evaluates the arguments).
+                    for (ai, place, rv, ty) in f7_reborrows {
+                        let Some(slot) = mir_args.get_mut(ai) else {
+                            return unsup("F7: a held forwarded argument has no operand");
+                        };
+                        if matches!(&slot.node, Operand::Move(p) if *p == place) {
+                            let tmp = cx.temp(ty);
+                            cx.assign(cur, tmp, rv);
+                            slot.node = Operand::Move(tmp);
+                        }
+                    }
                     // Trust (wave-C): spell the SITE identity `FnDef(site_def_id, site_args)` — exactly
                     // what built MIR writes. For a zero-generic callee this is `FnDef(def_id, [])` (the
                     // wave-6 spelling, byte-identical). The comparator's `raw_call_channel` re-verifies
@@ -21554,7 +22052,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                     // callee-path span here, so the call site's span is strictly closer than
                     // the body-constant def_span.
                     let func =
-                        Operand::function_handle(tcx, site_def_id, site_args, cx.source_info.span);
+                        Operand::function_handle(tcx, site_def_id, site_args.as_slice(), cx.source_info.span);
                     // The call splits the MIR chain exactly like an assert.
                     let succ = cx.new_block();
                     cx.terminate(
@@ -21917,7 +22415,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                                 }
                                 let fidx = FieldIdx::from_usize(k);
                                 let field_ty =
-                                    variant.fields[fidx].ty(tcx, args).skip_normalization();
+                                    variant.fields[fidx].ty(tcx, *args).skip_normalization();
                                 if cx.ir_scalar_of_body(field_ty).is_none() {
                                     return unsup(
                                         "enum payload field non-scalar (outside fragment)",
@@ -22334,7 +22832,7 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
         });
     }
 
-    Ok(MirLowering {
+    let mut lowering = MirLowering {
         // Clone the tiny per-body translation map before moving the lowering
         // context's block/local tables into `Body::new`.  Consumers use only
         // `BlockId` lookup followed by canonical CFG-role reconstruction;
@@ -22352,7 +22850,98 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
             None,
             None,
         ),
-    })
+    };
+    mutate_derived_assert_msg_for_test(tcx, def, &mut lowering.body);
+    Ok(lowering)
+}
+
+/// Trust (2026-09-30, F3 review round 3, ruling 2): a TEST-ONLY mutation control for the storage
+/// rule `mir_differential::compare_derived` applies to the REAL derived body.
+///
+/// `compare_derived` extracts both bodies into the verifier's model before comparing them, and
+/// that extraction keeps an `Assert` message's KIND but drops its operands, so the canonical and
+/// marker channels are blind to them by construction. The one check that reads them is
+/// `mir_storage_dead_use` (rustc's `-Zlint-mir` storage rule over this `Body`, with
+/// `PlaceContext::is_use`), which clears `markers_exact` on a use of a local whose storage may be
+/// dead. No producer is known to emit such a use (the overflow arm above builds the message from
+/// the very operands the compared `*WithOverflow` rvalue reads), so without this control that
+/// rule's reach over message operands would be argued rather than run.
+///
+/// Armed by `-Ztrust-test-mutate-derived-assert-msg` (a TRACKED session option, never the
+/// environment: a control that changes a verdict must be part of what the crate hash covers), this
+/// rewrites the FIRST overflow-assert message operand
+/// (a bare local, copied or moved) for which the same block has already retired a same-typed
+/// local with `StorageDead` (and not revived it), to read that retired local: a misbinding every
+/// other channel of the differential is blind to. It logs the rewrite at `info` and returns.
+///
+/// FENCED by the driver (`rustc_driver_impl`'s `trust_option_domain_error`): it requires
+/// `-Ztrust-verify=off -Ztrust-ir-lower -Ztrust-ir-flip=no` and refuses every `-Ztrust-dump`
+/// sink, so the mutated derived body is never installed and no report is ever written from it.
+/// INERT here too unless the flip is off for this session (`flip_registry::flip_session_enabled`),
+/// as a second line. Its only observable is the `info` line above;
+/// `tests/run-make/trust-ir-derived-assert-msg-storage-rule` pins the fence and that line, and
+/// `crates/trust-mir-extract/tests/derived_assert_msg_storage_rule.rs` runs the storage rule on
+/// real compiler-built bodies, planted and unplanted.
+fn mutate_derived_assert_msg_for_test(tcx: TyCtxt<'_>, def: LocalDefId, body: &mut Body<'_>) {
+    if !tcx.sess.opts.unstable_opts.trust_test_mutate_derived_assert_msg
+        || crate::flip_registry::flip_session_enabled(tcx)
+    {
+        return;
+    }
+    let local_tys: Vec<RustcTy<'_>> = body.local_decls.iter().map(|decl| decl.ty).collect();
+    for (bb, data) in body.basic_blocks_mut().iter_enumerated_mut() {
+        let Some(terminator) = data.terminator.as_mut() else { continue };
+        let TerminatorKind::Assert { msg, .. } = &mut terminator.kind else { continue };
+        let AssertKind::Overflow(_, lhs, rhs) = &mut **msg else { continue };
+        for operand in [lhs, rhs] {
+            let (Operand::Copy(place) | Operand::Move(place)) = operand else { continue };
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let from = place.local;
+            // A same-typed local this block retired and did not revive. The marker statements are
+            // recognised by equality with `mf_gate::marker_kind`, so this reader spells neither
+            // marker variant (`marker_gate_invariant_tests` pins where those are spelled).
+            let retired = (0..local_tys.len()).map(Local::from_usize).filter(|&dead| {
+                dead != from
+                    && local_tys.get(dead.as_usize()) == local_tys.get(from.as_usize())
+                    && data.statements.iter().fold(false, |is_dead, statement| {
+                        if statement.kind == mf_gate::marker_kind(dead, false) {
+                            true
+                        } else if statement.kind == mf_gate::marker_kind(dead, true) {
+                            false
+                        } else {
+                            is_dead
+                        }
+                    })
+            });
+            if let Some(to) = retired.into_iter().next() {
+                place.local = to;
+                tracing::info!(
+                    target: "trust_thir_lower::to_mir",
+                    ?def,
+                    ?bb,
+                    ?from,
+                    ?to,
+                    "TEST MUTATION (-Ztrust-test-mutate-derived-assert-msg): a derived \
+                     assert-message operand now reads a local whose storage is dead"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Trust (F3 review, round 4, 2026-09-30): the storage rule `mir_differential::compare_derived`
+/// applies to the REAL derived `mir::Body` (`mir_differential::mir_storage_dead_use`, kept
+/// `pub(crate)` in the frozen file), reachable for the in-process witness
+/// `crates/trust-mir-extract/tests/derived_assert_msg_storage_rule.rs`. That test runs it on bodies
+/// the compiler itself built, because an embedded `rustc_driver::run_compiler` frontend may not
+/// lower Trust-IR at all (`EmbeddedNoOfficialEvidence`), so it cannot reach `compare_derived`.
+/// Read-only and verdict-free: it returns the rule's finding and decides nothing.
+#[doc(hidden)]
+pub fn derived_mir_storage_dead_use(body: &Body<'_>) -> Option<String> {
+    crate::mir_differential::mir_storage_dead_use(body)
 }
 
 /// Recover a Trust-IR integer Switch case as raw fixed-width bits. V24's
@@ -22541,6 +23130,120 @@ fn signed_int_min(ty: &Ty) -> Option<i128> {
     Some(if w == 128 { i128::MIN } else { -(1i128 << (w - 1)) })
 }
 
+/// Trust (F7, 2026-09-30): how a forwarded `"Ptr"`-class param is passed as a call argument.
+enum ForwardedPtrArg<'tcx> {
+    /// Pass this operand directly.
+    Operand(Operand<'tcx>),
+    /// Assign this rvalue (a reborrow of the param) to a fresh temp and pass the temp by move.
+    Reborrow(Rvalue<'tcx>),
+    /// No spelling both moves the value and leaves the param readable: fail closed.
+    Refuse,
+}
+
+/// Trust (F7, 2026-09-30): the argument a forwarded `"Ptr"` param becomes, in MIR building's own
+/// spelling rather than a prediction of what codegen tolerates.
+///
+/// Wave-8a passed the param as `move _p` unconditionally. MIR forbids any read of a place after
+/// `Operand::Move` (the callee may own the place: the MIR interpreter's in-place argument passing
+/// destroys the value stored there, and the MIR inliner reuses a moved temporary as the callee's
+/// own parameter), so a body that forwards `_p` and then reads it again, by a second forward, a
+/// load through it or the same call on the next loop iteration, was ill-formed MIR. Its objects
+/// only came out right because a reference is a scalar that codegen moves and copies alike
+/// (reports/2026-09-29-crystal-callee-sidecar-retired.md, F7). The rules:
+///
+/// * a shared or raw pointer is `Copy`: `copy _p`, the spelling `consume_by_copy_or_move` gives a
+///   `Copy` place. Built reborrows instead (`_t = &(*_p)`), which is the same value; the temp is
+///   not minted for the reason given for a last-use unique reference below;
+/// * a unique reference that is `read_after` the call is reborrowed, `_t = &mut (*_p); g(move _t)`,
+///   the reborrow the coercion site inserts in built MIR;
+/// * a unique reference read by nothing after the call may be moved: this is its last use, and
+///   minting the temp there would shift every later local against the shim's marker plans for no
+///   ownership gain;
+/// * any other type (the `"Ptr"` class admits none today) is moved only when nothing reads it
+///   afterwards, and refused otherwise.
+///
+/// `read_after` is asked only for the types whose spelling depends on it, since a liveness walk
+/// is not free and a shared pointer's answer is `copy` whatever it says.
+fn forwarded_ptr_arg<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    place: Place<'tcx>,
+    pty: RustcTy<'tcx>,
+    read_after: impl FnOnce() -> bool,
+) -> ForwardedPtrArg<'tcx> {
+    match pty.kind() {
+        ty::Ref(_, _, m) if m.is_mut() => {
+            if read_after() {
+                ForwardedPtrArg::Reborrow(Rvalue::Ref(
+                    tcx.lifetimes.re_erased,
+                    BorrowKind::Mut { kind: rustc_middle::mir::MutBorrowKind::Default },
+                    tcx.mk_place_deref(place),
+                ))
+            } else {
+                ForwardedPtrArg::Operand(Operand::Move(place))
+            }
+        }
+        ty::Ref(..) | ty::RawPtr(..) => ForwardedPtrArg::Operand(Operand::Copy(place)),
+        _ if read_after() => ForwardedPtrArg::Refuse,
+        _ => ForwardedPtrArg::Operand(Operand::Move(place)),
+    }
+}
+
+/// Trust (F7, 2026-09-30): may `v` be READ again after node `i` of `blk` has executed? True when a
+/// later node of `blk` uses it, or when any node of a block reachable from `blk`'s terminator
+/// does, which, when `blk` lies on a cycle, includes every node of `blk` itself, node `i` too.
+/// This is liveness, not a use count: a call inside a loop is one lexical use and many dynamic
+/// ones. It over-approximates on purpose: a terminator whose successors it cannot enumerate, or a
+/// branch to a block the function does not declare, counts as a later read. Uses are found by
+/// `Inst::uses_value`, trust-ir's exhaustive operand walk.
+fn value_read_after_node(
+    func: &trust_ir::Function,
+    blk: &trust_ir::Block,
+    i: usize,
+    v: ValueId,
+) -> bool {
+    fn succs(block: &trust_ir::Block) -> Option<Vec<BlockId>> {
+        match &block.body.last()?.inst {
+            Inst::Br { target, .. } => Some(vec![*target]),
+            Inst::CondBr { then_target, else_target, .. } => {
+                Some(vec![*then_target, *else_target])
+            }
+            Inst::Switch { default, cases, .. } => {
+                Some(cases.iter().map(|c| c.target).chain(std::iter::once(*default)).collect())
+            }
+            Inst::Invoke { normal_dest, unwind_dest, .. } => {
+                Some(vec![*normal_dest, *unwind_dest])
+            }
+            Inst::Return { .. } | Inst::Resume { .. } | Inst::Unreachable => Some(Vec::new()),
+            _ => None,
+        }
+    }
+    if blk.body.iter().skip(i + 1).any(|n| n.inst.uses_value(v)) {
+        return true;
+    }
+    let Some(mut work) = succs(blk) else {
+        return true;
+    };
+    let by_id: HashMap<BlockId, &trust_ir::Block> =
+        func.blocks.iter().map(|x| (x.id, x)).collect();
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(&block) = by_id.get(&b) else {
+            return true;
+        };
+        if block.body.iter().any(|n| n.inst.uses_value(v)) {
+            return true;
+        }
+        match succs(block) {
+            Some(next) => work.extend(next),
+            None => return true,
+        }
+    }
+    false
+}
+
 /// Trust (wave-U, adversarial-review #3): does any node in `rest` consume value `v` as an operand?
 /// Used to fail-close a div/rem whose RESULT is DEAD. A dead div's value expression can be dropped
 /// by the comparator's pure-assign elimination (whose soundness assumes a dropped assign is
@@ -22565,7 +23268,10 @@ fn value_used_in(rest: &[InstrNode], v: ValueId) -> bool {
         Inst::Select { cond, then_val, else_val, .. } => {
             *cond == v || *then_val == v || *else_val == v
         }
-        Inst::Assert { cond } | Inst::Assume { cond } => *cond == v,
+        Inst::Assume { cond } => *cond == v,
+        // trust-ir's canonical walk: the condition, a kind's operands (v52) and a sited assert's
+        // run-time location (v54).
+        Inst::Assert { .. } => n.inst.uses_value(v),
         Inst::Store { ptr, value, .. } => *ptr == v || *value == v,
         Inst::Load { ptr, .. } => *ptr == v,
         Inst::Return { values } => has(values),
@@ -22584,6 +23290,9 @@ fn value_used_in(rest: &[InstrNode], v: ValueId) -> bool {
             *array == v || *index == v || *value == v
         }
         Inst::ExtractElement { array, index, .. } => *array == v || *index == v,
+        // v50 `[value; n]` reads its one operand (enumerated, so a use there is not read as
+        // dead).
+        Inst::ArraySplat { value, .. } => *value == v,
         _ => false,
     })
 }
@@ -22604,11 +23313,8 @@ fn div_idiom(nodes: &[InstrNode], i: usize) -> Option<DivIdiom> {
         _ => return None,
     };
     let nz = *n1.results.first()?;
-    // n2: `Assert(divisor != 0)`.
-    match &nodes.get(i + 2)?.inst {
-        Inst::Assert { cond } if *cond == nz => {}
-        _ => return None,
-    }
+    // n2: `Assert(divisor != 0)` — its kind is checked against the op below.
+    let n2 = &nodes.get(i + 2)?.inst;
     // UNSIGNED: n3 = `[U]Div/Rem(dividend, divisor)`. (Signed div/rem ALWAYS carries the overflow
     // guard, so a `UDiv`/`URem` here means the whole idiom is unsigned.)
     let n3 = nodes.get(i + 3)?;
@@ -22623,7 +23329,11 @@ fn div_idiom(nodes: &[InstrNode], i: usize) -> Option<DivIdiom> {
             // UNSIGNED type. Detection infers signedness from the opcode, so cross-check it against
             // the type — a `UDiv{ty:i32}` (which built would guard with a MIN/-1 overflow assert we
             // would omit) fails closed here, independent of the producer's op/type coherence.
-            if *ty == zty && *rhs == divisor && is_unsigned_int(&zty) {
+            if *ty == zty
+                && *rhs == divisor
+                && is_unsigned_int(&zty)
+                && is_idiom_assert(n2, nz, by_zero_assert_kind(mir_op))
+            {
                 return Some(DivIdiom {
                     op: mir_op,
                     signed: false,
@@ -22689,10 +23399,7 @@ fn div_idiom(nodes: &[InstrNode], i: usize) -> Option<DivIdiom> {
         }
         _ => return None,
     };
-    match &nodes.get(i + 9)?.inst {
-        Inst::Assert { cond } if *cond == sel => {}
-        _ => return None,
-    }
+    let n9 = &nodes.get(i + 9)?.inst;
     let n10 = nodes.get(i + 10)?;
     let (mir_op, result) = match &n10.inst {
         Inst::BinOp { op: BinOp::SDiv, ty, lhs, rhs }
@@ -22707,7 +23414,24 @@ fn div_idiom(nodes: &[InstrNode], i: usize) -> Option<DivIdiom> {
         }
         _ => return None,
     };
+    // The two asserts name the panics the op's MIR asserts are: division (or remainder) by
+    // zero, then the signed `MIN / -1` (or `MIN % -1`) overflow.
+    let min_overflow = IrAssertKind::Overflow(if mir_op == MirBinOp::Div {
+        AssertOverflowOp::Div
+    } else {
+        AssertOverflowOp::Rem
+    });
+    if !is_idiom_assert(n2, nz, by_zero_assert_kind(mir_op))
+        || !is_idiom_assert(n9, sel, min_overflow)
+    {
+        return None;
+    }
     Some(DivIdiom { op: mir_op, signed: true, ty: zty, dividend, divisor, result, len: 11 })
+}
+
+/// Trust (trust-ir v52): the kind of the divisor-is-zero check MIR asserts before `op`.
+fn by_zero_assert_kind(op: MirBinOp) -> IrAssertKind {
+    if op == MirBinOp::Rem { IrAssertKind::RemByZero } else { IrAssertKind::DivByZero }
 }
 
 /// The producer's CHECKED-SHIFT idiom, parsed and fully wiring-checked (see `shift_idiom`).
@@ -22790,11 +23514,8 @@ fn shift_idiom(nodes: &[InstrNode], i: usize) -> Option<ShiftIdiom> {
         _ => return None,
     };
     k += 1;
-    // The range assert.
-    match &nodes.get(k)?.inst {
-        Inst::Assert { cond } if *cond == inbounds => {}
-        _ => return None,
-    }
+    // The range assert — its kind is checked against the shift's flavor below.
+    let range_assert = &nodes.get(k)?.inst;
     k += 1;
     // Wiring: the compared value is the lead cast's result (signed amount, cast to `u_ty`) or
     // the raw amount itself (already-unsigned amount, compared at its own type).
@@ -22855,6 +23576,15 @@ fn shift_idiom(nodes: &[InstrNode], i: usize) -> Option<ShiftIdiom> {
     if int_width(&ty).map(i128::from) != Some(bits) {
         return None;
     }
+    // The range assert names the shift's overflow panic (trust-ir v52).
+    let shift_overflow = IrAssertKind::Overflow(if mir_op == MirBinOp::Shl {
+        AssertOverflowOp::Shl
+    } else {
+        AssertOverflowOp::Shr
+    });
+    if !is_idiom_assert(range_assert, inbounds, shift_overflow) {
+        return None;
+    }
     Some(ShiftIdiom {
         len: k - i,
         lhs,
@@ -22868,11 +23598,17 @@ fn shift_idiom(nodes: &[InstrNode], i: usize) -> Option<ShiftIdiom> {
     })
 }
 
-/// Match the producer's checks-OFF shift pair at `nodes[i..]`: the value-retype
+/// Match an UNMASKED checks-OFF shift pair at `nodes[i..]`: the value-retype
 /// `Cast{Trunc|SExt|ZExt, amt_ty, ty, amt}` immediately feeding
 /// `BinOp{Shl|LShr|AShr, ty, lhs, cast}`. Returns `(lhs, original_amount, ty, mir_op, result)`
-/// — the emitted MIR uses the ORIGINAL amount (built MIR has no cast here; out-of-range is UB
-/// on both sides, so discarding the value-preserving retype cannot change a defined execution).
+/// — the emitted MIR uses the ORIGINAL amount (built MIR has no cast here).
+///
+/// Since 2026-10-03 the producer no longer emits this pair: it masks the count
+/// (`emit_masked_shift_count`, read back by [`shift_masked_unit`]). The old premise here —
+/// "out-of-range is UB on both sides" — was false for the MIR side: a plain MIR shift takes
+/// its count `rem_euclid(BITS)`, while the unmasked trust-ir shift is undefined there. The
+/// emitted MIR was right regardless (it is the bare MIR shift); the trust-ir module was the
+/// side that did not mean the same thing.
 fn shift_value_cast_pair(
     nodes: &[InstrNode],
     i: usize,
@@ -22900,6 +23636,318 @@ fn shift_value_cast_pair(
             Some((*lhs, amt, ty.clone(), mir_op, *nodes[i + 1].results.first()?))
         }
         _ => None,
+    }
+}
+
+/// The producer's checks-OFF shift unit (`emit_masked_shift_count` + the shift), read by
+/// [`shift_masked_unit`].
+struct ShiftMaskedUnit {
+    /// Nodes the unit spans, from the mask `Const` through the shift.
+    len: usize,
+    lhs: ValueId,
+    /// The ORIGINAL amount — before the retype and the mask — which the emitted MIR shifts by.
+    amt: ValueId,
+    ty: Ty,
+    mir_op: MirBinOp,
+    result: ValueId,
+}
+
+/// Match the producer's checks-OFF shift unit at `nodes[i..]`:
+///
+/// ```text
+/// m = Const{ty, Int(BITS - 1)}
+/// [c = Cast{Trunc|SExt|ZExt|Bitcast, amt_ty, ty, amt}]
+/// k = BinOp{And, ty, c | amt, m}
+/// r = BinOp{Shl|LShr|AShr, ty, lhs, k}
+/// ```
+///
+/// and return it as the bare `Shl|Shr(lhs, amt)` over the ORIGINAL amount — exactly the
+/// statement built MIR carries. That is EXACT, not an approximation: a plain MIR shift takes
+/// its count as `RHS.rem_euclid(LHS::BITS)` (rustc_middle `mir::BinOp::Shl`), the retype keeps
+/// the low `log2(BITS) <= 7` bits that decide it, and `& (BITS - 1)` is that `rem_euclid` for a
+/// power-of-two `BITS`. The retype and mask exist only because a trust-ir shift is undefined at
+/// or above BITS.
+///
+/// Every wire is checked — the mask is the shifted type's exact `BITS - 1`, the `And` reads the
+/// cast (or the raw amount when there is no cast) and the mask, the shift reads the `And` — so a
+/// lookalike sequence (a source-level `x << (s & 7)` on a `u32`, a mask against another type)
+/// is not swallowed; it falls through to the ordinary arms, which emit it statement by
+/// statement. Any value of the unit read again later is not in `env` and fails closed there.
+fn shift_masked_unit(nodes: &[InstrNode], i: usize) -> Option<ShiftMaskedUnit> {
+    let (mask, mask_ty, mask_value) = match &nodes.get(i)?.inst {
+        Inst::Const { ty, value: Constant::Int(v) } if is_int(ty) => {
+            (*nodes[i].results.first()?, ty.clone(), *v)
+        }
+        _ => return None,
+    };
+    if int_width(&mask_ty).map(|w| i128::from(w) - 1) != Some(mask_value) {
+        return None;
+    }
+    let mut k = i + 1;
+    // The optional retype of the amount to the shifted type.
+    let cast = match &nodes.get(k)?.inst {
+        Inst::Cast {
+            op: CastOp::Trunc | CastOp::SExt | CastOp::ZExt | CastOp::Bitcast,
+            src_ty,
+            dst_ty,
+            operand,
+        } if is_int(src_ty) && *dst_ty == mask_ty => {
+            let res = *nodes[k].results.first()?;
+            k += 1;
+            Some((res, *operand))
+        }
+        _ => None,
+    };
+    // The mask.
+    let (masked, and_lhs) = match &nodes.get(k)?.inst {
+        Inst::BinOp { op: BinOp::And, ty, lhs, rhs } if *ty == mask_ty && *rhs == mask => {
+            (*nodes[k].results.first()?, *lhs)
+        }
+        _ => return None,
+    };
+    let amt = match cast {
+        Some((cast_res, original)) if and_lhs == cast_res => original,
+        Some(_) => return None,
+        None => and_lhs,
+    };
+    k += 1;
+    // The shift, by the masked count.
+    match &nodes.get(k)?.inst {
+        Inst::BinOp { op, ty, lhs, rhs } if *ty == mask_ty && *rhs == masked => {
+            let mir_op = match op {
+                BinOp::Shl => MirBinOp::Shl,
+                BinOp::LShr if is_unsigned_int(ty) => MirBinOp::Shr,
+                BinOp::AShr if is_signed_int(ty) => MirBinOp::Shr,
+                _ => return None,
+            };
+            Some(ShiftMaskedUnit {
+                len: k + 1 - i,
+                lhs: *lhs,
+                amt,
+                ty: ty.clone(),
+                mir_op,
+                result: *nodes[k].results.first()?,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod assert_kind_idiom_tests {
+    //! Trust (trust-ir v52/v54): an idiom recognizer rebuilds a trust-ir assert as the MIR
+    //! assert its idiom names, so the assert's own kind must AGREE with that name (or be
+    //! `Unspecified`, an assert of unknown identity), and a sited assert is never an idiom's.
+    use rustc_middle::mir::BinOp as MirBinOp;
+    use trust_ir::{
+        AssertKind, AssertOverflowOp, BinOp, Constant, FuncId, ICmpOp, Inst, InstrNode, OverflowOp,
+        PanicLocation, PanicSite, Ty, ValueId,
+    };
+
+    use super::{checked_unit, div_idiom, shift_idiom};
+
+    fn v(n: u32) -> ValueId {
+        ValueId::new(n)
+    }
+
+    fn assert(cond: u32, kind: AssertKind, site: Option<PanicSite>) -> InstrNode {
+        InstrNode::new(Inst::Assert { cond: v(cond), kind, site })
+    }
+
+    fn a_site() -> Option<PanicSite> {
+        Some(PanicSite { entry: FuncId::new(7), location: PanicLocation::Value(v(99)) })
+    }
+
+    /// `d != 0` asserted, then `n / d` on `u32` (values 0 = n, 1 = d).
+    fn unsigned_div(kind: AssertKind, site: Option<PanicSite>, op: BinOp) -> Vec<InstrNode> {
+        vec![
+            InstrNode::new(Inst::Const { ty: Ty::U32, value: Constant::Int(0) }).with_result(v(2)),
+            InstrNode::new(Inst::ICmp { op: ICmpOp::Ne, ty: Ty::U32, lhs: v(1), rhs: v(2) })
+                .with_result(v(3)),
+            assert(3, kind, site),
+            InstrNode::new(Inst::BinOp { op, ty: Ty::U32, lhs: v(0), rhs: v(1) }).with_result(v(4)),
+        ]
+    }
+
+    #[test]
+    fn the_divisor_assert_must_name_the_ops_zero_panic() {
+        let div = |kind| div_idiom(&unsigned_div(kind, None, BinOp::UDiv), 0).map(|d| d.op);
+        assert_eq!(div(AssertKind::DivByZero), Some(MirBinOp::Div));
+        assert_eq!(div(AssertKind::Unspecified), Some(MirBinOp::Div));
+        assert!(div(AssertKind::RemByZero).is_none(), "a remainder panic is not a division's");
+        assert!(div(AssertKind::Overflow(AssertOverflowOp::Div)).is_none());
+        let rem = |kind| div_idiom(&unsigned_div(kind, None, BinOp::URem), 0).map(|d| d.op);
+        assert_eq!(rem(AssertKind::RemByZero), Some(MirBinOp::Rem));
+        assert!(rem(AssertKind::DivByZero).is_none());
+    }
+
+    #[test]
+    fn a_sited_assert_is_no_idioms_assert() {
+        let nodes = unsigned_div(AssertKind::DivByZero, a_site(), BinOp::UDiv);
+        assert!(div_idiom(&nodes, 0).is_none());
+    }
+
+    /// `x + y` checked on `u32`: `Overflow; Const false; Const true; Select; Assert`.
+    fn checked_add(kind: AssertKind, site: Option<PanicSite>) -> Vec<InstrNode> {
+        vec![
+            InstrNode::new(Inst::Overflow {
+                op: OverflowOp::AddOverflow,
+                ty: Ty::U32,
+                lhs: v(0),
+                rhs: v(1),
+            })
+            .with_results([v(2), v(3)]),
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(false) })
+                .with_result(v(4)),
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                .with_result(v(5)),
+            InstrNode::new(Inst::Select {
+                ty: Ty::Bool,
+                cond: v(3),
+                then_val: v(4),
+                else_val: v(5),
+            })
+            .with_result(v(6)),
+            assert(6, kind, site),
+        ]
+    }
+
+    #[test]
+    fn the_overflow_assert_must_name_the_ops_overflow_panic() {
+        let unit = |kind, site| checked_unit(&checked_add(kind, site), 0).is_some();
+        assert!(unit(AssertKind::Overflow(AssertOverflowOp::Add), None));
+        assert!(unit(AssertKind::Unspecified, None));
+        assert!(!unit(AssertKind::Overflow(AssertOverflowOp::Sub), None));
+        assert!(!unit(AssertKind::DivByZero, None));
+        assert!(!unit(AssertKind::Overflow(AssertOverflowOp::Add), a_site()));
+    }
+
+    /// `x << s` checked on `u32`: `Const 32; ICmp Ult; Assert; Shl`.
+    fn checked_shl(kind: AssertKind, site: Option<PanicSite>) -> Vec<InstrNode> {
+        vec![
+            InstrNode::new(Inst::Const { ty: Ty::U32, value: Constant::Int(32) }).with_result(v(2)),
+            InstrNode::new(Inst::ICmp { op: ICmpOp::Ult, ty: Ty::U32, lhs: v(1), rhs: v(2) })
+                .with_result(v(3)),
+            assert(3, kind, site),
+            InstrNode::new(Inst::BinOp { op: BinOp::Shl, ty: Ty::U32, lhs: v(0), rhs: v(1) })
+                .with_result(v(4)),
+        ]
+    }
+
+    #[test]
+    fn the_range_assert_must_name_the_shifts_overflow_panic() {
+        let shift = |kind, site| shift_idiom(&checked_shl(kind, site), 0).map(|s| s.mir_op);
+        assert_eq!(shift(AssertKind::Overflow(AssertOverflowOp::Shl), None), Some(MirBinOp::Shl));
+        assert_eq!(shift(AssertKind::Unspecified, None), Some(MirBinOp::Shl));
+        assert!(shift(AssertKind::Overflow(AssertOverflowOp::Shr), None).is_none());
+        assert!(shift(AssertKind::Overflow(AssertOverflowOp::Shl), a_site()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod shift_masked_unit_tests {
+    use rustc_middle::mir::BinOp as MirBinOp;
+    use trust_ir::{BinOp, CastOp, Constant, Inst, InstrNode, Ty, ValueId};
+
+    use super::shift_masked_unit;
+
+    fn v(n: u32) -> ValueId {
+        ValueId::new(n)
+    }
+
+    fn mask(ty: Ty, value: i128, result: u32) -> InstrNode {
+        InstrNode::new(Inst::Const { ty, value: Constant::Int(value) }).with_result(v(result))
+    }
+
+    fn binop(op: BinOp, ty: Ty, lhs: u32, rhs: u32, result: u32) -> InstrNode {
+        InstrNode::new(Inst::BinOp { op, ty, lhs: v(lhs), rhs: v(rhs) }).with_result(v(result))
+    }
+
+    /// The producer's cast-free unit `x << s` (`x, s: u32`): `Const 31; And; Shl`, read back as
+    /// the bare MIR `Shl(x, s)` over the ORIGINAL count.
+    #[test]
+    fn the_cast_free_unit_reads_back_as_the_bare_shift() {
+        let nodes = vec![
+            mask(Ty::U32, 31, 2),
+            binop(BinOp::And, Ty::U32, 1, 2, 3),
+            binop(BinOp::Shl, Ty::U32, 0, 3, 4),
+        ];
+        let unit = shift_masked_unit(&nodes, 0).expect("the masked unit");
+        assert_eq!(unit.len, 3);
+        assert_eq!((unit.lhs, unit.amt, unit.result), (v(0), v(1), v(4)));
+        assert_eq!(unit.ty, Ty::U32);
+        assert_eq!(unit.mir_op, MirBinOp::Shl);
+    }
+
+    /// `x: u8 << s: u32`: `Const 7; Cast Trunc u32->u8; And; Shl` — the amount the MIR shift
+    /// reads is the cast's OPERAND, as built MIR has no cast there.
+    #[test]
+    fn the_retyped_unit_reads_the_original_amount() {
+        let nodes = vec![
+            mask(Ty::U8, 7, 3),
+            InstrNode::new(Inst::Cast {
+                op: CastOp::Trunc,
+                src_ty: Ty::U32,
+                dst_ty: Ty::U8,
+                operand: v(1),
+            })
+            .with_result(v(4)),
+            binop(BinOp::And, Ty::U8, 4, 3, 5),
+            binop(BinOp::Shl, Ty::U8, 0, 5, 6),
+        ];
+        let unit = shift_masked_unit(&nodes, 0).expect("the masked unit");
+        assert_eq!(unit.len, 4);
+        assert_eq!((unit.lhs, unit.amt, unit.result), (v(0), v(1), v(6)));
+    }
+
+    /// Signedness follows the op, as in the unmasked pair: `AShr` on a signed type is `Shr`,
+    /// `LShr` on a signed type is not a Rust shift and is left alone.
+    #[test]
+    fn the_shift_flavor_must_match_the_type() {
+        let ashr = vec![
+            mask(Ty::I32, 31, 2),
+            binop(BinOp::And, Ty::I32, 1, 2, 3),
+            binop(BinOp::AShr, Ty::I32, 0, 3, 4),
+        ];
+        assert_eq!(shift_masked_unit(&ashr, 0).map(|u| u.mir_op), Some(MirBinOp::Shr));
+        let lshr_signed = vec![
+            mask(Ty::I32, 31, 2),
+            binop(BinOp::And, Ty::I32, 1, 2, 3),
+            binop(BinOp::LShr, Ty::I32, 0, 3, 4),
+        ];
+        assert!(shift_masked_unit(&lshr_signed, 0).is_none());
+    }
+
+    /// Lookalikes are NOT swallowed: a source-level `s & 31` feeding the producer's own unit
+    /// declines at the user's literal and matches only at the producer's mask; a mask that is
+    /// not the shifted type's `BITS - 1`, and a shift that does not read the `And`, decline.
+    #[test]
+    fn lookalike_sequences_decline() {
+        // x << (s & 31): user `Const 31; And(s, 31)`, then the producer's unit over it.
+        let nodes = vec![
+            mask(Ty::U32, 31, 2),
+            binop(BinOp::And, Ty::U32, 1, 2, 3),
+            mask(Ty::U32, 31, 4),
+            binop(BinOp::And, Ty::U32, 3, 4, 5),
+            binop(BinOp::Shl, Ty::U32, 0, 5, 6),
+        ];
+        assert!(shift_masked_unit(&nodes, 0).is_none(), "the user's mask is not a shift unit");
+        let unit = shift_masked_unit(&nodes, 2).expect("the producer's unit");
+        assert_eq!((unit.amt, unit.len), (v(3), 3), "the MIR shift reads the user's `s & 31`");
+
+        let wrong_mask = vec![
+            mask(Ty::U32, 7, 2),
+            binop(BinOp::And, Ty::U32, 1, 2, 3),
+            binop(BinOp::Shl, Ty::U32, 0, 3, 4),
+        ];
+        assert!(shift_masked_unit(&wrong_mask, 0).is_none(), "`& 7` is not a u32 count mask");
+
+        let unread = vec![
+            mask(Ty::U32, 31, 2),
+            binop(BinOp::And, Ty::U32, 1, 2, 3),
+            binop(BinOp::Shl, Ty::U32, 0, 1, 4),
+        ];
+        assert!(shift_masked_unit(&unread, 0).is_none(), "the shift must read the mask");
     }
 }
 
@@ -23210,7 +24258,7 @@ mod scope_topology_tests {
     use super::scope_topology_error;
 
     fn sc(parent: Option<u32>) -> ScopeData {
-        ScopeData { parent, span: None }
+        ScopeData { parent, span: None, inlined_at: None }
     }
 
     #[test]
@@ -23369,13 +24417,14 @@ mod emission_chokepoint_tests {
     /// invariant stated only in a doc comment, which is precisely what failed.
     #[test]
     fn push_node_is_the_only_emission_site() {
-        let src = include_str!("lib.rs");
+        let src = crate::source_scan::producer_text();
         let sites = src.matches("self.cur.push(").count();
         assert_eq!(
             sites, 1,
-            "found {sites} `self.cur.push(` sites in trust-thir-lower/src/lib.rs; exactly one \
-             is allowed (the body of `push_node`). A new direct push bypasses span/scope \
-             stamping — route it through `self.push_node(..)` instead."
+            "found {sites} `self.cur.push(` sites in the producer (every file in \
+             `source_scan::PRODUCER_FILES`); exactly one is allowed (the body of `push_node`). A \
+             new direct push bypasses span/scope stamping — route it through \
+             `self.push_node(..)` instead."
         );
     }
 
@@ -25369,8 +26418,8 @@ mod rotation_marker_plan_tests {
     }
     fn rot_scopes() -> Option<Vec<ScopeData>> {
         Some(vec![
-            ScopeData { parent: None, span: None },
-            ScopeData { parent: Some(0), span: None },
+            ScopeData { parent: None, span: None, inlined_at: None },
+            ScopeData { parent: Some(0), span: None, inlined_at: None },
         ])
     }
 
@@ -25422,7 +26471,10 @@ mod rotation_marker_plan_tests {
         bd.body = vec![
             k64(8, 0),
             node(Inst::ICmp { op: ICmpOp::Ne, ty: Ty::U64, lhs: v(2), rhs: v(8) }, Some(9)),
-            node(Inst::Assert { cond: v(9) }, None),
+            node(
+                Inst::Assert { cond: v(9), kind: trust_ir::AssertKind::RemByZero, site: None },
+                None,
+            ),
             node(Inst::BinOp { op: BinOp::URem, ty: Ty::U64, lhs: v(3), rhs: v(2) }, Some(10)),
             node(Inst::Br { target: b(1), args: vec![v(10), v(2)] }, None),
         ];
@@ -25442,7 +26494,7 @@ mod rotation_marker_plan_tests {
             "the same body without the source witness keeps today's refusal"
         );
         let mut three = r1(BinOp::And);
-        three.scopes.as_mut().expect("scoped").push(ScopeData { parent: Some(1), span: None });
+        three.scopes.as_mut().expect("scoped").push(ScopeData { parent: Some(1), span: None, inlined_at: None });
         assert!(
             plan_loop_markers(&three, true).is_none(),
             "a deeper scope table is outside the measured shape"
@@ -26709,8 +27761,8 @@ mod branch_marker_plan_tests {
         // plan at THIS line, before multi-block support is even consulted.
         let mut f = min_if((0, 3));
         f.scopes = Some(vec![
-            ScopeData { parent: None, span: None },
-            ScopeData { parent: Some(0), span: None },
+            ScopeData { parent: None, span: None, inlined_at: None },
+            ScopeData { parent: Some(0), span: None, inlined_at: None },
         ]);
         assert!(plan_branch_markers(&f).is_none());
     }
@@ -27179,7 +28231,10 @@ mod checked_plan_tests {
                 Inst::Select { ty: Ty::Bool, cond: v(of), then_val: v(fc), else_val: v(tc) },
                 Some(ok),
             ),
-            node(Inst::Assert { cond: v(ok) }, None),
+            node(
+                Inst::Assert { cond: v(ok), kind: trust_ir::AssertKind::Unspecified, site: None },
+                None,
+            ),
         ]
     }
 
@@ -27243,7 +28298,7 @@ mod checked_plan_tests {
     #[test]
     fn test_plan_a_let_scope_is_refused() {
         let mut f = two_unit();
-        f.scopes = Some(vec![trust_ir::ScopeData { parent: None, span: None }]);
+        f.scopes = Some(vec![trust_ir::ScopeData { parent: None, span: None, inlined_at: None }]);
         assert!(
             plan_checked_markers(&f).is_none(),
             "wave-MF's firewall is consulted first and unchanged",
@@ -31297,13 +32352,17 @@ mod unit_chain_tests {
             def_id: did,
             definition,
             concrete_key: None,
+            instance_args: None,
             def_path: format!("decl{id}"),
             force_havoc: false,
             site_def_id: did,
             site_args: None,
             ret_ty: ret,
             ret_ty_conflict: false,
-            is_rust_abi: true,
+            abi: crate::calling_convention::FunctionAbi::RUST,
+            // No contributing body withdrew this callee's signature, and none signed
+            // it — the producer's own default at `admit_callee`'s push site.
+            params: crate::ParamSignature::Unsigned,
         }
     }
 
@@ -31730,5 +32789,322 @@ mod unit_chain_tests {
         let calls = unit_chain_calls(&corpus(), &|id| unit_chain_callee_ret(&good, id)).unwrap();
         assert_eq!(calls[2].ret_ty, None);
         assert_eq!(calls[0].ret_ty, Some(Ty::U64));
+    }
+}
+
+#[cfg(test)]
+mod bool_const_continue_tests {
+    use trust_ir::{Block, FuncTy, Function};
+
+    use super::*;
+
+    fn v(n: u32) -> ValueId {
+        ValueId::new(n)
+    }
+    fn b(n: u32) -> BlockId {
+        BlockId::new(n)
+    }
+    fn constant(n: u32, value: bool) -> InstrNode {
+        InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(value) }).with_result(v(n))
+    }
+    // Complete module: carry state and an independent counter. The transition
+    // changes BOTH, and the selected arm returns the updated counter.
+    fn fixture(next: bool) -> (Module, BlockId, BlockId) {
+        let mut module = Module::new("bool_const_continue");
+        let ty = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::U32],
+                returns: vec![Ty::U32],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut f = Function::new(FuncId::new(0), "transition", ty, b(0));
+        let mut entry = Block::new(b(0));
+        entry.params = vec![(v(0), Ty::U32)];
+        entry.body = vec![
+            constant(1, !next),
+            InstrNode::new(Inst::Br { target: b(1), args: vec![v(1), v(0)] }),
+        ];
+        let mut header = Block::new(b(1));
+        header.params = vec![(v(2), Ty::Bool), (v(3), Ty::U32)];
+        header.body = vec![InstrNode::new(Inst::CondBr {
+            cond: v(2),
+            then_target: b(2),
+            then_args: vec![],
+            else_target: b(3),
+            else_args: vec![],
+        })];
+        let source = if next { b(3) } else { b(2) };
+        let destination = if next { b(2) } else { b(3) };
+        let mut arm = Block::new(source);
+        arm.body = vec![
+            InstrNode::new(Inst::Const { ty: Ty::U32, value: Constant::Int(9) }).with_result(v(5)),
+            constant(4, next),
+            InstrNode::new(Inst::Br { target: b(1), args: vec![v(4), v(5)] }),
+        ];
+        let mut exit = Block::new(destination);
+        exit.body = vec![InstrNode::new(Inst::Return { values: vec![v(3)] })];
+        f.blocks = vec![entry, header, arm, exit];
+        module.functions.push(f);
+        let errors = trust_ir_build::validate_module(&module);
+        assert!(errors.is_empty(), "complete fixture must validate: {errors:?}");
+        (module, source, destination)
+    }
+    fn plan(module: &Module, source: BlockId, value: bool) -> Option<BlockId> {
+        let f = &module.functions[0];
+        bool_const_continue_target(f, &trust_ir::analysis::DominatorTree::new(f), source, value)
+    }
+
+    #[test]
+    fn exact_source_points_preserve_false_and_reject_missing_or_shifted_sites() {
+        let sites = HashMap::from([(10, false), (30, true)]);
+        let point = |n| Span::with_root_ctxt(rustc_span::BytePos(n), rustc_span::BytePos(n));
+        assert_eq!(bool_const_continue_at_source(&sites, Some(point(10))), Some(false));
+        assert_eq!(bool_const_continue_at_source(&sites, Some(point(30))), Some(true));
+        assert_eq!(bool_const_continue_at_source(&sites, Some(point(11))), None);
+        assert_eq!(bool_const_continue_at_source(&sites, Some(point(29))), None);
+        assert_eq!(bool_const_continue_at_source(&sites, None), None);
+        assert_eq!(bool_const_continue_at_source(&sites, Some(rustc_span::DUMMY_SP)), None);
+        let whole_expr = Span::with_root_ctxt(rustc_span::BytePos(10), rustc_span::BytePos(20));
+        assert_eq!(bool_const_continue_at_source(&sites, Some(whole_expr)), None);
+    }
+
+    #[test]
+    fn duplicate_source_points_remain_ambiguous_even_when_values_match() {
+        let mut points = HashMap::new();
+        let span = Span::with_root_ctxt(rustc_span::BytePos(10), rustc_span::BytePos(20));
+        record_bool_const_continue_site(&mut points, span, false);
+        assert_eq!(points.get(&10), Some(&Some(false)));
+        record_bool_const_continue_site(&mut points, span, false);
+        assert_eq!(points.get(&10), Some(&None));
+        record_bool_const_continue_site(&mut points, span, true);
+        assert_eq!(points.get(&10), Some(&None));
+        record_bool_const_continue_site(&mut points, rustc_span::DUMMY_SP, true);
+        assert_eq!(points.len(), 1);
+    }
+
+    #[test]
+    fn both_boolean_directions_select_the_right_arm_without_changing_edge_arguments() {
+        for next in [false, true] {
+            let (module, source, destination) = fixture(next);
+            let before = module.clone();
+            assert_eq!(plan(&module, source, next), Some(destination));
+            assert_eq!(module, before, "planning must retain all IR/copy inputs");
+            let source =
+                module.functions[0].blocks.iter().find(|block| block.id == source).unwrap();
+            assert!(
+                matches!(&source.body.last().unwrap().inst, Inst::Br { args, .. } if args == &[v(4), v(5)])
+            );
+        }
+    }
+
+    #[test]
+    fn entry_and_source_literal_disagreement_keep_original_translation() {
+        let (module, source, _) = fixture(true);
+        assert_eq!(plan(&module, b(0), false), None);
+        assert_eq!(plan(&module, source, false), None);
+    }
+
+    #[test]
+    fn header_computation_or_a_nonparameter_condition_is_not_skipped() {
+        let (mut module, source, _) = fixture(true);
+        module.functions[0].blocks[1].body.insert(0, constant(8, false));
+        assert_eq!(plan(&module, source, true), None);
+        module.functions[0].blocks[1].body.remove(0);
+        let Inst::CondBr { cond, .. } = &mut module.functions[0].blocks[1].body[0].inst else {
+            unreachable!()
+        };
+        *cond = v(1);
+        assert_eq!(plan(&module, source, true), None);
+    }
+
+    #[test]
+    fn nonliteral_or_wrongly_typed_edge_values_are_not_guessed() {
+        let (mut module, source, _) = fixture(true);
+        let Inst::Const { ty, .. } = &mut module.functions[0].blocks[2].body[1].inst else {
+            unreachable!()
+        };
+        *ty = Ty::U8;
+        assert_eq!(plan(&module, source, true), None);
+        let (mut module, source, _) = fixture(true);
+        let Inst::Br { args, .. } = &mut module.functions[0].blocks[2].body[2].inst else {
+            unreachable!()
+        };
+        args[0] = v(2);
+        assert_eq!(plan(&module, source, true), None);
+    }
+
+    #[test]
+    fn duplicate_definitions_and_blocks_are_not_collapsed() {
+        let (mut module, source, _) = fixture(true);
+        module.functions[0].blocks[0].body.insert(0, constant(4, false));
+        assert_eq!(plan(&module, source, true), None);
+        let (mut module, source, _) = fixture(true);
+        let duplicate = module.functions[0].blocks[1].clone();
+        module.functions[0].blocks.push(duplicate);
+        assert_eq!(plan(&module, source, true), None);
+    }
+
+    #[test]
+    fn parameter_count_and_successor_parameters_remain_checked() {
+        let (mut module, source, _) = fixture(true);
+        let Inst::Br { args, .. } = &mut module.functions[0].blocks[2].body[2].inst else {
+            unreachable!()
+        };
+        args.pop();
+        assert_eq!(plan(&module, source, true), None);
+        let (mut module, source, _) = fixture(true);
+        module.functions[0].blocks[3].params.push((v(8), Ty::U32));
+        assert_eq!(plan(&module, source, true), None);
+    }
+
+    #[test]
+    fn decision_edge_arguments_and_unknown_targets_are_not_discarded() {
+        let (mut module, source, _) = fixture(true);
+        let Inst::CondBr { then_args, .. } = &mut module.functions[0].blocks[1].body[0].inst else {
+            unreachable!()
+        };
+        then_args.push(v(3));
+        assert_eq!(plan(&module, source, true), None);
+        let (mut module, source, _) = fixture(true);
+        let Inst::CondBr { then_target, .. } = &mut module.functions[0].blocks[1].body[0].inst
+        else {
+            unreachable!()
+        };
+        *then_target = b(99);
+        assert_eq!(plan(&module, source, true), None);
+    }
+
+    #[test]
+    fn a_header_that_does_not_dominate_the_edge_is_not_threaded() {
+        let (mut module, source, _) = fixture(true);
+        module.functions[0].blocks[0].body[1].inst = Inst::Br { target: source, args: vec![] };
+        assert_eq!(plan(&module, source, true), None);
+    }
+}
+
+/// Trust (F7, 2026-09-30): `value_read_after_node` decides whether a forwarded unique reference
+/// may be MOVED into a call or must be reborrowed. Moving a param the body reads again is the F7
+/// defect, so every "read again" shape below must answer `true`, and the last-use shapes `false`.
+#[cfg(test)]
+mod forwarded_ptr_read_after_tests {
+    use trust_ir::{Block, Function};
+
+    use super::*;
+
+    fn v(n: u32) -> ValueId {
+        ValueId::new(n)
+    }
+    fn b(n: u32) -> BlockId {
+        BlockId::new(n)
+    }
+    fn call(args: &[u32]) -> InstrNode {
+        InstrNode::new(Inst::Call {
+            callee: FuncId::new(1),
+            args: args.iter().map(|a| v(*a)).collect(),
+        })
+    }
+    fn load(ptr: u32, res: u32) -> InstrNode {
+        InstrNode::new(Inst::Load { ty: Ty::U64, ptr: v(ptr), volatile: false, align: None })
+            .with_result(v(res))
+    }
+    fn ret() -> InstrNode {
+        InstrNode::new(Inst::Return { values: vec![] })
+    }
+    fn br(target: u32) -> InstrNode {
+        InstrNode::new(Inst::Br { target: b(target), args: vec![] })
+    }
+    fn cond_br(cond: u32, then_target: u32, else_target: u32) -> InstrNode {
+        InstrNode::new(Inst::CondBr {
+            cond: v(cond),
+            then_target: b(then_target),
+            then_args: vec![],
+            else_target: b(else_target),
+            else_args: vec![],
+        })
+    }
+    fn block(id: u32, body: Vec<InstrNode>) -> Block {
+        let mut blk = Block::new(b(id));
+        blk.body = body;
+        blk
+    }
+    fn function(blocks: Vec<Block>) -> Function {
+        let mut f = Function::new(FuncId::new(0), "f", trust_ir::FuncTyId::new(0), b(0));
+        f.blocks = blocks;
+        f
+    }
+    /// `value_read_after_node` for the node at `(block index, node index)`, for the param `v0`.
+    fn read_after(f: &Function, at: (usize, usize)) -> bool {
+        value_read_after_node(f, &f.blocks[at.0], at.1, v(0))
+    }
+
+    #[test]
+    fn a_single_forward_is_the_last_use() {
+        // `fn f(x: &mut u64) { g(x) }`
+        let f = function(vec![block(0, vec![call(&[0]), ret()])]);
+        assert!(!read_after(&f, (0, 0)));
+    }
+
+    #[test]
+    fn a_second_forward_in_the_same_block_reads_the_param_again() {
+        // `fn f(x: &mut u64) { g(x); g(x) }`: the first forward may not move `_1`.
+        let f = function(vec![block(0, vec![call(&[0]), call(&[0]), ret()])]);
+        assert!(read_after(&f, (0, 0)));
+        assert!(!read_after(&f, (0, 1)));
+    }
+
+    #[test]
+    fn a_load_through_the_param_after_the_forward_reads_it_again() {
+        // `fn f(x: &u64) -> u64 { g(x) + *x }`
+        let f = function(vec![block(0, vec![call(&[0]), load(0, 1), ret()])]);
+        assert!(read_after(&f, (0, 0)));
+    }
+
+    #[test]
+    fn a_forward_inside_a_loop_is_read_again_by_the_next_iteration() {
+        // entry -> header; header: CondBr(v5) -> body | exit; body: g(x); -> header.
+        // One lexical use, so a use COUNT says "move"; liveness says the back edge reads it.
+        let f = function(vec![
+            block(0, vec![br(1)]),
+            block(1, vec![cond_br(5, 2, 3)]),
+            block(2, vec![call(&[0]), br(1)]),
+            block(3, vec![ret()]),
+        ]);
+        assert!(read_after(&f, (2, 0)));
+    }
+
+    #[test]
+    fn forwards_on_disjoint_arms_are_each_the_last_use() {
+        // `if c { g(x) } else { h(x) }`: neither arm reaches the other.
+        let f = function(vec![
+            block(0, vec![cond_br(5, 1, 2)]),
+            block(1, vec![call(&[0]), br(3)]),
+            block(2, vec![call(&[0]), br(3)]),
+            block(3, vec![ret()]),
+        ]);
+        assert!(!read_after(&f, (1, 0)));
+        assert!(!read_after(&f, (2, 0)));
+    }
+
+    #[test]
+    fn a_read_in_a_later_block_counts() {
+        // `g(x); if c { *x } ...`: the use sits in a block reachable from the forward's.
+        let f = function(vec![
+            block(0, vec![call(&[0]), cond_br(5, 1, 2)]),
+            block(1, vec![load(0, 1), br(2)]),
+            block(2, vec![ret()]),
+        ]);
+        assert!(read_after(&f, (0, 0)));
+    }
+
+    #[test]
+    fn an_unenumerable_terminator_or_unknown_block_is_a_later_read() {
+        // A block with no terminator and a branch to an undeclared block both answer `true`:
+        // over-approximating here costs a reborrow temp, never a use-after-move.
+        let f = function(vec![block(0, vec![call(&[0])])]);
+        assert!(read_after(&f, (0, 0)));
+        let f = function(vec![block(0, vec![call(&[0]), br(9)])]);
+        assert!(read_after(&f, (0, 0)));
     }
 }

@@ -9,9 +9,10 @@ This helper is intentionally conservative:
 * It writes payloads only with ``--fetch`` and only after the downloaded bytes
   match the SHA-256 pinned in ``src/stage0``.
 
-When the checkout only declares repo-local ``file://{trust-root}/...`` URLs and
-the archive payloads are missing, this command reports that no fetchable source
-exists. That is a real release-evidence blocker, not a condition to bypass.
+When repo-local ``file://{trust-root}/...`` payloads are missing, an admitted
+internal release declared in the seed ledger supplies exact named assets via
+authenticated ``agh``. Without a declared source or release access, acquisition
+refuses; internal acquisition does not establish public-release admission.
 """
 
 from __future__ import annotations
@@ -168,7 +169,7 @@ def default_manifests(root: Path, dist_root: Path | None, values: dict[str, str]
 @dataclass
 class InternalRelease:
     """The seed ledger's `[release]` block: where the admitted-internal seed
-    payloads actually live (a private GitHub release). Authenticated `gh`
+    payloads actually live (a private GitHub release). Authenticated `agh`
     access to it is a DECLARED source — the ledger names it — so fetching from
     it invents nothing; every byte is still verified against the src/stage0
     SHA-256 pin before installation."""
@@ -197,37 +198,29 @@ def read_internal_release(root: Path) -> InternalRelease | None:
     return InternalRelease(repo=repo, tag=tag, scope=scope)
 
 
-def gh_available() -> bool:
-    gh = shutil.which("gh")
-    if gh is None:
-        return False
-    try:
-        probe = subprocess.run(
-            [gh, "auth", "status"], capture_output=True, timeout=30, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return probe.returncode == 0
+def agh_available() -> bool:
+    # Agh selects credentials by repository owner. A global auth-status probe
+    # cannot establish access to this declared release; the actual read does.
+    return shutil.which("agh") is not None
 
 
-def gh_release_fetch(release: InternalRelease, asset: str, destination: Path, timeout: float) -> None:
+def agh_release_fetch(release: InternalRelease, asset: str, destination: Path, timeout: float) -> None:
     """Download ONE named asset from the ledger's internal release into
-    `destination` via authenticated `gh`. The caller verifies the src/stage0
+    `destination` via authenticated `agh`. The caller verifies the src/stage0
     checksum before accepting the bytes (identical posture to every other
     lane)."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(destination.parent)) as tmp_dir:
         subprocess.run(
             [
-                "gh",
+                "agh",
                 "release",
                 "download",
-                release.tag,
-                "-R",
                 release.repo,
-                "--pattern",
+                release.tag,
+                "--asset",
                 asset,
-                "-D",
+                "--dir",
                 tmp_dir,
             ],
             check=True,
@@ -236,7 +229,7 @@ def gh_release_fetch(release: InternalRelease, asset: str, destination: Path, ti
         )
         fetched = Path(tmp_dir) / asset
         if not fetched.is_file():
-            raise FileNotFoundError(f"gh release download produced no {asset}")
+            raise FileNotFoundError(f"agh release download produced no {asset}")
         os.replace(fetched, destination)
 
 
@@ -371,46 +364,49 @@ def evaluate_payload(
         # DECLARES where the admitted-internal seed is published (a private
         # GitHub release). When the checkout's file:// payloads are missing —
         # every fresh pull on a machine that didn't mint the seed — fetch the
-        # named asset via authenticated `gh` and verify it against the
-        # src/stage0 pin exactly like any other source. No gh / no auth ⇒ the
+        # named asset via authenticated `agh` and verify it against the
+        # src/stage0 pin exactly like any other source. No Agh / no release access ⇒ the
         # report stays blocked and names the exact command to run.
         release = read_internal_release(root)
         if release is not None and release.scope == "internal":
             asset = Path(entry.relative_path).name
             if not fetch:
                 report.status = "fetchable"
-                report.selected_url = f"gh-release://{release.repo}@{release.tag}/{asset}"
+                report.selected_url = f"agh-release://{release.repo}@{release.tag}/{asset}"
                 report.message = (
                     "rerun with --fetch to download the admitted-internal seed asset "
-                    f"via `gh release download {release.tag} -R {release.repo}`"
+                    f"via `agh release download {release.repo} {release.tag} --asset {asset}`"
                 )
                 return report
-            if not gh_available():
+            if not agh_available():
                 report.message = (
                     "the seed ledger publishes this payload at the internal release "
-                    f"{release.repo}@{release.tag}, but `gh` is missing or unauthenticated; "
-                    f"run: gh release download {release.tag} -R {release.repo} "
-                    f"-D {target.parent}"
+                    f"{release.repo}@{release.tag}, but `agh` is missing; "
+                    f"run: agh release download {release.repo} {release.tag} --asset {asset} "
+                    f"--dir {target.parent}"
                 )
                 return report
             try:
-                gh_release_fetch(release, asset, target, max(timeout, 300.0))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix=".seed-fetch-", dir=target.parent) as staging:
+                    staged = Path(staging) / asset
+                    agh_release_fetch(release, asset, staged, max(timeout, 300.0))
+                    actual = sha256_file(staged)
+                    report.existing_sha256 = actual
+                    if actual != entry.expected_sha256:
+                        report.status = "download-checksum-mismatch"
+                        report.message = (
+                            "internal-release bytes failed src/stage0 checksum validation: "
+                            f"expected {entry.expected_sha256}, actual {actual}"
+                        )
+                        return report
+                    os.replace(staged, target)
             except (OSError, subprocess.SubprocessError) as exc:
                 report.status = "fetch-failed"
-                report.message = f"gh release download failed: {exc}"
-                return report
-            actual = sha256_file(target)
-            report.existing_sha256 = actual
-            if actual != entry.expected_sha256:
-                target.unlink(missing_ok=True)
-                report.status = "download-checksum-mismatch"
-                report.message = (
-                    f"internal-release bytes failed src/stage0 checksum validation: "
-                    f"expected {entry.expected_sha256}, actual {actual}"
-                )
+                report.message = f"agh release download failed: {exc}"
                 return report
             report.status = "fetched"
-            report.selected_url = f"gh-release://{release.repo}@{release.tag}/{asset}"
+            report.selected_url = f"agh-release://{release.repo}@{release.tag}/{asset}"
             return report
         if report.declared_sources:
             report.message = (

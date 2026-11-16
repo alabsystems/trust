@@ -82,10 +82,10 @@ fn blockers(invariant: &str) -> (Vec<String>, bool) {
 #[test]
 fn the_refusal_names_both_halves_and_says_which_one_widening_could_recover() {
     let (details, minted_e4) = blockers("shift <= 70");
-    let row = details
-        .iter()
-        .find(|detail| detail.contains("e4.machine.mixed-domain"))
-        .unwrap_or_else(|| panic!("the measured residual blocker is still the domain gate: {details:?}"));
+    let row =
+        details.iter().find(|detail| detail.contains("e4.machine.mixed-domain")).unwrap_or_else(
+            || panic!("the measured residual blocker is still the domain gate: {details:?}"),
+        );
 
     assert!(
         row.contains("declared domains disagree: u32, u64"),

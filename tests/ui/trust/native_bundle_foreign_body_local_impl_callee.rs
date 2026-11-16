@@ -3,7 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //! A call from a bundled FOREIGN (std) body into a LOCAL impl must be lowered
 //! and PROVED, not reported absent.
 //!
@@ -68,6 +68,9 @@ pub fn direct(w: &mut W) -> fmt::Result {
 
 /// The regression: local -> FOREIGN (`Write::write_fmt` / `spec_write_fmt`) ->
 /// local (`<W as Write>::write_str`). Must prove exactly like `direct`.
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `native_bundle_foreign_body_local_impl_callee::viamac`
+//~v NOTE this function has no obligation of its own
 pub fn viamac(w: &mut W) -> fmt::Result {
     write!(w, "S")
 }

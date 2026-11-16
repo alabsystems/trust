@@ -1,0 +1,36 @@
+; TrustIr text format v1
+module "parta-lean-should-emit-data"
+
+enum @Shape { sq(u64), rect(u64, u64) } id=0
+
+functy.0 = (enum.0) -> (u64)
+
+functy.1 = (u64, u64) -> (u64)
+
+rustcc fn @area(functy.0) {
+    ; #producer: clean
+bb0(%0: enum.0):
+    %1 = extractfield u8 %0, 0
+    switch %1 [ 0: bb1 1: bb2 default: bb3 ]
+bb1:
+    %2 = extractfield u64 %0, 1
+    %3 = mul u64 %2, %2
+    ret %3
+bb2:
+    %4 = extractfield u64 %0, 1
+    %5 = extractfield u64 %0, 2
+    %6 = mul u64 %4, %5
+    ret %6
+bb3:
+    unreachable
+}
+
+rustcc fn @areaOfRect(functy.1) {
+    ; #producer: clean
+bb0(%0: u64, %1: u64):
+    %2 = const enum.0 { 1, 0, 0 }
+    %3 = insertfield enum.0 %2, 1, %0
+    %4 = insertfield enum.0 %3, 2, %1
+    %5 = call @func.0(%4)
+    ret %5
+}

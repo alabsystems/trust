@@ -46,8 +46,18 @@ fn struct_accessor_contract_proven_inhabited_modulo_3() {
         Ty, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
-    let wrapper = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "Wrapper".into(), fields: vec![("value".into(), i())],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let wrapper = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
+        name: "Wrapper".into(),
+        fields: vec![("value".into(), i())].into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let func = VerifiableFunction {
         name: "get".into(),
         def_path: "crate::get".into(),
@@ -80,6 +90,7 @@ fn struct_accessor_contract_proven_inhabited_modulo_3() {
             Box::new(Formula::Var("p.value".into(), Sort::Int)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
         trust_clean::inhabit_verifiable_function(&func),
@@ -102,8 +113,18 @@ fn field_comparison_contract_proven_from_field_precondition_modulo_3() {
         Ty, VerifiableBody, VerifiableFunction,
     };
     let i = || Ty::Int { width: 32, signed: true };
-    let w = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "W".into(), fields: vec![("v".into(), i())],
-        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let w = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new().into(),
+        name: "W".into(),
+        fields: vec![("v".into(), i())].into(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        arbitrary_precision: None,
+        validity_wrapper: None,
+    };
     let pv = || Formula::Var("p.v".into(), Sort::Int);
     let func = VerifiableFunction {
         name: "floor".into(),
@@ -137,6 +158,7 @@ fn field_comparison_contract_proven_from_field_precondition_modulo_3() {
             Box::new(Formula::Int(100)),
         )],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert_eq!(
         trust_clean::inhabit_verifiable_function(&func),

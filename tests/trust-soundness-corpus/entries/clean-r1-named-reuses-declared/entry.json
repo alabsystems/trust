@@ -1,0 +1,25 @@
+{
+  "id": "clean-r1-named-reuses-declared",
+  "class": "Clean/Carcara reader, fix 38 (R1)",
+  "title": "a :named label took precedence over a declared constant of its name",
+  "origin": [
+    "clean a60db73bb (carcara fix 38), problem_reading.rs refutations_through_shadowed_or_reused_names_are_refused R1"
+  ],
+  "lang": "smt",
+  "source": "repro.json",
+  "reproducer": {
+    "cert": "repro.json",
+    "claim": "the problem is unsatisfiable (the certificate refutes it)"
+  },
+  "twin": {
+    "cert": "twin.json",
+    "claim": "unsatisfiable, with a correct refutation, and it contains the reproducer's construct: a :named label (n) that names no declared constant, beside the contradiction (= x 5), (not (= x 5))"
+  },
+  "witness": {
+    "solver": "ay",
+    "expect": "sat",
+    "input": "the reproducer's problem script, with (get-model) after every check-sat",
+    "observed": "sat at every check, with a model under which an independent evaluator (smt_model_check in the runner) finds every assertion and assumption in scope true"
+  },
+  "construct": ":named"
+}

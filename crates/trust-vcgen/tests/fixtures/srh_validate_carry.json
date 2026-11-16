@@ -1,0 +1,2583 @@
+{
+  "name": "validate_carry",
+  "def_path": "fx::validate_carry",
+  "span": {
+    "file": "path_collapse_refutation_held.rs",
+    "line_start": 24,
+    "col_start": 0,
+    "line_end": 57,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Adt": {
+            "name": "core::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                "Unit"
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    "Unit"
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "fx::Carry",
+                "fields": [
+                  [
+                    "state",
+                    {
+                      "Adt": {
+                        "name": "fx::State",
+                        "fields": [
+                          [
+                            "__tag",
+                            {
+                              "Int": {
+                                "width": 64,
+                                "signed": true
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [
+                          {
+                            "name": "Ground",
+                            "discriminant": 0,
+                            "fields": []
+                          },
+                          {
+                            "name": "Escape",
+                            "discriminant": 1,
+                            "fields": []
+                          },
+                          {
+                            "name": "CsiEntry",
+                            "discriminant": 2,
+                            "fields": []
+                          },
+                          {
+                            "name": "CsiParam",
+                            "discriminant": 3,
+                            "fields": []
+                          },
+                          {
+                            "name": "CsiIntermediate",
+                            "discriminant": 4,
+                            "fields": []
+                          },
+                          {
+                            "name": "CsiIgnore",
+                            "discriminant": 5,
+                            "fields": []
+                          },
+                          {
+                            "name": "DcsEntry",
+                            "discriminant": 6,
+                            "fields": []
+                          },
+                          {
+                            "name": "DcsParam",
+                            "discriminant": 7,
+                            "fields": []
+                          },
+                          {
+                            "name": "DcsIntermediate",
+                            "discriminant": 8,
+                            "fields": []
+                          },
+                          {
+                            "name": "DcsPassthrough",
+                            "discriminant": 9,
+                            "fields": []
+                          }
+                        ],
+                        "disc_index_safe": true,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Enum"
+                      }
+                    }
+                  ],
+                  [
+                    "params",
+                    {
+                      "Seq": {
+                        "elem": {
+                          "Int": {
+                            "width": 16,
+                            "signed": false
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "subparam_mask",
+                    {
+                      "Int": {
+                        "width": 32,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "current_param",
+                    {
+                      "Int": {
+                        "width": 16,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "param_started",
+                    "Bool"
+                  ],
+                  [
+                    "last_was_colon",
+                    "Bool"
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "carry"
+      },
+      {
+        "index": 2,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "fx::State",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Ground",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Escape",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiEntry",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiParam",
+                    "discriminant": 3,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiIntermediate",
+                    "discriminant": 4,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiIgnore",
+                    "discriminant": 5,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsEntry",
+                    "discriminant": 6,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsParam",
+                    "discriminant": 7,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsIntermediate",
+                    "discriminant": 8,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsPassthrough",
+                    "discriminant": 9,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "fx::State",
+                "fields": [
+                  [
+                    "__tag",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ],
+                "variants": [
+                  {
+                    "name": "Ground",
+                    "discriminant": 0,
+                    "fields": []
+                  },
+                  {
+                    "name": "Escape",
+                    "discriminant": 1,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiEntry",
+                    "discriminant": 2,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiParam",
+                    "discriminant": 3,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiIntermediate",
+                    "discriminant": 4,
+                    "fields": []
+                  },
+                  {
+                    "name": "CsiIgnore",
+                    "discriminant": 5,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsEntry",
+                    "discriminant": 6,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsParam",
+                    "discriminant": 7,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsIntermediate",
+                    "discriminant": 8,
+                    "fields": []
+                  },
+                  {
+                    "name": "DcsPassthrough",
+                    "discriminant": 9,
+                    "fields": []
+                  }
+                ],
+                "disc_index_safe": true,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Enum"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 5,
+        "ty": "Bool",
+        "name": "header"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 7,
+        "ty": "Bool",
+        "name": "parameters"
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": "Bool",
+        "name": "has_params"
+      },
+      {
+        "index": 10,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 12,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 16,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 18,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 22,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Int": {
+                    "width": 16,
+                    "signed": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": "Bool",
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 25,
+                "col_start": 7,
+                "line_end": 25,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 4,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "UnitVariantRef": {
+                      "enum_name": "fx::State",
+                      "variant": 9
+                    }
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 25,
+                "col_start": 22,
+                "line_end": 25,
+                "col_end": 43
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "__trust_total_clone",
+            "args": [
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 2,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 25,
+              "col_start": 7,
+              "line_end": 25,
+              "col_end": 43
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 17717261303976029778,
+              "def_index": 29465,
+              "substs_digest": [
+                12862415859131390927,
+                13673407405071590744
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 17717261303976029778,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 2,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                3
+              ]
+            ],
+            "otherwise": 2,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 25,
+              "col_start": 7,
+              "line_end": 25,
+              "col_end": 43
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          0,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 26,
+                "col_start": 15,
+                "line_end": 26,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 6,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref",
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 29,
+                "col_start": 8,
+                "line_end": 29,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 6,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                2,
+                5
+              ],
+              [
+                3,
+                5
+              ],
+              [
+                4,
+                5
+              ],
+              [
+                5,
+                5
+              ],
+              [
+                6,
+                5
+              ],
+              [
+                7,
+                5
+              ],
+              [
+                8,
+                5
+              ]
+            ],
+            "otherwise": 4,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 430,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 432,
+                "col_start": 17,
+                "line_end": 432,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 5,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 431,
+                "col_start": 38,
+                "line_end": 431,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 6
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 1,
+                  "projections": [
+                    "Deref",
+                    {
+                      "Field": 0
+                    }
+                  ]
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 39,
+                "col_start": 8,
+                "line_end": 39,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 8,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                3,
+                8
+              ],
+              [
+                4,
+                8
+              ],
+              [
+                7,
+                8
+              ],
+              [
+                8,
+                8
+              ]
+            ],
+            "otherwise": 7,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+              "line_start": 430,
+              "col_start": 8,
+              "line_end": 430,
+              "col_end": 8
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": false
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 432,
+                "col_start": 17,
+                "line_end": 432,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "<dump-root>/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs",
+                "line_start": 431,
+                "col_start": 38,
+                "line_end": 431,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 11,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 42,
+                "col_start": 22,
+                "line_end": 42,
+                "col_end": 34
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u16>::is_empty",
+            "args": [
+              {
+                "Move": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 10,
+              "projections": []
+            },
+            "target": 10,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 42,
+              "col_start": 22,
+              "line_end": 42,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 13764795148489922248,
+              "def_index": 8822,
+              "substs_digest": [
+                5307098113175635675,
+                8739766520148468318
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 13764795148489922248,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 10,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                15
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 42,
+              "col_start": 22,
+              "line_end": 42,
+              "col_end": 45
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 13,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 43,
+                "col_start": 11,
+                "line_end": 43,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 12,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 13,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 43,
+                "col_start": 11,
+                "line_end": 43,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 12,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                12
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 43,
+              "col_start": 11,
+              "line_end": 43,
+              "col_end": 35
+            }
+          }
+        }
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 3
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 44,
+                "col_start": 11,
+                "line_end": 44,
+                "col_end": 30
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 14,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 15,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        16
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 44,
+                "col_start": 11,
+                "line_end": 44,
+                "col_end": 35
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 14,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                13
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 44,
+              "col_start": 11,
+              "line_end": 44,
+              "col_end": 35
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 4
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 45,
+                "col_start": 11,
+                "line_end": 45,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                14
+              ]
+            ],
+            "otherwise": 15,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 45,
+              "col_start": 11,
+              "line_end": 45,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 5
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 46,
+                "col_start": 11,
+                "line_end": 46,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 16
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Constant": {
+                    "Bool": true
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 42,
+                "col_start": 21,
+                "line_end": 46,
+                "col_end": 31
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 16
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 9,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 47,
+                "col_start": 7,
+                "line_end": 47,
+                "col_end": 17
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 17,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                19
+              ]
+            ],
+            "otherwise": 17,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 47,
+              "col_start": 7,
+              "line_end": 47,
+              "col_end": 17
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 18,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 7,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 47,
+                "col_start": 22,
+                "line_end": 47,
+                "col_end": 32
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 18,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                18
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 47,
+              "col_start": 22,
+              "line_end": 47,
+              "col_end": 32
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          1,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 48,
+                "col_start": 15,
+                "line_end": 48,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 50,
+                "col_start": 7,
+                "line_end": 50,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u16>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 21,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 20,
+              "projections": []
+            },
+            "target": 20,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 50,
+              "col_start": 7,
+              "line_end": 50,
+              "col_end": 25
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 13764795148489922248,
+              "def_index": 8821,
+              "substs_digest": [
+                5307098113175635675,
+                8739766520148468318
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "VecLen",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 13764795148489922248,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Move": {
+                      "local": 20,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        24,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 50,
+                "col_start": 7,
+                "line_end": 50,
+                "col_end": 30
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 19,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                22
+              ]
+            ],
+            "otherwise": 21,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 50,
+              "col_start": 7,
+              "line_end": 50,
+              "col_end": 30
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          2,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 51,
+                "col_start": 15,
+                "line_end": 51,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 2
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 53,
+                "col_start": 7,
+                "line_end": 53,
+                "col_end": 26
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": false,
+                  "place": {
+                    "local": 1,
+                    "projections": [
+                      "Deref",
+                      {
+                        "Field": 1
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 53,
+                "col_start": 30,
+                "line_end": 53,
+                "col_end": 42
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<u16>::len",
+            "args": [
+              {
+                "Move": {
+                  "local": 26,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 25,
+              "projections": []
+            },
+            "target": 23,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 53,
+              "col_start": 30,
+              "line_end": 53,
+              "col_end": 48
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 13764795148489922248,
+              "def_index": 8821,
+              "substs_digest": [
+                5307098113175635675,
+                8739766520148468318
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "VecLen",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 13764795148489922248,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        32,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 53,
+                "col_start": 7,
+                "line_end": 53,
+                "col_end": 48
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 27,
+                "projections": []
+              }
+            },
+            "expected": true,
+            "msg": {
+              "Overflow": "Shr"
+            },
+            "target": 24,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 53,
+              "col_start": 7,
+              "line_end": 53,
+              "col_end": 48
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Shr",
+                  {
+                    "Move": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 25,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 53,
+                "col_start": 7,
+                "line_end": 53,
+                "col_end": 48
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Ne",
+                  {
+                    "Move": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        0,
+                        32
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 53,
+                "col_start": 7,
+                "line_end": 53,
+                "col_end": 53
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 22,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                26
+              ]
+            ],
+            "otherwise": 25,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 53,
+              "col_start": 7,
+              "line_end": 53,
+              "col_end": 53
+            }
+          }
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          3,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 54,
+                "col_start": 15,
+                "line_end": 54,
+                "col_end": 21
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 5,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 56,
+                "col_start": 7,
+                "line_end": 56,
+                "col_end": 13
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 28,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                28
+              ]
+            ],
+            "otherwise": 27,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "path_collapse_refutation_held.rs",
+              "line_start": 56,
+              "col_start": 7,
+              "line_end": 56,
+              "col_end": 13
+            }
+          }
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": "Unit"
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 56,
+                "col_start": 16,
+                "line_end": 56,
+                "col_end": 22
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 28,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::result::Result",
+                      "variant": 1,
+                      "active_field": null,
+                      "args": "core::result::Result<(), u8>"
+                    }
+                  },
+                  [
+                    {
+                      "Constant": {
+                        "Uint": [
+                          4,
+                          8
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "path_collapse_refutation_held.rs",
+                "line_start": 56,
+                "col_start": 32,
+                "line_end": 56,
+                "col_end": 38
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 29
+        }
+      },
+      {
+        "id": 29,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Adt": {
+        "name": "core::result::Result",
+        "fields": [
+          [
+            "__tag",
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            }
+          ],
+          [
+            "__v0_0",
+            "Unit"
+          ],
+          [
+            "__v1_0",
+            {
+              "Int": {
+                "width": 8,
+                "signed": false
+              }
+            }
+          ]
+        ],
+        "variants": [
+          {
+            "name": "Ok",
+            "discriminant": 0,
+            "fields": [
+              [
+                "0",
+                "Unit"
+              ]
+            ]
+          },
+          {
+            "name": "Err",
+            "discriminant": 1,
+            "fields": [
+              [
+                "0",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "disc_index_safe": true,
+        "faithful_enum_repr": null,
+        "layout": null,
+        "enum_layout": null,
+        "adt_kind": "Enum"
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 3
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 6
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 7
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 8
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_6",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 2
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 3
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 5
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 6
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 7
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 8
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_8",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

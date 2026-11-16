@@ -79,6 +79,7 @@ fn shift_loop(op: BinOp, count: i128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

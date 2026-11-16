@@ -19,7 +19,12 @@ trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-clean-origin = { path = "../trust-clean-origin" }
 trust-ir = { workspace = true }
 trust-types = { path = "../trust-types", default-features = false }
+trust-certify = { path = "../trust-certify" }
+# Plan step 3.1: the family gate reflects through the SAME side-B producers the MIR lane uses.
+# Trust (WS5.20): so do the standalone decision reflectors — the FROZEN term producers
+# (`admit_comparison_function`, `admit_select_function`) get a reading of the actual SSA,
+# never an `Expr` of their own.
+trust-spec-elab = { path = "../trust-spec-elab" }
 
 [dev-dependencies]
-trust-certify = { path = "../trust-certify" }
 trust-clean-ir = { path = "../trust-clean-ir" }

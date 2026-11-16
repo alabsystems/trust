@@ -5,11 +5,10 @@
 #![feature(allow_internal_unstable)]
 // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
 #![feature(fn_align)]
-#![feature(optimize_attribute)]
 #![feature(dropck_eyepatch)]
 #![feature(export_stable)]
 #![allow(incomplete_features)]
-#![feature(min_generic_const_args)]
+#![feature(gca_min_const_items)]
 #![feature(ffi_const, ffi_pure)]
 #![feature(coverage_attribute)]
 #![feature(sanitize)]
@@ -40,13 +39,16 @@
 //~^ ERROR malformed
 #[doc]
 //~^ ERROR
+#[doc()]
+//~^ ERROR
 #[rustc_macro_transparency]
 //~^ ERROR malformed
 //~| ERROR attribute cannot be used on
 #[repr]
 //~^ ERROR malformed
-#[rustc_as_ptr = 5]
+#[lint::as_ptr = 5]
 //~^ ERROR malformed
+//~| ERROR cannot find module or crate `lint` in this scope
 #[inline = 5]
 //~^ ERROR valid forms for the attribute are
 //~| WARN this was previously accepted by the compiler
@@ -76,8 +78,6 @@
 #[crate_name]
 //~^ ERROR malformed
 //~| WARN crate-level attribute should be an inner attribute
-#[doc]
-//~^ ERROR
 #[target_feature]
 //~^ ERROR malformed
 #[export_stable = 1]
@@ -105,7 +105,7 @@
 //~| WARN previously accepted
 #[proc_macro = 18]
 //~^ ERROR malformed
-//~| ERROR the `#[proc_macro]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro` attribute is only usable with crates of the `proc-macro` crate type
 #[cfg]
 //~^ ERROR malformed
 #[cfg_attr]
@@ -122,14 +122,14 @@ fn test() {
 
 #[proc_macro_attribute = 19]
 //~^ ERROR malformed
-//~| ERROR the `#[proc_macro_attribute]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro_attribute` attribute is only usable with crates of the `proc-macro` crate type
 #[must_use = 1]
 //~^ ERROR malformed
 fn test2() { }
 
 #[proc_macro_derive]
 //~^ ERROR malformed `proc_macro_derive` attribute
-//~| ERROR the `#[proc_macro_derive]` attribute is only usable with crates of the `proc-macro` crate type
+//~| ERROR the `proc_macro_derive` attribute is only usable with crates of the `proc-macro` crate type
 pub fn test3() {}
 
 #[must_not_suspend()]
@@ -208,6 +208,8 @@ static mut TLS: u8 = 42;
 
 #[no_link()]
 //~^ ERROR malformed
+//~| ERROR use of deprecated `no_link` attribute
+//~| WARN this was previously accepted by the compiler
 #[macro_use = 1]
 //~^ ERROR malformed
 extern crate wloop;
@@ -217,7 +219,7 @@ extern crate wloop;
 //~^ ERROR malformed
 #[allow_internal_unsafe = 1]
 //~^ ERROR malformed
-//~| ERROR allow_internal_unsafe side-steps the unsafe_code lint
+//~| ERROR the `allow_internal_unsafe` attribute side-steps the `unsafe_code` lint
 macro_rules! slump {
     () => {}
 }

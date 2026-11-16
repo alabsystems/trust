@@ -1,0 +1,10 @@
+error: `ident_bumps` did not elaborate: Type mismatch: expected trust_import_kernel_obligations_deferred_island__ident fvar#0 = fvar#0 + UInt64.ofNat 1, got trust_import_kernel_obligations_deferred_island__ident fvar#0 = trust_import_kernel_obligations_deferred_island__ident fvar#0
+  --> $DIR/kernel-obligations-deferred-island.rs:19:5
+   |
+LL |     theorem ident_bumps (x : UInt64) : trust_import_kernel_obligations_deferred_island__ident x = x + 1 := rfl
+   |     ^^^^^^^
+   |
+   = note: this island names the kernel-import namespace, so it was checked after program admissions were minted (two-language design item 10)
+
+error: aborting due to 1 previous error
+

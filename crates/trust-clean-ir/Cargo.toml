@@ -52,6 +52,19 @@ workspace = true
 trust-clean-origin = { path = "../trust-clean-origin" }
 trust-clean-carrier = { path = "../trust-clean-carrier" }
 trust-ir = { workspace = true }
+# The PINNED HANDLE RUNTIME lives here, and so does the writer for it.
+# `TRUSTED_HANDLE_RUNTIMES` is the validator's own `("Nat",
+# "trust_bignum::Nat")` row -- the four link-time symbols, their def paths, the
+# C calling convention and the exact signatures -- and
+# `ModuleBuilder::declare_handle_runtime` turns that row into the bodyless
+# `External` declarations `validate_module` admits as the ONLY origins of a
+# `Nat` handle. READ, never restated: a private copy of the pairing in this
+# crate could satisfy itself while disagreeing with the gate that enforces it,
+# which is the two-spellings defect this producer refuses everywhere else.
+#
+# No new build cost in the compiler: `rustc_mir_transform`, which links this
+# crate, already depends on `trust-ir-build`.
+trust-ir-build = { workspace = true }
 # The `ArithBinOp`/`ArithOperand`/`ArithExpr` vocabulary the plan speaks. REUSED,
 # never redefined: the plan's values come from the Clean term and the MIR
 # recognizer reads the same vocabulary off the emitted body, so a second

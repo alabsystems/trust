@@ -47,7 +47,8 @@ const SPEC_CLEAN_SUPPORTED_VERSION: u64 = 2;
 /// Closed schema-v2 spellings emitted by `trust_spec_emit`. A producer adding
 /// a new tag must update this reader rather than having the tag silently acquire
 /// meaning here.
-const SPEC_CLEAN_GOAL_ORIGINS: &[&str] = &["ensures-citation", "ensures-citation-deferred"];
+const SPEC_CLEAN_GOAL_ORIGINS: &[&str] =
+    &["ensures-citation", "ensures-citation-deferred", "ensures-island-defeq"];
 const SPEC_CLEAN_GOAL_VERDICTS: &[&str] = &[
     "certified",
     "trusted",
@@ -79,6 +80,18 @@ const SPEC_CLEAN_GOAL_KEYS: &[&str] = &[
     "elab_error",
     "verdict",
     "detail",
+    // Trust (ref-self I1, reader side — OR-A1 Inc 0 / critique H7): the
+    // compiler has written `view` on EVERY goal row since `76c7e66fe0d`, and a
+    // closed reader that did not list it refused every artifact that compiler
+    // produced. Optional here: an artifact written before that change has no
+    // such member, which is exactly how its absence reads.
+    "view",
+    // Trust (OR-A1, 2026-09-27): the rung the row's `goal_clean`
+    // was graded on, the requires-link of a conditional credit, and the
+    // hypotheses it carried. Optional for the same reason as `view`.
+    "rung",
+    "requires_link",
+    "hypotheses",
 ];
 const SPEC_CLEAN_DENOTATION_KEYS: &[&str] = &[
     "format",
@@ -95,7 +108,22 @@ const SPEC_CLEAN_DENOTATION_KEYS: &[&str] = &[
     "elab_error",
     "authority",
     "verdict",
+    // Trust (ref-self I1, reader side): written on every denotation row too.
+    "view",
 ];
+/// The one value a row's `view` key may carry besides `null`:
+/// `trust_types::e6_param_view::VIEW_MARKER`, which the compiler writes when the
+/// row's binders name a frozen shared pointee's field VALUES through the
+/// borrow-erased E6 parameter view. Such a row rests on R1
+/// (`docs/TCB.md`, `EnsuresCitationViewDischarge`), so a reader must not drop it.
+///
+/// Trust (2026-09-28): the compiler has written `view` on every goal and
+/// denotation row since `76c7e66fe0d` (2026-09-18), and this closed schema never
+/// learned it. Every `targo trust spec --emit clean` over a program with a
+/// Lean-discharged contract refused with "goal row has unknown field `view`".
+/// The key stays optional, because an artifact written before that commit has
+/// no view lane and so no view to disclose.
+const SPEC_CLEAN_VIEW_MARKERS: &[&str] = &[trust_types::e6_param_view::VIEW_MARKER];
 const SPEC_CLEAN_SESSION_KEYS: &[&str] =
     &["format", "v", "row", "crate", "session", "goals", "denotations"];
 
@@ -183,8 +211,43 @@ struct GoalRow {
     elab_error: Option<String>,
     verdict: String,
     detail: Option<String>,
+    /// Trust (ref-self I1 / OR-A1 review S5): the borrow-erased parameter
+    /// view the goal rests on, if any — a `Trusted` marker (R1).
+    /// `None` both when the member is absent (a pre-I1 artifact) and when it
+    /// is `null`; otherwise one of [`SPEC_CLEAN_VIEW_MARKERS`] (any other value
+    /// is refused by `parse_view_marker`).
+    view: Option<String>,
+    /// Trust (OR-A1 review S5): which goal `goal_clean` is — `unconditional`
+    /// or `under-requires` — when the artifact records it.
+    rung: Option<String>,
+    /// Trust (OR-A1 review S5): the requires-link of an `under-requires` row,
+    /// the marker the ruling requires (`kernel-canonical` / `allow-listed`).
+    requires_link: Option<String>,
+    /// Trust (OR-A1 review S5): the hypotheses an `under-requires` row carried,
+    /// in binder order; empty otherwise.
+    hypotheses: Vec<GoalHypothesis>,
     /// The raw line, for `--json` passthrough (byte-preserving output).
     raw: String,
+}
+
+/// Trust (OR-A1): one carried hypothesis of an `under-requires` goal row.
+#[derive(Debug, Clone, PartialEq)]
+struct GoalHypothesis {
+    binder: u64,
+    contract_index: u64,
+    /// The query-owned canonical spelling callers are charged.
+    canonical: String,
+    /// The spelling the kernel graded (the lifted `T_j` on the kernel-canonical
+    /// link, the canonical text itself on the allow-listed one).
+    graded: String,
+}
+
+/// Trust (OR-A1): the validated `rung` / `requires_link` / `hypotheses`
+/// members of one goal row.
+struct GoalRungMembers {
+    rung: Option<String>,
+    requires_link: Option<String>,
+    hypotheses: Vec<GoalHypothesis>,
 }
 
 /// One explicitly ungraded, zero-authority canonical clause denotation.
@@ -201,6 +264,8 @@ struct DenotationRow {
     elab_error: Option<String>,
     authority: String,
     verdict: String,
+    /// The E6 parameter-view disclosure (see [`SPEC_CLEAN_VIEW_MARKERS`]).
+    view: Option<String>,
     /// The raw line, for `--json` passthrough (byte-preserving output).
     raw: String,
 }
@@ -359,6 +424,39 @@ fn reject_unknown_row_keys(
     Ok(())
 }
 
+/// A row's `view` key: absent (an artifact from before the view lane), `null`,
+/// or one of [`SPEC_CLEAN_VIEW_MARKERS`]. Any other value is refused, because a
+/// marker this reader does not know may disclose an assumption it cannot state.
+fn parse_view_marker(
+    value: &serde_json::Value,
+    row_kind: &str,
+    file: &str,
+) -> Result<Option<String>, SpecRefusal> {
+    match value.get("view") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(marker))
+            if SPEC_CLEAN_VIEW_MARKERS.contains(&marker.as_str()) =>
+        {
+            Ok(Some(marker.clone()))
+        }
+        Some(other) => Err(SpecRefusal::Malformed {
+            file: file.to_string(),
+            detail: format!("{row_kind} row has unknown `view` disclosure {other}"),
+        }),
+    }
+}
+
+/// The human line for a row that rests on the E6 parameter view.
+fn render_view_disclosure(out: &mut String, view: Option<&str>) {
+    if let Some(marker) = view {
+        out.push_str(&format!(
+            "    view     {marker}: the binders name a frozen shared pointee's field values at \
+             entry; this rests on owner ruling R1 (a live `&T` argument with `T: Freeze` is \
+             immutable for the call) and is graded below Certified (docs/TCB.md)\n"
+        ));
+    }
+}
+
 fn parse_required_string(
     value: &serde_json::Value,
     key: &str,
@@ -426,6 +524,119 @@ fn parse_nullable_string(
             detail: format!("row missing `{key}`"),
         }),
     }
+}
+
+/// Like [`parse_nullable_string`], for a member a row may OMIT (written only
+/// by compilers after the member was introduced): absent, `null`, or a string.
+fn parse_optional_nullable_string(
+    value: &serde_json::Value,
+    key: &str,
+    file: &str,
+) -> Result<Option<String>, SpecRefusal> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(_) => parse_nullable_string(value, key, file),
+    }
+}
+
+/// Trust (OR-A1): the `rung` / `requires_link` / `hypotheses` members of a
+/// goal row. All three are optional (an artifact written before OR-A1 has
+/// none), but when present they must be one of the closed spellings and agree
+/// with each other: `requires_link` and a non-empty `hypotheses` list exactly
+/// on an `"under-requires"` row, which only a `"certified"` grade produces.
+fn validate_goal_rung_members(
+    value: &serde_json::Value,
+    verdict: &str,
+    file: &str,
+) -> Result<GoalRungMembers, SpecRefusal> {
+    let malformed = |detail: String| SpecRefusal::Malformed { file: file.to_string(), detail };
+    let rung = parse_optional_nullable_string(value, "rung", file)?;
+    let link = parse_optional_nullable_string(value, "requires_link", file)?;
+    if let Some(rung) = rung.as_deref() {
+        if !matches!(rung, "unconditional" | "under-requires") {
+            return Err(malformed(format!("unknown goal rung `{rung}`")));
+        }
+    }
+    if let Some(link) = link.as_deref() {
+        if !matches!(link, "kernel-canonical" | "allow-listed") {
+            return Err(malformed(format!("unknown requires_link `{link}`")));
+        }
+    }
+    let under_requires = rung.as_deref() == Some("under-requires");
+    if under_requires != link.is_some() {
+        return Err(malformed(
+            "goal row must carry a `requires_link` exactly when its rung is `under-requires`"
+                .to_string(),
+        ));
+    }
+    if under_requires && verdict != "certified" {
+        return Err(malformed(
+            "an `under-requires` goal row records a credited conditional grade, which is \
+             `certified`"
+                .to_string(),
+        ));
+    }
+    let hypotheses = match value.get("hypotheses") {
+        None | Some(serde_json::Value::Null) if !under_requires => Vec::new(),
+        Some(serde_json::Value::Array(rows)) if under_requires && !rows.is_empty() => {
+            let mut hypotheses = Vec::with_capacity(rows.len());
+            for row in rows {
+                let object = row.as_object().ok_or_else(|| {
+                    malformed("a `hypotheses` entry is not an object".to_string())
+                })?;
+                for key in object.keys() {
+                    if !matches!(key.as_str(), "binder" | "contract_index" | "canonical" | "graded")
+                    {
+                        return Err(malformed(format!(
+                            "a `hypotheses` entry has unknown field `{key}`"
+                        )));
+                    }
+                }
+                for key in ["binder", "contract_index"] {
+                    if object.get(key).and_then(serde_json::Value::as_u64).is_none() {
+                        return Err(malformed(format!(
+                            "a `hypotheses` entry's `{key}` is not an unsigned integer"
+                        )));
+                    }
+                }
+                for key in ["canonical", "graded"] {
+                    if object
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|text| text.trim().is_empty())
+                    {
+                        return Err(malformed(format!(
+                            "a `hypotheses` entry's `{key}` is not a non-empty string"
+                        )));
+                    }
+                }
+                let number =
+                    |key: &str| object.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let text = |key: &str| {
+                    object
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                hypotheses.push(GoalHypothesis {
+                    binder: number("binder"),
+                    contract_index: number("contract_index"),
+                    canonical: text("canonical"),
+                    graded: text("graded"),
+                });
+            }
+            hypotheses
+        }
+        _ => {
+            return Err(malformed(
+                "goal row must carry a non-empty `hypotheses` list exactly when its rung is \
+                 `under-requires`"
+                    .to_string(),
+            ));
+        }
+    };
+    Ok(GoalRungMembers { rung, requires_link: link, hypotheses })
 }
 
 /// Parse and validate ONE per-unit artifact file: every line self-describes
@@ -509,6 +720,8 @@ fn parse_unit_artifact(file_name: &str, contents: &str) -> Result<UnitArtifact, 
                     });
                 }
                 let detail = parse_nullable_string(&value, "detail", file_name)?;
+                let view = parse_view_marker(&value, "goal", file_name)?;
+                let rung_members = validate_goal_rung_members(&value, &verdict, file_name)?;
                 if clause.is_some() {
                     match (&goal_clean, &elab_error) {
                         (Some(goal), None) if !goal.trim().is_empty() => {}
@@ -588,6 +801,10 @@ fn parse_unit_artifact(file_name: &str, contents: &str) -> Result<UnitArtifact, 
                     elab_error,
                     verdict,
                     detail,
+                    view,
+                    rung: rung_members.rung,
+                    requires_link: rung_members.requires_link,
+                    hypotheses: rung_members.hypotheses,
                     raw: line.to_string(),
                 });
             }
@@ -659,6 +876,7 @@ fn parse_unit_artifact(file_name: &str, contents: &str) -> Result<UnitArtifact, 
                 }
                 let authority = parse_required_string(&value, "authority", file_name)?;
                 let verdict = parse_required_string(&value, "verdict", file_name)?;
+                let view = parse_view_marker(&value, "denotation", file_name)?;
                 if authority != "none" || verdict != "ungraded" {
                     return Err(SpecRefusal::Malformed {
                         file: file_name.to_string(),
@@ -688,6 +906,7 @@ fn parse_unit_artifact(file_name: &str, contents: &str) -> Result<UnitArtifact, 
                     elab_error,
                     authority,
                     verdict,
+                    view,
                     raw: line.to_string(),
                 });
             }
@@ -792,6 +1011,51 @@ fn render_goal_row(row: &GoalRow) -> String {
         Some(detail) => out.push_str(&format!("    verdict  {} ({detail})\n", row.verdict)),
         None => out.push_str(&format!("    verdict  {}\n", row.verdict)),
     }
+    // Trust (OR-A1 review S5): the markers the rulings require travel to the
+    // HUMAN rendering too. Without them a conditional or a view grade printed
+    // as a bare `verdict  certified`, which reads as a `Certified` row; the
+    // kernel's verdict on the goal is `certified`, the ROW is `Trusted`.
+    //
+    // Trust (OR-A1 review, round 2): this row records a GRADE, not a
+    // verification row's disposition. A conditional grade is credited only to a
+    // postcondition row no other lane already proved (H2), so the same artifact
+    // row describes both a function whose rows took the `Trusted` credit
+    // (`keep`) and one whose rows kept another lane's proof — possibly
+    // `Certified` — and took none (`keep_positive`). The artifact does not say
+    // which, so the line states the rule, never a row status it cannot know.
+    match (row.rung.as_deref(), row.requires_link.as_deref()) {
+        (Some(rung), Some(link)) => out.push_str(&format!(
+            "    rung     {rung} (requires-link: {link}) — the kernel certified this goal only \
+             for inputs satisfying the carried `requires`; a postcondition row credited from it \
+             is Trusted, never Certified (owner ruling OR-A1), and a row another lane already \
+             proved keeps that proof and takes no credit from it (the `targo trust check` report \
+             names the credited rows)\n"
+        )),
+        (Some(rung), None) => out.push_str(&format!("    rung     {rung}\n")),
+        (None, _) => {}
+    }
+    for hypothesis in &row.hypotheses {
+        if hypothesis.graded == hypothesis.canonical {
+            out.push_str(&format!(
+                "    assumes  h{} `{}` (requires #{})\n",
+                hypothesis.binder, hypothesis.canonical, hypothesis.contract_index
+            ));
+        } else {
+            out.push_str(&format!(
+                "    assumes  h{} `{}` (requires #{}; graded as `{}`)\n",
+                hypothesis.binder,
+                hypothesis.canonical,
+                hypothesis.contract_index,
+                hypothesis.graded
+            ));
+        }
+    }
+    if let Some(view) = &row.view {
+        out.push_str(&format!(
+            "    view     {view} — the row is Trusted, not Certified: the goal rests on the \
+             borrow-erased parameter view (owner ruling R1)\n"
+        ));
+    }
     match (&row.goal_clean, &row.elab_error) {
         (Some(goal), _) => out.push_str(&format!("    goal     {goal}\n")),
         (None, Some(reason)) => {
@@ -818,6 +1082,7 @@ fn render_denotation_row(row: &DenotationRow) -> String {
         }
         _ => unreachable!("the parser enforces exactly one denotation outcome"),
     }
+    render_view_disclosure(&mut out, row.view.as_deref());
     out
 }
 
@@ -894,6 +1159,9 @@ fn unfavorable_obligation_lines(report: &trust_types::JsonProofReport) -> Vec<St
     for function in &report.functions {
         for obligation in &function.obligations {
             let verdict = match &obligation.outcome {
+                trust_types::ObligationOutcome::Failed { basis, .. } if !basis.is_refuted() => {
+                    format!("FAILED ({})", basis.human_label())
+                }
                 trust_types::ObligationOutcome::Failed { .. } => "FAILED".to_string(),
                 trust_types::ObligationOutcome::Unknown { reason } => {
                     format!("UNKNOWN ({reason})")
@@ -1170,6 +1438,197 @@ mod tests {
         assert_eq!(denotation.raw, DENOTATION_LINE);
     }
 
+    /// Trust (OR-A1 Inc 0 / critique H7): goal and denotation rows shaped like
+    /// the ones the CURRENT compiler writes — with `view` — are accepted, and a
+    /// non-string `view` is refused.
+    #[test]
+    fn rows_with_the_view_member_parse() {
+        let mut goal = goal_value();
+        goal["view"] = serde_json::Value::Null;
+        parse_goal_value(goal.clone()).expect("a goal row with `view: null` parses");
+        goal["view"] = "frozen-shared-erased".into();
+        parse_goal_value(goal.clone()).expect("a goal row naming a view parses");
+        goal["view"] = serde_json::json!(7);
+        assert!(malformed_goal_detail(goal).contains("`view`"));
+
+        let mut denotation: serde_json::Value =
+            serde_json::from_str(DENOTATION_LINE).expect("test denotation JSON");
+        denotation["view"] = serde_json::Value::Null;
+        let line = serde_json::to_string(&denotation).expect("serialize");
+        parse_unit_artifact("demo.spec-clean.jsonl", &format!("{line}\n{}\n", seal_line(0, 1)))
+            .expect("a denotation row with `view: null` parses");
+    }
+
+    /// Trust (OR-A1 Inc 0 / critique H7): a goal row shaped like the one the
+    /// CURRENT compiler writes — with `view`, and with the three OR-A1 members —
+    /// is accepted; an unknown rung, a link without an `under-requires` rung, or
+    /// an `under-requires` row with no hypotheses is refused.
+    #[test]
+    fn a_goal_row_with_the_view_and_rung_members_parses() {
+        let mut unconditional = goal_value();
+        let object = unconditional.as_object_mut().expect("goal object");
+        object.insert("view".into(), serde_json::Value::Null);
+        object.insert("rung".into(), "unconditional".into());
+        object.insert("requires_link".into(), serde_json::Value::Null);
+        object.insert("hypotheses".into(), serde_json::Value::Null);
+        parse_goal_value(unconditional.clone()).expect("the current compiler's goal row parses");
+
+        let mut conditional = unconditional.clone();
+        let object = conditional.as_object_mut().expect("goal object");
+        object.insert("rung".into(), "under-requires".into());
+        object.insert("requires_link".into(), "kernel-canonical".into());
+        object.insert(
+            "hypotheses".into(),
+            serde_json::json!([{
+                "binder": 0,
+                "contract_index": 0,
+                "canonical": "b <= a",
+                "graded": "(b as nat) <= (a as nat)",
+            }]),
+        );
+        parse_goal_value(conditional.clone()).expect("a credited conditional row parses");
+
+        let mut unknown_rung = conditional.clone();
+        unknown_rung["rung"] = "sideways".into();
+        assert!(malformed_goal_detail(unknown_rung).contains("unknown goal rung"));
+
+        let mut dangling_link = unconditional.clone();
+        dangling_link["requires_link"] = "allow-listed".into();
+        assert!(malformed_goal_detail(dangling_link).contains("exactly when its rung"));
+
+        let mut no_hypotheses = conditional.clone();
+        no_hypotheses["hypotheses"] = serde_json::json!([]);
+        assert!(malformed_goal_detail(no_hypotheses).contains("non-empty `hypotheses`"));
+
+        let mut uncertified = conditional;
+        uncertified["verdict"] = "statement-or-certification-rejected".into();
+        uncertified["detail"] = "drift".into();
+        assert!(malformed_goal_detail(uncertified).contains("credited conditional grade"));
+    }
+
+    /// Trust (OR-A1 review S5): the human rendering carries the rung, the
+    /// requires-link marker, the carried hypotheses and the view marker, so a
+    /// conditional or a view grade never prints as a bare `verdict  certified`.
+    #[test]
+    fn the_human_rendering_shows_the_rung_link_hypotheses_and_view_markers() {
+        let mut conditional = goal_value();
+        let object = conditional.as_object_mut().expect("goal object");
+        object.insert("view".into(), serde_json::Value::Null);
+        object.insert("rung".into(), "under-requires".into());
+        object.insert("requires_link".into(), "kernel-canonical".into());
+        object.insert(
+            "hypotheses".into(),
+            serde_json::json!([{
+                "binder": 0,
+                "contract_index": 2,
+                "canonical": "b <= a",
+                "graded": "(b as nat) <= (a as nat)",
+            }]),
+        );
+        let unit = parse_goal_value(conditional.clone()).expect("a credited conditional row");
+        let row = &unit.goals[0];
+        assert_eq!(row.rung.as_deref(), Some("under-requires"));
+        assert_eq!(row.requires_link.as_deref(), Some("kernel-canonical"));
+        assert_eq!(
+            row.hypotheses,
+            vec![GoalHypothesis {
+                binder: 0,
+                contract_index: 2,
+                canonical: "b <= a".to_string(),
+                graded: "(b as nat) <= (a as nat)".to_string(),
+            }]
+        );
+        let rendered = render_goal_row(row);
+        assert!(
+            rendered.contains("rung     under-requires (requires-link: kernel-canonical)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("is Trusted, never Certified (owner ruling OR-A1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "assumes  h0 `b <= a` (requires #2; graded as `(b as nat) <= (a as nat)`)"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("    view "), "no view marker on a null view: {rendered}");
+
+        let mut allow_listed = conditional.clone();
+        allow_listed["requires_link"] = "allow-listed".into();
+        allow_listed["hypotheses"][0]["graded"] = "b <= a".into();
+        let unit = parse_goal_value(allow_listed).expect("an allow-listed conditional row");
+        let rendered = render_goal_row(&unit.goals[0]);
+        assert!(rendered.contains("(requires-link: allow-listed)"), "{rendered}");
+        assert!(rendered.contains("assumes  h0 `b <= a` (requires #2)\n"), "{rendered}");
+
+        let mut viewed = goal_value();
+        viewed["view"] = "frozen-shared-erased".into();
+        viewed["rung"] = "unconditional".into();
+        viewed["requires_link"] = serde_json::Value::Null;
+        viewed["hypotheses"] = serde_json::Value::Null;
+        let unit = parse_goal_value(viewed).expect("a view row");
+        let rendered = render_goal_row(&unit.goals[0]);
+        assert!(rendered.contains("rung     unconditional\n"), "{rendered}");
+        assert!(!rendered.contains("requires-link"), "{rendered}");
+        assert!(
+            rendered.contains("view     frozen-shared-erased — the row is Trusted, not Certified"),
+            "{rendered}"
+        );
+
+        // A pre-OR-A1 artifact renders exactly as before: no marker lines.
+        let unit = parse_goal_value(goal_value()).expect("a pre-I1 goal row");
+        let rendered = render_goal_row(&unit.goals[0]);
+        for absent in ["rung ", "assumes", "view "] {
+            assert!(!rendered.contains(absent), "`{absent}` on a pre-OR-A1 row: {rendered}");
+        }
+    }
+
+    /// Trust (OR-A1 review, round 2): the goal row is a GRADE. A conditional
+    /// grade credits only rows no other lane already proved (H2), so for a
+    /// function like the fixture's `keep_positive` — every postcondition row
+    /// already kernel-certified by another lane, nothing credited — the SAME
+    /// artifact row is written as for `keep`, whose rows did take the credit.
+    /// The rendering therefore must not assert that "the row is Trusted": for
+    /// `keep_positive` that was false (its row is `Certified`). It states the
+    /// credit rule, which is true of both.
+    #[test]
+    fn a_conditional_grade_never_claims_the_status_of_a_row_it_may_not_have_credited() {
+        let mut keep_positive = goal_value();
+        let object = keep_positive.as_object_mut().expect("goal object");
+        object.insert(
+            "def_path".into(),
+            "e9_requires_hypothesis_kernel_canonical::keep_positive".into(),
+        );
+        object.insert("view".into(), serde_json::Value::Null);
+        object.insert("rung".into(), "under-requires".into());
+        object.insert("requires_link".into(), "kernel-canonical".into());
+        object.insert(
+            "hypotheses".into(),
+            serde_json::json!([{
+                "binder": 0,
+                "contract_index": 0,
+                "canonical": "k > 0",
+                "graded": "(k as nat) > 0",
+            }]),
+        );
+        let unit = parse_goal_value(keep_positive).expect("a creditable conditional row");
+        let rendered = render_goal_row(&unit.goals[0]);
+        assert!(!rendered.contains("the row is Trusted"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "a row another lane already proved keeps that proof and takes no credit from it"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("names the credited rows"), "{rendered}");
+        assert!(
+            rendered.contains("only for inputs satisfying the carried `requires`"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn goal_required_strings_reject_missing_wrong_null_and_empty_values() {
         for field in ["crate", "def_path", "origin", "theorem", "verdict"] {
@@ -1373,7 +1832,7 @@ mod tests {
 
     #[test]
     fn goal_tags_are_closed_to_compiler_schema_v2_spellings() {
-        for origin in ["ensures-citation", "ensures-citation-deferred"] {
+        for origin in ["ensures-citation", "ensures-citation-deferred", "ensures-island-defeq"] {
             let mut value = goal_value();
             value["origin"] = serde_json::json!(origin);
             parse_goal_value(value).unwrap_or_else(|error| {
@@ -1474,6 +1933,52 @@ mod tests {
             malformed_artifact_detail(&format!("{seal}\n")),
             "session row has unknown field `future_session_semantics`"
         );
+    }
+
+    #[test]
+    fn the_view_disclosure_is_read_and_rendered_on_both_row_kinds() {
+        // The compiler writes `view` on every goal and denotation row: `null`
+        // for most, the E6 parameter-view marker for a row that rests on R1.
+        let marker = trust_types::e6_param_view::VIEW_MARKER;
+        let mut goal = goal_value();
+        goal["view"] = serde_json::Value::Null;
+        let unit = parse_goal_value(goal.clone()).expect("a null view is the common case");
+        assert_eq!(unit.goals[0].view, None);
+        assert!(!render_goal_row(&unit.goals[0]).contains("view"));
+
+        goal["view"] = serde_json::json!(marker);
+        let unit = parse_goal_value(goal.clone()).expect("the view marker is known");
+        assert_eq!(unit.goals[0].view.as_deref(), Some(marker));
+        let rendered = render_goal_row(&unit.goals[0]);
+        assert!(rendered.contains(marker) && rendered.contains("owner ruling R1"), "{rendered}");
+
+        let mut denotation: serde_json::Value =
+            serde_json::from_str(DENOTATION_LINE).expect("test denotation JSON");
+        denotation["view"] = serde_json::json!(marker);
+        let denotation = serde_json::to_string(&denotation).expect("serialize denotation");
+        let unit = parse_unit_artifact(
+            "demo.spec-clean.jsonl",
+            &format!("{denotation}\n{}\n", seal_line(0, 1)),
+        )
+        .expect("a denotation may carry the view marker");
+        assert_eq!(unit.denotations[0].view.as_deref(), Some(marker));
+        assert!(render_denotation_row(&unit.denotations[0]).contains("owner ruling R1"));
+
+        // An artifact from before the view lane has no key at all: GOAL_LINE.
+        let unit = parse_unit_artifact(
+            "demo.spec-clean.jsonl",
+            &format!("{GOAL_LINE}\n{}\n", seal_line(1, 0)),
+        )
+        .expect("an artifact with no view key predates the lane");
+        assert_eq!(unit.goals[0].view, None);
+
+        // A marker this reader does not know may disclose an assumption it cannot
+        // state, so it refuses, as an unknown key does.
+        for bogus in [serde_json::json!("some-future-view"), serde_json::json!(true)] {
+            goal["view"] = bogus;
+            let detail = malformed_goal_detail(goal.clone());
+            assert!(detail.starts_with("goal row has unknown `view` disclosure"), "{detail}");
+        }
     }
 
     #[test]
@@ -1671,6 +2176,7 @@ mod tests {
         outcome: trust_types::ObligationOutcome,
     ) -> trust_types::ObligationReport {
         trust_types::ObligationReport {
+            assumes: Vec::new(),
             obligation_id: None,
             description: description.to_string(),
             kind: kind.to_string(),
@@ -1703,6 +2209,7 @@ mod tests {
                 unknown: 1,
                 timed_out: 0,
                 design_requirements: 0,
+                failed_unproved: 0,
                 unattributed_failed: 0,
                 unattributed_unknown: 0,
                 unattributed_proved: 0,
@@ -1729,7 +2236,10 @@ mod tests {
                 obligation_row(
                     "assertion",
                     "assertion may fail",
-                    trust_types::ObligationOutcome::Failed { counterexample: None },
+                    trust_types::ObligationOutcome::Failed {
+                        counterexample: None,
+                        basis: trust_types::FailureBasis::Refuted,
+                    },
                 ),
             ],
         };
@@ -1739,8 +2249,6 @@ mod tests {
                 trust_version: "test".to_string(),
                 timestamp: String::new(),
                 total_time_ms: 0,
-                timeout_ms: None,
-                function_budget_ms: None,
             },
             crate_name: "demo".to_string(),
             summary: trust_types::CrateSummary {
@@ -1756,6 +2264,7 @@ mod tests {
                 total_unknown: 1,
                 total_timed_out: 0,
                 total_design_requirements: 0,
+                total_failed_unproved: 0,
                 total_unattributed_failed: 0,
                 total_unattributed_unknown: 0,
                 total_unattributed_proved: 0,

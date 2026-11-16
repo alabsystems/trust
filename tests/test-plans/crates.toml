@@ -1,0 +1,345 @@
+# The crates-tests lane as one Targo test plan:
+#
+#   targo --unverified test --plan tests/test-plans/crates.toml \
+#         --changed-range <rev>..<rev> [--reached <dir>]... \
+#         --locked --no-fail-fast
+#
+# is the whole lane: selection, pool, bounds and verdict are this file's and
+# Targo's. `--changed-pushed-refs -` reads a pre-push hook's ref lines,
+# `--changed-paths <FILE|->` a path list, `-p <member>` and `--request <id>`
+# narrow a rerun, and `--whole-plan` runs every request. The exit status is
+# 0 passed or nothing selected, 101 red, 2 cannot judge, 3 out of time.
+# `--changed-range A..B` is the two trees, as git reads it; the script lane's
+# `--range A..B` meant the merge-base form, which here is `A...B`.
+#
+# Every key is documented in src/tools/targo/src/doc/src/reference/test-plan.md.
+# Targo's own test `ops::cargo_test::plan_checked_in` holds every package,
+# feature, target, manifest and test path named here to the tree, so a rename
+# fails there instead of quietly running less.
+#
+# Until scripts/check_crates_tests_scoped.py is retired this file mirrors its
+# tables, named beside each section. Change both together. It differs where a
+# plan is stricter: the Python lane reports a `crates/` path no member owns
+# and exits 0, and a plan refuses it, so `[select.elsewhere]` below names
+# every workspace member under `crates/` that is no default member.
+
+schema = "targo.test-plan.v1"
+
+[select]
+members = "default-members"
+# A changed path under crates/ that no member, own workspace or tool of this
+# plan owns is refused (exit 2) rather than read as tested.
+attribute-under = ["crates/"]
+# A pushed branch the remote does not have is compared with this revision
+# (`--changed-pushed-refs`), as the script lane's --push-context did. Input
+# that names no pushed tree is judged as `origin/main...HEAD`.
+base = "origin/main"
+# The lane's own policy. A change to this file (a dropped variant, a raised
+# bound, a moved `min-tests`) or to the known-red file (a new row excuses a
+# failure; whether it is a real one only its binary says) changes what every
+# request's result means, so it runs every request, never just the
+# instrument its path happens to meet.
+whole-plan-when-changed = ["tests/test-plans/crates.toml", "tests/known-red/crates-tests.txt"]
+
+# Workspace members under `crates/` outside the developer default-members,
+# each with the command that does test it. A change to one is reported with
+# that command and is no part of this run's verdict. The plan's own test holds
+# this table to the tree: a member under `crates/` that is neither a default
+# member nor named here fails it.
+[select.elsewhere]
+# EXCLUDED_ELSEWHERE: the rustc_private frontends.
+trust-mir-extract = "x.py test --stage 1 crates/trust-mir-extract"
+trust-thir-lower = "x.py test --stage 1 crates/trust-thir-lower"
+trust-witness = "x.py test --stage 1 crates/trust-witness"
+# Crates the compiler links, tested by bootstrap's compiler-crate step like
+# the three above. The Python lane lists their paths as "owned by no member".
+trust-build-cpu = "x.py test --stage 1 crates/trust-build-cpu"
+trust-proc-macro-bridge = "x.py test --stage 1 crates/trust-proc-macro-bridge"
+trust-proof-session = "x.py test --stage 1 crates/trust-proof-session"
+trust-source-contract = "x.py test --stage 1 crates/trust-source-contract"
+# No lane runs the tests of these two (2026-11-11): the command is the one
+# that tests each, and nothing issues it. Named so that a change to one is
+# reported as not tested here, never refused and never read as tested.
+trust-bridge-closure = "targo --unverified test --manifest-path Cargo.toml --locked -p trust-bridge-closure"
+trust-test-execution = "targo --unverified test --manifest-path Cargo.toml --locked -p trust-test-execution"
+
+# Run 1: the selected members in one resolve, `-p A -p B ... --tests`.
+[default]
+targets = "tests"
+# The zero-test rule: a selected member must report at least one test, summed
+# over this run and its variants.
+min-tests = 1
+
+# KNOWN_RED_REL. A ratchet, not a mask: an unlisted failure fails the run, and
+# so does a listed test that passes, unless its row is tagged [flaky].
+[expect]
+known-red = "tests/known-red/crates-tests.txt"
+
+# The lane's pool and bounds, which were host knobs and constants of the
+# script lane. `build.test-jobs`, `build.test-weight`, `build.test-memory-mib`,
+# `build.test-wall-seconds` and `build.test-stall-seconds` stand over them on
+# a host that needs another figure (reference/test-plan.md, "[run]").
+[run]
+# TRUST_CRATES_TESTS_JOBS=4 binaries of RUST_TEST_THREADS=4: sixteen credits,
+# four a harness. A build-slot job's CARGO_BUILD_JOBS share and -j bound both.
+test-jobs = 16
+test-weight = 4
+# host_budget's `crates-test` child: 16 GiB wanted per test binary, admitted
+# against the memory available now less an eighth of the host.
+harness-memory-mib = 16384
+# scripts/lib/crates_tests_time.py: a ceiling of four hours or 900 s a member,
+# whichever is larger, and 1800 s without a line from a running binary.
+wall-seconds = 14400
+wall-seconds-per-member = 900
+stall-seconds = 1800
+# DEFAULT_RUN_AFTER_MAX_S: how long a run the push hook holds at its barrier
+# (`--run-after`) waits with nothing else to do. A cold `x.py check --stage 1`
+# before it has taken over an hour.
+run-after-seconds = 14400
+
+# How long each of the longest harnesses runs, in seconds: the queue starts
+# the longest expected one first, so that the run does not end waiting for a
+# ten-minute harness that started last (the script lane sorted by file size
+# for the same reason). Medians of six whole-plan runs on 2026-11-12
+# (docs/measurements/2026-11-12-crates-plan-native-vs-script.md); a harness
+# without a row is expected to be short. A wrong figure costs time, never a
+# verdict.
+[harness.trust-integration-tests.test.m3_acceptance]
+seconds = 1180
+[harness.trust-certify.lib]
+seconds = 940
+[harness.trust-vcgen.test.opaque_deref_store_reseat]
+seconds = 650
+[harness.trust-integration-tests.test.scale_real_crate]
+seconds = 570
+[harness.trust-vcgen.test.escaped_local_seam_realmir]
+seconds = 390
+[harness.trust-integration-tests.test.checker_core_is_whnf_emit_discharge_e2e]
+seconds = 350
+[harness.trust-vcgen.test.ffi_pointer_contract_realmir]
+seconds = 290
+[harness.trust-clean.lib]
+seconds = 275
+[harness.trust-clean.test.lean_clean_bridge]
+seconds = 250
+[harness.trust-vcgen.lib]
+seconds = 220
+[harness.trust-integration-tests.test.real_mir_pipeline]
+seconds = 180
+[harness.trust-vcgen.test.ploss_adv_false_proofs_realmir]
+seconds = 160
+
+# RUN_ALONE: test_clean_kernel_rejects_wrong_proof_for_vc asserts the kernel
+# rejects a wrong proof in under 5000 ms, and missed under the pool's load
+# (2026-09-29). Declared here rather than masked by a [flaky] row, which would
+# excuse every failure of that test.
+[harness.trust-clean.test.clean_pipeline_integration]
+exclusive = true
+
+# FEATURE_RUNS: feature lanes a default-feature `--tests` run cannot reach.
+# Each is performed when its package is selected and counts toward that
+# member's `min-tests`. All but one build the lib only, so no variant rebuilds
+# a bin that the default run's integration tests execute.
+
+# TRUST-16: every ay-backend module of trust-router is
+# `#[cfg(feature = "ay-backend")]`. Its router tests also have
+# `not(feature = "ay-backend")` tests, so the default run is not redundant.
+[[variant]]
+id = "router-ay-backend"
+package = "trust-router"
+features = ["ay-backend"]
+lib = true
+
+# A superset of the features above that still does not replace it: only the
+# run above compiles the code behind `not(feature = "carcara-crosscheck")` and
+# `not(feature = "ay-certify")`. This one adds ay_certify.rs,
+# carcara_cross_check.rs and its gate, trust_cg_backend.rs and the
+# trust-vc-native full_verification paths.
+[[variant]]
+id = "router-certify"
+package = "trust-router"
+features = ["ay-certify", "trust-build", "trust-cg-backend", "carcara-crosscheck"]
+lib = true
+
+# The default run compiles this file's ay-backend tests out. The Python lane
+# gives this tail a target directory of its own; a plan needs none, because
+# each variant's units have their own file names and trust-router has no bin.
+[[variant]]
+id = "router-setter"
+package = "trust-router"
+features = ["ay-backend"]
+test = ["setter_assert_refute_lane"]
+
+# validation.rs: translation validation of lifted code through ay.
+[[variant]]
+id = "lift-ay-verify"
+package = "trust-lift"
+features = ["ay-verify"]
+lib = true
+
+# The native trust-vc engine paths and trust_ir_adapter_request.rs.
+[[variant]]
+id = "vc-bridge-trust-build"
+package = "trust-vc-bridge"
+features = ["trust-build"]
+lib = true
+
+# trust_wp_oracle.rs, the trust-wp/trust-vcgen strengthening oracle.
+[[variant]]
+id = "strengthen-trust-wp"
+package = "trust-strengthen"
+features = ["trust-wp"]
+lib = true
+
+# ay_bridge.rs with its solving tests (ay-bridge-solve implies ay-bridge) and
+# trust_wp_bridge.rs.
+[[variant]]
+id = "types-bridges"
+package = "trust-types"
+features = ["ay-bridge-solve", "trust-wp-bridge"]
+lib = true
+
+# verifier_api.rs and replay_oracle.rs, the trust-mc CHC/PDR solver path, in
+# the configuration the compiler ships (trust-build is trust-mc-core-types
+# plus trust-mc-native-trust-ir-bundle).
+[[variant]]
+id = "bmc-trust-build"
+package = "trust-bmc"
+features = ["trust-build"]
+lib = true
+
+# The trust-cg-bridge conversion paths; targo-trust ships this build.
+[[variant]]
+id = "decompile-trust-cg"
+package = "trust-decompile"
+features = ["trust-cg"]
+lib = true
+
+# native.rs's trust_build_tests and the native verifier_api paths.
+[[variant]]
+id = "wp-trust-build"
+package = "trust-wp"
+features = ["trust-build"]
+lib = true
+
+# CROSS_CRATE_INSTRUMENTS: tests whose subject is another crate's output.
+# `-p X` never runs the tests of X's callers. Each is performed when a changed
+# path matches and the default run does not already perform it on a touched
+# host; it counts toward no member's `min-tests` and must itself report a test.
+
+# TARGO_TRUST_INSTRUMENTS: runs the targo-trust binary the [[tool]] below
+# builds, over the binary-decompilation fixtures.
+[[instrument]]
+id = "binary-to-trust-ir-e2e"
+package = "trust-integration-tests"
+test = ["binary_to_trust_ir_e2e"]
+when-changed = ["tests/fixtures/binary_decomp/"]
+
+# Compares the spine against trust-vcgen's VCs over the trust-clean fixture
+# corpus. 1f3b181649 changed trust-vcgen alone and left it red on main.
+[[instrument]]
+id = "missing-obligation-ratchet"
+package = "trust-ir-bridge"
+lib = true
+args = ["flip::missing_obligation_ratchet::"]
+when-changed = ["crates/trust-vcgen/", "crates/trust-types/", "crates/trust-clean/fixtures/"]
+
+# trust-model-prelude `include_str!`s the Trust/*.lean files that
+# trust-spec-temporal owns and exports PRELUDE_DIGEST over their bytes.
+# INSTRUMENT_REQUIRED_PASSES: the digest test itself must run and pass, not
+# only the ignored re-bless printer beside it.
+[[instrument]]
+id = "prelude-digest"
+package = "trust-model-prelude"
+lib = true
+args = ["tests::digest::"]
+when-changed = ["crates/trust-spec-temporal/clean/Trust/"]
+require-pass = ["tests::digest::source_digest_matches"]
+
+# The in-process check that the codegen-equivalence and trust-soundness proofs
+# still prove the theorems their gates name, and that trust-cg-bridge's
+# MAX_RECHECKABLE_MUL_WIDTH stays where the proofs cover it.
+# `crates/trust-certify/src/clean_island` is a path prefix, not a directory:
+# it covers clean_island.rs, clean_island_batch.rs and clean_island/.
+[[instrument]]
+id = "clean-proof-obligations"
+package = "trust-integration-tests"
+lib = true
+args = ["clean_proof_obligations::tests::"]
+when-changed = [
+    "proofs/codegen-equivalence/",
+    "proofs/trust-soundness/",
+    "crates/trust-cg-bridge/src/",
+    "crates/trust-certify/src/clean_island",
+]
+
+# CORPUS_INSTRUMENTS: gates whose subject is every checked-in document of one
+# format, pinned by path in the host's tests/corpus_manifest.txt. `test` names
+# every test target of the host that reads that manifest.
+[[instrument]]
+id = "json-corpus"
+package = "trust-json"
+test = ["acceptance_gate"]
+when-changed-suffix = ".json"
+not-under = ["first-party/", "vendor/"]
+
+[[instrument]]
+id = "toml-corpus"
+package = "trust-toml"
+test = ["differential_corpus", "serialize_differential"]
+when-changed-suffix = ".toml"
+not-under = ["first-party/", "vendor/"]
+
+# TARGO_TRUST_BUILD, TARGO_TRUST_VAR, TARGO_TRUST_CONSUMERS: the tests of the
+# members in `needed-by` run the targo-trust binary this variable names and
+# fail without it. It is built under its own manifest and lockfile whenever a
+# request tests one of them.
+[[tool]]
+manifest = "targo-trust/Cargo.toml"
+bin = "targo-trust"
+env = "TRUST_TARGO_TRUST_BIN"
+needed-by = ["trust-integration-tests"]
+
+# Own-workspace crates (scripts/lib/crates_lane_members.py): each
+# `crates/<dir>` whose Cargo.toml has its own `[workspace]`, tested as
+# `--manifest-path crates/<dir>/Cargo.toml --tests` when one of its paths
+# changes, or when the run names no change. `-p` does not reach one: it names
+# a member of the root workspace, and an own-workspace crate may share a
+# member's name. A `[workspace]` nested deeper is its parent member's data,
+# not a crate of this plan.
+[[workspace]]
+manifest = "crates/trust-build-tree/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-cmake/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-exec-policy/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-oracle-freeze-facts/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-process-isolation/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-qualification/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-resource-controller/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-resource-provenance/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-spec-temporal/Cargo.toml"
+
+[[workspace]]
+manifest = "crates/trust-stage-receipt/Cargo.toml"
+
+# apply_host_limits: its library is `#![cfg(target_os = "linux")]`, so its
+# test targets build nowhere else. Elsewhere it is reported NOT RUN, never
+# counted as tested.
+[[workspace]]
+manifest = "crates/trust-worker-linux/Cargo.toml"
+cfg = 'target_os = "linux"'

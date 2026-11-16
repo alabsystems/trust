@@ -1,0 +1,74 @@
+{
+ "schema": "trust.two-language.producer-ratchets.expected/v1",
+ "row": "ir-ta-island_mutant",
+ "measured_on": {
+  "trustc": "rustc 1.99.0-dev (a523fbdf4 2026-09-20) (trustc 0.1.0)",
+  "trust-ir": "first-party/trust-ir@4ac1b25c7518 sha256:e38e559a127c245c",
+  "clean": "first-party/clean@434ba130d321 sha256:acbfaf0cb01efa69",
+  "trust-cg": "first-party/trust-cg@5aca5cd4d662 sha256:9db90b2968fc0f50"
+ },
+ "ratchets": {
+  "a.island_mutant.control.differential_fails": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the row is the WS8.8 MUTATION CONTROL, added 2026-09-21 — the proof program stated 'mutating the Clean body changes the value' as prose (REPORT.md), never as a measured row; this is that statement as a ratchet, measured on this branch's stage1"
+  },
+  "a.island_mutant.control.native_differs": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the row is the WS8.8 MUTATION CONTROL, added 2026-09-21 — the proof program stated 'mutating the Clean body changes the value' as prose (REPORT.md), never as a measured row; this is that statement as a ratchet, measured on this branch's stage1"
+  },
+  "a.island_mutant.control.one_island_line": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the row is the WS8.8 MUTATION CONTROL, added 2026-09-21 — the proof program stated 'mutating the Clean body changes the value' as prose (REPORT.md), never as a measured row; this is that statement as a ratchet, measured on this branch's stage1"
+  },
+  "a.island_mutant.emit": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.exec": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.native": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.roundtrip": {
+   "verdict": "GAP",
+   "class": "producer-gap",
+   "signature": "roundtrip:text-parse:fn-name",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.twin.codec.trailing": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.twin.exec.mutant": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.twin.validate.site": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.twin.validate.vararg": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  },
+  "a.island_mutant.validate": {
+   "verdict": "PASS",
+   "audit": null,
+   "moved": "not in the audit: the mutant unit (p10 with one island line edited) did not exist in the proof program; its per-unit ratchets are judged by the same machinery as ir-ta10 and pin the same shape as ir-ta10's (the text-leg fn-name parse GAP included)"
+  }
+ }
+}

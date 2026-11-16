@@ -16,7 +16,12 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = ["elf"]
+# Both parsers on by default. `macho` was left out of the default from the
+# initial commit (06efaa37ef), alongside trust-lift's note that
+# trust-binary-parse "has pre-existing compile issues". That note was measured
+# false 2026-09-27; see trust-lift/Cargo.toml. trust-binary-parse is already a
+# non-optional dependency here, so `macho` adds only trust-lift's Mach-O path.
+default = ["elf", "macho"]
 elf = ["trust-lift/elf"]
 macho = ["trust-lift/macho"]
 trust-cg = ["dep:trust-cg-bridge"]
@@ -35,3 +40,7 @@ trust-wasm-bridge = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The unit tests run under serde_json/preserve_order, which every targo-trust
+# build has through trust-certify (f2c4e2ccce), so the rendered-text key-order
+# test checks the configuration that ships rather than passing vacuously.
+serde_json = { workspace = true, features = ["preserve_order"] }

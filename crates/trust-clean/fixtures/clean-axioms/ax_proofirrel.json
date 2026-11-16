@@ -1,0 +1,1 @@
+{"term": {"Const": "proofIrrel"}, "context": [{"name": "False", "entry": {"Axiom": {"ty": {"Sort": 0}}}}, {"name": "proofIrrel", "entry": {"Axiom": {"ty": {"Const": "False"}}}}]}

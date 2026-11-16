@@ -23,7 +23,7 @@ use std::time::Duration;
 use clean_auto::AutomationEngine;
 use clean_kernel::{BinderInfo, Environment, Expr, ExprKind, Level, Name, TypeChecker};
 use trust_clean_carrier::{Carrier, carrier_at};
-use trust_clean_origin::{check_faithful, plan_clean_origin_body};
+use trust_clean_origin::check_faithful;
 use trust_spec_elab::{Domain, MachineUIntWidth};
 use trust_types::Ty;
 
@@ -118,8 +118,9 @@ fn lane1_p1_which_spellings_of_b_ne_zero_elaborate_at_uint64() {
     let mut supported = Vec::new();
     let mut refused = Vec::new();
     for (label, spelling) in candidates {
-        let source =
-            format!("theorem tp1 (a : UInt64) (b : UInt64) (h : {spelling}) : a % b = a % b := rfl");
+        let source = format!(
+            "theorem tp1 (a : UInt64) (b : UInt64) (h : {spelling}) : a % b = a % b := rfl"
+        );
         match island_try(&[&source]) {
             Ok(_) => {
                 supported.push(*label);
@@ -198,10 +199,8 @@ fn lane1_p2_side_a_and_the_rust_side_lowering_at_an_open_divisor() {
          UInt64.ofNat (Nat.mod (UInt64.toNat b) (UInt64.toNat a))",
     ]);
     let checker = TypeChecker::new(&env_wrong);
-    let swapped = checker.is_def_eq(
-        &definition_value(&env_wrong, "m"),
-        &definition_value(&env_wrong, "wrong"),
-    );
+    let swapped = checker
+        .is_def_eq(&definition_value(&env_wrong, "m"), &definition_value(&env_wrong, "wrong"));
     drop(checker);
     assert!(
         !swapped,
@@ -320,9 +319,8 @@ fn lane1_p4_the_conditional_proposition_in_the_kernel() {
 
     // The ANTI-VACUITY control: a conditional whose CONCLUSION is false must
     // NOT be provable, hypothesis or no hypothesis.
-    let bogus = island_try(&[
-        "theorem c2 (a : UInt64) (b : UInt64) (h : b ≠ 0) : a % b = a := rfl",
-    ]);
+    let bogus =
+        island_try(&["theorem c2 (a : UInt64) (b : UInt64) (h : b ≠ 0) : a % b = a := rfl"]);
     eprintln!("LANE1-P4 | CONTROL: `b ≠ 0 → a % b = a` by rfl is_err = {}", bogus.is_err());
     assert!(
         bogus.is_err(),
@@ -396,6 +394,14 @@ fn lane1_p4_the_conditional_proposition_in_the_kernel() {
                      {rechecked}, strategy = {}",
                     result.proof_text()
                 );
+                // A proof clean-auto found that the kernel then rejects is an
+                // automation defect, never a measurement to print and move past.
+                assert!(
+                    rechecked,
+                    "clean-auto under `{label}` returned a proof the kernel REJECTS on \
+                     re-check (strategy = {})",
+                    result.proof_text()
+                );
             }
             None => eprintln!("LANE1-P4 | clean-auto under `{label}`: no proof within 5s"),
         }
@@ -437,9 +443,7 @@ fn lift_one(expr: &Expr) -> Expr {
             | ExprKind::Const(_, _)
             | ExprKind::Lit(_) => expr.clone(),
             ExprKind::App(f, a) => Expr::app(go(f, cutoff), go(a, cutoff)),
-            ExprKind::Lam(bi, ty, body) => {
-                Expr::lam(*bi, go(ty, cutoff), go(body, cutoff + 1))
-            }
+            ExprKind::Lam(bi, ty, body) => Expr::lam(*bi, go(ty, cutoff), go(body, cutoff + 1)),
             ExprKind::Pi(bi, ty, body) => Expr::pi(*bi, go(ty, cutoff), go(body, cutoff + 1)),
             ExprKind::MData(_, inner) => go(inner, cutoff),
             other => panic!("lift_one is not defined over {other:?}"),
@@ -454,99 +458,4 @@ fn mint_zero(env: &Environment, bits: u32) -> Expr {
     let _ = env;
     let zero_env = island(&[&format!("def lane1_zero : UInt{bits} := 0")]);
     definition_value(&zero_env, "lane1_zero")
-}
-
-// ═══════ P6 — THE OTHER PLACE A HYPOTHESIS COULD LIVE: SIDE A's OWN TYPE ═══════
-
-/// If the kernel comparison cannot carry a hypothesis, the DECLARATION could:
-/// `def m (a b : UInt64) (h : b ≠ 0) : UInt64 := a % b`. Then `b ≠ 0` is a
-/// real precondition of the callable name, and every Rust caller owes it.
-///
-/// Measured here: does that declaration elaborate, and does the carrier /
-/// plan / gate machinery have anywhere to put the proof parameter?
-#[test]
-fn lane1_p6_a_declaration_that_carries_the_hypothesis_in_its_type() {
-    let sources: &[&str] = &[
-        "def mh (a : UInt64) (b : UInt64) (h : b ≠ 0) : UInt64 := a % b",
-        "def mrust (a : UInt64) (b : UInt64) : UInt64 := \
-         UInt64.ofNat (Nat.mod (UInt64.toNat a) (UInt64.toNat b))",
-    ];
-    let Ok(env) = island_try(sources) else {
-        eprintln!("LANE1-P6 | the hypothesis-carrying declaration does NOT elaborate");
-        return;
-    };
-    eprintln!("LANE1-P6 | the hypothesis-carrying declaration ELABORATES");
-
-    let info = env.get_const(&Name::from_string("mh")).expect("mh is declared");
-    eprintln!("LANE1-P6 | type of `mh` = {}", info.type_);
-
-    match trust_clean_carrier::carrier_signature_for(&info.type_) {
-        Ok(signature) => eprintln!(
-            "LANE1-P6 | carrier_signature_for(mh) = GRANTED at arity {}",
-            signature.arity()
-        ),
-        Err(refusal) => eprintln!("LANE1-P6 | carrier_signature_for(mh) = REFUSED: {refusal:?}"),
-    }
-
-    let planned = plan_clean_origin_body(&env, "mh");
-    eprintln!(
-        "LANE1-P6 | plan_clean_origin_body(mh) = {}",
-        match &planned {
-            Ok(plan) => format!("PLANNED {:?}", plan.shape()),
-            Err(refusal) => format!("REFUSED: {refusal:?}"),
-        }
-    );
-
-    // And the gate, handed a side B that ignores the proof parameter.
-    let side_b = definition_value(&env, "mrust");
-    let gated = check_faithful(&env, "mh", &side_b, &carrier_of(64));
-    eprintln!(
-        "LANE1-P6 | check_faithful(mh, <two-parameter lowering>) = {}",
-        match &gated {
-            Ok(token) => format!("ADMIT via {:?}", token.method()),
-            Err(refusal) => format!("REFUSED: {refusal:?}"),
-        }
-    );
-
-    // The non-dependent alternative: a `Nat`-level hypothesis that does not
-    // mention a previous binder still makes the Pi dependent, so measure the
-    // one shape that is NOT dependent — a closed proposition.
-    if let Ok(closed_env) = island_try(&[
-        "def mc (a : UInt64) (b : UInt64) (h : (1 : UInt64) ≠ 0) : UInt64 := a % b",
-    ]) {
-        let closed = closed_env.get_const(&Name::from_string("mc")).expect("mc is declared");
-        eprintln!("LANE1-P6 | type of `mc` (CLOSED hypothesis) = {}", closed.type_);
-        match trust_clean_carrier::carrier_signature_for(&closed.type_) {
-            Ok(signature) => eprintln!(
-                "LANE1-P6 | carrier_signature_for(mc) = GRANTED at arity {}",
-                signature.arity()
-            ),
-            Err(refusal) => {
-                eprintln!("LANE1-P6 | carrier_signature_for(mc) = REFUSED: {refusal:?}");
-            }
-        }
-    }
-}
-
-// ═══════ P5 — WHAT ACTUALLY REFUSES TODAY ═══════
-
-/// The plan lane, on the very declaration `gcd` needs. Recorded verbatim so the
-/// report names the refusal that is actually in the way, rather than guessing.
-#[test]
-fn lane1_p5_where_the_symbolic_divisor_is_refused_today() {
-    let env = island(&[
-        "def m (a : UInt64) (b : UInt64) : UInt64 := a % b",
-        "def m3 (a : UInt64) : UInt64 := a % 3",
-    ]);
-
-    for name in ["m", "m3"] {
-        let planned = plan_clean_origin_body(&env, name);
-        eprintln!(
-            "LANE1-P5 | plan_clean_origin_body({name}) = {}",
-            match &planned {
-                Ok(plan) => format!("PLANNED {:?}", plan.shape()),
-                Err(refusal) => format!("REFUSED: {refusal:?}"),
-            }
-        );
-    }
 }

@@ -1,6 +1,13 @@
+use semver::Version;
+
 use crate::common::CodegenBackend;
-use crate::debuggers::{extract_gdb_version, extract_lldb_version};
+use crate::debuggers::{LldbVersion, extract_gdb_version, extract_lldb_version};
 use crate::is_test;
+
+// Trust: re-enters this unit binary through its genuine entry with an actual GNU
+// transport (COMPILETEST-JOBSERVER-CUSTODY-1).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod entry_transport;
 
 /// Trust: every backend name that reaches `--default-codegen-backend`,
 /// `ignore-backends`, or `needs-backends` must parse. All three sites turn an
@@ -9,12 +16,12 @@ use crate::is_test;
 #[test]
 fn codegen_backend_names_round_trip() {
     for name in ["llvm", "cranelift", "gcc", "trust-cg"] {
-        let backend = CodegenBackend::try_from(name).unwrap();
+        let backend = name.parse::<CodegenBackend>().unwrap();
         assert_eq!(backend.as_str(), name);
     }
     // `-Zcodegen-backend` accepts the underscore spelling too.
-    assert_eq!(CodegenBackend::try_from("trust_cg").unwrap(), CodegenBackend::TrustCg);
-    assert!(CodegenBackend::try_from("nonexistent-backend").is_err());
+    assert_eq!("trust_cg".parse::<CodegenBackend>().unwrap(), CodegenBackend::TrustCg);
+    assert!("nonexistent-backend".parse::<CodegenBackend>().is_err());
 }
 
 #[test]
@@ -64,12 +71,18 @@ fn test_extract_gdb_version() {
 #[test]
 fn test_extract_lldb_version() {
     // Apple variants
-    assert_eq!(extract_lldb_version("LLDB-179.5"), Some(179));
-    assert_eq!(extract_lldb_version("lldb-300.2.51"), Some(300));
+    assert_eq!(extract_lldb_version("LLDB-179.5"), Some(LldbVersion::Apple([179, 5, 0, 0])));
+    assert_eq!(extract_lldb_version("lldb-300.2.51"), Some(LldbVersion::Apple([300, 2, 51, 0])));
 
     // Upstream versions
-    assert_eq!(extract_lldb_version("lldb version 6.0.1"), Some(600));
-    assert_eq!(extract_lldb_version("lldb version 9.0.0"), Some(900));
+    assert_eq!(
+        extract_lldb_version("lldb version 6.0.1"),
+        Some(LldbVersion::Llvm(Version::new(6, 0, 1)))
+    );
+    assert_eq!(
+        extract_lldb_version("lldb version 9.0.0"),
+        Some(LldbVersion::Llvm(Version::new(9, 0, 0)))
+    );
 }
 
 #[test]

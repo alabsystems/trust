@@ -34,5 +34,14 @@ pub mod lib_features {
 }
 pub mod privacy;
 pub mod region;
+pub mod resolve;
 pub mod resolve_bound_vars;
 pub mod stability;
+// Trust: cross-crate PROOF-position citation, increment 2 — the transport
+// manifest that rides beside a crate's `clean { … }` island sources.
+pub mod trust_clean_proof;
+// Trust: step 2 increment 6 (6.2) — the trust-ir rmeta carrier types.
+pub mod trust_ir_entry;
+// Trust: CB4 — identify the items rustc's libtest harness synthesizes by
+// expansion provenance (never by name or by the forgeable attribute alone).
+pub mod trust_test_harness;

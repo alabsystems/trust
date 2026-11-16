@@ -18,12 +18,9 @@ pub(crate) fn provide(providers: &mut Providers) {
         let local_def_id = def_id.expect_local();
         let body = tcx.hir_maybe_body_owned_by(local_def_id)?;
 
-        let mut local_collector = LocalCollector::default();
-        local_collector.visit_body(&body);
-
         let mut capture_collector = CaptureCollector {
             tcx,
-            locals: &local_collector.locals,
+            locals: FxHashSet::default(),
             upvars: FxIndexMap::default(),
         };
         capture_collector.visit_body(&body);
@@ -36,28 +33,15 @@ pub(crate) fn provide(providers: &mut Providers) {
     };
 }
 
-#[derive(Default)]
-struct LocalCollector {
+struct CaptureCollector<'tcx> {
+    tcx: TyCtxt<'tcx>,
     // FIXME(eddyb) perhaps use `ItemLocalId` instead?
     locals: FxHashSet<HirId>,
-}
-
-impl<'tcx> Visitor<'tcx> for LocalCollector {
-    fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
-        if let hir::PatKind::Binding(_, hir_id, ..) = pat.kind {
-            self.locals.insert(hir_id);
-        }
-        intravisit::walk_pat(self, pat);
-    }
-}
-
-struct CaptureCollector<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    locals: &'a FxHashSet<HirId>,
     upvars: FxIndexMap<HirId, hir::Upvar>,
 }
 
-impl CaptureCollector<'_, '_> {
+impl CaptureCollector<'_> {
+    #[inline]
     fn visit_local_use(&mut self, var_id: HirId, span: Span) {
         if !self.locals.contains(&var_id) {
             self.upvars.entry(var_id).or_insert(hir::Upvar { span });
@@ -65,7 +49,15 @@ impl CaptureCollector<'_, '_> {
     }
 }
 
-impl<'tcx> Visitor<'tcx> for CaptureCollector<'_, 'tcx> {
+impl<'tcx> Visitor<'tcx> for CaptureCollector<'tcx> {
+    fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
+        if let hir::PatKind::Binding(_, hir_id, ..) = pat.kind {
+            self.locals.insert(hir_id);
+            self.upvars.shift_remove(&hir_id);
+        }
+        intravisit::walk_pat(self, pat);
+    }
+
     fn visit_path(&mut self, path: &hir::Path<'tcx>, _: HirId) {
         if let Res::Local(var_id) = path.res {
             self.visit_local_use(var_id, path.span);

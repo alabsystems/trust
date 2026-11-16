@@ -9,6 +9,15 @@ The initial runner intentionally consumes a manifest plus committed fixture
 evidence. Later workers can replace individual checks with stable tool outputs
 without changing the report envelope consumed by dscan/dpub.
 
+NOT EVIDENCE (2026-10-09). Every check kind this runner knows is STATIC: it
+reads committed files only (a file exists, or a field of a committed JSON file
+equals a literal in the same commit's manifest or the sha256 of another
+committed file). No trustc, solver, kernel or model checker runs, so a pass
+says the committed files agree, never that a tool produced "valid", "unsat" or
+"kernel_checked: true". Each case in the report carries `static_only` (true
+when none of its checks ran a tool) so a consumer cannot present the committed
+JSON as tool output, and the runner names the static cases on stderr.
+
 Exit codes: 0 all cases passed; 1 a case failed; 2 manifest/output error (or
 --strict over an incomplete corpus); 3 no failures but a case ran zero checks.
 """
@@ -22,11 +31,13 @@ import io
 import json
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+UTC = timezone.utc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = REPO_ROOT / "trust-conformance" / "manifest.json"
@@ -49,6 +60,14 @@ ALLOWED_CATEGORIES = {
     "trust-integration",
 }
 ALLOWED_STATUSES = ("pass", "fail", "blocked", "waived")
+# Check kinds that read committed files and run no tool (see the module docstring).
+# Today these are every kind the manifest may name. A kind that runs a pinned tool
+# on the case input belongs in ALLOWED_CHECK_KINDS and NOT here; until one exists,
+# every case is `static_only` and the corpus is not evidence.
+STATIC_CHECK_KINDS = frozenset(
+    {"file_exists", "json_pointer_equals", "json_pointer_file_sha256_equals"}
+)
+ALLOWED_CHECK_KINDS = STATIC_CHECK_KINDS
 
 
 class ManifestError(ValueError):
@@ -157,11 +176,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
             for check_index, raw_check in enumerate(checks):
                 check = _require_mapping(raw_check, f"{case_id}.checks[{check_index}]")
                 kind = _require_string(check.get("kind"), f"{case_id}.checks[{check_index}].kind")
-                if kind not in {
-                    "file_exists",
-                    "json_pointer_equals",
-                    "json_pointer_file_sha256_equals",
-                }:
+                if kind not in ALLOWED_CHECK_KINDS:
                     raise ManifestError(f"{case_id}.checks[{check_index}].kind is not allowed: {kind}")
                 _require_string(check.get("path"), f"{case_id}.checks[{check_index}].path")
                 if kind in {"json_pointer_equals", "json_pointer_file_sha256_equals"}:
@@ -332,12 +347,24 @@ def _case_evidence(case: Mapping[str, Any]) -> list[str]:
     return [_require_string(item, f"{case['id']}.evidence[]") for item in raw_evidence]
 
 
+def _static_only(checks: list[Any]) -> bool:
+    """True when no check runs a tool: every kind is static, or there is no check
+    at all (a blocked or waived case ran nothing, so nothing a tool produced)."""
+    return all(
+        isinstance(check, Mapping) and check.get("kind") in STATIC_CHECK_KINDS
+        for check in checks
+    )
+
+
 def _run_case(repo_root: Path, case: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": case["id"],
         "category": case["category"],
         "title": case["title"],
         "evidence": _case_evidence(case),
+        # A waived or blocked case runs no check, so nothing a tool produced; a
+        # case that runs is re-judged from the kinds it runs, below.
+        "static_only": _static_only([]),
     }
     if "waiver" in case:
         waiver = _require_mapping(case["waiver"], f"{case['id']}.waiver")
@@ -372,6 +399,7 @@ def _run_case(repo_root: Path, case: Mapping[str, Any]) -> dict[str, Any]:
         {
             "status": status,
             "checks": [check.to_dict() for check in checks],
+            "static_only": _static_only(list(case["checks"])),
         }
     )
     return result
@@ -403,6 +431,25 @@ def _emit_failure_notice(report: Mapping[str, Any]) -> None:
             if check["status"] == "fail":
                 detail = check.get("message") or "check failed"
                 print(f"    {check['kind']} {check.get('path', '')}: {detail}", file=sys.stderr)
+
+
+def _emit_static_only_notice(report: Mapping[str, Any]) -> None:
+    """A static case's pass is fixture/manifest agreement. Say so where the green is read.
+    Blocked and waived cases ran nothing; the INCOMPLETE notice names those."""
+    static = [
+        result for result in report["results"] if result.get("static_only") and result["checks"]
+    ]
+    if not static:
+        return
+    print(
+        f"trust-conformance NOT EVIDENCE: {len(static)} of {report['summary']['total']} "
+        "cases ran only static checks (a committed file exists, or a field of a committed "
+        "JSON file equals a manifest literal or another committed file's sha256); no "
+        "trustc, solver, kernel or model checker ran, so their result is not tool output:",
+        file=sys.stderr,
+    )
+    for result in static:
+        print(f"  {result['status']}: {result['id']} [{result['category']}]", file=sys.stderr)
 
 
 def _emit_incomplete_notice(report: Mapping[str, Any]) -> bool:
@@ -463,6 +510,7 @@ def run_manifest(
         "results": results,
         "blocked": [result["id"] for result in results if result["status"] == "blocked"],
         "waived": [result["id"] for result in results if result["status"] == "waived"],
+        "static_only_cases": [result["id"] for result in results if result["static_only"]],
         "categories_without_executed_checks": _categories_without_executed_checks(results),
     }
 
@@ -526,6 +574,29 @@ def _run_cli(argv: list[str]) -> tuple[int, str]:
     return code, err.getvalue()
 
 
+@contextlib.contextmanager
+def _planted_tool_kind(kind: str) -> Iterator[None]:
+    """--selftest only: allow one tool-running check kind, and pass it, for the duration.
+
+    Every real kind is static today, so a corpus cannot show that a case running a tool
+    clears `static_only`; a constant `True` in `_run_case` would pass every other check.
+    This plants such a kind without adding one to the runner."""
+    global ALLOWED_CHECK_KINDS, _run_check
+    saved_allowed, saved_run_check = ALLOWED_CHECK_KINDS, _run_check
+
+    def planted_run_check(repo_root: Path, check: Mapping[str, Any]) -> CheckResult:
+        if check["kind"] == kind:
+            return CheckResult(kind=kind, status="pass", path=str(check["path"]))
+        return saved_run_check(repo_root, check)
+
+    ALLOWED_CHECK_KINDS = saved_allowed | {kind}
+    _run_check = planted_run_check
+    try:
+        yield
+    finally:
+        ALLOWED_CHECK_KINDS, _run_check = saved_allowed, saved_run_check
+
+
 def run_selftest() -> int:
     """Plant retired cases through main() and watch the silent-green path fail."""
     failures = 0
@@ -568,10 +639,95 @@ def run_selftest() -> int:
             f"exit={code}",
         )
         check("unretired corpus never exits 3", code != EXIT_INCOMPLETE, f"exit={code}")
+
+        # static_only: present on every case, and equal to "no check kind runs a tool".
+        report = run_manifest(DEFAULT_MANIFEST)
+        manifest_cases = {
+            case["id"]: case for case in json.loads(DEFAULT_MANIFEST.read_text())["cases"]
+        }
+        wrong = [
+            result["id"]
+            for result in report["results"]
+            if result.get("static_only")
+            is not all(
+                check["kind"] in STATIC_CHECK_KINDS
+                for check in manifest_cases[result["id"]].get("checks", [])
+            )
+        ]
+        check(
+            "every case reports static_only from its check kinds",
+            not wrong and bool(report["results"]),
+            f"wrong={wrong}, cases={len(report['results'])}",
+        )
+        check(
+            "static_only_cases lists exactly the static cases",
+            report.get("static_only_cases")
+            == [result["id"] for result in report["results"] if result.get("static_only")],
+            f"static_only_cases={report.get('static_only_cases')}",
+        )
+        check(
+            "a tool-running kind is not static",
+            not _static_only([{"kind": "command_output_json_pointer_equals"}])
+            and _static_only([{"kind": "file_exists"}])
+            and _static_only([]),
+            "kinds outside STATIC_CHECK_KINDS must clear static_only",
+        )
+        static_count = len(report.get("static_only_cases") or [])
+        check(
+            "static cases print the NOT EVIDENCE notice",
+            static_count == 0 or "trust-conformance NOT EVIDENCE" in err,
+            f"static={static_count}, notice present={'trust-conformance NOT EVIDENCE' in err}",
+        )
         check(
             "a failing corpus names its failures on stderr",
             code != EXIT_FAILED or "trust-conformance FAILED:" in err,
             f"exit={code}, notice present={'trust-conformance FAILED:' in err}",
+        )
+
+        # The checks above cannot tell `_run_case` reading the kinds from a constant
+        # `True`: every real kind is static. Plant one tool-running kind for a single
+        # run. A case that runs it must clear static_only everywhere it is reported; a
+        # blocked case that declares it ran nothing, so it stays static.
+        planted_kind = "selftest_planted_tool_kind"
+        manifest = json.loads(DEFAULT_MANIFEST.read_text())
+        tool_case, blocked_case = [case for case in manifest["cases"] if case.get("checks")][:2]
+        tool_check = {"kind": planted_kind, "path": tool_case["checks"][0]["path"]}
+        tool_case["checks"] = [tool_check]
+        blocked_case["checks"] = [dict(tool_check)]
+        blocked_case["blocked"] = {"reason": "planted by --selftest"}
+        planted = tmp / "tool_kind.json"
+        planted.write_text(json.dumps(manifest, indent=2))
+        with _planted_tool_kind(planted_kind):
+            tool_report = run_manifest(planted)
+            _, tool_err = _run_cli(["--manifest", str(planted)])
+        by_id = {result["id"]: result for result in tool_report["results"]}
+        ran_tool = by_id[tool_case["id"]]
+        check(
+            "a case that runs a tool clears static_only end to end",
+            ran_tool["status"] == "pass"
+            and ran_tool["static_only"] is False
+            and tool_case["id"] not in tool_report["static_only_cases"],
+            f"status={ran_tool['status']}, static_only={ran_tool['static_only']}, "
+            f"listed={tool_case['id'] in tool_report['static_only_cases']}",
+        )
+        tool_line = f"  pass: {tool_case['id']} [{tool_case['category']}]"
+        check(
+            "the NOT EVIDENCE notice names only static cases",
+            "trust-conformance NOT EVIDENCE" in tool_err and tool_line not in tool_err,
+            f"notice present={'trust-conformance NOT EVIDENCE' in tool_err}, "
+            f"tool case named={tool_line in tool_err}",
+        )
+        check(
+            "a blocked case is static even when it declares a tool kind",
+            by_id[blocked_case["id"]]["static_only"] is True
+            and blocked_case["id"] in tool_report["static_only_cases"],
+            f"static_only={by_id[blocked_case['id']]['static_only']}",
+        )
+        code, _ = _run_cli(["--manifest", str(planted)])
+        check(
+            "the planted kind is withdrawn after its run",
+            code == EXIT_ERROR and planted_kind not in ALLOWED_CHECK_KINDS,
+            f"exit={code} (want {EXIT_ERROR})",
         )
 
     print(f"selftest: {f'FAIL - {failures} check(s)' if failures else 'all checks passed'}")
@@ -638,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _emit_failure_notice(report)
     incomplete = _emit_incomplete_notice(report)
+    _emit_static_only_notice(report)
 
     if report["summary"]["fail"] > 0:
         return EXIT_FAILED

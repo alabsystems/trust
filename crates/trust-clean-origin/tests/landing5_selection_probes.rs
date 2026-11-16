@@ -59,7 +59,7 @@
 //!    template primitive away, and with a v7/D3 refusal that names the second
 //!    spelling and the one-character fix.
 
-use clean_kernel::{BinderInfo, Environment, Expr, ExprKind, Level, Name};
+use clean_kernel::{BinderInfo, Environment, Expr, ExprKind, Level, Name, TypeChecker};
 use trust_clean_carrier::{Carrier, carrier_at};
 use trust_clean_origin::{
     CleanOriginShape, EmitRefusal, GateRefusal, admit_lowering, check_faithful,
@@ -399,6 +399,7 @@ fn emitted_diamond(
         preconditions: Vec::new(),
         postconditions: Vec::new(),
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -712,6 +713,80 @@ fn l5_p2_the_propositional_spelling_still_admits_end_to_end() {
 /// identified upstream and all of landing 5 would need re-measuring. The
 /// decision term itself is accepted in either spelling, so a printer that goes
 /// back to juxtaposition does not turn this row red a second time.
+///
+/// # 2026-09-29 — RED again, and again the verdict had not moved
+///
+/// The `Decidable.rec` assertion failed at clean pin `e00470647`. The island
+/// still refuses the bridge with a `Type mismatch`, on the same two `ite`s,
+/// with the same two instances; what changed is the `got` half:
+///
+/// ```text
+/// Type mismatch: expected
+///   ite UInt64 ((fvar#0 == fvar#1) = Bool.true)
+///              (instDecidableEqBool (fvar#0 == fvar#1) Bool.true) fvar#0 fvar#1
+/// = ite UInt64 (fvar#0 = fvar#1) (instDecidableEqUInt64 fvar#0 fvar#1) fvar#0 fvar#1,
+/// got <that same side A> = <that same side A>
+/// ```
+///
+/// The cause is clean `1a8f1c807` (*"assign a bare metavariable the constant
+/// AS WRITTEN, not its unfolding"*, 2026-09-20). The `got` half was never a
+/// kernel reduct of the two sides. It is `rfl`'s own type, `@Eq ?α ?a ?a`, after
+/// `?a` has been unified against side A. Before that commit `unify_app_args`
+/// whnf'd a constant-headed argument before assigning it to a bare metavariable,
+/// so `?a` became side A's unfolding `Decidable.rec …`. From that commit on, as
+/// Lean's `isDefEqQuickOther` does, `?a` is assigned side A as written.
+/// This was MEASURED, not read off the log. A probe drove the island's own
+/// parse → preprocess → elaborate-and-register calls on this exact theorem.
+/// At the parent `6ae8e874c` the `got` half is `Decidable.rec (…)
+/// (instDecidableEqBool …) = <the same>`. At `1a8f1c807`, and at the pin, it
+/// is the message above. Trust's pin crossed that commit at `ca1ef61a3a`
+/// (*"pins: train T0"*, 2026-09-28, clean `336d20039` → `c3a3b2d61`).
+/// It is a Lean-faithfulness fix in the unifier, not a regression, and the
+/// verdict did not move.
+/// So the 2026-08-27 reading above over-read the message. Its `got` showed
+/// side A's reduct twice and never showed side B stuck at all.
+/// The message is emitted by the B18/B14 body gates in `elab_def_body`
+/// (`reject_body_type_mismatch`), which run only after the
+/// `.default`-transparency unifier fails to equate the body's type with the
+/// statement.
+///
+/// So the row is re-pinned in two halves:
+///
+/// * **the message, exactly.** It is parsed into its `expected` and `got`
+///   halves, and each half is split at its top-level `=`. The instances are
+///   asserted PER SIDE, not merely somewhere in the text: side A carries
+///   `instDecidableEqBool` and the `Bool.true` lift and no carrier instance;
+///   side B carries `instDecidableEqUInt64` and neither Bool piece. The `got`
+///   half must be side A on BOTH sides of the `=`. That is `rfl` at
+///   `?a := side A` as written. If that assignment ever goes back to an
+///   unfolding, or the refusal moves to a different term, the row goes red and
+///   has to be read again.
+/// * **the mechanism, measured in the kernel directly.** The text never
+///   carried it: the old `Decidable.rec` showed only one side. The row now puts
+///   the two spellings to `clean_kernel::TypeChecker::is_def_eq` as closed
+///   definitions, at BOTH reducibility settings, next to twin controls that
+///   must be defeq. Transparency-blind (`honor_reducibility = false`) is the
+///   setting the kernel's `add_decl` re-check uses. If it refuses, no
+///   reducibility setting can close the bridge. This also tells the B18
+///   "not defeq at all" gate apart from the B14 "defeq only through an
+///   `@[irreducible]` unfold" gate, which print the identical message shape.
+///
+/// # 2026-10-14 — RED a third time, on the `got` half only
+///
+/// At clean `46d887ef9` (origin/main `b959e290e4b`; the pin first crossed clean's
+/// unifier rework at `ea19c4aceeb`, *"train D1b"*, clean `446a496e6` → `921a066bb`)
+/// the `got` half is side A's `Decidable.rec` unfolding on both sides of the `=`
+/// again. Everything else this row asserts on the message still held at that pin:
+/// the `Type mismatch`, the two different `ite`s, and the per-side instances. The
+/// range brings the unifier's structural probes ahead of WHNF in rollback scopes
+/// (clean `99d4246fb`, `013ce8352`, `7847644ed`). Which of its commits moved `?a`
+/// back to the unfolding was NOT bisected. It is a message-spelling change in a
+/// refusal the island still makes, so the half is re-pinned to the spelling
+/// measured at the pin, rebuilt from side A's own pieces (`ite_delta_unfolding`).
+/// Lean's `isDefEqQuickOther` assigns as written (the reason for `1a8f1c807`), so
+/// this spelling is a Clean faithfulness question, not a Trust verdict. If `?a`
+/// goes back to side A as written, or the refusal moves to another term, the row
+/// goes red and has to be read again.
 #[test]
 fn l5_p3_no_existing_route_admits_the_beq_spelling_and_the_kernel_says_why() {
     for bits in WIDTHS {
@@ -779,13 +854,22 @@ fn l5_p3_no_existing_route_admits_the_beq_spelling_and_the_kernel_says_why() {
          ever starts closing, the whole of landing 5 is superseded and must be re-measured: \
          {rejection}"
     );
-    // The rejection must NAME THE DECISION TERM it is stuck on. It is spelled
-    // in whichever of the two forms the printer currently uses — `BEq.beq`
-    // before clean `6d1663115`, `==` since — and this row does not care which,
-    // because the printer is not the subject. See the note below.
+    // THE MESSAGE, pinned half by half. The shape is the elaborator's body gate
+    // (`reject_body_type_mismatch`): `expected <statement>, got <rfl's type>`.
+    let (expected, got) = mismatch_halves(&rejection);
+    let (side_a, side_b) = split_top_level_eq(expected)
+        .unwrap_or_else(|| panic!("the `expected` half is the bridge's `=` statement: {expected}"));
     assert!(
-        rejection.contains("BEq.beq") || rejection.contains("=="),
-        "the rejection must name the decision term it is stuck on: {rejection}"
+        side_a.starts_with("ite UInt64 ") && side_b.starts_with("ite UInt64 "),
+        "both sides of the refused statement are the two `ite`s at the carrier: {expected}"
+    );
+    assert_ne!(side_a, side_b, "the two spellings must elaborate to DIFFERENT terms: {expected}");
+    // Side A must name the decision term. It is spelled in whichever form the
+    // printer uses: `BEq.beq` before clean `6d1663115`, `==` since. The printer
+    // is not this row's subject.
+    assert!(
+        side_a.contains("BEq.beq") || side_a.contains("=="),
+        "side A must name the Bool decision term: {side_a}"
     );
 
     // THE PART THAT IS THE SUBJECT, and that no notation table can hide: the
@@ -793,36 +877,165 @@ fn l5_p3_no_existing_route_admits_the_beq_spelling_and_the_kernel_says_why() {
     // whole mechanism of the refusal. `instDecidableEqBool` decides the
     // Bool-level `(a == b) = true`; `instDecidableEqUInt64` decides the
     // propositional `a = b` at the carrier. Neither constant has a notation
-    // entry, so neither can be printed away.
+    // entry, so neither can be printed away. Asserted PER SIDE.
     assert!(
-        rejection.contains("instDecidableEqBool"),
-        "the `==` side must resolve the BOOL decision instance: {rejection}"
+        side_a.contains("instDecidableEqBool") && !side_a.contains("instDecidableEqUInt64"),
+        "the `==` side must resolve the BOOL decision instance, and only it: {side_a}"
     );
     assert!(
-        rejection.contains("instDecidableEqUInt64"),
-        "the `=` side must resolve the CARRIER equality instance — if both sides now name the \
-         same instance, the two spellings have been identified somewhere upstream and the \
-         whole of landing 5 must be re-measured: {rejection}"
+        side_b.contains("instDecidableEqUInt64") && !side_b.contains("instDecidableEqBool"),
+        "the `=` side must resolve the CARRIER equality instance, and only it. If both sides \
+         now name the same instance, the two spellings have been identified somewhere upstream \
+         and the whole of landing 5 must be re-measured: {side_b}"
     );
     assert!(
-        rejection.contains("Bool.true"),
+        side_a.contains("Bool.true") && !side_b.contains("Bool.true"),
         "the `==` side is the Bool decision LIFTED to a proposition, and the lift is what the \
-         `select.eq` row does not read: {rejection}"
+         `select.eq` row does not read: {expected}"
     );
 
-    // WHY it does not close, in the kernel's own output rather than in this
-    // file's prose: both sides reduce to a `Decidable.rec` STUCK on a neutral
-    // scrutinee. The doc-comment above has asserted this since landing 5 and
-    // never measured it; the notation-aware message now shows it.
-    assert!(
-        rejection.contains("Decidable.rec"),
-        "the mismatch must bottom out in a STUCK `Decidable.rec` — that, not a missing \
-         producer, is why no reducibility setting can ever close this bridge: {rejection}"
+    // The `got` half is `rfl`'s own type `@Eq ?α ?a ?a`, with `?a` assigned side A's
+    // `Decidable.rec` unfolding (clean `921a066bb` on; side A AS WRITTEN from
+    // `1a8f1c807` through `336d20039`, the unfolding before that; see the 2026-10-14
+    // note). The mismatch is that exact `unfold(side A) = unfold(side A)` against
+    // `side A = side B`. It is not some other term failing to check: the unfolding is
+    // rebuilt from side A's OWN condition, instance and arms, so side B, or any other
+    // term, in that position turns the row red.
+    let (got_a, got_b) = split_top_level_eq(got)
+        .unwrap_or_else(|| panic!("the `got` half is `rfl`'s `=` type: {got}"));
+    let unfolded_a = ite_delta_unfolding(side_a)
+        .unwrap_or_else(|| panic!("side A is an `ite` with exactly five arguments: {side_a}"));
+    assert_eq!(
+        (got_a, got_b),
+        (unfolded_a.as_str(), unfolded_a.as_str()),
+        "MEASURED at clean `46d887ef9`: `rfl` is assigned side A's `Decidable.rec` unfolding, \
+         so the refused type is `unfold(side A) = unfold(side A)` against `side A = side B`: \
+         {rejection}"
     );
+
+    // WHY it does not close, put to the kernel directly rather than read off a
+    // message. The kernel is shown the two spellings as closed definitions at
+    // BOTH reducibility settings. Transparency-blind is the `add_decl` setting,
+    // so a refusal there means no reducibility setting can close the bridge.
+    // The twins are the anti-vacuity controls: the checker must answer `true`
+    // for a spelling against its own copy.
+    let defs = island(&[
+        "def bridgeA (a b : UInt64) : UInt64 := if a == b then a else b",
+        "def bridgeATwin (a b : UInt64) : UInt64 := if a == b then a else b",
+        "def bridgeB (a b : UInt64) : UInt64 := if a = b then a else b",
+        "def bridgeBTwin (a b : UInt64) : UInt64 := if a = b then a else b",
+    ]);
+    let cnst = |name: &str| Expr::const_(Name::from_string(name), vec![]);
+    for honor in [false, true] {
+        // A fresh checker per setting: its reduction caches must never mix them.
+        let tc = TypeChecker::new(&defs);
+        tc.set_honor_reducibility(honor);
+        assert!(
+            tc.is_def_eq(&cnst("bridgeA"), &cnst("bridgeATwin")),
+            "CONTROL (honor_reducibility = {honor}): the `==` spelling is defeq to its own twin"
+        );
+        assert!(
+            tc.is_def_eq(&cnst("bridgeB"), &cnst("bridgeBTwin")),
+            "CONTROL (honor_reducibility = {honor}): the `=` spelling is defeq to its own twin"
+        );
+        assert!(
+            !tc.is_def_eq(&cnst("bridgeA"), &cnst("bridgeB")),
+            "MEASURED (honor_reducibility = {honor}): the kernel must refuse `==` against `=`. \
+             If this ever holds, the whole of landing 5 is superseded and must be re-measured"
+        );
+    }
     eprintln!(
         "PROBE-ROW | the `rfl` bridge          | side A: REAL | REJECTED by the island — the \
-         two `ite`s are not defeq, measured in the kernel's own voice"
+         two `ite`s are not defeq, and the kernel refuses them at both reducibility settings"
     );
+}
+
+/// The `expected` and `got` halves of the island's single `Type mismatch`
+/// diagnostic, read out of the batch's `Debug` rendering. Refuses (panics) on
+/// anything but exactly one mismatch with exactly one `, got ` separator, so a
+/// change of message shape is a loud red rather than a silent mis-split.
+fn mismatch_halves(rejection: &str) -> (&str, &str) {
+    const OPEN: &str = "`bridge` did not elaborate: Type mismatch: expected ";
+    assert_eq!(
+        rejection.matches(OPEN).count(),
+        1,
+        "exactly one elaboration-time mismatch on `bridge`: {rejection}"
+    );
+    let rest = &rejection[rejection.find(OPEN).expect("counted above") + OPEN.len()..];
+    // The message is a `Debug` string literal; it ends at its closing quote.
+    let message = &rest[..rest.find('"').expect("the Debug message literal closes")];
+    assert_eq!(message.matches(", got ").count(), 1, "exactly one `, got ` separator: {message}");
+    message.split_once(", got ").expect("counted above")
+}
+
+/// Split `lhs = rhs` at its single `=` at parenthesis depth zero. `None` unless
+/// there is exactly one such `=`.
+fn split_top_level_eq(eq: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let mut splits = Vec::new();
+    for (at, ch) in eq.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '=' if depth == 0 && eq[..at].ends_with(' ') && eq[at + 1..].starts_with(' ') => {
+                splits.push(at);
+            }
+            _ => {}
+        }
+    }
+    let [at] = splits[..] else { return None };
+    Some((eq[..at].trim_end(), eq[at + 1..].trim_start()))
+}
+
+/// `ite α c h t e` as the island prints its δ-unfolding, built from the `ite`'s own
+/// five arguments:
+/// `Decidable.rec c (fun (x : Decidable c) => α)
+///  (fun (f : c -> False) => (fun (f1 : c -> False) => e) f)
+///  (fun (x : c) => (fun (x1 : c) => t) x) h`.
+/// `None` unless `ite` is `ite` applied to exactly five top-level arguments with a
+/// parenthesized condition.
+fn ite_delta_unfolding(ite: &str) -> Option<String> {
+    let args = top_level_args(ite.strip_prefix("ite ")?)?;
+    let [ty, cond, inst, then_arm, else_arm] = args[..] else { return None };
+    let bare = cond.strip_prefix('(')?.strip_suffix(')')?;
+    Some(format!(
+        "Decidable.rec {cond} (fun (x : Decidable {cond}) => {ty}) \
+         (fun (f : {bare} -> False) => (fun (f1 : {bare} -> False) => {else_arm}) f) \
+         (fun (x : {bare}) => (fun (x1 : {bare}) => {then_arm}) x) {inst}"
+    ))
+}
+
+/// The space-separated arguments of an application spine at parenthesis depth zero.
+/// `None` on unbalanced parentheses.
+fn top_level_args(spine: &str) -> Option<Vec<&str>> {
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut args = Vec::new();
+    for (at, ch) in spine.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ' ' if depth == 0 => {
+                if at > start {
+                    args.push(&spine[start..at]);
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    if start < spine.len() {
+        args.push(&spine[start..]);
+    }
+    Some(args)
 }
 
 // ═══════ L5-P4 — THE PRODUCER ARM: ADMIT, with nine refused mutations ═══════

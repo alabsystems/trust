@@ -1,7 +1,7 @@
-use rustc_middle::bug;
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_span::bug;
 
 const INSTR_COST: usize = 5;
 const CALL_PENALTY: usize = 25;
@@ -19,6 +19,8 @@ pub(super) struct CostChecker<'b, 'tcx> {
     bonus: usize,
     callee_body: &'b Body<'tcx>,
     instance: Option<ty::Instance<'tcx>>,
+    ub_checks: bool,
+    overflow_checks: bool,
 }
 
 impl<'b, 'tcx> CostChecker<'b, 'tcx> {
@@ -28,7 +30,18 @@ impl<'b, 'tcx> CostChecker<'b, 'tcx> {
         instance: Option<ty::Instance<'tcx>>,
         callee_body: &'b Body<'tcx>,
     ) -> CostChecker<'b, 'tcx> {
-        CostChecker { tcx, typing_env, callee_body, instance, penalty: 0, bonus: 0 }
+        let inline_mir_preserve_debug = tcx.sess.opts.unstable_opts.inline_mir_preserve_debug;
+        CostChecker {
+            tcx,
+            typing_env,
+            callee_body,
+            instance,
+            penalty: 0,
+            bonus: 0,
+            ub_checks: inline_mir_preserve_debug.unwrap_or_else(|| tcx.sess.ub_checks()),
+            overflow_checks: inline_mir_preserve_debug
+                .unwrap_or_else(|| tcx.sess.overflow_checks()),
+        }
     }
 
     /// Add function-level costs not well-represented by the block-level costs.
@@ -39,7 +52,13 @@ impl<'b, 'tcx> CostChecker<'b, 'tcx> {
     pub(super) fn add_function_level_costs(&mut self) {
         // If the only has one Call (or similar), inlining isn't increasing the total
         // number of calls, so give extra encouragement to inlining that.
-        if self.callee_body.basic_blocks.iter().filter(|bbd| is_call_like(bbd.terminator())).count()
+        if self
+            .callee_body
+            .basic_blocks
+            .iter()
+            .filter(|bbd| is_call_like(bbd.terminator()))
+            .take(2)
+            .count()
             == 1
         {
             self.bonus += CALL_PENALTY;
@@ -60,17 +79,14 @@ impl<'b, 'tcx> CostChecker<'b, 'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
+    fn visit_place(&mut self, _: &Place<'tcx>, _: PlaceContext, _: Location) {}
+
+    fn visit_source_info(&mut self, _: &SourceInfo) {}
+
     fn visit_operand(&mut self, operand: &Operand<'tcx>, _: Location) {
         match operand {
             Operand::RuntimeChecks(RuntimeChecks::UbChecks) => {
-                if !self
-                    .tcx
-                    .sess
-                    .opts
-                    .unstable_opts
-                    .inline_mir_preserve_debug
-                    .unwrap_or(self.tcx.sess.ub_checks())
-                {
+                if !self.ub_checks {
                     // If this is in optimized MIR it's because it's used later, so if we don't need UB
                     // checks this session, give a bonus here to offset the cost of the call later.
                     self.bonus += CALL_PENALTY;
@@ -88,6 +104,11 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
                     NonDivergingIntrinsic::Assume(..) => INSTR_COST,
                     NonDivergingIntrinsic::CopyNonOverlapping(..) => CALL_PENALTY,
                 };
+            }
+            StatementKind::Assign((_, Rvalue::Use(Operand::Constant(ref constant), _)))
+                if matches!(constant.const_, Const::Val(ConstValue::ZeroSized, _)) =>
+            {
+                // Assigning a ZST constant emits no code.
             }
             StatementKind::Assign(..) => self.penalty += INSTR_COST,
             _ => {}
@@ -136,15 +157,7 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
                 }
             }
             TerminatorKind::Assert { unwind, msg, .. } => {
-                self.penalty += if msg.is_optional_overflow_check()
-                    && !self
-                        .tcx
-                        .sess
-                        .opts
-                        .unstable_opts
-                        .inline_mir_preserve_debug
-                        .unwrap_or(self.tcx.sess.overflow_checks())
-                {
+                self.penalty += if msg.is_optional_overflow_check() && !self.overflow_checks {
                     INSTR_COST
                 } else {
                     CALL_PENALTY

@@ -101,6 +101,19 @@ pub(super) fn evidence_satisfies_policy(
             direct_trust_vc_receipt,
         );
     }
+    // Native body-WP authority always requires its checked certificate and
+    // original public claim, even in diagnostic policies that waive ordinary
+    // artifact requirements for generic engines.
+    if route.primary == PrimaryEngine::TrustWp {
+        return evidence_satisfies_full_artifact_policy(
+            route,
+            evidence,
+            bundle,
+            obligation,
+            native_trust_ir,
+            direct_trust_vc_receipt,
+        );
+    }
     !policy.require_proof_artifacts
         || evidence_satisfies_full_artifact_policy(
             route,
@@ -132,8 +145,23 @@ pub(super) fn evidence_satisfies_full_artifact_policy(
             direct_trust_vc_receipt,
         );
     }
-    evidence_satisfies_route_artifact_policy(route, evidence)
-        && native_trust_ir_artifact_match(native_trust_ir, route, obligation).is_ok()
+    if !evidence_satisfies_route_artifact_policy(route, evidence) {
+        return false;
+    }
+    match native_trust_ir_artifact_match(native_trust_ir, route, obligation) {
+        Ok(Some(binding)) if route.primary == PrimaryEngine::TrustWp => native_trust_ir
+            .is_some_and(|index| {
+                index.accepts_wp_certificate(
+                    bundle,
+                    obligation,
+                    evidence,
+                    binding.request_id,
+                    binding.proof_id,
+                )
+            }),
+        Ok(_) => route.primary != PrimaryEngine::TrustWp,
+        Err(_) => false,
+    }
 }
 
 pub(super) fn evidence_uses_reserved_direct_trust_vc_namespace(
@@ -168,6 +196,7 @@ pub(super) fn evidence_satisfies_route_artifact_policy(
     }
     let has = |kind| evidence.artifacts.iter().any(|artifact| artifact.kind == kind);
     match route.proof_family {
+        ProofFamily::TrustWpDeductive => has(EvidenceArtifactKind::ProofCertificate),
         ProofFamily::TrustMcReachability => {
             has(EvidenceArtifactKind::SolverTranscript)
                 && has(EvidenceArtifactKind::ReplayLog)

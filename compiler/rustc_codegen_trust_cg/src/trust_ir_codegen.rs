@@ -100,6 +100,7 @@ fn module_lir_error_variant(e: &trust_cg_bridge::ModuleLirError) -> &'static str
         E::NonLocalPointer { .. } => "NonLocalPointer",
         E::UnsupportedMemory { .. } => "UnsupportedMemory",
         E::UninlinableCall { .. } => "UninlinableCall",
+        E::UnclassifiedAggregateAbi { .. } => "UnclassifiedAggregateAbi",
         // `ModuleLirError` is `#[non_exhaustive]`; a future variant logs as
         // "Other" rather than failing to compile here.
         _ => "Other",

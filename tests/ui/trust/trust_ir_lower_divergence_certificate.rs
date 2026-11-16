@@ -1,5 +1,5 @@
 //@ check-pass
-//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off
+//@ compile-flags: -Ztrust-ir-lower -Ztrust-verify=off --crate-type=lib -Ainvalid_value
 // wave-DRC: THE BODY-DIVERGENCE CERTIFICATE the wave-UE record prescribed.
 // A fn whose declared return is an opaque-lane enum (register_enum declined
 // end-to-end) used to refuse at SIGNATURE time ('Ty(opaque-lane enum

@@ -171,15 +171,15 @@ fn examples_verify_alias_points_to_canonical_verify_examples() {
 /// and scripts typing the pre-rename spelling — so a dead-code sweep reads them
 /// as dead and deletes them, which is exactly what fc5a9655a0 did. The absence
 /// of a test is what let that regression stay invisible; this is that test.
+///
+/// `report`, `verify`, `alignment` and `alignment status` used to name
+/// `deps status`/`deps validate`; those are retired (TRUST-08), so pointing at
+/// them would send the user to another refusal. They now print the retirement
+/// message instead, which names the gitlink-era replacements.
 #[test]
 fn removed_deps_aliases_point_to_canonical_commands() {
-    for (alias, replacement) in [
-        (&["report"][..], "targo trust deps status"),
-        (&["verify"][..], "targo trust deps validate"),
-        (&["alignment"][..], "targo trust deps status"),
-        (&["alignment", "status"][..], "targo trust deps status"),
-        (&["inventory"][..], "targo trust deps upstream-test-inventory"),
-    ] {
+    {
+        let (alias, replacement) = (&["inventory"][..], "targo trust deps upstream-test-inventory");
         let spelling = alias.join(" ");
         let mut args = vec!["trust", "deps"];
         args.extend_from_slice(alias);
@@ -207,6 +207,90 @@ fn removed_deps_aliases_point_to_canonical_commands() {
             )),
             "removed deps alias `{spelling}` should name the canonical command\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+
+    for alias in
+        [&["report"][..], &["verify"][..], &["alignment"][..], &["alignment", "status"][..]]
+    {
+        let spelling = alias.join(" ");
+        let mut args = vec!["trust", "deps"];
+        args.extend_from_slice(alias);
+        args.push("--help");
+
+        let output = Command::new(targo_trust_binary())
+            .args(&args)
+            .output()
+            .unwrap_or_else(|error| panic!("run deps {spelling} help: {error}"));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "removed deps alias `{spelling}` should be rejected\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.trim().is_empty(),
+            "removed alias should not print old help\nstdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains(&format!("targo trust deps {spelling}: retired"))
+                && stderr.contains("targo trust repo submodule-reachability"),
+            "removed deps alias `{spelling}` should name the gitlink replacements\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// TRUST-08: the lock-driven `deps` verbs read `trust-engines.lock` and
+/// compared checked-in `first-party/` snapshots against it. No such lock is
+/// tracked, and `first-party/*` are git submodules pinned by gitlink, so run at
+/// the repository root every one of them failed on the missing lock
+/// (`status` exited 1 with `failed to read .../trust-engines.lock`) — a verb
+/// that cannot succeed. They are retired; each one must exit 2 and name the
+/// gitlink-era commands that answer the question it used to ask, instead of
+/// failing on an input the tree no longer has.
+#[test]
+fn retired_deps_alignment_verbs_name_the_gitlink_replacements_at_the_repo_root() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("targo-trust lives directly under the trust checkout")
+        .to_path_buf();
+    assert!(
+        repo_root.join(".gitmodules").is_file(),
+        "fixture precondition: {} is the Trust checkout root",
+        repo_root.display()
+    );
+
+    for verb in ["status", "validate", "diff", "upstream-plan", "export", "import", "lock"] {
+        let output = Command::new(targo_trust_binary())
+            .args(["trust", "deps", verb])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap_or_else(|error| panic!("run deps {verb}: {error}"));
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "retired `deps {verb}` must be a directed usage refusal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stdout.trim().is_empty(), "retired verb must print no report\nstdout:\n{stdout}");
+        assert!(
+            !stderr.contains("No such file"),
+            "`deps {verb}` must not fail on the obsolete lock input\nstderr:\n{stderr}"
+        );
+        for replacement in [
+            format!("targo trust deps {verb}: retired"),
+            "targo trust repo submodule-reachability".to_string(),
+            "targo trust gate coherence".to_string(),
+            "scripts/submodule_sync.sh".to_string(),
+        ] {
+            assert!(
+                stderr.contains(&replacement),
+                "`deps {verb}` must name `{replacement}`\nstderr:\n{stderr}"
+            );
+        }
     }
 }
 
@@ -321,6 +405,41 @@ fn removed_top_level_kani_subcommand_explains_its_deletion() {
             !stderr.contains("unknown subcommand"),
             "the removed spelling must be answered by name, not by the generic usage dump\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+}
+
+/// A help-only `check` or `build` compiles nothing, so the post-compile gates
+/// (temporal, Kani, Creusot) have no run to inspect. Before this guard they ran
+/// anyway after the usage text, probed `targo metadata` for the selected
+/// packages, and turned a successful `--help` into exit 2 wherever that probe
+/// could not run — here, a directory with no Cargo project at all.
+#[test]
+fn compile_verb_help_runs_no_post_compile_gate_outside_a_cargo_project() {
+    let empty = tempfile::tempdir().expect("create a directory with no Cargo project");
+    for verb in ["check", "build"] {
+        for flag in ["--help", "-h"] {
+            let output = Command::new(targo_trust_binary())
+                .args(["trust", verb, flag])
+                .current_dir(empty.path())
+                .output()
+                .unwrap_or_else(|error| panic!("run `trust {verb} {flag}`: {error}"));
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "`targo trust {verb} {flag}` must succeed outside a Cargo project\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stdout.contains("targo trust check [file]"),
+                "`targo trust {verb} {flag}` must print the usage text\nstdout:\n{stdout}"
+            );
+            assert!(
+                !stderr.contains("gate"),
+                "a help-only run compiled nothing, so no post-compile gate may speak\nstderr:\n{stderr}"
+            );
+        }
     }
 }
 

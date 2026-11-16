@@ -252,24 +252,21 @@ impl TerminationAnalyzer {
         let total_vcs = current.total();
 
         // Compute moving average over last 5 rates.
-        let window: usize = 5;
-        let recent_deltas: Vec<i64> = self
-            .rate_history
+        let recent_len = self.rate_history.len().min(4);
+        let recent_sum: i64 = self.rate_history[self.rate_history.len() - recent_len..]
             .iter()
-            .rev()
-            .take(window.saturating_sub(1))
             .map(|r| r.vcs_proved_delta)
-            .collect();
+            .sum();
 
-        let sum: i64 = recent_deltas.iter().sum::<i64>() + vcs_proved_delta;
-        let count = recent_deltas.len().saturating_add(1);
+        let sum: i64 = recent_sum + vcs_proved_delta;
+        let count = recent_len.saturating_add(1);
         let moving_average = sum as f64 / count as f64;
 
         // Trend: compare current average to previous average.
-        let prev_avg = if recent_deltas.is_empty() {
+        let prev_avg = if recent_len == 0 {
             0.0
         } else {
-            recent_deltas.iter().sum::<i64>() as f64 / recent_deltas.len() as f64
+            recent_sum as f64 / recent_len as f64
         };
         let trend = moving_average - prev_avg;
 
@@ -610,22 +607,9 @@ impl RankingAnalyzer {
         }
 
         if decreasing_vars.is_empty() {
-            // Try lexicographic if configured.
-            if self.config.use_lexicographic && variables.len() > 1 {
-                // Try each variable individually.
-                for var in variables {
-                    let dec_pattern = format!("{var} = {var} - ");
-                    let dec_assign = format!("{var} -= ");
-                    if loop_body.contains(&dec_pattern) || loop_body.contains(&dec_assign) {
-                        decreasing_vars.push((var, "1"));
-                    }
-                }
-            }
-            if decreasing_vars.is_empty() {
-                return TerminationResult::MayNotTerminate(
-                    "no decreasing variable found".to_string(),
-                );
-            }
+            return TerminationResult::MayNotTerminate(
+                "no decreasing variable found".to_string(),
+            );
         }
 
         // Attempt to find a ranking function.
@@ -1456,41 +1440,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_ranking_function_creation() {
-        let rf = RankingFunction {
-            name: "rank_n".to_string(),
-            expression: "n".to_string(),
-            domain: "non-negative integers".to_string(),
-        };
-        assert_eq!(rf.name, "rank_n");
-        assert_eq!(rf.expression, "n");
-        assert_eq!(rf.domain, "non-negative integers");
-    }
-
-    #[test]
-    fn test_decrease_measure_strict() {
-        let dm = DecreaseMeasure {
-            variable: "i".to_string(),
-            before: "i".to_string(),
-            after: "i - 1".to_string(),
-            strict: true,
-        };
-        assert!(dm.strict);
-        assert_eq!(dm.variable, "i");
-    }
-
-    #[test]
-    fn test_decrease_measure_non_strict() {
-        let dm = DecreaseMeasure {
-            variable: "x".to_string(),
-            before: "10".to_string(),
-            after: "10".to_string(),
-            strict: false,
-        };
-        assert!(!dm.strict);
-    }
-
-    #[test]
     fn test_lex_order_creation() {
         let analyzer = RankingAnalyzer::new(TerminationConfig::default());
         let r1 = RankingFunction {
@@ -1681,17 +1630,5 @@ mod tests {
         let analyzer = RankingAnalyzer::new(TerminationConfig::default());
         let rf = analyzer.synthesize_ranking("flag == true", "toggle(flag)");
         assert!(rf.is_none());
-    }
-
-    #[test]
-    fn test_ranking_analyzer_config_access() {
-        let config = TerminationConfig {
-            max_ranking_attempts: 5,
-            use_lexicographic: false,
-            bound_synthesis: true,
-        };
-        let analyzer = RankingAnalyzer::new(config);
-        assert_eq!(analyzer.config().max_ranking_attempts, 5);
-        assert!(!analyzer.config().use_lexicographic);
     }
 }

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use super::shared_helpers::{
+use shim_utils::{
     canonicalize_trust_no_verify, finalize_trust_no_verify, trust_bootstrap_no_verify_applies,
 };
 
@@ -118,4 +118,112 @@ fn no_verify_is_canonical_and_precedes_positional_tail() {
         rustdoc_args,
         args(&["src/lib.rs", "-Ztrust-verify=off", "--", "-Ztrust-verify=on",]),
     );
+}
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): a `/bin/sh` launch whose custody
+/// environment is decided here, not by the runner.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn custody_launch(script: &str, set: &[(&str, &str)]) -> std::process::Command {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", script]);
+    for name in super::GNU_ADVERTISEMENTS.into_iter().chain(super::STRICT_CUSTODY_MARKERS) {
+        cmd.env_remove(name);
+    }
+    for (name, value) in set {
+        cmd.env(name, value);
+    }
+    cmd
+}
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): only a strict launch that inherited
+/// nothing and was advertised nothing is lent, and a doctest run only when the
+/// shim can hold it to one thread.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rustdoc_is_lent_an_execution_only_when_owed_one() {
+    use super::{Lending, lending_owed};
+    let doc = args(&["src/lib.rs", "--crate-name", "fixture"]);
+    let doctest = args(&["--test", "src/lib.rs", "--test-args", "--quiet"]);
+    let strict = custody_launch("", &[("BUILD_SLOT_CPU_PROTOCOL", "1")]);
+    assert_eq!(
+        lending_owed(false, false, &strict, &doc),
+        Lending::Lend { one_doctest_at_a_time: false }
+    );
+    assert_eq!(
+        lending_owed(false, false, &strict, &doctest),
+        Lending::Lend { one_doctest_at_a_time: true }
+    );
+    for marker in super::STRICT_CUSTODY_MARKERS {
+        let strict = custody_launch("", &[(marker, "1")]);
+        assert_ne!(lending_owed(false, false, &strict, &doc), Lending::Forward, "{marker}");
+    }
+    // An inherited scheduler, any inbound advertisement, an advertisement the
+    // command itself carries, no strict marker, or a chosen doctest thread
+    // count: forwarded, so the real rustdoc judges its own custody.
+    assert_eq!(lending_owed(true, false, &strict, &doctest), Lending::Forward);
+    assert_eq!(lending_owed(false, true, &strict, &doctest), Lending::Forward);
+    for name in super::GNU_ADVERTISEMENTS {
+        let advertised = custody_launch("", &[("BUILD_SLOT_CPU_PROTOCOL", "1"), (name, "-k")]);
+        assert_eq!(lending_owed(false, false, &advertised, &doctest), Lending::Forward, "{name}");
+    }
+    assert_eq!(lending_owed(false, false, &custody_launch("", &[]), &doctest), Lending::Forward);
+    for chosen in [
+        args(&["--test", "src/lib.rs", "--test-args", "--test-threads=4"]),
+        args(&["--test", "src/lib.rs", "--test-args=--quiet --test-threads 2"]),
+        args(&["--test", "src/lib.rs", "--test-args", "--test-threads", "--test-args", "1"]),
+        args(&["--test", "src/lib.rs", "--test-args=--test-threads=1 --test-threads=3"]),
+    ] {
+        assert_eq!(lending_owed(false, false, &strict, &chosen), Lending::Forward, "{chosen:?}");
+    }
+    for one in [
+        args(&["--test", "src/lib.rs", "--test-args", "--test-threads=1"]),
+        args(&["--test", "src/lib.rs", "--test-args=--quiet --test-threads=1"]),
+    ] {
+        assert_eq!(
+            lending_owed(false, false, &strict, &one),
+            Lending::Lend { one_doctest_at_a_time: true },
+            "{one:?}"
+        );
+    }
+}
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): every GNU option the launched process
+/// receives names a descriptor open in it, and the handoff locator is present.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LENT_POOL_OPEN: &str = r#"
+for value in "${CARGO_MAKEFLAGS-}" "${MAKEFLAGS-}" "${MFLAGS-}"; do
+  case "$value" in *--jobserver-auth=*) ;; *) echo "no GNU auth in: [$value]" >&2; exit 3 ;; esac
+  auth=${value##*--jobserver-auth=}
+  auth=${auth%% *}
+  if [ ! -e "/dev/fd/${auth%%,*}" ] || [ ! -e "/dev/fd/${auth##*,}" ]; then exit 4; fi
+done
+[ -n "${CARGO_JOBSERVER_HANDOFF-}" ] || exit 5
+echo "lent-open threads=${RUST_TEST_THREADS-unset}"
+"#;
+
+/// Trust (CUSTODY-PROTOCOL1-LAUNCH-1): a loan is an open pool with the
+/// handoff that holds no token, read on its owner (a pool built with one token
+/// is the reading's positive control), and a doctest loan holds the harness to
+/// one thread.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_loan_is_an_open_empty_pool_with_the_handoff() {
+    use super::{Lending, lend};
+    for (one, threads) in [(false, "unset"), (true, "1")] {
+        let mut cmd = custody_launch(LENT_POOL_OPEN, &[("BUILD_SLOT_CPU_PROTOCOL", "1")]);
+        cmd.env_remove("RUST_TEST_THREADS");
+        let lent = lend(Lending::Lend { one_doctest_at_a_time: one }, &mut cmd)
+            .expect("an owed run is lent");
+        assert_eq!(lent.client().available().unwrap(), 0);
+        let output = cmd.output().unwrap();
+        drop(cmd);
+        drop(lent);
+        let expected = format!("lent-open threads={threads}");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&expected),
+            "{expected}: {output:?}"
+        );
+    }
+    let control = jobserver_utils::Jobserver::new(1).unwrap();
+    assert_eq!(control.client().available().unwrap(), 1);
 }

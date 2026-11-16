@@ -20,7 +20,7 @@ use trust_types::translation_validation::{
 };
 use trust_types::{BlockId, VerifiableFunction, VerificationCondition};
 
-use crate::cross_check::{CrossCheckResult, full_cross_check};
+use crate::cross_check::{CrossCheckResult, full_cross_check_with_vcs};
 
 // ---------------------------------------------------------------------------
 // Certification levels
@@ -344,7 +344,7 @@ pub fn cross_checked_translation(
     func: &VerifiableFunction,
 ) -> Result<CertifiedTranslation, CertificationError> {
     let vcs = crate::generate_vcs(func);
-    let cross_result = full_cross_check(func);
+    let cross_result = full_cross_check_with_vcs(func, &vcs);
 
     if cross_result.has_soundness_alarm() {
         return Err(CertificationError::SoundnessAlarm {
@@ -354,7 +354,8 @@ pub fn cross_checked_translation(
     }
 
     // Build per-block certificates from the cross-check.
-    let mut block_certs = FxHashMap::default();
+    let mut block_certs =
+        FxHashMap::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
     for block in &func.body.blocks {
         block_certs.insert(
             block.id,
@@ -398,7 +399,7 @@ pub fn proof_certified_translation(
     let vcs = crate::generate_vcs(func);
 
     // Cross-check first — proof certification includes cross-checking.
-    let cross_result = full_cross_check(func);
+    let cross_result = full_cross_check_with_vcs(func, &vcs);
     if cross_result.has_soundness_alarm() {
         return Err(CertificationError::SoundnessAlarm {
             function: func.name.as_str().into(),
@@ -407,8 +408,8 @@ pub fn proof_certified_translation(
     }
 
     // Build proof judgments from the simulation relation.
-    let mut judgments = Vec::new();
-    let mut proof_terms = Vec::new();
+    let mut judgments = Vec::with_capacity(func.body.blocks.len() + 2);
+    let mut proof_terms = Vec::with_capacity(func.body.blocks.len() + 2);
 
     // Entry point preservation judgment.
     judgments.push(ProofJudgment {
@@ -478,7 +479,8 @@ pub fn proof_certified_translation(
     });
 
     // Build per-block certificates.
-    let mut block_certs = FxHashMap::default();
+    let mut block_certs =
+        FxHashMap::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
     for block in &func.body.blocks {
         block_certs.insert(
             block.id,
@@ -519,6 +521,7 @@ mod tests {
     use trust_types::{BasicBlock, BlockId, LocalDecl, SourceSpan, Terminator, Ty, VerifiableBody};
 
     use super::*;
+    use crate::cross_check::full_cross_check;
 
     fn midpoint_function() -> VerifiableFunction {
         crate::tests::midpoint_function()
@@ -544,6 +547,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 

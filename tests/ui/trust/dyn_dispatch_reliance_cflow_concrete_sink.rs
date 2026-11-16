@@ -3,7 +3,7 @@
 //@ dont-check-compiler-stderr
 //@ dont-require-annotations: NOTE
 //@ dont-require-annotations: WARN
-//@ check-pass
+//@ check-fail
 //! C-FLOW: a `dyn` call whose receiver's vtable provenance is COMPLETE inside the
 //! bundle discharges by CASE SPLIT over the enumerated `Self` types.
 //!
@@ -98,6 +98,9 @@ impl fmt::Write for Sink {
     }
 }
 
+// ZERO-ROW-GATE (2026-10-10): zero bridged obligations plus a call no authenticated registry discharges publish an `unknown` row; refused.
+//~vv ERROR Trust strict verification failed for `dyn_dispatch_reliance_cflow_concrete_sink::render`
+//~v NOTE this function has no obligation of its own
 pub fn render(sink: &mut Sink) -> fmt::Result {
     use fmt::Write as _;
     write!(sink, "constant")

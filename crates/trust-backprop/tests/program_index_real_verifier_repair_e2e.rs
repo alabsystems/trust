@@ -13,20 +13,26 @@ const REPAIRED_RS: &str = "repaired.rs";
 const PATCH_DIFF: &str = "patch.diff";
 const IMPROVEMENT_JSON: &str = "repair-proof-improvement.json";
 const IMPROVEMENT_MD: &str = "repair-proof-improvement.md";
+const DEFAULT_STAGE2_TRUSTC: &str = "build/host/stage2/bin/rustc";
 
 /// End-to-end repair test that requires a real stage2 trustc.
 ///
-/// When `TRUST_REPAIR_E2E_TRUSTC` is unset the helper prints a SKIP notice and
-/// the test early-returns without invoking the compiler, so the test passes
-/// trivially in normal `cargo test` runs. CI configurations that exercise the
-/// full repair pipeline supply `TRUST_REPAIR_E2E_TRUSTC` + `TRUST_REPAIR_E2E_REPORT_DIR`.
+/// `#[ignore]`d, so an ordinary `targo --unverified test` never reaches it; the
+/// slow harness row `slow.program-index-repair-e2e` runs it by name with
+/// `--ignored --exact` and demands `1 passed`. A run that selects it never
+/// skips: the compiler is the in-tree `build/host/stage2/bin/rustc`
+/// (`TRUST_REPAIR_E2E_TRUSTC` overrides it), and with no compiler there the
+/// test PANICS. It used to early-return and pass whenever the variable was
+/// unset, so every run that did not set it reported green having compiled
+/// nothing. Evidence lands in a fresh directory under the test target's tmp
+/// dir (`TRUST_REPAIR_E2E_REPORT_DIR` overrides it); the path is printed first.
 #[test]
+#[ignore = "needs a stage2 trustc; run by harness row slow.program-index-repair-e2e"]
 fn real_stage2_program_index_divzero_repair_improves_proof_counts() {
-    let Some(trustc) = explicit_stage2_trustc_or_skip() else {
-        return;
-    };
-    let report_dir = required_report_dir();
-    fs::create_dir_all(&report_dir).expect("create TRUST_REPAIR_E2E_REPORT_DIR");
+    let trustc = stage2_trustc();
+    let report_dir = report_dir();
+    eprintln!("repair e2e: compiler {}", trustc.display());
+    eprintln!("repair e2e: evidence {}", report_dir.display());
 
     let repo_root = repo_root();
     let fixture = repo_root.join(FLAWED_FIXTURE);
@@ -159,36 +165,56 @@ impl VerifierRun {
     }
 }
 
-fn explicit_stage2_trustc_or_skip() -> Option<PathBuf> {
-    let value = match std::env::var_os("TRUST_REPAIR_E2E_TRUSTC") {
-        Some(value) if !value.is_empty() => value,
-        _ => {
-            eprintln!(
-                "SKIPPING: TRUST_REPAIR_E2E_TRUSTC is unset; set it to a real stage2 trustc to run this ignored e2e test"
-            );
-            return None;
+/// The stage2 compiler this run exercises: `TRUST_REPAIR_E2E_TRUSTC` when set
+/// (relative paths resolve from the repo root), else the in-tree
+/// `build/host/stage2/bin/rustc`. Panics, never returns a skip: only a run
+/// that asked for this ignored test reaches here, and it asked for the real
+/// compiler.
+fn stage2_trustc() -> PathBuf {
+    let (path, source) = match std::env::var_os("TRUST_REPAIR_E2E_TRUSTC") {
+        Some(value) if !value.is_empty() => {
+            let raw = PathBuf::from(value);
+            let path = if raw.is_absolute() { raw } else { repo_root().join(raw) };
+            (path, "TRUST_REPAIR_E2E_TRUSTC")
         }
+        _ => (repo_root().join(DEFAULT_STAGE2_TRUSTC), "the in-tree default"),
     };
-    let raw = PathBuf::from(value);
-    let path = if raw.is_absolute() { raw } else { repo_root().join(raw) };
-    assert!(path.is_file(), "TRUST_REPAIR_E2E_TRUSTC is not a file: {}", path.display());
     assert!(
-        is_stage2_path(&path),
-        "TRUST_REPAIR_E2E_TRUSTC must point at a stage2 compiler path, got {}",
+        path.is_file(),
+        "no stage2 compiler at {} ({source}); this ignored e2e refuses to pass without \
+         running one. Build it with `./x.py build --stage 2` (it writes {DEFAULT_STAGE2_TRUSTC}), \
+         or set TRUST_REPAIR_E2E_TRUSTC to an existing stage2 trustc.",
         path.display()
     );
-    Some(path)
+    assert!(
+        is_stage2_path(&path),
+        "{source} must point at a stage2 compiler path, got {}",
+        path.display()
+    );
+    path
 }
 
-fn required_report_dir() -> PathBuf {
-    let value = std::env::var_os("TRUST_REPAIR_E2E_REPORT_DIR")
-        .expect("TRUST_REPAIR_E2E_REPORT_DIR must be set when TRUST_REPAIR_E2E_TRUSTC is set");
-    assert!(
-        !value.is_empty(),
-        "TRUST_REPAIR_E2E_REPORT_DIR must not be empty when TRUST_REPAIR_E2E_TRUSTC is set"
-    );
-    let raw = PathBuf::from(value);
-    if raw.is_absolute() { raw } else { repo_root().join(raw) }
+/// Where the evidence is archived: `TRUST_REPAIR_E2E_REPORT_DIR` when set
+/// (created if missing), else a fresh, kept directory under the test target's
+/// `CARGO_TARGET_TMPDIR`, so a failed run never leaves a previous run's
+/// `after.stderr` beside this run's `before.stderr`.
+fn report_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("TRUST_REPAIR_E2E_REPORT_DIR")
+        && !value.is_empty()
+    {
+        let raw = PathBuf::from(value);
+        let dir = if raw.is_absolute() { raw } else { repo_root().join(raw) };
+        fs::create_dir_all(&dir).expect("create TRUST_REPAIR_E2E_REPORT_DIR");
+        return dir;
+    }
+    let base =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("program_index_real_verifier_repair_e2e");
+    fs::create_dir_all(&base).expect("create repair e2e evidence root");
+    tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&base)
+        .expect("create repair e2e evidence dir")
+        .keep()
 }
 
 fn repo_root() -> PathBuf {

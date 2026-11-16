@@ -35,6 +35,9 @@ fn max_then_cast(c: i128, narrowing: bool) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "<u32 as core::cmp::Ord>::max",
+                        ),
                         is_foreign: false,
                         func: "<u32 as core::cmp::Ord>::max".into(),
                         args: vec![
@@ -65,6 +68,7 @@ fn max_then_cast(c: i128, narrowing: bool) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -120,6 +124,9 @@ fn max_const_lower_bound_dropped_when_source_reassigned() {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "<u64 as core::cmp::Ord>::max",
+                        ),
                         is_foreign: false,
                         func: "<u64 as core::cmp::Ord>::max".into(),
                         args: vec![
@@ -158,6 +165,7 @@ fn max_const_lower_bound_dropped_when_source_reassigned() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     assert!(
         build_cast_lower_bound_facts(&func).is_empty(),
@@ -189,6 +197,9 @@ fn clamp_then_cast(lo: i128, hi: i128) -> VerifiableFunction {
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(
+                            "<i32 as core::cmp::Ord>::clamp",
+                        ),
                         is_foreign: false,
                         func: "<i32 as core::cmp::Ord>::clamp".into(),
                         args: vec![
@@ -220,6 +231,7 @@ fn clamp_then_cast(lo: i128, hi: i128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -335,6 +347,7 @@ fn clamp_diamond(cmp: BinOp, c: u128, const_on_true: bool) -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -424,6 +437,7 @@ fn bitcount_call(callee: &str, recv: Operand, recv_ty: Ty) -> VerifiableFunction
                         unwind: UnwindEdge::Unreachable,
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
                         is_foreign: false,
                         func: callee.into(),
                         args: vec![recv],
@@ -443,6 +457,7 @@ fn bitcount_call(callee: &str, recv: Operand, recv_ty: Ty) -> VerifiableFunction
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -459,7 +474,7 @@ fn bitcount_upper_bound(func: &VerifiableFunction) -> Option<i128> {
 
 /// WITNESS (a live false proof, no negative numbers needed):
 ///
-/// ```ignore
+/// ```ignore (illustrative)
 /// const K: i128 = 1;
 /// let n = K.count_zeros();          // truly 127
 /// let arr = [0u8; 65];
@@ -566,8 +581,16 @@ fn bool_edge_sum_chain() -> VerifiableFunction {
         LocalDecl { index: 4, ty: Ty::Bool, name: Some("s3".into()) },
     ];
     for k in 0..4 {
-        locals.push(LocalDecl { index: 5 + 2 * k, ty: Ty::Bool, name: Some(format!("_{}", 5 + 2 * k)) });
-        locals.push(LocalDecl { index: 6 + 2 * k, ty: Ty::u32(), name: Some(format!("_{}", 6 + 2 * k)) });
+        locals.push(LocalDecl {
+            index: 5 + 2 * k,
+            ty: Ty::Bool,
+            name: Some(format!("_{}", 5 + 2 * k)),
+        });
+        locals.push(LocalDecl {
+            index: 6 + 2 * k,
+            ty: Ty::u32(),
+            name: Some(format!("_{}", 6 + 2 * k)),
+        });
     }
     for t in 13..=15 {
         locals.push(LocalDecl { index: t, ty: pair.clone(), name: Some(format!("_{t}")) });
@@ -577,7 +600,11 @@ fn bool_edge_sum_chain() -> VerifiableFunction {
         let (a, b) = (1 + k, 1 + (k + 1) % 4);
         stmts.push(Statement::Assign {
             place: Place::local(5 + 2 * k),
-            rvalue: Rvalue::BinaryOp(BinOp::Ne, Operand::Copy(Place::local(a)), Operand::Copy(Place::local(b))),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Ne,
+                Operand::Copy(Place::local(a)),
+                Operand::Copy(Place::local(b)),
+            ),
             span: SourceSpan::default(),
         });
         stmts.push(Statement::Assign {
@@ -589,17 +616,29 @@ fn bool_edge_sum_chain() -> VerifiableFunction {
     // _13 = _6 + _8 ; _14 = _13.0 + _10 ; _15 = _14.0 + _12
     stmts.push(Statement::Assign {
         place: Place::local(13),
-        rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, Operand::Copy(Place::local(6)), Operand::Copy(Place::local(8))),
+        rvalue: Rvalue::CheckedBinaryOp(
+            BinOp::Add,
+            Operand::Copy(Place::local(6)),
+            Operand::Copy(Place::local(8)),
+        ),
         span: SourceSpan::default(),
     });
     stmts.push(Statement::Assign {
         place: Place::local(14),
-        rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, Operand::Copy(field0(13)), Operand::Copy(Place::local(10))),
+        rvalue: Rvalue::CheckedBinaryOp(
+            BinOp::Add,
+            Operand::Copy(field0(13)),
+            Operand::Copy(Place::local(10)),
+        ),
         span: SourceSpan::default(),
     });
     stmts.push(Statement::Assign {
         place: Place::local(15),
-        rvalue: Rvalue::CheckedBinaryOp(BinOp::Add, Operand::Copy(field0(14)), Operand::Copy(Place::local(12))),
+        rvalue: Rvalue::CheckedBinaryOp(
+            BinOp::Add,
+            Operand::Copy(field0(14)),
+            Operand::Copy(Place::local(12)),
+        ),
         span: SourceSpan::default(),
     });
     stmts.push(Statement::Assign {
@@ -622,6 +661,7 @@ fn bool_edge_sum_chain() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -636,7 +676,11 @@ fn u8_checked_const_op(op: BinOp, ua: u128, ub: u128) -> VerifiableFunction {
         body: VerifiableBody {
             locals: vec![
                 LocalDecl { index: 0, ty: Ty::u8(), name: Some("_0".into()) },
-                LocalDecl { index: 1, ty: Ty::Tuple(vec![Ty::u8(), Ty::Bool]), name: Some("_1".into()) },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Tuple(vec![Ty::u8(), Ty::Bool]),
+                    name: Some("_1".into()),
+                },
             ],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -666,6 +710,7 @@ fn u8_checked_const_op(op: BinOp, ua: u128, ub: u128) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -704,7 +749,11 @@ fn checked_result_field_bound_declines_exactly_at_type_max() {
     // is real — so the guard is `>=`, pinned in BOTH directions here.
     // KILLS: guard-deleted mutant, and the off-by-one `>` mutant.
     let at_max = build_additive_bound_facts(&u8_checked_const_op(BinOp::Add, 200, 55));
-    assert_eq!(le_fact_for(&at_max, "_1.0"), None, "200+55 == u8::MAX must emit nothing: {at_max:?}");
+    assert_eq!(
+        le_fact_for(&at_max, "_1.0"),
+        None,
+        "200+55 == u8::MAX must emit nothing: {at_max:?}"
+    );
     let below = build_additive_bound_facts(&u8_checked_const_op(BinOp::Add, 200, 54));
     assert_eq!(le_fact_for(&below, "_1.0"), Some(254), "200+54 is strictly tighter: {below:?}");
     // And well above the type max — where the machine really does wrap — nothing.
@@ -758,7 +807,11 @@ fn checked_result_field_bound_declines_for_free_operands() {
                 LocalDecl { index: 0, ty: Ty::u32(), name: Some("_0".into()) },
                 LocalDecl { index: 1, ty: Ty::u32(), name: Some("a".into()) },
                 LocalDecl { index: 2, ty: Ty::u32(), name: Some("b".into()) },
-                LocalDecl { index: 3, ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]), name: Some("_3".into()) },
+                LocalDecl {
+                    index: 3,
+                    ty: Ty::Tuple(vec![Ty::u32(), Ty::Bool]),
+                    name: Some("_3".into()),
+                },
             ],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -788,6 +841,7 @@ fn checked_result_field_bound_declines_for_free_operands() {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     };
     let facts = build_additive_bound_facts(&func);
     assert_eq!(le_fact_for(&facts, "_3.0"), None, "unbounded u32 add: {facts:?}");
@@ -826,6 +880,7 @@ fn checked_result_field_bound_declines_when_the_tuple_local_is_a_call_destinatio
         unwind: UnwindEdge::Unreachable,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key("reseat"),
         is_foreign: false,
         func: "reseat".into(),
         args: vec![],
@@ -866,4 +921,212 @@ fn checked_result_field_bound_declines_when_the_tuple_local_is_mut_borrowed() {
         None,
         "a `&mut` on the tuple local admits writes no def scan can see: {facts:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// CAST-SIGNED-CLAMP-UB-1: a `min(v, C)` clamp on a SIGNED local is not an
+// unsigned bound on its `as uN` cast.
+//
+// `fn c2_index(v: i32, arr: &[u8; 11]) -> u8 { let l = if v > 10 { 10 } else { v };
+// arr[l as usize] }`: `clamp_upper_bound(l) == Some(10)` is true of `l`, but
+// `l = -1` casts to `usize::MAX`. `unsigned_upper_bound` followed the cast's
+// `inner` into the signed `l`, took the clamp's 10, and `build_additive_bound_facts`
+// published the GLOBAL fact `(l as usize) <= 10`. With that fact the bounds VC is
+// UNSAT and the row read Certified (clean kernel) while the program panics with
+// index 18446744073709551615.
+// ---------------------------------------------------------------------------
+
+/// The two-block clamp diamond over a `src`-typed `v`, then a cast consumer:
+///
+/// ```text
+///   bb0: _2 = Gt(_1, C) ; SwitchInt(_2){ 0 -> bb2, otherwise -> bb1 }
+///   bb1: _3 = const C   ; Goto bb3          (the const arm, on the TRUE edge)
+///   bb2: _3 = copy _1   ; Goto bb3          (the var arm,  on the FALSE edge)
+///   bb3: [_6 = Div(_3, const 2)] ; [_7 = _3 as mid] ; _5 = <_3|_6|_7> as usize ; Return
+/// ```
+///
+/// `_1` is the parameter `v`, `_3` the clamp result `l`, `_5` the `usize` index.
+/// `div` inserts `d = l / 2` and casts `d`; `mid` inserts an intermediate cast
+/// `l as mid` and casts that (the `(l as u8) as usize` shape).
+fn signed_clamp_cast(src: Ty, c: i128, div: bool, mid: Option<Ty>) -> VerifiableFunction {
+    let k = |v: i128| match &src {
+        Ty::Int { signed: true, .. } => ConstValue::Int(v),
+        Ty::Int { width, .. } => ConstValue::Uint(v as u128, *width),
+        other => panic!("integer source expected, got {other:?}"),
+    };
+    let mid_ty = mid.clone().unwrap_or_else(|| src.clone());
+    let mut tail = Vec::new();
+    let mut cast_src = 3;
+    if div {
+        tail.push(Statement::Assign {
+            place: Place::local(6),
+            rvalue: Rvalue::BinaryOp(
+                BinOp::Div,
+                Operand::Copy(Place::local(3)),
+                Operand::Constant(k(2)),
+            ),
+            span: SourceSpan::default(),
+        });
+        cast_src = 6;
+    }
+    if let Some(m) = &mid {
+        tail.push(Statement::Assign {
+            place: Place::local(7),
+            rvalue: Rvalue::Cast(Operand::Copy(Place::local(cast_src)), m.clone()),
+            span: SourceSpan::default(),
+        });
+        cast_src = 7;
+    }
+    tail.push(Statement::Assign {
+        place: Place::local(5),
+        rvalue: Rvalue::Cast(Operand::Copy(Place::local(cast_src)), Ty::usize()),
+        span: SourceSpan::default(),
+    });
+    VerifiableFunction {
+        name: "c2_index".into(),
+        def_path: "c2_index".into(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u8(), name: Some("_0".into()) },
+                LocalDecl { index: 1, ty: src.clone(), name: Some("v".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("_2".into()) },
+                LocalDecl { index: 3, ty: src.clone(), name: Some("l".into()) },
+                LocalDecl { index: 4, ty: Ty::u8(), name: Some("_4".into()) },
+                LocalDecl { index: 5, ty: Ty::usize(), name: Some("_5".into()) },
+                LocalDecl { index: 6, ty: src.clone(), name: Some("d".into()) },
+                LocalDecl { index: 7, ty: mid_ty, name: Some("_7".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(2),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Gt,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Constant(k(c)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(2)),
+                        targets: vec![(0, BlockId(2))],
+                        otherwise: BlockId(1),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Use(Operand::Constant(k(c))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(3),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock { id: BlockId(3), stmts: tail, terminator: Terminator::Return },
+            ],
+            arg_count: 1,
+            return_ty: Ty::u8(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
+}
+
+/// `usize::MAX`, the loose bound a cast of an unbounded source must fall back to.
+const USIZE_MAX: i128 = u64::MAX as i128;
+
+#[test]
+fn signed_clamp_cast_to_usize_has_no_tight_bound() {
+    // The clamp itself is recognized — `min(v, 10) <= 10` is true of the SIGNED
+    // value — so the fix must be at the cast, not in `clamp_upper_bound`.
+    for src in [Ty::i8(), Ty::i32(), Ty::isize(), Ty::Int { width: 128, signed: true }] {
+        let func = signed_clamp_cast(src.clone(), 10, false, None);
+        assert_eq!(clamp_upper_bound(&func, 3), Some(10), "{src:?}: the diamond is a clamp");
+        // The signed clamp result has NO unsigned upper bound ...
+        assert_eq!(
+            unsigned_upper_bound(&func, &Operand::Copy(Place::local(3)), 16),
+            None,
+            "{src:?}: a signed component has no unsigned bound"
+        );
+        // ... so its `as usize` image is bounded only by the target type.
+        assert_eq!(
+            unsigned_upper_bound(&func, &Operand::Copy(Place::local(5)), 16),
+            Some(USIZE_MAX),
+            "{src:?}: `l as usize` wraps a negative `l` to a huge index"
+        );
+        let facts = build_additive_bound_facts(&func);
+        assert_eq!(
+            le_fact_for(&facts, "_5"),
+            None,
+            "{src:?}: no global `(l as usize) <= C` fact may be published: {facts:?}"
+        );
+    }
+}
+
+#[test]
+fn signed_clamp_divided_then_cast_has_no_tight_bound() {
+    // `let d = l / 2; arr[d as usize]`: `l = -3` gives `d = -1`, index usize::MAX.
+    // The Div arm recursed into the signed clamp and published `(d as usize) <= 5`.
+    let func = signed_clamp_cast(Ty::i32(), 10, true, None);
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(6)), 16), None);
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(5)), 16), Some(USIZE_MAX));
+    let facts = build_additive_bound_facts(&func);
+    assert_eq!(le_fact_for(&facts, "_5"), None, "no `(d as usize) <= 5`: {facts:?}");
+}
+
+#[test]
+fn signed_clamp_through_u8_is_bounded_by_u8_only() {
+    // `arr[(l as u8) as usize]` with `l: i8`: `l = -1` gives 255. The bound on the
+    // `u8` intermediate is its type range, and the `usize` index is `<= 255` — the
+    // true bound, published by the widening — never `<= 10`.
+    let func = signed_clamp_cast(Ty::i8(), 10, false, Some(Ty::u8()));
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(7)), 16), Some(255));
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(5)), 16), Some(255));
+    let facts = build_additive_bound_facts(&func);
+    assert_eq!(le_fact_for(&facts, "_7"), None, "no `(l as u8) <= 10`: {facts:?}");
+    assert_eq!(le_fact_for(&facts, "_5"), Some(255), "the widening's true bound: {facts:?}");
+}
+
+#[test]
+fn unsigned_clamp_cast_to_usize_keeps_its_tight_bound() {
+    // CONTROL: the same diamond on an UNSIGNED `v` is sound and must still prove
+    // `arr[l as usize]` — `l <= 10` holds and the cast preserves it.
+    let func = signed_clamp_cast(Ty::u32(), 10, false, None);
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(5)), 16), Some(10));
+    assert_eq!(le_fact_for(&build_additive_bound_facts(&func), "_5"), Some(10));
+    // ... and through the division: `(l / 2) as usize <= 5`.
+    let func = signed_clamp_cast(Ty::u32(), 10, true, None);
+    assert_eq!(le_fact_for(&build_additive_bound_facts(&func), "_5"), Some(5));
+    // `u128` has no `ty_max` (width >= 127) but is unsigned: the guard keys on the
+    // SIGN, not on whether the type range is representable, so the clamp still
+    // bounds the cast.
+    let func = signed_clamp_cast(Ty::u128(), 10, false, None);
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Copy(Place::local(3)), 16), Some(10));
+    assert_eq!(le_fact_for(&build_additive_bound_facts(&func), "_5"), Some(10));
+}
+
+#[test]
+fn signed_constant_operands_keep_their_value_bound() {
+    // A non-negative signed CONSTANT is its own exact bound (it casts unchanged);
+    // a negative one is not bounded at all. Neither goes through a place type.
+    let func = signed_clamp_cast(Ty::i32(), 10, false, None);
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Constant(ConstValue::Int(7)), 16), Some(7));
+    assert_eq!(unsigned_upper_bound(&func, &Operand::Constant(ConstValue::Int(-1)), 16), None);
 }

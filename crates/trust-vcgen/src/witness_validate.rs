@@ -85,75 +85,60 @@ impl WitnessValidator {
     /// - `Valid` if the formula evaluates to `true` (witness demonstrates the property).
     /// - `Invalid` if the formula evaluates to `false`.
     /// - `Inconclusive` if the formula cannot be fully reduced to a boolean.
+    /// Diagnostic memory-image assignments are always `Inconclusive`, including
+    /// images nested in another constant or assigned to an unused variable.
     pub fn validate_witness(
         &self,
         vc: &VerificationCondition,
         assignments: &[(String, ConstValue)],
     ) -> WitnessValidation {
-        // Build substitution map from assignments.
-        let env: FxHashMap<String, Formula> = assignments
-            .iter()
-            .map(|(name, val)| (name.clone(), const_value_to_formula(val)))
-            .collect();
-
-        // Check for unbound free variables after substitution.
-        let free_vars = vc.formula.free_variables();
-        let missing: Vec<&str> = free_vars
-            .iter()
-            .filter(|v| !env.contains_key(v.as_str()))
-            .map(String::as_str)
-            .collect();
-
-        if !missing.is_empty() {
-            return WitnessValidation::Inconclusive {
-                reason: format!("missing assignments for free variables: {}", missing.join(", ")),
-            };
-        }
-
-        // Substitute and evaluate.
-        let substituted = substitute(&vc.formula, &env);
-        let evaluated = evaluate(&substituted);
-
-        match evaluated {
-            Formula::Bool(true) => WitnessValidation::Valid,
-            Formula::Bool(false) => WitnessValidation::Invalid {
-                reason: "formula evaluates to false under the given assignments".to_string(),
-            },
-            _ => WitnessValidation::Inconclusive {
-                reason: format!("formula did not reduce to a boolean: {}", evaluated.to_smtlib()),
-            },
-        }
+        self.validate_formula(&vc.formula, assignments)
     }
 
     /// Validate a raw formula (not wrapped in a VC) against assignments.
     ///
     /// Convenience method for testing formula evaluation without constructing
-    /// a full `VerificationCondition`.
+    /// a full `VerificationCondition`. The same diagnostic memory-image refusal
+    /// applies before substitution or evaluation.
     pub fn validate_formula(
         &self,
         formula: &Formula,
         assignments: &[(String, ConstValue)],
     ) -> WitnessValidation {
-        let env: FxHashMap<String, Formula> = assignments
-            .iter()
-            .map(|(name, val)| (name.clone(), const_value_to_formula(val)))
-            .collect();
-
-        let free_vars = formula.free_variables();
-        let missing: Vec<&str> = free_vars
-            .iter()
-            .filter(|v| !env.contains_key(v.as_str()))
-            .map(String::as_str)
-            .collect();
-
-        if !missing.is_empty() {
-            return WitnessValidation::Inconclusive {
-                reason: format!("missing assignments for free variables: {}", missing.join(", ")),
-            };
+        if let Some(refusal) = memory_image_assignment_refusal(assignments) {
+            return refusal;
+        }
+        let mut env: FxHashMap<&str, Formula> =
+            FxHashMap::with_capacity_and_hasher(assignments.len(), Default::default());
+        for (name, val) in assignments {
+            env.insert(name.as_str(), const_value_to_formula(val));
         }
 
-        let substituted = substitute(formula, &env);
-        let evaluated = evaluate(&substituted);
+        let mut has_free_var = false;
+        if !trust_types::all_free_variable_names(formula, &mut |name| {
+            has_free_var = true;
+            env.contains_key(name)
+        }) {
+            let mut missing_set: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
+            let _ = trust_types::all_free_variable_names(formula, &mut |name| {
+                if !env.contains_key(name) {
+                    missing_set.insert(name);
+                }
+                true
+            });
+            let mut reason = String::from("missing assignments for free variables: ");
+            for (idx, name) in missing_set.into_iter().enumerate() {
+                if idx > 0 {
+                    reason.push_str(", ");
+                }
+                reason.push_str(name);
+            }
+            return WitnessValidation::Inconclusive { reason };
+        }
+
+        let substituted = if has_free_var { substitute(formula, &mut env) } else { formula.clone() };
+        let evaluated = evaluate(substituted);
 
         match evaluated {
             Formula::Bool(true) => WitnessValidation::Valid,
@@ -165,6 +150,21 @@ impl WitnessValidator {
             },
         }
     }
+}
+
+fn memory_image_assignment_refusal(
+    assignments: &[(String, ConstValue)],
+) -> Option<WitnessValidation> {
+    // Memory images preserve extraction diagnostics, not concrete witness
+    // values. Reject before building the substitution map: duplicate names or
+    // boolean short-circuiting must not erase an unsupported assignment.
+    assignments.iter().find(|(_, value)| value.contains_memory_image()).map(|(name, _)| {
+        WitnessValidation::Inconclusive {
+            reason: format!(
+                "assignment {name:?} contains diagnostic ConstValue::MemoryImage, which cannot be used as a witness value"
+            ),
+        }
+    })
 }
 
 // Convert a `ConstValue` to a `Formula` literal.
@@ -191,39 +191,67 @@ fn const_value_to_formula(val: &ConstValue) -> Formula {
         // falsely confirm a counterexample (Float above stays opaque-shared by
         // the #478 design, which only ever forces Inconclusive).
         ConstValue::Str { bytes } => Formula::Var(ConstValue::str_smt_var_name(bytes), Sort::Int),
-        // ConstValue is #[non_exhaustive]; unknown variants produce
-        // an unconstrained symbolic variable (sound: forces Inconclusive).
-        _ => Formula::Var("__unknown_witness".into(), Sort::Int),
+        // A carrier with no modeled value keeps the symbol the VC formula gave it
+        // (its occurrence identity, OPAQUE-SCALAR-ID-1 / OPAQUE-REF-ID-1), so two
+        // different values never meet as one term here either.
+        other => match other.unmodeled_value_smt_var_name() {
+            Some(name) => Formula::Var(name, Sort::Int),
+            // ConstValue is #[non_exhaustive]; unknown variants produce
+            // an unconstrained symbolic variable (sound: forces Inconclusive).
+            None => Formula::Var("__unknown_witness".into(), Sort::Int),
+        },
     }
 }
 
 // Substitute variables in a formula with concrete values.
-fn substitute(formula: &Formula, env: &FxHashMap<String, Formula>) -> Formula {
+fn substitute<'a>(formula: &Formula, env: &mut FxHashMap<&'a str, Formula>) -> Formula {
+    if env.is_empty() {
+        return formula.clone();
+    }
+    substitute_owned(formula.clone(), env)
+}
+
+fn substitute_owned<'a>(formula: Formula, env: &mut FxHashMap<&'a str, Formula>) -> Formula {
+    if env.is_empty() {
+        return formula;
+    }
     match formula {
-        Formula::Var(name, _sort) => {
-            if let Some(replacement) = env.get(name) {
+        Formula::Var(ref name, _) => {
+            if let Some(replacement) = env.get(name.as_str()) {
                 replacement.clone()
             } else {
-                formula.clone()
+                formula
             }
         }
         // Quantifiers bind variables — do not substitute bound names.
         Formula::Forall(bindings, body) => {
-            let mut inner_env = env.clone();
-            for (name, _) in bindings {
-                inner_env.remove(name.as_str());
+            let mut saved = Vec::new();
+            for (name, _) in &bindings {
+                if let Some(entry) = env.remove_entry(name.as_str()) {
+                    saved.push(entry);
+                }
             }
-            Formula::Forall(bindings.clone(), Box::new(substitute(body, &inner_env)))
+            let new_body = substitute_owned(*body, env);
+            for (k, v) in saved.into_iter().rev() {
+                env.insert(k, v);
+            }
+            Formula::Forall(bindings, Box::new(new_body))
         }
         Formula::Exists(bindings, body) => {
-            let mut inner_env = env.clone();
-            for (name, _) in bindings {
-                inner_env.remove(name.as_str());
+            let mut saved = Vec::new();
+            for (name, _) in &bindings {
+                if let Some(entry) = env.remove_entry(name.as_str()) {
+                    saved.push(entry);
+                }
             }
-            Formula::Exists(bindings.clone(), Box::new(substitute(body, &inner_env)))
+            let new_body = substitute_owned(*body, env);
+            for (k, v) in saved.into_iter().rev() {
+                env.insert(k, v);
+            }
+            Formula::Exists(bindings, Box::new(new_body))
         }
         // Recursively substitute through all other formula nodes.
-        _ => formula.clone().map_children(&mut |child| substitute(&child, env)),
+        other => other.map_children(&mut |child| substitute_owned(child, env)),
     }
 }
 
@@ -232,16 +260,16 @@ fn substitute(formula: &Formula, env: &FxHashMap<String, Formula>) -> Formula {
 // Handles: Bool, Int, UInt, Not, And, Or, Implies, Eq, Lt, Le, Gt, Ge,
 // Add, Sub, Mul, Div, Rem, Neg, Ite. Returns the formula unchanged if
 // it cannot be reduced (e.g., bitvector ops, quantifiers, arrays).
-fn evaluate(formula: &Formula) -> Formula {
+fn evaluate(formula: Formula) -> Formula {
     match formula {
         // Literals are already values.
-        Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) => formula.clone(),
-        Formula::BitVec { .. } => formula.clone(),
-        Formula::Var(..) => formula.clone(),
+        Formula::Bool(_) | Formula::Int(_) | Formula::UInt(_) => formula,
+        Formula::BitVec { .. } => formula,
+        Formula::Var(..) => formula,
 
         // Boolean connectives.
         Formula::Not(inner) => {
-            let inner_val = evaluate(inner);
+            let inner_val = evaluate(*inner);
             match inner_val {
                 Formula::Bool(b) => Formula::Bool(!b),
                 other => Formula::Not(Box::new(other)),
@@ -264,7 +292,7 @@ fn evaluate(formula: &Formula) -> Formula {
             if all_true {
                 Formula::Bool(true)
             } else if evaluated_terms.len() == 1 {
-                evaluated_terms.pop().expect("invariant: exactly one element")
+                evaluated_terms.pop().unwrap_or(Formula::Bool(true))
             } else {
                 Formula::And(evaluated_terms)
             }
@@ -286,14 +314,14 @@ fn evaluate(formula: &Formula) -> Formula {
             if all_false {
                 Formula::Bool(false)
             } else if evaluated_terms.len() == 1 {
-                evaluated_terms.pop().expect("invariant: exactly one element")
+                evaluated_terms.pop().unwrap_or(Formula::Bool(false))
             } else {
                 Formula::Or(evaluated_terms)
             }
         }
         Formula::Implies(lhs, rhs) => {
-            let l = evaluate(lhs);
-            let r = evaluate(rhs);
+            let l = evaluate(*lhs);
+            let r = evaluate(*rhs);
             match (&l, &r) {
                 (Formula::Bool(false), _) => Formula::Bool(true),
                 (Formula::Bool(true), _) => r,
@@ -304,8 +332,8 @@ fn evaluate(formula: &Formula) -> Formula {
 
         // Comparisons.
         Formula::Eq(lhs, rhs) => {
-            let l = evaluate(lhs);
-            let r = evaluate(rhs);
+            let l = evaluate(*lhs);
+            let r = evaluate(*rhs);
             match (&l, &r) {
                 (Formula::Int(a), Formula::Int(b)) => Formula::Bool(a == b),
                 (Formula::Bool(a), Formula::Bool(b)) => Formula::Bool(a == b),
@@ -319,19 +347,19 @@ fn evaluate(formula: &Formula) -> Formula {
                 _ => Formula::Eq(Box::new(l), Box::new(r)),
             }
         }
-        Formula::Lt(lhs, rhs) => eval_int_cmp(lhs, rhs, |a, b| a < b),
-        Formula::Le(lhs, rhs) => eval_int_cmp(lhs, rhs, |a, b| a <= b),
-        Formula::Gt(lhs, rhs) => eval_int_cmp(lhs, rhs, |a, b| a > b),
-        Formula::Ge(lhs, rhs) => eval_int_cmp(lhs, rhs, |a, b| a >= b),
+        Formula::Lt(lhs, rhs) => eval_int_cmp(*lhs, *rhs, |a, b| a < b),
+        Formula::Le(lhs, rhs) => eval_int_cmp(*lhs, *rhs, |a, b| a <= b),
+        Formula::Gt(lhs, rhs) => eval_int_cmp(*lhs, *rhs, |a, b| a > b),
+        Formula::Ge(lhs, rhs) => eval_int_cmp(*lhs, *rhs, |a, b| a >= b),
 
         // Integer arithmetic.
-        Formula::Add(lhs, rhs) => eval_int_binop(lhs, rhs, i128::checked_add),
-        Formula::Sub(lhs, rhs) => eval_int_binop(lhs, rhs, i128::checked_sub),
-        Formula::Mul(lhs, rhs) => eval_int_binop(lhs, rhs, i128::checked_mul),
-        Formula::Div(lhs, rhs) => eval_int_binop(lhs, rhs, i128::checked_div),
-        Formula::Rem(lhs, rhs) => eval_int_binop(lhs, rhs, i128::checked_rem),
+        Formula::Add(lhs, rhs) => eval_int_binop(*lhs, *rhs, i128::checked_add),
+        Formula::Sub(lhs, rhs) => eval_int_binop(*lhs, *rhs, i128::checked_sub),
+        Formula::Mul(lhs, rhs) => eval_int_binop(*lhs, *rhs, i128::checked_mul),
+        Formula::Div(lhs, rhs) => eval_int_binop(*lhs, *rhs, i128::checked_div),
+        Formula::Rem(lhs, rhs) => eval_int_binop(*lhs, *rhs, i128::checked_rem),
         Formula::Neg(inner) => {
-            let v = evaluate(inner);
+            let v = evaluate(*inner);
             match v {
                 Formula::Int(n) => {
                     n.checked_neg().map_or(Formula::Neg(Box::new(Formula::Int(n))), Formula::Int)
@@ -342,26 +370,26 @@ fn evaluate(formula: &Formula) -> Formula {
 
         // Conditional (if-then-else).
         Formula::Ite(cond, then_branch, else_branch) => {
-            let c = evaluate(cond);
+            let c = evaluate(*cond);
             match c {
-                Formula::Bool(true) => evaluate(then_branch),
-                Formula::Bool(false) => evaluate(else_branch),
+                Formula::Bool(true) => evaluate(*then_branch),
+                Formula::Bool(false) => evaluate(*else_branch),
                 _ => Formula::Ite(
                     Box::new(c),
-                    Box::new(evaluate(then_branch)),
-                    Box::new(evaluate(else_branch)),
+                    Box::new(evaluate(*then_branch)),
+                    Box::new(evaluate(*else_branch)),
                 ),
             }
         }
 
         // All other formula nodes (bitvector, quantifier, array, etc.)
         // are returned with recursively evaluated children but no top-level reduction.
-        _ => formula.clone().map_children(&mut |child| evaluate(&child)),
+        other => other.map_children(&mut evaluate),
     }
 }
 
 // Helper for integer comparison evaluation.
-fn eval_int_cmp(lhs: &Formula, rhs: &Formula, cmp: fn(i128, i128) -> bool) -> Formula {
+fn eval_int_cmp(lhs: Formula, rhs: Formula, cmp: fn(i128, i128) -> bool) -> Formula {
     let l = evaluate(lhs);
     let r = evaluate(rhs);
     match (&l, &r) {
@@ -380,7 +408,7 @@ fn eval_int_cmp(lhs: &Formula, rhs: &Formula, cmp: fn(i128, i128) -> bool) -> Fo
 }
 
 // Helper for integer binary operation evaluation.
-fn eval_int_binop(lhs: &Formula, rhs: &Formula, op: fn(i128, i128) -> Option<i128>) -> Formula {
+fn eval_int_binop(lhs: Formula, rhs: Formula, op: fn(i128, i128) -> Option<i128>) -> Formula {
     let l = evaluate(lhs);
     let r = evaluate(rhs);
     match (&l, &r) {
@@ -396,6 +424,41 @@ mod tests {
     use trust_types::{SourceSpan, VcKind};
 
     use super::*;
+
+    #[test]
+    fn memory_image_equal_distinct_and_nested_witnesses_are_inconclusive() {
+        use crate::memory_image_tests::{image, nested_image};
+        let validator = WitnessValidator::new();
+        let formula = Formula::Eq(
+            Box::new(Formula::var("a", Sort::Int)),
+            Box::new(Formula::var("b", Sort::Int)),
+        );
+        for (left, right) in
+            [(image(0), image(0)), (image(0), image(8)), (nested_image(0), nested_image(8))]
+        {
+            let assignments = [("a".into(), left), ("b".into(), right)];
+            for result in [
+                validator.validate_formula(&formula, &assignments),
+                validator.validate_witness(&make_vc(formula.clone()), &assignments),
+            ] {
+                assert!(matches!(result, WitnessValidation::Inconclusive { reason }
+                    if reason.contains("ConstValue::MemoryImage")));
+            }
+        }
+    }
+
+    #[test]
+    fn memory_image_witness_refusal_precedes_duplicate_and_boolean_shortcuts() {
+        let validator = WitnessValidator::new();
+        let assignments = [
+            ("ignored".into(), crate::memory_image_tests::nested_image(8)),
+            ("ignored".into(), ConstValue::Int(0)),
+        ];
+        for formula in [Formula::Bool(true), Formula::Bool(false)] {
+            assert!(validator.validate_formula(&formula, &assignments).is_inconclusive());
+            assert!(validator.validate_witness(&make_vc(formula), &assignments).is_inconclusive());
+        }
+    }
 
     // Helper to build a simple VC with a given formula.
     fn make_vc(formula: Formula) -> VerificationCondition {

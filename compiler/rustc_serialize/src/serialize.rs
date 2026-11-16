@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hash};
 use std::marker::{PhantomData, PointeeSized};
-use std::num::NonZero;
+use std::num::{NonZero, ZeroablePrimitive};
 use std::path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -85,6 +85,67 @@ pub trait Encoder {
     }
 
     fn emit_raw_bytes(&mut self, s: &[u8]);
+
+    /// Controls whether `HashMap`-s are stable sorted by their key before encoding. Some encoders
+    /// don't need determinism, improving performance.
+    const DETERMINISTIC_HASH_MAP_ENCODE: bool = false;
+
+    fn encode_hash_map<K, V, S>(&mut self, map: &HashMap<K, V, S>)
+    where
+        Self: Sized,
+        K: Encodable<Self> + for<'a> ContextOrd<&'a Self>,
+        V: Encodable<Self>,
+        S: BuildHasher,
+    {
+        self.emit_usize(map.len());
+        if Self::DETERMINISTIC_HASH_MAP_ENCODE {
+            // we are sorting right after
+            #[expect(rustc::potential_query_instability)]
+            let mut values: Vec<_> = map.iter().collect();
+            let mut cmp = <K as ContextOrd<&Self>>::stable_cmp_with_context(self);
+            values.sort_by(|(k1, _), (k2, _)| cmp(*k1, *k2));
+            drop(cmp);
+
+            for (key, val) in values {
+                key.encode(self);
+                val.encode(self);
+            }
+        } else {
+            // this is explicitly allowed when Self::DETERMINISTIC_HASH_MAP_ENCODE is false
+            #[expect(rustc::potential_query_instability)]
+            for (key, val) in map.iter() {
+                key.encode(self);
+                val.encode(self);
+            }
+        }
+    }
+
+    fn encode_hash_set<K, S>(&mut self, map: &HashSet<K, S>)
+    where
+        Self: Sized,
+        K: Encodable<Self> + for<'a> ContextOrd<&'a Self>,
+        S: BuildHasher,
+    {
+        self.emit_usize(map.len());
+        if Self::DETERMINISTIC_HASH_MAP_ENCODE {
+            // we are sorting right after
+            #[expect(rustc::potential_query_instability)]
+            let mut values: Vec<_> = map.iter().collect();
+            let mut cmp = <K as ContextOrd<&Self>>::stable_cmp_with_context(self);
+            values.sort_by(|k1, k2| cmp(*k1, *k2));
+            drop(cmp);
+
+            for key in values {
+                key.encode(self);
+            }
+        } else {
+            // this is explicitly allowed when Self::DETERMINISTIC_HASH_MAP_ENCODE is false
+            #[expect(rustc::potential_query_instability)]
+            for key in map.iter() {
+                key.encode(self);
+            }
+        }
+    }
 }
 
 // Note: all the methods in this trait are infallible, which may be surprising.
@@ -187,12 +248,14 @@ macro_rules! direct_serialize_impls {
     ($($ty:ident $emit_method:ident $read_method:ident),*) => {
         $(
             impl<S: Encoder> Encodable<S> for $ty {
+                #[inline]
                 fn encode(&self, s: &mut S) {
                     s.$emit_method(*self);
                 }
             }
 
             impl<D: Decoder> Decodable<D> for $ty {
+                #[inline]
                 fn decode(d: &mut D) -> $ty {
                     d.$read_method()
                 }
@@ -224,6 +287,7 @@ impl<S: Encoder, T: ?Sized + PointeeSized> Encodable<S> for &T
 where
     T: Encodable<S>,
 {
+    #[inline]
     fn encode(&self, s: &mut S) {
         (**self).encode(s)
     }
@@ -241,55 +305,65 @@ impl<D: Decoder> Decodable<D> for ! {
     }
 }
 
-impl<S: Encoder> Encodable<S> for NonZero<u32> {
+impl<T: ZeroablePrimitive + Encodable<S>, S: Encoder> Encodable<S> for NonZero<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
-        s.emit_u32(self.get());
+        self.get().encode(s)
     }
 }
 
-impl<D: Decoder> Decodable<D> for NonZero<u32> {
+impl<T: ZeroablePrimitive + Decodable<D>, D: Decoder> Decodable<D> for NonZero<T> {
+    #[inline]
     fn decode(d: &mut D) -> Self {
-        NonZero::new(d.read_u32()).unwrap()
+        NonZero::new(T::decode(d)).unwrap()
     }
 }
 
 impl<S: Encoder> Encodable<S> for str {
+    #[inline]
     fn encode(&self, s: &mut S) {
         s.emit_str(self);
     }
 }
 
 impl<S: Encoder> Encodable<S> for String {
+    #[inline]
     fn encode(&self, s: &mut S) {
         s.emit_str(&self);
     }
 }
 
 impl<D: Decoder> Decodable<D> for String {
+    #[inline]
     fn decode(d: &mut D) -> String {
         d.read_str().to_owned()
     }
 }
 
 impl<S: Encoder> Encodable<S> for () {
+    #[inline]
     fn encode(&self, _s: &mut S) {}
 }
 
 impl<D: Decoder> Decodable<D> for () {
+    #[inline]
     fn decode(_: &mut D) {}
 }
 
 impl<S: Encoder, T> Encodable<S> for PhantomData<T> {
+    #[inline]
     fn encode(&self, _s: &mut S) {}
 }
 
 impl<D: Decoder, T> Decodable<D> for PhantomData<T> {
+    #[inline]
     fn decode(_: &mut D) -> PhantomData<T> {
         PhantomData
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Box<[T]> {
+    #[inline]
     fn decode(d: &mut D) -> Box<[T]> {
         let v: Vec<T> = Decodable::decode(d);
         v.into_boxed_slice()
@@ -297,18 +371,21 @@ impl<D: Decoder, T: Decodable<D>> Decodable<D> for Box<[T]> {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for Rc<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         (**self).encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Rc<T> {
+    #[inline]
     fn decode(d: &mut D) -> Rc<T> {
         Rc::new(Decodable::decode(d))
     }
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for [T] {
+    #[inline]
     default fn encode(&self, s: &mut S) {
         s.emit_usize(self.len());
         for e in self {
@@ -318,12 +395,14 @@ impl<S: Encoder, T: Encodable<S>> Encodable<S> for [T] {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for Vec<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         self.as_slice().encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Vec<T> {
+    #[inline]
     default fn decode(d: &mut D) -> Vec<T> {
         let len = d.read_usize();
         (0..len).map(|_| Decodable::decode(d)).collect()
@@ -336,15 +415,11 @@ impl<S: Encoder, T: Encodable<S>, const N: usize> Encodable<S> for [T; N] {
     }
 }
 
-impl<D: Decoder, const N: usize> Decodable<D> for [u8; N] {
-    fn decode(d: &mut D) -> [u8; N] {
+impl<D: Decoder, T: Decodable<D>, const N: usize> Decodable<D> for [T; N] {
+    fn decode(d: &mut D) -> [T; N] {
         let len = d.read_usize();
         assert!(len == N);
-        let mut v = [0u8; N];
-        for i in 0..len {
-            v[i] = Decodable::decode(d);
-        }
-        v
+        std::array::from_fn(move |_| Decodable::decode(d))
     }
 }
 
@@ -383,6 +458,7 @@ impl<D: Decoder> Decodable<D> for Cow<'_, str> {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for Option<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         match *self {
             None => s.emit_u8(0),
@@ -395,6 +471,7 @@ impl<S: Encoder, T: Encodable<S>> Encodable<S> for Option<T> {
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Option<T> {
+    #[inline]
     fn decode(d: &mut D) -> Option<T> {
         match d.read_u8() {
             0 => None,
@@ -405,6 +482,7 @@ impl<D: Decoder, T: Decodable<D>> Decodable<D> for Option<T> {
 }
 
 impl<S: Encoder, T1: Encodable<S>, T2: Encodable<S>> Encodable<S> for Result<T1, T2> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         match *self {
             Ok(ref v) => {
@@ -420,6 +498,7 @@ impl<S: Encoder, T1: Encodable<S>, T2: Encodable<S>> Encodable<S> for Result<T1,
 }
 
 impl<D: Decoder, T1: Decodable<D>, T2: Decodable<D>> Decodable<D> for Result<T1, T2> {
+    #[inline]
     fn decode(d: &mut D) -> Result<T1, T2> {
         match d.read_u8() {
             0 => Ok(T1::decode(d)),
@@ -437,11 +516,13 @@ macro_rules! tuple {
     () => ();
     ( $($name:ident,)+ ) => (
         impl<D: Decoder, $($name: Decodable<D>),+> Decodable<D> for ($($name,)+) {
+            #[inline]
             fn decode(d: &mut D) -> ($($name,)+) {
                 ($({ let element: $name = Decodable::decode(d); element },)+)
             }
         }
         impl<S: Encoder, $($name: Encodable<S>),+> Encodable<S> for ($($name,)+) {
+            #[inline]
             #[allow(non_snake_case)]
             fn encode(&self, s: &mut S) {
                 let ($(ref $name,)+) = *self;
@@ -474,60 +555,70 @@ impl<D: Decoder> Decodable<D> for path::PathBuf {
 }
 
 impl<S: Encoder, T: Encodable<S> + Copy> Encodable<S> for Cell<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         self.get().encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D> + Copy> Decodable<D> for Cell<T> {
+    #[inline]
     fn decode(d: &mut D) -> Cell<T> {
         Cell::new(Decodable::decode(d))
     }
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for RefCell<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         self.borrow().encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for RefCell<T> {
+    #[inline]
     fn decode(d: &mut D) -> RefCell<T> {
         RefCell::new(Decodable::decode(d))
     }
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for Arc<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         (**self).encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Arc<T> {
+    #[inline]
     fn decode(d: &mut D) -> Arc<T> {
         Arc::new(Decodable::decode(d))
     }
 }
 
 impl<S: Encoder, T: ?Sized + Encodable<S>> Encodable<S> for Box<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         (**self).encode(s)
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Box<T> {
+    #[inline]
     fn decode(d: &mut D) -> Box<T> {
         Box::new(Decodable::decode(d))
     }
 }
 
 impl<S: Encoder, A: Array<Item: Encodable<S>>> Encodable<S> for SmallVec<A> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         self.as_slice().encode(s);
     }
 }
 
 impl<D: Decoder, A: Array<Item: Decodable<D>>> Decodable<D> for SmallVec<A> {
+    #[inline]
     fn decode(d: &mut D) -> SmallVec<A> {
         let len = d.read_usize();
         (0..len).map(|_| Decodable::decode(d)).collect()
@@ -535,12 +626,14 @@ impl<D: Decoder, A: Array<Item: Decodable<D>>> Decodable<D> for SmallVec<A> {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for ThinVec<T> {
+    #[inline]
     fn encode(&self, s: &mut S) {
         self.as_slice().encode(s);
     }
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for ThinVec<T> {
+    #[inline]
     fn decode(d: &mut D) -> ThinVec<T> {
         let len = d.read_usize();
         (0..len).map(|_| Decodable::decode(d)).collect()
@@ -612,16 +705,13 @@ where
 
 impl<E: Encoder, K, V, S> Encodable<E> for HashMap<K, V, S>
 where
-    K: Encodable<E> + Eq,
+    E: Sized,
+    K: Encodable<E> + Eq + for<'a> ContextOrd<&'a E>,
     V: Encodable<E>,
     S: BuildHasher,
 {
     fn encode(&self, e: &mut E) {
-        e.emit_usize(self.len());
-        for (key, val) in self {
-            key.encode(e);
-            val.encode(e);
-        }
+        e.encode_hash_map(self)
     }
 }
 
@@ -639,14 +729,11 @@ where
 
 impl<E: Encoder, T, S> Encodable<E> for HashSet<T, S>
 where
-    T: Encodable<E> + Eq,
+    T: Encodable<E> + for<'a> ContextOrd<&'a E>,
     S: BuildHasher,
 {
-    fn encode(&self, s: &mut E) {
-        s.emit_usize(self.len());
-        for e in self {
-            e.encode(s);
-        }
+    fn encode(&self, e: &mut E) {
+        e.encode_hash_set(self)
     }
 }
 
@@ -713,6 +800,7 @@ where
 }
 
 impl<E: Encoder, T: Encodable<E>> Encodable<E> for Rc<[T]> {
+    #[inline]
     fn encode(&self, s: &mut E) {
         let slice: &[T] = self;
         slice.encode(s);
@@ -720,13 +808,15 @@ impl<E: Encoder, T: Encodable<E>> Encodable<E> for Rc<[T]> {
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Rc<[T]> {
+    #[inline]
     fn decode(d: &mut D) -> Rc<[T]> {
-        let vec: Vec<T> = Decodable::decode(d);
-        vec.into()
+        let len = d.read_usize();
+        (0..len).map(|_| Decodable::decode(d)).collect()
     }
 }
 
 impl<E: Encoder, T: Encodable<E>> Encodable<E> for Arc<[T]> {
+    #[inline]
     fn encode(&self, s: &mut E) {
         let slice: &[T] = self;
         slice.encode(s);
@@ -734,9 +824,10 @@ impl<E: Encoder, T: Encodable<E>> Encodable<E> for Arc<[T]> {
 }
 
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Arc<[T]> {
+    #[inline]
     fn decode(d: &mut D) -> Arc<[T]> {
-        let vec: Vec<T> = Decodable::decode(d);
-        vec.into()
+        let len = d.read_usize();
+        (0..len).map(|_| Decodable::decode(d)).collect()
     }
 }
 
@@ -767,3 +858,26 @@ impl<D: Decoder> Decodable<D> for Hash128 {
         Self::new(u128::from_le_bytes(d.read_raw_bytes(16).try_into().unwrap()))
     }
 }
+
+pub trait ContextOrd<Ctx> {
+    /// The returned comparator must be stable.
+    /// E. g. compares `DefPathHash` instead of `DefIndex`
+    fn stable_cmp_with_context(_context: Ctx) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        unimplemented!();
+        #[allow(unused)]
+        |_i, _i2| unreachable!()
+    }
+}
+
+impl<Ctx> ContextOrd<Ctx> for String {
+    fn stable_cmp_with_context(_context: Ctx) -> impl FnMut(&Self, &Self) -> std::cmp::Ordering {
+        <Self as Ord>::cmp
+    }
+}
+
+// FIXME remove this. This is only here because CacheEncoder, which does not need to be
+// deterministic, encodes a HashMap<u32,V>. If a real implementation is ever needed, that use should
+// be switched to a new type instead of u32
+impl<Ctx> ContextOrd<Ctx> for u32 {}
+
+impl<Ctx> ContextOrd<Ctx> for i64 {}

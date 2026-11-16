@@ -87,6 +87,7 @@ fn recursive_u32_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "test::factorial".to_string(),
                         args: vec![Operand::Copy(Place::local(3))],
@@ -126,6 +127,7 @@ fn recursive_u32_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -203,6 +205,7 @@ fn recursive_same_arg_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "test::spin_same".to_string(),
                         args: vec![Operand::Copy(Place::local(1))],
@@ -223,6 +226,7 @@ fn recursive_same_arg_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -338,6 +342,7 @@ fn recursive_checked_sub_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         func: "test::rec_cs".to_string(),
                         args: vec![Operand::Move(Place::local(4))],
@@ -358,6 +363,7 @@ fn recursive_checked_sub_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -465,6 +471,7 @@ fn countdown_loop_u32_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -597,6 +604,7 @@ fn countdown_loop_checked_sub_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -776,6 +784,7 @@ fn countdown_loop_checked_sub_preheader_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

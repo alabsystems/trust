@@ -479,7 +479,9 @@ fn constant_matches_type(value: &ConstValue, expected: &Ty) -> bool {
             Ty::Adt { .. } => is_canonical_unit_marker_ty(expected),
             _ => false,
         },
-        ConstValue::OpaqueScalar { width, signed } => int_like(expected) == Some((*width, *signed)),
+        ConstValue::OpaqueScalar { width, signed, .. } => {
+            int_like(expected) == Some((*width, *signed))
+        }
         ConstValue::ConstParam { width: 1, signed: false, .. } => matches!(expected, Ty::Bool),
         ConstValue::ConstParam { width, signed, .. } => {
             int_like(expected) == Some((*width, *signed))
@@ -493,12 +495,12 @@ fn constant_matches_type(value: &ConstValue, expected: &Ty) -> bool {
         // The element type is erased, but the schema retains that this is an
         // immutable aggregate reference. Context may establish that much and no
         // scalar claim; the downstream value remains unconstrained.
-        ConstValue::OpaqueConst => opaque_reference_constant_matches_type(expected),
-        ConstValue::UnitVariantRef { enum_name, variant } => {
+        ConstValue::OpaqueConst(_) => opaque_reference_constant_matches_type(expected),
+        ConstValue::UnitVariantRef { enum_name, variant, .. } => {
             unit_variant_reference_matches_type(enum_name, *variant, expected)
         }
         // Trust: EFHT-P — the struct sibling of the arm above.
-        ConstValue::StructScalarFieldsRef { adt_name, fields } => {
+        ConstValue::StructScalarFieldsRef { adt_name, fields, .. } => {
             struct_scalar_fields_reference_matches_type(adt_name, fields, expected)
         }
         _ => false,
@@ -531,7 +533,7 @@ fn operand_known_type(body: &VerifiableBody, operand: &Operand) -> Option<Ty> {
         Operand::Constant(ConstValue::FloatBits { width, .. }) => Some(Ty::Float { width: *width }),
         Operand::Constant(ConstValue::Unit) => Some(Ty::Unit),
         Operand::Constant(ConstValue::ConstParam { width: 1, signed: false, .. }) => Some(Ty::Bool),
-        Operand::Constant(ConstValue::OpaqueScalar { width, signed })
+        Operand::Constant(ConstValue::OpaqueScalar { width, signed, .. })
         | Operand::Constant(ConstValue::ConstParam { width, signed, .. }) => {
             Some(Ty::Int { width: *width, signed: *signed })
         }
@@ -1209,10 +1211,7 @@ pub(crate) fn first_assignment_mismatch_kind(body: &VerifiableBody) -> Option<&'
         };
         // Find the operand the aggregate check would reject, and say what it is.
         let fields: Vec<Ty> = match (kind, &expected) {
-            (
-                AggregateKind::Adt { variant, .. },
-                Ty::Adt { fields, variants, .. },
-            ) => {
+            (AggregateKind::Adt { variant, .. }, Ty::Adt { fields, variants, .. }) => {
                 if let Some(v) = variants.get(usize::try_from(*variant).unwrap_or(usize::MAX)) {
                     v.fields.iter().map(|(_, t)| t.clone()).collect()
                 } else {
@@ -1241,7 +1240,7 @@ pub(crate) fn first_assignment_mismatch_kind(body: &VerifiableBody) -> Option<&'
                         ConstValue::Unit => "Unit",
                         ConstValue::Float(_) | ConstValue::FloatBits { .. } => "Float",
                         ConstValue::Str { .. } => "Str",
-                        ConstValue::OpaqueConst => "OpaqueConst",
+                        ConstValue::OpaqueConst(_) => "OpaqueConst",
                         _ => "other-const",
                     };
                     let fk = match want {
@@ -1259,7 +1258,9 @@ pub(crate) fn first_assignment_mismatch_kind(body: &VerifiableBody) -> Option<&'
                         ("OpaqueConst", "Adt") => "CONST(OpaqueConst) vs field Adt",
                         ("Str", "Adt") => "CONST(Str) vs field Adt",
                         ("other-const", "Adt") => "CONST(other) vs field Adt",
-                        ("OpaqueConst" | "Str" | "other-const", _) => "CONST(non-scalar) vs a non-Adt field",
+                        ("OpaqueConst" | "Str" | "other-const", _) => {
+                            "CONST(non-scalar) vs a non-Adt field"
+                        }
                         ("Unit", "Adt") => "CONST(Unit) vs field Adt",
                         ("Int" | "Uint", "Adt") => "CONST(Int) vs field Adt",
                         ("Int" | "Uint", "Int") => "CONST(Int) vs field Int (width/sign)",
@@ -1461,16 +1462,26 @@ mod tests {
             adt_kind: None,
             layout: None,
             name: "demo::Legacy".into(),
-            fields: vec![("__v0_0".into(), i32_ty.clone())],
-            variants: vec![variant.clone()],
+            fields: vec![("__v0_0".into(), i32_ty.clone())].into(),
+            variants: vec![variant.clone()].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let first_class = Ty::Adt { adt_kind: None, layout: None,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let first_class = Ty::Adt {
+            adt_kind: None,
+            layout: None,
             name: "demo::FirstClass".into(),
-            fields: vec![("0".into(), i32_ty.clone())],
-            variants: vec![variant],
+            fields: vec![("0".into(), i32_ty.clone())].into(),
+            variants: vec![variant].into(),
             disc_index_safe: true,
-            faithful_enum_repr: Some(None), enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: Some(None),
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let datatype = Ty::Datatype {
             name: "demo::Record".into(),
             variants: vec![("mk".into(), vec![("value".into(), i32_ty.clone())])],
@@ -1490,10 +1501,15 @@ mod tests {
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
                 ("__v1_0".into(), Ty::Bool),
-            ],
-            variants: vec![],
+            ]
+            .into(),
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let body = body(vec![legacy_option]);
         assert!(assignment_types_match(
             &body,
@@ -1544,17 +1560,24 @@ mod tests {
             layout: None,
             name: "demo::OptionPair".into(),
             fields,
-            variants: vec![],
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let valid = legacy(vec![
-            tag(),
-            ("__v1_0".into(), Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 32, signed: false }])),
-        ]);
-        let tag_only = legacy(vec![tag()]);
-        let missing_zero = legacy(vec![tag(), ("__v1_1".into(), Ty::Bool)]);
-        let named_payload = legacy(vec![tag(), ("__v1_value".into(), Ty::Bool)]);
-        let tag_after_payload = legacy(vec![("__v1_0".into(), Ty::Bool), tag()]);
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let valid = legacy(
+            vec![
+                tag(),
+                ("__v1_0".into(), Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 32, signed: false }])),
+            ]
+            .into(),
+        );
+        let tag_only = legacy(vec![tag()].into());
+        let missing_zero = legacy(vec![tag(), ("__v1_1".into(), Ty::Bool)].into());
+        let named_payload = legacy(vec![tag(), ("__v1_value".into(), Ty::Bool)].into());
+        let tag_after_payload = legacy(vec![("__v1_0".into(), Ty::Bool), tag()].into());
         let body = body(vec![valid, tag_only, missing_zero, named_payload, tag_after_payload]);
         let payload = |local| Place {
             local,
@@ -1601,9 +1624,13 @@ mod tests {
             layout: None,
             name: name.into(),
             fields,
-            variants: vec![],
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let exact_tag = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class_error = Ty::adt_enum(
             "Error",
@@ -1617,16 +1644,20 @@ mod tests {
         );
         let body = body(vec![
             first_class_error,
-            legacy("Error", exact_tag()),
-            legacy("cmp::Ordering", exact_tag()),
-            legacy("demo::Error", exact_tag()),
-            legacy("cmp::Ordering", vec![("__tag".into(), Ty::Int { width: 32, signed: true })]),
+            legacy("Error", exact_tag().into()),
+            legacy("cmp::Ordering", exact_tag().into()),
+            legacy("demo::Error", exact_tag().into()),
+            legacy(
+                "cmp::Ordering",
+                vec![("__tag".into(), Ty::Int { width: 32, signed: true })].into(),
+            ),
             legacy(
                 "Error",
                 vec![
                     ("__tag".into(), Ty::Int { width: 64, signed: true }),
                     ("extra".into(), Ty::Unit),
-                ],
+                ]
+                .into(),
             ),
         ]);
         let aggregate = |name: &str, variant, active_field, operands| {
@@ -1737,36 +1768,55 @@ mod tests {
             layout: None,
             name: "demo::LegacyEither".into(),
             fields,
-            variants: vec![],
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let valid = legacy(vec![
-            ("__tag".into(), discr_ty.clone()),
-            ("__v0_0".into(), Ty::Unit),
-            ("__v1_0".into(), Ty::Bool),
-        ]);
-        let tag_only = legacy(vec![("__tag".into(), discr_ty.clone())]);
-        let wrong_tag_type = legacy(vec![("__tag".into(), Ty::Bool), ("__v0_0".into(), Ty::Unit)]);
-        let missing_tag = legacy(vec![("__v0_0".into(), discr_ty.clone())]);
-        let duplicate_tag = legacy(vec![
-            ("__tag".into(), discr_ty.clone()),
-            ("__tag".into(), discr_ty.clone()),
-            ("__v0_0".into(), Ty::Unit),
-        ]);
-        let malformed_payload =
-            legacy(vec![("__tag".into(), discr_ty.clone()), ("__vnot-a-variant".into(), Ty::Unit)]);
-        let named_payload =
-            legacy(vec![("__tag".into(), discr_ty.clone()), ("__v0_payload".into(), Ty::Unit)]);
-        let arbitrary_extra_field = legacy(vec![
-            ("__tag".into(), discr_ty.clone()),
-            ("__v0_0".into(), Ty::Unit),
-            ("ordinary_field".into(), Ty::Bool),
-        ]);
-        let duplicate_payload = legacy(vec![
-            ("__tag".into(), discr_ty.clone()),
-            ("__v0_0".into(), Ty::Unit),
-            ("__v0_0".into(), Ty::Bool),
-        ]);
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let valid = legacy(
+            vec![
+                ("__tag".into(), discr_ty.clone()),
+                ("__v0_0".into(), Ty::Unit),
+                ("__v1_0".into(), Ty::Bool),
+            ]
+            .into(),
+        );
+        let tag_only = legacy(vec![("__tag".into(), discr_ty.clone())].into());
+        let wrong_tag_type =
+            legacy(vec![("__tag".into(), Ty::Bool), ("__v0_0".into(), Ty::Unit)].into());
+        let missing_tag = legacy(vec![("__v0_0".into(), discr_ty.clone())].into());
+        let duplicate_tag = legacy(
+            vec![
+                ("__tag".into(), discr_ty.clone()),
+                ("__tag".into(), discr_ty.clone()),
+                ("__v0_0".into(), Ty::Unit),
+            ]
+            .into(),
+        );
+        let malformed_payload = legacy(
+            vec![("__tag".into(), discr_ty.clone()), ("__vnot-a-variant".into(), Ty::Unit)].into(),
+        );
+        let named_payload = legacy(
+            vec![("__tag".into(), discr_ty.clone()), ("__v0_payload".into(), Ty::Unit)].into(),
+        );
+        let arbitrary_extra_field = legacy(
+            vec![
+                ("__tag".into(), discr_ty.clone()),
+                ("__v0_0".into(), Ty::Unit),
+                ("ordinary_field".into(), Ty::Bool),
+            ]
+            .into(),
+        );
+        let duplicate_payload = legacy(
+            vec![
+                ("__tag".into(), discr_ty.clone()),
+                ("__v0_0".into(), Ty::Unit),
+                ("__v0_0".into(), Ty::Bool),
+            ]
+            .into(),
+        );
         let body = body(vec![
             discr_ty,
             valid,
@@ -1798,9 +1848,13 @@ mod tests {
             layout: None,
             name: name.into(),
             fields,
-            variants: vec![],
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let exact_fields = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class = Ty::adt_enum(
             "cmp::Ordering",
@@ -1813,19 +1867,26 @@ mod tests {
         let body = body(vec![
             i8_ty.clone(),
             first_class,
-            ordering("cmp::Ordering", exact_fields()),
-            ordering("user::cmp::Ordering", exact_fields()),
-            ordering("cmp::Ordering", vec![("__tag".into(), Ty::Int { width: 32, signed: true })]),
-            ordering("cmp::Ordering", vec![("__tag".into(), Ty::Int { width: 64, signed: false })]),
+            ordering("cmp::Ordering", exact_fields().into()),
+            ordering("user::cmp::Ordering", exact_fields().into()),
+            ordering(
+                "cmp::Ordering",
+                vec![("__tag".into(), Ty::Int { width: 32, signed: true })].into(),
+            ),
+            ordering(
+                "cmp::Ordering",
+                vec![("__tag".into(), Ty::Int { width: 64, signed: false })].into(),
+            ),
             ordering(
                 "cmp::Ordering",
                 vec![
                     ("__tag".into(), Ty::Int { width: 64, signed: true }),
                     ("extra".into(), Ty::Unit),
-                ],
+                ]
+                .into(),
             ),
             Ty::Int { width: 16, signed: true },
-            ordering("cmp::Ordering", exact_fields()),
+            ordering("cmp::Ordering", exact_fields().into()),
         ]);
         let discriminant_of = |local| Rvalue::Discriminant(Place::local(local));
         let compare_i8 = || {
@@ -1967,10 +2028,14 @@ mod tests {
             adt_kind: None,
             layout: None,
             name: "user::Ordering".into(),
-            fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
-            variants: vec![],
+            fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })].into(),
+            variants: vec![].into(),
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         let closure = Ty::Closure { name: "demo::call".into(), upvars: vec![], call: None };
         let body = body(vec![
             Ty::Bool,
@@ -2112,7 +2177,9 @@ mod tests {
         // today: the flattened `__tag` / `__v{v}_{f}` view plus first-class
         // variants. Shape taken from the shipped
         // `fixtures/structural-fold-corpus/xor_all.json`, `locals[1].ty`.
-        let tree_definition = Ty::Adt { arbitrary_precision: None, 
+        let tree_definition = Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name: "Tree".into(),
             fields: vec![
                 ("__tag".into(), i64_ty()),
@@ -2120,12 +2187,14 @@ mod tests {
                 ("__v1_0".into(), arc()),
                 ("__v2_0".into(), arc()),
                 ("__v2_1".into(), arc()),
-            ],
+            ]
+            .into(),
             variants: vec![
                 variant("Leaf", 0, vec![("0".into(), i64_ty())]),
                 variant("One", 1, vec![("0".into(), arc())]),
                 variant("Two", 2, vec![("0".into(), arc()), ("1".into(), arc())]),
-            ],
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr: None,
             layout: None,
@@ -2271,7 +2340,9 @@ mod tests {
             Ty::Datatype { name: "Tree".into(), variants: tree_variants.clone() };
         // The `lower_enum_adt` spelling of the SAME type, taken from the shipped
         // `fixtures/structural-fold-corpus/xor_all.json` `locals[1].ty`.
-        let tree_adt_def = Ty::Adt { arbitrary_precision: None, 
+        let tree_adt_def = Ty::Adt {
+            arbitrary_precision: None,
+            validity_wrapper: None,
             name: "Tree".into(),
             fields: vec![
                 ("__tag".into(), i64_ty()),
@@ -2279,7 +2350,8 @@ mod tests {
                 ("__v1_0".into(), arc()),
                 ("__v2_0".into(), arc()),
                 ("__v2_1".into(), arc()),
-            ],
+            ]
+            .into(),
             variants: vec![
                 VariantDef {
                     name: "Leaf".into(),
@@ -2296,7 +2368,8 @@ mod tests {
                     discriminant: 2,
                     fields: vec![("0".into(), arc()), ("1".into(), arc())],
                 },
-            ],
+            ]
+            .into(),
             disc_index_safe: true,
             faithful_enum_repr: None,
             layout: None,
@@ -2441,7 +2514,9 @@ mod tests {
             Ty::Adt { name: n, .. } if n == name => {
                 Ty::Datatype { name: name.to_string(), variants: vec![] }
             }
-            Ty::Adt { arbitrary_precision: _, 
+            Ty::Adt {
+                arbitrary_precision: _,
+                validity_wrapper: _,
                 name: n,
                 fields,
                 variants,
@@ -2450,7 +2525,9 @@ mod tests {
                 layout,
                 enum_layout,
                 adt_kind,
-            } => Ty::Adt { arbitrary_precision: None, 
+            } => Ty::Adt {
+                arbitrary_precision: None,
+                validity_wrapper: None,
                 name: n.clone(),
                 fields: fields.iter().map(|(f, t)| (f.clone(), go(t))).collect(),
                 variants: variants

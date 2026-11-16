@@ -1,6 +1,7 @@
 //! Tests for directory sources.
 
-use std::collections::HashMap;
+use targo::util::data_structures::HashMap;
+
 use std::fs;
 use std::str;
 
@@ -45,7 +46,7 @@ impl VendorPackage {
             p: Some(project().at(&format!("index/{}", name))),
             cksum: Checksum {
                 package: Some(String::new()),
-                files: HashMap::new(),
+                files: HashMap::default(),
             },
         }
     }
@@ -107,7 +108,7 @@ fn simple() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -147,8 +148,29 @@ fn simple_install() {
     cargo_process("install bar")
         .with_stderr_data(str![[r#"
 [INSTALLING] bar v0.1.0
-[LOCKING] 1 package to latest compatible version
 [COMPILING] foo v0.0.1
+[COMPILING] bar v0.1.0
+[FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
+[INSTALLING] [..]bar[..]
+[INSTALLED] package `bar v0.1.0` (executable `bar[EXE]`)
+[WARNING] be sure to add `[ROOT]/home/.cargo/bin` to your PATH to be able to run the installed binaries
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn install_without_dependencies() {
+    setup();
+
+    VendorPackage::new("bar")
+        .file("Cargo.toml", &basic_manifest("bar", "0.1.0"))
+        .file("src/main.rs", "pub fn main() {}")
+        .build();
+
+    cargo_process("install bar")
+        .with_stderr_data(str![[r#"
+[INSTALLING] bar v0.1.0
 [COMPILING] bar v0.1.0
 [FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
 [INSTALLING] [..]bar[..]
@@ -240,7 +262,6 @@ fn install_without_feature_dep() {
     cargo_process("install bar")
         .with_stderr_data(str![[r#"
 [INSTALLING] bar v0.1.0
-[LOCKING] 1 package to latest compatible version
 [COMPILING] foo v0.0.1
 [COMPILING] bar v0.1.0
 [FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
@@ -327,7 +348,7 @@ fn multiple() {
 
     p.cargo("check")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ADDING] bar v0.1.0 (available: v0.2.0)
 [CHECKING] bar v0.1.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
@@ -366,7 +387,7 @@ fn crates_io_then_directory() {
     p.cargo("check")
         .with_stderr_data(str![[r#"
 [UPDATING] `dummy-registry` index
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [DOWNLOADING] crates ...
 [DOWNLOADED] bar v0.1.0 (registry `dummy-registry`)
 [CHECKING] bar v0.1.0
@@ -475,7 +496,7 @@ fn bad_file_checksum() {
     p.cargo("check")
         .with_status(101)
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [ERROR] the listed checksum of `[ROOT]/index/bar/src/lib.rs` has changed:
 expected: [..]
 actual:   [..]
@@ -579,6 +600,9 @@ fn git_lock_file_doesnt_change() {
 
                     [dependencies]
                     git = {{ git = '{0}' }}
+
+                    [lints.cargo]
+                    default = "allow"
                 "#,
                 git.url()
             ),
@@ -695,6 +719,9 @@ fn workspace_different_locations() {
 
                 [dependencies]
                 baz = "*"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("foo/src/lib.rs", "")
@@ -711,6 +738,9 @@ fn workspace_different_locations() {
 
                 [dependencies]
                 baz = "*"
+
+                [lints.cargo]
+                default = "allow"
             "#,
         )
         .file("bar/src/lib.rs", "")
@@ -733,7 +763,7 @@ fn workspace_different_locations() {
     p.cargo("check")
         .cwd("bar")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [CHECKING] bar v0.1.0 ([ROOT]/foo/bar)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 

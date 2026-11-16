@@ -159,6 +159,11 @@ const MAX_WITNESS_ASSIGNMENTS: usize = 4096;
 /// fact is then a conjunct of the assembled VC, so every model the search finds
 /// already satisfies it and [`only_excluded_counterexamples`] declines.
 pub(super) fn dropped_requires_clauses(func: &VerifiableFunction) -> Vec<Formula> {
+    if func.spec.requires.is_empty()
+        && !func.contracts.iter().any(|contract| matches!(contract.kind, ContractKind::Requires))
+    {
+        return Vec::new();
+    }
     let mut authored: Vec<Formula> = Vec::new();
     let mut push_parsed = |text: &str| {
         let body = text.strip_prefix(contracts::LOWERED_CONTRACT_PREFIX).unwrap_or(text);
@@ -186,8 +191,11 @@ pub(super) fn dropped_requires_clauses(func: &VerifiableFunction) -> Vec<Formula
     if authored.iter().any(carried) {
         return Vec::new();
     }
-    let mut seen: FxHashSet<String> = FxHashSet::default();
-    authored.retain(|clause| seen.insert(format!("{clause:?}")));
+    if authored.len() > 1 {
+        let mut seen: FxHashSet<Formula> =
+            FxHashSet::with_capacity_and_hasher(authored.len(), Default::default());
+        authored.retain(|clause| seen.insert(clause.clone()));
+    }
     authored
 }
 
@@ -232,16 +240,22 @@ pub(super) fn only_excluded_counterexamples(
     let dropped: &[Formula] = restated.as_deref().unwrap_or(dropped);
 
     // Relevance: the dropped hypothesis must speak about a name this row reads.
-    let vc_vars = vc.free_variables();
-    if !dropped.iter().any(|clause| clause.free_variables().iter().any(|v| vc_vars.contains(v))) {
+    let mut vc_vars: FxHashSet<&str> = FxHashSet::default();
+    trust_types::for_each_free_variable_name(vc, &mut |name| {
+        vc_vars.insert(name);
+    });
+    if !dropped
+        .iter()
+        .any(|clause| trust_types::any_free_variable_name(clause, &mut |v| vc_vars.contains(v)))
+    {
         return false;
     }
 
     let Some(sorts) = fragment_var_sorts(vc, dropped) else {
         return false;
     };
-    let mut names: Vec<&String> = sorts.keys().collect();
-    names.sort();
+    let mut names: Vec<&str> = sorts.keys().copied().collect();
+    names.sort_unstable();
     if names.len() > MAX_WITNESS_VARS {
         return false;
     }
@@ -269,13 +283,12 @@ pub(super) fn only_excluded_counterexamples(
 
     let mut found_excluded_counterexample = false;
     let mut indices = vec![0usize; names.len()];
+    let mut env: FxHashMap<&str, Value> = names
+        .iter()
+        .enumerate()
+        .map(|(position, &name)| (name, domains[position][0]))
+        .collect();
     loop {
-        let env: FxHashMap<&str, Value> = names
-            .iter()
-            .zip(indices.iter())
-            .enumerate()
-            .map(|(position, (name, &index))| (name.as_str(), domains[position][index]))
-            .collect();
         if eval_bool(vc, &env) == Some(true) {
             // A model of the row: the row is REFUTABLE, so it is not a proof we
             // could be discarding. Whether the refutation is honest is decided
@@ -320,9 +333,11 @@ pub(super) fn only_excluded_counterexamples(
             }
             indices[position] += 1;
             if indices[position] < domains[position].len() {
+                env.insert(names[position], domains[position][indices[position]]);
                 break;
             }
             indices[position] = 0;
+            env.insert(names[position], domains[position][0]);
             position += 1;
         }
     }
@@ -379,7 +394,11 @@ pub(super) fn forced_parameter_alias(
     // that position alone.
     let mut parameters: Vec<(&str, &Ty)> = Vec::with_capacity(body.arg_count);
     for index in 1..=body.arg_count {
-        let decl = body.locals.iter().find(|local| local.index == index)?;
+        let decl = body
+            .locals
+            .get(index)
+            .filter(|local| local.index == index)
+            .or_else(|| body.locals.iter().find(|local| local.index == index))?;
         let name = decl.name.as_deref()?;
         if !plain_source_binding(name) {
             return None;
@@ -393,16 +412,31 @@ pub(super) fn forced_parameter_alias(
     let body_names: FxHashSet<&str> =
         body.locals.iter().filter_map(|local| local.name.as_deref()).collect();
 
-    let mut clause_vars: FxHashSet<String> = FxHashSet::default();
+    let mut clause_vars: FxHashSet<&str> = FxHashSet::default();
     for clause in dropped {
-        if formula_binds_a_variable(clause) {
+        // `Formula::rename_var` is a syntactic rename with no binder awareness, so a
+        // quantified clause (`Forall` / `Exists`) is refused outright rather than risking
+        // capture. (Such clauses are outside the gate's assumable fragment anyway, and
+        // `eval` answers `None` on them, so this costs no reach.) Combine the binder
+        // rejection and free-variable collection into a single `all_formula_nodes` walk.
+        if !trust_types::all_formula_nodes(clause, &mut |node| match node {
+            Formula::Forall(..) | Formula::Exists(..) => false,
+            Formula::Var(name, _) => {
+                clause_vars.insert(name.as_str());
+                true
+            }
+            Formula::SymVar(symbol, _) => {
+                clause_vars.insert(symbol.as_str());
+                true
+            }
+            _ => true,
+        }) {
             return None;
         }
-        clause_vars.extend(clause.free_variables());
     }
 
     // Exactly one clause spelling the body namespace cannot bind.
-    let mut unresolved = clause_vars.iter().filter(|name| !body_names.contains(name.as_str()));
+    let mut unresolved = clause_vars.iter().copied().filter(|name| !body_names.contains(*name));
     let source = unresolved.next()?;
     if unresolved.next().is_some() {
         return None;
@@ -429,7 +463,7 @@ pub(super) fn forced_parameter_alias(
         return None;
     }
 
-    Some((source.clone(), body_spelling.to_string()))
+    Some((source.to_string(), body_spelling.to_string()))
 }
 
 /// A plain source binding spelling: identifier characters only. Rejects every
@@ -442,41 +476,30 @@ fn plain_source_binding(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Whether any node of `formula` binds a variable. `Formula::rename_var` is a
-/// syntactic rename with no binder awareness, so a quantified clause is refused
-/// outright rather than risking capture. (Such clauses are outside the gate's
-/// assumable fragment anyway, and `eval` answers `None` on them, so this costs
-/// no reach.)
-fn formula_binds_a_variable(formula: &Formula) -> bool {
-    let mut found = false;
-    formula.visit(&mut |node| {
-        if matches!(node, Formula::Forall(..) | Formula::Exists(..)) {
-            found = true;
-        }
-    });
-    found
-}
-
 /// The single sort `name` carries across `formulas`, or `None` when it carries
 /// none or more than one — an ambiguity this module refuses to resolve.
 fn sole_var_sort(formulas: &[Formula], name: &str) -> Option<Sort> {
     let mut sort: Option<Sort> = None;
-    let mut ambiguous = false;
     for formula in formulas {
-        formula.visit(&mut |node| {
+        if !trust_types::all_formula_nodes(formula, &mut |node| {
             let found = match node {
                 Formula::Var(var, var_sort) if var == name => var_sort,
                 Formula::SymVar(symbol, var_sort) if symbol.as_str() == name => var_sort,
-                _ => return,
+                _ => return true,
             };
             match &sort {
-                Some(existing) if existing != found => ambiguous = true,
-                Some(_) => {}
-                None => sort = Some(found.clone()),
+                Some(existing) if existing != found => false,
+                Some(_) => true,
+                None => {
+                    sort = Some(found.clone());
+                    true
+                }
             }
-        });
+        }) {
+            return None;
+        }
     }
-    if ambiguous { None } else { sort }
+    sort
 }
 
 /// Whether a parameter of type `ty` can be what a clause variable of sort `sort`
@@ -503,34 +526,40 @@ enum Value {
 /// variable is outside the fragment (`BitVec`, `Float`, `Array`, datatype, …) or
 /// carries two different sorts across the formulas — an ambiguity this module
 /// refuses to resolve by guessing.
-fn fragment_var_sorts(vc: &Formula, dropped: &[Formula]) -> Option<FxHashMap<String, Sort>> {
-    let mut sorts: FxHashMap<String, Sort> = FxHashMap::default();
-    let mut ok = true;
-    let mut collect = |formula: &Formula| {
-        formula.visit(&mut |node| {
+fn fragment_var_sorts<'a>(
+    vc: &'a Formula,
+    dropped: &'a [Formula],
+) -> Option<FxHashMap<&'a str, &'a Sort>> {
+    let mut sorts: FxHashMap<&'a str, &'a Sort> = FxHashMap::default();
+    let mut collect = |formula: &'a Formula| -> bool {
+        trust_types::all_formula_nodes(formula, &mut |node| {
             let (name, sort) = match node {
-                Formula::Var(name, sort) => (name.clone(), sort),
-                Formula::SymVar(symbol, sort) => (symbol.as_str().to_string(), sort),
-                _ => return,
+                Formula::Var(name, sort) => (name.as_str(), sort),
+                Formula::SymVar(symbol, sort) => (symbol.as_str(), sort),
+                _ => return true,
             };
             if !matches!(sort, Sort::Int | Sort::Bool) {
-                ok = false;
-                return;
+                return false;
             }
-            match sorts.get(&name) {
-                Some(existing) if existing != sort => ok = false,
-                Some(_) => {}
+            match sorts.get(name) {
+                Some(&existing) if existing != sort => false,
+                Some(_) => true,
                 None => {
-                    sorts.insert(name, sort.clone());
+                    sorts.insert(name, sort);
+                    true
                 }
             }
-        });
+        })
     };
-    collect(vc);
-    for clause in dropped {
-        collect(clause);
+    if !collect(vc) {
+        return None;
     }
-    ok.then_some(sorts)
+    for clause in dropped {
+        if !collect(clause) {
+            return None;
+        }
+    }
+    Some(sorts)
 }
 
 /// The integer candidate grid: every integer literal appearing in the formulas,
@@ -539,30 +568,35 @@ fn fragment_var_sorts(vc: &Formula, dropped: &[Formula]) -> Option<FxHashMap<Str
 /// the very value a genuine counterexample needs, which would turn an honest
 /// refutation into a fail-closed row.
 fn candidate_ints(vc: &Formula, dropped: &[Formula]) -> Option<Vec<i128>> {
-    let mut literals: Vec<i128> = vec![-1, 0, 1];
-    let mut ok = true;
-    let mut collect = |formula: &Formula| {
-        formula.visit(&mut |node| match node {
-            Formula::Int(value) => literals.push(*value),
-            Formula::UInt(value) => match i128::try_from(*value) {
-                Ok(value) => literals.push(value),
-                Err(_) => ok = false,
-            },
-            _ => {}
-        });
-    };
-    collect(vc);
-    for clause in dropped {
-        collect(clause);
-    }
-    if !ok {
-        return None;
-    }
-    let mut grid: Vec<i128> = Vec::with_capacity(literals.len() * 3);
-    for value in literals {
+    let mut grid: Vec<i128> = vec![-2, -1, 0, 1, 2];
+    let mut push_with_neighbours = |value: i128| {
         grid.push(value);
         grid.extend(value.checked_add(1));
         grid.extend(value.checked_sub(1));
+    };
+    let mut collect = |formula: &Formula| -> bool {
+        trust_types::all_formula_nodes(formula, &mut |node| match node {
+            Formula::Int(value) => {
+                push_with_neighbours(*value);
+                true
+            }
+            Formula::UInt(value) => match i128::try_from(*value) {
+                Ok(value) => {
+                    push_with_neighbours(value);
+                    true
+                }
+                Err(_) => false,
+            },
+            _ => true,
+        })
+    };
+    if !collect(vc) {
+        return None;
+    }
+    for clause in dropped {
+        if !collect(clause) {
+            return None;
+        }
     }
     grid.sort_unstable();
     grid.dedup();

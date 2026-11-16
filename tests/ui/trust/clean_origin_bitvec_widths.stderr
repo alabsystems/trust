@@ -1,0 +1,103 @@
+error[E0425]: cannot find function `bv8` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_widths.rs:82:23
+   |
+LL |     let _ = crate::m::bv8(1u8);
+   |                       ^^^ not found in `crate::m`
+   |
+note: `bv8` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_widths.rs:73:9
+   |
+LL |         def bv8  (x : BitVec 8)  : BitVec 8  := x
+   |         ^^^
+   = note: `bv8` is kernel-checked and argument 0 carries TOTALLY and exactly (`BitVec 8` -> `u8`), but this compiler cannot make `bv8` CALLABLE from Rust, because it has no way to re-earn the emitted body's agreement with the declaration at `BitVec 8`.
+           Why, precisely: the faithfulness gate reflects the EMITTED MIR back into Clean using only the emitted body's own local types — deliberately, so that an emitter which typed a local wrongly is caught — and the Clean domain it reads off `u8` is `UInt8`, never `BitVec 8`. `UInt8` and `BitVec 8` are DIFFERENT Clean types (`UInt8` is a structure whose one field is a `BitVec 8`), so the reflected term is not definitionally equal to the declaration and the gate refuses. Refusing HERE turns that into a diagnostic at the call site with options, instead of a fail-closed correctness refusal at code generation.
+           This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong is emitted, and `BitVec 8` still carries everywhere a carrier is only READ — contract clauses, citations, and the declared-carrier lane.
+           options:
+           - restate `bv8` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the SAME Rust carrier at the same width and is emittable today, and keep the `BitVec 8` version alongside for proof position if the bit-level spelling is what the proof wants;
+           - cite `bv8` from `requires`/`ensures` instead of calling it — proof position needs no emitted body and no reflection;
+           - write the computation as a Rust `fn` and prove it agrees with `bv8` in an `ensures` clause, which is the same guarantee reached from the other side;
+           - or extend the compiler: side B needs a reflection domain whose Clean type is `BitVec 8` at the Rust carrier `u8`, AND a way to SELECT it that does not read the declaration. Unsigned `BitVec`-typed domains already exist in `trust_spec_elab` (`Domain::U128` at `u128`, `Domain::USize` at `usize`), so the missing half is not signedness: it is that `ty_to_domain` maps the emitted local's Rust type ALONE — deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so nothing may tell it that this `u8` stands for `BitVec 8` rather than `UInt8`. That is an owner decision with four costed options, written up in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a widening someone should just write.
+
+error[E0425]: cannot find function `bv16` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_widths.rs:85:23
+   |
+LL |     let _ = crate::m::bv16(1u16);
+   |                       ^^^^ not found in `crate::m`
+   |
+note: `bv16` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_widths.rs:74:9
+   |
+LL |         def bv16 (x : BitVec 16) : BitVec 16 := x
+   |         ^^^
+   = note: `bv16` is kernel-checked and argument 0 carries TOTALLY and exactly (`BitVec 16` -> `u16`), but this compiler cannot make `bv16` CALLABLE from Rust, because it has no way to re-earn the emitted body's agreement with the declaration at `BitVec 16`.
+           Why, precisely: the faithfulness gate reflects the EMITTED MIR back into Clean using only the emitted body's own local types — deliberately, so that an emitter which typed a local wrongly is caught — and the Clean domain it reads off `u16` is `UInt16`, never `BitVec 16`. `UInt16` and `BitVec 16` are DIFFERENT Clean types (`UInt16` is a structure whose one field is a `BitVec 16`), so the reflected term is not definitionally equal to the declaration and the gate refuses. Refusing HERE turns that into a diagnostic at the call site with options, instead of a fail-closed correctness refusal at code generation.
+           This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong is emitted, and `BitVec 16` still carries everywhere a carrier is only READ — contract clauses, citations, and the declared-carrier lane.
+           options:
+           - restate `bv16` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the SAME Rust carrier at the same width and is emittable today, and keep the `BitVec 16` version alongside for proof position if the bit-level spelling is what the proof wants;
+           - cite `bv16` from `requires`/`ensures` instead of calling it — proof position needs no emitted body and no reflection;
+           - write the computation as a Rust `fn` and prove it agrees with `bv16` in an `ensures` clause, which is the same guarantee reached from the other side;
+           - or extend the compiler: side B needs a reflection domain whose Clean type is `BitVec 16` at the Rust carrier `u16`, AND a way to SELECT it that does not read the declaration. Unsigned `BitVec`-typed domains already exist in `trust_spec_elab` (`Domain::U128` at `u128`, `Domain::USize` at `usize`), so the missing half is not signedness: it is that `ty_to_domain` maps the emitted local's Rust type ALONE — deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so nothing may tell it that this `u16` stands for `BitVec 16` rather than `UInt16`. That is an owner decision with four costed options, written up in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a widening someone should just write.
+
+error[E0425]: cannot find function `bv32` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_widths.rs:88:23
+   |
+LL |     let _ = crate::m::bv32(1u32);
+   |                       ^^^^ not found in `crate::m`
+   |
+note: `bv32` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_widths.rs:75:9
+   |
+LL |         def bv32 (x : BitVec 32) : BitVec 32 := x
+   |         ^^^
+   = note: `bv32` is kernel-checked and argument 0 carries TOTALLY and exactly (`BitVec 32` -> `u32`), but this compiler cannot make `bv32` CALLABLE from Rust, because it has no way to re-earn the emitted body's agreement with the declaration at `BitVec 32`.
+           Why, precisely: the faithfulness gate reflects the EMITTED MIR back into Clean using only the emitted body's own local types — deliberately, so that an emitter which typed a local wrongly is caught — and the Clean domain it reads off `u32` is `UInt32`, never `BitVec 32`. `UInt32` and `BitVec 32` are DIFFERENT Clean types (`UInt32` is a structure whose one field is a `BitVec 32`), so the reflected term is not definitionally equal to the declaration and the gate refuses. Refusing HERE turns that into a diagnostic at the call site with options, instead of a fail-closed correctness refusal at code generation.
+           This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong is emitted, and `BitVec 32` still carries everywhere a carrier is only READ — contract clauses, citations, and the declared-carrier lane.
+           options:
+           - restate `bv32` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the SAME Rust carrier at the same width and is emittable today, and keep the `BitVec 32` version alongside for proof position if the bit-level spelling is what the proof wants;
+           - cite `bv32` from `requires`/`ensures` instead of calling it — proof position needs no emitted body and no reflection;
+           - write the computation as a Rust `fn` and prove it agrees with `bv32` in an `ensures` clause, which is the same guarantee reached from the other side;
+           - or extend the compiler: side B needs a reflection domain whose Clean type is `BitVec 32` at the Rust carrier `u32`, AND a way to SELECT it that does not read the declaration. Unsigned `BitVec`-typed domains already exist in `trust_spec_elab` (`Domain::U128` at `u128`, `Domain::USize` at `usize`), so the missing half is not signedness: it is that `ty_to_domain` maps the emitted local's Rust type ALONE — deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so nothing may tell it that this `u32` stands for `BitVec 32` rather than `UInt32`. That is an owner decision with four costed options, written up in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a widening someone should just write.
+
+error[E0425]: cannot find function `bv64` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_widths.rs:91:23
+   |
+LL |     let _ = crate::m::bv64(1u64);
+   |                       ^^^^ not found in `crate::m`
+   |
+note: `bv64` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_widths.rs:76:9
+   |
+LL |         def bv64 (x : BitVec 64) : BitVec 64 := x
+   |         ^^^
+   = note: `bv64` is kernel-checked and argument 0 carries TOTALLY and exactly (`BitVec 64` -> `u64`), but this compiler cannot make `bv64` CALLABLE from Rust, because it has no way to re-earn the emitted body's agreement with the declaration at `BitVec 64`.
+           Why, precisely: the faithfulness gate reflects the EMITTED MIR back into Clean using only the emitted body's own local types — deliberately, so that an emitter which typed a local wrongly is caught — and the Clean domain it reads off `u64` is `UInt64`, never `BitVec 64`. `UInt64` and `BitVec 64` are DIFFERENT Clean types (`UInt64` is a structure whose one field is a `BitVec 64`), so the reflected term is not definitionally equal to the declaration and the gate refuses. Refusing HERE turns that into a diagnostic at the call site with options, instead of a fail-closed correctness refusal at code generation.
+           This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong is emitted, and `BitVec 64` still carries everywhere a carrier is only READ — contract clauses, citations, and the declared-carrier lane.
+           options:
+           - restate `bv64` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the SAME Rust carrier at the same width and is emittable today, and keep the `BitVec 64` version alongside for proof position if the bit-level spelling is what the proof wants;
+           - cite `bv64` from `requires`/`ensures` instead of calling it — proof position needs no emitted body and no reflection;
+           - write the computation as a Rust `fn` and prove it agrees with `bv64` in an `ensures` clause, which is the same guarantee reached from the other side;
+           - or extend the compiler: side B needs a reflection domain whose Clean type is `BitVec 64` at the Rust carrier `u64`, AND a way to SELECT it that does not read the declaration. Unsigned `BitVec`-typed domains already exist in `trust_spec_elab` (`Domain::U128` at `u128`, `Domain::USize` at `usize`), so the missing half is not signedness: it is that `ty_to_domain` maps the emitted local's Rust type ALONE — deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so nothing may tell it that this `u64` stands for `BitVec 64` rather than `UInt64`. That is an owner decision with four costed options, written up in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a widening someone should just write.
+
+error[E0425]: cannot find function `bvmix` in module `crate::m`
+  --> $DIR/clean_origin_bitvec_widths.rs:94:23
+   |
+LL |     let _ = crate::m::bvmix(1u64, 2u8);
+   |                       ^^^^^ not found in `crate::m`
+   |
+note: `bvmix` is declared in this `clean { … }` island, but it did not become callable from Rust
+  --> $DIR/clean_origin_bitvec_widths.rs:77:9
+   |
+LL |         def bvmix (a : BitVec 64) (b : BitVec 8) : BitVec 8 := b
+   |         ^^^
+   = note: `bvmix` is kernel-checked and argument 0 carries TOTALLY and exactly (`BitVec 64` -> `u64`), but this compiler cannot make `bvmix` CALLABLE from Rust, because it has no way to re-earn the emitted body's agreement with the declaration at `BitVec 64`.
+           Why, precisely: the faithfulness gate reflects the EMITTED MIR back into Clean using only the emitted body's own local types — deliberately, so that an emitter which typed a local wrongly is caught — and the Clean domain it reads off `u64` is `UInt64`, never `BitVec 64`. `UInt64` and `BitVec 64` are DIFFERENT Clean types (`UInt64` is a structure whose one field is a `BitVec 64`), so the reflected term is not definitionally equal to the declaration and the gate refuses. Refusing HERE turns that into a diagnostic at the call site with options, instead of a fail-closed correctness refusal at code generation.
+           This is a measured boundary of the compiler, not a rule about what you may write (ruling v7/D2), and it is NOT a soundness problem: nothing wrong is emitted, and `BitVec 64` still carries everywhere a carrier is only READ — contract clauses, citations, and the declared-carrier lane.
+           options:
+           - restate `bvmix` at `UInt8`/`UInt16`/`UInt32`/`UInt64`, which has the SAME Rust carrier at the same width and is emittable today, and keep the `BitVec 64` version alongside for proof position if the bit-level spelling is what the proof wants;
+           - cite `bvmix` from `requires`/`ensures` instead of calling it — proof position needs no emitted body and no reflection;
+           - write the computation as a Rust `fn` and prove it agrees with `bvmix` in an `ensures` clause, which is the same guarantee reached from the other side;
+           - or extend the compiler: side B needs a reflection domain whose Clean type is `BitVec 64` at the Rust carrier `u64`, AND a way to SELECT it that does not read the declaration. Unsigned `BitVec`-typed domains already exist in `trust_spec_elab` (`Domain::U128` at `u128`, `Domain::USize` at `usize`), so the missing half is not signedness: it is that `ty_to_domain` maps the emitted local's Rust type ALONE — deliberately, and pinned by `h_i_the_reflector_never_sees_the_plan` — so nothing may tell it that this `u64` stands for `BitVec 64` rather than `UInt64`. That is an owner decision with four costed options, written up in `docs/design/2026-09-14-bitvec-return-direction.md`; it is not a widening someone should just write.
+
+error: aborting due to 5 previous errors
+
+For more information about this error, try `trustc --explain E0425`.

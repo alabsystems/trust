@@ -2,18 +2,33 @@
 //! helpers for the full verifier.
 
 mod bundle_evidence;
+mod checked_wp;
 mod index;
+mod public_claim;
+#[cfg(feature = "trust-build")]
+mod wp_replay;
 
 pub use bundle_evidence::{
-    DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
-    trust_wp_native_replay_metadata_entries_for_request,
+    DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt, FreshWholeFunctionChcPdrReceipt,
+    NativeSourceReferenceFacts, trust_wp_native_replay_metadata_entries_for_request,
 };
 pub(crate) use bundle_evidence::{
-    LiveVerificationDispatchSeal, is_native_trust_ir_engine, native_trust_ir_bundle_evidence,
+    LiveVerificationDispatchSeal, NativeLiveSource, is_native_trust_ir_engine,
+    is_native_trust_mc_trust_bmc_engine, native_trust_ir_bundle_evidence,
     native_trust_ir_bundle_evidence_is_incomplete,
 };
+#[cfg(feature = "trust-build")]
+pub use bundle_evidence::{
+    NativeSourceReferenceFactsError, NativeSourceReferenceLoadFact,
+    NativeSourceReferenceParameterFact, NativeSourceReferenceValueFact,
+};
+pub use checked_wp::CheckedNativeWpProof;
 pub(crate) use index::{
     NativeTrustIrEvidenceIndex, NativeTrustIrObligationIdentity, native_trust_ir_artifact_match,
+};
+pub(crate) use public_claim::validate_public_claim;
+pub use trust_ir::request::transport::{
+    NATIVE_BUNDLE_REPLAY_FORMULA_REF_ENCODING, rehydrate_native_bundle_transport_payload,
 };
 use trust_ir_bridge::NativeVerificationBundle;
 use trust_verifier_api::{EvidenceArtifact, TrustObligation};

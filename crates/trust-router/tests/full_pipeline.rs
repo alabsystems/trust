@@ -53,6 +53,7 @@ fn division_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -123,6 +124,7 @@ fn bounded_checked_mul_function() -> VerifiableFunction {
         ],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -151,6 +153,7 @@ fn recursive_countdown_function() -> VerifiableFunction {
                     terminator: Terminator::Call {
                         is_unsafe_sig: false,
                         callee_identity: None,
+                        callee_key: None,
                         is_foreign: false,
                         // E5 recursion rows require the compiler-owned exact
                         // definition identity; a bare same-name callee is not
@@ -174,6 +177,7 @@ fn recursive_countdown_function() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -380,7 +384,7 @@ fn mutation_control_dropping_precondition_flips_overflow_proof() {
 /// The strongest form of the falsification control: the real `ay` SMT solver
 /// must REFUTE the mutant with a concrete counterexample, not merely fail to
 /// prove it. Gated on the `ay-backend` feature because it drives the in-process
-/// solver. Run with: `cargo test -p trust-router --features ay-backend`.
+/// solver. Run with: `targo --unverified test -p trust-router --features ay-backend`.
 #[cfg(feature = "ay-backend")]
 #[test]
 fn mutation_control_ay_refutes_unbounded_overflow() {

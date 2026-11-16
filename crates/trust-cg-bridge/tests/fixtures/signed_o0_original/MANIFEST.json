@@ -1,0 +1,20 @@
+{
+  "scope": "Frozen non-authorizing source/model/object data from actual Trust b8 Rust Compiler lane at O0. Tests independently pin the observed bytes and preserve all eight functions; replay still checks exact current expected original equations and physical ABI. This JSON alone is not SourceExtraction authority.",
+  "compiler_source": "b8f24f1b5b575f19686a67cda63ff1bb0025459e",
+  "original_handoff_sha256": "ed8435a73117ce9f6946a71bed738144f5e73c3a4de2cb9a6d80e0ae632825b4",
+  "actual_subjects": 8,
+  "original_O0_closed": 6,
+  "original_O0_unknown": [
+    "trust_c_i8_store",
+    "trust_c_i16_store"
+  ],
+  "actual_native_full_W0_and_memory": "PASS",
+  "files": {
+    "compiler-input.json": "8b0fea9f81e69a36adab955bcb2bb3ad158aaaf1ebe63c20439da1944199f104",
+    "compiler-output.o": "6f730f51bd83601d193a141525e57bc57524eb4ca3f3a8d4e8c5ba543eb44742",
+    "subject.rs": "5a38892e9ce3a7ab89013595096ba861ddf441bea84cd1d92956c48cab748db0",
+    "original-8.json": "e82c3b6d181c5499cb83b00c3060a63996c6d019be18f2855d5b2dab93c05f53",
+    "original-16.json": "b40b58c44d329d99cd8fd39e30ec617d9a431402cf3a110099193e7935641083"
+  },
+  "derived_original_equations": "Complete original 24-pair store goals captured before kernel/packet acceptance by the current verifier on the exact immutable object/input. Data only, no proof credit."
+}

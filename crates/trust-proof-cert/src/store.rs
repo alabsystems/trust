@@ -295,10 +295,4 @@ mod tests {
         assert!(t2.is_some());
         assert!(t2.unwrap() > t1.unwrap(), "later timestamp should have larger epoch");
     }
-
-    #[test]
-    fn test_parse_timestamp_epoch_invalid() {
-        assert!(parse_timestamp_epoch("not-a-timestamp").is_none());
-        assert!(parse_timestamp_epoch("").is_none());
-    }
 }

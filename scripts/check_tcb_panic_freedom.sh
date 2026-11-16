@@ -11,13 +11,17 @@
 # burned down deliberately (the baseline only ever ratchets DOWN).
 #
 # This is a BASELINE-RATCHET gate, not a claim of panic-freedom. The current
-# baseline is the honest production-path count at the time of committing; the
-# accompanying audit (reports/tcb-hardening-audit.md) classifies offenders.
+# baseline caps the production-path count of this lexer. Measurements are in
+# docs/STATUS.md; this syntactic metric does not establish panic-freedom.
 #
 # What "production path" means here:
 #   * test-named files (tests.rs, *_tests.rs, test_*.rs, *_test.rs) are excluded;
 #   * every `#[cfg(test)]` item — `mod`, `fn`, `impl`, anything — is dropped
 #     whole, by tracking its brace depth to the closing brace;
+#   * a module FILE is excluded when every resolved `mod` declaration of it
+#     is test-only, explicitly or through established parent-file ancestry
+#     (with `#[path]` and inline nesting resolved); a production declaration,
+#     no declaration or an ungrounded cycle keeps the file counted;
 #   * comment text and the CONTENTS of string/char literals are erased before
 #     matching, so only executable code is counted.
 #
@@ -39,7 +43,9 @@
 #
 # Usage:
 #   scripts/check_tcb_panic_freedom.sh            # gate against the baseline
-#   scripts/check_tcb_panic_freedom.sh --print    # per-pattern + per-crate counts
+#   scripts/check_tcb_panic_freedom.sh --print    # per-pattern + per-crate counts,
+#                                                 # and the files excluded as test-only
+#   scripts/check_tcb_panic_freedom.sh --list     # every counted site, one per line
 #   scripts/check_tcb_panic_freedom.sh --update-baseline  # rewrite the committed
 #                                                          # baseline to current
 #                                                          # (use ONLY to ratchet
@@ -53,10 +59,10 @@
 # Copyright 2026 Andrew Yates | License: Apache 2.0
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$REPO_ROOT"
 
-# TCB source roots (directory OR single file). Keep in sync with the audit.
+# TCB source roots (directory OR single file), including the split compiler pass.
 TCB_ROOTS=(
   "crates/trust-vcgen/src"
   "crates/trust-router/src"
@@ -66,9 +72,9 @@ TCB_ROOTS=(
   "crates/trust-ir-bridge/src"
   "crates/trust-vc-bridge/src"
   "crates/trust-cg-bridge/src"
-  "crates/trust-ny-bridge/src"
   "crates/trust-wasm-bridge/src"
   "compiler/rustc_mir_transform/src/trust_verify.rs"
+  "compiler/rustc_mir_transform/src/trust_verify/"
 )
 
 # Committed baseline: the gate FAILS if the live total exceeds this. Ratchet
@@ -84,8 +90,15 @@ BASELINE_FILE="$REPO_ROOT/scripts/check_tcb_panic_freedom.baseline"
 # depth is only ever counted on ALREADY-erased lines, so a `'{'` char literal
 # or a `"}"` in a message cannot end a `#[cfg(test)]` block early — the defect
 # that used to let test bodies through.
+#
+# The same pass records every `mod NAME;` DECLARATION it reads (into the file
+# named by `-v DECLS=`), with the inline modules it sits in, the `#[path]` it
+# carries and whether it is test-only. `build_stream` resolves those to files
+# and drops a file whose every declaration is test-only (see `test_only_files`).
 read -r -d '' LEX_AWK <<'AWK' || true
-BEGIN { st = 0; bdepth = 0; rhash = 0; in_test = 0; depth = 0; pend = 0 }
+BEGIN { st = 0; bdepth = 0; rhash = 0; in_test = 0; depth = 0; pend = 0
+        gdepth = 0; nmods = 0; pathattr = ""
+        CFG_TEST = "#\\[cfg\\(test\\)\\]|#\\[cfg\\(all\\([^)]*test[^)]*\\)\\)\\]" }
 # st: 0 = code, 1 = block comment, 2 = string, 3 = raw string
 function erase(s,   out, i, n, c, d, h, j) {
   out = ""; i = 1; n = length(s)
@@ -137,15 +150,55 @@ function erase(s,   out, i, n, c, d, h, j) {
   }
   return out
 }
+# The inline modules enclosing the current line, as path components ("a/b/").
+function inline_path(   k, p) {
+  p = ""
+  for (k = 1; k <= nmods; k++) p = p mname[k] "/"
+  return p
+}
+# Record a `mod NAME;` declaration and track inline `mod NAME {` nesting. Runs
+# on EVERY line, test or not, so brace depth and nesting stay exact; `is_test`
+# says whether the line belongs to a `#[cfg(test)]` item. `line` is the erased
+# text, `raw` the original: a `#[path = "…"]` value is literal content, which
+# `erase` blanks, so it is read back from `raw`.
+function note_decls(raw, line, is_test,   m, o, c) {
+  if (line ~ /#\[path[ \t]*=/ && match(raw, /#\[path[ \t]*=[ \t]*"[^"]*"/)) {
+    pathattr = substr(raw, RSTART, RLENGTH)
+    sub(/^#\[path[ \t]*=[ \t]*"/, "", pathattr); sub(/"$/, "", pathattr)
+  }
+  if (match(line, /(^|[^A-Za-z0-9_])mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;/)) {
+    m = substr(line, RSTART, RLENGTH)
+    sub(/^[^A-Za-z0-9_]?mod[ \t]+/, "", m); sub(/[ \t]*;$/, "", m)
+    if (DECLS != "") print FILENAME "\t" inline_path() "\t" m "\t" pathattr "\t" is_test >> DECLS
+    pathattr = ""
+  } else if (match(line, /(^|[^A-Za-z0-9_])mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{/)) {
+    m = substr(line, RSTART, RLENGTH)
+    sub(/^[^A-Za-z0-9_]?mod[ \t]+/, "", m); sub(/[ \t]*\{$/, "", m)
+    nmods++; mname[nmods] = m; mdepth[nmods] = gdepth + 1
+    pathattr = ""
+  } else if (line ~ /[;{}]/) {
+    pathattr = ""                        # some other item took the attribute
+  }
+  o = gsub(/{/, "{", line); c = gsub(/}/, "}", line)
+  gdepth += o - c
+  while (nmods > 0 && gdepth < mdepth[nmods]) nmods--
+}
 {
   line = erase($0)
+  note_decls($0, line, (in_test == 1 || pend == 1 || line ~ CFG_TEST) ? 1 : 0)
   if (in_test == 1) {
     o = gsub(/{/, "{", line); c = gsub(/}/, "}", line)
     depth += o - c
     if (depth <= 0) in_test = 0
     next
   }
-  if (line ~ /#\[cfg\(test\)\]/ || line ~ /#\[cfg\(all\([^)]*test[^)]*\)\)\]/) { pend = 1; next }
+  if (match(line, CFG_TEST)) {
+    pend = 1
+    # `#[cfg(test)] mod x;` (or `… fn t() {`) on ONE line: the item is the
+    # rest of this line, not the next one, which would otherwise be swallowed.
+    line = substr(line, RSTART + RLENGTH)
+    if (line !~ /[{;]/) next
+  }
   if (pend == 1) {
     # Scan forward to the ITEM the `#[cfg(test)]` attaches to. Anything between
     # is a further attribute or a signature continuation and is dropped while
@@ -176,7 +229,7 @@ function erase(s,   out, i, n, c, d, h, j) {
     if (line ~ /;/) { pend = 0; next }
     next
   }
-  print FILENAME ":" line
+  print FILENAME ":" FNR ":" line
 }
 AWK
 
@@ -197,19 +250,197 @@ tcb_files() {
   fi
 }
 
-# One lexing pass over the whole TCB, cached as `<path>:<code>` lines. Every
-# count below is a grep over this stream, so adding a breakdown is free.
+# One lexing pass over the whole TCB, cached as `<path>:<line>:<code>` lines.
+# Every count below is a grep over this stream, so adding a breakdown is free —
+# and `--list` is that same grep, printed instead of counted.
 STREAM="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-stream.XXXXXX")"
-trap 'rm -f "$STREAM"' EXIT
+RAW="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-raw.XXXXXX")"
+DECLS="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-decls.XXXXXX")"
+FILES="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-files.XXXXXX")"
+ALL_FILES="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-all-files.XXXXXX")"
+TEST_ONLY="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-test-only.XXXXXX")"
+trap 'rm -f "$STREAM" "$RAW" "$DECLS" "$FILES" "$ALL_FILES" "$TEST_ONLY"' EXIT
+# `.expect(` IS NOT ALWAYS `Option::expect`. A file may define its own
+# `fn expect(&self, ..)`, and an inherent method SHADOWS the std ones — neither
+# `Option` nor `Result` can be `Self` here, because they are foreign types this
+# workspace cannot `impl`. Measured 2026-09-21: the two spec parsers
+# (`trust-types/src/spec_parse.rs`, `spec_attrs.rs`) each define
+# `fn expect(&mut self, expected: &Token, label: &str) -> Result<(), SpecParseError>`
+# and call it 32 times between them, EVERY ONE `?`-propagated. Counting those as
+# panic sites is the same class of error as the 2026-07-24 entry's counting of
+# comment prose: it inflates the number with things that cannot panic, and it can
+# be "reduced" by making a parser worse.
+#
+# The rewrite below is deliberately visible in `--list` rather than silent, so a
+# reader sees WHY a call was not counted instead of wondering where it went.
+#
+# IT IS RECEIVER-SCOPED (`self.expect(`), NOT FILE-SCOPED, ON PURPOSE. A
+# file-scoped exclusion would hide a genuine `Option::expect` sitting in the same
+# parser file, which is exactly the hole this gate exists to catch. The cost is
+# that a call to the inherent method through some OTHER binding is still counted
+# — an over-count, which is the safe direction, and there are zero such calls
+# today (all 32 are `self.`).
+#
+# MUTATION-PROVED 2026-09-21, four plants against a 250 base, each restored:
+#   Option::expect in a file with no inherent method      250 -> 251  (counted)
+#   a `self.`-receiver expect in that same file           251 -> 252  (counted)
+#   the inherent method reached through a binding         250 -> 251  (counted)
+#   a REAL Option::expect inside spec_parse.rs            251 -> 252  (counted)
+# So the exclusion fires only where method resolution says it must, and the
+# counter still detects every real panic site including in the excluded files.
+inherent_expect_file() {
+  grep -qE '^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?fn expect\(&(mut )?self' "$1"
+}
+
+# A FILE DECLARED ONLY UNDER `#[cfg(test)]` IS TEST CODE, WHATEVER ITS NAME.
+# The name filter in `tcb_files` and the item stripper in `LEX_AWK` both miss
+# it: `#[cfg(test)] #[path = "compiler_consumer_census.rs"] mod census;` drops
+# only the declaration line, and the file's whole body was then read as
+# production. Measured 2026-10-10 on main ce026e1c63b, that put 13 test-only
+# constructs into the count: trust-cg-bridge's compiler_consumer_census.rs x9
+# (declared at compiler_consumer.rs:269-271) and trust-vcgen's
+# referent_fold/fold_cost_fix.rs x4 (declared inside the inline
+# `mod referent_fold` of lib.rs). Neither file is compiled outside `cfg(test)`.
+#
+# The rule is per declaration, and fails toward COUNTING: a file is dropped only
+# when it has at least one resolved `mod` declaration in the TCB and EVERY one
+# of them is test-only (carries `#[cfg(test)]`, sits inside a `#[cfg(test)]`
+# item, or comes from an already established test-only source file). Resolve
+# declarations in test-named files too, without treating the name as ancestry.
+# A single production declaration keeps it; a file no declaration
+# resolves to (a crate root, a `#[path]` from outside the TCB, a shape this
+# resolver does not model) keeps it. Resolution is Rust's: a declaration in
+# lib.rs/main.rs/mod.rs names `<dir>/<inline mods>/name{.rs,/mod.rs}`, one in
+# `foo.rs` names `<dir>/foo/<inline mods>/name{.rs,/mod.rs}`; a `#[path]` is
+# relative to the declaring file's directory, or, inside an inline module, to
+# that module's directory. Only a TCB file can be a target, so a misresolved
+# declaration lands on no file rather than on the wrong one.
+#
+# Mutation-proved by scripts/tests/check_tcb_panic_freedom_test.sh in the four
+# directions (a production file counts; a file declared only under cfg(test)
+# does not; a file declared both ways counts; `#[path]` and inline nesting
+# resolve), plus an undeclared file counting.
+test_only_files() {
+  awk -F '\t' -v FILES="$ALL_FILES" -v CANDIDATES="$FILES" '
+    function norm(p,   n, a, s, i, k, out) {
+      n = split(p, a, "/"); k = 0
+      for (i = 1; i <= n; i++) {
+        if (a[i] == "" || a[i] == ".") continue
+        if (a[i] == ".." && k > 0 && s[k] != "..") { k--; continue }
+        s[++k] = a[i]
+      }
+      out = ""
+      for (i = 1; i <= k; i++) out = out (i > 1 ? "/" : "") s[i]
+      return out
+    }
+    BEGIN {
+      while ((getline l < FILES) > 0) tcb[l] = 1
+      while ((getline l < CANDIDATES) > 0) candidate[l] = 1
+    }
+    {
+      f = $1; inl = $2; name = $3; pth = $4; t = $5
+      d = f; sub(/\/[^\/]*$/, "", d)
+      b = f; sub(/^.*\//, "", b)
+      if (b == "lib.rs" || b == "main.rs" || b == "mod.rs") m = d
+      else { m = d "/" b; sub(/\.rs$/, "", m) }
+      if (pth != "") {
+        c1 = norm((inl == "") ? d "/" pth : m "/" inl pth); c2 = ""
+      } else {
+        c1 = norm(m "/" inl name ".rs"); c2 = norm(m "/" inl name "/mod.rs")
+      }
+      if (c1 in tcb) target = c1
+      else if (c2 != "" && (c2 in tcb)) target = c2
+      else next
+      targets[target] = 1
+      from[++edges] = f; to[edges] = target; explicit_test[edges] = (t == 1)
+    }
+    END {
+      # Only established test ancestry propagates. An orphan, an unanchored
+      # cycle or any incoming production declaration keeps a file counted.
+      do {
+        changed = 0
+        for (x in prod_decl) delete prod_decl[x]
+        for (i = 1; i <= edges; i++)
+          if (!explicit_test[i] && !(from[i] in test_only)) prod_decl[to[i]] = 1
+        for (x in targets)
+          if (!(x in prod_decl) && !(x in test_only)) { test_only[x] = 1; changed = 1 }
+      } while (changed)
+      # Named test files were already excluded by the filename rule. Report
+      # only files whose counted population this declaration rule changes.
+      for (x in test_only) if (x in candidate) print x
+    }
+  ' "$DECLS" | LC_ALL=C sort
+}
+
 build_stream() {
   local root f
-  : > "$STREAM"
+  # An absent sparse-checkout input is unknown, not a zero-panic source file.
+  # In a checkout, include every committed Rust file in the required roots;
+  # checking only the directory would miss a partially materialized root.
   for root in "${TCB_ROOTS[@]}"; do
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      awk "$LEX_AWK" "$f" >> "$STREAM"
-    done < <(tcb_files "$root")
+    if [ ! -f "$root" ] && [ ! -d "$root" ]; then
+      echo "NOT JUDGED: missing TCB source root: $root" >&2
+      exit 2
+    fi
   done
+  if [ "$(git rev-parse --show-toplevel 2>/dev/null || true)" = "$REPO_ROOT" ]; then
+    if ! git ls-tree -r --name-only -z HEAD -- "${TCB_ROOTS[@]}" > "$FILES"; then
+      echo "NOT JUDGED: cannot enumerate committed TCB sources" >&2
+      exit 2
+    fi
+    while IFS= read -r -d '' f; do
+      case "$f" in
+        *.rs)
+          if [ ! -f "$f" ]; then
+            echo "NOT JUDGED: missing committed TCB source: $f" >&2
+            exit 2
+          fi
+          ;;
+      esac
+    done < "$FILES"
+  fi
+  : > "$RAW"; : > "$DECLS"; : > "$FILES"; : > "$ALL_FILES"
+  for root in "${TCB_ROOTS[@]}"; do
+    tcb_files "$root" >> "$FILES"
+    # Filename-excluded parents still declare children. Do not infer test
+    # ancestry from a name: parse their declarations and require a cfg(test)
+    # chain from the actual parent, just as for every other source file.
+    if [ -f "$root" ]; then
+      printf '%s\n' "$root" >> "$ALL_FILES"
+    else
+      find "$root" -name '*.rs' | LC_ALL=C sort >> "$ALL_FILES"
+    fi
+  done
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if inherent_expect_file "$f"; then
+      awk -v DECLS="$DECLS" "$LEX_AWK" "$f" | sed 's/self\.expect(/self.<inherent-expect>(/g' >> "$RAW"
+    else
+      awk -v DECLS="$DECLS" "$LEX_AWK" "$f" >> "$RAW"
+    fi
+  done < "$ALL_FILES"
+  test_only_files > "$TEST_ONLY"
+  # The stream is RAW minus the lines of test-only files. (A `getline` set,
+  # not the `NR == FNR` idiom, which misreads an empty skip list.)
+  awk -v SKIP="$TEST_ONLY" -v FILES="$FILES" '
+    BEGIN {
+      while ((getline l < SKIP) > 0) skip[l] = 1
+      while ((getline l < FILES) > 0) candidate[l] = 1
+    }
+    { p = $0; sub(/:.*/, "", p); if ((p in candidate) && !(p in skip)) print }
+  ' "$RAW" > "$STREAM"
+}
+
+# The files `build_stream` dropped as test-only, each with the construct lines
+# it would otherwise have added: printed, so an exclusion is never silent.
+print_test_only() {
+  local f n
+  [ -s "$TEST_ONLY" ] || return 0
+  echo "Not counted, every resolved \`mod\` declaration has test-only ancestry (construct lines in the file):"
+  while IFS= read -r f; do
+    n=$(awk -v f="$f" 'index($0, f ":") == 1' "$RAW" | grep -cE "$RE_ANY" || true)
+    printf "  %-66s %s\n" "$f" "$n"
+  done < "$TEST_ONLY"
 }
 
 # The panicking-construct patterns. `.unwrap()` is the exact zero-arg method;
@@ -268,10 +499,37 @@ print_per_root() {
 
 # Read the committed number, ignoring `#` commentary and blank lines.
 read_baseline() {
-  awk '/^[[:space:]]*#/ { next } /^[[:space:]]*$/ { next } { gsub(/[^0-9]/, "", $0); print; exit }' "$BASELINE_FILE"
+  # One canonical nonnegative decimal, bounded for portable shell integer
+  # comparisons. An overflowing test inside an if would otherwise fail open.
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      records++
+      if (records != 1 || $0 !~ /^[ \t]*(0|[1-9][0-9]*)[ \t]*$/) { bad = 1; exit 1 }
+      value = $0; gsub(/^[ \t]+|[ \t]+$/, "", value)
+      if (length(value) > 10 || value + 0 > 2147483647) { bad = 1; exit 1 }
+    }
+    END { if (bad || records != 1) exit 1; print value }
+  ' "$BASELINE_FILE"
+}
+
+# The sites themselves. The gate says "replace it with a propagated
+# error/Result" and until now could not say WHICH — so the first move after a
+# red was to re-derive this by hand, with a different lexer than the gate's.
+print_sites() {
+  local root
+  for root in "${TCB_ROOTS[@]}"; do
+    awk -v r="$root" 'index($0, r) == 1' "$STREAM" | grep -E "$RE_ANY" || true
+  done
 }
 
 case "${1:-gate}" in
+  --list|list)
+    build_stream
+    print_sites
+    exit 0
+    ;;
   --print|print)
     compute_total
     print_breakdown
@@ -279,12 +537,33 @@ case "${1:-gate}" in
     printf "  %-16s %s\n" "TOTAL" "$TOTAL"
     echo ""
     print_per_root
+    if [ -s "$TEST_ONLY" ]; then
+      echo ""
+      print_test_only
+    fi
     exit 0
     ;;
   --update-baseline)
+    if [ -L "$BASELINE_FILE" ] || { [ -e "$BASELINE_FILE" ] && [ ! -f "$BASELINE_FILE" ]; }; then
+      echo "FAIL: baseline path must be a regular file or absent: $BASELINE_FILE" >&2
+      exit 1
+    fi
     compute_total
     OLD="(none)"
-    [ -f "$BASELINE_FILE" ] && OLD="$(read_baseline)"
+    if [ -f "$BASELINE_FILE" ]; then
+      if ! OLD="$(read_baseline)"; then
+        echo "FAIL: baseline must contain one integer in 0..2147483647: $BASELINE_FILE" >&2
+        exit 1
+      fi
+      if [ "$TOTAL" -gt "$OLD" ]; then
+        echo "FAIL: refusing to raise the TCB panic baseline ($OLD -> $TOTAL)." >&2
+        exit 1
+      fi
+      if [ "$TOTAL" -eq "$OLD" ]; then
+        echo "Baseline unchanged: $OLD ($BASELINE_FILE)"
+        exit 0
+      fi
+    fi
     # Preserve the `#` header verbatim: it carries the rationale for the last
     # move, which is the part a bare number cannot express.
     NEW_BASELINE="$(mktemp "${TMPDIR:-/tmp}/tcb-panic-baseline.XXXXXX")"
@@ -317,9 +596,8 @@ if [ ! -f "$BASELINE_FILE" ]; then
   echo "DETAIL: run 'scripts/check_tcb_panic_freedom.sh --update-baseline' to seed it." >&2
   exit 1
 fi
-BASELINE="$(read_baseline)"
-if [ -z "$BASELINE" ]; then
-  echo "FAIL: baseline file is empty/non-numeric: $BASELINE_FILE" >&2
+if ! BASELINE="$(read_baseline)"; then
+  echo "FAIL: baseline must contain one integer in 0..2147483647: $BASELINE_FILE" >&2
   exit 1
 fi
 
@@ -332,11 +610,13 @@ if [ "$TOTAL" -gt "$BASELINE" ]; then
   echo ""
   print_per_root
   echo ""
+  print_test_only
+  echo ""
   echo "FAIL: TCB production-path panic surface GREW ($TOTAL > baseline $BASELINE)."
   echo "      A new unwrap/expect/panic/unreachable/unimplemented/todo landed in the"
   echo "      verifier's trusted core. Replace it with a propagated error/Result, or"
   echo "      (if it is a documented invariant) justify it in"
-  echo "      reports/tcb-hardening-audit.md and ratchet the baseline only after review."
+  echo "      docs/OPEN_ISSUES.md; the baseline updater never raises the ceiling."
   exit 1
 fi
 if [ "$TOTAL" -lt "$BASELINE" ]; then

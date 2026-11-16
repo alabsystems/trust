@@ -283,18 +283,19 @@ fn test_integration_race_non_atomic_write_read() {
     let vcs = generate_race_vcs(&races, "increment_counter", &accesses);
     assert_eq!(vcs.len(), 1);
     match &vcs[0].kind {
-        VcKind::DataRace { variable, thread_a, thread_b } => {
-            assert_eq!(variable, "shared_counter");
-            assert_eq!(thread_a, "writer_thread");
-            assert_eq!(thread_b, "reader_thread");
+        VcKind::UnsupportedMir { kind, detail } => {
+            assert_eq!(kind, "DataRaceCandidate");
+            assert!(detail.contains("shared_counter"));
+            assert!(detail.contains("writer_thread"));
+            assert!(detail.contains("reader_thread"));
         }
-        other => panic!("expected DataRace VC, got: {other:?}"),
+        other => panic!("expected unsupported race candidate, got: {other:?}"),
     }
 }
 
-/// Integration test: no race between properly-ordered atomics with HB chain.
+/// Integration test: an authored release/acquire chain cannot prove race absence.
 #[test]
-fn test_integration_no_race_release_acquire_pattern() {
+fn test_integration_claimed_release_acquire_pattern_still_reports_candidate() {
     // Thread 1: write data (0), release-store flag (1)
     // Thread 2: acquire-load flag (2), read data (3)
     // HB chain: 0 -> 1 -> 2 -> 3 (via program order + release-acquire sync)
@@ -306,8 +307,10 @@ fn test_integration_no_race_release_acquire_pattern() {
     ];
 
     let races = detect_potential_races(&accesses);
-    let data_races: Vec<_> = races.iter().filter(|r| r.variable == "data").collect();
-    assert!(data_races.is_empty(), "release-acquire synchronization prevents race on data");
+    assert!(
+        races.iter().any(|race| (race.first, race.second) == (0, 3)),
+        "a claimed release/acquire chain lacks an authenticated read-from witness"
+    );
 }
 
 /// Integration test: race when ordering is too weak (Relaxed instead of Release).
@@ -324,11 +327,9 @@ fn test_integration_race_when_ordering_too_weak() {
     ];
 
     let races = detect_potential_races(&accesses);
-    let data_races: Vec<_> = races.iter().filter(|r| r.variable == "data").collect();
-    assert_eq!(
-        data_races.len(),
-        1,
-        "weak ordering (Relaxed instead of Release) should allow race on data"
+    assert!(
+        races.iter().any(|race| (race.first, race.second) == (0, 3)),
+        "the data write and read remain a candidate"
     );
 }
 
@@ -381,20 +382,18 @@ fn test_integration_multi_thread_multi_variable_races() {
     ];
 
     let races = detect_potential_races(&accesses);
-    let x_races: Vec<_> = races.iter().filter(|r| r.variable == "x").collect();
-    let y_races: Vec<_> = races.iter().filter(|r| r.variable == "y").collect();
-
-    assert_eq!(x_races.len(), 1, "should detect 1 race on x (t1 write vs t2 read)");
-    assert!(y_races.len() >= 2, "should detect races on y (t1 vs t2, t1 vs t3, t2 vs t3)");
+    assert_eq!(races.len(), 9, "location and thread labels cannot discard may-alias pairs");
+    assert!(races.iter().any(|race| (race.first, race.second) == (0, 2)));
+    assert!(races.iter().any(|race| (race.first, race.second) == (1, 4)));
 }
 
 // ===========================================================================
 // Part 5: DataRaceDetector end-to-end
 // ===========================================================================
 
-/// Integration test: full detector workflow with sync preventing race.
+/// Integration test: a caller-claimed sync pair cannot prove race absence.
 #[test]
-fn test_integration_detector_release_acquire_sync() {
+fn test_integration_detector_claimed_release_acquire_sync_still_reports_candidate() {
     let mut det = DataRaceDetector::new();
 
     // Producer thread: write data, then release-store flag
@@ -421,8 +420,10 @@ fn test_integration_detector_release_acquire_sync() {
     det.add_sync_pair(rel, acq);
 
     let races = det.detect_races();
-    let data_races: Vec<_> = races.iter().filter(|r| r.location == "data").collect();
-    assert!(data_races.is_empty(), "release-acquire sync should prevent data race");
+    assert!(
+        races.iter().any(|race| (race.first_access, race.second_access) == (w, r)),
+        "the caller-claimed sync pair is not an authenticated event witness"
+    );
 }
 
 /// Integration test: detector finds race when sync is missing.
@@ -451,8 +452,14 @@ fn test_integration_detector_missing_sync_race() {
     // NO sync pair — producer used Relaxed, not Release
 
     let races = det.detect_races();
-    let data_races: Vec<_> = races.iter().filter(|r| r.location == "data").collect();
-    assert_eq!(data_races.len(), 1, "missing sync should allow data race");
+    assert!(
+        races.iter().any(|race| (race.first_access, race.second_access) == (w, r)),
+        "missing sync should allow data race"
+    );
+    assert!(
+        races.iter().any(|race| (race.first_access, race.second_access) == (w, _acq)),
+        "data and flag labels do not establish disjointness"
+    );
 }
 
 /// Integration test: describe() output on detected race.
@@ -546,22 +553,23 @@ fn test_integration_legality_mixed_violations() {
     }
 }
 
-/// Integration test: CAS with double violation (L3 + L4).
+/// Integration test: a Release failure ordering stronger than the success
+/// ordering fires L3 only. The retired L4 (failure stronger than success) is
+/// valid Rust since 1.64 and must not add a second row.
 #[test]
-fn test_integration_legality_cas_double_violation() {
-    // success=Relaxed, failure=Release: L3 (Release forbidden) + L4 (failure > success)
+fn test_integration_legality_cas_release_failure_is_l3_only() {
     let ops = [make_op(
         AtomicOpKind::CompareExchange,
         AtomicOrdering::Relaxed,
         Some(AtomicOrdering::Release),
     )];
 
-    let vcs = MemoryModelChecker::check_operation_legality(&ops, "cas_double_bug");
-    assert!(vcs.len() >= 2, "should fire both L3 and L4, got {} VCs", vcs.len());
+    let vcs = MemoryModelChecker::check_operation_legality(&ops, "cas_release_failure");
+    assert_eq!(vcs.len(), 1, "only L3 applies, got {vcs:?}");
 
     let vc_texts: Vec<String> = vcs.iter().map(|vc| vc.kind.to_string()).collect();
     assert!(vc_texts.iter().any(|t| t.contains("L3")), "should have L3 violation");
-    assert!(vc_texts.iter().any(|t| t.contains("L4")), "should have L4 violation");
+    assert!(!vc_texts.iter().any(|t| t.contains("L4")), "retired L4 must not fire");
 }
 
 /// Integration test: CompareExchangeWeak follows the same rules.

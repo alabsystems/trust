@@ -60,6 +60,9 @@ use trust_types::{
     VerificationResult,
 };
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(name: &str) -> VerifiableFunction {
     let path = format!("{}/tests/data/{name}.json", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path)
@@ -83,7 +86,7 @@ fn saturated() -> VerifiableFunction {
 }
 
 fn refuted(vcs: &[VerificationCondition]) -> Vec<String> {
-    let router = trust_router::Router::deterministic_in_process_ay(60_000);
+    let router = test_router::deterministic_test_router();
     router
         .verify_all(vcs)
         .into_iter()
@@ -286,7 +289,7 @@ fn an_enum_wider_than_the_switch_cases_still_refutes() {
             panic!("the discriminant source must be an enum")
         };
         let grown = variants.iter().map(|v| v.discriminant).max().unwrap_or(0) + 1;
-        variants.push(trust_types::VariantDef {
+        variants.make_mut().push(trust_types::VariantDef {
             name: "GrownByTheTest".to_string(),
             discriminant: grown,
             fields: Vec::new(),

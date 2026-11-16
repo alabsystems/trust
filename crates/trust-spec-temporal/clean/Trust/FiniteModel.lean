@@ -322,7 +322,7 @@ inductive Evaluates (model : Model) :
   | bool (value : Bool) :
       Evaluates model locals state (ScalarExpr.bool value) (Value.bool value)
 
--- A first-order inversion view for the owner-ratified scalar macro grammar.
+-- A first-order inversion view for the ratified scalar macro grammar.
 -- Clean's ordinary dependent-pattern elaborator does not yet accept a direct
 -- match on Evaluates (the authenticated constructor indices are more
 -- general than that surface matcher).  This definition plus the explicit
@@ -337,8 +337,8 @@ def MacroEvaluationView (model : Model) (locals : List (String × Nat))
   | ScalarExpr.var name =>
       (DeclaresScalar model name ∧
         value = Value.nat (state.scalar name)) ∨
-      (∃ local : Nat,
-        LocalValue locals name local ∧ value = Value.nat local) ∨
+      (∃ localValue : Nat,
+        LocalValue locals name localValue ∧ value = Value.nat localValue) ∨
       (∃ range : String,
         FunctionRange model name range ∧
           value = Value.function range (state.function name))
@@ -401,59 +401,59 @@ theorem macroEvaluationViewOfEvaluates
   @Evaluates.rec model
     (fun locals state expression value _ =>
       MacroEvaluationView model locals state expression value)
-    (fun _ _ literal => rfl)
-    (fun _ _ name declared => Or.inl ⟨declared, rfl⟩)
-    (fun _ _ name local found => Or.inr (Or.inl ⟨local, found, rfl⟩))
-    (fun _ _ name range found =>
+    (fun literal => rfl)
+    (fun name declared => Or.inl ⟨declared, rfl⟩)
+    (fun name localValue found => Or.inr (Or.inl ⟨localValue, found, rfl⟩))
+    (fun name range found =>
       Or.inr (Or.inr ⟨range, found, rfl⟩))
-    (fun _ _ name constant found => ⟨constant, found, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun name constant found => ⟨constant, found, rfl⟩)
+    (fun left right leftValue rightValue
         leftProof rightProof _ _ =>
       ⟨leftValue, rightValue, leftProof, rightProof, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof _ _ =>
       ⟨leftValue, rightValue, leftProof, rightProof, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof order _ _ =>
       Or.inl ⟨leftValue, rightValue, leftProof, rightProof, order, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof order _ _ =>
       Or.inr ⟨leftValue, rightValue, leftProof, rightProof, order, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof order _ _ =>
       Or.inl ⟨leftValue, rightValue, leftProof, rightProof, order, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof order _ _ =>
       Or.inr ⟨leftValue, rightValue, leftProof, rightProof, order, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof same _ _ =>
       Or.inl ⟨leftValue, rightValue, leftProof, rightProof, same, rfl⟩)
-    (fun _ _ left right leftValue rightValue
+    (fun left right leftValue rightValue
         leftProof rightProof different _ _ =>
       Or.inr ⟨leftValue, rightValue, leftProof, rightProof, different, rfl⟩)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
     (fun _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
     (fun _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ condition thenValue elseValue result
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun condition thenValue elseValue result
         conditionProof branchProof _ _ =>
       Or.inl ⟨conditionProof, branchProof⟩)
-    (fun _ _ condition thenValue elseValue result
+    (fun condition thenValue elseValue result
         conditionProof branchProof _ _ =>
       Or.inr ⟨conditionProof, branchProof⟩)
-    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
     (fun _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ => True.intro)
     locals state expression value evaluation
 
 -- A second inversion view covers the function-valued finite ABI.  It is kept
@@ -468,8 +468,8 @@ def FunctionEvaluationView (model : Model) (locals : List (String × Nat))
   | ScalarExpr.var name =>
       (DeclaresScalar model name ∧
         value = Value.nat (state.scalar name)) ∨
-      (∃ local : Nat,
-        LocalValue locals name local ∧ value = Value.nat local) ∨
+      (∃ localValue : Nat,
+        LocalValue locals name localValue ∧ value = Value.nat localValue) ∨
       (∃ range : String,
         FunctionRange model name range ∧
           value = Value.function range (state.function name))
@@ -571,57 +571,57 @@ theorem functionEvaluationViewOfEvaluates
   @Evaluates.rec model
     (fun locals state expression value _ =>
       FunctionEvaluationView model locals state expression value)
-    (fun _ _ literal => rfl)
-    (fun _ _ _ declared => Or.inl ⟨declared, rfl⟩)
-    (fun _ _ _ local found => Or.inr (Or.inl ⟨local, found, rfl⟩))
-    (fun _ _ _ range found => Or.inr (Or.inr ⟨range, found, rfl⟩))
-    (fun _ _ _ constant found => ⟨constant, found, rfl⟩)
-    (fun _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ leftValue rightValue leftProof rightProof same _ _ =>
-      Or.inl ⟨leftValue, rightValue, leftProof, rightProof, same, rfl⟩)
-    (fun _ _ _ _ leftValue rightValue leftProof rightProof different _ _ =>
-      Or.inr ⟨leftValue, rightValue, leftProof, rightProof, different, rfl⟩)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun literal => rfl)
+    (fun _ declared => Or.inl ⟨declared, rfl⟩)
+    (fun _ localValue found => Or.inr (Or.inl ⟨localValue, found, rfl⟩))
+    (fun _ range found => Or.inr (Or.inr ⟨range, found, rfl⟩))
+    (fun _ constant found => ⟨constant, found, rfl⟩)
+    (fun _ _ _ _ _ _ _ _ => True.intro)
     (fun _ _ _ _ _ _ _ _ => True.intro)
     (fun _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ leftProof rightProof _ _ =>
+    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ leftValue rightValue leftProof rightProof same _ _ =>
+      Or.inl ⟨leftValue, rightValue, leftProof, rightProof, same, rfl⟩)
+    (fun _ _ leftValue rightValue leftProof rightProof different _ _ =>
+      Or.inr ⟨leftValue, rightValue, leftProof, rightProof, different, rfl⟩)
+    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ => True.intro)
+    (fun _ _ leftProof rightProof _ _ =>
       Or.inl ⟨leftProof, rightProof, rfl⟩)
-    (fun _ _ _ _ rightValue leftProof rightProof _ _ =>
+    (fun _ _ rightValue leftProof rightProof _ _ =>
       Or.inr (Or.inl ⟨rightValue, leftProof, rightProof, rfl⟩))
-    (fun _ _ _ _ leftProof rightProof _ _ =>
+    (fun _ _ leftProof rightProof _ _ =>
       Or.inr (Or.inr ⟨leftProof, rightProof, rfl⟩))
-    (fun _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ _ _ _ _ _ _ => True.intro)
-    (fun _ _ _ _ truth leftProof rightProof _ _ =>
+    (fun _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ _ _ _ _ _ _ => True.intro)
+    (fun _ _ truth leftProof rightProof _ _ =>
       Or.inl ⟨truth, leftProof, rightProof, rfl⟩)
-    (fun _ _ _ _ leftProof rightProof _ _ =>
+    (fun _ _ leftProof rightProof _ _ =>
       Or.inr (Or.inl ⟨leftProof, rightProof, rfl⟩))
-    (fun _ _ _ _ leftProof rightProof _ _ =>
+    (fun _ _ leftProof rightProof _ _ =>
       Or.inr (Or.inr ⟨leftProof, rightProof, rfl⟩))
-    (fun _ _ _ _ _ _ lowValue highValue lowProof highProof bodyProof _ _ _ =>
+    (fun _ _ _ _ lowValue highValue lowProof highProof bodyProof _ _ _ =>
       Or.inl ⟨lowValue, highValue, lowProof, highProof, bodyProof, rfl⟩)
-    (fun _ _ _ _ _ _ lowValue highValue witness
+    (fun _ _ _ _ lowValue highValue witness
         lowProof highProof lower upper bodyProof _ _ _ =>
       Or.inr ⟨lowValue, highValue, witness, lowProof, highProof,
         lower, upper, bodyProof, rfl⟩)
-    (fun _ _ _ range _ indexValue found indexProof domain _ =>
+    (fun _ range _ indexValue found indexProof domain _ =>
       ⟨range, indexValue, found, indexProof, domain, rfl⟩)
-    (fun _ _ _ range _ _ indexValue boolValue result
+    (fun _ range _ _ indexValue boolValue result
         found indexProof domain valueProof atIndex others outside _ _ =>
       ⟨range, indexValue, boolValue, result, found, indexProof, domain,
         valueProof, atIndex, others, outside, rfl⟩)
-    (fun _ _ _ range low high _ lowValue highValue result
+    (fun _ range low high _ lowValue highValue result
         lowShape highShape lowIsOne found lowProof highProof bodyProof outside _ _ _ =>
       ⟨range, lowValue, highValue, result, lowShape, highShape, lowIsOne,
         found, lowProof, highProof, bodyProof, outside, rfl⟩)
-    (fun _ _ _ => rfl)
+    (fun _ => rfl)
     locals state expression value evaluation
 
 theorem memberNilFalse {alpha : Type} {value : alpha}
@@ -767,9 +767,9 @@ theorem exactScalarVar (model : Model) (state : State)
         (fun localOrFunction =>
           Or.elim localOrFunction
             (fun localCase =>
-              Exists.elim localCase (fun local foundAndSame =>
+              Exists.elim localCase (fun localValue foundAndSame =>
                 False.elim
-                  (localValueNilFalse name local foundAndSame.1)))
+                  (localValueNilFalse name localValue foundAndSame.1)))
             (fun functionCase =>
               Exists.elim functionCase (fun range foundAndSame =>
                 False.elim (noFunction range foundAndSame.1)))) }

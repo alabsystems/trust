@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 //, #565: Adapter bridging trust-lift output to trust_vcgen for binary verification.
 //
 // Converts LiftedFunction (binary -> CFG -> SSA -> TrustIr) into VerificationConditions
@@ -63,6 +63,7 @@ pub fn lift_to_verifiable(lifted: &LiftedFunction) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -80,7 +81,10 @@ pub fn lift_to_verifiable(lifted: &LiftedFunction) -> VerifiableFunction {
 /// The conversion walks the TrustIr body and synthesizes `AbstractInsn` values
 /// with synthetic addresses derived from block ID and statement index.
 #[must_use]
-pub fn lifted_to_legacy(lifted: &LiftedFunction) -> LiftedProgram {
+pub fn lifted_to_legacy(lifted: &LiftedFunction) -> Result<LiftedProgram, crate::VcgenError> {
+    if lifted.trust_ir_body.contains_memory_image() {
+        return Err(crate::memory_image_error(&lifted.name));
+    }
     let mut instructions = Vec::new();
 
     for block in &lifted.trust_ir_body.blocks {
@@ -121,7 +125,14 @@ pub fn lifted_to_legacy(lifted: &LiftedFunction) -> LiftedProgram {
     // Ensure instructions are sorted by address and the entry point is present
     instructions.sort_by_key(|insn| insn.address);
 
-    LiftedProgram { instructions, entry_point: lifted.entry_point, registers }
+    Ok(LiftedProgram { instructions, entry_point: lifted.entry_point, registers })
+}
+
+fn memory_image_lift_vc(lifted: &LiftedFunction) -> Option<VerificationCondition> {
+    if !lifted.trust_ir_body.contains_memory_image() {
+        return None;
+    }
+    crate::memory_image_vc(&lift_to_verifiable(lifted))
 }
 
 /// Convert a TrustIr statement to an abstract instruction.
@@ -276,10 +287,24 @@ fn operand_to_abstract_value(op: &Operand) -> AbstractValue {
                 ConstValue::Str { bytes } => {
                     Formula::Var(ConstValue::str_smt_var_name(bytes), Sort::Int)
                 }
-                _ => Formula::Var(generated_lift_symbol("unknown_constant"), Sort::Int),
+                // A carrier with no modeled value is named by its occurrence
+                // identity (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1), never by one
+                // shared symbol.
+                other => match other.unmodeled_value_smt_var_name() {
+                    Some(name) => Formula::Var(name, Sort::Int),
+                    None => Formula::Var(generated_lift_symbol("unknown_constant"), Sort::Int),
+                },
             };
             AbstractValue::Formula(formula)
         }
+        // A refused operand is named by its occurrence identity (OPAQUE-REF-ID-1).
+        Operand::Unsupported { kind, origin, .. } => AbstractValue::Formula(Formula::Var(
+            Operand::unsupported_operand_smt_var_name(
+                origin,
+                &crate::sanitize_symbol_fragment(kind),
+            ),
+            Sort::Int,
+        )),
         _ => AbstractValue::Formula(Formula::Var(
             generated_lift_symbol("unknown_operand"),
             Sort::Int,
@@ -581,16 +606,14 @@ fn collect_allocator_blockers(
     formula: &Formula,
     blockers: &mut Vec<BinarySecurityBlockingEvidence>,
 ) {
-    if let Some(name) = formula.var_name()
-        && let Some(blocker) = allocator_blocker_from_var_name(name)
-        && !blockers.contains(&blocker)
-    {
-        blockers.push(blocker);
-    }
-
-    for child in formula.children() {
-        collect_allocator_blockers(child, blockers);
-    }
+    trust_types::visit_formula_nodes(formula, &mut |node| {
+        if let Some(name) = node.var_name()
+            && let Some(blocker) = allocator_blocker_from_var_name(name)
+            && !blockers.contains(&blocker)
+        {
+            blockers.push(blocker);
+        }
+    });
 }
 
 fn allocator_blocker_from_var_name(name: &str) -> Option<BinarySecurityBlockingEvidence> {
@@ -1009,6 +1032,9 @@ fn copy_sink_length_desc(
 /// Returns all VCs sorted by location for deterministic output.
 #[must_use]
 pub fn generate_binary_vcs(lifted: &LiftedFunction) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let verifiable = lift_to_verifiable(lifted);
     let mut vcs = crate::generate_vcs(&verifiable);
 
@@ -1053,6 +1079,9 @@ const AARCH64_ATOMIC_OBLIGATION_EVIDENCE_ID_PREFIX: &str = "aarch64-atomic:sha25
 pub fn generate_aarch64_selected_slice_boundary_vcs(
     lifted: &LiftedFunction,
 ) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let accesses = lifted
         .memory_accesses
         .iter()
@@ -1291,47 +1320,46 @@ fn aarch64_require_selected_access_evidence(
         &instruction_digest,
         &memory_digest,
     );
-    let evidence_id = aarch64_release_acquire_evidence_id(
-        role,
-        selected_image_digest,
-        &instruction_digest,
-        &memory_digest,
-    );
+    let evidence_id = format!("{AARCH64_RELEASE_ACQUIRE_EVIDENCE_ID_PREFIX}{evidence_hash}");
+    let evidence_digest = format!("sha256:{evidence_hash}");
+    let selected_image_sha = format!("sha256:{selected_image_digest}");
+    let instruction_sha = format!("sha256:{instruction_digest}");
+    let memory_sha = format!("sha256:{memory_digest}");
 
     let expected = [
-        ("evidence_schema", AARCH64_RELEASE_ACQUIRE_EVIDENCE_SCHEMA.to_string()),
-        ("evidence_id", evidence_id),
-        ("artifact_digest", format!("sha256:{evidence_hash}")),
-        ("artifact_row_schema", AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_SCHEMA.to_string()),
-        ("artifact_row_type", AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_TYPE.to_string()),
-        ("artifact_row_status", "accepted".to_string()),
-        ("selected_image_digest", format!("sha256:{selected_image_digest}")),
-        ("instruction_provenance_digest", format!("sha256:{instruction_digest}")),
-        ("memory_access_digest", format!("sha256:{memory_digest}")),
-        ("opcode", expected_opcode.to_string()),
-        ("ordering", expected_ordering.to_string()),
-        ("ordering_event", expected_ordering_event.to_string()),
-        ("exclusive_monitor", "None".to_string()),
-        ("exclusive_monitor_witness", "not-applicable-reviewed".to_string()),
-        ("store_conditional_status", "not-applicable-reviewed".to_string()),
-        ("synchronization_edge", "absent-reviewed".to_string()),
-        ("happens_before_witness", "absent-reviewed".to_string()),
-        ("thread_identity", "absent-reviewed".to_string()),
-        ("unsupported_ledger_boundary", "explicit-empty".to_string()),
-        ("unsupported_ledger_records", "0".to_string()),
-        ("reviewed_unsupported_absence", AARCH64_REVIEWED_UNSUPPORTED_ABSENCE.to_string()),
+        ("evidence_schema", AARCH64_RELEASE_ACQUIRE_EVIDENCE_SCHEMA),
+        ("evidence_id", evidence_id.as_str()),
+        ("artifact_digest", evidence_digest.as_str()),
+        ("artifact_row_schema", AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_SCHEMA),
+        ("artifact_row_type", AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_TYPE),
+        ("artifact_row_status", "accepted"),
+        ("selected_image_digest", selected_image_sha.as_str()),
+        ("instruction_provenance_digest", instruction_sha.as_str()),
+        ("memory_access_digest", memory_sha.as_str()),
+        ("opcode", expected_opcode),
+        ("ordering", expected_ordering),
+        ("ordering_event", expected_ordering_event),
+        ("exclusive_monitor", "None"),
+        ("exclusive_monitor_witness", "not-applicable-reviewed"),
+        ("store_conditional_status", "not-applicable-reviewed"),
+        ("synchronization_edge", "absent-reviewed"),
+        ("happens_before_witness", "absent-reviewed"),
+        ("thread_identity", "absent-reviewed"),
+        ("unsupported_ledger_boundary", "explicit-empty"),
+        ("unsupported_ledger_records", "0"),
+        ("reviewed_unsupported_absence", AARCH64_REVIEWED_UNSUPPORTED_ABSENCE),
         (
             "aarch64_ordering_monitor_evidence_schema",
-            AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_SCHEMA.to_string(),
+            AARCH64_ORDERING_MONITOR_EVIDENCE_ROW_SCHEMA,
         ),
-        ("aarch64_ordering_monitor_evidence_status", "accepted".to_string()),
-        ("aarch64_ordering_monitor_evidence_opcode", expected_opcode.to_string()),
-        ("aarch64_ordering_monitor_evidence_ordering", expected_ordering.to_string()),
-        ("aarch64_ordering_monitor_evidence_exclusive_monitor", "None".to_string()),
-        ("aarch64_ordering_monitor_evidence_digest", format!("sha256:{evidence_hash}")),
-        ("aarch64_ordering_monitor_evidence_blockers", "[]".to_string()),
-        ("release_transcript_consumed", "true".to_string()),
-        ("release_transcript_digest", format!("sha256:{evidence_hash}")),
+        ("aarch64_ordering_monitor_evidence_status", "accepted"),
+        ("aarch64_ordering_monitor_evidence_opcode", expected_opcode),
+        ("aarch64_ordering_monitor_evidence_ordering", expected_ordering),
+        ("aarch64_ordering_monitor_evidence_exclusive_monitor", "None"),
+        ("aarch64_ordering_monitor_evidence_digest", evidence_digest.as_str()),
+        ("aarch64_ordering_monitor_evidence_blockers", "[]"),
+        ("release_transcript_consumed", "true"),
+        ("release_transcript_digest", evidence_digest.as_str()),
     ];
 
     for (key, expected_value) in expected {
@@ -1513,6 +1541,7 @@ fn aarch64_release_acquire_evidence_hash(
     )
 }
 
+#[cfg(test)]
 fn aarch64_release_acquire_evidence_id(
     role: &str,
     selected_image_digest: &str,
@@ -1531,8 +1560,10 @@ fn aarch64_release_acquire_evidence_id(
 }
 
 fn aarch64_provenance_value<'a>(provenance: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    provenance.split(';').map(str::trim).find_map(|part| part.strip_prefix(&prefix))
+    provenance
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.split_once('=').and_then(|(k, v)| (k == key).then_some(v)))
 }
 
 fn aarch64_release_acquire_opcode_for_role(role: &str) -> Option<&'static str> {
@@ -1575,6 +1606,9 @@ fn aarch64_unsupported_record_summary(record: &UnsupportedRecord) -> String {
 /// facts cannot disappear between lifting and reporting.
 #[must_use]
 pub fn generate_unsupported_ledger_vcs(lifted: &LiftedFunction) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let aarch64_consumption = aarch64_atomic_consumption_by_record(lifted);
     lifted
         .unsupported
@@ -1642,10 +1676,6 @@ fn aarch64_atomic_fact_rejection_detail(
     let rejection = fact
         .proof_grade_rejection_reason()
         .unwrap_or_else(|| "AArch64 atomic semantic fact has no proof consumer".to_string());
-    let evidence_hash =
-        aarch64_atomic_obligation_evidence_hash(record, fact, related_memory_accesses, consumption);
-    let evidence_id =
-        aarch64_atomic_obligation_evidence_id(record, fact, related_memory_accesses, consumption);
     let instruction_digest = fact
         .origin
         .as_ref()
@@ -1655,6 +1685,14 @@ fn aarch64_atomic_fact_rejection_detail(
     let fact_digest = aarch64_atomic_fact_digest(fact);
     let memory_accesses_digest = aarch64_memory_accesses_digest(related_memory_accesses);
     let consumption_digest = aarch64_atomic_consumption_digest(consumption);
+    let evidence_hash = aarch64_atomic_obligation_evidence_hash_from_digests(
+        &record_digest,
+        &fact_digest,
+        &memory_accesses_digest,
+        &consumption_digest,
+        &instruction_digest,
+    );
+    let evidence_id = format!("{AARCH64_ATOMIC_OBLIGATION_EVIDENCE_ID_PREFIX}{evidence_hash}");
     let mut detail = format!(
         "{}; evidence_schema={AARCH64_ATOMIC_OBLIGATION_EVIDENCE_SCHEMA}; evidence_id={evidence_id}; artifact_digest=sha256:{evidence_hash}; instruction_provenance_digest=sha256:{instruction_digest}; unsupported_record_digest=sha256:{record_digest}; semantic_fact_digest=sha256:{fact_digest}; memory_access_facts_digest=sha256:{memory_accesses_digest}; proof_consumer_digest=sha256:{consumption_digest}; {}; {}; access={:?}; ordering={:?}; exclusive_monitor={:?}; reports_status={}",
         unsupported_record_detail(record),
@@ -1679,42 +1717,23 @@ fn aarch64_atomic_fact_rejection_detail(
     detail
 }
 
-fn aarch64_atomic_obligation_evidence_hash(
-    record: &UnsupportedRecord,
-    fact: &Aarch64AtomicSemanticFact,
-    related_memory_accesses: &[&MemoryAccessFact],
-    consumption: Option<&Aarch64ProofObligationConsumption>,
+fn aarch64_atomic_obligation_evidence_hash_from_digests(
+    record_digest: &str,
+    fact_digest: &str,
+    memory_accesses_digest: &str,
+    consumption_digest: &str,
+    instruction_digest: &str,
 ) -> String {
     stable_sha256_hex(
         format!(
             "schema={AARCH64_ATOMIC_OBLIGATION_EVIDENCE_SCHEMA}\n\
-             record_digest=sha256:{}\n\
-             semantic_fact_digest=sha256:{}\n\
-             memory_access_facts_digest=sha256:{}\n\
-             proof_consumer_digest=sha256:{}\n\
-             instruction_provenance_digest=sha256:{}",
-            aarch64_unsupported_record_digest(record),
-            aarch64_atomic_fact_digest(fact),
-            aarch64_memory_accesses_digest(related_memory_accesses),
-            aarch64_atomic_consumption_digest(consumption),
-            fact.origin
-                .as_ref()
-                .map(aarch64_instruction_provenance_digest)
-                .unwrap_or_else(|| stable_sha256_hex(b"missing-aarch64-atomic-origin")),
+             record_digest=sha256:{record_digest}\n\
+             semantic_fact_digest=sha256:{fact_digest}\n\
+             memory_access_facts_digest=sha256:{memory_accesses_digest}\n\
+             proof_consumer_digest=sha256:{consumption_digest}\n\
+             instruction_provenance_digest=sha256:{instruction_digest}",
         )
         .as_bytes(),
-    )
-}
-
-fn aarch64_atomic_obligation_evidence_id(
-    record: &UnsupportedRecord,
-    fact: &Aarch64AtomicSemanticFact,
-    related_memory_accesses: &[&MemoryAccessFact],
-    consumption: Option<&Aarch64ProofObligationConsumption>,
-) -> String {
-    format!(
-        "{AARCH64_ATOMIC_OBLIGATION_EVIDENCE_ID_PREFIX}{}",
-        aarch64_atomic_obligation_evidence_hash(record, fact, related_memory_accesses, consumption)
     )
 }
 
@@ -2126,6 +2145,9 @@ pub fn generate_binary_vcs_with_metadata(
     abi_facts: &[BinaryAbiFact],
     storage_facts: &[BinaryStorageFact],
 ) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let mut vcs = generate_binary_vcs(lifted);
     vcs.extend(generate_binary_abi_contradiction_vcs(
         &lifted.name,
@@ -2346,14 +2368,22 @@ fn known_layout_matches(
 }
 
 fn has_local_index(locals: &[trust_types::LocalDecl], index: usize) -> bool {
-    locals.iter().any(|local| local.index == index)
+    locals.get(index).is_some_and(|local| local.index == index)
+        || locals.iter().any(|local| local.index == index)
 }
 
 fn has_local_name(locals: &[trust_types::LocalDecl], index: usize, name: &str) -> bool {
-    locals.iter().any(|local| local.index == index && local.name.as_deref() == Some(name))
+    locals
+        .get(index)
+        .filter(|local| local.index == index)
+        .or_else(|| locals.iter().find(|local| local.index == index))
+        .is_some_and(|local| local.name.as_deref() == Some(name))
 }
 
 fn has_exact_dense_layout(locals: &[trust_types::LocalDecl], total: usize) -> bool {
+    if locals.len() == total && locals.iter().enumerate().all(|(idx, local)| local.index == idx) {
+        return true;
+    }
     locals.iter().map(|local| local.index).max() == Some(total - 1)
         && (0..total).all(|index| has_local_index(locals, index))
 }
@@ -2470,6 +2500,7 @@ fn lifted_rvalue_formula(rvalue: &Rvalue) -> Option<Formula> {
 
 fn lifted_operand_formula(operand: &Operand) -> Option<Formula> {
     match operand {
+        Operand::Constant(value) if value.contains_memory_image() => None,
         Operand::Symbolic(formula) => Some(formula.clone()),
         Operand::Constant(value) => Some(const_value_to_formula(value)),
         Operand::Copy(_) | Operand::Move(_) => None,
@@ -2495,29 +2526,143 @@ fn const_value_to_formula(value: &ConstValue) -> Formula {
         ),
         // opaque, injectively-named term for a `&str` literal.
         ConstValue::Str { bytes } => Formula::Var(ConstValue::str_smt_var_name(bytes), Sort::Int),
-        _ => Formula::Var(generated_lift_symbol("unknown_constant"), Sort::Int),
+        // A carrier with no modeled value is named by its occurrence identity
+        // (OPAQUE-SCALAR-ID-1, OPAQUE-REF-ID-1), never by one shared symbol.
+        other => match other.unmodeled_value_smt_var_name() {
+            Some(name) => Formula::Var(name, Sort::Int),
+            None => Formula::Var(generated_lift_symbol("unknown_constant"), Sort::Int),
+        },
     }
 }
 
-fn stack_pointer_mismatch_formula(
-    block: &trust_types::BasicBlock,
-    sp_local_index: Option<usize>,
-) -> Formula {
-    let entry_sp = Formula::Var("SP".into(), Sort::BitVec(64));
-    let return_sp = sp_local_index
-        .and_then(|sp_local| latest_sp_assignment_in_block(block, sp_local))
-        .map(|(formula, _)| formula)
-        .unwrap_or_else(|| {
-            // Return terminators do not currently carry an SP operand, and lifted
-            // TrustIr has no cross-block SP SSA value. This fallback remains
-            // path-insensitive but is tied to the return block and source span.
-            Formula::Var(
-                generated_lift_symbol(&format!("return_sp_bb{}", block.id.0)),
-                Sort::BitVec(64),
-            )
-        });
+// ── Stack discipline: the stack pointer at a return, over FUNCTION-ENTRY SP ──
+//
+// The semantic lift seeds a FRESH symbolic machine state per basic block, so a
+// bare `Var("SP")` in block B is SP at B's ENTRY, while the stack-discipline VC
+// compares against `Var("SP")` read as SP at FUNCTION entry. SP at a return is
+// therefore carried from function entry across the lifted CFG by
+// `trust_lift::stack_pointer_flow` — the dataflow this file used to own, moved
+// to `trust-lift` unchanged so `trust-decompile`'s frame reconstruction reads SP
+// through the same model. Its module note states the model; the contract this
+// file relies on is that every "not derivable" outcome is `None`, which leaves
+// SP at exit unconstrained and the VC satisfiable (reported).
 
-    Formula::Not(Box::new(Formula::Eq(Box::new(return_sp), Box::new(entry_sp))))
+fn machine_entry_sp() -> Formula {
+    trust_lift::function_entry_stack_pointer()
+}
+
+/// SP at the entry and exit of every block of `lifted` (by block position), over
+/// function-entry SP; `None` where it is not derivable. SP and frame-pointer
+/// writes are read with `lifted_rvalue_formula`, as everywhere else in this file.
+fn lifted_stack_pointer_flow(
+    lifted: &LiftedFunction,
+    sp_local: usize,
+) -> trust_lift::StackPointerFlow {
+    trust_lift::stack_pointer_flow_with_frame_pointer(
+        &lifted.trust_ir_body,
+        trust_lift::lifted_entry_block(lifted),
+        sp_local,
+        lifted_frame_pointer(lifted).as_ref(),
+        lifted_rvalue_formula,
+    )
+}
+
+/// The architecture a lifted body's local layout identifies, when exactly one
+/// matches. The single source for every architecture-dependent rule below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiftedLayout {
+    X86_64,
+    Aarch64,
+}
+
+fn lifted_layout(lifted: &LiftedFunction) -> Option<LiftedLayout> {
+    let x86_64 = known_layout_matches(
+        lifted,
+        &LocalLayout::x86_64(),
+        &[(1, "RAX"), (2, "RCX"), (19, "CF"), (20, "ZF")],
+    );
+    let aarch64 = known_layout_matches(
+        lifted,
+        &LocalLayout::aarch64(),
+        &[(1, "X0"), (2, "X1"), (34, "N"), (35, "Z")],
+    );
+    match (x86_64, aarch64) {
+        (true, false) => Some(LiftedLayout::X86_64),
+        (false, true) => Some(LiftedLayout::Aarch64),
+        _ => None,
+    }
+}
+
+/// The frame pointer the SP flow carries beside SP — `RBP` on x86-64, `X29` on
+/// AArch64 — so that a frame-pointer epilogue (`leave`, `mov sp, x29`) in a block
+/// after the prologue's re-expresses over function-entry SP instead of leaving
+/// SP at return unconstrained. Required beyond the layout match: the local is
+/// declared under the register's own name. Anything else tracks SP alone, which
+/// can only leave more returns unconstrained (reported), never fewer.
+fn lifted_frame_pointer(lifted: &LiftedFunction) -> Option<trust_lift::FramePointer> {
+    let (frame_pointer, name) = match lifted_layout(lifted)? {
+        LiftedLayout::X86_64 => (trust_lift::FramePointer::x86_64(), "RBP"),
+        LiftedLayout::Aarch64 => (trust_lift::FramePointer::aarch64(), "X29"),
+    };
+    has_local_name(&lifted.trust_ir_body.locals, frame_pointer.local(), name)
+        .then_some(frame_pointer)
+}
+
+/// How far the function-exit transfer itself leaves SP above its value at
+/// function entry when the stack is balanced — the ABI's definition of
+/// "restored" — or `None` when the body's architecture is not recognized.
+///
+/// * x86-64 SysV: the caller's `call` pushed the 8-byte return address, so SP
+///   at entry points at it and a balanced `ret` pops it, leaving entry SP + 8
+///   (the caller's SP before the `call`). The lift models `ret` as exactly
+///   that `SP := SP + 8` inside the return block.
+/// * AArch64 AAPCS64: `bl` passes the return address in X30, never on the
+///   stack, and `ret` does not touch SP, so a balanced return leaves entry SP.
+/// * A tail call jumps with the return address still in place: entry SP on
+///   both architectures.
+///
+/// The architecture is recognized from the lifted local layout, the same
+/// evidence `detect_sp_local` uses; an unrecognized body gets no expectation
+/// (and so a VC that stays satisfiable) rather than a guessed one — guessing
+/// AArch64 for an x86-64 body would accept an unbalanced `push`.
+fn balanced_return_sp_offset(lifted: &LiftedFunction, terminator: &Terminator) -> Option<i128> {
+    let return_address_on_stack = lifted_layout(lifted)? == LiftedLayout::X86_64;
+    match terminator {
+        Terminator::Return if return_address_on_stack => Some(8),
+        Terminator::Return | Terminator::TailCall { .. } => Some(0),
+        _ => None,
+    }
+}
+
+/// The stack-discipline violation formula for one function-exit block:
+/// `SP at exit != entry SP + balanced offset`. When either side is not
+/// derivable, SP at exit is a fresh unconstrained variable, so the violation
+/// stays satisfiable (reported), exactly as before this was modelled.
+fn stack_pointer_mismatch_formula(
+    block_id: usize,
+    sp_at_exit: Option<&Formula>,
+    balanced_offset: Option<i128>,
+) -> Formula {
+    let (exit_sp, expected_sp) = match (sp_at_exit, balanced_offset) {
+        (Some(exit_sp), Some(0)) => (exit_sp.clone(), machine_entry_sp()),
+        (Some(exit_sp), Some(offset)) => (
+            exit_sp.clone(),
+            Formula::BvAdd(
+                Box::new(machine_entry_sp()),
+                Box::new(Formula::BitVec { value: offset, width: 64 }),
+                64,
+            ),
+        ),
+        _ => (
+            Formula::Var(
+                generated_lift_symbol(&format!("return_sp_bb{block_id}")),
+                Sort::BitVec(64),
+            ),
+            machine_entry_sp(),
+        ),
+    };
+
+    Formula::Not(Box::new(Formula::Eq(Box::new(exit_sp), Box::new(expected_sp))))
 }
 
 fn return_source_span(
@@ -2543,7 +2688,12 @@ fn return_source_span(
 }
 
 fn block_return_instruction_span(lifted: &LiftedFunction, block_id: usize) -> Option<SourceSpan> {
-    let cfg_block = lifted.cfg.blocks.iter().find(|block| block.id == block_id)?;
+    let cfg_block = lifted
+        .cfg
+        .blocks
+        .get(block_id)
+        .filter(|block| block.id == block_id)
+        .or_else(|| lifted.cfg.blocks.iter().find(|block| block.id == block_id))?;
     let address = cfg_block.instructions.last()?.address;
 
     Some(SourceSpan {
@@ -2556,7 +2706,12 @@ fn block_return_instruction_span(lifted: &LiftedFunction, block_id: usize) -> Op
 }
 
 fn block_start_span(lifted: &LiftedFunction, block_id: usize) -> Option<SourceSpan> {
-    let cfg_block = lifted.cfg.blocks.iter().find(|block| block.id == block_id)?;
+    let cfg_block = lifted
+        .cfg
+        .blocks
+        .get(block_id)
+        .filter(|block| block.id == block_id)
+        .or_else(|| lifted.cfg.blocks.iter().find(|block| block.id == block_id))?;
     let address = cfg_block.start_addr;
 
     Some(SourceSpan {
@@ -2588,25 +2743,32 @@ fn statement_span(stmt: &Statement) -> Option<SourceSpan> {
 ///
 /// Memory-write VCs are emitted only for lifted `Store(MEM, address, value)`
 /// formulas so the OOB check uses the real access address. Stack-discipline VCs
-/// use the last lifted SP assignment in the return block when one exists; if no
-/// same-block SP assignment is available, the fallback is still path-insensitive
-/// because TrustIr return terminators do not carry a current SP operand.
+/// state `SP at exit != function-entry SP + the ABI's balanced-return offset`
+/// (8 for an x86-64 `ret`, 0 on AArch64 and for tail calls), with SP at exit
+/// carried from function entry through the lifted CFG by
+/// `lifted_stack_pointer_flow`. Where it cannot be derived on every path, SP
+/// at exit stays a fresh unconstrained variable and the VC stays satisfiable.
 #[must_use]
 pub fn generate_memory_model_vcs(lifted: &LiftedFunction) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let mut vcs = Vec::new();
     let func_name = &lifted.name;
     let mem_local_index = detect_memory_local(lifted);
     let sp_local_index = detect_sp_local(lifted);
+    let sp_flow = sp_local_index.map(|sp_local| lifted_stack_pointer_flow(lifted, sp_local));
     let has_memory_access_trace = !lifted.memory_accesses.is_empty();
 
     if has_memory_access_trace {
         vcs.extend(lifted.memory_accesses.iter().map(|access| memory_access_vc(func_name, access)));
-        vcs.extend(
-            lifted
-                .memory_accesses
-                .iter()
-                .filter_map(|access| saved_return_address_overwrite_access_vc(func_name, access)),
-        );
+        vcs.extend(lifted.memory_accesses.iter().filter_map(|access| {
+            saved_return_address_overwrite_access_vc(
+                func_name,
+                access,
+                stack_access_offset_from_function_entry(lifted, sp_flow.as_ref(), access),
+            )
+        }));
     }
 
     // Scan TrustIr blocks for memory-related statements.
@@ -2671,7 +2833,11 @@ pub fn generate_memory_model_vcs(lifted: &LiftedFunction) -> Vec<VerificationCon
 
         // Stack discipline: check that Return terminators restore SP.
         if matches!(&block.terminator, Terminator::Return | Terminator::TailCall { .. }) {
-            let sp_mismatch = stack_pointer_mismatch_formula(block, sp_local_index);
+            let sp_mismatch = stack_pointer_mismatch_formula(
+                block.id.0,
+                sp_flow.as_ref().and_then(|flow| flow.at_block_exit(block.id.0)),
+                balanced_return_sp_offset(lifted, &block.terminator),
+            );
 
             vcs.push(VerificationCondition {
                 kind: VcKind::Assertion {
@@ -2707,7 +2873,25 @@ fn memory_access_fact_covers(
     addr: &Formula,
 ) -> bool {
     accesses.iter().any(|access| {
-        access.kind == kind && (access.address == *addr || access.origin.span().file == span.file)
+        if access.kind != kind {
+            return false;
+        }
+        if access.address == *addr {
+            return true;
+        }
+        match &access.origin.source {
+            Some(src) => src.file == span.file,
+            None => span.file.strip_prefix("binary:0x").is_some_and(|hex| {
+                let mut buf = [0u8; 16];
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                let _ = std::io::Write::write_fmt(
+                    &mut cursor,
+                    format_args!("{:x}", access.origin.instruction_address),
+                );
+                let len = cursor.position() as usize;
+                hex.as_bytes() == &buf[..len]
+            }),
+        }
     })
 }
 
@@ -2719,6 +2903,9 @@ fn memory_access_fact_covers(
 /// promoted as proof-grade evidence.
 #[must_use]
 pub fn generate_control_flow_vcs(lifted: &LiftedFunction) -> Vec<VerificationCondition> {
+    if let Some(vc) = memory_image_lift_vc(lifted) {
+        return vec![vc];
+    }
     let mut vcs = Vec::new();
     let mut cfg_unresolved_blocks = Vec::new();
 
@@ -2832,8 +3019,15 @@ fn format_operand_formula(operand: &Operand, lifted: &LiftedFunction) -> Formula
                 let name = lifted
                     .trust_ir_body
                     .locals
-                    .iter()
-                    .find(|local| local.index == place.local)
+                    .get(place.local)
+                    .filter(|local| local.index == place.local)
+                    .or_else(|| {
+                        lifted
+                            .trust_ir_body
+                            .locals
+                            .iter()
+                            .find(|local| local.index == place.local)
+                    })
                     .and_then(|local| local.name.clone())
                     .unwrap_or_else(|| format!("_{}", place.local));
                 Formula::Var(name, Sort::Int)
@@ -2899,15 +3093,19 @@ fn unknown_memory_region_formula(_addr: Formula) -> Formula {
     Formula::Bool(true)
 }
 
+/// `offset_from_function_entry` is where the access lands relative to
+/// FUNCTION-entry SP (`stack_access_offset_from_function_entry`), or `None` when
+/// that is not known — and then the write is never presumed to miss the slot.
 fn saved_return_address_overwrite_access_vc(
     func_name: &str,
     access: &MemoryAccessFact,
+    offset_from_function_entry: Option<i64>,
 ) -> Option<VerificationCondition> {
     if access.kind != MemoryAccessKind::Write || !is_stack_like_access(access) {
         return None;
     }
 
-    if stack_write_definitely_misses_saved_return_slot(access) {
+    if stack_write_definitely_misses_saved_return_slot(access, offset_from_function_entry) {
         return None;
     }
 
@@ -2980,16 +3178,71 @@ fn is_stack_like_access(access: &MemoryAccessFact) -> bool {
                 .is_some_and(|base| base.contains("stack") || base.contains("frame")))
 }
 
-fn stack_write_definitely_misses_saved_return_slot(access: &MemoryAccessFact) -> bool {
-    let Some(offset) = access.offset.as_ref().and_then(formula_i128_value) else {
+/// Whether a stack write provably ends at or below function-entry SP, or starts
+/// at or above the end of the saved return-address slot `[entry SP, +8)`. Only
+/// then is its VC skipped. `offset_from_function_entry` is `None` when the
+/// write's position relative to function entry is not known, and then it is
+/// never presumed to miss.
+///
+/// The offset MUST be function-entry-relative. Until 2026-09-28 this read the
+/// lift's recorded `offset`, which is relative to the write's BLOCK-entry SP, so
+/// a write in a later block whose SP had been lowered could be judged a miss
+/// while it covered the slot — its VC silently dropped.
+fn stack_write_definitely_misses_saved_return_slot(
+    access: &MemoryAccessFact,
+    offset_from_function_entry: Option<i64>,
+) -> bool {
+    let Some(offset) = offset_from_function_entry.map(i128::from) else {
         return false;
     };
-    let Some(width) = i128::from(access.width_bytes).checked_add(offset) else {
-        return false;
-    };
+    let end = i128::from(access.width_bytes) + offset;
     let slot_width = i128::from(default_saved_return_address_width_bytes());
 
-    width <= 0 || offset >= slot_width
+    end <= 0 || offset >= slot_width
+}
+
+/// Where a stack access lands relative to FUNCTION-entry SP, in bytes.
+///
+/// The lift records a stack access's `offset` from the SP its instruction's
+/// BLOCK started with: each block is lifted from a fresh symbolic state, the
+/// same block-relative reading 887ac8352d and 756fb13e14 corrected for SP
+/// writes. So SP at that block's entry, from the shared flow, is added back.
+/// `None` — never a guess — when the block holding the instruction is not
+/// exactly one lifted block, SP at its entry is not function-entry SP plus a
+/// constant, the recorded offset is not a literal, or the sum leaves `i64`.
+/// Both parts are read in two's complement, so a wrapped literal is a small
+/// negative displacement, not a huge positive one.
+fn stack_access_offset_from_function_entry(
+    lifted: &LiftedFunction,
+    flow: Option<&trust_lift::StackPointerFlow>,
+    access: &MemoryAccessFact,
+) -> Option<i64> {
+    let recorded = displacement_as_i64(access.offset.as_ref().and_then(formula_i128_value)?);
+    let block = lifted_block_holding(lifted, access.origin.instruction_address)?;
+    let block_entry = trust_lift::function_entry_sp_offset(flow?.at_block_entry(block)?)?;
+    block_entry.checked_add(recorded)
+}
+
+/// A 64-bit address displacement, read in two's complement.
+fn displacement_as_i64(value: i128) -> i64 {
+    let modulus = 1i128 << 64;
+    let wrapped = value.rem_euclid(modulus);
+    let signed = if wrapped < modulus / 2 { wrapped } else { wrapped - modulus };
+    // In range by construction: `signed` lies in [-2^63, 2^63).
+    i64::try_from(signed).unwrap_or(i64::MIN)
+}
+
+/// The position, in the lifted body, of the ONE lifted block whose instructions
+/// include `instruction_address`; `None` when none or more than one does.
+fn lifted_block_holding(lifted: &LiftedFunction, instruction_address: u64) -> Option<usize> {
+    let mut holders = lifted.cfg.blocks.iter().filter(|block| {
+        block.instructions.iter().any(|instruction| instruction.address == instruction_address)
+    });
+    let block = holders.next()?;
+    if holders.next().is_some() {
+        return None;
+    }
+    (block.id < lifted.trust_ir_body.blocks.len()).then_some(block.id)
 }
 
 fn formula_i128_value(formula: &Formula) -> Option<i128> {
@@ -3067,6 +3320,32 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn memory_image_binary_entries_and_legacy_adapter_refuse_before_shortcuts() {
+        use crate::memory_image_tests::{assert_refusal, image, nested_image};
+        for value in [image(0), image(8), nested_image(8)] {
+            let mut lifted = make_test_lifted();
+            lifted.trust_ir_body.blocks[0].stmts[0] = Statement::Assign {
+                place: Place::local(0),
+                rvalue: Rvalue::Use(Operand::Constant(value.clone())),
+                span: SourceSpan::binary_address(0x1000),
+            };
+            let error = lifted_to_legacy(&lifted).expect_err("image cannot become a legacy symbol");
+            assert!(error.to_string().contains(crate::MEMORY_IMAGE_KIND));
+            for rows in [
+                generate_binary_vcs(&lifted),
+                generate_binary_vcs_with_metadata(&lifted, &[], &[]),
+                generate_memory_model_vcs(&lifted),
+                generate_control_flow_vcs(&lifted),
+                generate_unsupported_ledger_vcs(&lifted),
+                generate_aarch64_selected_slice_boundary_vcs(&lifted),
+            ] {
+                assert_refusal(&rows);
+            }
+            assert!(lifted_operand_formula(&Operand::Constant(value)).is_none());
+        }
+    }
 
     /// Build a minimal LiftedFunction for testing.
     fn make_test_lifted() -> LiftedFunction {
@@ -3243,6 +3522,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("callee"),
             is_foreign: false,
             func: "callee".to_string(),
             args: vec![Operand::Symbolic(formula.clone())],
@@ -3816,6 +4096,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("callee"),
             is_foreign: false,
             func: "callee".to_string(),
             args: vec![Operand::Symbolic(formula.clone())],
@@ -4193,8 +4474,44 @@ mod tests {
         assert!(!ret_addr_vcs[0].kind.has_runtime_fallback(true));
     }
 
+    /// A stack write whose instruction lies in NO lifted block has no known
+    /// position relative to function-entry SP (its recorded offset is relative
+    /// to an unknown block's entry), so it is never presumed to miss the saved
+    /// return-address slot. Until 2026-09-28 this fixture asserted the opposite,
+    /// reading the recorded `-16` as function-entry-relative. That the skip still
+    /// fires for a write whose position IS known is pinned on real lifted bytes:
+    /// `stack_discipline_from_real_bytes::saved_return_slot_*`.
+    /// A recorded offset is a 64-bit displacement: `2^64 - 4` is `-4`, so an
+    /// 8-byte write there spans `[entry SP - 4, entry SP + 4)` and crosses the
+    /// slot. Read as a plain integer it was "far above the slot" and skipped.
     #[test]
-    fn test_generate_memory_model_vcs_disjoint_stack_write_skips_return_address_vc() {
+    fn a_wrapped_stack_offset_is_a_small_negative_displacement() {
+        assert_eq!(displacement_as_i64((1i128 << 64) - 4), -4);
+        assert_eq!(displacement_as_i64(-16), -16);
+        assert_eq!(displacement_as_i64(8), 8);
+        let write = MemoryAccessFact {
+            origin: test_binary_origin(0x2000),
+            kind: MemoryAccessKind::Write,
+            address: Formula::Var("w".into(), Sort::BitVec(64)),
+            width_bytes: 8,
+            endianness: Endianness::Little,
+            region: MemoryRegionKind::Stack,
+            base_object: Some("SP".to_string()),
+            offset: None,
+            extent: None,
+            provenance: None,
+            taint: vec![],
+        };
+        let at = |offset: i128| Some(displacement_as_i64(offset));
+        assert!(!stack_write_definitely_misses_saved_return_slot(&write, at((1i128 << 64) - 4)));
+        assert!(stack_write_definitely_misses_saved_return_slot(&write, at((1i128 << 64) - 8)));
+        assert!(stack_write_definitely_misses_saved_return_slot(&write, at(8)));
+        assert!(!stack_write_definitely_misses_saved_return_slot(&write, at(7)));
+        assert!(!stack_write_definitely_misses_saved_return_slot(&write, None));
+    }
+
+    #[test]
+    fn test_generate_memory_model_vcs_stack_write_in_no_lifted_block_keeps_return_address_vc() {
         let mut lifted = make_mem_lifted();
         lifted.memory_accesses = vec![MemoryAccessFact {
             origin: test_binary_origin(0x2018),
@@ -4210,12 +4527,11 @@ mod tests {
             taint: vec![],
         }];
 
+        assert!(lifted.cfg.blocks.iter().all(|block| block.instructions.is_empty()));
         let mem_vcs = generate_memory_model_vcs(&lifted);
         assert!(
-            !mem_vcs
-                .iter()
-                .any(|vc| matches!(&vc.kind, VcKind::SavedReturnAddressOverwrite { .. })),
-            "stack writes whose known byte range misses [0, pointer_width) should not emit the saved-return-address VC"
+            mem_vcs.iter().any(|vc| matches!(&vc.kind, VcKind::SavedReturnAddressOverwrite { .. })),
+            "a stack write whose position relative to function entry is unknown keeps the saved-return-address VC"
         );
     }
 
@@ -4578,6 +4894,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("memcpy"),
             is_foreign: false,
             func: "memcpy".to_string(),
             args: vec![
@@ -4630,6 +4947,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("printf"),
             is_foreign: false,
             func: "printf".to_string(),
             args: vec![Operand::Copy(Place::local(1))],
@@ -4663,6 +4981,7 @@ mod tests {
             unwind: UnwindEdge::Unreachable,
             is_unsafe_sig: false,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("printf"),
             is_foreign: false,
             func: "printf".to_string(),
             args: vec![Operand::Constant(ConstValue::Uint(0x4000, 64))],
@@ -4919,6 +5238,379 @@ mod tests {
             sp_vc.location.file, "binary:0x2004",
             "stack VC should point at the lifted SP assignment when no return instruction span exists"
         );
+    }
+
+    /// The stack-discipline VC on REAL instruction bytes, lifted by the public
+    /// `trust_lift::Lifter` and decided by the in-process ay backend.
+    ///
+    /// A VC formula is the VIOLATION: `Proved` (UNSAT) means SP is restored on
+    /// every path, `Failed` (SAT) is a real unbalanced stack with a witness.
+    /// The positives pin that a function which never moves SP is no longer
+    /// reported; the NEGATIVE controls pin that one which moves SP and does not
+    /// restore it still is — including when the move is in an EARLIER block than
+    /// the `ret`, which is exactly where reading `Var("SP")` in the return block
+    /// as function-entry SP would have proved an unbalanced stack.
+    ///
+    /// Every encoding is Apple `as` output (`as -arch arm64` / `as -arch x86_64`,
+    /// read back with `otool -t` and `otool -tv`, 2026-09-27); each sequence's
+    /// assembly is written beside its bytes.
+    mod stack_discipline_from_real_bytes {
+        use trust_lift::{FunctionBoundary, LiftArch, Lifter};
+        use trust_router::{InProcessAyBackend, VerificationBackend};
+        use trust_types::VerificationResult;
+
+        use super::*;
+
+        const TEXT_BASE: u64 = 0x1000;
+
+        fn lift(arch: LiftArch, code: &[u8]) -> LiftedFunction {
+            let size = code.len() as u64;
+            Lifter::new_with_arch(
+                vec![FunctionBoundary { name: "stack_fixture".into(), start: TEXT_BASE, size }],
+                TEXT_BASE,
+                size,
+                0,
+                arch,
+            )
+            .lift_function(code, TEXT_BASE)
+            .unwrap_or_else(|error| panic!("fixture must lift: {error}"))
+        }
+
+        fn aarch64(words: &[u32]) -> LiftedFunction {
+            let code = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            lift(LiftArch::Aarch64, &code)
+        }
+
+        fn x86_64(code: &[u8]) -> LiftedFunction {
+            lift(LiftArch::X86_64, code)
+        }
+
+        fn stack_vcs(lifted: &LiftedFunction) -> Vec<VerificationCondition> {
+            let vcs = generate_binary_vcs(lifted)
+                .into_iter()
+                .filter(|vc| {
+                    matches!(&vc.kind, VcKind::Assertion { message }
+                        if message.starts_with("stack pointer not restored"))
+                })
+                .collect::<Vec<_>>();
+            assert!(!vcs.is_empty(), "every return block carries a stack-discipline VC");
+            vcs
+        }
+
+        fn solve(vc: &VerificationCondition) -> VerificationResult {
+            let backend = InProcessAyBackend::new();
+            assert!(backend.can_handle(vc), "ay must accept the stack VC: {vc:?}");
+            backend.verify(vc)
+        }
+
+        /// SP at the return is DERIVED (no fresh unknown) and the violation is
+        /// UNSAT on every return block.
+        fn assert_restored(lifted: &LiftedFunction, label: &str) {
+            for vc in stack_vcs(lifted) {
+                assert!(
+                    !formula_contains_var_prefix(
+                        &vc.formula,
+                        &generated_lift_symbol("return_sp_bb")
+                    ),
+                    "{label}: SP at return must be derived, not a fresh unknown: {:?}",
+                    vc.formula
+                );
+                let result = solve(&vc);
+                assert!(
+                    matches!(result, VerificationResult::Proved { .. }),
+                    "{label}: SP is restored, so the violation must be UNSAT; got {result:?} for {:?}",
+                    vc.formula
+                );
+            }
+        }
+
+        /// How SP at the return is expected to reach the VC.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum SpAtReturn {
+            /// Carried from function entry by the model (no fresh unknown).
+            Derived,
+            /// Paths disagree: a fresh unconstrained SP, by design.
+            Unconstrained,
+        }
+
+        /// Some return block's violation is SAT: the unbalanced stack is reported
+        /// with a witness, not merely left unknown. `expected` pins WHY it is SAT,
+        /// so a control the model should catch cannot pass via the fallback.
+        fn assert_not_restored(lifted: &LiftedFunction, label: &str, expected: SpAtReturn) {
+            let vcs = stack_vcs(lifted);
+            let fresh_prefix = generated_lift_symbol("return_sp_bb");
+            let observed =
+                if vcs.iter().any(|vc| formula_contains_var_prefix(&vc.formula, &fresh_prefix)) {
+                    SpAtReturn::Unconstrained
+                } else {
+                    SpAtReturn::Derived
+                };
+            assert_eq!(observed, expected, "{label}: {vcs:?}");
+            let results = vcs.iter().map(solve).collect::<Vec<_>>();
+            assert!(
+                results.iter().any(|result| matches!(result, VerificationResult::Failed { .. })),
+                "{label}: SP is NOT restored, so a violation must be SAT; got {results:?}"
+            );
+        }
+
+        #[test]
+        fn aarch64_function_that_never_moves_sp_restores_it() {
+            // ldr x0, [x0] ; ret — the relift Mach-O fixture's body.
+            assert_restored(&aarch64(&[0xF940_0000, 0xD65F_03C0]), "AArch64 ldr;ret");
+        }
+
+        #[test]
+        fn x86_64_function_that_never_moves_sp_restores_it() {
+            // mov rax, qword ptr [rdi] ; ret — the relift ELF fixture's body.
+            // `ret` pops the caller's return address: SP at exit is entry SP + 8.
+            assert_restored(&x86_64(&[0x48, 0x8B, 0x07, 0xC3]), "x86-64 mov;ret");
+        }
+
+        #[test]
+        fn x86_64_balanced_push_pop_frame_restores_sp() {
+            // push rbp ; mov rbp, rsp ; xor eax, eax ; pop rbp ; ret
+            let lifted = x86_64(&[0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3]);
+            assert_restored(&lifted, "x86-64 push/pop frame");
+        }
+
+        #[test]
+        fn restore_in_a_later_block_is_carried_across_the_cfg() {
+            // AArch64: sub sp, sp, #16 ; cbz x0, 1f ; mov x0, #1 ; 1: add sp, sp, #16 ; ret
+            let lifted =
+                aarch64(&[0xD100_43FF, 0xB400_0040, 0xD280_0020, 0x9100_43FF, 0xD65F_03C0]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_restored(&lifted, "AArch64 sub; cbz; mov; add; ret");
+
+            // x86-64: sub rsp, 8 ; test rdi, rdi ; je 1f ; xor eax, eax ; 1: add rsp, 8 ; ret
+            let lifted = x86_64(&[
+                0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0x48, 0x83, 0xC4,
+                0x08, 0xC3,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_restored(&lifted, "x86-64 sub; test; je; xor; add; ret");
+        }
+
+        /// A frame-pointer epilogue in a LATER block restores SP FROM the frame
+        /// pointer, which that block reads at its own entry. Until the frame
+        /// pointer was carried across blocks beside SP, each of these correct
+        /// functions was REPORTED unbalanced, with a counterexample; in one block
+        /// they always proved.
+        #[test]
+        fn frame_pointer_epilogue_in_a_later_block_restores_sp() {
+            // x86-64: push rbp ; mov rbp, rsp ; sub rsp, 16 ; test rdi, rdi ; je 1f ;
+            //         xor eax, eax ; 1: leave ; ret
+            let lifted = x86_64(&[
+                0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31,
+                0xC0, 0xC9, 0xC3,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_restored(&lifted, "x86-64 frame; je; leave; ret");
+
+            // x86-64, spelled out: ... 1: mov rsp, rbp ; pop rbp ; ret
+            let lifted = x86_64(&[
+                0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31,
+                0xC0, 0x48, 0x89, 0xEC, 0x5D, 0xC3,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_restored(&lifted, "x86-64 frame; je; mov rsp, rbp; pop rbp; ret");
+
+            // AArch64: stp x29, x30, [sp, #-16]! ; mov x29, sp ; sub sp, sp, #16 ;
+            //          cbz x0, 1f ; mov x0, #1 ; 1: mov sp, x29 ;
+            //          ldp x29, x30, [sp], #16 ; ret
+            let lifted = aarch64(&[
+                0xA9BF_7BFD,
+                0x9100_03FD,
+                0xD100_43FF,
+                0xB400_0040,
+                0xD280_0020,
+                0x9100_03BF,
+                0xA8C1_7BFD,
+                0xD65F_03C0,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_restored(&lifted, "AArch64 frame record; cbz; mov sp, x29; ldp; ret");
+        }
+
+        /// How many saved-return-address VCs the stack writes of `lifted` carry.
+        fn saved_return_slot_vcs(lifted: &LiftedFunction) -> usize {
+            generate_binary_vcs(lifted)
+                .iter()
+                .filter(|vc| matches!(vc.kind, VcKind::SavedReturnAddressOverwrite { .. }))
+                .count()
+        }
+
+        /// The skip is judged on the write's position from FUNCTION-entry SP.
+        /// Every fixture lowers SP by 16 in the entry block first, so a write at
+        /// `[rsp+16]` covers `[entry SP, +8)` and one at `[rsp+8]` or `[rsp]` lies
+        /// wholly below it — wherever the write sits.
+        #[test]
+        fn saved_return_slot_write_in_the_entry_block_is_judged_from_function_entry() {
+            // sub rsp, 16 ; mov [rsp+16], rax ; add rsp, 16 ; ret
+            let covers = x86_64(&[
+                0x48, 0x83, 0xEC, 0x10, 0x48, 0x89, 0x44, 0x24, 0x10, 0x48, 0x83, 0xC4, 0x10, 0xC3,
+            ]);
+            assert_eq!(saved_return_slot_vcs(&covers), 1, "the write covers the slot");
+
+            // sub rsp, 16 ; mov [rsp], rax ; add rsp, 16 ; ret
+            let below = x86_64(&[
+                0x48, 0x83, 0xEC, 0x10, 0x48, 0x89, 0x04, 0x24, 0x48, 0x83, 0xC4, 0x10, 0xC3,
+            ]);
+            assert_eq!(saved_return_slot_vcs(&below), 0, "the write lies below the slot");
+        }
+
+        /// The same writes in a LATER block. The lift records their offsets from
+        /// that block's entry SP (16 and 8); read as function-entry offsets, both
+        /// looked disjoint from the slot and the covering write's VC was dropped.
+        #[test]
+        fn saved_return_slot_write_in_a_later_block_is_judged_from_function_entry() {
+            // sub rsp, 16 ; test rdi, rdi ; je 1f ; xor eax, eax ;
+            // 1: mov [rsp+16], rax ; add rsp, 16 ; ret
+            let covers = x86_64(&[
+                0x48, 0x83, 0xEC, 0x10, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0x48, 0x89, 0x44,
+                0x24, 0x10, 0x48, 0x83, 0xC4, 0x10, 0xC3,
+            ]);
+            assert!(covers.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_eq!(saved_return_slot_vcs(&covers), 1, "the later-block write covers the slot");
+
+            // ... 1: mov [rsp+8], rax ; add rsp, 16 ; ret
+            let below = x86_64(&[
+                0x48, 0x83, 0xEC, 0x10, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0x48, 0x89, 0x44,
+                0x24, 0x08, 0x48, 0x83, 0xC4, 0x10, 0xC3,
+            ]);
+            assert!(below.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_eq!(
+                saved_return_slot_vcs(&below),
+                0,
+                "the later-block write lies below the slot"
+            );
+        }
+
+        // ── NEGATIVE controls: SP moved and never restored stays REPORTED ──
+
+        #[test]
+        fn aarch64_unrestored_sp_is_still_a_violation() {
+            // sub sp, sp, #16 ; ret
+            assert_not_restored(
+                &aarch64(&[0xD100_43FF, 0xD65F_03C0]),
+                "AArch64 sub;ret",
+                SpAtReturn::Derived,
+            );
+        }
+
+        #[test]
+        fn x86_64_unrestored_sp_is_still_a_violation() {
+            // sub rsp, 8 ; ret — `ret` then pops the wrong slot.
+            assert_not_restored(
+                &x86_64(&[0x48, 0x83, 0xEC, 0x08, 0xC3]),
+                "x86-64 sub;ret",
+                SpAtReturn::Derived,
+            );
+        }
+
+        /// The move is in the ENTRY block, the `ret` in a JOIN block that writes
+        /// no SP. The return block alone says "SP untouched"; only the path from
+        /// entry says it is 16 (8) bytes down. Reading the return block's
+        /// `Var("SP")` as function-entry SP would prove this unbalanced stack.
+        #[test]
+        fn sp_moved_in_an_earlier_block_and_not_restored_is_still_a_violation() {
+            // AArch64: sub sp, sp, #16 ; cbz x0, 1f ; mov x0, #1 ; 1: ret
+            let lifted = aarch64(&[0xD100_43FF, 0xB400_0040, 0xD280_0020, 0xD65F_03C0]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "AArch64 sub; cbz; mov; ret", SpAtReturn::Derived);
+
+            // x86-64: sub rsp, 8 ; test rdi, rdi ; je 1f ; xor eax, eax ; 1: ret
+            let lifted =
+                x86_64(&[0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0xC3]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "x86-64 sub; test; je; xor; ret", SpAtReturn::Derived);
+        }
+
+        /// Paths that disagree about SP at a join give no derived value: the VC
+        /// keeps a fresh SP and stays satisfiable.
+        #[test]
+        fn sp_moved_on_only_one_path_to_the_return_is_still_a_violation() {
+            // AArch64: cbz x0, 1f ; sub sp, sp, #16 ; 1: ret
+            let lifted = aarch64(&[0xB400_0040, 0xD100_43FF, 0xD65F_03C0]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "AArch64 cbz; sub; ret", SpAtReturn::Unconstrained);
+        }
+
+        /// A loop back into the ENTRY block: its entry state is the function's
+        /// entry state only on the first arrival. With x0 = 2 this pushes twice
+        /// and pops once. Treating the entry block's `Var("SP")` as function-entry
+        /// SP regardless of the back edge would prove it balanced.
+        #[test]
+        fn sp_moved_in_a_loop_back_to_entry_is_still_a_violation() {
+            // 1: sub sp, sp, #16 ; sub x0, x0, #1 ; cbnz x0, 1b ; add sp, sp, #16 ; ret
+            let lifted =
+                aarch64(&[0xD100_43FF, 0xD100_0400, 0xB5FF_FFC0, 0x9100_43FF, 0xD65F_03C0]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "AArch64 loop to entry", SpAtReturn::Unconstrained);
+        }
+
+        /// A frame-pointer epilogue that does NOT balance stays reported, with SP
+        /// at return DERIVED through the frame pointer: the carried value is exact,
+        /// not a looser "anything goes".
+        #[test]
+        fn frame_pointer_epilogue_that_does_not_balance_is_still_a_violation() {
+            // x86-64: push rbp ; mov rbp, rsp ; test rdi, rdi ; je 1f ; xor eax, eax ;
+            //         1: mov rsp, rbp ; ret — rbp is never popped, so `ret` pops it.
+            let lifted = x86_64(&[
+                0x55, 0x48, 0x89, 0xE5, 0x48, 0x85, 0xFF, 0x74, 0x02, 0x31, 0xC0, 0x48, 0x89, 0xEC,
+                0xC3,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "x86-64 mov rsp, rbp without pop", SpAtReturn::Derived);
+
+            // AArch64: stp x29, x30, [sp, #-16]! ; mov x29, sp ; sub sp, sp, #16 ;
+            //          cbz x0, 1f ; mov x0, #1 ; 1: mov sp, x29 ; ret — the frame
+            //          record is never popped.
+            let lifted = aarch64(&[
+                0xA9BF_7BFD,
+                0x9100_03FD,
+                0xD100_43FF,
+                0xB400_0040,
+                0xD280_0020,
+                0x9100_03BF,
+                0xD65F_03C0,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "AArch64 mov sp, x29 without ldp", SpAtReturn::Derived);
+        }
+
+        /// A frame pointer overwritten on one path no longer locates the frame, so
+        /// SP restored from it at the join is not derivable and stays reported.
+        /// Carrying the frame pointer while ignoring a later block's write to it
+        /// would prove both of these.
+        #[test]
+        fn frame_pointer_clobbered_on_one_path_is_still_a_violation() {
+            // x86-64: push rbp ; mov rbp, rsp ; sub rsp, 16 ; test rdi, rdi ; je 1f ;
+            //         mov rbp, rdi ; 1: leave ; ret
+            let lifted = x86_64(&[
+                0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10, 0x48, 0x85, 0xFF, 0x74, 0x03, 0x48,
+                0x89, 0xFD, 0xC9, 0xC3,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(&lifted, "x86-64 rbp clobbered; leave", SpAtReturn::Unconstrained);
+
+            // AArch64: stp x29, x30, [sp, #-16]! ; mov x29, sp ; cbz x0, 1f ;
+            //          mov x29, x0 ; 1: mov sp, x29 ; ldp x29, x30, [sp], #16 ; ret
+            let lifted = aarch64(&[
+                0xA9BF_7BFD,
+                0x9100_03FD,
+                0xB400_0040,
+                0xAA00_03FD,
+                0x9100_03BF,
+                0xA8C1_7BFD,
+                0xD65F_03C0,
+            ]);
+            assert!(lifted.trust_ir_body.blocks.len() > 1, "the fixture must be multi-block");
+            assert_not_restored(
+                &lifted,
+                "AArch64 x29 clobbered; mov sp, x29",
+                SpAtReturn::Unconstrained,
+            );
+        }
     }
 
     #[test]
@@ -5750,14 +6442,14 @@ mod tests {
     #[test]
     fn test_lifted_to_legacy_preserves_entry_point() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
         assert_eq!(legacy.entry_point, 0x1000);
     }
 
     #[test]
     fn test_lifted_to_legacy_creates_registers_from_locals() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
         assert_eq!(
             legacy.registers.len(),
             lifted.trust_ir_body.locals.len(),
@@ -5772,7 +6464,7 @@ mod tests {
     #[test]
     fn test_lifted_to_legacy_produces_instructions() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
         // One BinArith statement + one Return terminator
         assert!(
             legacy.instructions.len() >= 2,
@@ -5784,7 +6476,7 @@ mod tests {
     #[test]
     fn test_lifted_to_legacy_binarith_op() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
 
         let has_add = legacy.instructions.iter().any(|insn| {
             matches!(&insn.op, AbstractOp::BinArith { op: trust_types::BinOp::Add, .. })
@@ -5795,7 +6487,7 @@ mod tests {
     #[test]
     fn test_lifted_to_legacy_has_return() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
 
         let has_ret =
             legacy.instructions.iter().any(|insn| matches!(&insn.op, AbstractOp::Return { .. }));
@@ -5909,7 +6601,7 @@ mod tests {
     #[test]
     fn test_lifted_to_legacy_entry_point_in_instructions() {
         let lifted = make_test_lifted();
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
 
         let has_entry = legacy.instructions.iter().any(|insn| insn.address == legacy.entry_point);
         assert!(
@@ -5940,7 +6632,7 @@ mod tests {
             terminator: Terminator::Return,
         });
 
-        let legacy = lifted_to_legacy(&lifted);
+        let legacy = lifted_to_legacy(&lifted).expect("supported legacy fixture");
         let opaque_insn = legacy
             .instructions
             .iter()

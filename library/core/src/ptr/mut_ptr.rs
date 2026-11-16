@@ -40,8 +40,6 @@ impl<T: PointeeSized> *mut T {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(pointer_try_cast_aligned)]
-    ///
     /// let mut x = 0u64;
     ///
     /// let aligned: *mut u64 = &mut x;
@@ -50,7 +48,7 @@ impl<T: PointeeSized> *mut T {
     /// assert!(aligned.try_cast_aligned::<u32>().is_some());
     /// assert!(unaligned.try_cast_aligned::<u32>().is_none());
     /// ```
-    #[unstable(feature = "pointer_try_cast_aligned", issue = "141221")]
+    #[stable(feature = "pointer_try_cast_aligned", since = "CURRENT_RUSTC_VERSION")]
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[inline]
@@ -140,6 +138,7 @@ impl<T: PointeeSized> *mut T {
     /// [without_provenance]: without_provenance_mut
     #[must_use]
     #[inline(always)]
+    #[expect(clippy::transmutes_expressible_as_ptr_casts, reason = "implements pointer cast")]
     #[stable(feature = "strict_provenance", since = "1.84.0")]
     pub fn addr(self) -> usize {
         // A pointer-to-integer transmute currently has exactly the right semantics: it returns the
@@ -256,7 +255,6 @@ impl<T: PointeeSized> *mut T {
     /// [`as_uninit_ref`]: #method.as_uninit_ref-1
     /// [`as_ref_unchecked`]: #method.as_ref_unchecked-1
     /// [`as_mut`]: #method.as_mut
-
     #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[rustc_const_stable(feature = "const_ptr_is_null", since = "1.84.0")]
     #[inline]
@@ -399,11 +397,14 @@ impl<T: PointeeSized> *mut T {
     /// `count` is in units of **bytes**.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [offset][pointer::offset] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [offset][pointer::offset] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [offset][pointer::offset] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -638,6 +639,8 @@ impl<T: PointeeSized> *mut T {
     ///
     /// When calling this method, you have to ensure that *either* the pointer is null *or*
     /// the pointer is [convertible to a reference](crate::ptr#pointer-to-reference-conversion).
+    /// Note that because the created reference is to `MaybeUninit<T>`, the
+    /// source pointer can point to uninitialized memory.
     ///
     /// # Panics during const evaluation
     ///
@@ -748,9 +751,8 @@ impl<T: PointeeSized> *mut T {
     /// needed for `const`-compatibility: the distance between pointers into *different* allocated
     /// objects is not known at compile-time. However, the requirement also exists at
     /// runtime and may be exploited by optimizations. If you wish to compute the difference between
-    /// pointers that are not guaranteed to be from the same allocation, use `(self as isize -
-    /// origin as isize) / size_of::<T>()`.
-    // FIXME: recommend `addr()` instead of `as usize` once that is stable.
+    /// pointers that are not guaranteed to be from the same allocation, use
+    /// `(self.addr() as isize - origin.addr() as isize) / size_of::<T>()`.
     ///
     /// [`add`]: #method.add
     /// [allocation]: crate::ptr#allocation
@@ -807,11 +809,14 @@ impl<T: PointeeSized> *mut T {
     /// units of **bytes**.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [`offset_from`][pointer::offset_from] on it. See that method for
-    /// documentation and safety requirements.
+    /// using [`offset_from`][pointer::offset_from] on it.
     ///
     /// For non-`Sized` pointees this operation considers only the data pointers,
     /// ignoring the metadata.
+    ///
+    /// # Safety
+    ///
+    /// See [`offset_from`][pointer::offset_from] for documentation and safety requirements.
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
     #[rustc_const_stable(feature = "const_pointer_byte_offsets", since = "1.75.0")]
@@ -898,10 +903,13 @@ impl<T: PointeeSized> *mut T {
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
     /// using [`offset_from_unsigned`][pointer::offset_from_unsigned] on it.
-    /// See that method for documentation and safety requirements.
     ///
     /// For non-`Sized` pointees this operation considers only the data pointers,
     /// ignoring the metadata.
+    ///
+    /// # Safety
+    ///
+    /// See [`offset_from_unsigned`][pointer::offset_from_unsigned] for documentation and safety requirements.
     #[stable(feature = "ptr_sub_ptr", since = "1.87.0")]
     #[rustc_const_stable(feature = "const_ptr_sub_ptr", since = "1.87.0")]
     #[inline]
@@ -975,11 +983,14 @@ impl<T: PointeeSized> *mut T {
     /// `count` is in units of bytes.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [add][pointer::add] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [add][pointer::add] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [`add`][pointer::add] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -1060,11 +1071,14 @@ impl<T: PointeeSized> *mut T {
     /// `count` is in units of bytes.
     ///
     /// This is purely a convenience for casting to a `u8` pointer and
-    /// using [sub][pointer::sub] on it. See that method for documentation
-    /// and safety requirements.
+    /// using [sub][pointer::sub] on it.
     ///
     /// For non-`Sized` pointees this operation changes only the data pointer,
     /// leaving the metadata untouched.
+    ///
+    /// # Safety
+    ///
+    /// See [`sub`][pointer::sub] for documentation and safety requirements.
     #[must_use]
     #[inline(always)]
     #[stable(feature = "pointer_byte_offsets", since = "1.75.0")]
@@ -1126,6 +1140,7 @@ impl<T: PointeeSized> *mut T {
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[must_use = "returns a new pointer rather than modifying its argument"]
     #[rustc_const_stable(feature = "const_ptr_offset", since = "1.61.0")]
+    #[allow(clippy::ptr_offset_with_cast)]
     #[inline(always)]
     pub const fn wrapping_add(self, count: usize) -> Self
     where
@@ -1230,6 +1245,8 @@ impl<T: PointeeSized> *mut T {
     /// Reads the value from `self` without moving it. This leaves the
     /// memory in `self` unchanged.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::read`] for safety concerns and examples.
     ///
     /// [`ptr::read`]: crate::ptr::read()
@@ -1252,13 +1269,16 @@ impl<T: PointeeSized> *mut T {
     /// to not be elided or reordered by the compiler across other volatile
     /// operations.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::read_volatile`] for safety concerns and examples.
     ///
     /// [`ptr::read_volatile`]: crate::ptr::read_volatile()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
+    #[rustc_const_unstable(feature = "const_volatile", issue = "159094")]
     #[inline(always)]
     #[track_caller]
-    pub unsafe fn read_volatile(self) -> T
+    pub const unsafe fn read_volatile(self) -> T
     where
         T: Sized,
     {
@@ -1270,6 +1290,8 @@ impl<T: PointeeSized> *mut T {
     /// memory in `self` unchanged.
     ///
     /// Unlike `read`, the pointer may be unaligned.
+    ///
+    /// # Safety
     ///
     /// See [`ptr::read_unaligned`] for safety concerns and examples.
     ///
@@ -1291,6 +1313,8 @@ impl<T: PointeeSized> *mut T {
     ///
     /// NOTE: this has the *same* argument order as [`ptr::copy`].
     ///
+    /// # Safety
+    ///
     /// See [`ptr::copy`] for safety concerns and examples.
     ///
     /// [`ptr::copy`]: crate::ptr::copy()
@@ -1310,6 +1334,8 @@ impl<T: PointeeSized> *mut T {
     /// and destination may *not* overlap.
     ///
     /// NOTE: this has the *same* argument order as [`ptr::copy_nonoverlapping`].
+    ///
+    /// # Safety
     ///
     /// See [`ptr::copy_nonoverlapping`] for safety concerns and examples.
     ///
@@ -1331,6 +1357,8 @@ impl<T: PointeeSized> *mut T {
     ///
     /// NOTE: this has the *opposite* argument order of [`ptr::copy`].
     ///
+    /// # Safety
+    ///
     /// See [`ptr::copy`] for safety concerns and examples.
     ///
     /// [`ptr::copy`]: crate::ptr::copy()
@@ -1351,6 +1379,8 @@ impl<T: PointeeSized> *mut T {
     ///
     /// NOTE: this has the *opposite* argument order of [`ptr::copy_nonoverlapping`].
     ///
+    /// # Safety
+    ///
     /// See [`ptr::copy_nonoverlapping`] for safety concerns and examples.
     ///
     /// [`ptr::copy_nonoverlapping`]: crate::ptr::copy_nonoverlapping()
@@ -1368,11 +1398,14 @@ impl<T: PointeeSized> *mut T {
 
     /// Executes the destructor (if any) of the pointed-to value.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::drop_in_place`] for safety concerns and examples.
     ///
     /// [`ptr::drop_in_place`]: crate::ptr::drop_in_place()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
     #[rustc_const_unstable(feature = "const_drop_in_place", issue = "109342")]
+    #[rustc_diagnostic_item = "ptr_drop_in_place_self"]
     #[inline(always)]
     pub const unsafe fn drop_in_place(self)
     where
@@ -1384,6 +1417,8 @@ impl<T: PointeeSized> *mut T {
 
     /// Overwrites a memory location with the given value without reading or
     /// dropping the old value.
+    ///
+    /// # Safety
     ///
     /// See [`ptr::write`] for safety concerns and examples.
     ///
@@ -1402,6 +1437,8 @@ impl<T: PointeeSized> *mut T {
 
     /// Invokes memset on the specified pointer, setting `count * size_of::<T>()`
     /// bytes of memory starting at `self` to `val`.
+    ///
+    /// # Safety
     ///
     /// See [`ptr::write_bytes`] for safety concerns and examples.
     ///
@@ -1426,13 +1463,16 @@ impl<T: PointeeSized> *mut T {
     /// to not be elided or reordered by the compiler across other volatile
     /// operations.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::write_volatile`] for safety concerns and examples.
     ///
     /// [`ptr::write_volatile`]: crate::ptr::write_volatile()
     #[stable(feature = "pointer_methods", since = "1.26.0")]
+    #[rustc_const_unstable(feature = "const_volatile", issue = "159094")]
     #[inline(always)]
     #[track_caller]
-    pub unsafe fn write_volatile(self, val: T)
+    pub const unsafe fn write_volatile(self, val: T)
     where
         T: Sized,
     {
@@ -1444,6 +1484,8 @@ impl<T: PointeeSized> *mut T {
     /// dropping the old value.
     ///
     /// Unlike `write`, the pointer may be unaligned.
+    ///
+    /// # Safety
     ///
     /// See [`ptr::write_unaligned`] for safety concerns and examples.
     ///
@@ -1463,6 +1505,8 @@ impl<T: PointeeSized> *mut T {
     /// Replaces the value at `self` with `src`, returning the old
     /// value, without dropping either.
     ///
+    /// # Safety
+    ///
     /// See [`ptr::replace`] for safety concerns and examples.
     ///
     /// [`ptr::replace`]: crate::ptr::replace()
@@ -1480,6 +1524,8 @@ impl<T: PointeeSized> *mut T {
     /// Swaps the values at two mutable locations of the same type, without
     /// deinitializing either. They may overlap, unlike `mem::swap` which is
     /// otherwise equivalent.
+    ///
+    /// # Safety
     ///
     /// See [`ptr::swap`] for safety concerns and examples.
     ///
@@ -1645,17 +1691,14 @@ impl<T> *mut T {
     /// Performs the same functionality as [`cast_slice`] on a `*const T`, except that a
     /// raw mutable slice is returned, as opposed to a raw immutable slice.
     ///
-    /// This function is safe, but actually using the return value is unsafe.
-    /// See the documentation of [`slice::from_raw_parts_mut`] for slice safety requirements.
+    /// See [`ptr::slice_from_raw_parts`] for more information.
     ///
-    /// [`slice::from_raw_parts_mut`]: crate::slice::from_raw_parts_mut
+    /// [`ptr::slice_from_raw_parts`]: crate::ptr::slice_from_raw_parts
     /// [`cast_slice`]: pointer::cast_slice
     ///
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(ptr_cast_slice)]
-    ///
     /// let x = &mut [5, 6, 7];
     /// let raw_mut_slice = x.as_mut_ptr().cast_slice(3);
     ///
@@ -1670,7 +1713,6 @@ impl<T> *mut T {
     /// the raw slice. A slice reference must never have a null pointer, even if it's empty.
     ///
     /// ```rust,should_panic
-    /// #![feature(ptr_cast_slice)]
     /// use std::ptr;
     /// let danger: *mut [u8] = ptr::null_mut::<u8>().cast_slice(0);
     /// unsafe {
@@ -1678,7 +1720,8 @@ impl<T> *mut T {
     /// }
     /// ```
     #[inline]
-    #[unstable(feature = "ptr_cast_slice", issue = "149103")]
+    #[stable(feature = "ptr_cast_slice", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "ptr_cast_slice", since = "CURRENT_RUSTC_VERSION")]
     pub const fn cast_slice(self, len: usize) -> *mut [T] {
         slice_from_raw_parts_mut(self, len)
     }
@@ -1873,6 +1916,8 @@ impl<T> *mut [T] {
     /// Returns a raw pointer to an element or subslice, without doing bounds
     /// checking.
     ///
+    /// # Safety
+    ///
     /// Calling this method with an [out-of-bounds index] or when `self` is not dereferenceable
     /// is *[undefined behavior]* even if the resulting pointer is not used.
     ///
@@ -2025,7 +2070,7 @@ impl<T, const N: usize> *mut [T; N] {
     }
 }
 
-/// Pointer equality is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
+/// For thin pointers, equality is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",
@@ -2047,7 +2092,7 @@ impl<T: PointeeSized> PartialEq for *mut T {
 )]
 impl<T: PointeeSized> Eq for *mut T {}
 
-/// Pointer comparison is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
+/// For thin pointers, comparison is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",
@@ -2067,7 +2112,7 @@ impl<T: PointeeSized> Ord for *mut T {
     }
 }
 
-/// Pointer comparison is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
+/// For thin pointers, comparison is by address, as produced by the [`<*mut T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
 #[diagnostic::on_const(
     message = "pointers cannot be reliably compared during const eval",

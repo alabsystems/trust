@@ -1,4 +1,4 @@
-// ignore-tidy-dbg -- `lenwitness_dbg!` is a gated debug channel, not std dbg!; tidy's check is textual
+// ignore-tidy-file-dbg -- `lenwitness_dbg!` is a gated debug channel, not std dbg!; tidy's check is textual
 // Return-value grounding for functions returning `Option`/`Result` and for
 // paired length and ordering witnesses. An ungrounded return leaves the
 // postcondition talking about a model variable nothing pins, so the credited
@@ -153,22 +153,35 @@ fn return_producer_ancestors<'a>(
     func: &'a VerifiableFunction,
     from: &'a trust_types::BasicBlock,
 ) -> Vec<&'a trust_types::BasicBlock> {
+    if !block_preserves_return_place(from) {
+        return Vec::new();
+    }
     let mut chain = Vec::new();
     let mut current = from;
     let mut visited: FxHashSet<BlockId> = FxHashSet::default();
     visited.insert(from.id);
-    for _ in 0..RETURN_PRODUCER_WALK_FUEL {
-        if !block_preserves_return_place(current) {
+    let v2_preds = crate::fn_memo::v2_predecessors(func);
+    for step in 0..RETURN_PRODUCER_WALK_FUEL {
+        if step > 0 && !block_preserves_return_place(current) {
             break;
         }
-        let preds: Vec<&'a trust_types::BasicBlock> = func
-            .body
-            .blocks
-            .iter()
-            .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&current.id))
-            .collect();
         // Sole predecessor only: a join would need ALL of its predecessors.
-        let [only] = preds.as_slice() else { break };
+        let Some(only) = (match v2_preds.as_deref() {
+            Some(preds) => preds.sole_predecessor(func, current.id),
+            None => {
+                let mut preds = func
+                    .body
+                    .blocks
+                    .iter()
+                    .filter(|pred| v2_terminator_has_target(&pred.terminator, current.id));
+                match (preds.next(), preds.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            }
+        }) else {
+            break;
+        };
         if !visited.insert(only.id) {
             break;
         }
@@ -178,7 +191,7 @@ fn return_producer_ancestors<'a>(
         if !terminator_preserves_return_place(&only.terminator) {
             break;
         }
-        chain.push(*only);
+        chain.push(only);
         current = only;
     }
     chain
@@ -350,22 +363,8 @@ pub(super) fn resolve_forwarded_call_return_variant(
     fwd_block: usize,
 ) -> Option<(StdEnumReturn, usize)> {
     const FUEL: u32 = 8;
-    // (1) `call_dest` is a `Call` dest, and its value is stable end-to-end (so
-    // `discriminant(call_dest)` at the switch equals `_0`'s discriminant at the
-    // forward). A param / undefined / mutated local is NOT a forwarded call
-    // result and stays fail-closed.
-    let is_call_dest = func.body.blocks.iter().any(|b| {
-        matches!(&b.terminator, Terminator::Call { dest, .. }
-            if dest.local == call_dest && dest.projections.is_empty())
-    });
-    // NOTE: no GLOBAL stability requirement here — when the optimizer writes
-    // the callee result straight into `_0`, every OTHER return path also
-    // writes `_0` (their in-body aggregates), so global single-def can never
-    // hold. Soundness instead comes from the PATH-REGION no-write check below
-    // (2d): discriminant(call_dest) at the switch equals its value at Return
-    // along this path iff nothing writes `call_dest` between the switch edge
-    // and Return — the only segment that matters.
-    if !is_call_dest {
+    let tp = super::terminator_presence_for(func);
+    if !tp.has_bare_dest_call || !tp.has_switch_int {
         return None;
     }
     // The return type fixes the std enum + its variant defs; the forwarded value
@@ -380,6 +379,29 @@ pub(super) fn resolve_forwarded_call_return_variant(
     } else {
         return None;
     };
+    // (1) `call_dest` is a `Call` dest, and its value is stable end-to-end (so
+    // `discriminant(call_dest)` at the switch equals `_0`'s discriminant at the
+    // forward). A param / undefined / mutated local is NOT a forwarded call
+    // result and stays fail-closed.
+    let is_call_dest = crate::any_local_write_term(
+        func,
+        &func.body.blocks,
+        call_dest,
+        |_b, term| {
+            matches!(term, Terminator::Call { dest, .. }
+                if dest.local == call_dest && dest.projections.is_empty())
+        },
+    );
+    // NOTE: no GLOBAL stability requirement here — when the optimizer writes
+    // the callee result straight into `_0`, every OTHER return path also
+    // writes `_0` (their in-body aggregates), so global single-def can never
+    // hold. Soundness instead comes from the PATH-REGION no-write check below
+    // (2d): discriminant(call_dest) at the switch equals its value at Return
+    // along this path iff nothing writes `call_dest` between the switch edge
+    // and Return — the only segment that matters.
+    if !is_call_dest {
+        return None;
+    }
     let payload_variant = std_enum_payload_variant(kind);
     for gblock in &func.body.blocks {
         let Terminator::SwitchInt { discr, targets, otherwise, .. } = &gblock.terminator else {
@@ -393,6 +415,9 @@ pub(super) fn resolve_forwarded_call_return_variant(
         }
         // (2a) the switch discriminant is `discriminant(call_dest)`.
         let Some(d) = operand_root_local(func, discr, FUEL) else { continue };
+        if crate::local_defs::is_parameter(func, d) {
+            continue;
+        }
         let Some(Rvalue::Discriminant(p)) = crate::local_defs::unique_value_def(func, d) else {
             continue;
         };
@@ -401,34 +426,45 @@ pub(super) fn resolve_forwarded_call_return_variant(
         }
         // (2b) the switch DOMINATES the forward block (it is unreachable from
         // entry while avoiding the switch — every path to it passes the switch).
-        if reachable_avoiding(func, 0, &one_block_set(g)).contains(&fwd_block) {
+        if reachable_avoiding_one_contains(func, 0, Some(g), fwd_block) {
             continue;
         }
         // (2c) EXACTLY ONE switch edge reaches the forward block avoiding the
         // switch; that edge's selected variant is forced on this return path.
-        let avoid_g = one_block_set(g);
+        let discr_ty = crate::operand_ty_cow(func, discr);
         let mut n_reaching = 0usize;
         let mut forced: Option<usize> = None;
-        let mut edge_target: Option<usize> = None;
+        let mut reaching_start: Option<usize> = None;
         for (tag, tgt) in targets {
-            if !reachable_avoiding(func, tgt.0, &avoid_g).contains(&fwd_block) {
+            if !reachable_avoiding_one_contains(func, tgt.0, Some(g), fwd_block) {
                 continue;
             }
             n_reaching += 1;
-            edge_target = Some(tgt.0);
+            if n_reaching > 1 {
+                break;
+            }
+            reaching_start = Some(tgt.0);
             // `VariantDef::discriminant` is DECODED at the extraction boundary,
             // so the raw MIR arm label must be decoded too before the two can be
             // compared. (They used to be raw-vs-raw, which agreed by accident.)
             // An undecodable label leaves `forced` at `None`, which drops this
             // grounding — fail closed.
-            forced = crate::operand_ty_cow(func, discr)
+            forced = discr_ty
                 .as_deref()
                 .and_then(|ty| ty.decode_switch_label(*tag))
                 .and_then(|t| variants.iter().position(|v| v.discriminant == t));
         }
-        if reachable_avoiding(func, otherwise.0, &avoid_g).contains(&fwd_block) {
+        if n_reaching > 1
+            || (n_reaching == 1 && forced.is_none_or(|v| v == payload_variant))
+        {
+            continue;
+        }
+        if reachable_avoiding_one_contains(func, otherwise.0, Some(g), fwd_block) {
             n_reaching += 1;
-            edge_target = Some(otherwise.0);
+            if n_reaching != 1 {
+                continue;
+            }
+            reaching_start = Some(otherwise.0);
             // `otherwise` selects the COMPLEMENT of the explicit tags; force a
             // variant only when that complement is a SINGLE variant (the exact
             // 2-variant / `n-1`-explicit-target enum partition — e.g. Result's
@@ -439,7 +475,7 @@ pub(super) fn resolve_forwarded_call_return_variant(
             // GROW `remaining`, and a `remaining` that grows from 0 to 1 would
             // force a variant on a path whose `otherwise` is in fact
             // unreachable. Decline the whole complement instead.
-            let Some(covered) = crate::operand_ty_cow(func, discr).as_deref().and_then(|ty| {
+            let Some(covered) = discr_ty.as_deref().and_then(|ty| {
                 targets
                     .iter()
                     .map(|(t, _)| ty.decode_switch_label(*t))
@@ -447,13 +483,15 @@ pub(super) fn resolve_forwarded_call_return_variant(
             }) else {
                 continue;
             };
-            let remaining: Vec<usize> = variants
+            let mut rem = variants
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| !covered.contains(&v.discriminant))
-                .map(|(i, _)| i)
-                .collect();
-            forced = if remaining.len() == 1 { Some(remaining[0]) } else { None };
+                .map(|(i, _)| i);
+            forced = match (rem.next(), rem.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            };
         }
         if n_reaching != 1 {
             continue;
@@ -473,8 +511,9 @@ pub(super) fn resolve_forwarded_call_return_variant(
         // (ANY projection: a field write also perturbs the value) or as a
         // Call dest. The other return paths' `_0` writes live OUTSIDE S, so
         // this is exactly the sound scope. Fail closed on any write.
-        let Some(et) = edge_target else { continue };
-        let region = reachable_avoiding(func, et, &avoid_g);
+        let Some(start_block) = reaching_start else { continue };
+        let avoid_g = one_block_set(g);
+        let region = reachable_avoiding(func, start_block, &avoid_g);
         let region_writes = func.body.blocks.iter().any(|b| {
             if !region.contains(&b.id.0) {
                 return false;
@@ -502,6 +541,43 @@ pub(super) fn resolve_forwarded_call_return_variant(
         return Some((kind, variant));
     }
     None
+}
+
+/// Trust: 2026-09-14 — SOUNDNESS (kernel-`Certified` FALSE-VERIFY closure).
+/// True iff ANY statement in the function hands out a MUTABLE or RAW alias of
+/// `local` — `&mut local` / `&raw [const|mut] local` — via
+/// [`trust_types::Statement::escapes_local`], the affirmative escape test the
+/// owning crate spells out (`Rvalue::Ref { mutable: true }` | `Rvalue::AddressOf`,
+/// with `borrowed.local == local`; a `*const` is a valid `*const -> *mut` cast
+/// root, so a raw-const address-of qualifies, while a plain shared `&local`
+/// cannot mutate and does not).
+///
+/// WHY THE RESOLVER NEEDS IT. Once `local` has been mutably aliased, its value
+/// can be RESEATED through that alias (`*p = None`) AFTER its whole-local
+/// initializer runs, so an earlier `Rvalue::Aggregate`/`Use` definition can no
+/// longer be attributed to it as the value observed at `Return`. That is exactly
+/// the `let mut r = Some(5); let p = &mut r; *p = None; r` shape, which
+/// previously certified `is_some()` on a body returning `None` (and the polarity
+/// twin certified `is_none()` on a body returning `Some`): the resolver hopped
+/// `_0 -> _1` and read `_1`'s STALE `Some(5)` aggregate, blind to the
+/// `_2 = &mut _1; (*_2) = None` reseat that the discriminant model then
+/// contradicts (`_0__discr == 1` pinned against a `_0__discr == 0` fact from the
+/// deref store — an inconsistent context the kernel certifies vacuously).
+/// [`statements_preserve_return_place`] cannot catch it: the borrow's place-local
+/// is `_2` and the deref store's is `_2` (a `Deref` projection), never `_0`.
+///
+/// SCOPE. Whole-function, and conservative on purpose: the value reaching `_0`
+/// IS this tracked local's, this resolver has no region/liveness model of where
+/// the reseat happens relative to the definition, and the gates this feeds
+/// already fail the WHOLE function closed when any return path is unresolved. It
+/// withholds ONLY when a mutable/raw borrow of the tracked local actually exists,
+/// so a plain non-aliased `Some(..)`/`None`/`Ok(..)`/`Err(..)` return — whose
+/// holder is never borrowed — still grounds exactly as before. This mirrors the
+/// discipline [`f4_whole_local_defs`] already applies to its own witness local.
+fn local_escapes_anywhere(func: &VerifiableFunction, local: usize) -> bool {
+    crate::any_local_write_stmt(func, &func.body.blocks, local, |_b, s| {
+        crate::stmt_escapes_local(func, s, local)
+    })
 }
 
 /// Resolve the std-`Option`/`Result` aggregate that defines the return value
@@ -533,6 +609,46 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
     vc_block: &'a trust_types::BasicBlock,
     block: &'a trust_types::BasicBlock,
 ) -> Option<(StdEnumReturn, usize, &'a [trust_types::Operand], BlockId)> {
+    resolve_enum_return_aggregate_located(func, vc_block, block)
+        .map(|(kind, variant, ops, b, _)| (kind, variant, ops, b))
+}
+
+/// Fast whole-function pre-check for [`resolve_enum_return_aggregate_located`]:
+/// returns `true` iff the function's return local `_0` is a std `Option`/`Result`
+/// ADT or any statement in the body constructs a 2-variant std `Option`/`Result`
+/// aggregate. Without either, `resolve_enum_return_aggregate_located` is
+/// guaranteed to return `None` on every return path.
+pub(super) fn body_may_have_std_enum_return(func: &VerifiableFunction) -> bool {
+    if let Some(Ty::Adt { name, .. }) = crate::local_ty_ref(func, 0)
+        && (is_std_option_name(name) || is_std_result_name(name))
+    {
+        return true;
+    }
+    func.body.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::Assign {
+                    rvalue: Rvalue::Aggregate(AggregateKind::Adt { name, variant, .. }, _),
+                    ..
+                } if *variant <= 1 && (is_std_option_name(name) || is_std_result_name(name))
+            )
+        })
+    })
+}
+
+/// [`resolve_enum_return_aggregate_with_block`] plus the STATEMENT index of the
+/// resolved aggregate assignment inside that block (`None` for the forwarded
+/// Call-dest resolution, which has no aggregate statement and no operands).
+///
+/// Trust (2026-09-30, P2 of the `vac` root cause): the postcondition lane stamps
+/// the payload pin's reads at this statement, so a later whole-formula rename
+/// cannot re-read them against a post-write value.
+pub(super) fn resolve_enum_return_aggregate_located<'a>(
+    func: &'a VerifiableFunction,
+    vc_block: &'a trust_types::BasicBlock,
+    block: &'a trust_types::BasicBlock,
+) -> Option<(StdEnumReturn, usize, &'a [trust_types::Operand], BlockId, Option<usize>)> {
     // The whole-local definition of `local` (no field projection) that REACHES
     // the return, searched over the window the pin loop threads: the aggregate
     // lives in `vc_block`, the `_0 = _k` move in `block`; the
@@ -580,13 +696,13 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
     // wins)"; this makes the resolver agree with it.
     let mut search: Vec<&'a trust_types::BasicBlock> = vec![block, vc_block];
     search.extend(return_producer_ancestors(func, vc_block));
-    let whole_def = |local: usize| -> Option<(&'a Rvalue, BlockId)> {
-        search.iter().copied().find_map(|b| {
-            b.stmts.iter().rev().find_map(|stmt| match stmt {
+    let whole_def = |local: usize| -> Option<(&'a Rvalue, BlockId, usize, usize)> {
+        search.iter().copied().enumerate().find_map(|(bi, b)| {
+            b.stmts.iter().enumerate().rev().find_map(|(k, stmt)| match stmt {
                 Statement::Assign { place, rvalue, .. }
                     if place.local == local && place.projections.is_empty() =>
                 {
-                    Some((rvalue, b.id))
+                    Some((rvalue, b.id, bi, k))
                 }
                 _ => None,
             })
@@ -603,9 +719,26 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
     // check could never pass against it (the real-pipeline sbar trace).
     let mut fwd_block = vc_block.id.0;
     for _ in 0..4 {
+        // Trust: SOUNDNESS (2026-09-14) — WITHHOLD when the tracked local can be
+        // reseated through a `&mut`/`&raw` alias. Checked BEFORE `whole_def` so it
+        // covers `_0` itself, every whole-local alias hop below, and a bottomed-out
+        // Call-dest before it reaches `resolve_forwarded_call_return_variant`
+        // (whose discriminant-stability argument the same reseat would break). A
+        // `false` here changes nothing; a missed `true` re-attributes a stale
+        // initializer to a value the alias overwrote — the enum-return
+        // false-`Certified` this closes. See `local_escapes_anywhere`.
+        if local_escapes_anywhere(func, local) {
+            lenwitness_dbg!(
+                &lenwitness_dbg_fn(),
+                "resolve bb{}->bb{}: tracked _{local} is mutably/raw aliased (&mut/&raw) in-body -> WITHHELD (fail-closed, no stale-def grounding through an alias)",
+                vc_block.id.0,
+                block.id.0
+            );
+            return None;
+        }
         let wd = whole_def(local);
         if lenwitness_debug() {
-            let desc = if let Some((rv, b)) = wd {
+            let desc = if let Some((rv, b, _, _)) = wd {
                 format!("{} @bb{}", lenwitness_rvalue_tag(rv), b.0)
             } else {
                 "NONE (Call-dest / param / no in-block whole-local def)".to_string()
@@ -617,7 +750,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                 block.id.0
             );
         }
-        let Some((rv, def_block)) = wd else {
+        let Some((rv, def_block, def_bi, def_stmt)) = wd else {
             // No in-block whole-local def for `local` in the [vc_block, block]
             // window. Before giving up, try a GLOBAL unique forward-move hop:
             // the optimizer's `Err(e) => return Err(e)` arm lowers to
@@ -641,14 +774,24 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                 // resolution never uses it — no regression.
                 let mut cur = fwd_block;
                 let mut hopped = false;
+                let v2_preds = crate::fn_memo::v2_predecessors(func);
                 for _ in 0..6 {
-                    let preds: Vec<&trust_types::BasicBlock> = func
-                        .body
-                        .blocks
-                        .iter()
-                        .filter(|b| v2_terminator_targets(&b.terminator).iter().any(|t| t.0 == cur))
-                        .collect();
-                    let [only] = preds.as_slice() else { break };
+                    let Some(only) = (match v2_preds.as_deref() {
+                        Some(preds) => preds.sole_predecessor(func, BlockId(cur)),
+                        None => {
+                            let mut preds = func
+                                .body
+                                .blocks
+                                .iter()
+                                .filter(|b| v2_terminator_has_target(&b.terminator, BlockId(cur)));
+                            match (preds.next(), preds.next()) {
+                                (Some(only), None) => Some(only),
+                                _ => None,
+                            }
+                        }
+                    }) else {
+                        break;
+                    };
                     // Trust: SOUNDNESS (2026-09-01) — this walk previously inspected
                     // ONLY `Assign` statements, so it would hop into, or step through,
                     // a block whose TERMINATOR writes `local` (`Call { dest: local }`,
@@ -666,11 +809,9 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                     // the forward-move this hop models; anything else (a partial store,
                     // a `SetDiscriminant`, a `Deinit`, an unlocatable write) fails
                     // closed rather than being hopped over.
-                    let last_write = only
-                        .stmts
-                        .iter()
-                        .rev()
-                        .find(|s| !matches!(s.local_write(local), trust_types::LocalWrite::Untouched));
+                    let last_write = only.stmts.iter().rev().find(|s| {
+                        !matches!(s.local_write(local), trust_types::LocalWrite::Untouched)
+                    });
                     let def = match last_write {
                         None => None,
                         Some(Statement::Assign { place, rvalue, .. })
@@ -718,7 +859,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                     vc_block.id.0,
                     block.id.0
                 );
-                return Some((k, variant, &[], BlockId(fwd_block)));
+                return Some((k, variant, &[], BlockId(fwd_block), None));
             }
             return None;
         };
@@ -745,7 +886,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                     ops.len(),
                     def_block.0
                 );
-                return Some((kind, *variant, ops, def_block));
+                return Some((kind, *variant, ops, def_block, Some(def_stmt)));
             }
             Rvalue::Use(trust_types::Operand::Copy(p) | trust_types::Operand::Move(p))
                 if p.projections.is_empty() =>
@@ -757,6 +898,37 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                     block.id.0,
                     p.local
                 );
+                // Review round 44: `whole_def` reads the LAST def in the window,
+                // which can follow the copy being hopped through (`let t = r; r =
+                // Some(a); t` pinned `Some` for a `None` return, certified). Hop
+                // only when nothing writes the target AFTER the copy on this path:
+                // later statements of the copy's block, its terminator, and every
+                // block nearer the return (earlier in `search`). The last def found
+                // is then the value the copy read.
+                let target = p.local;
+                let writes_target = |stmt: &Statement| {
+                    !matches!(stmt.local_write(target), trust_types::LocalWrite::Untouched)
+                        || crate::stmt_escapes_local(func, stmt, target)
+                };
+                let written_after_copy =
+                    search[def_bi].stmts[def_stmt + 1..].iter().any(writes_target)
+                        || search[..=def_bi].iter().any(|b| {
+                            !matches!(
+                                b.terminator.local_write(target),
+                                trust_types::LocalWrite::Untouched
+                            )
+                        })
+                        || search[..def_bi].iter().any(|b| b.stmts.iter().any(writes_target));
+                if written_after_copy {
+                    lenwitness_dbg!(
+                        &lenwitness_dbg_fn(),
+                        "resolve bb{}->bb{}: alias hop target _{} is written after the copy -> WITHHELD",
+                        vc_block.id.0,
+                        block.id.0,
+                        p.local
+                    );
+                    return None;
+                }
                 // The block holding THIS `_local = move _p` is where the value
                 // (ultimately a Call-dest) is forwarded — record it so a
                 // bottomed-out Call-dest resolves its switch against this block.
@@ -880,19 +1052,43 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
         );
         return empty;
     }
+    // (c) FAIL CLOSED ON AN EXIT THIS GATE CANNOT INSPECT. The loop below walks
+    // `Terminator::Return` blocks only, while the pin loop it feeds
+    // (`contract_vcs.rs`) pins over `Return | TailCall` — so a tail-call exit is
+    // pinned without ever being gated, and a body with no `Return` at all is
+    // credited having inspected nothing. Neither can be grounded even in
+    // principle: a `TailCall`'s destination IS the return place, implicitly
+    // (`convert.rs:1838`, `let implicit_return = Place::local(0)`), so every
+    // `_0` definition reaching it is stale by construction — the same fact
+    // [`terminator_preserves_return_place`] refuses on. Measured before this
+    // guard: a body whose only exit was a tail call credited BOTH `_0__discr`
+    // and `_0__value` off `n_return_paths == 0`, and the pin loop then pinned
+    // the pre-tail-call `Ok(5)` into a body-aware `Postcondition` VC that is
+    // UNSAT on its own conjunction — a vacuous PROVE about a value the callee
+    // replaced.
+    if super::terminator_presence_for(func).has_tail_call {
+        lenwitness_dbg!(
+            &func.def_path,
+            "discr-gate: body has a TailCall exit (implicit `_0` dest, ungroundable) -> _0__discr UNGROUNDED"
+        );
+        return empty;
+    }
+    if !func.body.blocks.iter().any(|b| matches!(b.terminator, Terminator::Return)) {
+        lenwitness_dbg!(
+            &func.def_path,
+            "discr-gate: NO `Return` block to ground -> _0__discr UNGROUNDED (nothing was inspected)"
+        );
+        return empty;
+    }
     // (b) every Return path assigns _0 via an in-body aggregate of the SAME
     // std enum as the return type.
+    let v2_preds = crate::fn_memo::v2_predecessors_or_build(func);
     let mut n_return_paths = 0usize;
     for block in &func.body.blocks {
         if !matches!(block.terminator, Terminator::Return) {
             continue;
         }
-        let predecessors: Vec<&trust_types::BasicBlock> = func
-            .body
-            .blocks
-            .iter()
-            .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&block.id))
-            .collect();
+        let predecessors = v2_preds.predecessors(func, block.id);
         let vc_blocks: Vec<&trust_types::BasicBlock> =
             if predecessors.is_empty() { vec![block] } else { predecessors };
         for &vc_block in &vc_blocks {
@@ -922,34 +1118,6 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
                 }
             }
         }
-    }
-    // (c) FAIL CLOSED ON AN EXIT THIS GATE CANNOT INSPECT. The loop above walks
-    // `Terminator::Return` blocks only, while the pin loop it feeds
-    // (`contract_vcs.rs`) pins over `Return | TailCall` — so a tail-call exit is
-    // pinned without ever being gated, and a body with no `Return` at all is
-    // credited having inspected nothing. Neither can be grounded even in
-    // principle: a `TailCall`'s destination IS the return place, implicitly
-    // (`convert.rs:1838`, `let implicit_return = Place::local(0)`), so every
-    // `_0` definition reaching it is stale by construction — the same fact
-    // [`terminator_preserves_return_place`] refuses on. Measured before this
-    // guard: a body whose only exit was a tail call credited BOTH `_0__discr`
-    // and `_0__value` off `n_return_paths == 0`, and the pin loop then pinned
-    // the pre-tail-call `Ok(5)` into a body-aware `Postcondition` VC that is
-    // UNSAT on its own conjunction — a vacuous PROVE about a value the callee
-    // replaced.
-    if n_return_paths == 0 {
-        lenwitness_dbg!(
-            &func.def_path,
-            "discr-gate: NO `Return` block to ground -> _0__discr UNGROUNDED (nothing was inspected)"
-        );
-        return empty;
-    }
-    if func.body.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. })) {
-        lenwitness_dbg!(
-            &func.def_path,
-            "discr-gate: body has a TailCall exit (implicit `_0` dest, ungroundable) -> _0__discr UNGROUNDED"
-        );
-        return empty;
     }
     let mut set = FxHashSet::default();
     set.insert("_0__discr".to_string());
@@ -981,30 +1149,46 @@ pub(super) fn parse_len_model_var(name: &str) -> Option<LenModelVar> {
 /// NEITHER var occurs anywhere else (see the section banner — an occurrence
 /// outside a len/len `Eq` atom would leave the term under-constrained by the
 /// equality pin, flipping an honest Unknown into a refutable FAILED).
-pub(super) fn len_pair_coverage(posts: &[&Formula]) -> Vec<(LenModelVar, LenModelVar)> {
-    let mut total: FxHashMap<String, usize> = FxHashMap::default();
-    let mut paired: FxHashMap<String, usize> = FxHashMap::default();
+pub(super) fn len_pair_coverage<'a>(posts: &[&'a Formula]) -> Vec<(LenModelVar, LenModelVar)> {
+    let is_len_model_base = |base: &str| -> bool {
+        let Some(core) = base.strip_prefix("_0__value.").and_then(|s| s.strip_suffix("__len"))
+        else {
+            return false;
+        };
+        !core.is_empty() && core.split('.').all(|s| s.parse::<usize>().is_ok())
+    };
+    let mut total: FxHashMap<&'a str, usize> = FxHashMap::default();
+    let mut paired: FxHashMap<&'a str, usize> = FxHashMap::default();
     let mut pairs: Vec<(LenModelVar, LenModelVar)> = Vec::new();
-    for post in posts {
-        post.visit(&mut |f| match f {
-            Formula::Var(n, _) => {
-                if let Some(v) = parse_len_model_var(n) {
-                    *total.entry(v.name).or_default() += 1;
+    for &post in posts {
+        trust_types::visit_formula_nodes(post, &mut |f| match f {
+            Formula::Var(n, _) if n.starts_with("_0__value.") => {
+                let base = n.split('#').next().unwrap_or(n);
+                if is_len_model_base(base) {
+                    *total.entry(base).or_default() += 1;
                 }
             }
             Formula::Eq(l, r) => {
                 if let (Formula::Var(a, _), Formula::Var(b, _)) = (&**l, &**r)
-                    && let (Some(va), Some(vb)) = (parse_len_model_var(a), parse_len_model_var(b))
-                    && va.name != vb.name
+                    && a.starts_with("_0__value.")
+                    && b.starts_with("_0__value.")
                 {
-                    *paired.entry(va.name.clone()).or_default() += 1;
-                    *paired.entry(vb.name.clone()).or_default() += 1;
-                    let seen = pairs.iter().any(|(x, y)| {
-                        (x.name == va.name && y.name == vb.name)
-                            || (x.name == vb.name && y.name == va.name)
-                    });
-                    if !seen {
-                        pairs.push((va, vb));
+                    let base_a = a.split('#').next().unwrap_or(a);
+                    let base_b = b.split('#').next().unwrap_or(b);
+                    if base_a != base_b && is_len_model_base(base_a) && is_len_model_base(base_b) {
+                        for base in [base_a, base_b] {
+                            *paired.entry(base).or_default() += 1;
+                        }
+                        let seen = pairs.iter().any(|(x, y)| {
+                            (x.name == base_a && y.name == base_b)
+                                || (x.name == base_b && y.name == base_a)
+                        });
+                        if !seen
+                            && let (Some(va), Some(vb)) =
+                                (parse_len_model_var(base_a), parse_len_model_var(base_b))
+                        {
+                            pairs.push((va, vb));
+                        }
                     }
                 }
             }
@@ -1014,10 +1198,10 @@ pub(super) fn len_pair_coverage(posts: &[&Formula]) -> Vec<(LenModelVar, LenMode
     if lenwitness_debug() {
         let who = lenwitness_dbg_fn();
         for (a, b) in &pairs {
-            let cov_a = total.get(&a.name).copied().unwrap_or(0);
-            let par_a = paired.get(&a.name).copied().unwrap_or(0);
-            let cov_b = total.get(&b.name).copied().unwrap_or(0);
-            let par_b = paired.get(&b.name).copied().unwrap_or(0);
+            let cov_a = total.get(a.name.as_str()).copied().unwrap_or(0);
+            let par_a = paired.get(a.name.as_str()).copied().unwrap_or(0);
+            let cov_b = total.get(b.name.as_str()).copied().unwrap_or(0);
+            let par_b = paired.get(b.name.as_str()).copied().unwrap_or(0);
             let ok = cov_a == par_a && cov_b == par_b;
             eprintln!(
                 "LENWITNESS: [{who}] coverage: pair ({} path={:?} / {} path={:?}) totals(a occ={cov_a} paired={par_a}, b occ={cov_b} paired={par_b}) covered={ok}",
@@ -1032,7 +1216,8 @@ pub(super) fn len_pair_coverage(posts: &[&Formula]) -> Vec<(LenModelVar, LenMode
         }
     }
     pairs.retain(|(a, b)| {
-        total.get(&a.name) == paired.get(&a.name) && total.get(&b.name) == paired.get(&b.name)
+        total.get(a.name.as_str()) == paired.get(a.name.as_str())
+            && total.get(b.name.as_str()) == paired.get(b.name.as_str())
     });
     pairs
 }
@@ -1080,7 +1265,7 @@ pub(super) fn component_ty_is_owned_vec(func: &VerifiableFunction, path: &[usize
             _ => return false,
         };
     }
-    matches!(ty, Ty::Adt { name, .. } if is_owned_slice_container_name(name))
+    ty_is_owned_vec(ty)
 }
 
 /// The places that denote the payload component `src.<path>`, unfolded through
@@ -1092,10 +1277,13 @@ pub(super) fn component_ty_is_owned_vec(func: &VerifiableFunction, path: &[usize
 /// extract-then-guard wrapper shape, whose `_0 = Ok(move t)` operand is
 /// `t = move c` while the guard's `Vec::len` calls borrow `c.<path>`). A
 /// candidate is admitted ONLY while every root on the unfold — including every
-/// alias hop's source — is `place_source_is_stable` (single construction, no
-/// projected write, no `&mut`/raw-mut anywhere) — so a length observed on ANY
-/// candidate equals the returned component's length (no mutation can intervene
-/// between the witness and the return). An unstable/unresolvable hop stops
+/// alias hop's source — is `place_source_is_stable_modulo_whole_drops` (single
+/// construction, no projected write, no `&mut`/raw-mut anywhere) — so a length
+/// observed on ANY candidate equals the returned component's length (no mutation
+/// can intervene between the witness and the return). A terminator `Drop` of a
+/// WHOLE root is not such a mutation: it ends the value, and the witness borrow and
+/// the returned construction both read the root while it is live (the guard-Err
+/// path's `Drop(c)` in the ny wrapper; VCGEN-LIB-REDS-1). An unstable/unresolvable hop stops
 /// the unfold (keeping the shallower, still-valid candidates); an unstable
 /// `src` yields NO candidates at all. Fuel-bounded: alias hops do not consume
 /// a path index, so the walk needs an explicit bound (which also breaks a
@@ -1112,14 +1300,19 @@ pub(super) fn component_candidate_places(
     // Debug-only: WHY the descent stopped (never read unless `lenwitness_debug`).
     let mut stop_reason = "fuel exhausted (>16 hops)";
     for _ in 0..FUEL {
-        if !crate::place_source_is_stable(func, local) {
-            stop_reason = "root _local not place_source_is_stable (multi-def / projected write / &mut / raw-mut)";
+        if !crate::place_source_is_stable_modulo_whole_drops(func, local) {
+            stop_reason = "root _local not place_source_is_stable_modulo_whole_drops (multi-def / projected write / slot-write channel)";
             break;
         }
         out.push(Place {
             local,
             projections: path[idx..].iter().map(|&i| trust_types::Projection::Field(i)).collect(),
         });
+        if crate::local_defs::is_parameter(func, local) {
+            stop_reason =
+                "def is not a positional aggregate or whole-local move alias (leaf reached, or Call-dest / projected / non-variant-0)";
+            break;
+        }
         match crate::local_defs::unique_value_def(func, local) {
             // Positional aggregate: descend into the component's source operand.
             // Only while path components remain — at the leaf (`idx ==
@@ -1144,7 +1337,7 @@ pub(super) fn component_candidate_places(
                 idx += 1;
             }
             // Whole-value alias: the same value under another name; the loop
-            // head re-checks `place_source_is_stable` on the new root before
+            // head re-checks `place_source_is_stable_modulo_whole_drops` on the new root before
             // admitting any candidate through it. Followed at ANY idx, INCLUDING
             // the leaf (`idx == path.len()`): a FLAT top-level field pair whose
             // rebuilt-aggregate operand is a fresh move-temp of the guard
@@ -1209,6 +1402,13 @@ pub(super) fn component_source_leaf(
             );
             return None;
         }
+        if crate::local_defs::is_parameter(func, local) {
+            lenwitness_dbg!(
+                &func.def_path,
+                "source-leaf: src=_{src} path={path:?} STOP _{local} has no unique-whole-def aggregate (alias/Call-dest/multi-def) -> None"
+            );
+            return None;
+        }
         let Some(Rvalue::Aggregate(kind, ops)) = crate::local_defs::unique_value_def(func, local)
         else {
             lenwitness_dbg!(
@@ -1257,14 +1457,20 @@ pub(super) fn dominating_len_equality_guard(
     cand_b: &[Place],
 ) -> Option<(usize, usize)> {
     const FUEL: u32 = 8;
+    let tp = super::terminator_presence_for(func);
+    if !tp.has_switch_int || !tp.has_bare_dest_call {
+        return None;
+    }
     // The unique def of `l` is an INHERENT `Vec::len` call (`std::vec::Vec::<T>::len`
     // — no `as`-qualified trait path, which a user `len` impl over a `&Vec`
     // receiver would carry), so the dest genuinely denotes the container length.
-    // `operand_is_len_of_place` alone admits ANY `len`-tailed callee; combined
-    // with the component-type gate this pins the std semantics.
+    // `operand_is_len_of_place` admitted ANY `len`-tailed callee until 2026-10-03
+    // (NAME-ANCHOR-1); it now admits only a std container length
+    // (`is_std_inherent_len_call`), and this lane keeps its own narrower
+    // inherent-`Vec` gate, which with the component-type gate pins the std semantics.
     let inherent_vec_len_dest = |l: usize| -> bool {
-        func.body.blocks.iter().any(|b| {
-            matches!(&b.terminator,
+        crate::any_local_write_term(func, &func.body.blocks, l, |_b, term| {
+            matches!(term,
                 Terminator::Call { func: callee, dest, .. }
                     if dest.local == l
                         && dest.projections.is_empty()
@@ -1274,9 +1480,10 @@ pub(super) fn dominating_len_equality_guard(
     };
     let len_local_for = |op: &Operand, cands: &[Place]| -> Option<usize> {
         let (Operand::Copy(p) | Operand::Move(p)) = op else { return None };
-        if !p.projections.is_empty()
-            || !crate::place_source_is_stable(func, p.local)
+        if cands.is_empty()
+            || !p.projections.is_empty()
             || !inherent_vec_len_dest(p.local)
+            || !crate::place_source_is_stable(func, p.local)
         {
             return None;
         }
@@ -1294,6 +1501,9 @@ pub(super) fn dominating_len_equality_guard(
             continue;
         }
         let Some(c) = operand_root_local(func, discr, FUEL) else { continue };
+        if crate::local_defs::is_parameter(func, c) {
+            continue;
+        }
         let Some(Rvalue::BinaryOp(cmp, opl, opr)) = crate::local_defs::unique_value_def(func, c)
         else {
             continue;
@@ -1301,17 +1511,12 @@ pub(super) fn dominating_len_equality_guard(
         if !matches!(cmp, BinOp::Eq | BinOp::Ne) {
             continue;
         }
-        let sides = if let (Some(la), Some(lb)) =
-            (len_local_for(opl, cand_a), len_local_for(opr, cand_b))
-        {
-            Some((la, lb))
-        } else if let (Some(la), Some(lb)) =
-            (len_local_for(opr, cand_a), len_local_for(opl, cand_b))
-        {
-            Some((la, lb))
-        } else {
-            None
-        };
+        let sides = len_local_for(opl, cand_a)
+            .and_then(|la| len_local_for(opr, cand_b).map(|lb| (la, lb)))
+            .or_else(|| {
+                len_local_for(opr, cand_a)
+                    .and_then(|la| len_local_for(opl, cand_b).map(|lb| (la, lb)))
+            });
         let Some((la, lb)) = sides else { continue };
         let Some((true_t, false_t)) = bool_switch_branch_targets(targets, *otherwise) else {
             lenwitness_dbg!(
@@ -1323,7 +1528,7 @@ pub(super) fn dominating_len_equality_guard(
         let (good, bad) =
             if matches!(cmp, BinOp::Eq) { (true_t, false_t) } else { (false_t, true_t) };
         // The guard dominates the aggregate block (every path to it passes g)…
-        if reachable_avoiding(func, 0, &one_block_set(g)).contains(&agg_block) {
+        if reachable_avoiding_one_contains(func, 0, Some(g), agg_block) {
             lenwitness_dbg!(
                 &func.def_path,
                 "guard: bb{g} len-eq compare(_{la}/_{lb}) does NOT dominate agg bb{agg_block} (agg reachable from entry avoiding bb{g}) -> skip"
@@ -1331,8 +1536,7 @@ pub(super) fn dominating_len_equality_guard(
             continue;
         }
         // …the INEQUALITY edge cannot reach it, and the equality edge can.
-        let avoid_g = one_block_set(g);
-        if reachable_avoiding(func, bad.0, &avoid_g).contains(&agg_block) {
+        if reachable_avoiding_one_contains(func, bad.0, Some(g), agg_block) {
             lenwitness_dbg!(
                 &func.def_path,
                 "guard: bb{g} INEQUALITY edge bb{} reaches agg bb{agg_block} (not a fail-closed guard) -> skip",
@@ -1340,7 +1544,7 @@ pub(super) fn dominating_len_equality_guard(
             );
             continue;
         }
-        if !reachable_avoiding(func, good.0, &avoid_g).contains(&agg_block) {
+        if !reachable_avoiding_one_contains(func, good.0, Some(g), agg_block) {
             lenwitness_dbg!(
                 &func.def_path,
                 "guard: bb{g} EQUALITY edge bb{} cannot reach agg bb{agg_block} (out of window) -> skip",
@@ -1368,8 +1572,9 @@ pub(super) fn dominating_len_equality_guard(
 /// created EMPTY, single whole-local def, never written through a projection,
 /// every `&mut`/raw borrow feeding only `Vec::push`.
 pub(super) fn leaf_push_disciplined(func: &VerifiableFunction, leaf: usize) -> bool {
-    matches!(crate::local_ty_ref(func, leaf), Some(Ty::Adt { name, .. })
-        if is_owned_slice_container_name(name))
+    !crate::local_defs::is_parameter(func, leaf)
+        && super::terminator_presence_for(func).has_bare_dest_call
+        && crate::local_ty_ref(func, leaf).is_some_and(ty_is_owned_vec)
         && crate::local_defs::has_one_explicit_def(func, leaf)
         && vec_created_empty(func, leaf)
         && !local_has_projected_write(func, leaf)
@@ -1403,11 +1608,12 @@ pub(super) fn leaf_push_blocks(func: &VerifiableFunction, leaf: usize) -> Vec<us
 /// unwind edges excluded, matching the reachability helpers: a panic path
 /// never reaches `Return`, so postcondition facts are vacuous there).
 pub(super) fn block_pred_counts(func: &VerifiableFunction) -> FxHashMap<usize, usize> {
-    let mut preds: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut preds: FxHashMap<usize, usize> =
+        FxHashMap::with_capacity_and_hasher(func.body.blocks.len(), Default::default());
     for b in &func.body.blocks {
-        for t in v2_terminator_targets(&b.terminator) {
+        for_each_v2_terminator_target(&b.terminator, |t| {
             *preds.entry(t.0).or_default() += 1;
-        }
+        });
     }
     preds
 }
@@ -1450,11 +1656,19 @@ pub(super) fn push_chain_mate(
         if block_mentions_local(b, leaf_a) || block_mentions_local(b, leaf_b) {
             return None;
         }
-        let succs = v2_terminator_targets(&b.terminator);
-        if succs.len() != 1 {
+        let mut single_succ: Option<usize> = None;
+        let mut multiple_succs = false;
+        for_each_v2_terminator_target(&b.terminator, |target| {
+            if single_succ.is_some() {
+                multiple_succs = true;
+            } else {
+                single_succ = Some(target.0);
+            }
+        });
+        if multiple_succs {
             return None;
         }
-        cur = succs[0].0;
+        cur = single_succ?;
     }
     None
 }
@@ -1511,6 +1725,12 @@ pub(super) fn len_witness_path_pins(
     block: &trust_types::BasicBlock,
     pair: &(LenModelVar, LenModelVar),
 ) -> Option<Vec<Formula>> {
+    if !lenwitness_debug()
+        && (!component_ty_is_owned_vec(func, &pair.0.path)
+            || !component_ty_is_owned_vec(func, &pair.1.path))
+    {
+        return None;
+    }
     let dp = &func.def_path;
     let bb = (vc_block.id.0, block.id.0);
     let names = (&pair.0.name, &pair.1.name);
@@ -1576,9 +1796,9 @@ pub(super) fn len_witness_path_pins(
     let src = sp.local;
     // Both components must be owned-Vec-typed per the DECLARED payload type,
     // so the witness `len` has the std container semantics.
-    if !component_ty_is_owned_vec(func, &pair.0.path)
-        || !component_ty_is_owned_vec(func, &pair.1.path)
-    {
+    let a_ok = component_ty_is_owned_vec(func, &pair.0.path);
+    let b_ok = a_ok && component_ty_is_owned_vec(func, &pair.1.path);
+    if !b_ok {
         lenwitness_dbg!(
             dp,
             "path-pins bb{}->bb{} pair({}/{}): component type not owned Vec (a_ok={}, b_ok={}) -> None",
@@ -1586,8 +1806,8 @@ pub(super) fn len_witness_path_pins(
             bb.1,
             names.0,
             names.1,
-            component_ty_is_owned_vec(func, &pair.0.path),
-            component_ty_is_owned_vec(func, &pair.1.path)
+            a_ok,
+            b_ok
         );
         return None;
     }
@@ -1626,11 +1846,11 @@ pub(super) fn len_witness_path_pins(
             eq,
             Formula::Eq(
                 Box::new(a_var),
-                Box::new(operand_to_formula(func, &Operand::Copy(Place::local(la)))),
+                Box::new(crate::place_to_formula(func, &Place::local(la))),
             ),
             Formula::Eq(
                 Box::new(b_var),
-                Box::new(operand_to_formula(func, &Operand::Copy(Place::local(lb)))),
+                Box::new(crate::place_to_formula(func, &Place::local(lb))),
             ),
         ]);
     }
@@ -1687,11 +1907,19 @@ pub(super) fn len_witness_path_pins(
 /// lane, where `len_witness_path_pins` (same resolver) grounds them per path.
 pub(super) fn len_witness_credited_pairs(
     func: &VerifiableFunction,
-    posts: &[(Formula, String, SourceSpan, Option<usize>)],
+    posts: &[&Formula],
 ) -> Vec<(LenModelVar, LenModelVar)> {
     lenwitness_dbg_set_fn(&func.def_path);
-    let refs: Vec<&Formula> = posts.iter().map(|(f, _, _, _)| f).collect();
-    let mut pairs = len_pair_coverage(&refs);
+    if posts.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs = len_pair_coverage(posts);
+    if !lenwitness_debug() {
+        pairs.retain(|pair| {
+            component_ty_is_owned_vec(func, &pair.0.path)
+                && component_ty_is_owned_vec(func, &pair.1.path)
+        });
+    }
     if pairs.is_empty() {
         lenwitness_dbg!(
             &func.def_path,
@@ -1699,21 +1927,25 @@ pub(super) fn len_witness_credited_pairs(
         );
         return pairs;
     }
-    let before: Vec<(String, String)> =
-        pairs.iter().map(|(a, b)| (a.name.clone(), b.name.clone())).collect();
+    let before: Vec<(String, String)> = if lenwitness_debug() {
+        pairs.iter().map(|(a, b)| (a.name.clone(), b.name.clone())).collect()
+    } else {
+        Vec::new()
+    };
+    let v2_preds = crate::fn_memo::v2_predecessors_or_build(func);
+    let return_paths: Vec<(&trust_types::BasicBlock, Vec<&trust_types::BasicBlock>)> = func
+        .body
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.terminator, Terminator::Return))
+        .map(|block| {
+            let predecessors = v2_preds.predecessors(func, block.id);
+            let vc_blocks = if predecessors.is_empty() { vec![block] } else { predecessors };
+            (block, vc_blocks)
+        })
+        .collect();
     pairs.retain(|pair| {
-        for block in &func.body.blocks {
-            if !matches!(block.terminator, Terminator::Return) {
-                continue;
-            }
-            let predecessors: Vec<&trust_types::BasicBlock> = func
-                .body
-                .blocks
-                .iter()
-                .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&block.id))
-                .collect();
-            let vc_blocks: Vec<&trust_types::BasicBlock> =
-                if predecessors.is_empty() { vec![block] } else { predecessors };
+        for (block, vc_blocks) in &return_paths {
             for vc_block in vc_blocks {
                 if len_witness_path_pins(func, vc_block, block, pair).is_none() {
                     return false;
@@ -1744,14 +1976,6 @@ pub(super) fn parse_ok_pair_model_var(name: &str) -> Option<OkPairModelVar> {
     Some(OkPairModelVar { name: base.to_string(), index })
 }
 
-/// Parse the RETURN-payload sign term `_0__value__sign` (any `#version` token
-/// stripped). Other `{base}__sign` names (params, deeper projections) stay
-/// fail-closed: only the returned payload's own construction is grounded.
-pub(super) fn parse_sign_model_var(name: &str) -> Option<String> {
-    let base = name.split('#').next().unwrap_or(name);
-    (base == "_0__value__sign").then(|| base.to_string())
-}
-
 /// The two sides of an ordering ATOM (`Lt/Le/Gt/Ge/Eq`) — the only formula
 /// shapes the F4 coverage gates admit an occurrence inside. The parser lowers
 /// `!=` to `Not(Eq(..))`, so both polarities of every comparison reduce to
@@ -1773,84 +1997,73 @@ pub(super) fn ordering_atom_sides(f: &Formula) -> Option<(&Formula, &Formula)> {
 /// outside a pair ordering atom would leave the term under-constrained by
 /// the single pinned fact, flipping an honest Unknown into a refutable
 /// FAILED, and could smuggle in a discreteness-bearing atom).
-pub(super) fn ordering_pair_coverage(posts: &[&Formula]) -> Vec<(OkPairModelVar, OkPairModelVar)> {
-    let mut total: FxHashMap<String, usize> = FxHashMap::default();
-    let mut paired: FxHashMap<String, usize> = FxHashMap::default();
+pub(super) fn ordering_pair_coverage<'a>(
+    posts: &[&'a Formula],
+) -> Vec<(OkPairModelVar, OkPairModelVar)> {
+    let parse_ok_pair_base = |base: &str| -> Option<usize> {
+        base.strip_prefix("_0__value.__trust_ok_")?.parse::<usize>().ok()
+    };
+    let mut total: FxHashMap<&'a str, usize> = FxHashMap::default();
+    let mut paired: FxHashMap<&'a str, usize> = FxHashMap::default();
     let mut pairs: Vec<(OkPairModelVar, OkPairModelVar)> = Vec::new();
-    for post in posts {
-        post.visit(&mut |f| {
+    for &post in posts {
+        trust_types::visit_formula_nodes(post, &mut |f| {
             if let Formula::Var(n, _) = f
-                && let Some(v) = parse_ok_pair_model_var(n)
+                && n.starts_with("_0__value.__trust_ok_")
             {
-                *total.entry(v.name).or_default() += 1;
+                let base = n.split('#').next().unwrap_or(n);
+                if parse_ok_pair_base(base).is_some() {
+                    *total.entry(base).or_default() += 1;
+                }
             }
             if let Some((l, r)) = ordering_atom_sides(f)
                 && let (Formula::Var(a, _), Formula::Var(b, _)) = (l, r)
-                && let (Some(va), Some(vb)) =
-                    (parse_ok_pair_model_var(a), parse_ok_pair_model_var(b))
-                && va.index != vb.index
+                && a.starts_with("_0__value.__trust_ok_")
+                && b.starts_with("_0__value.__trust_ok_")
             {
-                *paired.entry(va.name.clone()).or_default() += 1;
-                *paired.entry(vb.name.clone()).or_default() += 1;
-                let seen = pairs.iter().any(|(x, y)| {
-                    (x.name == va.name && y.name == vb.name)
-                        || (x.name == vb.name && y.name == va.name)
-                });
-                if !seen {
-                    pairs.push((va, vb));
+                let base_a = a.split('#').next().unwrap_or(a);
+                let base_b = b.split('#').next().unwrap_or(b);
+                if let (Some(idx_a), Some(idx_b)) =
+                    (parse_ok_pair_base(base_a), parse_ok_pair_base(base_b))
+                    && idx_a != idx_b
+                {
+                    for base in [base_a, base_b] {
+                        *paired.entry(base).or_default() += 1;
+                    }
+                    let seen = pairs.iter().any(|(x, y)| {
+                        (x.name == base_a && y.name == base_b)
+                            || (x.name == base_b && y.name == base_a)
+                    });
+                    if !seen {
+                        pairs.push((
+                            OkPairModelVar { name: base_a.to_string(), index: idx_a },
+                            OkPairModelVar { name: base_b.to_string(), index: idx_b },
+                        ));
+                    }
                 }
             }
         });
     }
     pairs.retain(|(a, b)| {
-        total.get(&a.name) == paired.get(&a.name) && total.get(&b.name) == paired.get(&b.name)
+        total.get(a.name.as_str()) == paired.get(a.name.as_str())
+            && total.get(b.name.as_str()) == paired.get(b.name.as_str())
     });
     pairs
-}
-
-/// True iff `_0__value__sign` occurs in the declared postconditions and EVERY
-/// occurrence sits inside an ordering atom against the LITERAL 0 (either
-/// side). Any other position — a nonzero constant (which would need Int
-/// discreteness), another variable, arithmetic — keeps the term uncredited.
-pub(super) fn sign_var_covered(posts: &[&Formula]) -> bool {
-    let mut total = 0usize;
-    let mut covered = 0usize;
-    for post in posts {
-        post.visit(&mut |f| {
-            if let Formula::Var(n, _) = f
-                && parse_sign_model_var(n).is_some()
-            {
-                total += 1;
-            }
-            if let Some((l, r)) = ordering_atom_sides(f) {
-                let hit = matches!(
-                    (l, r),
-                    (Formula::Var(n, _), Formula::Int(0)) if parse_sign_model_var(n).is_some()
-                ) || matches!(
-                    (l, r),
-                    (Formula::Int(0), Formula::Var(n, _)) if parse_sign_model_var(n).is_some()
-                );
-                if hit {
-                    covered += 1;
-                }
-            }
-        });
-    }
-    total > 0 && total == covered
 }
 
 /// The ADT NAME of the payload component at positional `path` — walked
 /// through plain STRUCT (`variants.is_empty()`) and tuple types only, exactly
 /// like `component_ty_is_owned_vec`. The name keys the witness-callee
-/// allowlist (the component type's OWN `PartialOrd` impl / inherent sign
-/// predicates — the same functions the contract's runtime check denotes).
+/// allowlist (the component type's OWN `PartialOrd` impl — the same functions
+/// the contract's runtime check denotes) and the compiler's order-consistency
+/// set (`crate::is_order_consistent_adt`).
 /// `Ref`/slice/other component types fail closed: a by-ref component's
 /// REFERENT mutability is not closed by `place_source_is_stable` on the
 /// place roots.
-pub(super) fn payload_component_adt_name(
-    func: &VerifiableFunction,
+pub(super) fn payload_component_adt_name<'a>(
+    func: &'a VerifiableFunction,
     path: &[usize],
-) -> Option<String> {
+) -> Option<&'a str> {
     let mut ty = return_payload_ty(func)?;
     for &i in path {
         ty = match ty {
@@ -1860,7 +2073,7 @@ pub(super) fn payload_component_adt_name(
         };
     }
     match ty {
-        Ty::Adt { name, .. } => Some(name.clone()),
+        Ty::Adt { name, .. } => Some(name.as_str()),
         _ => None,
     }
 }
@@ -1871,25 +2084,23 @@ pub(super) fn payload_component_adt_name(
 /// the argument pair IN CALL ORDER. Exact-prefix matching against the full
 /// rendered self type prevents a partial type-name match.
 pub(super) fn partial_ord_witness_facts(callee: &str, ty_name: &str) -> Option<OrderFacts> {
+    // Trust (ARGS-FINGERPRINT-READ-1 round 3, 2026-10-07): this is a TYPE-PATH
+    // reader — it matches the rendered `Self` type `ty_name` and the trait path
+    // `core::cmp::PartialOrd` — so it DECLINES on a callee carrying the
+    // duplicate-crate-name argument tag, like every other type-path reader
+    // (`trust_types::args_display_may_name_a_same_named_crate`). The producer
+    // writes the tag exactly when a def in the call's generic arguments (for
+    // this trait method, `Self` and `Rhs`) lives in a crate whose rendered name
+    // does not identify it, so `<k::P as core::cmp::PartialOrd>::lt` may then be
+    // a same-named crate's `P`, whose operators nothing makes consistent. Until
+    // round 3 this reader stripped the tag and matched past it.
+    if trust_types::args_display_may_name_a_same_named_crate(callee) {
+        return None;
+    }
     let rest = callee.strip_prefix('<')?.strip_prefix(ty_name)?;
     let method = rest
         .strip_prefix(" as std::cmp::PartialOrd>::")
         .or_else(|| rest.strip_prefix(" as core::cmp::PartialOrd>::"))?;
-    // The extractor appends an exact monomorphization fingerprint to every
-    // rendered callee. Strip only its canonical fixed-width form: accepting a
-    // lookalike suffix would widen this closed witness allowlist.
-    let method = if let Some((method, tag)) = method.rsplit_once("::<__trust_args@") {
-        let Some(hex) = tag.strip_suffix('>') else {
-            return None;
-        };
-        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return None;
-        }
-        method
-    } else {
-        method
-    };
     match method {
         "lt" => Some(OrderFacts::LT),
         "le" => Some(OrderFacts::LE),
@@ -1899,21 +2110,16 @@ pub(super) fn partial_ord_witness_facts(callee: &str, ty_name: &str) -> Option<O
     }
 }
 
-/// Classify an allowlisted SIGN witness callee: the payload type's own
-/// INHERENT sign predicate `{ty_name}::{is_positive,is_negative,is_zero}`,
-/// returning the outcome set its TRUE result admits for `(payload, 0)`.
-/// These are the exact predicates the spec parser's `{base}__sign` convention
-/// denotes (all three share one sign term — the parser's own trichotomy
-/// reading, see `spec_parse`).
-pub(super) fn sign_witness_facts(callee: &str, ty_name: &str) -> Option<OrderFacts> {
-    let method = callee.strip_prefix(ty_name)?.strip_prefix("::")?;
-    match method {
-        "is_positive" => Some(OrderFacts::GT),
-        "is_negative" => Some(OrderFacts::LT),
-        "is_zero" => Some(OrderFacts::EQ),
-        _ => None,
-    }
-}
+// Trust (2026-10-05, ORD-WITNESS-CONSISTENT-1): the SIGN witness lane is
+// retired. It credited a payload type's own inherent `is_positive` /
+// `is_negative` / `is_zero` as one trichotomy over the payload's sign, read off
+// the callee's rendered name alone. Nothing makes three user methods agree:
+// with `is_negative` and `is_positive` both answering `true`, a body guarded by
+// `c.is_negative()` had `!(Ok(c) if c.is_positive())` reported proved under
+// certify (`tests/ui/trust/ordering_witness_inconsistent_partial_ord.rs`). No
+// compiler fact establishes them consistent, so `_0__value__sign` stays
+// ungrounded (`SpecModelUngrounded`), as every other unmodeled spec-model term
+// does.
 
 /// True iff witness-call operand `op` denotes one of the component's
 /// candidate places: the place itself, a single-def SHARED borrow of it, or a
@@ -1929,22 +2135,34 @@ pub(super) fn f4_operand_denotes_candidate(
     cands: &[Place],
     fuel: u32,
 ) -> bool {
+    fn place_denotes(
+        func: &VerifiableFunction,
+        p: &Place,
+        cands: &[Place],
+        fuel: u32,
+    ) -> bool {
+        if cands.contains(p) {
+            return true;
+        }
+        if fuel == 0
+            || !p.projections.is_empty()
+            || crate::local_defs::is_parameter(func, p.local)
+            || !crate::place_source_is_stable(func, p.local)
+        {
+            return false;
+        }
+        match crate::local_defs::unique_value_def(func, p.local) {
+            Some(Rvalue::Ref { mutable: false, place }) => cands.contains(place),
+            Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) if q.projections.is_empty() => {
+                place_denotes(func, q, cands, fuel - 1)
+            }
+            _ => false,
+        }
+    }
     let (Operand::Copy(p) | Operand::Move(p)) = op else {
         return false;
     };
-    if cands.contains(p) {
-        return true;
-    }
-    if fuel == 0 || !p.projections.is_empty() || !crate::place_source_is_stable(func, p.local) {
-        return false;
-    }
-    match crate::local_defs::unique_value_def(func, p.local) {
-        Some(Rvalue::Ref { mutable: false, place }) => cands.contains(place),
-        Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) if q.projections.is_empty() => {
-            f4_operand_denotes_candidate(func, &Operand::Copy(q.clone()), cands, fuel - 1)
-        }
-        _ => false,
-    }
+    place_denotes(func, p, cands, fuel)
 }
 
 /// The outcome set a single allowlisted witness CALL's true result admits for
@@ -1959,37 +2177,33 @@ pub(super) fn f4_call_witness_facts(
     target: &OrdWitnessTarget<'_>,
 ) -> Option<OrderFacts> {
     const FUEL: u32 = 4;
-    match target {
-        OrdWitnessTarget::Pair { ty_name, cand_a, cand_b } => {
-            let base = partial_ord_witness_facts(callee, ty_name)?;
-            let [a0, a1] = args else {
-                return None;
-            };
-            let fwd = f4_operand_denotes_candidate(func, a0, cand_a, FUEL)
-                && f4_operand_denotes_candidate(func, a1, cand_b, FUEL);
-            let rev = f4_operand_denotes_candidate(func, a0, cand_b, FUEL)
-                && f4_operand_denotes_candidate(func, a1, cand_a, FUEL);
-            match (fwd, rev) {
-                (true, false) => Some(base),
-                (false, true) => Some(base.mirrored()),
-                (true, true) if base == base.mirrored() => Some(base),
-                _ => None,
-            }
-        }
-        OrdWitnessTarget::Sign { ty_name, cands } => {
-            let base = sign_witness_facts(callee, ty_name)?;
-            let [a0] = args else {
-                return None;
-            };
-            f4_operand_denotes_candidate(func, a0, cands, FUEL).then_some(base)
-        }
+    let OrdWitnessTarget::Pair { ty_name, cand_a, cand_b } = target;
+    let base = partial_ord_witness_facts(callee, ty_name)?;
+    let [a0, a1] = args else {
+        return None;
+    };
+    let fwd = f4_operand_denotes_candidate(func, a0, cand_a, FUEL)
+        && f4_operand_denotes_candidate(func, a1, cand_b, FUEL);
+    if fwd && base == base.mirrored() {
+        return Some(base);
+    }
+    let rev = f4_operand_denotes_candidate(func, a0, cand_b, FUEL)
+        && f4_operand_denotes_candidate(func, a1, cand_a, FUEL);
+    match (fwd, rev) {
+        (true, false) => Some(base),
+        (false, true) => Some(base.mirrored()),
+        (true, true) if base == base.mirrored() => Some(base),
+        _ => None,
     }
 }
 
 /// EVERY whole-local def of `local` — statement assigns AND call dests.
 /// `None` (fail-closed) on any projected write, `SetDiscriminant`/`Deinit`,
-/// any `&mut`/raw-mut borrow (an invisible reseat channel), or when there is
-/// no def at all (a parameter — its value is no witness).
+/// any slot-write channel of `local` (`path_defs::own_storage_write_borrow`: `&mut`,
+/// `&raw mut`, and `&raw const` of an owned place — an invisible reseat channel;
+/// `&raw const` was missing until 2026-09-30), or when there is no def at all (a
+/// parameter — its value is no witness). The SLOT rule: this asks about
+/// `local`'s own value, never about memory behind it.
 pub(super) fn f4_whole_local_defs<'a>(
     func: &'a VerifiableFunction,
     local: usize,
@@ -2001,41 +2215,39 @@ pub(super) fn f4_whole_local_defs<'a>(
         return None;
     }
     let mut out = Vec::new();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
+    let invalid =
+        crate::any_local_write_candidate(func, &func.body.blocks, local, |block, item| match item {
+            Some(stmt) => match stmt {
                 Statement::Assign { place, rvalue, .. } => {
                     if place.local == local {
                         if !place.projections.is_empty() {
-                            return None;
+                            return true;
                         }
                         out.push(F4LocalDef::Rv(rvalue));
                     }
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(true, borrowed) = rvalue
-                        && borrowed.local == local
-                    {
-                        return None;
-                    }
+                    // `&raw const local` of its own storage too (2026-10-08 H2:
+                    // `path_defs::own_storage_write_borrow`).
+                    super::own_storage_write_borrow(func, rvalue)
+                        .is_some_and(|borrowed| borrowed.local == local)
                 }
-                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
-                    if place.local == local =>
+                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place } => {
+                    place.local == local
+                }
+                _ => false,
+            },
+            None => {
+                if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
+                    && dest.local == local
                 {
-                    return None;
+                    if !dest.projections.is_empty() {
+                        return true;
+                    }
+                    out.push(F4LocalDef::Call { callee, args });
                 }
-                _ => {}
+                false
             }
-        }
-        if let Terminator::Call { func: callee, args, dest, .. } = &block.terminator
-            && dest.local == local
-        {
-            if !dest.projections.is_empty() {
-                return None;
-            }
-            out.push(F4LocalDef::Call { callee, args });
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
+        });
+    if invalid || out.is_empty() { None } else { Some(out) }
 }
 
 /// The outcome set the guard EDGE (`true_edge`) admits for `target`, joined
@@ -2101,7 +2313,8 @@ pub(super) fn f4_switch_root_local(
     }
     let mut local = p.local;
     for _ in 0..fuel {
-        if crate::place_source_is_stable(func, local)
+        if !crate::local_defs::is_parameter(func, local)
+            && crate::place_source_is_stable(func, local)
             && let Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) =
                 crate::local_defs::unique_value_def(func, local)
             && q.projections.is_empty()
@@ -2114,7 +2327,7 @@ pub(super) fn f4_switch_root_local(
     Some(local)
 }
 
-/// A dominating ordering/sign witness guard for `target`: a `SwitchInt` on a
+/// A dominating ordering witness guard for `target`: a `SwitchInt` on a
 /// recognized witness bool, one of whose edges dominates the aggregate block
 /// while the other cannot reach it (the `dominating_len_equality_guard`
 /// structural-dominance discipline). Returns the dominating edge's joined
@@ -2126,6 +2339,10 @@ pub(super) fn dominating_ordering_witness_guard(
     target: &OrdWitnessTarget<'_>,
 ) -> Option<OrderFacts> {
     const FUEL: u32 = 8;
+    let tp = super::terminator_presence_for(func);
+    if !tp.has_switch_int || !tp.has_bare_dest_call {
+        return None;
+    }
     for gblock in &func.body.blocks {
         let Terminator::SwitchInt { discr, targets, otherwise, .. } = &gblock.terminator else {
             continue;
@@ -2140,21 +2357,31 @@ pub(super) fn dominating_ordering_witness_guard(
         let Some((true_t, false_t)) = bool_switch_branch_targets(targets, *otherwise) else {
             continue;
         };
+        if true_t == false_t {
+            continue;
+        }
+        // Check witness-bool edge facts BEFORE running the three full-CFG
+        // `reachable_avoiding` BFS walks: most `SwitchInt`s in a body are not
+        // ordering witnesses for `target`.
+        let Some(true_facts) = f4_local_edge_facts(func, root, target, true, FUEL) else {
+            continue;
+        };
         // The guard dominates the aggregate block (every path passes g)…
-        if reachable_avoiding(func, 0, &one_block_set(g)).contains(&agg_block) {
+        if reachable_avoiding_one_contains(func, 0, Some(g), agg_block) {
             continue;
         }
         // …and exactly ONE edge reaches it.
-        let avoid_g = one_block_set(g);
-        let true_reaches = reachable_avoiding(func, true_t.0, &avoid_g).contains(&agg_block);
-        let false_reaches = reachable_avoiding(func, false_t.0, &avoid_g).contains(&agg_block);
-        let edge_is_true = match (true_reaches, false_reaches) {
-            (true, false) => true,
-            (false, true) => false,
+        let true_reaches = reachable_avoiding_one_contains(func, true_t.0, Some(g), agg_block);
+        let false_reaches = reachable_avoiding_one_contains(func, false_t.0, Some(g), agg_block);
+        let facts = match (true_reaches, false_reaches) {
+            (true, false) => true_facts,
+            (false, true) => {
+                let Some(f) = f4_local_edge_facts(func, root, target, false, FUEL) else {
+                    continue;
+                };
+                f
+            }
             _ => continue,
-        };
-        let Some(facts) = f4_local_edge_facts(func, root, target, edge_is_true, FUEL) else {
-            continue;
         };
         // Full = no information; empty = contradictory edge — both refuse
         // (to_formula would also refuse, but refusing HERE lets a later,
@@ -2183,10 +2410,19 @@ pub(super) fn ordering_witness_path_pins(
 ) -> Option<Vec<Formula>> {
     // Read-only, env-gated diagnostics (TRUST_ORDWIT_DEBUG) for the ordering-
     // witness grounding lane — never alters any verdict path.
-    let dbg = std::env::var_os("TRUST_ORDWIT_DEBUG").is_some()
+    static ORDWIT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dbg = *ORDWIT_DEBUG.get_or_init(|| crate::trust_vcgen_env_var_present("TRUST_ORDWIT_DEBUG"))
         && (func.def_path.contains("check_chain")
             || func.def_path.contains("check_entailment")
             || func.def_path.contains("check_branch_tree"));
+    let OrdWitnessItem::Pair(va, vb) = item;
+    if !dbg {
+        let ty_a = payload_component_adt_name(func, &[va.index])?;
+        let ty_b = payload_component_adt_name(func, &[vb.index])?;
+        if ty_a != ty_b || !crate::is_order_consistent_adt(ty_a) {
+            return None;
+        }
+    }
     let Some((kind, variant, ops, agg_block)) =
         resolve_enum_return_aggregate_with_block(func, vc_block, block)
     else {
@@ -2217,61 +2453,66 @@ pub(super) fn ordering_witness_path_pins(
         return None;
     }
     let src = sp.local;
-    match item {
-        OrdWitnessItem::Pair(va, vb) => {
-            // Both components must be the SAME non-ref ADT per the DECLARED
-            // payload type — the callee allowlist key (`PartialOrd<Self>`
-            // could not compare two different types anyway; fail closed).
-            let ty_a = payload_component_adt_name(func, &[va.index])?;
-            let ty_b = payload_component_adt_name(func, &[vb.index])?;
-            if ty_a != ty_b {
-                return None;
-            }
-            let cand_a = component_candidate_places(func, src, &[va.index]);
-            let cand_b = component_candidate_places(func, src, &[vb.index]);
-            if dbg {
-                eprintln!(
-                    "[ORDWIT] {} pair({},{}) src=_{} cand_a={} cand_b={}",
-                    func.def_path, va.name, vb.name, src, cand_a.len(), cand_b.len()
-                );
-            }
-            if cand_a.is_empty() || cand_b.is_empty() {
-                return None;
-            }
-            let target =
-                OrdWitnessTarget::Pair { ty_name: &ty_a, cand_a: &cand_a, cand_b: &cand_b };
-            let facts = dominating_ordering_witness_guard(func, agg_block.0, &target);
-            if dbg {
-                eprintln!(
-                    "[ORDWIT] {} pair guard_matched={}",
-                    func.def_path,
-                    facts.is_some()
-                );
-            }
-            let facts = facts?;
-            let pin = facts.to_formula(
-                Formula::var_owned(va.name.clone(), Sort::Int),
-                Formula::var_owned(vb.name.clone(), Sort::Int),
-            )?;
-            Some(vec![pin])
-        }
-        OrdWitnessItem::Sign(name) => {
-            let ty_name = payload_component_adt_name(func, &[])?;
-            let cands = component_candidate_places(func, src, &[]);
-            if cands.is_empty() {
-                return None;
-            }
-            let target = OrdWitnessTarget::Sign { ty_name: &ty_name, cands: &cands };
-            let facts = dominating_ordering_witness_guard(func, agg_block.0, &target)?;
-            let pin =
-                facts.to_formula(Formula::var_owned(name.clone(), Sort::Int), Formula::Int(0))?;
-            Some(vec![pin])
-        }
+    let OrdWitnessItem::Pair(va, vb) = item;
+    // Both components must be the SAME non-ref ADT per the DECLARED
+    // payload type — the callee allowlist key (`PartialOrd<Self>`
+    // could not compare two different types anyway; fail closed).
+    let ty_a = payload_component_adt_name(func, &[va.index])?;
+    let ty_b = payload_component_adt_name(func, &[vb.index])?;
+    if ty_a != ty_b {
+        return None;
     }
+    // Trust (2026-10-05, ORD-WITNESS-CONSISTENT-1): the type's comparison
+    // operators must be ONE consistent total order, and only the compiler can
+    // say so. The pin below reads a guard of one operator (`a <= b`) as a fact
+    // about the integer order the contract atoms are encoded in, and the
+    // contract's own atom names another operator (`d > c`); Rust does not
+    // enforce the `PartialOrd` laws, so a user impl whose `le` and `gt` both
+    // answer `true` had that `ensures` reported proved under certify, false at
+    // run time. `is_order_consistent_adt` admits only the types the compiler
+    // found builtin-derived over integer, `bool` and `char` fields (see
+    // `trust_verify::order_consistent_adts`); anything else stays ungrounded.
+    if !crate::is_order_consistent_adt(ty_a) {
+        if dbg {
+            eprintln!(
+                "[ORDWIT] {} pair type `{ty_a}` is not a compiler-established consistent order",
+                func.def_path
+            );
+        }
+        return None;
+    }
+    let cand_a = component_candidate_places(func, src, &[va.index]);
+    let cand_b = component_candidate_places(func, src, &[vb.index]);
+    if dbg {
+        eprintln!(
+            "[ORDWIT] {} pair({},{}) src=_{} cand_a={} cand_b={}",
+            func.def_path,
+            va.name,
+            vb.name,
+            src,
+            cand_a.len(),
+            cand_b.len()
+        );
+    }
+    if cand_a.is_empty() || cand_b.is_empty() {
+        return None;
+    }
+    let target = OrdWitnessTarget::Pair { ty_name: ty_a, cand_a: &cand_a, cand_b: &cand_b };
+    let facts = dominating_ordering_witness_guard(func, agg_block.0, &target);
+    if dbg {
+        eprintln!("[ORDWIT] {} pair guard_matched={}", func.def_path, facts.is_some());
+    }
+    let facts = facts?;
+    let pin = facts.to_formula(
+        Formula::var_owned(va.name.clone(), Sort::Int),
+        Formula::var_owned(vb.name.clone(), Sort::Int),
+    )?;
+    Some(vec![pin])
 }
 
-/// The GATE for the F4 lane: the covered items (see `ordering_pair_coverage`
-/// / `sign_var_covered`) for which EVERY Return path — the same
+/// The GATE for the F4 lane: the covered items (see `ordering_pair_coverage`;
+/// the sign lane is retired, see ORD-WITNESS-CONSISTENT-1 above
+/// `f4_operand_denotes_candidate`) for which EVERY Return path — the same
 /// `Return`-block/predecessor enumeration the pin loop, the discr gate, and
 /// the len gate use — yields `Some` pins. Credited names are removed from
 /// the per-post ungrounded set so the postcondition survives into the
@@ -2279,32 +2520,41 @@ pub(super) fn ordering_witness_path_pins(
 /// resolver) grounds them per path.
 pub(super) fn ordering_witness_credited_items(
     func: &VerifiableFunction,
-    posts: &[(Formula, String, SourceSpan, Option<usize>)],
+    posts: &[&Formula],
 ) -> Vec<OrdWitnessItem> {
-    let refs: Vec<&Formula> = posts.iter().map(|(f, _, _, _)| f).collect();
-    let mut items: Vec<OrdWitnessItem> = ordering_pair_coverage(&refs)
+    if posts.is_empty() {
+        return Vec::new();
+    }
+    let mut items: Vec<OrdWitnessItem> = ordering_pair_coverage(posts)
         .into_iter()
+        .filter(|(va, vb)| {
+            let Some(ty_a) = payload_component_adt_name(func, &[va.index]) else {
+                return false;
+            };
+            let Some(ty_b) = payload_component_adt_name(func, &[vb.index]) else {
+                return false;
+            };
+            ty_a == ty_b && crate::is_order_consistent_adt(ty_a)
+        })
         .map(|(a, b)| OrdWitnessItem::Pair(a, b))
         .collect();
-    if sign_var_covered(&refs) {
-        items.push(OrdWitnessItem::Sign("_0__value__sign".to_string()));
-    }
     if items.is_empty() {
         return items;
     }
+    let v2_preds = crate::fn_memo::v2_predecessors_or_build(func);
+    let return_paths: Vec<(&trust_types::BasicBlock, Vec<&trust_types::BasicBlock>)> = func
+        .body
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.terminator, Terminator::Return))
+        .map(|block| {
+            let predecessors = v2_preds.predecessors(func, block.id);
+            let vc_blocks = if predecessors.is_empty() { vec![block] } else { predecessors };
+            (block, vc_blocks)
+        })
+        .collect();
     items.retain(|item| {
-        for block in &func.body.blocks {
-            if !matches!(block.terminator, Terminator::Return) {
-                continue;
-            }
-            let predecessors: Vec<&trust_types::BasicBlock> = func
-                .body
-                .blocks
-                .iter()
-                .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&block.id))
-                .collect();
-            let vc_blocks: Vec<&trust_types::BasicBlock> =
-                if predecessors.is_empty() { vec![block] } else { predecessors };
+        for (block, vc_blocks) in &return_paths {
             for vc_block in vc_blocks {
                 if ordering_witness_path_pins(func, vc_block, block, item).is_none() {
                     return false;

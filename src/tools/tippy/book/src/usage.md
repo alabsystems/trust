@@ -4,7 +4,8 @@ This chapter describes how to use Tippy's Clippy-compatible lint catalog. Tippy
 can be used directly, as a `targo` subcommand, or at the compiler-driver level
 with `tippy-driver`.
 
-> _Note:_ This chapter assumes that you have Tippy installed already. If you're
+> [!NOTE]
+> This chapter assumes that you have Tippy installed already. If you're
 > not sure, take a look at the [Installation] chapter.
 
 ## Targo subcommand
@@ -29,7 +30,8 @@ lint group `clippy::all`. You might want to use even more lints, or you may not
 agree with every Clippy lint, and for that there are ways to configure lint
 levels.
 
-> _Note:_ Clippy is meant to be used with a generous sprinkling of
+> [!NOTE]
+> Clippy is meant to be used with a generous sprinkling of
 > `#[allow(..)]`s through your code. So if you disagree with a lint, don't feel
 > bad disabling them for parts of your code or the whole project.
 
@@ -42,16 +44,41 @@ You can configure lint levels on the command line by adding
 targo tippy -- -Aclippy::style -Wclippy::box_default -Dclippy::perf
 ```
 
+#### Elevating warning to errors
+
 For [CI] all warnings can be elevated to errors which will in turn fail
 the build and cause Clippy to exit with a code other than `0`.
 
+The recommended way to do this is by using the [`build.warnings`] config option.
+
+It can be enabled on the command line using the environment variable:
+
+```bash
+CARGO_BUILD_WARNINGS=deny targo tippy
 ```
+
+.. or permanently, in `.cargo/config.toml`:
+
+```toml
+# .cargo/config.toml
+[build]
+warnings = "deny"
+```
+
+> [!NOTE]
+> Using `CARGO_BUILD_WARNINGS=deny` (or `-D warnings`) will cause your build to fail if **any** warnings
+> are found in your code. That includes warnings found by rustc (e.g.
+> `dead_code`, etc.)
+
+If you use an older version of Targo, you can use the following instead:
+
+```bash
 targo tippy -- -Dwarnings
 ```
 
-> _Note:_ Adding `-D warnings` will cause your build to fail if **any** warnings
-> are found in your code. That includes warnings found by rustc (e.g.
-> `dead_code`, etc.).
+Note, however, that this will invalidate build caches and is therefore not recommended.
+
+[`build.warnings`]: https://doc.rust-lang.org/cargo/reference/config.html#buildwarnings
 
 For more information on configuring lint levels, see the [rustc documentation].
 
@@ -66,7 +93,7 @@ For a full list of all lints with their description and examples, please refer
 to [Clippy's lint list]. The two most important allow-by-default groups are
 described below:
 
-[Clippy's lint list]: https://rust-lang.github.io/rust-clippy/master/index.html
+[Clippy's lint list]: https://rust-lang.github.io/rust-clippy/main/index.html
 
 ##### `clippy::pedantic`
 
@@ -85,7 +112,8 @@ The second group is the `restriction` group. This group contains lints that
 this group won't allow you to use `.unwrap()` in your code. You may want to look
 through the lints in this group and enable the ones that fit your need.
 
-> _Note:_ You shouldn't enable the whole lint group, but cherry-pick lints from
+> [!NOTE]
+> You shouldn't enable the whole lint group, but cherry-pick lints from
 > this group. Some lints in this group will even contradict other Clippy lints!
 
 #### Too many lints
@@ -95,7 +123,8 @@ group. Some people prefer to disable this group completely and then cherry-pick
 some lints they like from this group. The same is of course possible with every
 other of Clippy's lint groups.
 
-> _Note:_ We try to keep the warn-by-default groups free from false positives
+> [!NOTE]
+> We try to keep the warn-by-default groups free from false positives
 > (FP). If you find that a lint wrongly triggers, please report it in an issue
 > (if there isn't an issue for that FP already)
 
@@ -149,7 +178,8 @@ arguments you use for `trustc`. For example:
 tippy-driver --edition 2018 -Cpanic=abort foo.rs
 ```
 
-> _Note:_ `tippy-driver` is designed for running lints and should not be used
+> [!NOTE]
+> `tippy-driver` is designed for running lints and should not be used
 > as a general replacement for `trustc`. `tippy-driver` may produce artifacts
 > that are not optimized as expected, for example.
 

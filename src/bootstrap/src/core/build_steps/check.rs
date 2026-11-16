@@ -3,8 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Trust: this module has no codegen-backend-kind use.
 use crate::core::build_steps::compile::{
-    ArtifactKeepMode, add_to_sysroot, run_cargo, rustc_cargo, std_cargo, std_crates_for_run_make,
+    ArtifactKeepMode, add_to_sysroot, run_cargo, rustc_cargo, std_cargo, std_crates_for_make_run,
 };
 use crate::core::build_steps::tool;
 use crate::core::build_steps::tool::{
@@ -12,11 +13,31 @@ use crate::core::build_steps::tool::{
     prepare_tool_cargo,
 };
 use crate::core::builder::{
-    self, Alias, Builder, Cargo, Kind, RunConfig, ShouldRun, Step, StepMetadata, crate_description,
+    self, Alias, Builder, Cargo, CommandLineStep, Kind, RunConfig, ShouldRun, Step, StepMetadata,
+    crate_description,
 };
+use crate::core::compiler::Compiler;
 use crate::core::config::TargetSelection;
+use crate::core::session::Mode;
 use crate::utils::build_stamp::{self, BuildStamp};
-use crate::{Compiler, Mode, Subcommand, t};
+use crate::utils::helpers::t;
+
+/// Allows individual check-step instances to keep track of whether they
+/// represent `cargo check` or `cargo fix`, independently of [`Builder::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CheckKind {
+    Check,
+    Fix,
+}
+
+impl CheckKind {
+    fn to_kind(self) -> Kind {
+        match self {
+            CheckKind::Check => Kind::Check,
+            CheckKind::Fix => Kind::Fix,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Std {
@@ -35,7 +56,7 @@ impl Std {
     const CRATE_OR_DEPS: &[&str] = &["sysroot", "coretests", "alloctests"];
 }
 
-impl Step for Std {
+impl CommandLineStep for Std {
     type Output = BuildStamp;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -67,7 +88,7 @@ impl Step for Std {
         // Explicitly pass -p for all dependencies crates -- this will force cargo
         // to also check the tests/benches/examples for these crates, rather
         // than just the leaf crate.
-        let crates = std_crates_for_run_make(&run);
+        let crates = std_crates_for_make_run(&run);
         run.builder.ensure(Std {
             build_compiler: prepare_compiler_for_check(run.builder, run.target, Mode::Std)
                 .build_compiler(),
@@ -86,17 +107,17 @@ impl Step for Std {
             Mode::Std,
             SourceType::InTree,
             target,
-            builder.config.cmd.kind(),
+            builder.kind,
         );
 
         std_cargo(builder, target, &mut cargo, &self.crates);
-        if matches!(builder.config.cmd, Subcommand::Fix) {
+        if matches!(builder.kind, Kind::Fix) {
             // By default, cargo tries to fix all targets. Tell it not to fix tests until we've added `test` to the sysroot.
             cargo.arg("--lib");
         }
 
         let _guard = builder.msg(
-            builder.config.cmd.kind(),
+            builder.kind,
             format_args!("library artifacts{}", crate_description(&self.crates)),
             Mode::Std,
             build_compiler,
@@ -197,8 +218,18 @@ impl RmetaSysroot {
             format!("{},{}", self.host_dir.to_str().unwrap(), self.target_dir.to_str().unwrap()),
             ",",
         );
+        // Trust: build-script probes can invoke the compiler directly, bypassing
+        // the shim's environment channel. Expose the same metadata directories
+        // through Cargo's tracked rustflags, as rustc-private tool builds do.
+        for search_path in [&self.host_dir, &self.target_dir] {
+            cargo.rustflag(&format!("-Lall={}", search_path.to_str().unwrap()));
+        }
     }
 }
+
+// Trust: exercise the check-specific Cargo configuration and flag serialization.
+#[cfg(test)]
+mod tests;
 
 /// Checks rustc using the given `build_compiler` for the given `target`, and produces
 /// a sysroot in the build directory that stores the generated .rmeta files.
@@ -221,22 +252,15 @@ impl PrepareRustcRmetaSysroot {
 impl Step for PrepareRustcRmetaSysroot {
     type Output = RmetaSysroot;
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         // Check rustc
-        let stamp = builder.ensure(Rustc::from_build_compiler(
-            self.build_compiler.clone(),
-            self.target,
-            vec![],
-        ));
+        let stamp = Rustc::check_rustc_for_preparing_sysroot(builder, &self);
 
         let build_compiler = self.build_compiler.build_compiler();
 
         // Copy the generated rmeta artifacts to a separate directory
         let dir = builder
+            .config
             .out
             .join(build_compiler.host)
             .join(format!("stage{}-rustc-rmeta-artifacts", build_compiler.stage + 1));
@@ -265,10 +289,6 @@ impl PrepareStdRmetaSysroot {
 impl Step for PrepareStdRmetaSysroot {
     type Output = RmetaSysroot;
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         // Check std
         let stamp = builder.ensure(Std {
@@ -279,6 +299,7 @@ impl Step for PrepareStdRmetaSysroot {
 
         // Copy the generated rmeta artifacts to a separate directory
         let dir = builder
+            .config
             .out
             .join(self.build_compiler.host)
             .join(format!("stage{}-std-rmeta-artifacts", self.build_compiler.stage));
@@ -290,9 +311,12 @@ impl Step for PrepareStdRmetaSysroot {
 /// Checks rustc using `build_compiler`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Rustc {
+    check_kind: CheckKind,
+
     /// Compiler that will check this rustc.
-    pub build_compiler: CompilerForCheck,
-    pub target: TargetSelection,
+    build_compiler: CompilerForCheck,
+    target: TargetSelection,
+
     /// Whether to build only a subset of crates.
     ///
     /// This shouldn't be used from other steps; see the comment on [`compile::Rustc`].
@@ -302,21 +326,37 @@ pub struct Rustc {
 }
 
 impl Rustc {
-    pub fn new(builder: &Builder<'_>, target: TargetSelection, crates: Vec<String>) -> Self {
-        let build_compiler = prepare_compiler_for_check(builder, target, Mode::Rustc);
-        Self::from_build_compiler(build_compiler, target, crates)
+    // Trust: the native repository workflow checks the same complete compiler
+    // crate set as `check compiler --all-targets`, within the existing graph.
+    pub(crate) fn ensure_repo_check(builder: &Builder<'_>, target: TargetSelection) {
+        let crates = builder
+            .in_tree_crates("rustc-main", Some(target))
+            .into_iter()
+            .map(|krate| krate.name.to_string())
+            .collect();
+        builder.ensure(Self {
+            check_kind: CheckKind::Check,
+            build_compiler: prepare_compiler_for_check(builder, target, Mode::Rustc),
+            target,
+            crates,
+        });
     }
 
-    fn from_build_compiler(
-        build_compiler: CompilerForCheck,
-        target: TargetSelection,
-        crates: Vec<String>,
-    ) -> Self {
-        Self { build_compiler, target, crates }
+    fn check_rustc_for_preparing_sysroot(
+        builder: &Builder<'_>,
+        prepare: &PrepareRustcRmetaSysroot,
+    ) -> BuildStamp {
+        builder.ensure(Rustc {
+            // We specifically want `cargo check`, not the current bootstrap subcommand.
+            check_kind: CheckKind::Check,
+            build_compiler: prepare.build_compiler.clone(),
+            target: prepare.target,
+            crates: vec![],
+        })
     }
 }
 
-impl Step for Rustc {
+impl CommandLineStep for Rustc {
     type Output = BuildStamp;
     const IS_HOST: bool = true;
 
@@ -329,8 +369,17 @@ impl Step for Rustc {
     }
 
     fn make_run(run: RunConfig<'_>) {
+        let check_kind = match run.builder.kind {
+            Kind::Check => CheckKind::Check,
+            Kind::Fix => CheckKind::Fix,
+            kind => panic!("unexpected kind for `check::Rustc`: {kind:?}"),
+        };
+
+        let target = run.target;
+        let build_compiler = prepare_compiler_for_check(run.builder, target, Mode::Rustc);
         let crates = run.make_run_crates(Alias::Compiler);
-        run.builder.ensure(Rustc::new(run.builder, run.target, crates));
+
+        run.builder.ensure(Rustc { check_kind, build_compiler, target, crates });
     }
 
     /// Check the compiler.
@@ -350,7 +399,7 @@ impl Step for Rustc {
             Mode::Rustc,
             SourceType::InTree,
             target,
-            Kind::Check,
+            self.check_kind.to_kind(),
         );
 
         rustc_cargo(builder, &mut cargo, target, &build_compiler, &self.crates);
@@ -360,6 +409,16 @@ impl Step for Rustc {
         // named crate rather than just the leaf.
         for krate in &*self.crates {
             cargo.arg("-p").arg(krate);
+        }
+        // When we run `x check compiler --all-targets`, then the `Rustc` step is executed in
+        // two "modes" - one with all in-tree rustc crates, and a second time with empty crates
+        // in `PrepareRustcRmetaSysroot`, to prepare .rmeta files for RustcPrivate tools.
+        // If we use `--all-targets` for both, then we will end up with a duplicated .rmeta file
+        // in the sysroot, which breaks everything.
+        // So we only use `--all-targets` for the default case where crates are empty.
+        // This will also be used when someone does `x check compiler/<rustc-crate>`.
+        if !self.crates.is_empty() && builder.sess.config.cmd.check_all_targets() {
+            cargo.arg("--all-targets");
         }
 
         // Trust: `-p` alone does NOT reach test targets. The comment this
@@ -379,7 +438,7 @@ impl Step for Rustc {
         cargo.arg("--tests");
 
         let _guard = builder.msg(
-            Kind::Check,
+            self.check_kind.to_kind(),
             format_args!("compiler artifacts{}", crate_description(&self.crates)),
             Mode::Rustc,
             self.build_compiler.build_compiler(),
@@ -402,13 +461,11 @@ impl Step for Rustc {
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
-        let metadata = StepMetadata::check("rustc", self.target)
+        let mut metadata = StepMetadata::new("rustc", self.target, self.check_kind.to_kind())
             .built_by(self.build_compiler.build_compiler());
-        let metadata = if self.crates.is_empty() {
-            metadata
-        } else {
-            metadata.with_metadata(format!("({} crates)", self.crates.len()))
-        };
+        if !self.crates.is_empty() {
+            metadata = metadata.with_metadata(format!("({} crates)", self.crates.len()));
+        }
         Some(metadata)
     }
 }
@@ -472,6 +529,18 @@ pub fn prepare_compiler_for_check(
     target: TargetSelection,
     mode: Mode,
 ) -> CompilerForCheck {
+    prepare_compiler_for_check_with_minimum_stage(builder, target, mode, 0)
+}
+
+// Trust: some rustc-private tools require APIs absent from the pinned bootstrap
+// std. Check them with a locally built compiler and its own std/rustc metadata;
+// never substitute an ambient SDK or remove targets from their Cargo check.
+fn prepare_compiler_for_check_with_minimum_stage(
+    builder: &Builder<'_>,
+    target: TargetSelection,
+    mode: Mode,
+    minimum_compiler_stage: u32,
+) -> CompilerForCheck {
     let host = builder.host_target;
 
     let mut rustc_rmeta_sysroot = None;
@@ -500,7 +569,13 @@ pub fn prepare_compiler_for_check(
             // return the build compiler that was used to check rustc.
             // We do not need to check examples/tests/etc. of Rustc for rustc_private, so we pass
             // an empty set of crates, which will avoid using `cargo -p`.
-            let compiler_for_rustc = prepare_compiler_for_check(builder, target, Mode::Rustc);
+            // Trust: the tool and every private crate must use the same compiler.
+            let compiler_for_rustc = prepare_compiler_for_check_with_minimum_stage(
+                builder,
+                target,
+                Mode::Rustc,
+                minimum_compiler_stage,
+            );
             rustc_rmeta_sysroot = Some(
                 builder.ensure(PrepareRustcRmetaSysroot::new(compiler_for_rustc.clone(), target)),
             );
@@ -518,8 +593,11 @@ pub fn prepare_compiler_for_check(
             //
             // FIXME: remove this and either fix cross-compilation check on stage 2 (which has a
             // myriad of other problems) or disable cross-checking on stage 1.
+            // Trust: keep stage zero unsupported, including for tools with a floor.
+            assert!(builder.top_stage > 0, "checking rustc requires stage >= 1");
             let stage = if host == target { builder.top_stage - 1 } else { builder.top_stage };
-            let build_compiler = builder.compiler(stage, host);
+            // Trust: a tool can require the current std without changing other checks.
+            let build_compiler = builder.compiler(stage.max(minimum_compiler_stage), host);
 
             // To check rustc, we need to check std that it will link to
             std_rmeta_sysroot = prepare_std(builder, build_compiler, target);
@@ -549,6 +627,8 @@ macro_rules! tool_check_step {
             $(, enable_features: [$($enable_features:expr),*] )?
             $(, default_features: $default_features:expr )?
             $(, default: $default:literal )?
+            // Trust: minimum compiler that can supply this tool's host std APIs.
+            $(, minimum_compiler_stage: $minimum_compiler_stage:expr )?
             $( , )?
         }
     ) => {
@@ -558,12 +638,12 @@ macro_rules! tool_check_step {
             target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
             const IS_HOST: bool = true;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                run.selectors(&[$path $(, $alt_path )*])
+                run.multi_path(&[$path $(, $alt_path )*])
             }
 
             fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -575,7 +655,11 @@ macro_rules! tool_check_step {
                 let target = run.target;
                 let mode: Mode = $mode;
 
-                let compiler = prepare_compiler_for_check(run.builder, target, mode);
+                // Trust: keep all targets checked against one coherent local toolchain.
+                let minimum_compiler_stage = 0 $(.max($minimum_compiler_stage))?;
+                let compiler = prepare_compiler_for_check_with_minimum_stage(
+                    run.builder, target, mode, minimum_compiler_stage,
+                );
 
                 // It doesn't make sense to cross-check bootstrap tools
                 if mode == Mode::ToolBootstrap && target != run.builder.host_target {
@@ -608,6 +692,59 @@ macro_rules! tool_check_step {
             }
         }
     }
+}
+
+// Trust: a full Rustc build links its artifacts into the build compiler's
+// sysroot. Check artifacts have different crate hashes, so private tool checks
+// must read std from an isolated copy and rustc only from their checked rmetas.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ToolCheckSysroot {
+    compiler: Compiler,
+}
+
+impl Step for ToolCheckSysroot {
+    type Output = PathBuf;
+
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
+        let source = builder.sysroot(self.compiler);
+        let destination = builder
+            .out
+            .join(self.compiler.host)
+            .join(format!("stage{}-tool-check-sysroot", self.compiler.stage));
+        copy_tool_check_sysroot(builder, &source, &destination);
+        destination
+    }
+}
+
+// Trust: never mutate the build compiler's sysroot or follow its source aliases.
+fn copy_tool_check_sysroot(
+    session: &crate::core::session::Session,
+    source: &Path,
+    destination: &Path,
+) {
+    if session.config.dry_run() {
+        return;
+    }
+    match fs::remove_dir_all(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            panic!("failed to replace tool-check sysroot {}: {error}", destination.display())
+        }
+    }
+    t!(fs::create_dir_all(destination.join("lib")));
+    session.cp_link_filtered(&source.join("lib"), &destination.join("lib"), &|path| {
+        path != Path::new("rustlib/src")
+            && path != Path::new("rustlib/rustc-src")
+            && !crate::core::build_steps::compile::is_rustc_private_artifact(path)
+    });
+}
+
+// Trust: the explicit flag also reaches direct probes and Cargo's fingerprints.
+fn configure_tool_check_sysroot(cargo: &mut Cargo, sysroot: &Path) {
+    cargo.env("RUSTC_SYSROOT", sysroot);
+    cargo.rustflag("--sysroot");
+    cargo.rustflag(sysroot.to_str().unwrap());
 }
 
 /// Used by the implementation of `Step::run` in `tool_check_step!`.
@@ -643,6 +780,11 @@ fn run_tool_check_step(
     );
     cargo.allow_features(allow_features);
     compiler.configure_cargo(&mut cargo);
+    // Trust: prevent full-build rustc metadata from competing with check metadata.
+    if mode == Mode::ToolRustcPrivate {
+        let sysroot = builder.ensure(ToolCheckSysroot { compiler: build_compiler });
+        configure_tool_check_sysroot(&mut cargo, &sysroot);
+    }
 
     // FIXME: check bootstrap doesn't currently work when multiple targets are checked
     // FIXME: rust-analyzer does not work with --all-targets
@@ -658,8 +800,14 @@ fn run_tool_check_step(
         cargo.arg("--no-default-features");
     }
 
-    let stamp = BuildStamp::new(&builder.cargo_out(build_compiler, mode, target))
-        .with_prefix(&format!("{display_name}-check"));
+    // Trust: this must match prepare_tool_cargo's actual selected generation.
+    let stamp = BuildStamp::new(&builder.cargo_out_for_input(
+        build_compiler,
+        mode,
+        target,
+        builder.cargo_input(mode),
+    ))
+    .with_prefix(&format!("{display_name}-check"));
 
     let _guard = builder.msg(builder.kind, display_name, mode, build_compiler, target);
     run_cargo(
@@ -682,10 +830,25 @@ tool_check_step!(Rustdoc {
 // behavior, treat it as in-tree so that any new warnings in clippy will be
 // rejected.
 tool_check_step!(Clippy { path: "src/tools/tippy", mode: Mode::ToolRustcPrivate });
+// Trust: the trust-ir → trust-cg self-host backend, a sibling-repo crate
+// (build_steps/trust_ir_cg.rs). Not a default check step: it is built only when
+// `rust.codegen-backends` lists "trust-ir-cg", and a sibling checkout mid-sync
+// must not be able to fail `x check` for everyone. Select it explicitly:
+// `x check first-party/trust-cg/crates/rustc-codegen-trust-cg`.
+tool_check_step!(TrustIrCgBackend {
+    path: "first-party/trust-cg/crates/rustc-codegen-trust-cg",
+    mode: Mode::ToolRustcPrivate,
+    default: false,
+});
 tool_check_step!(Miri {
     path: "src/tools/miri",
+    // Trust: preserve the explicit debugger path after its package joined Miri.
+    alt_path: "src/tools/miri/priroda",
     mode: Mode::ToolRustcPrivate,
-    enable_features: ["check_only"],
+    enable_features: ["check_only", "priroda"],
+    // Trust: Miri and its Priroda binary require host APIs absent from the seed.
+    // Keep all targets checked with the locally built compiler and matching std.
+    minimum_compiler_stage: 1,
 });
 tool_check_step!(CargoMiri { path: "src/tools/miri/cargo-miri", mode: Mode::ToolRustcPrivate });
 tool_check_step!(Rustfmt { path: "src/tools/trustfmt", mode: Mode::ToolRustcPrivate });
@@ -710,7 +873,15 @@ tool_check_step!(FeaturesStatusDump {
     mode: Mode::ToolBootstrap
 });
 
-tool_check_step!(Bootstrap { path: "src/bootstrap", mode: Mode::ToolBootstrap, default: false });
+// Trust: `--all-targets` includes Bootstrap's library test target, and Bootstrap links the
+// native controller client, so this allows what its test build allows
+// (test::BOOTSTRAP_SELF_ALLOW_FEATURES).
+tool_check_step!(Bootstrap {
+    path: "src/bootstrap",
+    mode: Mode::ToolBootstrap,
+    allow_features: super::test::BOOTSTRAP_SELF_ALLOW_FEATURES,
+    default: false
+});
 
 // `run-make-support` will be built as part of suitable run-make compiletest test steps, but support
 // check to make it easier to work on.
@@ -731,6 +902,8 @@ tool_check_step!(CoverageDump {
 tool_check_step!(Compiletest {
     path: "src/tools/compiletest",
     mode: Mode::ToolBootstrap,
+    // Trust: `--all-targets` compiles the library test target, as its test build does.
+    allow_features: tool::COMPILETEST_SELF_ALLOW_FEATURES,
     default: false,
 });
 
@@ -740,6 +913,8 @@ tool_check_step!(Compiletest {
 tool_check_step!(RustdocGuiTest {
     path: "src/tools/rustdoc-gui-test",
     mode: Mode::ToolBootstrap,
+    // Trust: it links compiletest's library, which carries the native query transport.
+    allow_features: tool::COMPILETEST_ALLOW_FEATURES,
     default: false,
 });
 

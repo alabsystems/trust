@@ -93,6 +93,18 @@ extern llvm::StringMap<
 
 constexpr int IndexMappingError = 0x0000fffd;
 
+/// Classification of what type of use is requested
+enum class QueryType {
+  // The original value is needed for the derivative
+  Primal = 0,
+  // The shadow value is needed for the derivative
+  Shadow = 1,
+  // The primal value is needed to stand in for the shadow
+  // value and compute the derivative of an instruction
+  ShadowByConstPrimal = 2
+};
+typedef std::pair<const llvm::Value *, QueryType> UsageKey;
+
 extern "C" {
 extern llvm::cl::opt<bool> EnzymeInactiveDynamic;
 extern llvm::cl::opt<bool> EnzymeFreeInternalAllocations;
@@ -177,6 +189,11 @@ public:
   const std::map<llvm::CallInst *, std::pair<bool, const std::vector<bool>>>
       *overwritten_args_map_ptr;
   const llvm::SmallPtrSetImpl<const llvm::Value *> *unnecessaryValuesP;
+  //! In the reverse pass of split mode, the augmented pass's unnecessary values
+  //! and recompute decisions, to answer whether the primal pass used a value.
+  const std::set<const llvm::Value *> *primalUnnecessaryValuesP = nullptr;
+  const std::map<const llvm::Value *, bool> *primalKnownRecomputeHeuristicP =
+      nullptr;
 
   llvm::SmallVector<llvm::OperandBundleDef, 2> getInvertedBundles(
       llvm::CallInst *orig, llvm::ArrayRef<ValueType> types,
@@ -290,11 +307,13 @@ public:
   };
 
   llvm::ValueMap<llvm::Value *, Rematerializer> rematerializableAllocations;
+  llvm::SmallPtrSet<llvm::Value *, 4> allocationsToBeRematerialized;
 
   /// Only loaded from and stored to (not captured), mapped to the stores (and
   /// memset). Boolean denotes whether the primal initializes the shadow as well
   /// (for use) as a structure which carries data.
   llvm::ValueMap<llvm::Value *, ShadowRematerializer> backwardsOnlyShadows;
+  std::vector<bool> nowrite_shadows;
 
   void computeForwardingProperties(llvm::Instruction *V);
   void computeGuaranteedFrees();
@@ -302,6 +321,10 @@ public:
 private:
   llvm::SmallVector<llvm::WeakTrackingVH, 4> addedTapeVals;
   unsigned tapeidx;
+  /// Most recently inserted `tapeIndices` slot during the augmented primal
+  /// pass, allowing `cacheForReverse` to rewrite the slot in place when no
+  /// physical tape storage is needed.
+  int *lastTapeIndex = nullptr;
   llvm::Value *tape;
 
   std::map<llvm::BasicBlock *,
@@ -318,6 +341,17 @@ public:
   llvm::BasicBlock *addReverseBlock(llvm::BasicBlock *currentBlock,
                                     llvm::Twine const &name,
                                     bool forkCache = true, bool push = true);
+
+  std::map<UsageKey, bool> populateSeenFromKnownRecompute() const {
+    std::map<UsageKey, bool> Seen;
+    for (auto pair : knownRecomputeHeuristic) {
+      if (!pair.second || unnecessaryIntermediates.count(
+                              llvm::cast<llvm::Instruction>(pair.first))) {
+        Seen[UsageKey(pair.first, QueryType::Primal)] = false;
+      }
+    }
+    return Seen;
+  }
 
   bool legalRecompute(const llvm::Value *val,
                       const llvm::ValueToValueMapTy &available,
@@ -405,6 +439,11 @@ public:
                                 bool *shadowReturnUsedP,
                                 DerivativeMode cmode) const;
 
+  //! Whether the augmented pass used the primal of \p orig. In the reverse pass
+  //! of split mode this is the augmented pass's answer rather than one from
+  //! this pass's own analysis, so it can rebuild how a call was augmented.
+  bool augmentedPrimalReturnUsed(llvm::Value *orig) const;
+
   DIFFE_TYPE getReturnDiffeType(llvm::Value *orig, bool *primalReturnUsedP,
                                 bool *shadowReturnUsedP) const;
 
@@ -477,7 +516,6 @@ public:
   bool isConstantInstruction(const llvm::Instruction *inst) const;
 
   bool getContext(llvm::BasicBlock *BB, LoopContext &lc);
-
   void forceAugmentedReturns();
 
 private:
@@ -510,8 +548,11 @@ public:
                        bool tryLegalRecomputeCheck = true,
                        llvm::BasicBlock *scope = nullptr) override;
 
+  llvm::Value *invertPointerM(llvm::Value *val, llvm::IRBuilder<> &BuilderM);
   llvm::Value *invertPointerM(llvm::Value *val, llvm::IRBuilder<> &BuilderM,
-                              bool nullShadow = false);
+                              TypeTree look);
+
+  bool isAtomic(llvm::Value *origptr) const;
 
   static llvm::Constant *GetOrCreateShadowConstant(
       RequestContext context, EnzymeLogic &Logic, llvm::TargetLibraryInfo &TLI,
@@ -658,7 +699,8 @@ void SubTransferHelper(GradientUtils *gutils, DerivativeMode Mode,
                        llvm::Type *secretty, llvm::Intrinsic::ID intrinsic,
                        unsigned dstalign, unsigned srcalign, unsigned offset,
                        bool dstConstant, llvm::Value *shadow_dst,
-                       bool srcConstant, llvm::Value *shadow_src,
+                       llvm::Value *primal_dst, bool srcConstant,
+                       llvm::Value *shadow_src, llvm::Value *primal_src,
                        llvm::Value *length, llvm::Value *isVolatile,
                        llvm::CallInst *MTI, bool allowForward = true,
                        bool shadowsLookedUp = false,

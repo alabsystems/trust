@@ -1,0 +1,3035 @@
+{
+  "name": "lift_points",
+  "def_path": "c_rows_precision::lift_points",
+  "span": {
+    "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+    "line_start": 80,
+    "col_start": 0,
+    "line_end": 96,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Seq": {
+            "elem": {
+              "Tuple": [
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                },
+                {
+                  "Adt": {
+                    "name": "c_rows_precision::Tone",
+                    "fields": [
+                      [
+                        "fill",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "lift",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "warn",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "g"
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "r"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "e"
+      },
+      {
+        "index": 4,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": "peak"
+      },
+      {
+        "index": 5,
+        "ty": {
+          "Adt": {
+            "name": "c_rows_precision::Tone",
+            "fields": [
+              [
+                "fill",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "lift",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "warn",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "ink"
+      },
+      {
+        "index": 6,
+        "ty": {
+          "Seq": {
+            "elem": {
+              "Tuple": [
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                },
+                {
+                  "Adt": {
+                    "name": "c_rows_precision::Tone",
+                    "fields": [
+                      [
+                        "fill",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "lift",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ],
+                      [
+                        "warn",
+                        {
+                          "Int": {
+                            "width": 8,
+                            "signed": false
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "name": "points"
+      },
+      {
+        "index": 7,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 8,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 9,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 10,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": false
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 11,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "n"
+      },
+      {
+        "index": 12,
+        "ty": {
+          "Adt": {
+            "name": "core::result::Result",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v0_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "core::num::error::TryFromIntError",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "core::num::error::IntErrorKind",
+                            "fields": [
+                              [
+                                "__tag",
+                                {
+                                  "Int": {
+                                    "width": 64,
+                                    "signed": true
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [
+                              {
+                                "name": "Empty",
+                                "discriminant": 0,
+                                "fields": []
+                              },
+                              {
+                                "name": "InvalidDigit",
+                                "discriminant": 1,
+                                "fields": []
+                              },
+                              {
+                                "name": "PosOverflow",
+                                "discriminant": 2,
+                                "fields": []
+                              },
+                              {
+                                "name": "NegOverflow",
+                                "discriminant": 3,
+                                "fields": []
+                              },
+                              {
+                                "name": "Zero",
+                                "discriminant": 4,
+                                "fields": []
+                              },
+                              {
+                                "name": "NotAPowerOfTwo",
+                                "discriminant": 5,
+                                "fields": []
+                              }
+                            ],
+                            "disc_index_safe": true,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Enum"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "Ok",
+                "discriminant": 0,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "name": "Err",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "core::num::error::TryFromIntError",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "core::num::error::IntErrorKind",
+                                "fields": [
+                                  [
+                                    "__tag",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": true
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [
+                                  {
+                                    "name": "Empty",
+                                    "discriminant": 0,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "InvalidDigit",
+                                    "discriminant": 1,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "PosOverflow",
+                                    "discriminant": 2,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "NegOverflow",
+                                    "discriminant": 3,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "Zero",
+                                    "discriminant": 4,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "NotAPowerOfTwo",
+                                    "discriminant": 5,
+                                    "fields": []
+                                  }
+                                ],
+                                "disc_index_safe": true,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Enum"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 13,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeInclusive",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "exhausted",
+                "Bool"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 14,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeInclusive",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "exhausted",
+                "Bool"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 15,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 16,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 17,
+        "ty": {
+          "Adt": {
+            "name": "core::ops::range::RangeInclusive",
+            "fields": [
+              [
+                "start",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "end",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "exhausted",
+                "Bool"
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": "iter"
+      },
+      {
+        "index": 18,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": true,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 19,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Adt": {
+                "name": "core::ops::range::RangeInclusive",
+                "fields": [
+                  [
+                    "start",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "end",
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    }
+                  ],
+                  [
+                    "exhausted",
+                    "Bool"
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 20,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 21,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "k"
+      },
+      {
+        "index": 22,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": "x"
+      },
+      {
+        "index": 23,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 24,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 25,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 26,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 27,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 28,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 29,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 30,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 31,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 32,
+        "ty": "Bool",
+        "name": null
+      },
+      {
+        "index": 33,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 34,
+        "ty": {
+          "Ref": {
+            "mutable": true,
+            "inner": {
+              "Seq": {
+                "elem": {
+                  "Tuple": [
+                    {
+                      "Int": {
+                        "width": 64,
+                        "signed": true
+                      }
+                    },
+                    {
+                      "Adt": {
+                        "name": "c_rows_precision::Tone",
+                        "fields": [
+                          [
+                            "fill",
+                            {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          ],
+                          [
+                            "lift",
+                            {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          ],
+                          [
+                            "warn",
+                            {
+                              "Int": {
+                                "width": 8,
+                                "signed": false
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 35,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            {
+              "Adt": {
+                "name": "c_rows_precision::Tone",
+                "fields": [
+                  [
+                    "fill",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "lift",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "warn",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          ]
+        },
+        "name": null
+      },
+      {
+        "index": 36,
+        "ty": {
+          "Adt": {
+            "name": "c_rows_precision::Tone",
+            "fields": [
+              [
+                "fill",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "lift",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ],
+              [
+                "warn",
+                {
+                  "Int": {
+                    "width": 8,
+                    "signed": false
+                  }
+                }
+              ]
+            ],
+            "variants": [],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Struct"
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 37,
+        "ty": {
+          "Int": {
+            "width": 8,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 38,
+        "ty": {
+          "Int": {
+            "width": 64,
+            "signed": true
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 39,
+        "ty": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            "Bool"
+          ]
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "StorageLive": 6
+          },
+          {
+            "StorageLive": 7
+          },
+          {
+            "StorageLive": 8
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 9,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Mul",
+                  {
+                    "Constant": {
+                      "Uint": [
+                        16,
+                        64
+                      ]
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        2,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 81,
+                "col_start": 40,
+                "line_end": 81,
+                "col_end": 54
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 9,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Mul"
+            },
+            "target": 1,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 81,
+              "col_start": 40,
+              "line_end": 81,
+              "col_end": 54
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 8,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 9,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 81,
+                "col_start": 40,
+                "line_end": 81,
+                "col_end": 54
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 10,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 8,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Uint": [
+                        3,
+                        64
+                      ]
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 81,
+                "col_start": 40,
+                "line_end": 81,
+                "col_end": 58
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 10,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 2,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 81,
+              "col_start": 40,
+              "line_end": 81,
+              "col_end": 58
+            },
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 7,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 10,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 81,
+                "col_start": 40,
+                "line_end": 81,
+                "col_end": 58
+              }
+            }
+          },
+          {
+            "StorageDead": 8
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<(i64, c_rows_precision::Tone)>::with_capacity::<__trust_elem_bytes@16>",
+            "args": [
+              {
+                "Move": {
+                  "local": 7,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 3,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 81,
+              "col_start": 21,
+              "line_end": 81,
+              "col_end": 59
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 8166309126012024383,
+              "def_index": 8729,
+              "substs_digest": [
+                18202837925860049735,
+                4320960826280432744
+              ]
+            },
+            "callee_key": {
+              "sysroot_item": "VecWithCapacity",
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 8166309126012024383,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "stmts": [
+          {
+            "StorageDead": 7
+          },
+          {
+            "StorageLive": 11
+          },
+          {
+            "StorageLive": 12
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<i64 as core::convert::TryFrom<usize>>::try_from",
+            "args": [
+              {
+                "Constant": {
+                  "Uint": [
+                    16,
+                    64
+                  ]
+                }
+              }
+            ],
+            "dest": {
+              "local": 12,
+              "projections": []
+            },
+            "target": 4,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 82,
+              "col_start": 12,
+              "line_end": 82,
+              "col_end": 37
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 4413607509966151476,
+              "def_index": 3768,
+              "substs_digest": [
+                11500534772682626348,
+                8713857171688281012
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4413607509966151476,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::result::Result::<i64, core::num::error::TryFromIntError>::unwrap_or",
+            "args": [
+              {
+                "Move": {
+                  "local": 12,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Int": 16
+                }
+              }
+            ],
+            "dest": {
+              "local": 11,
+              "projections": []
+            },
+            "target": 5,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 82,
+              "col_start": 12,
+              "line_end": 82,
+              "col_end": 51
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 4413607509966151476,
+              "def_index": 12375,
+              "substs_digest": [
+                9098407396773521883,
+                7953940912966105056
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4413607509966151476,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "stmts": [
+          {
+            "StorageDead": 12
+          },
+          {
+            "StorageLive": 13
+          },
+          {
+            "StorageLive": 14
+          },
+          {
+            "StorageLive": 15
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 16,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -9223372036854775808
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 16,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "OverflowNeg",
+            "target": 6,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 83,
+              "col_start": 13,
+              "line_end": 83,
+              "col_end": 15
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 15,
+                "projections": []
+              },
+              "rvalue": {
+                "UnaryOp": [
+                  "Neg",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 15
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::ops::range::RangeInclusive::<i64>::new",
+            "args": [
+              {
+                "Move": {
+                  "local": 15,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 11,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 14,
+              "projections": []
+            },
+            "target": 7,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 83,
+              "col_start": 13,
+              "line_end": 83,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 4413607509966151476,
+              "def_index": 4601,
+              "substs_digest": [
+                14205494443886450244,
+                8799166871696541797
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4413607509966151476,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "stmts": [
+          {
+            "StorageDead": 15
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::RangeInclusive<i64> as core::iter::traits::collect::IntoIterator>::into_iter",
+            "args": [
+              {
+                "Move": {
+                  "local": 14,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 13,
+              "projections": []
+            },
+            "target": 8,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 83,
+              "col_start": 13,
+              "line_end": 83,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 4413607509966151476,
+              "def_index": 10349,
+              "substs_digest": [
+                7492323047419615150,
+                10757516500150662161
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4413607509966151476,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "stmts": [
+          {
+            "StorageDead": 14
+          },
+          {
+            "StorageLive": 17
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 17,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 13,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 9,
+        "stmts": [
+          {
+            "StorageLive": 18
+          },
+          {
+            "StorageLive": 19
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 19,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 17,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "<core::ops::range::RangeInclusive<i64> as core::iter::traits::iterator::Iterator>::next",
+            "args": [
+              {
+                "Copy": {
+                  "local": 19,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 18,
+              "projections": []
+            },
+            "target": 10,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 83,
+              "col_start": 13,
+              "line_end": 83,
+              "col_end": 19
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 4413607509966151476,
+              "def_index": 10530,
+              "substs_digest": [
+                7492323047419615150,
+                10757516500150662161
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4413607509966151476,
+              "krate_name": "core"
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 20,
+                "projections": []
+              },
+              "rvalue": {
+                "Discriminant": {
+                  "local": 18,
+                  "projections": []
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 13,
+                "line_end": 83,
+                "col_end": 19
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 20,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                13
+              ],
+              [
+                1,
+                12
+              ]
+            ],
+            "otherwise": 11,
+            "exhaustive_enum_unreachable": true,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 83,
+              "col_start": 13,
+              "line_end": 83,
+              "col_end": 19
+            }
+          }
+        }
+      },
+      {
+        "id": 11,
+        "stmts": [],
+        "terminator": "Unreachable"
+      },
+      {
+        "id": 12,
+        "stmts": [
+          {
+            "StorageLive": 21
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 21,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Copy": {
+                    "local": 18,
+                    "projections": [
+                      {
+                        "Downcast": 1
+                      },
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 83,
+                "col_start": 8,
+                "line_end": 83,
+                "col_end": 9
+              }
+            }
+          },
+          {
+            "StorageLive": 22
+          },
+          {
+            "StorageLive": 23
+          },
+          {
+            "StorageLive": 24
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 25,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Mul",
+                  {
+                    "Copy": {
+                      "local": 2,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 21,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 25,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Mul"
+            },
+            "target": 14,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 84,
+              "col_start": 20,
+              "line_end": 84,
+              "col_end": 25
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 13,
+        "stmts": [
+          {
+            "StorageDead": 19
+          },
+          {
+            "StorageDead": 18
+          },
+          {
+            "StorageDead": 17
+          },
+          {
+            "StorageDead": 13
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 0,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 95,
+                "col_start": 4,
+                "line_end": 95,
+                "col_end": 10
+              }
+            }
+          },
+          {
+            "StorageDead": 11
+          },
+          {
+            "StorageDead": 6
+          }
+        ],
+        "terminator": "Return"
+      },
+      {
+        "id": 14,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 24,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 25,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 25
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 26,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 26,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": "DivisionByZero",
+            "target": 15,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 84,
+              "col_start": 20,
+              "line_end": 84,
+              "col_end": 29
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 15,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 27,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -1
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 28,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Eq",
+                  {
+                    "Copy": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": -9223372036854775808
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 29,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "BitAnd",
+                  {
+                    "Move": {
+                      "local": 27,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Move": {
+                      "local": 28,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 29,
+                "projections": []
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Div"
+            },
+            "target": 16,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 84,
+              "col_start": 20,
+              "line_end": 84,
+              "col_end": 29
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 16,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 23,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Div",
+                  {
+                    "Move": {
+                      "local": 24,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 11,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 20,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 24
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 30,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Add",
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 23,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 16,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 30,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Add"
+            },
+            "target": 17,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 84,
+              "col_start": 16,
+              "line_end": 84,
+              "col_end": 29
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 17,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 22,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 30,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 84,
+                "col_start": 16,
+                "line_end": 84,
+                "col_end": 29
+              }
+            }
+          },
+          {
+            "StorageDead": 23
+          },
+          {
+            "StorageLive": 31
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 31,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Gt",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Constant": {
+                      "Int": 0
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 85,
+                "col_start": 11,
+                "line_end": 85,
+                "col_end": 16
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 31,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                24
+              ]
+            ],
+            "otherwise": 18,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 85,
+              "col_start": 11,
+              "line_end": 85,
+              "col_end": 16
+            }
+          }
+        }
+      },
+      {
+        "id": 18,
+        "stmts": [
+          {
+            "StorageLive": 32
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 32,
+                "projections": []
+              },
+              "rvalue": {
+                "BinaryOp": [
+                  "Lt",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 3,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 85,
+                "col_start": 20,
+                "line_end": 85,
+                "col_end": 25
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "SwitchInt": {
+            "discr": {
+              "Move": {
+                "local": 32,
+                "projections": []
+              }
+            },
+            "targets": [
+              [
+                0,
+                23
+              ]
+            ],
+            "otherwise": 19,
+            "exhaustive_enum_unreachable": false,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 85,
+              "col_start": 20,
+              "line_end": 85,
+              "col_end": 25
+            }
+          }
+        }
+      },
+      {
+        "id": 19,
+        "stmts": [
+          {
+            "StorageLive": 34
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 34,
+                "projections": []
+              },
+              "rvalue": {
+                "Ref": {
+                  "mutable": true,
+                  "place": {
+                    "local": 6,
+                    "projections": []
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 86,
+                "col_start": 12,
+                "line_end": 86,
+                "col_end": 18
+              }
+            }
+          },
+          {
+            "StorageLive": 35
+          },
+          {
+            "StorageLive": 36
+          },
+          {
+            "StorageLive": 37
+          },
+          {
+            "StorageLive": 38
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 39,
+                "projections": []
+              },
+              "rvalue": {
+                "CheckedBinaryOp": [
+                  "Sub",
+                  {
+                    "Copy": {
+                      "local": 22,
+                      "projections": []
+                    }
+                  },
+                  {
+                    "Copy": {
+                      "local": 1,
+                      "projections": []
+                    }
+                  }
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 89,
+                "col_start": 40,
+                "line_end": 89,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Assert": {
+            "cond": {
+              "Move": {
+                "local": 39,
+                "projections": [
+                  {
+                    "Field": 1
+                  }
+                ]
+              }
+            },
+            "expected": false,
+            "msg": {
+              "Overflow": "Sub"
+            },
+            "target": 20,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 89,
+              "col_start": 40,
+              "line_end": 89,
+              "col_end": 45
+            },
+            "unwind": {
+              "Cleanup": 26
+            }
+          }
+        }
+      },
+      {
+        "id": 20,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 38,
+                "projections": []
+              },
+              "rvalue": {
+                "Use": {
+                  "Move": {
+                    "local": 39,
+                    "projections": [
+                      {
+                        "Field": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 89,
+                "col_start": 40,
+                "line_end": 89,
+                "col_end": 45
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "c_rows_precision::raised_cosine",
+            "args": [
+              {
+                "Move": {
+                  "local": 38,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Copy": {
+                  "local": 4,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 37,
+              "projections": []
+            },
+            "target": 21,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 89,
+              "col_start": 26,
+              "line_end": 89,
+              "col_end": 55
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 18256943366226480901,
+              "def_index": 13,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 18256943366226480901,
+              "krate_name": "c_rows_precision"
+            }
+          }
+        }
+      },
+      {
+        "id": 21,
+        "stmts": [
+          {
+            "StorageDead": 38
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 36,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "c_rows_precision::Tone",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "c_rows_precision::Tone"
+                    }
+                  },
+                  [
+                    {
+                      "Copy": {
+                        "local": 5,
+                        "projections": [
+                          {
+                            "Field": 0
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 37,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Copy": {
+                        "local": 5,
+                        "projections": [
+                          {
+                            "Field": 2
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 88,
+                "col_start": 16,
+                "line_end": 91,
+                "col_end": 17
+              }
+            }
+          },
+          {
+            "StorageDead": 37
+          },
+          {
+            "Assign": {
+              "place": {
+                "local": 35,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  "Tuple",
+                  [
+                    {
+                      "Copy": {
+                        "local": 22,
+                        "projections": []
+                      }
+                    },
+                    {
+                      "Move": {
+                        "local": 36,
+                        "projections": []
+                      }
+                    }
+                  ]
+                ]
+              },
+              "span": {
+                "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+                "line_start": 86,
+                "col_start": 24,
+                "line_end": 92,
+                "col_end": 13
+              }
+            }
+          },
+          {
+            "StorageDead": 36
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "alloc::vec::Vec::<(i64, c_rows_precision::Tone)>::push",
+            "args": [
+              {
+                "Move": {
+                  "local": 34,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 35,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 33,
+              "projections": []
+            },
+            "target": 22,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 86,
+              "col_start": 12,
+              "line_end": 92,
+              "col_end": 14
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": {
+              "Cleanup": 26
+            },
+            "callee_identity": {
+              "stable_crate_id": 8166309126012024383,
+              "def_index": 10013,
+              "substs_digest": [
+                10232062050444309329,
+                4708265050608276836
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 8166309126012024383,
+              "krate_name": "alloc"
+            }
+          }
+        }
+      },
+      {
+        "id": 22,
+        "stmts": [
+          {
+            "StorageDead": 35
+          },
+          {
+            "StorageDead": 34
+          }
+        ],
+        "terminator": {
+          "Goto": 25
+        }
+      },
+      {
+        "id": 23,
+        "stmts": [],
+        "terminator": {
+          "Goto": 25
+        }
+      },
+      {
+        "id": 24,
+        "stmts": [],
+        "terminator": {
+          "Goto": 25
+        }
+      },
+      {
+        "id": 25,
+        "stmts": [
+          {
+            "StorageDead": 32
+          },
+          {
+            "StorageDead": 31
+          },
+          {
+            "StorageDead": 22
+          },
+          {
+            "StorageDead": 21
+          },
+          {
+            "StorageDead": 19
+          },
+          {
+            "StorageDead": 18
+          }
+        ],
+        "terminator": {
+          "Goto": 9
+        }
+      },
+      {
+        "id": 26,
+        "stmts": [],
+        "terminator": {
+          "Drop": {
+            "place": {
+              "local": 6,
+              "projections": []
+            },
+            "target": 27,
+            "span": {
+              "file": "crates/trust-vcgen/tests/data/c_rows_precision.rs",
+              "line_start": 96,
+              "col_start": 0,
+              "line_end": 96,
+              "col_end": 1
+            },
+            "unwind": "Terminate"
+          }
+        }
+      },
+      {
+        "id": 27,
+        "stmts": [],
+        "terminator": "Resume"
+      }
+    ],
+    "arg_count": 5,
+    "return_ty": {
+      "Seq": {
+        "elem": {
+          "Tuple": [
+            {
+              "Int": {
+                "width": 64,
+                "signed": true
+              }
+            },
+            {
+              "Adt": {
+                "name": "c_rows_precision::Tone",
+                "fields": [
+                  [
+                    "fill",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "lift",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ],
+                  [
+                    "warn",
+                    {
+                      "Int": {
+                        "width": 8,
+                        "signed": false
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "contracts": [],
+  "preconditions": [
+    {
+      "Or": [
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_20",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Eq": [
+            {
+              "Var": [
+                "_20",
+                "Int"
+              ]
+            },
+            {
+              "Int": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "g",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "g",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "r",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "r",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "e",
+                "Int"
+              ]
+            },
+            {
+              "Int": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "e",
+                "Int"
+              ]
+            },
+            {
+              "Int": 9223372036854775807
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "peak",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "peak",
+                "Int"
+              ]
+            },
+            {
+              "Int": 255
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

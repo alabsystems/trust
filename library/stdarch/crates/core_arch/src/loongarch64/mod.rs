@@ -4,9 +4,9 @@ mod lasx;
 mod lsx;
 mod simd;
 
-#[unstable(feature = "stdarch_loongarch", issue = "117427")]
+#[stable(feature = "stdarch_loongarch_simd", since = "CURRENT_RUSTC_VERSION")]
 pub use self::lasx::*;
-#[unstable(feature = "stdarch_loongarch", issue = "117427")]
+#[stable(feature = "stdarch_loongarch_simd", since = "CURRENT_RUSTC_VERSION")]
 pub use self::lsx::*;
 
 use crate::arch::asm;
@@ -21,7 +21,7 @@ pub fn rdtime_d() -> (i64, isize) {
 }
 
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
     #[link_name = "llvm.loongarch.crc.w.b.w"]
     fn __crc_w_b_w(a: i32, b: i32) -> i32;
     #[link_name = "llvm.loongarch.crc.w.h.w"]
@@ -62,56 +62,56 @@ unsafe extern "unadjusted" {
 
 /// Calculate the CRC value using the IEEE 802.3 polynomial (0xEDB88320)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crc_w_b_w(a: i8, b: i32) -> i32 {
     unsafe { __crc_w_b_w(a as i32, b) }
 }
 
 /// Calculate the CRC value using the IEEE 802.3 polynomial (0xEDB88320)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crc_w_h_w(a: i16, b: i32) -> i32 {
     unsafe { __crc_w_h_w(a as i32, b) }
 }
 
 /// Calculate the CRC value using the IEEE 802.3 polynomial (0xEDB88320)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crc_w_w_w(a: i32, b: i32) -> i32 {
     unsafe { __crc_w_w_w(a, b) }
 }
 
 /// Calculate the CRC value using the IEEE 802.3 polynomial (0xEDB88320)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crc_w_d_w(a: i64, b: i32) -> i32 {
     unsafe { __crc_w_d_w(a, b) }
 }
 
 /// Calculate the CRC value using the Castagnoli polynomial (0x82F63B78)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crcc_w_b_w(a: i8, b: i32) -> i32 {
     unsafe { __crcc_w_b_w(a as i32, b) }
 }
 
 /// Calculate the CRC value using the Castagnoli polynomial (0x82F63B78)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crcc_w_h_w(a: i16, b: i32) -> i32 {
     unsafe { __crcc_w_h_w(a as i32, b) }
 }
 
 /// Calculate the CRC value using the Castagnoli polynomial (0x82F63B78)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crcc_w_w_w(a: i32, b: i32) -> i32 {
     unsafe { __crcc_w_w_w(a, b) }
 }
 
 /// Calculate the CRC value using the Castagnoli polynomial (0x82F63B78)
 #[inline(always)]
-#[stable(feature = "stdarch_loongarch_crc", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "stdarch_loongarch_crc", since = "1.98.0")]
 pub fn crcc_w_d_w(a: i64, b: i32) -> i32 {
     unsafe { __crcc_w_d_w(a, b) }
 }
@@ -179,7 +179,6 @@ pub unsafe fn asrtgt(a: i64, b: i64) {
 
 /// Loads the page table directory entry
 #[inline(always)]
-#[rustc_legacy_const_generics(1)]
 #[unstable(feature = "stdarch_loongarch", issue = "117427")]
 pub unsafe fn lddir<const IMM8: i64>(a: i64) -> i64 {
     static_assert_uimm_bits!(IMM8, 8);
@@ -188,7 +187,6 @@ pub unsafe fn lddir<const IMM8: i64>(a: i64) -> i64 {
 
 /// Loads the page table entry
 #[inline(always)]
-#[rustc_legacy_const_generics(1)]
 #[unstable(feature = "stdarch_loongarch", issue = "117427")]
 pub unsafe fn ldpte<const IMM8: i64>(a: i64) {
     static_assert_uimm_bits!(IMM8, 8);

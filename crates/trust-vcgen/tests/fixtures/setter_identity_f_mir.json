@@ -1,6 +1,6 @@
 {
   "name": "f",
-  "def_path": "f",
+  "def_path": "assert_mut_setter_identity::f",
   "span": {
     "file": "tests/trust-falsification/proved/assert_mut_setter_identity.rs",
     "line_start": 12,
@@ -145,7 +145,7 @@
         ],
         "terminator": {
           "Call": {
-            "func": "set",
+            "func": "assert_mut_setter_identity::set",
             "args": [
               {
                 "Copy": {
@@ -174,7 +174,22 @@
             },
             "atomic": null,
             "is_foreign": false,
-            "is_unsafe_sig": false
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 15050081721712959844,
+              "def_index": 3,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": false,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 15050081721712959844,
+              "krate_name": "assert_mut_setter_identity"
+            }
           }
         }
       },
@@ -346,7 +361,22 @@
             },
             "atomic": null,
             "is_foreign": false,
-            "is_unsafe_sig": false
+            "is_unsafe_sig": false,
+            "unwind": "Continue",
+            "callee_identity": {
+              "stable_crate_id": 4927783192382188436,
+              "def_index": 11819,
+              "substs_digest": [
+                14241860155052752853,
+                2268345107747320411
+              ]
+            },
+            "callee_key": {
+              "krate_is_real_sysroot": true,
+              "krate_name_is_ambiguous": false,
+              "stable_crate_id": 4927783192382188436,
+              "krate_name": "core"
+            }
           }
         }
       }

@@ -27,6 +27,44 @@ hello
     assert!(p.bin("foo").is_file());
 }
 
+#[cfg(windows)]
+#[cargo_test]
+fn explicit_child_breakaway() {
+    let p = project()
+        .file(
+            "src/main.rs",
+            r#"
+                use std::os::windows::process::CommandExt;
+                use std::process::Command;
+
+                const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+                fn main() {
+                    if std::env::args().nth(1).as_deref() == Some("child") {
+                        println!("child ran");
+                        return;
+                    }
+
+                    let status = Command::new(std::env::current_exe().unwrap())
+                        .arg("child")
+                        .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("run --quiet")
+        .with_stderr_data("")
+        .with_stdout_data(str![[r#"
+child ran
+
+"#]])
+        .run();
+}
+
 #[cargo_test]
 fn quiet_arg() {
     let p = project()
@@ -277,6 +315,7 @@ fn exit_code() {
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `target/debug/foo[EXE]`
+
 [ERROR] process didn't exit successfully: `target/debug/foo[EXE]` ([EXIT_STATUS]: 2)
 
 "#]]
@@ -306,6 +345,7 @@ fn exit_code_verbose() {
 [RUNNING] `rustc [..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `target/debug/foo[EXE]`
+
 [ERROR] process didn't exit successfully: `target/debug/foo[EXE]` ([EXIT_STATUS]: 2)
 
 "#]]
@@ -1103,11 +1143,11 @@ fn example_with_release_flag() {
 
     p.cargo("run -v --release --example a")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/deps -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps[..]`
+[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link[..] -C opt-level=3[..] -C metadata=[..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link -C opt-level=3[..] -C metadata=[..] --out-dir [ROOT]/foo/target/release/examples -C strip=debuginfo -L dependency=[ROOT]/foo/target/release/deps --extern bar=[ROOT]/foo/target/release/deps/libbar-[HASH].rlib[..]`
+[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link[..] -C opt-level=3[..] -C metadata=[..]`
 [FINISHED] `release` profile [optimized] target(s) in [ELAPSED]s
 [RUNNING] `target/release/examples/a[EXE]`
 
@@ -1122,9 +1162,9 @@ fast2
     p.cargo("run -v --example a")
         .with_stderr_data(str![[r#"
 [COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
-[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/deps -L dependency=[ROOT]/foo/target/debug/deps[..]`
+[RUNNING] `rustc --crate-name bar --edition=2015 bar/src/bar.rs [..]--crate-type lib --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..]`
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
-[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..] --out-dir [ROOT]/foo/target/debug/examples -L dependency=[ROOT]/foo/target/debug/deps --extern bar=[ROOT]/foo/target/debug/deps/libbar-[HASH].rlib[..]`
+[RUNNING] `rustc --crate-name a --edition=2015 examples/a.rs [..]--crate-type bin --emit=[..]link [..]-C debuginfo=2 [..]-C metadata=[..]`
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 [RUNNING] `target/debug/examples/a[EXE]`
 
@@ -1210,7 +1250,7 @@ fn run_with_bin_dep() {
 
     p.cargo("run")
         .with_stderr_data(str![[r#"
-[LOCKING] 1 package to latest compatible version
+[LOCKING] 1 package to highest compatible version
 [WARNING] foo v0.0.1 ([ROOT]/foo) ignoring invalid dependency `bar` which is missing a lib target
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
@@ -1274,7 +1314,7 @@ fn run_with_bin_deps() {
 
     p.cargo("run")
         .with_stderr_data(str![[r#"
-[LOCKING] 2 packages to latest compatible versions
+[LOCKING] 2 packages to highest compatible versions
 [WARNING] foo v0.0.1 ([ROOT]/foo) ignoring invalid dependency `bar1` which is missing a lib target
 [WARNING] foo v0.0.1 ([ROOT]/foo) ignoring invalid dependency `bar2` which is missing a lib target
 [COMPILING] foo v0.0.1 ([ROOT]/foo)
@@ -1967,6 +2007,33 @@ fn run_binary_with_same_name_as_dependency() {
         .with_status(101)
         .with_stderr_data(str![[r#"
 [ERROR] package(s) `foo@0.4` not found in workspace `[ROOT]/foo`
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn cargo_run_does_not_leak_out_dir() {
+    let p = project()
+        .file("build.rs", "fn main() {}")
+        .file(
+            "src/main.rs",
+            r#"
+            fn main() {
+                assert!(
+                    std::env::var("OUT_DIR").is_err(),
+                    "OUT_DIR should not be set at runtime"
+                );
+            }
+            "#,
+        )
+        .build();
+
+    p.cargo("run")
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.0.1 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .run();

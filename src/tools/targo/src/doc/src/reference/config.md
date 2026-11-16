@@ -574,6 +574,532 @@ Available template variables:
 
 For more information see the [build cache documentation](../reference/build-cache.md).
 
+#### `build.action-sandbox` (Trust)
+
+* Type: boolean
+* Default: `false`
+
+Native Targo can confine unverified compiler actions on macOS:
+
+```sh
+targo --unverified build -Zbuild-dir-new-layout --config build.action-sandbox=true
+```
+
+This currently admits Rust library builds and checks without build scripts,
+proc macros or compiler wrappers. The compiler and Targo must use the same
+native host architecture. Undeclared file reads, writes outside the unit's
+output directory and network access are denied. An unsupported action fails;
+it does not retry without confinement.
+
+Compiler stdin is an empty stream. The prepared command's arguments, working
+directory and final environment participate in cache validation. Scheduler and
+subprocess-broker addresses are transport; when Rust source reads such a value
+through `env!` or `option_env!`, its actual value is still checked for freshness.
+
+The inherited compiler environment is also declared. Targo captures `PATH`,
+`HOME`, locale variables (`LANG`, `LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, `TZ`),
+`RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP`, Apple deployment-target
+variables, `SDKROOT`, `DEVELOPER_DIR`, and the platform library-search variable.
+Declare additional variables with the existing `[env]` configuration:
+
+```toml
+[env]
+MY_BUILD_INPUT = { value = "default", force = false }
+```
+
+With `force = false`, an existing caller value takes precedence. These resolved
+values enter the confined fingerprint and are captured for compiler execution.
+Other ambient variables are absent from the compiler environment and cannot
+invalidate its artifacts. Targo still supplies package metadata, per-action
+paths and the selected jobserver separately. Unconfined builds retain their
+normal environment inheritance.
+
+This boundary does not yet enable cross-project artifact sharing or certify a
+complete hermetic action identity. Process-local state, final per-unit overlays,
+input immutability and shared publication require their own checks.
+
+#### `build.test-jobs` (Trust)
+
+* Type: integer, at least 1
+* Default: `build.jobs` for native unverified worker admission; `1` otherwise
+
+Maximum number of credits running test harnesses hold together:
+
+```sh
+targo --unverified test --config build.test-jobs=4 -j 4
+```
+
+Native Targo retains the compilation jobserver for execution. A harness of
+weight `w` (see `build.test-weight`) holds `w` tokens of that same pool while it
+runs, all taken when it starts or none, and receives `RUST_TEST_THREADS=w`; this
+setting creates no second CPU pool. The bound is also capped by `build.jobs` and
+by the worker budget. A weight above the bound is lowered to it, so libtest's
+threads always equal the credits held. Explicit `--test-threads` arguments,
+custom runners and authenticated test execution are not supported by this
+opt-in mode. It currently requires Linux or macOS. Without a test plan (see
+below), the non-native default preserves
+sequential harness execution and its existing libtest thread configuration;
+`build.test-weight` and `build.test-harnesses` are checked there but shape
+nothing. Documentation tests retain their existing path.
+
+Under native unverified worker admission, an unset value uses `build.jobs` as
+the ceiling for independent test executables. An explicit configuration value
+or a plan's `test-jobs` takes precedence. Each action still requires its own
+actual CPU lease and passes the existing memory admission; each native harness
+gets one thread. This ceiling supplies no capacity and does not make a single
+harness parallel. Fixed and retained execution keep their existing defaults.
+
+Harnesses start in the queue's priority order, heaviest first among those
+ready: one that cannot take its credits yet holds back the harnesses behind it
+rather than being starved by lighter ones. Ready compilation is never held back
+by a waiting harness, and with no compiler running, ready compilation starts
+before any harness. Credits a harness of weight above 1 collects are idle until
+it has them all, so Targo asks for them only once the harness fits in the pool
+beside the compilation running or ready; until then a running rustc keeps the
+pool's free tokens for its own parallel work. A target with `harness = false`
+runs at weight 1 and passes or fails by its exit status alone; a weight above 1
+on it is refused.
+
+Targo assembles each scheduled command through the ordinary Cargo test path.
+Repository `[env]` values (including `force` and `relative`), the package working
+directory, dynamic-library search paths and test arguments therefore survive
+this compile/execution phase boundary. Use this mode for independent harnesses
+instead of extracting `--no-run` executable paths and launching them directly:
+those paths alone are not execution recipes. In particular, direct execution
+can lose a repository's `RUST_MIN_STACK` and change whether a test completes.
+
+A harness starts only after its own compilation prerequisites succeed. With
+fail-fast enabled, a failed harness prevents pending harnesses from starting;
+already-running independent harnesses finish. With `--no-fail-fast`, remaining
+harnesses run. Parallel jobs use Targo's bounded-output process supervisor;
+interruption cancels and reaps the owned process groups.
+
+JSON output adds `test-execution` records with schema
+`targo.test-execution.v2`. Each identifies an invocation-local index, total
+inventory size, prerequisite artifact, `package_id`, `package`, `target`,
+target `kind` (`lib`, `bin`, `test`, `bench` or `example`), `harness`,
+`weight`, `exclusive`, state and execution time. States are `ready`,
+`running`, `passed`, `failed` and `blocked`. A `passed` or `failed` record
+carries the process's `exit_code`, or the `signal` that ended it; both are
+`null` when Targo ended the action itself (its cancellation, an output
+overflow or an interruption) or never started it. A process that exited by
+itself and that Targo then judged failed (a `--require-test-bin` harness that
+reported no passing test) keeps its `exit_code`. Each line a harness writes
+becomes a `test-output` record with schema `targo.test-output.v1`, naming the
+action's `index`, its `stream` (`stdout` or `stderr`) and the `line`, so
+concurrent harnesses never share an unattributed line on Targo's standard
+output. A line longer than 1 MiB is cut, not refused: it is written once, as
+`[line cut: it is longer than 1048576 bytes] ` followed by its first bytes,
+1 MiB together, and the harness runs on and is judged by its tests. All a
+harness writes to one stream still counts against that stream's limit (512
+MiB, more on a machine with more memory), past which Targo ends the action.
+Documentation tests keep their existing path and output.
+
+A test plan (`targo --unverified test --plan <FILE>`, narrowed by `--request
+<ID>`; [Test Plans](test-plan.md) lists every key of the file) always runs in
+this queue, also with `build.test-jobs` unset or 1: each request has its own
+harness arguments, and the sequential runner has one argument list. A test executable runs once per distinct argument list of the
+requests that selected it; requests with equal arguments share that one action.
+The actions of one test target (the runs of one executable, and the builds of
+that target under other features) never overlap: each starts after the one
+before it ended. A failed one releases the next unless the failure stopped the
+run (fail-fast), in which case the rest are reported `blocked`. Without JSON,
+each `Running` line ends with the action's request ids in brackets.
+
+Which requests a plan run performs follows from what the invocation says
+changed; Targo runs no version-control command. `--changed-paths <FILE>` (`-`
+for standard input) names paths relative to the workspace root, separated by
+NUL when the input holds one and by newlines otherwise; each is a normal
+relative path (no leading `/`, no `.`, `..` or empty component). A
+newline-separated line that is quoted, holds a control character (the `\r` of a
+CRLF file) or starts or ends with white space is an error, since a tool that
+printed it may have altered the name: pass such paths NUL-separated. A plan
+whose member lies outside the workspace root takes no `--changed-paths`, since
+no such path can name that member's files. A plan member
+is *touched* when its directory is the longest member directory a changed path
+lies under, so a nested member keeps its own paths. `-p <SPEC>` names a plan
+member the change *reaches* without touching; with a plan it has no other
+meaning, and a spec that names no plan member is an error. `[default]` tests
+the touched and reached members, a `[[variant]]` runs iff its package is one of
+them, and an `[[instrument]]` runs iff a changed path starts with one of its
+`when-changed` entries or ends with its `when-changed-suffix` (paths under a
+`not-under` entry never count), unless its host is touched and the `[default]`
+run of that host performs everything the instrument would judge. It does only
+when the instrument has no `require-pass`, passes no harness option (an
+argument starting with `-`), and names only targets `--tests` runs under default
+features (no `test = false`, no `required-features`); otherwise the instrument
+runs beside the default run. An instrument with neither condition runs under
+every selection. With neither `--changed-paths` nor `-p`, every request runs.
+A plan without `[default]` tests only the members its variants name: `-p` of
+another member is an error, and its paths are not accounted for.
+`--request` then narrows the performed requests and never adds one.
+
+A changed path that starts with a `select.attribute-under` entry must be
+accounted for: owned by a plan member, by a member `select.elsewhere` names
+another lane for (reported, with that lane's command), or by the directory of a
+`[[workspace]]` manifest or of a `[[tool]]` manifest that no member owns.
+Otherwise the invocation exits with status 2 before
+resolving or building anything, listing each such path. A selection that
+performs no request and no phase (below) exits 0 having resolved and built
+nothing (so `--locked` checks no lockfile), after the plan passed the checks
+every other route makes. Each request's harness arguments are checked whether
+or not the selection performs it.
+
+`[[tool]]` and `[[workspace]]` entries name builds outside the plan's graph.
+Each is a phase under its own manifest, performed in this process before the
+plan's requests, one after another, tools first; `--unit-graph` performs none
+and says so. A `[[workspace]]` manifest is the root of a workspace of its own
+(its own lockfile, patches and profiles); a `[[tool]]` manifest may also be a
+member of the invocation's workspace. A manifest is written one way, as a
+changed path is: relative to the workspace root with `/`, with no `.`, `..` or
+empty part.
+
+* `[[tool]]` (`manifest`, `bin`, `env`, `needed-by`) is built as `targo build
+  --bin <bin>` under `manifest` builds it (the `dev` profile, the invocation's
+  jobs and `--target`), when a request this run performs tests a member
+  `needed-by` names; otherwise it is not built. The built file is copied into a
+  private directory beside it, and the copy's path is set as the variable `env`
+  for the test executables of the `needed-by` members and for no other: every
+  other test executable of the run, a `[[workspace]]`'s included, has the
+  variable removed, whatever the invocation's environment holds. The copy is
+  deleted when the invocation ends. A changed path in the tool's directory
+  selects the `needed-by` members as `-p` would, so the tool is built and the
+  tests that run it run; a conditional instrument hosted on one of them runs
+  too where no default run tests that host. If no request of the plan tests a
+  `needed-by` member, a run with such a path is refused (status 2). A tool that fails to build ends the
+  invocation with status 101 before any test, with or without
+  `--no-fail-fast`. `--no-run` builds the tool and makes no copy. `needed-by`
+  names members this plan can test, and `env` is a plain variable name that is
+  not one Cargo, rustc or the loader reads.
+* `[[workspace]]` (`manifest`, optional `cfg`) names the root manifest of a
+  crate that is its own workspace. It is tested as `targo test --tests` under
+  that manifest tests it, when a changed path lies in its directory or when the
+  invocation names no change (`-p` alone selects none). The phase is a plan run
+  of that workspace's default members: every harness is held to its closing
+  line and counted, and `[default] min-tests` is asked of each of those
+  members. A run that reports no test at all fails the phase, with or without
+  a `min-tests`. `[harness]` and `[expect] known-red` do not apply to it. The
+  phase reads configuration as the invocation does, from its own directory
+  upwards: a `.cargo/config.toml` between the workspace root and the
+  `[[workspace]]`'s directory would be read only by a run inside that
+  directory, so a selected workspace that has one is refused. A `cfg`
+  expression is held against the build's target first; where it does not hold
+  the workspace is neither built nor run and is reported as `not-applicable`.
+  It may test only what the target decides: `unix`, `windows`, and
+  `target_abi`, `target_arch`, `target_endian`, `target_env`, `target_family`,
+  `target_os`, `target_pointer_width` or `target_vendor` with a value the
+  compiler knows for some target (asked of `rustc --print=check-cfg`). Any
+  other name or key, a constant, or an unknown value is refused on every run:
+  it would report the workspace as not for this target on every host.
+  `--request` leaves a selected workspace out (`left-out`) and sets `narrowed`.
+  A failed workspace fails the run: without `--no-fail-fast` the invocation
+  stops there; with it, the phases and requests after it still run and the
+  result record lists it in `unmet`. A phase that does not run to its end (a
+  build failure, an interruption) ends the invocation.
+
+With JSON messages each phase that builds anything is bracketed by two
+`reason="test-plan-phase"` records with schema `targo.test-plan-phase.v1`
+(`plan`, `kind`, `manifest`, `state`, `why`, `env`, `tests`): one with `state`
+`started` and one with its outcome (`built`, `passed`, `failed`); a phase that
+builds nothing writes the outcome alone (`not-needed`, `not-selected`,
+`left-out`, `not-applicable`). A phase the invocation ends in (a tool that does
+not build, a workspace that fails without `--no-fail-fast`) still writes its
+closing `failed` record, which is then the last record: a `started` with no
+closing record is a run that was cut off. Every record between the two is that phase's,
+and a test action's `index` is counted within its phase. A workspace's run that
+ran to its end writes `reason="test-plan-phase-result"`, the result record's
+shape with `phase` set to its manifest.
+
+With JSON messages, the first record of a plan invocation is
+`reason="test-plan"` with schema `targo.test-plan-selection.v1`: the `plan`
+path, the `sha256` of the file's bytes, `selection` (`changed_paths`: every
+changed path the run read, from `--changed-paths`, `--changed-range` and
+`--changed-pushed-refs` together, or `null` where none was given;
+`changed_ranges`, the ranges diffed; the `-p` values as `packages`; the
+`--reached` directories as `reached`; `whole_plan`; the `--request` ids as
+`requests`), `members` (`touched`, `reached`, `selected`), one `requests` row
+per request of the file (`id`, `role`, `packages`, `active`, `why`),
+`elsewhere` (`member`, `command`, `paths`), `workspaces` (the `[[workspace]]`
+manifests a changed path lies under; every one of the plan when neither
+selection input is given), `tools` (the `[[tool]]`s a changed path lies under:
+`manifest`, `members`, `paths`) and `unattributed` (`path`, `why`). It is
+written before a status 2 refusal and left out under `--unit-graph`, whose
+output is one document of its own. A run that performs no request still ends
+with the `test-plan-result` record.
+
+A plan's `test-execution` records have schema `targo.test-execution.v3`: the v2
+keys, then `requests` (the ids of the requests the action runs for, in plan
+order), `features` (the features the executable was built with, which is the
+built unit's activated set and not the request's list), `args` (the harness
+arguments of this action), `memory_mib` (what the action is counted for
+against the run's memory budget, 0 where the plan counts none),
+`expected_seconds` (the plan's `[harness] seconds` for it, 0 where it states
+none) and `tests`. On a terminal record `tests` is what the
+harness reported, `{passed, failed, ignored, filtered_out}`, read from libtest's
+closing `test result:` line (the last one printed); it is `null` before the
+action ends, for an action that never ran, and wherever the exit and the
+closing line disagree. A target with `harness = false` prints no summary and
+counts as one test, passed on exit 0 and failed otherwise. Runs without a plan
+keep v2, key for key.
+
+A harness that exits 0 is held to its closing line: without a complete
+`test result: ok.` line as the last one (it exited from inside a test, or a
+`FAILED` line closed the run) the action is recorded `failed` with its own
+`exit_code` of 0. The closing line must close the run the harness announced:
+its passed, failed, ignored and measured numbers add up to the N of the first
+`running N tests` line, and only blank lines follow it. A harness's stdout also
+carries whatever its tests write past libtest's capture and whatever a child
+process they start prints, so a closing line that fails this is not taken for
+the harness's own. A request's `args` may not select another output format
+(`--format json`, `--format junit`), which prints none of these lines. A plan
+run that ran to its end then asks what the plan asks.
+With `[default] min-tests = N`, each member of `[default]` must have reported at
+least N tests (passed plus failed; ignored and filtered-out tests judge
+nothing), summed over the default run and the member's `[[variant]]` runs; an
+instrument's run credits no member. `min-tests = 0` is refused. A run from which
+`--request` left out `[default]` or a variant has only part of that sum, so it
+does not judge `min-tests` and warns that it does not; leaving out only
+instruments takes nothing from the sum, and `min-tests` is judged. Each
+`[[variant]]` must itself report a test over its executables: one whose feature
+set compiles no test in fails, even where its member's `min-tests` is met
+elsewhere. Each name in an instrument's `require-pass` must appear as
+`test <name> ... ok` in the output of one of that instrument's test
+executables: an ignored, filtered-out, renamed or failed test does not. A
+`#[should_panic]` test is named by its path alone; its line
+`test <name> - should panic ... ok` is that test passing. A harness's result
+lines are read only where they number what its closing line says passed, and a
+name that also printed another result (`ignored`, `FAILED`) did not pass; a
+harness run with `--quiet` prints no result lines and satisfies no
+`require-pass`. These checks catch output on a harness's stdout that is not
+libtest's by its disagreement with libtest's own lines; test code written to
+forge every line consistently is not detected. A requirement that is not met
+ends the run with one error listing each, and with exit status 2 (the run
+could not judge) unless something else it judged is red, which is 101
+([the plan's exit status](test-plan.md#exit-status)).
+
+With JSON messages, such a run's last record is `reason="test-plan-result"`
+with schema `targo.test-plan-result.v1`: the `plan` path, `passed`, `outcome`
+and `exit_status` (how the run ended, as its exit status says it), `narrowed`
+(`--request` left out a request the selection performs, so `passed` is not that
+selection's verdict), `min_tests_skipped` (the plan sets `min-tests` and this run did not
+judge it), one `requests` row per request (`id`, `actions`, `failed`, `excused`, `tests`,
+`passed`), one `members` row per member `min-tests` was judged for (`package`,
+`tests`, `min_tests`, `passed`), `unmet`, the requirements not met, and
+`known_red` (`null` without `[expect] known-red`), `phase` (`null`) and
+`phases`, one row per `[[tool]]` and `[[workspace]]` entry in the shape of its
+closing `test-plan-phase` record. A run that ended before it had a verdict (a
+refused invocation, a failed build, a stop at its first failure without
+`--no-fail-fast`, a run Targo stopped for time or for a signal) closes with
+the short form of the same record: `schema`, `plan`, `phase`, `passed`
+(`false`), `outcome`, `exit_status` and `why`. Every plan invocation's JSON
+therefore ends in one `test-plan-result` record, and a stream without one was
+cut off.
+
+A plan's `[harness.<package>.<kind>[.<name>]]` tables are the harness policy of
+its run, with the keys of `build.test-harnesses` (`weight`, `exclusive`,
+`memory-mib`, `seconds`). They are its only source: a non-empty
+`build.test-harnesses` beside a plan is an error on every route, including
+`--no-run` and a selection that performs nothing. A plan's `[run]` table
+states its pool, its memory count and its bounds
+([reference](test-plan.md#run)); `build.test-jobs`, `build.test-weight`,
+`build.test-memory-mib`, `build.test-wall-seconds` and
+`build.test-stall-seconds` stand over it, and `-j` stays the caller's.
+
+What a script lane took from its caller's environment maps onto this:
+
+| Script lane | Targo |
+|-------------|-------|
+| `TRUST_CRATES_TESTS_JOBS=N` binaries at once, `RUST_TEST_THREADS=T` each | `[run] test-jobs = N×T` and `test-weight = T`; on one host, `CARGO_BUILD_TEST_JOBS` and `CARGO_BUILD_TEST_WEIGHT` (or `--config`). A harness gets as many libtest threads as credits: Targo sets `RUST_TEST_THREADS` for each, and one the caller exported is replaced. |
+| `CARGO_BUILD_JOBS` | Unchanged: the size of the one pool compilers and tests share (`-j`). Test credits never exceed it. |
+| A build-slot job (`BUILD_SLOT_HELD=1`, `CARGO_BUILD_JOBS=<share>`) | Read as before: the share bounds the test credits and each weight, and must be a positive decimal. No flag is needed. |
+| 16 GiB per binary against the memory available | `[run] harness-memory-mib`; the budget is measured by Targo, or `CARGO_BUILD_TEST_MEMORY_MIB`. |
+| `TRUST_CRATES_TESTS_BUDGET_S`, `TRUST_CRATES_TESTS_STALL_S` | `[run] wall-seconds` and `stall-seconds`; `CARGO_BUILD_TEST_WALL_SECONDS`, `CARGO_BUILD_TEST_STALL_SECONDS`. |
+| `TRUST_RUSTC` | Not Targo's: the tests that need a Trust compiler read it from the environment Targo passes on. Targo compiles with `RUSTC`. |
+| `--range A..B`, `--push-context`, `--also-members` | `--changed-range`, `--changed-pushed-refs -`, `--reached`. Note `--changed-range A..B` is git's own two-tree diff; the script read `A..B` as git's `A...B`. |
+| exit 1 red, 2 cannot judge, 3 out of time | 101, 2, 3. |
+
+`[expect] known-red = "<file>"` names a file under the workspace root that
+lists the tests the plan expects to fail, one `<test binary>::<test path>` per
+line: the test target's crate name (its executable's file name without the
+hash) and the name libtest prints. `#` starts a comment, and a comment
+containing `[flaky]` marks a test that may pass or fail. A missing file, a path
+that a symlink leads out of the workspace, a row of another shape and a key
+listed twice are errors on every route. A key names its binary by crate name
+alone, so a row whose binary name more than one test target of the workspace
+has (two packages with a `tests/it.rs`, or a lib and an integration test of
+its name; packages `select.elsewhere` names are not counted) is also an error
+on every route, whatever the run selects: it would excuse the test in each of
+them. A row applies to its test under every request that runs the binary. The
+file is a ratchet:
+
+* A harness that failed only in listed tests is *excused*. Its record stays
+  `failed` with its own exit code, its request counts it under `excused`, and
+  it does not fail the run.
+* A failed test the file does not list is a new failure, and its harness
+  fails the run as without the file.
+* A listed test that passed is a stale row. It is an unmet requirement (exit
+  status 101) until the row is deleted, unless the row is `[flaky]`.
+* A row is judged by its harness's result lines. A harness with listed tests
+  that passed while its result lines were not read (it printed `ok` lines its
+  closing line does not count, as a child process writing to stdout or
+  `--format terse` does, or its target has `harness = false`) is *unjudged*,
+  and an unmet requirement: a listed test that passed there would go unseen.
+
+Only a failure libtest reported test by test is excused: the harness exited
+with a code, closed the run it announced with `test result: FAILED.`, and
+printed as many `FAILED` and `ok` result lines as that line counts. A crash, a
+signal, a harness that exited 0 and was judged failed, and a target with
+`harness = false` name no failed test, so no row excuses them; where such a
+harness has listed tests, a note and the result record say why nothing was
+excused. The file is judged over a run that ran to its end, so a run of a plan
+with `known-red` requires `--no-fail-fast`, and so does a selection that
+performs nothing. The result record's `known_red` holds the `file`, its
+`sha256`, and five lists: `excused` (listed tests that failed in an excused
+harness), `not_excused` (listed tests that failed in a harness that also
+failed in an unlisted test), `new_failures` (failed tests the file does not
+list), `stale`, and `unjudged` (one `package`, `binary`, `failed`, `why` row
+per harness with listed tests whose result lines were not read).
+
+A plan run fails, whatever its harnesses exit with, when a request selected no
+test executable, and when an action that runs for an `[[instrument]]` reported
+no passing test (a filter that matched nothing, or only ignored tests); such
+an action is recorded `failed` with the harness's own `exit_code` of 0. A
+target with `harness = false` is judged by its exit status alone. An
+instrument's `args` may not contain `--list`, `--help` or `-h`, and request ids
+are plain words (ASCII letters, digits, `_`, `.`, `-`, not starting with `-`).
+A failed action is reported with the target that failed and the arguments that
+rerun it: the plan and one of its requests, a single-package request where
+there is one. A failure inside a `[[workspace]]` phase is reported with the
+command that reruns that workspace (`targo --unverified test --manifest-path
+<its manifest> --tests`, without `--plan`), and the phase's `Running` lines are
+labelled `[workspace <manifest>]`.
+
+With nothing running, a pool Targo created returns its tokens at once. If a
+harness still lacks its credits after 30 seconds of that, the pool lost
+tokens (a client that exited or was killed while holding them; rustc's
+parallel frontend, `-Zthreads`, sometimes exits holding one): the run fails
+and the tests still pending are reported `blocked` rather than waited for
+forever. A lost token is never minted again, since Targo cannot tell it from
+one a surviving process still holds.
+
+These are process-execution observations, not proof or test-result cache
+authority. Arbitrary test code can consume resources outside the cooperative
+CPU budget, including more threads than its weight; this setting is not an RSS
+limit or a filesystem sandbox.
+
+#### `build.test-weight` (Trust)
+
+* Type: integer, at least 1
+* Default: `1`
+
+The credits, and libtest threads, each libtest harness holds under
+`build.test-jobs` unless `build.test-harnesses` sets its own. Targets with
+`harness = false` always hold 1.
+
+When Targo runs under an inherited jobserver (another `make` or Cargo) or
+native worker admission is requested, a weight still above 1 after the
+`build.test-jobs` bound is refused before anything is built: neither can
+promise a harness all of its credits at once.
+
+#### `build.test-memory-mib` (Trust)
+
+* Type: integer
+* Default: measured: the memory available when the run begins, less an eighth
+  of the host's (at least 1 GiB)
+* Environment: `CARGO_BUILD_TEST_MEMORY_MIB`
+
+The mebibytes running test executables may be counted for together, where a
+harness policy counts any (`memory-mib` of a `build.test-harnesses` or
+`[harness]` entry, or a test plan's `[run] harness-memory-mib`). A test
+executable starts only while the counts of the running ones and its own fit;
+one counted for more than the whole budget runs with no other test beside it.
+This is admission by a stated figure, not a limit on what a test may use.
+
+#### `build.test-wall-seconds` (Trust)
+
+* Type: integer, at least 1
+* Default: none
+* Environment: `CARGO_BUILD_TEST_WALL_SECONDS`
+
+Seconds a test plan's whole invocation may take, over the plan's `[run]
+wall-seconds` and `wall-seconds-per-member`. A run past it is stopped, with its build if that is what is running, and
+exits 3. It has no effect without `--plan`.
+
+#### `build.test-stall-seconds` (Trust)
+
+* Type: integer, at least 1
+* Default: none
+* Environment: `CARGO_BUILD_TEST_STALL_SECONDS`
+
+Seconds a running test executable of a test plan may print nothing, over the
+plan's `[run] stall-seconds`. A run with one silent for longer is stopped and
+exits 3. It has no effect without `--plan`.
+
+#### `build.test-harnesses` (Trust)
+
+* Type: table
+* Default: none
+
+Admission for individual test targets under `build.test-jobs`, keyed by package
+and then by the target selector's kind (`lib`, `bin`, `test`, `bench`,
+`example`) and, except for `lib`, the target's name:
+
+```toml
+[build.test-harnesses.my-package.test.integration]
+weight = 4
+
+[build.test-harnesses.my-package.test.uses-global-state]
+exclusive = true
+
+[build.test-harnesses.my-package.lib]
+weight = 2
+```
+
+`weight` overrides `build.test-weight` for that target. `memory-mib` counts
+the harness against `build.test-memory-mib` while it runs, and `seconds`
+says how long it is expected to run: among the harnesses ready to start, the
+longest expected one starts first. An `exclusive` harness
+starts only once no compilation is running or ready and nothing else runs, and
+nothing starts beside it; it is scheduled after the other harnesses, so it must
+not be one another test waits for. Unknown kinds and settings, a zero weight,
+`memory-mib` or `seconds`, and a target a workspace member does not have are refused before anything is
+built. An entry for a package outside the workspace is checked the same way,
+before any test body runs, for every version of that package the run tests,
+whether through its harnesses or only its doctests. With `build.test-jobs`
+above 1, an entry for a package the run does not test draws a warning; the
+sequential runner, which applies none of this table, says nothing. Environment
+variables cannot spell this table and are refused; use a config file or
+`--config`.
+
+#### `build.shared-dependency-cache` (Trust)
+
+* Type: boolean
+* Default: `false`
+
+Share eligible dependency compilations between projects on the same
+machine and under the same `CARGO_HOME`:
+
+```sh
+targo --unverified build -Zbuild-dir-new-layout -Zfine-grain-locking \
+  --config build.shared-dependency-cache=true
+```
+
+This currently requires native unverified Targo on macOS, the native host
+architecture, and no compiler wrappers. Targo selects registry library units
+and external path dependencies outside the current workspace whose entire
+dependency graph can be compiled without build scripts, proc macros or
+workspace-local inputs. Selected units use the confinement and declared
+environment contract described above. Other units retain ordinary private
+build directories and execution, so a project can still use build scripts and
+proc macros without placing their results in this shared store.
+
+Shared unit files live under `CARGO_HOME/trust/native-dependencies-v1`. Targo
+requires a local filesystem and owned directories that other users cannot write, checks recorded
+inputs and output digests, and coordinates readers and writers through a
+per-unit lock. A waiting builder checks freshness again after obtaining its
+lock. This is a local development cache, not a verified verdict or a remote
+artifact trust policy. `targo clean` remains scoped to project build outputs.
+
 #### `build.rustflags`
 * Type: string or array of strings
 * Default: none

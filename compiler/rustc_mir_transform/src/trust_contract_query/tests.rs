@@ -129,13 +129,26 @@ fn lowered_text(
 
 /// Build the projection environment a `&mut self` receiver of
 /// `struct Grid { storage: Storage }` / `struct Storage { detached: bool, n: u64 }`
-/// produces, plus a by-reference `s: &S` with one `u64` field.
+/// produces, plus a by-reference `s: &S` with one `u64` field, plus a scalar
+/// `x: &mut u64`. The `&mut` heads carry their D2 primed spellings (`LeafEpoch`).
 fn projection_fixture() -> ProjectionEnvironment {
     let mut canonical_text = FxHashMap::default();
-    canonical_text.insert("self.storage.detached".to_string(), "(*self).0.0".to_string());
-    canonical_text.insert("self.storage.n".to_string(), "(*self).0.1".to_string());
-    canonical_text.insert("s.n".to_string(), "s.0".to_string());
-    ProjectionEnvironment { canonical_text }
+    let mut epochs = FxHashMap::default();
+    for (authored, canonical, epoch) in [
+        ("self.storage.detached", "(*self).0.0", LeafEpoch::MutPointeeUnprimed),
+        ("self.storage.n", "(*self).0.1", LeafEpoch::MutPointeeUnprimed),
+        ("self'.storage.detached", "(*self).0.0", LeafEpoch::Primed),
+        ("self'.storage.n", "(*self).0.1", LeafEpoch::Primed),
+        ("x'", "(*x)", LeafEpoch::Primed),
+        ("s.n", "s.0", LeafEpoch::Plain),
+    ] {
+        canonical_text.insert(authored.to_string(), canonical.to_string());
+        epochs.insert(authored.to_string(), epoch);
+    }
+    let mut mut_params = FxHashSet::default();
+    mut_params.insert("self".to_string());
+    mut_params.insert("x".to_string());
+    ProjectionEnvironment { canonical_text, epochs, mut_params }
 }
 
 fn projected_text(kind: TrustContractKind, body: &str) -> Option<String> {
@@ -147,6 +160,10 @@ fn projected_text(kind: TrustContractKind, body: &str) -> Option<String> {
         LoweredVariableDomain { name: "self*.0.0".to_string(), domain: Domain::Bool },
         LoweredVariableDomain {
             name: "self*.0.1".to_string(),
+            domain: Domain::MachineInt { width: 64, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "x*".to_string(),
             domain: Domain::MachineInt { width: 64, signed: false },
         },
     ];
@@ -192,6 +209,35 @@ fn native_field_projection_lowers_to_the_canonical_place_spelling() {
     );
 }
 
+/// D2 primes (M0(b1), 2026-09-30). A prime on a `&mut` parameter's pointee names its
+/// FINAL value, and resolves to the canonical place today's native lane reads at exit,
+/// in a native uncited `ensures` only. See `LeafEpoch`.
+#[test]
+fn d2_primes_bind_a_mut_pointee_final_value_in_a_native_ensures_only() {
+    use TrustContractKind::{Ensures, Requires};
+    assert_eq!(
+        projected_text(Ensures, "!self'.storage.detached").as_deref(),
+        Some("!((*self).0.0)")
+    );
+    assert_eq!(
+        projected_text(Ensures, "self'.storage.n == 0").as_deref(),
+        Some("((*self).0.1) == (0)")
+    );
+    assert_eq!(projected_text(Ensures, "x' == 1").as_deref(), Some("((*x)) == (1)"));
+    // A precondition is a one-state predicate: no post-state exists to name.
+    assert_eq!(projected_text(Requires, "!self'.storage.detached"), None);
+    // MIXED EPOCHS. The unprimed spelling of a `&mut` pointee still reads the EXIT
+    // value, so each of these would compare exit with exit: `x' == *x + 1` over
+    // `*x += 1` would lower to `x* == x* + 1`.
+    assert_eq!(projected_text(Ensures, "self'.storage.n == self.storage.n"), None);
+    assert_eq!(projected_text(Ensures, "x' == *x + 1"), None);
+    // Not D2 spellings: a deref of a primed name, a prime on a shared or by-value
+    // head, a double prime.
+    assert_eq!(projected_text(Ensures, "*x' == 1"), None);
+    assert_eq!(projected_text(Ensures, "s'.n == 0"), None);
+    assert_eq!(projected_text(Ensures, "x'' == 1"), None);
+}
+
 /// §13.1 of `docs/STRICT_VERIFICATION_FRAGMENT.md`: every one of these spellings
 /// used to make the WHOLE clause unparseable, silently, while the identical
 /// constant in the function body was fine. They are the same integer written
@@ -199,9 +245,8 @@ fn native_field_projection_lowers_to_the_canonical_place_spelling() {
 /// text — which is what the downstream formula parser reads.
 #[test]
 fn every_rust_integer_literal_spelling_lowers_to_the_same_bare_decimal() {
-    let lowered = |body: &str| {
-        lowered_text(TrustContractKind::Ensures, ContractClauseOrigin::Native, body)
-    };
+    let lowered =
+        |body: &str| lowered_text(TrustContractKind::Ensures, ContractClauseOrigin::Native, body);
     let bare = lowered("result <= 999999999");
     assert_eq!(bare.as_deref(), Some("(result) <= (999999999)"));
     for spelling in ["999_999_999", "0x3B9AC9FF", "999999999u32", "999_999_999usize"] {
@@ -548,19 +593,11 @@ fn structural_query_refuses_cross_domain_numeric_operations() {
             name: "i8v".to_string(),
             domain: Domain::MachineInt { width: 8, signed: true },
         },
-        LoweredVariableDomain {
-            name: "flag".to_string(),
-            domain: Domain::Bool,
-        },
+        LoweredVariableDomain { name: "flag".to_string(), domain: Domain::Bool },
     ];
 
     with_test_session_globals(|| {
-        for text in [
-            "u8v == u16v",
-            "u8v < i8v",
-            "u16v + u8v == u16v",
-            "flag == u8v",
-        ] {
+        for text in ["u8v == u16v", "u8v < i8v", "u16v + u8v == u16v", "flag == u8v"] {
             assert!(
                 matches!(
                     lowered_contract_text_with_domains(text.to_string(), &domains),
@@ -613,8 +650,7 @@ fn helper_scanner_preserves_unicode_strings_comments_and_refused_calls() {
 #[test]
 fn helper_argument_scanner_ignores_nested_delimiters_inside_tokens() {
     assert_eq!(
-        split_top_level_commas("x, \"a,b)\", r#\"c,d)\"#, /* , ) */ nested(y, z)")
-            .unwrap(),
+        split_top_level_commas("x, \"a,b)\", r#\"c,d)\"#, /* , ) */ nested(y, z)").unwrap(),
         ["x", " \"a,b)\"", " r#\"c,d)\"#", " /* , ) */ nested(y, z)"],
     );
     let wrapped = "outer(\"λ)\", r#\")\"#, /* ) */ inner(x)) tail";
@@ -636,6 +672,64 @@ fn snippet_fallback_lowers_public_sample_requires() {
         lowered_text(TrustContractKind::Requires, ContractClauseOrigin::Attribute, "low <= high")
             .as_deref(),
         Some("(low) <= (high)")
+    );
+}
+
+/// NEGATIVE. `requires` is the only clause whose predicate is ASSUMED, so the
+/// return-place vocabulary must never reach it.
+///
+/// Measured on the promoted toolchain trust-e26541e3 before this refusal
+/// existed: `#[trust::requires(result == 0)]` lowered to `Eq(_0, 0)` and
+/// emitted a real `assumption:requires` row. What kept it from becoming a
+/// definition-entry assumption over the return place was the later
+/// `contract_assumption_gate` (crates/trust-mir-extract), which warns
+/// "predicate references `_0`, which is not a parameter" and skips it. That
+/// gate stays as defence in depth; this refusal is the FIRST boundary, the one
+/// that sees the text, and it matches the native lane, which refuses the same
+/// spelling outright with "`result` is only allowed in an ensures clause"
+/// (tests/ui/trust/typed_citation_result_scope.rs).
+#[test]
+fn attribute_requires_refuses_the_return_place_vocabulary() {
+    for body in ["result == 0", "result == x", "_0 == 0", "x > 0 && result < x"] {
+        assert_eq!(
+            lowered_text(TrustContractKind::Requires, ContractClauseOrigin::Attribute, body),
+            None,
+            "`requires {body}` must not lower the return place into an entry assumption"
+        );
+    }
+    // The refusal is scoped to the return-place vocabulary: ordinary
+    // preconditions over parameters keep lowering.
+    assert_eq!(
+        lowered_text(TrustContractKind::Requires, ContractClauseOrigin::Attribute, "x > 0")
+            .as_deref(),
+        Some("(x) > (0)")
+    );
+    // The rule keys on the absence of a RESULT BINDING, not on the origin or
+    // the clause keyword, so every other bindingless kind that reaches this
+    // parser is covered too. A native `requires` is separately caught by
+    // `lower_native_clause`'s hard error before it ever gets here.
+    for kind in [
+        TrustContractKind::Requires,
+        TrustContractKind::Invariant,
+        TrustContractKind::Assumes,
+        TrustContractKind::Asserts,
+    ] {
+        for origin in [ContractClauseOrigin::Attribute, ContractClauseOrigin::Native] {
+            assert_eq!(
+                lowered_text(kind, origin, "result == x"),
+                None,
+                "`result` must not denote the return place in {kind:?} ({origin:?})"
+            );
+        }
+    }
+    // An `ensures` still binds it, which is the whole point. (The native lane
+    // is the one `lowered_text` gives signature domains; an attribute bare-
+    // `result` ensures is source-typed against real domains and is pinned by
+    // its own tests.)
+    assert_eq!(
+        lowered_text(TrustContractKind::Ensures, ContractClauseOrigin::Native, "result == x")
+            .as_deref(),
+        Some("(result) == (x)")
     );
 }
 
@@ -948,6 +1042,7 @@ fn native_function_requires_len_mints_typed_query_proposition() {
                 P::Var { name, .. } => {
                     names.insert(name.as_str().to_string());
                 }
+                P::Float { .. } => {}
                 P::Not(inner) | P::Neg(inner) => collect_leaves(inner, names),
                 P::And(terms) | P::Or(terms) => {
                     terms.iter().for_each(|term| collect_leaves(term, names));
@@ -1202,6 +1297,7 @@ fn native_collection_loop_clause_mints_exact_literal_projection_domains() {
                 Proposition::Var { name, domain } => {
                     variables.insert(name.to_string(), *domain);
                 }
+                Proposition::Float { .. } => {}
                 Proposition::Not(inner) | Proposition::Neg(inner) => collect(inner, variables),
                 Proposition::And(terms) | Proposition::Or(terms) => {
                     for term in terms {
@@ -1471,6 +1567,22 @@ fn primed_identifiers_fail_closed_until_post_state_places_are_bound() {
     assert_eq!(primed_identifier_in_contract_snippet("x == y"), None);
 }
 
+/// Trust (CITE-PRIME-NONASCII-1, 2026-10-05): the prime scanner lexes whole
+/// identifiers with rustc's predicates. The ASCII byte scanner returned `a'`
+/// for `éa'` and nothing at all for `δ'`.
+#[test]
+fn primed_identifier_scan_reads_whole_non_ascii_identifiers() {
+    assert_eq!(primed_identifier_in_contract_snippet("éa' >= éa"), Some("éa'"));
+    assert_eq!(primed_identifier_in_contract_snippet("δx' >= δx"), Some("δx'"));
+    assert_eq!(primed_identifier_in_contract_snippet("δ' >= δ"), Some("δ'"));
+    assert_eq!(primed_identifier_in_contract_snippet("e\u{301}a' == 0"), Some("e\u{301}a'"));
+    // Unchanged ASCII behaviour.
+    assert_eq!(primed_identifier_in_contract_snippet("result >= x'"), Some("x'"));
+    assert_eq!(primed_identifier_in_contract_snippet("_x1' == 0"), Some("_x1'"));
+    assert_eq!(primed_identifier_in_contract_snippet("1 + x == y"), None);
+    assert_eq!(primed_identifier_in_contract_snippet("éa >= δx"), None);
+}
+
 #[test]
 fn attribute_compatibility_vocabulary_does_not_leak_into_native_grammar() {
     assert_eq!(
@@ -1628,4 +1740,48 @@ fn pointer_sized_casts_are_decided_at_the_target_width() {
         !value_preserving_int_cast_widths(u(32), u(16)),
         "on a 16-bit target `u32 as usize` TRUNCATES -> must be refused there"
     );
+}
+
+// Trust (SPEC-FLOAT-EQ-STRUCTURAL-1): the parser spells `x == 1.0` as IEEE
+// `FpEq`. The query must still type it as the same `Proposition::Eq` over the
+// float domain (it fell out as Opaque without the `FpEq` arm), narrowing the
+// literal onto an `f32` peer exactly as `Eq` and the orderings do.
+#[test]
+fn float_literal_equality_stays_a_typed_proposition() {
+    use rustc_middle::mir::trust_contract::{
+        TrustContractPredicateKind as Predicate, TrustContractProposition as Proposition,
+        TrustContractPropositionDomain as Domain,
+    };
+
+    assert!(
+        matches!(trust_types::parse_spec_expr("x == 1.0"), Some(trust_types::Formula::FpEq(..))),
+        "the parser's spelling this test relies on changed"
+    );
+    with_test_session_globals(|| {
+        for (width, bits) in [(64, 1.0_f64.to_bits()), (32, u64::from(1.0_f32.to_bits()))] {
+            let predicate = lowered_contract_text_with_domains(
+                "x == 1.0".to_string(),
+                &[LoweredVariableDomain { name: "x".to_string(), domain: Domain::Float { width } }],
+            );
+            let Predicate::Typed { proposition, .. } = &predicate else {
+                panic!("an f{width} literal equality must stay typed, got {predicate:?}");
+            };
+            assert_eq!(
+                proposition,
+                &Proposition::Eq(
+                    Box::new(Proposition::Var {
+                        name: Symbol::intern("x"),
+                        domain: Domain::Float { width },
+                    }),
+                    Box::new(Proposition::Float { bits, width }),
+                )
+            );
+        }
+        // A literal of the wrong format is not a typed equality.
+        let mixed = lowered_contract_text_with_domains(
+            "x == 0.1".to_string(),
+            &[LoweredVariableDomain { name: "x".to_string(), domain: Domain::Float { width: 32 } }],
+        );
+        assert!(matches!(mixed, Predicate::Opaque { .. }), "{mixed:?}");
+    });
 }

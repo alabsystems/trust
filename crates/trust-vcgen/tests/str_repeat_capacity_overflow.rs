@@ -5,7 +5,7 @@
 // caller-visible BinaryOp, so the pre-fix verifier emitted ZERO obligations
 // (`"ab".repeat(usize::MAX)` compiled clean, rc 0). The fix mints an
 // `UnsupportedMir { kind: "str-repeat-capacity-overflow" }` obligation → Unknown →
-// runtime-checked in the default lane (the owner-decided demotion), so the
+// runtime-checked in the default lane (the default lane's disclosed demotion), so the
 // overflow is honestly accounted and delegated to the runtime capacity check.
 //
 // Pins:

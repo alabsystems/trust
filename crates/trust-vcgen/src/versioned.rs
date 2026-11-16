@@ -22,6 +22,9 @@ use trust_types::{BlockId, Formula};
 #[derive(Debug, Clone)]
 pub(crate) struct Fact {
     formula: Formula,
+    /// `None`: an ENTRY fact, its place names bare. `Some((block, point))`: a fact
+    /// VERSIONED AND SEALED at that point ([`Fact::sealed_at`]).
+    sealed: Option<(BlockId, usize)>,
 }
 
 /// A verification-condition body whose place variables have been versioned at its
@@ -38,7 +41,29 @@ impl Fact {
     /// A fact carrying ENTRY/parameter values: its place names are unversioned
     /// (bare), so it unifies with a VC variable that has not been reassigned.
     pub(crate) fn entry(formula: Formula) -> Self {
-        Fact { formula }
+        Fact { formula, sealed: None }
+    }
+
+    /// TINV step 10.2: a fact whose place names were versioned at `(block, point)` and
+    /// SEALED there (`generate::seal_bare_reads`: a name left bare is spelled `#e` or
+    /// `#pre_s{b}_{k}`), so it carries version tokens and is NOT an entry fact: the
+    /// `Fact::entry` contract (bare = entry value) does not hold for it. A post-call
+    /// type-invariant fact is one, sealed at its call's single-predecessor target `(T, 0)`
+    /// by `generate::tinv_rows::tinv_sealed_post_call_hyps`; it may be conjoined only where
+    /// that helper kept it (`(T, 0)` dominates the row, and the row's rename leaves it
+    /// unchanged).
+    pub(crate) fn sealed_at(formula: Formula, block: BlockId, point: usize) -> Self {
+        Fact { formula, sealed: Some((block, point)) }
+    }
+
+    /// The fact's formula.
+    pub(crate) fn formula(&self) -> &Formula {
+        &self.formula
+    }
+
+    /// The point a sealed fact was versioned and sealed at; `None` for an entry fact.
+    pub(crate) fn sealed_point(&self) -> Option<(BlockId, usize)> {
+        self.sealed
     }
 }
 
@@ -63,7 +88,18 @@ pub(crate) fn conjoin(facts: &[Fact], vc: Vc) -> Formula {
     if facts.is_empty() {
         return vc.into_formula();
     }
-    let mut conj: Vec<Formula> = facts.iter().map(|f| f.formula.clone()).collect();
+    let mut conj = Vec::with_capacity(facts.len() + 1);
+    conj.extend(facts.iter().map(|f| f.formula.clone()));
+    conj.push(vc.into_formula());
+    Formula::And(conj)
+}
+
+pub(crate) fn conjoin_owned(facts: Vec<Fact>, vc: Vc) -> Formula {
+    if facts.is_empty() {
+        return vc.into_formula();
+    }
+    let mut conj = Vec::with_capacity(facts.len() + 1);
+    conj.extend(facts.into_iter().map(|f| f.formula));
     conj.push(vc.into_formula());
     Formula::And(conj)
 }

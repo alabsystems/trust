@@ -348,8 +348,17 @@ pub(crate) fn discover_native_rustc_checked() -> Option<NativeRustcDiscovery> {
 /// `cargo` from PATH: doing so can mix an upstream frontend into otherwise
 /// same-sysroot Trust evidence.
 pub(crate) fn discover_native_trust_cargo_checked() -> Result<PathBuf, String> {
+    discover_native_trust_toolchain_checked().map(|(_, targo)| targo)
+}
+
+/// The canonical Trust compiler and its sibling Targo frontend from one
+/// discovery, as `(rustc, targo)`. Selection probes run that Targo with that
+/// compiler pinned (`cargo_selection::selection_probe_command`), so both must
+/// come from the same resolution.
+pub(crate) fn discover_native_trust_toolchain_checked() -> Result<(PathBuf, PathBuf), String> {
     let discovery = discover_native_rustc_checked().ok_or_else(|| {
         "no canonical Trust compiler is available to anchor the sibling targo frontend".to_string()
     })?;
-    native_trust_cargo_path(&discovery.rustc)
+    let targo = native_trust_cargo_path(&discovery.rustc)?;
+    Ok((discovery.rustc, targo))
 }

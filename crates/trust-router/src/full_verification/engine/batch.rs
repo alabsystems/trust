@@ -6,15 +6,21 @@ use trust_verifier_api::{
     EngineManifest, ObligationEvidence, TrustObligation, VerifierExecutionContext,
 };
 
-use super::super::native_trust_ir::{DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt};
+use super::super::native_trust_ir::{
+    CheckedNativeWpProof, DirectTrustVcProofReceipt, FreshExactDirectChcPdrReceipt,
+    FreshWholeFunctionChcPdrReceipt,
+};
 use super::super::routing::ObligationRoute;
 use super::super::util::worker_threads;
 
 pub(super) struct FullVerificationBatchResult {
     pub(super) evidence: Vec<ObligationEvidence>,
     pub(super) diagnostics: Vec<String>,
+    pub(super) checked_native_wp_proofs: BTreeMap<String, CheckedNativeWpProof>,
     pub(super) direct_trust_vc_receipts: BTreeMap<String, DirectTrustVcProofReceipt>,
     pub(super) fresh_exact_direct_chc_pdr_receipts: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    pub(super) fresh_whole_function_chc_pdr_receipts:
+        BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
 }
 
 impl FullVerificationBatchResult {
@@ -22,8 +28,10 @@ impl FullVerificationBatchResult {
         Self {
             evidence,
             diagnostics,
+            checked_native_wp_proofs: BTreeMap::new(),
             direct_trust_vc_receipts: BTreeMap::new(),
             fresh_exact_direct_chc_pdr_receipts: BTreeMap::new(),
+            fresh_whole_function_chc_pdr_receipts: BTreeMap::new(),
         }
     }
 }
@@ -40,6 +48,8 @@ pub(super) struct CompletedEngineBatch {
     pub(super) elapsed_ms: u128,
     pub(super) direct_trust_vc_receipts: BTreeMap<String, DirectTrustVcProofReceipt>,
     pub(super) fresh_exact_direct_chc_pdr_receipts: BTreeMap<String, FreshExactDirectChcPdrReceipt>,
+    pub(super) fresh_whole_function_chc_pdr_receipts:
+        BTreeMap<String, FreshWholeFunctionChcPdrReceipt>,
 }
 
 pub(super) struct RoutedObligation {

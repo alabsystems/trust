@@ -15,9 +15,8 @@
 
 use trust_types::{
     AssertMessage, BasicBlock, BinOp, BlockId, ConstValue, Counterexample, CounterexampleValue,
-    LocalDecl, Operand, Place, ProofLevel, ProofStrength, Rvalue, SourceSpan, Statement,
-    Terminator, Ty, VcKind, VerifiableBody, VerifiableFunction, VerificationCondition,
-    VerificationResult,
+    LocalDecl, Operand, Place, ProofLevel, Rvalue, SourceSpan, Statement, Terminator, Ty, VcKind,
+    VerifiableBody, VerifiableFunction, VerificationCondition, VerificationResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +121,7 @@ fn buggy_midpoint() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -230,6 +230,7 @@ fn safe_midpoint() -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -506,52 +507,60 @@ fn test_m4_counterexample_demonstrates_overflow() {
 
 #[test]
 fn test_m4_safe_version_proof_structure() {
-    let func = safe_midpoint();
-    let vcs = trust_vcgen::generate_vcs(&func);
+    use trust_integration_tests::ay_test_support::require_ay;
+    use trust_types::{Formula, Sort};
 
-    // The safe version may still produce DivisionByZero VCs (for the / 2
-    // operations), even though dividing by a constant 2 is trivially safe.
-    // For this test, we simulate ay proving each VC.
-    let simulated_results: Vec<(VerificationCondition, VerificationResult)> = vcs
-        .iter()
-        .map(|vc| {
-            let proved = VerificationResult::Proved {
-                solver: "ay".into(),
-                time_ms: 3,
-                strength: ProofStrength::smt_unsat(),
-                proof_certificate: None,
-                solver_warnings: None,
-                native_proof_envelope: None,
-            };
-            (vc.clone(), proved)
-        })
+    // Verify with a REAL solver and assert on the raw results. This test used to
+    // hand-build `Proved` rows and assert on `build_json_report`'s summary; since
+    // 72ada1163c6 / b6171397b6d that report is gated for publication and
+    // (correctly) downgrades freely constructed `Proved` rows, which carry no
+    // replay-bound authority, to Unknown — so a simulated proof can no longer be
+    // read back as proved. The router is wired like the m3 scale pipeline:
+    // `Router::new()` alone has no SMT backend and answers Unknown.
+    let router = trust_router::Router::with_backends(vec![
+        Box::new(require_ay()),
+        Box::new(trust_router::interval_backend::IntervalBackend),
+        Box::new(trust_router::constant_folder::ConstantFolderBackend),
+    ]);
+
+    // `safe_midpoint`'s safety rests on the binary-search loop invariant
+    // `lo <= hi` (see its doc comment). Without it `hi - lo` really can wrap, and
+    // the solver must say so: the proof below is not vacuous.
+    let unconstrained = trust_vcgen::generate_vcs(&safe_midpoint());
+    let sub_results: Vec<_> = router
+        .verify_all(&unconstrained)
+        .into_iter()
+        .filter(|(vc, _)| matches!(vc.kind, VcKind::ArithmeticOverflow { op: BinOp::Sub, .. }))
         .collect();
+    assert_eq!(sub_results.len(), 1, "exactly one Sub overflow row");
+    assert!(
+        sub_results[0].1.is_failed(),
+        "without `lo <= hi`, `hi - lo` underflows and must be refuted: {:?}",
+        sub_results[0].1
+    );
 
-    if simulated_results.is_empty() {
-        // No VCs at all — the safe version is trivially safe.
-        eprintln!("=== M4 Safe Version Proof: No VCs (trivially safe) ===");
-        return;
+    let mut func = safe_midpoint();
+    func.preconditions.push(Formula::Le(
+        Box::new(Formula::Var("lo".into(), Sort::Int)),
+        Box::new(Formula::Var("hi".into(), Sort::Int)),
+    ));
+    let vcs = trust_vcgen::generate_vcs(&func);
+    assert!(!vcs.is_empty(), "the safe midpoint carries its overflow obligations");
+    let results = router.verify_all(&vcs);
+    assert_eq!(results.len(), vcs.len(), "router should return one result per VC");
+
+    for (vc, result) in &results {
+        eprintln!("  {:?} -> {:?}", vc.kind, result);
+        assert!(
+            result.is_proved(),
+            "under `lo <= hi` every obligation of the safe midpoint must be proved; \
+             {:?} got {result:?}",
+            vc.kind
+        );
     }
 
-    let report = trust_report::build_json_report("m4-safe-proof", &simulated_results);
-
-    // All obligations should be proved.
-    assert_eq!(
-        report.summary.total_proved, report.summary.total_obligations,
-        "all obligations should be proved: {} proved out of {}",
-        report.summary.total_proved, report.summary.total_obligations
-    );
-    assert_eq!(report.summary.total_failed, 0, "no obligations should fail");
-
-    assert!(
-        matches!(report.summary.verdict, trust_types::CrateVerdict::Verified),
-        "verdict should be Verified, got: {:?}",
-        report.summary.verdict
-    );
-
-    eprintln!("=== M4 Safe Version Proof (Simulated ay) ===");
+    eprintln!("=== M4 Safe Version Proof (real solver) ===");
     eprintln!("  VCs: {}", vcs.len());
-    eprintln!("  All proved: {}", report.summary.total_proved);
-    eprintln!("  Verdict: {:?}", report.summary.verdict);
+    eprintln!("  All proved: {}", results.len());
     eprintln!("==============================================");
 }

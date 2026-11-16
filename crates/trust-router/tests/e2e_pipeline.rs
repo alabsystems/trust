@@ -83,6 +83,7 @@ fn contract_function(name: &str, def_path: &str, contracts: Vec<Contract>) -> Ve
         preconditions,
         postconditions,
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -151,6 +152,7 @@ fn checked_add_function(name: &str, def_path: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -425,7 +427,18 @@ fn multiple_contracts_report_correct_counts() {
 }
 
 #[test]
-fn invariant_contract_generates_assertion_vc() {
+fn invariant_contract_mints_one_unverifiable_row_not_an_assertion() {
+    // Re-pinned 2026-09-14 (m16). An item-position `invariant` names no program
+    // point, so vcgen (`contracts.rs`, `ContractKind::Invariant` arm) mints ONE
+    // non-refutable `SpecUnverifiable` row preclassified `Unknown` instead of
+    // the old `Assertion { "invariant: x > 0" }` -- a predicate checked in
+    // isolation is provable only when it is a tautology, and that was a
+    // false-PROVE shape. Measured identically on the pre-merge commit
+    // 13a58aa1981 and the integrated tree, so the previous expectation had
+    // been stale on main, not broken by an integration. What this pins: the
+    // clause stays VISIBLE (one authored clause, one row -- the denominator
+    // does not shrink), it carries no proof, and the report names it
+    // `unsupported_mir` rather than `assertion`.
     let func = contract_function(
         "invariant_fn",
         "pipeline::invariant_fn",
@@ -433,12 +446,37 @@ fn invariant_contract_generates_assertion_vc() {
     );
 
     let vcs = generate_vcs(&func);
-    assert_eq!(vcs.len(), 1);
-    assert!(matches!(&vcs[0].kind, VcKind::Assertion { message } if message == "invariant: x > 0"));
+    assert_eq!(vcs.len(), 1, "one authored clause mints exactly one row");
+    match &vcs[0].kind {
+        VcKind::UnsupportedMir { kind, detail } => {
+            assert_eq!(kind, "SpecUnverifiable");
+            assert!(
+                detail.starts_with(
+                    "unverifiable source specification (item-position `invariant` names no \
+                     program point"
+                ),
+                "detail must name the refusal, got: {detail}"
+            );
+            assert!(detail.ends_with(": x > 0"), "detail must carry the authored body: {detail}");
+        }
+        other => panic!("expected the SpecUnverifiable UnsupportedMir row, got {other:?}"),
+    }
+    assert!(
+        !matches!(&vcs[0].kind, VcKind::Assertion { .. }),
+        "an item-position invariant must never become a provable assertion"
+    );
 
     let report = build_json_report("invariant-contract", &Router::new().verify_all(&vcs));
     let kinds = obligation_kinds(&report, "invariant_fn");
-    assert_eq!(kinds, vec!["assertion".to_string()]);
+    assert_eq!(kinds, vec!["unsupported_mir".to_string()]);
+    let function = report
+        .functions
+        .iter()
+        .find(|entry| entry.function == "invariant_fn")
+        .expect("function should be present in report");
+    assert_eq!(function.summary.total_obligations, 1);
+    assert_eq!(function.summary.proved, 0, "a SpecUnverifiable row can never be proof credit");
+    assert_eq!(function.summary.unknown, 1);
 }
 
 #[test]

@@ -488,6 +488,19 @@
 # count alone.
 # ###########################################################################
 
+# NOTE 2026-09-29 (NOT a re-mint; the numbers below are unchanged). Trust `main`
+# stopped minting the `[unsafe:sep:alloc]` null row for `Box::new` (docs/TCB.md,
+# "Allocation failure is an abort, not a panic"): that row was the allocator
+# premise conjoined onto its own negation, a tautology, and the 8 of them this
+# crate carried (the EXPERIMENT A block above: four `Box::new` each in
+# `noOverflow_violation_formula` / `noOverflow_safe_range_formula`) are counted in
+# `proved_min`. A toolchain built from that commit reads `proved` lower by exactly
+# those rows (and `certified` lower by any of them that were kernel-rechecked).
+# That is NOT the "un-emitted is unchecked" regression EXPERIMENT A warns about —
+# the allocation's non-null result is still used by every later deref of the box,
+# it simply is not re-minted as a demand whose proof checks nothing — so re-mint
+# the floor at that promotion, citing this note; do not restore the rows. Not
+# re-measured here: this gate needs a verifying toolchain built from that commit.
 certified_min = 7
 proved_min    = 29
 assumed_max   = 6

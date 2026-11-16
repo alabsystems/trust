@@ -308,7 +308,7 @@ pub(super) fn stmt_writes_local(stmt: &trust_types::Statement, local: usize) -> 
 /// EVOLUTION separately (`sem_operand_for_loop`, which does NOT route through
 /// [`sem_operand_of_mir`]) and so a reassigned LOOP counter still certifies.
 pub(crate) fn param_reassigned_by_stmt(body: &trust_types::VerifiableBody, local: usize) -> bool {
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::Terminator;
     if local == 0 || local > body.arg_count {
         return false; // not a parameter local — nothing to protect (see doc).
     }
@@ -321,12 +321,19 @@ pub(crate) fn param_reassigned_by_stmt(body: &trust_types::VerifiableBody, local
     // borrow of the parameter has `place.local == p`, invisible to it. Once a MUTABLE alias
     // to the parameter's entry value exists anywhere in the body, the recognizer can no
     // longer track its value, so the entry-time `Var(idx)` model is unsound. Fail-closed:
-    // treat a mutable borrow / raw-mut address-of the parameter as a reassignment.
+    // treat a write-capable borrow of the parameter as a reassignment.
+    //
+    // INT-RAWCONST-HAVOC-1 (2026-10-06): `&raw const` is write-capable. For a `mut x`
+    // parameter, `*(&raw const x as *mut T) = v` (or a safe `AtomicU8::from_ptr(..)
+    // .store(..)`) is defined under Tree Borrows, and this arm had matched
+    // `AddressOf(true, _)` only. The test is trust-vcgen's `write_capable_borrow`, the one
+    // vcgen's havoc list uses. It leaves out only the two `&raw const` borrows that grant
+    // no more than a shared borrow: one through a SHARED reference (`&raw const (*s)` of a
+    // `&[T]` parameter, the `as_ptr` shape, cannot change `s`), and the extractor's
+    // fake-metadata borrow.
     if body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        matches!(s,
-            Statement::Assign { rvalue: Rvalue::Ref { mutable: true, place }, .. }
-                | Statement::Assign { rvalue: Rvalue::AddressOf(true, place), .. }
-            if place.local == local)
+        trust_vcgen::place_write::write_capable_borrow(body, s, |place| place.local == local)
+            .is_some()
     }) {
         return true;
     }
@@ -353,7 +360,7 @@ pub(super) fn call_family_local_writes(
 ) -> Option<(usize, Vec<trust_types::BlockId>)> {
     use std::collections::HashSet;
 
-    use trust_types::{Rvalue, Statement, Terminator};
+    use trust_types::{Statement, Terminator};
 
     // Every control-flow/dominance lookup below is block-id based. Duplicate ids
     // would make the selected definition/call ambiguous, so no profile is sound.
@@ -366,15 +373,13 @@ pub(super) fn call_family_local_writes(
     let mut call_destinations = Vec::new();
     for block in &body.blocks {
         for statement in &block.stmts {
-            // A mutable or raw-mutable alias permits a later indirect write whose
-            // destination is not syntactically rooted at `local`.
-            if matches!(statement,
-                Statement::Assign {
-                    rvalue:
-                        Rvalue::Ref { mutable: true, place }
-                        | Rvalue::AddressOf(true, place),
-                    ..
-                } if place.local == local)
+            // A mutable or raw (either mutability, INT-RAWCONST-HAVOC-1) alias permits a
+            // later indirect write whose destination is not syntactically rooted at
+            // `local`.
+            if trust_vcgen::place_write::write_capable_borrow(body, statement, |place| {
+                place.local == local
+            })
+            .is_some()
             {
                 return None;
             }

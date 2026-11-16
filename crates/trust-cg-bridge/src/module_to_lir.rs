@@ -22,17 +22,31 @@
 //! trap behavior is preserved exactly. For shifts the resulting `amount < width`
 //! precondition makes the AArch64-masked register shift equal the guarded shift
 //! (the hardware masks the amount mod width; masking is a no-op below width).
+//! **Superseded 2026-09-30 (plan §5 fail-open item 1):** that trap is not Rust's
+//! panic (no message, no hook, SIGTRAP), so every function whose lowered body
+//! carries an `Assert` is now refused by name —
+//! [`ModuleLirError::ImplicitPanicUnfaithful`], predicate
+//! [`function_has_unfaithful_assert`] — and the guarded shapes above lower only
+//! once the guard is absent (e.g. `-Coverflow-checks=off` for overflow/shift).
 //!
 //! MEMORY: scalar stack slots (`Alloca`/`Load`/`Store`/single-index `GEP`) over
 //! fixed-width integers, AND — unblocked by the trust-ir pin c58fa68 (`Ty::Tuple`
 //! `byte_size`/`byte_align` + the aggregate Store/Load round-trip) — a WHOLE
-//! 2-field scalar `Ty::Tuple` round-tripped through ONE aggregate stack slot
-//! (the shape the bridge promotes a multi-block-written tuple local to). The
+//! N-field scalar `Ty::Tuple`, or a `Ty::Struct` whose `StructDef` the module
+//! resolves, round-tripped through ONE aggregate stack slot (the shape the bridge
+//! promotes a multi-block-written tuple or struct local to). The
 //! aggregate is DECOMPOSED into its per-field scalars and lowered to per-field
-//! Str/Ldr at the C-style field offsets (`aggregate_mem_layout`, byte-for-byte
-//! the interpreter's `aggregate_layout`), so the emitted bytes and the reference
-//! interpreter agree on the in-memory layout. Every unmapped `Inst` (calls,
-//! non-2-field/nested aggregates, floats, casts, i128 div/rem, i128 shifts, ...)
+//! Str/Ldr at the field offsets of the interpreter's own layout of the type
+//! (`aggregate_mem_layout`, CG-DECLARED-LAYOUT-1): a declared `StructDef`
+//! size/align/offset triple or `Module::tuple_layouts` descriptor read and
+//! re-validated, and the declaration-order `aggregate_layout` only for a type
+//! that declares none. A slot is only ever stored and loaded WHOLE at its own
+//! type, or through a FIELD POINTER of a `Ty::Struct` slot: a `gep i8` at a
+//! constant that starts exactly one field in that layout, used only as the
+//! pointer of a non-volatile Load/Store at that field's type (PASS 1.7 step 1b,
+//! F1-FIELD-POINTER-AGREEMENT-1). Every
+//! unmapped `Inst` (calls,
+//! nested aggregates, floats, casts, i128 div/rem, i128 shifts, ...)
 //! returns an explicit [`ModuleLirError`] — it NEVER fabricates wrong LIR.
 //!
 //! CONTROL FLOW: trust_ir is already SSA with explicit per-edge args and block
@@ -58,7 +72,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use trust_cg_lower::function::{
-    BasicBlock as LirBlock, Function as LirFunction, Signature, StackSlotInfo,
+    AbiSretParam, BasicBlock as LirBlock, Function as LirFunction, Signature, StackSlotInfo,
 };
 use trust_cg_lower::instructions::{Block, DirectCallBinding, Instruction, IntCC, Opcode, Value};
 use trust_cg_lower::types::Type as LirType;
@@ -105,6 +119,14 @@ pub enum ModuleLirError {
     #[error("function `{name}` switch has a non-integer case value")]
     UnsupportedSwitchCase { name: String },
 
+    /// A `Switch`'s integer case constants cannot be put in the form the LIR
+    /// switch lowering compares against for this selector (a 128-bit selector,
+    /// a non-integer selector, a selector with no recorded LIR type, or two
+    /// case constants that denote one selector value). See
+    /// `mapping::encode_switch_case` for the encoding contract.
+    #[error("function `{name}` switch cases cannot be encoded for its selector: {detail}")]
+    UnencodableSwitchCase { name: String, detail: String },
+
     /// The function's control-flow graph is irreducible / unorderable, or a
     /// terminator appears in a non-terminal body position, so a deterministic
     /// reachable block order could not be established.
@@ -132,6 +154,23 @@ pub enum ModuleLirError {
         "unsupported instruction `{inst}` in `{name}` (outside the converter's mapped fragment)"
     )]
     UnsupportedInst { name: String, inst: &'static str },
+
+    /// A `Producer::Clean` function reached the codegen consumer. Trust: the
+    /// binding boundary "no codegen consumes a Clean-origin trust-ir row below
+    /// tier `gate`" is enforced HERE, on the `Function` itself — never read off
+    /// the Clean-origin disclosure `SpecModule`, whose `tier`/`body_gate`
+    /// strings are claim-style prose this backend does not consult. Since plan
+    /// step 3.4 a tier-`gate` row carries a Function-level carrier (the
+    /// `clean-carrier-gate` stamp beside a session-ledger entry), but this
+    /// converter honors none (it gets no new coverage, plan R-5; the carrier is
+    /// admitted only on the `Compiler::compile` lane at step 3.6), so EVERY
+    /// Clean-producer body is refused fail-closed, whether it is the function
+    /// being lowered or a callee the inliner / real-call path would otherwise
+    /// splice into a Rust caller's object, with or without a body.
+    #[error(
+        "Clean-origin trust-ir function `{name}` is not admitted to codegen ({detail}). This converter honors no Clean carrier: a tier-`gate` row's authenticated `clean-carrier-gate` license (plan step 3.4) is admitted only on F1's `Compiler::compile` lane (plan step 3.6), so the trust-ir codegen frontend refuses every `Producer::Clean` body fail-closed. Options: (1) keep the MIR lane, the sole value-producing path for Clean-origin bodies today; (2) for a tier-`gate` row, build on the `Compiler::compile` lane once plan step 3.6 admits it there; (3) if the body was reached through a Rust caller's IR-5 call edge, lower that caller on the MIR lane or keep the call outside the trust-ir-frontend unit"
+    )]
+    CleanOriginBelowCodegenGate { name: String, detail: String },
 
     /// A `GlobalAddr` named a module-global table entry that does not exist.
     #[error("function `{name}` references missing global id {global}")]
@@ -202,7 +241,8 @@ pub enum ModuleLirError {
     /// slots; the aggregate-memory slice (PASS 1.7, unblocked by the trust-ir pin
     /// c58fa68's `Ty::Tuple` `byte_size` + aggregate Store/Load round-trip) models
     /// a WHOLE 2-field scalar `Ty::Tuple` round-tripped through one slot via
-    /// per-field Str/Ldr at the C-style field offsets; anything else fails closed.
+    /// per-field Str/Ldr at the interpreter's field offsets; anything else fails
+    /// closed.
     #[error("unsupported memory shape in `{name}`: {detail}")]
     UnsupportedMemory { name: String, detail: String },
 
@@ -239,21 +279,292 @@ pub enum ModuleLirError {
     #[error("unsupported checked-overflow shape in `{name}`: {detail}")]
     UnsupportedOverflow { name: String, detail: String },
 
-    /// An aggregate (`Inst::ExtractField` / `Inst::InsertField`) shape outside
-    /// the decomposable checked-arithmetic tuple slice. The ONLY aggregate the
-    /// converter models is the BRIDGE's checked-arith result tuple
-    /// `Tuple([Int, Bool])` — a 2-field `(value, overflow_flag)` pair built by a
-    /// `Tuple`-typed `Undef` seed + two `InsertField`s (field 0 = value, field 1
-    /// = flag), read back only by `ExtractField`. It is DECOMPOSED into the two
-    /// scalar SSA Values without ever materializing a tuple in memory (the pinned
-    /// interpreter lacks `Ty::Tuple` `byte_size`). Any other aggregate — a
-    /// non-2-field tuple, a struct/array/record, a tuple stored to memory, a
-    /// partially-built tuple read before a field is defined, an `InsertField`
-    /// overwriting an already-defined field, or a tuple consumed by anything but
-    /// `InsertField`/`ExtractField` — FAILS CLOSED here, so a tuple-in-memory the
-    /// converter cannot decompose is never fabricated.
+    /// An aggregate (`Inst::ExtractField` / `Inst::InsertField` /
+    /// `Inst::MakeAggregate`) shape outside the two decomposable aggregate
+    /// slices: the BRIDGE's checked-arith result pair `Tuple([Int, Bool])`,
+    /// DECOMPOSED into its two scalar SSA Values and never stored (PASS 1.6), and
+    /// a scalar-field tuple or struct round-tripped whole through one stack slot
+    /// (PASS 1.7). Since BMC-LANE-1 (2026-11-06) the bridge builds a complete
+    /// aggregate of either kind with one `MakeAggregate`; the legacy spelling, a
+    /// `Tuple`-typed `Undef` seed + one `InsertField` per field, is still
+    /// decomposed. Any other aggregate FAILS CLOSED here — for example a checked
+    /// pair stored to memory, a tuple-typed field or lane (a nested aggregate), a
+    /// constructor whose lane count differs from its type's field count, a pair
+    /// read before a field is defined, or an `InsertField` overwriting an
+    /// already-defined pair field — so an aggregate the converter cannot
+    /// decompose is never fabricated.
     #[error("unsupported aggregate shape in `{name}`: {detail}")]
     UnsupportedAggregate { name: String, detail: String },
+
+    /// The module DECLARES `StructPassingPolicy::Unclassified` — "the producer
+    /// performs NO aggregate classification, and says so" — and a by-value
+    /// aggregate nonetheless crosses a call edge THIS lowering realizes, with no
+    /// [`AbiPassModeCrossCheck`] attached to it.
+    ///
+    /// trust-ir's contract for that value is explicit, and it is a contract on
+    /// the CONSUMER: *"A CONSUMER MUST NOT infer either scheme from it — it is a
+    /// declaration of absence, not a third convention. A backend needing a
+    /// classification must refuse the module rather than pick one."*
+    ///
+    /// This converter DOES need one: it classifies by-value aggregates by its own
+    /// size/shape rules (`indirect_struct_sig`, `pair_struct_sig`,
+    /// `newtype_struct_sig`, `pair_enum_sig`) and reads `ParamAttrs::sret` that an
+    /// `Unclassified` producer never emits (`sret_convention` then yields
+    /// `abi_sret_param: None` and an EMPTY `sret_arg_callees` — faithful to the
+    /// IR it was handed, and not a safety argument on its own). Admitting such a
+    /// module would therefore be exactly the inference the contract forbids, and
+    /// what it produces is not a refusal but a SILENT WRONG ABI: caller and callee
+    /// each self-consistent, disagreeing with every LLVM-compiled neighbour. That
+    /// is the class trust-cg measured and fixed in 822fdc69 / 67122610, where a
+    /// `{i32,i32}` packed into one register made llvm x tcg exit 188 at `-O0`.
+    ///
+    /// The refusal is lifted by ATTACHING evidence, never by relaxing the check:
+    /// see [`AbiPassModeCrossCheck`] and
+    /// [`lower_module_to_lir_with_abi_cross_check`]. Under `Unclassified` that
+    /// token is the ONLY admission for a by-value aggregate edge (trust-ir SPEC
+    /// §17: a consumer places such a slot only from an authority outside the
+    /// module), and it places the lowered function's OWN signature edge only —
+    /// an aggregate on a `CallIndirect`'s declared `sig` is refused by this
+    /// variant with a token attached too; the two declared policies refuse the
+    /// same edges by their own variants, [`Self::NativeCAggregateAbiUnsupported`]
+    /// and [`Self::AlwaysMemoryByValueAggregate`].
+    #[error(
+        "function `{name}`: the module declares `struct_passing = unclassified` (the producer \
+         performs no aggregate classification, and says so), but {detail}. Lowering it would \
+         require this backend to CHOOSE a classification, which trust-ir's contract for that \
+         value forbids in terms — \"a backend needing a classification must refuse the module \
+         rather than pick one\". Options: (1) ATTACH A PASS-MODE CROSS-CHECK to this lowering — \
+         call `lower_module_to_lir_with_abi_cross_check` (or the \
+         `lower_trust_ir_function_to_lir*_with_abi_cross_check` twins) from a consumer that has \
+         already validated every aggregate argument and the return against the target's real \
+         parameter passing modes, which is what the rustc driver does by running \
+         `validate_codegen_instance_abi_trust_ir` (`rustc_codegen_trust_cg`) over rustc's own \
+         `FnAbi` immediately before it lowers (a cross-check places the lowered function's OWN \
+         signature edge only: an aggregate on an indirect call edge's declared signature stays \
+         refused with one attached, and needs option (2) or (3)); (2) have the PRODUCER \
+         pre-lower the crossing — pass the aggregate's address as a pointer parameter, and \
+         return an aggregate through a leading `sret` pointer parameter with an empty return \
+         list (read by `sret_convention`) \
+         — because a pointer is not a by-value aggregate slot under any policy (a declared \
+         `native_c` or `always_memory` policy does NOT admit a by-value aggregate here: this \
+         converter implements no native-C aggregate ruleset, and `always_memory` means no such \
+         slot exists); (3) keep aggregates off the call edge (scalarize the signature), which \
+         makes the `unclassified` claim range over nothing and admits the module unchanged"
+    )]
+    UnclassifiedAggregateAbi { name: String, detail: String },
+
+    /// The module DECLARES `StructPassingPolicy::NativeC` and a by-value
+    /// aggregate crosses a call edge this lowering reads.
+    ///
+    /// Under `NativeC` it is the CONSUMER that classifies: each by-value
+    /// aggregate slot crosses where the target's C ruleset for the edge's calling
+    /// convention places it, and the producer claims the other side of every
+    /// edge uses that placement (trust-ir SPEC §17, ratified 2026-09-27; "a
+    /// consumer that implements no ruleset for an edge's convention refuses the
+    /// slot"). This converter implements NO native-C aggregate ruleset. Its
+    /// classifiers (`indirect_struct_sig`, `pair_struct_sig`,
+    /// `newtype_struct_sig`, `pair_enum_sig`) are size/shape rules for rustc's
+    /// own Rust ABI, and the only ABI authority they are ever held against is a
+    /// pass-mode cross-check over rustc's `FnAbi`. The two ABIs disagree on real shapes
+    /// (§17 measured an `F3 { f32; 3 }` passed `Indirect` by the Rust ABI and
+    /// as an HFA by C on aarch64-apple-darwin, and `int32x4_t` `Indirect` vs
+    /// `Direct`), so lowering a `NativeC` aggregate by these rules would place
+    /// it where the module says nobody else does.
+    ///
+    /// An [`AbiPassModeCrossCheck`] does NOT lift this refusal: it attests
+    /// rustc's placement for the lowered instance, which is not the C placement
+    /// the module claims, so it cannot establish that the two agree. Before
+    /// 2026-09-27 this converter admitted every `NativeC` module unchecked, on
+    /// the retracted reading that the policy obliged the producer to mark
+    /// `byval`/`sret` (no producer ever did).
+    #[error(
+        "function `{name}`: the module declares `struct_passing = native_c`, under which the \
+         CONSUMER must place every by-value aggregate slot by the target's C ruleset for the \
+         edge's calling convention (trust-ir SPEC §17), but {detail}. This converter implements \
+         no native-C aggregate ruleset: its classifiers (`indirect_struct_sig`, \
+         `pair_struct_sig`, `newtype_struct_sig`, `pair_enum_sig`) are shapes of rustc's own \
+         Rust ABI, and the only ABI authority they are held against is a pass-mode cross-check \
+         over rustc's `FnAbi` — which attests rustc's placement, not the C placement this \
+         module claims, so no cross-check lifts this refusal. Options: (1) have the PRODUCER stamp \
+         `unclassified` when it performed no C classification (the honest value for a rustc-ABI \
+         producer) and lower with the pass-mode cross-check attached; (2) have the PRODUCER \
+         pre-lower the crossing — a pointer parameter, and a leading `sret` pointer parameter \
+         with an empty return list for a returned aggregate; (3) scalarize the signature; \
+         (4) lower the module with a backend that implements the target's C aggregate ruleset"
+    )]
+    NativeCAggregateAbiUnsupported { name: String, detail: String },
+
+    /// The module DECLARES `StructPassingPolicy::AlwaysMemory` and a by-value
+    /// aggregate nonetheless crosses a call edge this lowering reads.
+    ///
+    /// `AlwaysMemory` states that every aggregate crossing is PRE-LOWERED, so no
+    /// `FuncTy` of the module has a by-value aggregate slot at all (trust-ir
+    /// SPEC §17, decided by `validate_module` as `AlwaysMemoryByValueAggregate`
+    /// at the ratification the pinned trust-ir predates). A module carrying one
+    /// contradicts its own policy, and no evidence from outside the module can
+    /// reconcile a module with itself — so, unlike `Unclassified`, an
+    /// [`AbiPassModeCrossCheck`] does NOT lift this refusal.
+    #[error(
+        "function `{name}`: the module declares `struct_passing = always_memory` — every \
+         aggregate crossing is PRE-LOWERED, so no signature has a by-value aggregate slot \
+         (trust-ir SPEC §17, `AlwaysMemoryByValueAggregate`) — but {detail}. The module \
+         contradicts its own policy, and no evidence from outside it can reconcile that, so a \
+         pass-mode cross-check does not lift this refusal. Options: (1) have the PRODUCER \
+         pre-lower the crossing — a pointer parameter, and a leading `sret` pointer parameter \
+         with an empty return list for a returned aggregate; (2) have the PRODUCER stamp the \
+         policy it actually established (`unclassified` when it classified nothing)"
+    )]
+    AlwaysMemoryByValueAggregate { name: String, detail: String },
+
+    /// A call edge this lowering reads RECORDS a slot ABI fact this converter
+    /// does not read: `ParamAttrs.pass`, a non-`None` `ParamAttrs.ext`, or any
+    /// `FuncAttrs.ret` (return-slot) fact.
+    ///
+    /// Each is a producer's statement of how a slot crosses the edge. This
+    /// converter places every slot by its own classification and reads none of
+    /// them, so admitting the module would drop the statement silently — and a
+    /// recorded fact that disagreed with the emitted placement would be a wrong
+    /// ABI at a boundary, not a refusal. trust-ir SPEC §17: a recorded `pass` /
+    /// `ret` fact "must AGREE" with the placement the consumer computes, and "a
+    /// consumer that cannot establish agreement MUST refuse the module rather
+    /// than prefer either statement"; `ext` is unrecorded only as `None`, never
+    /// "no extension needed". Refused under EVERY policy, with or without a
+    /// pinned target, and a pass-mode cross-check does not lift it: the token is
+    /// minted outside the module and says nothing about facts recorded inside it.
+    #[error(
+        "function `{name}`: {detail}. This converter places every slot by its own \
+         classification and reads no recorded `ParamAttrs.pass`, `ParamAttrs.ext` or \
+         `FuncAttrs.ret` fact, so it cannot establish that the recorded fact AGREES with the \
+         placement it would emit; trust-ir SPEC §17 requires a consumer in that position to \
+         refuse rather than prefer either statement, and ignoring the fact would be a silent \
+         ABI disagreement. No `struct_passing` policy and no pass-mode cross-check lifts this \
+         refusal. Options: (1) have the PRODUCER leave the fact unrecorded (`pass: None`, \
+         `ext: None`, an empty `ret` slot) where it has nothing this converter must honour; \
+         (2) lower the module with a backend that reads and honours the recorded facts"
+    )]
+    RecordedAbiSlotFact { name: String, detail: String },
+
+    /// The function can reach a failed `Inst::Assert` — an IMPLICIT Rust panic
+    /// (arithmetic overflow, division or remainder by zero, `MIN / -1`, a shift
+    /// amount out of range, an index out of bounds) — and this converter has no
+    /// faithful lowering for one.
+    ///
+    /// trust-ir's `Assert` names WHICH panic it is (`kind`, v52) and may name
+    /// the entry a failed check calls and its location (`site`, v54), but this
+    /// converter lowers neither: the only lowering it ever had for an assert
+    /// was `Brif(cond, cont, trap)` into a shared
+    /// `Opcode::Trap` block — a bare `brk`. Under that lowering a failing check
+    /// prints nothing, never runs the panic handler or a `std::panic::set_hook`
+    /// hook, and kills the process with SIGTRAP (exit 133) where the MIR/LLVM
+    /// path prints `attempt to add with overflow` (or the bounds / division
+    /// message) and aborts through the panic handler (exit 134 under
+    /// `panic=abort`). The proven-output gate could not catch it: it proves the
+    /// bytes against trust-ir, where a failed assert IS a divergence, so a
+    /// `[PROVED]` row would certify the trap (R-8 audit
+    /// `docs/audits/2026-09-29-r8-trust-ir-vs-mir.md`, finding 1; plan §5,
+    /// fail-open item 1). The MIR lane already refuses the same shape
+    /// (`trust-mir-extract`: "Assert omits the exact panic payload and
+    /// executable unwind edge"); this is F1's twin of that refusal.
+    ///
+    /// Refused for EVERY `Assert` in the lowered body — the function's own and
+    /// any an inlined callee contributes — whatever the block's reachability:
+    /// [`function_has_unfaithful_assert`] is a syntactic predicate, so an assert
+    /// the converter cannot see past is refused rather than reasoned away. It
+    /// is lifted only by plan §5 item P (an `Assert` that carries its message,
+    /// operands and span, lowered to Rust's panic entry points), never by
+    /// relaxing this check.
+    #[error(
+        "function `{name}` [implicit-panic-unfaithful]: {detail}. A failed trust-ir `Assert` is \
+         an implicit Rust panic (overflow, division by zero, shift range, bounds), and `Assert` \
+         carries no panic message, operands or location, so the only lowering this converter has \
+         is a bare trap: no message, no panic hook, SIGTRAP instead of the panic handler's \
+         abort. The trust-ir codegen frontend refuses the function rather than emit a program \
+         that panics differently from the MIR path. Options: (1) keep the MIR lane for this \
+         crate; (2) build with the check provably absent (`-Coverflow-checks=off` removes the \
+         overflow and shift asserts; division and bounds checks remain); (3) land plan §5 item \
+         P (an `Assert` with message, operands and span, lowered to Rust's panic entry points)"
+    )]
+    ImplicitPanicUnfaithful { name: String, detail: String },
+}
+
+/// Where a function body carries an `Inst::Assert`: the trust-ir block and the
+/// node's position in that block's body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnfaithfulAssertSite {
+    /// The block that carries the `Assert`.
+    pub block: BlockId,
+    /// The `Assert` node's index in `block.body`.
+    pub index: usize,
+}
+
+/// The FIRST `Inst::Assert` in `function`'s body (blocks in stored order,
+/// nodes in body order), or `None` when it carries none. An
+/// `Inst::AssertInvoke` (trust-ir v54: a sited check whose failure enters an
+/// in-frame landing pad) is the same check and counts as one.
+///
+/// This is the predicate behind [`ModuleLirError::ImplicitPanicUnfaithful`],
+/// shared with every other trust-ir codegen consumer the superproject drives
+/// (`compiler_consumer`), so the two lanes refuse exactly the same functions.
+/// It is SYNTACTIC on purpose: every block is scanned, reachable or not, and a
+/// body-less declaration answers `None` (it has no code to emit here).
+#[must_use]
+pub fn unfaithful_assert_site(function: &IrFunction) -> Option<UnfaithfulAssertSite> {
+    function.blocks.iter().find_map(|block| {
+        block
+            .body
+            .iter()
+            .position(|node| matches!(node.inst, Inst::Assert { .. } | Inst::AssertInvoke { .. }))
+            .map(|index| UnfaithfulAssertSite { block: block.id, index })
+    })
+}
+
+/// `true` when `function` carries any `Inst::Assert`, i.e. when a trust-ir
+/// codegen consumer that cannot lower a panic faithfully must refuse it. See
+/// [`unfaithful_assert_site`] and [`ModuleLirError::ImplicitPanicUnfaithful`].
+#[must_use]
+pub fn function_has_unfaithful_assert(function: &IrFunction) -> bool {
+    unfaithful_assert_site(function).is_some()
+}
+
+impl ModuleLirError {
+    /// The variant's stable name, for refusal censuses that bucket by class
+    /// without parsing the rendered message.
+    #[must_use]
+    pub fn class_name(&self) -> &'static str {
+        match self {
+            Self::MissingFunction(_) => "MissingFunction",
+            Self::MissingFuncType { .. } => "MissingFuncType",
+            Self::NoBlocks { .. } => "NoBlocks",
+            Self::MissingBlock { .. } => "MissingBlock",
+            Self::EdgeArgArity { .. } => "EdgeArgArity",
+            Self::UnsupportedSwitchCase { .. } => "UnsupportedSwitchCase",
+            Self::UnencodableSwitchCase { .. } => "UnencodableSwitchCase",
+            Self::MalformedControlFlow { .. } => "MalformedControlFlow",
+            Self::BlockParamArity { .. } => "BlockParamArity",
+            Self::UnsupportedType { .. } => "UnsupportedType",
+            Self::UnsupportedInst { .. } => "UnsupportedInst",
+            Self::CleanOriginBelowCodegenGate { .. } => "CleanOriginBelowCodegenGate",
+            Self::MissingGlobal { .. } => "MissingGlobal",
+            Self::UnsupportedBinOp { .. } => "UnsupportedBinOp",
+            Self::UnsupportedUnOp { .. } => "UnsupportedUnOp",
+            Self::UnsupportedCast { .. } => "UnsupportedCast",
+            Self::UnsupportedConstant { .. } => "UnsupportedConstant",
+            Self::UndefinedValue { .. } => "UndefinedValue",
+            Self::MalformedReturn { .. } => "MalformedReturn",
+            Self::UnsupportedSignature { .. } => "UnsupportedSignature",
+            Self::NonLocalPointer { .. } => "NonLocalPointer",
+            Self::UnsupportedMemory { .. } => "UnsupportedMemory",
+            Self::UninlinableCall { .. } => "UninlinableCall",
+            Self::UnsupportedUndef { .. } => "UnsupportedUndef",
+            Self::UnsupportedOverflow { .. } => "UnsupportedOverflow",
+            Self::UnsupportedAggregate { .. } => "UnsupportedAggregate",
+            Self::UnclassifiedAggregateAbi { .. } => "UnclassifiedAggregateAbi",
+            Self::NativeCAggregateAbiUnsupported { .. } => "NativeCAggregateAbiUnsupported",
+            Self::AlwaysMemoryByValueAggregate { .. } => "AlwaysMemoryByValueAggregate",
+            Self::RecordedAbiSlotFact { .. } => "RecordedAbiSlotFact",
+            Self::ImplicitPanicUnfaithful { .. } => "ImplicitPanicUnfaithful",
+        }
+    }
 }
 
 /// THE ONE INTEGER TYPE a FIELDLESS (C-like) enum's value occupies, or `None`
@@ -302,6 +613,14 @@ pub(crate) fn fieldless_enum_carrier(module: &Module, ty: &Ty) -> Option<Ty> {
         trust_ir::EnumTagRepr::U16 | trust_ir::EnumTagRepr::I16 => 2,
         trust_ir::EnumTagRepr::U32 | trust_ir::EnumTagRepr::I32 => 4,
         trust_ir::EnumTagRepr::U64 | trust_ir::EnumTagRepr::I64 => 8,
+        // trust-ir v45. This lane admits a fieldless enum as a SCALAR
+        // carrier, and nothing downstream of it carries a 128-bit tag: the
+        // mask this width feeds is computed as `(1u128 << (bytes * 8)) - 1`,
+        // which OVERFLOWS at 16. Refusing is the fail-closed answer and the
+        // one this function already spells for every other shape it cannot
+        // model — a `None` here just means the enum is not carried as a
+        // scalar, never that it is miscompiled.
+        trust_ir::EnumTagRepr::U128 | trust_ir::EnumTagRepr::I128 => return None,
     };
     if layout.size != tag_bytes {
         return None;
@@ -513,6 +832,9 @@ fn map_int_binop(op: BinOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirErro
         | BinOp::FRem
         | BinOp::FMin
         | BinOp::FMax
+        | BinOp::FCopySign
+        | BinOp::RotL
+        | BinOp::RotR
         // Trust: the boolean-carrier LOGICAL connectives are REFUSED here, not
         // mapped onto `Band`/`Bor`/`Bxor`. On a well-formed 0/1 carrier the two
         // agree, but that premise is exactly what this converter cannot check
@@ -556,12 +878,15 @@ fn binop_name(op: BinOp) -> &'static str {
         BinOp::BXor => "bxor",
         BinOp::FMin => "fmin",
         BinOp::FMax => "fmax",
+        BinOp::FCopySign => "fcopysign",
         BinOp::And => "and",
         BinOp::Or => "or",
         BinOp::Xor => "xor",
         BinOp::Shl => "shl",
         BinOp::LShr => "lshr",
         BinOp::AShr => "ashr",
+        BinOp::RotL => "rotl",
+        BinOp::RotR => "rotr",
     }
 }
 
@@ -646,7 +971,7 @@ fn map_int_unop(op: UnOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirError>
         }
         // Population count: the LIR has a `CtPop` opcode but this bridge carries
         // no verified popcount lowering, so fail closed.
-        UnOp::CtPop => {
+        UnOp::CtPop | UnOp::CtLz | UnOp::CtTz | UnOp::BSwap | UnOp::BitReverse => {
             return Err(ModuleLirError::UnsupportedUnOp {
                 name: name.to_string(),
                 op: unop_name(op),
@@ -668,6 +993,10 @@ fn unop_name(op: UnOp) -> &'static str {
         UnOp::Neg => "neg",
         UnOp::Not => "not",
         UnOp::CtPop => "ctpop",
+        UnOp::CtLz => "ctlz",
+        UnOp::CtTz => "cttz",
+        UnOp::BSwap => "bswap",
+        UnOp::BitReverse => "bitreverse",
         UnOp::FNeg => "fneg",
         UnOp::FAbs => "fabs",
         UnOp::FSqrt => "fsqrt",
@@ -764,9 +1093,10 @@ fn map_int_cast(
             // plus zero/ASR-#63 high — and `Trunc(I128 -> I64)` reads the low
             // half; `select_i128_{add,sub,mul,sdiv}` and the I128 `Icmp`
             // lane consume the pairs). What stays refused: Bitcast involving
-            // I128 (no measured lane), and non-integers (Bool routes through
-            // Select at the producer, never a Cast; pointers are handled by
-            // the fail-closed pointer arms). The trust-ir gate rejects
+            // I128 (no measured lane), and non-integers (a `bool` SOURCE is
+            // the one exception — `b as uN` is a `ZExt` from the 1-bit `Bool`
+            // whose byte carrier maps below; pointers are handled by the
+            // fail-closed pointer arms). The trust-ir gate rejects
             // 128-bit arithmetic in its own fragment, so functions taking
             // this lane emit UNCERTIFIED under allow-unknown — completeness
             // now, proofs with the pair-aware gate later.
@@ -793,6 +1123,23 @@ fn map_int_cast(
                     Ok(Some(Opcode::Trunc { to_ty: to }))
                 }
                 CastOp::SExt | CastOp::ZExt => {
+                    // A `bool` -> 8-bit `ZExt` is what the producer emits for
+                    // `b as u8` / `b as i8` (trust-ir's `Bool` is 1 bit wide,
+                    // so the cast classifies as an extension), and the bool's
+                    // byte-wide LIR carrier ALREADY IS its zero-extended value
+                    // (0 or 1 in the byte) — so at the LIR level it is the
+                    // identity on the bit pattern, exactly like a same-width
+                    // `Bitcast`, and lowers to `Copy` (WS7.13: measured on the
+                    // `<bool as AsPrimitive<u8>>::as_` corpus row, which this
+                    // arm refused as a non-widening extend; the gate still
+                    // discharges the emitted bytes against the IR's own
+                    // `zext(bool -> u8)` semantics, so nothing is trusted here).
+                    if matches!(op, CastOp::ZExt)
+                        && matches!(src_ty, Ty::Bool)
+                        && matches!(to, LirType::I8)
+                    {
+                        return Ok(None);
+                    }
                     // An extend MUST widen; a non-widening extend is malformed.
                     if from_bytes >= to_bytes {
                         return Err(fail(format!(
@@ -942,6 +1289,8 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::Cast { .. } => "Cast",
         Inst::Load { .. } => "Load",
         Inst::Store { .. } => "Store",
+        Inst::MemCopy { .. } => "MemCopy",
+        Inst::MemSet { .. } => "MemSet",
         Inst::Alloca { .. } => "Alloca",
         Inst::HeapAlloc { .. } => "HeapAlloc",
         Inst::GEP { .. } => "GEP",
@@ -959,6 +1308,9 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::Call { .. } => "Call",
         Inst::CallIndirect { .. } => "CallIndirect",
         Inst::Return { .. } => "Return",
+        Inst::MakeAggregate { .. } => "MakeAggregate",
+        Inst::MakeClosure { .. } => "MakeClosure",
+        Inst::ArraySplat { .. } => "ArraySplat",
         Inst::ExtractField { .. } => "ExtractField",
         Inst::InsertField { .. } => "InsertField",
         Inst::ExtractElement { .. } => "ExtractElement",
@@ -979,6 +1331,7 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::Release { .. } => "Release",
         Inst::IsUnique { .. } => "IsUnique",
         Inst::Dealloc { .. } => "Dealloc",
+        Inst::Drop { .. } => "Drop",
         Inst::OpenFrame { .. } => "OpenFrame",
         Inst::BindSlot { .. } => "BindSlot",
         Inst::LoadSlot { .. } => "LoadSlot",
@@ -990,7 +1343,20 @@ fn inst_name(inst: &Inst) -> &'static str {
         Inst::Invoke { .. } => "Invoke",
         Inst::LandingPad { .. } => "LandingPad",
         Inst::Resume { .. } => "Resume",
+        Inst::AssertInvoke { .. } => "AssertInvoke",
+        Inst::CallCannotUnwind { .. } => "CallCannotUnwind",
+        Inst::CallIndirectCannotUnwind { .. } => "CallIndirectCannotUnwind",
+        Inst::DropInvoke { .. } => "DropInvoke",
+        Inst::InvokeIndirect { .. } => "InvokeIndirect",
         Inst::DialectOp(_) => "DialectOp",
+        // trust-ir v67-v69 tensor operations: outside this bridge's slice,
+        // refused by name like every other unmapped instruction.
+        Inst::TensorContract { .. } => "TensorContract",
+        Inst::TensorMap { .. } => "TensorMap",
+        Inst::TensorReduce { .. } => "TensorReduce",
+        Inst::TensorView { .. } => "TensorView",
+        Inst::TensorGather { .. } => "TensorGather",
+        Inst::TensorScatter { .. } => "TensorScatter",
     }
 }
 
@@ -1171,9 +1537,9 @@ impl MemoryCtx {
 
     /// Allocate a fresh fixed-size stack slot of an explicit `size`/`align`,
     /// returning its index. Used for AGGREGATE slots whose size/align come from
-    /// the C-style [`aggregate_mem_layout`] (matching trust-ir's
-    /// `aggregate_layout`), so the slot the field Str/Ldr address into is exactly
-    /// the in-memory aggregate the reference interpreter round-trips.
+    /// [`aggregate_mem_layout`], which is the trust-ir interpreter's own layout
+    /// of the slot's type (declared, or declaration order when none is declared;
+    /// CG-DECLARED-LAYOUT-1).
     fn alloc_sized_slot(&mut self, size: u32, align: u32) -> u32 {
         let slot = self.stack_slots.len() as u32;
         self.stack_slots.push(StackSlotInfo::new(size, align));
@@ -1181,28 +1547,31 @@ impl MemoryCtx {
     }
 }
 
-/// The C-style in-memory layout of a 2-field scalar aggregate (`Ty::Tuple` of
-/// two scalar-int/Bool fields), computed IDENTICALLY to the pinned trust-ir
-/// reference interpreter's `aggregate_layout` (`first-party/trust-ir/.../
-/// interpret.rs`): each field is placed at the next offset aligned up to its
-/// natural alignment, and the total size is rounded up to the aggregate
-/// alignment (max field alignment, min 1).
+/// The in-memory layout of a scalar-field aggregate (`Ty::Tuple` or
+/// `Ty::Struct`): its byte size and alignment and each field's byte offset, in
+/// declaration order.
 ///
-/// SOUNDNESS — this is the layout-match contract. The value-diff interpreter
-/// stores/loads the aggregate through `aggregate_layout`'s `field_offsets`; the
-/// converter MUST place its per-field Str/Ldr at the SAME byte offsets or the
-/// emitted machine bytes would disagree with the interpreted result. The
-/// per-field scalar (`byte_size`/`byte_align`) values used here are exactly the
-/// interpreter's (`I8/U8/Bool`=1, `I16/U16`=2, `I32/U32`=4, `I64/U64`=8); a
+/// Two producers build one. [`aggregate_mem_layout`] builds the layout of a slot
+/// this converter allocates, and it is the pinned trust-ir reference
+/// interpreter's own layout of the type, byte for byte (CG-DECLARED-LAYOUT-1): a
+/// declared layout read verbatim and re-validated as the interpreter's
+/// `declared_struct_layout` / `tuple_layout_in` validate it, or, when the type
+/// declares none, the interpreter's declaration-order `aggregate_layout` (each
+/// field at the next offset aligned up to its natural alignment, the size
+/// rounded up to the maximum field alignment, min 1).
+/// [`recorded_struct_mem_layout`] builds the layout of memory a CALLER laid out,
+/// and reads only rustc's recorded triple.
+///
+/// The per-field scalar (`byte_size`/`byte_align`) values used here are exactly
+/// the interpreter's (`I8/U8/Bool`=1, `I16/U16`=2, `I32/U32`=4, `I64/U64`=8); a
 /// `LirType`'s `bytes()`/`align()` agree with those for the scalar ints this
-/// slice admits (re-validated below). Any field type whose layout the converter
-/// cannot reproduce 1:1 fails closed (the caller restricts to 2-field scalar
-/// tuples before calling this).
+/// slice admits. Any field type without such a scalar layout fails closed
+/// (`scalar_field_size_align`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AggMemLayout {
-    /// Total byte size (rounded up to `align`).
+    /// Total byte size (a multiple of `align`).
     size: u32,
-    /// Aggregate alignment (max field alignment, min 1).
+    /// Aggregate alignment (a power of two).
     align: u32,
     /// Per-field `(byte_offset, lir_field_type)` in declaration order.
     field_offsets: Vec<(u32, LirType)>,
@@ -1211,8 +1580,15 @@ struct AggMemLayout {
 /// Natural byte size / alignment of a scalar-int/Bool field, matching the
 /// trust-ir interpreter's `byte_size`/`byte_align` for these types EXACTLY.
 /// FAIL-CLOSED on any non-scalar field (the C layout would need a recursive
-/// aggregate layout this slice does not reproduce).
-fn scalar_field_size_align(ty: &Ty, name: &str) -> Result<(u32, u32, LirType), ModuleLirError> {
+/// aggregate layout this slice does not reproduce), and on a pointer-width
+/// field (`isize`/`usize`) of a module whose target does not have 8-byte
+/// pointers: the interpreter sizes that field at the target's pointer width
+/// (4 bytes on wasm32 or i686) and this table only has the 64-bit width.
+fn scalar_field_size_align(
+    ty: &Ty,
+    module: &Module,
+    name: &str,
+) -> Result<(u32, u32, LirType), ModuleLirError> {
     // trust-ir interpret.rs byte_size/byte_align: Bool/I8/U8 = (1,1),
     // I16/U16 = (2,2), I32/U32 = (4,4), I64/U64 = (8,8). i128 is admitted as a
     // scalar carrier but its 16-byte layout is NOT part of this 2-field slice
@@ -1223,10 +1599,23 @@ fn scalar_field_size_align(ty: &Ty, name: &str) -> Result<(u32, u32, LirType), M
         Ty::I16 | Ty::U16 => (2, 2),
         Ty::I32 | Ty::U32 => (4, 4),
         Ty::I64 | Ty::U64 => (8, 8),
-        // Trust (v25 B1): isize/usize are pointer-width — 8 bytes on the pinned
-        // 64-bit target (trust-ir interpret int_shape convention), laid out
-        // exactly like I64/U64.
-        Ty::Isize | Ty::Usize => (8, 8),
+        // Trust (v25 B1): isize/usize are pointer-width — 8 bytes on a
+        // target-free module (the interpreter's 64-bit reference width) and on
+        // a target with 8-byte pointers, laid out exactly like I64/U64. Any
+        // other pointer width is refused, never laid out at 8.
+        Ty::Isize | Ty::Usize => match module.target_info.as_ref().map(|t| t.pointer_size) {
+            None | Some(8) => (8, 8),
+            Some(pointer_size) => {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "aggregate field type {ty:?} is pointer-width and the module's target has \
+                         {pointer_size}-byte pointers; this converter's field table sizes it only \
+                         at 8 bytes"
+                    ),
+                });
+            }
+        },
         // Trust (v25 B1): char is a 32-bit unsigned carrier — 4-byte size/align,
         // exactly the U32 layout.
         Ty::Char => (4, 4),
@@ -1257,57 +1646,26 @@ fn align_up_u32(value: u32, align: u32) -> u32 {
 /// self-describing.
 ///
 /// FAIL-CLOSED on any non-aggregate type, and — for a struct — on a missing
-/// `StructDef` or a `repr` other than the layout-default `Rust`: this converter
-/// reproduces ONLY a natural declaration-order C-style layout, so a
-/// `#[repr(C/packed/transparent)]` struct — whose real ABI layout could differ —
-/// is rejected rather than laid out under a layout the emitted bytes are not
-/// proven against. The bridge emits `StructRepr::Rust` for every ADT/closure-env
-/// it lowers, so this covers the real emitted shape; a non-default repr is out
-/// of the proven slice.
+/// `StructDef` or a `repr` other than the layout-default `Rust`: a
+/// `#[repr(C/packed/transparent)]` struct is outside the slice whose emitted
+/// bytes are proven (the interpreter re-validates a packed clamp and a
+/// transparent carrier this file does not reproduce), so it is rejected rather
+/// than laid out. The bridge emits `StructRepr::Rust` for every ADT/closure-env
+/// it lowers, so this covers the real emitted shape.
 ///
-/// # KNOWN GAP — this doc used to claim parity with the interpreter, and that
-/// claim is FALSE at the current `first-party/trust-ir` pin
-///
-/// The wording removed above said the interpreter's layout "ignores
-/// `repr`/`size`/`align`/`offset`". That was true when it was written and stopped
-/// being true at trust-ir `c951b2e` (*"a declared struct layout is NORMATIVE"*).
-/// `interpret::struct_layout` now DISPATCHES on `(def.size, def.align)`:
-///
-/// * both `Some` -> `declared_struct_layout`, which lays the struct out at
-///   `FieldDef::offset` verbatim (and errors on an incoherent size/align);
-/// * both `None`  -> the declaration-order `aggregate_layout` this file mirrors —
-///   and that branch additionally ERRORS if any field declares an offset;
-/// * one of each -> an error.
-///
-/// So for a `StructDef` that carries a declared layout, the interpreter and this
-/// function are TWO DIFFERENT LAYOUT ALGORITHMS for one type. That is not
-/// hypothetical: the producer's `register_struct` fills `size`/`align`/`offset`
-/// from rustc's REORDER-AWARE `layout.fields.offset` for every concrete struct it
-/// registers, and wave-SG measured 3,489 of 4,788 field offsets on `clean-kernel`
-/// differing from the declaration-order layout. Grep this file: it holds exactly
-/// ONE `struct_def(` call — right below — and reads NONE of `def.size`,
-/// `def.align` or `FieldDef::offset` anywhere.
-///
-/// Why it is not (yet) a wrong emission, stated exactly: the admitted slice only
-/// ever round-trips a WHOLE aggregate through one slot, so a Store and its Load
-/// use the same (possibly non-rustc) offsets and the observable value survives;
-/// partial access, a re-derived `GEP` into the slot, and every escape already
-/// fail closed; and the declaration-order slot is never SMALLER than rustc's.
-/// Remove any one of those three and the two algorithms disagree silently.
-///
-/// The `module_to_lir_struct_mem_proven_output.rs` suite does not cover this:
-/// every `StructDef` it builds is `size: None, align: None` with no field offset,
-/// i.e. exactly the one branch on which the two algorithms cannot differ. Its
-/// "value-differential (layout agreement)" test is therefore green by
-/// construction for the divergent case.
-///
-/// The fix is a decision, not a patch, and it is deliberately NOT made here:
-/// either REFUSE a `StructDef` that declares a layout this file does not read
-/// (fail-closed, but that is most producer-emitted structs and its coverage cost
-/// is unmeasured), or READ the declared triple and lay the slot out at
-/// `FieldDef::offset` (parity, but it moves emitted bytes and needs its own
-/// proven-output gate). Recorded here so the next reader does not inherit a doc
-/// comment that asserts the opposite of the contract.
+/// This answers the field TYPES only. Where each field LIVES is
+/// [`aggregate_mem_layout`]'s answer, and since CG-DECLARED-LAYOUT-1
+/// (2026-11-10) that is the interpreter's: a declared `StructDef`
+/// size/align/`FieldDef::offset` triple or a `Module::tuple_layouts` descriptor
+/// is read and re-validated, and only a type that declares none is laid out in
+/// declaration order. (Until then this doc carried a KNOWN GAP: the slot was laid
+/// out in declaration order for every type, while the interpreter has used a
+/// declared layout since trust-ir `c951b2e` — *"a declared struct layout is
+/// NORMATIVE"* — and the producer's `register_struct` fills one from rustc's
+/// reorder-aware offsets for every concrete struct; wave-SG measured 3,489 of
+/// 4,788 field offsets on `clean-kernel` differing. Values agreed only because the
+/// slot was round-tripped whole, step 1b refused every partial access, and the
+/// declaration-order slot was never smaller than rustc's.)
 fn aggregate_field_types(ty: &Ty, module: &Module, name: &str) -> Result<Vec<Ty>, ModuleLirError> {
     match ty {
         Ty::Tuple(elems) => Ok(elems.clone()),
@@ -1320,18 +1678,15 @@ fn aggregate_field_types(ty: &Ty, module: &Module, name: &str) -> Result<Vec<Ty>
                         sid.as_usize()
                     ),
                 })?;
-            // Reproduce ONLY a natural declaration-order C layout, which ignores
-            // `repr`. A non-`Rust` repr's real ABI layout could diverge from the
-            // natural layout the emitted bytes are proven against; fail closed.
-            // NOTE: a `StructRepr::Rust` struct that DECLARES `size`/`align`/
-            // `FieldDef::offset` is admitted here and laid out in declaration
-            // order anyway — see the KNOWN GAP on `aggregate_field_types`.
+            // Only `repr(Rust)` is in the proven slice: a packed clamp or a
+            // transparent carrier changes what the interpreter accepts as a
+            // declared layout, and neither is reproduced here; fail closed.
             if def.repr != trust_ir::ty::StructRepr::Rust {
                 return Err(ModuleLirError::UnsupportedAggregate {
                     name: name.to_string(),
                     detail: format!(
-                        "aggregate Ty::Struct({}) has non-default repr {:?}; only the natural \
-                         (repr(Rust)) C layout is reproduced in the aggregate-memory slice",
+                        "aggregate Ty::Struct({}) has non-default repr {:?}; only repr(Rust) is in \
+                         the aggregate-memory slice",
                         sid.as_usize(),
                         def.repr
                     ),
@@ -1348,12 +1703,149 @@ fn aggregate_field_types(ty: &Ty, module: &Module, name: &str) -> Result<Vec<Ty>
     }
 }
 
-/// Compute the C-style [`AggMemLayout`] of a `Ty::Tuple`/`Ty::Struct` made of
-/// scalar fields, matching the trust-ir interpreter's `aggregate_layout`
-/// BYTE-FOR-BYTE. Handles N scalar fields (generalized from the initial 2-field
-/// tuple slice). FAIL-CLOSED on a non-aggregate type, a non-scalar field, or a
-/// zero-field aggregate (there is nothing to round-trip and the bridge never
-/// emits one for a promoted local).
+/// A layout the module DECLARES for an aggregate type, as the interpreter reads
+/// it: a `StructDef`'s `(size, align, FieldDef::offset)` triple, or a
+/// `Module::tuple_layouts` descriptor. Offsets are in declaration order.
+struct DeclaredAggLayout {
+    size: u64,
+    align: u64,
+    offsets: Vec<u64>,
+}
+
+/// The layout `ty` DECLARES, exactly where the pinned trust-ir interpreter finds
+/// one (`interpret::struct_layout_unguarded` / `tuple_layout_in`), or `None` when
+/// it declares none and the interpreter lays it out in declaration order.
+///
+/// FAIL-CLOSED on every declaration the interpreter refuses, so this converter
+/// never lowers a slot the reference semantics cannot execute:
+/// * a struct: a size without an alignment or the reverse; an offset on a field of
+///   a struct with neither; under a declared size and alignment, a field with no
+///   offset (the interpreter admits that only for a zero-sized field, and every
+///   field this slice admits is a non-zero-sized scalar);
+/// * a tuple: a `Module::tuple_layouts` table that does not validate (the
+///   interpreter validates the whole table before laying out any tuple), or two
+///   descriptors for one tuple;
+/// * either, on a module whose target is not the 64-bit little-endian
+///   canonical-scalar layout `scalar_field_size_align` describes: the interpreter
+///   refuses a declared layout on a big-endian or non-canonical-scalar target
+///   (`require_reference_execution_layout`), and on a 32-bit target it sizes
+///   `isize`/`usize` at 4 bytes where this converter's field table says 8.
+fn declared_aggregate_layout(
+    ty: &Ty,
+    module: &Module,
+    name: &str,
+) -> Result<Option<DeclaredAggLayout>, ModuleLirError> {
+    let refuse =
+        |detail: String| ModuleLirError::UnsupportedAggregate { name: name.to_string(), detail };
+    let declared = declared_aggregate_layout_unchecked_target(ty, module, &refuse)?;
+    if declared.is_some()
+        && let Some(target) = &module.target_info
+        && !(target.pointer_size == 8
+            && target.endianness == trust_ir::Endianness::Little
+            && module.target_has_canonical_scalar_layout())
+    {
+        return Err(refuse(format!(
+            "{ty:?} declares a layout for target {:?} ({}-byte pointers, {:?}), which is not the \
+             64-bit little-endian canonical-scalar layout this converter's field table describes",
+            target.triple, target.pointer_size, target.endianness
+        )));
+    }
+    Ok(declared)
+}
+
+/// [`declared_aggregate_layout`] before its target check.
+fn declared_aggregate_layout_unchecked_target(
+    ty: &Ty,
+    module: &Module,
+    refuse: &dyn Fn(String) -> ModuleLirError,
+) -> Result<Option<DeclaredAggLayout>, ModuleLirError> {
+    match ty {
+        Ty::Struct(sid) => {
+            let def = module.struct_def(*sid).ok_or_else(|| {
+                refuse(format!(
+                    "aggregate Ty::Struct({}) has no StructDef in the module table",
+                    sid.as_usize()
+                ))
+            })?;
+            match (def.size, def.align) {
+                (Some(size), Some(align)) => {
+                    let offsets = def
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            field.offset.ok_or_else(|| {
+                                refuse(format!(
+                                    "struct `{}` declares size {size} / align {align} but no offset \
+                                     for field `{}`",
+                                    def.name, field.name
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<u64>, _>>()?;
+                    Ok(Some(DeclaredAggLayout { size, align, offsets }))
+                }
+                (None, None) => match def.fields.iter().find(|field| field.offset.is_some()) {
+                    Some(field) => Err(refuse(format!(
+                        "struct `{}` declares an offset for field `{}` but no size or alignment",
+                        def.name, field.name
+                    ))),
+                    None => Ok(None),
+                },
+                (Some(_), None) | (None, Some(_)) => Err(refuse(format!(
+                    "struct `{}` declares a size without an alignment, or the reverse",
+                    def.name
+                ))),
+            }
+        }
+        Ty::Tuple(elems) => {
+            if module.tuple_layouts.is_empty() {
+                return Ok(None);
+            }
+            module
+                .validate_tuple_layouts()
+                .map_err(|e| refuse(format!("the module's tuple layout table is invalid: {e}")))?;
+            let Some(desc) = module.tuple_layout_descriptor(ty).map_err(|e| {
+                refuse(format!("tuple {ty:?} has no unambiguous layout descriptor: {e}"))
+            })?
+            else {
+                return Ok(None);
+            };
+            if desc.field_offsets.len() != elems.len() {
+                return Err(refuse(format!(
+                    "tuple {ty:?} has {} elements but its layout descriptor names {} offsets",
+                    elems.len(),
+                    desc.field_offsets.len()
+                )));
+            }
+            Ok(Some(DeclaredAggLayout {
+                size: desc.size,
+                align: desc.align,
+                offsets: desc.field_offsets.clone(),
+            }))
+        }
+        other => Err(refuse(format!(
+            "aggregate-memory layout is only computed for Ty::Tuple / Ty::Struct; got {other:?}"
+        ))),
+    }
+}
+
+/// Compute the [`AggMemLayout`] of a slot holding a `Ty::Tuple`/`Ty::Struct` of
+/// scalar fields: the trust-ir interpreter's own layout of that type, byte for
+/// byte (CG-DECLARED-LAYOUT-1).
+///
+/// * A DECLARED layout ([`declared_aggregate_layout`]) is read verbatim and
+///   re-validated as the interpreter's `declared_struct_layout` validates it for
+///   `repr(Rust)`: a power-of-two alignment, a size that is a multiple of it, and
+///   every field at an offset that is a multiple of its own alignment, no wider
+///   aligned than the aggregate, inside the size, and overlapping no other field.
+///   A declaration that fails any of these is refused, never repaired.
+/// * Otherwise the interpreter's declaration-order `aggregate_layout`: each field
+///   at the next offset aligned up to its natural alignment, the size rounded up
+///   to the aggregate alignment (max field alignment, min 1).
+///
+/// FAIL-CLOSED on a non-aggregate type, a non-scalar field, a declaration the
+/// interpreter refuses, or a zero-field aggregate (there is nothing to round-trip
+/// and the bridge never emits one for a promoted local).
 fn aggregate_mem_layout(
     ty: &Ty,
     module: &Module,
@@ -1369,21 +1861,95 @@ fn aggregate_mem_layout(
             detail: format!("aggregate-memory slice rejects a zero-field aggregate {ty:?}"),
         });
     }
-    let mut offset: u32 = 0;
-    let mut max_align: u32 = 1;
-    let mut field_offsets = Vec::with_capacity(fields.len());
-    for field_ty in &fields {
-        // scalar_field_size_align FAILS CLOSED on any non-scalar field (nested
-        // struct/tuple, float, i128, pointer), so a struct-of-struct / float /
-        // i128-field aggregate never lays out under this slice.
-        let (f_size, f_align, f_lir) = scalar_field_size_align(field_ty, name)?;
-        offset = align_up_u32(offset, f_align);
-        field_offsets.push((offset, f_lir));
-        offset += f_size;
-        max_align = max_align.max(f_align);
+    // scalar_field_size_align FAILS CLOSED on any non-scalar field (nested
+    // struct/tuple, float, i128, pointer), so a struct-of-struct / float /
+    // i128-field aggregate never lays out under this slice.
+    let scalars = fields
+        .iter()
+        .map(|field_ty| scalar_field_size_align(field_ty, module, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    match declared_aggregate_layout(ty, module, name)? {
+        Some(declared) => declared_slot_layout(ty, &declared, scalars, name),
+        None => {
+            let mut offset: u32 = 0;
+            let mut max_align: u32 = 1;
+            let mut field_offsets = Vec::with_capacity(scalars.len());
+            for (f_size, f_align, f_lir) in scalars {
+                offset = align_up_u32(offset, f_align);
+                field_offsets.push((offset, f_lir));
+                offset += f_size;
+                max_align = max_align.max(f_align);
+            }
+            let size = align_up_u32(offset, max_align);
+            Ok(AggMemLayout { size, align: max_align, field_offsets })
+        }
     }
-    let size = align_up_u32(offset, max_align);
-    Ok(AggMemLayout { size, align: max_align, field_offsets })
+}
+
+/// The slot layout of a DECLARED aggregate layout, after the re-validation
+/// [`aggregate_mem_layout`] lists. `scalars` are the fields' `(size, align,
+/// lir_type)` in declaration order.
+///
+/// The declared alignment is the slot's. trust-cg's frame guarantees a slot base
+/// only 16-byte alignment, so an over-aligned declaration (`repr(align(32))`) can
+/// get an under-aligned base; nothing admitted observes the base (step 1b: a
+/// field pointer is only ever the address of a field access, never compared,
+/// stored, cast or returned), and every field access stays aligned to its own
+/// width, which is at most 8.
+fn declared_slot_layout(
+    ty: &Ty,
+    declared: &DeclaredAggLayout,
+    scalars: Vec<(u32, u32, LirType)>,
+    name: &str,
+) -> Result<AggMemLayout, ModuleLirError> {
+    let refuse = |detail: String| ModuleLirError::UnsupportedAggregate {
+        name: name.to_string(),
+        detail: format!("declared layout of {ty:?}: {detail}"),
+    };
+    if declared.offsets.len() != scalars.len() {
+        return Err(refuse(format!(
+            "{} declared offsets for {} fields",
+            declared.offsets.len(),
+            scalars.len()
+        )));
+    }
+    let size = u32::try_from(declared.size)
+        .map_err(|_| refuse(format!("size {} exceeds u32", declared.size)))?;
+    let align = u32::try_from(declared.align)
+        .map_err(|_| refuse(format!("alignment {} exceeds u32", declared.align)))?;
+    if !align.is_power_of_two() || !size.is_multiple_of(align) {
+        return Err(refuse(format!("incoherent size {size} / alignment {align}")));
+    }
+    let mut field_offsets: Vec<(u32, LirType)> = Vec::with_capacity(scalars.len());
+    let mut extents: Vec<(u32, u32)> = Vec::with_capacity(scalars.len());
+    for (index, (&offset, (f_size, f_align, f_lir))) in
+        declared.offsets.iter().zip(scalars).enumerate()
+    {
+        let in_bounds = u32::try_from(offset)
+            .ok()
+            .filter(|off| off.checked_add(f_size).is_some_and(|end| end <= size));
+        let Some(offset) = in_bounds else {
+            return Err(refuse(format!(
+                "field {index} at offset {offset} ({f_size} bytes) overruns the declared size \
+                 {size}"
+            )));
+        };
+        if !offset.is_multiple_of(f_align) || f_align > align {
+            return Err(refuse(format!(
+                "field {index} at offset {offset} (align {f_align}) is misaligned or over-aligned \
+                 for declared alignment {align}"
+            )));
+        }
+        if let Some(other) = extents
+            .iter()
+            .position(|&(o, s)| offset < o.saturating_add(s) && o < offset.saturating_add(f_size))
+        {
+            return Err(refuse(format!("fields {other} and {index} overlap")));
+        }
+        extents.push((offset, f_size));
+        field_offsets.push((offset, f_lir));
+    }
+    Ok(AggMemLayout { size, align, field_offsets })
 }
 
 /// The TAG-CARRIER read view of an ENUM-typed struct field, or `None` when
@@ -1468,16 +2034,17 @@ fn pair_enum_view(module: &Module, ty: &Ty) -> Option<PairEnumView> {
 /// The RUSTC-RECORDED memory layout of a `Ty::Struct` — for reading memory a
 /// CALLER laid out (the incoming-pointer aggregate lane).
 ///
-/// SOUNDNESS — this is deliberately NOT [`aggregate_mem_layout`]. The
-/// canonical sequential layout matches the trust-ir reference interpreter and
-/// is correct for slots this converter itself allocates and fills; memory
+/// SOUNDNESS — this is deliberately NOT [`aggregate_mem_layout`]. That one is
+/// the interpreter's layout of a slot this converter itself allocates, fills and
+/// reads WHOLE (PASS 1.7 step 1b), and for a type that declares no layout it is
+/// the canonical declaration-order layout; memory
 /// reached through an INCOMING pointer was laid out by rustc, and repr(Rust)
 /// reorders fields, so canonical offsets can read the wrong bytes. This
 /// function therefore uses only what the PRODUCER recorded off rustc's layout
 /// — the struct's `size`/`align` and every field's `offset` — and FAILS
 /// CLOSED when any of them is absent (degraded defs, e.g. a `Vec` field
-/// spelled `()`), and on `Ty::Tuple` entirely (tuples carry no recorded
-/// offsets and also reorder).
+/// spelled `()`), and on `Ty::Tuple` entirely (this function reads no
+/// `Module::tuple_layouts` descriptor, and rustc reorders tuples too).
 fn recorded_struct_mem_layout(
     ty: &Ty,
     module: &Module,
@@ -1493,12 +2060,11 @@ fn recorded_struct_mem_layout(
             ),
         });
     };
-    let def = module.structs.get(sid.as_usize()).ok_or_else(|| {
-        ModuleLirError::UnsupportedAggregate {
+    let def =
+        module.structs.get(sid.as_usize()).ok_or_else(|| ModuleLirError::UnsupportedAggregate {
             name: name.to_string(),
             detail: format!("struct id {} not in module", sid.as_usize()),
-        }
-    })?;
+        })?;
     let (Some(size), Some(align)) = (def.size, def.align) else {
         return Err(ModuleLirError::UnsupportedAggregate {
             name: name.to_string(),
@@ -1539,20 +2105,19 @@ fn recorded_struct_mem_layout(
         // failing closed in scalar_field_size_align.
         let (field_scalar_ty, bounds_size) = match enum_tag_read_view(module, &field.ty) {
             Some((carrier, full_size, _)) => {
-                let full = u32::try_from(full_size).map_err(|_| {
-                    ModuleLirError::UnsupportedAggregate {
+                let full =
+                    u32::try_from(full_size).map_err(|_| ModuleLirError::UnsupportedAggregate {
                         name: name.to_string(),
                         detail: format!(
                             "struct `{}` enum field `{}` size exceeds u32",
                             def.name, field.name
                         ),
-                    }
-                })?;
+                    })?;
                 (carrier, Some(full))
             }
             None => (field.ty.clone(), None),
         };
-        let (f_size, _f_align, f_lir) = scalar_field_size_align(&field_scalar_ty, name)?;
+        let (f_size, _f_align, f_lir) = scalar_field_size_align(&field_scalar_ty, module, name)?;
         let f_size = bounds_size.unwrap_or(f_size).max(f_size);
         if offset.checked_add(f_size).is_none_or(|end| end > size) {
             return Err(ModuleLirError::UnsupportedAggregate {
@@ -1586,9 +2151,50 @@ pub fn lower_module_to_lir(
     module: &Module,
     func_id: trust_ir::value::FuncId,
 ) -> Result<LirFunction, ModuleLirError> {
+    lower_module_to_lir_maybe_cross_checked(module, func_id, None)
+}
+
+/// [`lower_module_to_lir`] with a [`AbiPassModeCrossCheck`] attached.
+///
+/// The token is the ONLY thing that admits a module declaring
+/// `StructPassingPolicy::Unclassified` whose call edges carry a by-value
+/// aggregate — see [`ModuleLirError::UnclassifiedAggregateAbi`] for why the
+/// bare entry point must refuse such a module instead of classifying it. It
+/// admits nothing else: a by-value aggregate edge under `NativeC` or
+/// `AlwaysMemory`, and a recorded `ParamAttrs.pass` / `ParamAttrs.ext` /
+/// `FuncAttrs.ret` fact under any policy, are refused with or without it
+/// (trust-ir SPEC §17; see [`AbiPassModeCrossCheck`]).
+///
+/// Call this only from a consumer that has ALREADY checked every aggregate
+/// argument and the return against the target's real pass modes; the token
+/// records that claim, it does not verify it.
+pub fn lower_module_to_lir_with_abi_cross_check(
+    module: &Module,
+    func_id: trust_ir::value::FuncId,
+    cross_check: &AbiPassModeCrossCheck,
+) -> Result<LirFunction, ModuleLirError> {
+    lower_module_to_lir_maybe_cross_checked(module, func_id, Some(cross_check))
+}
+
+/// [`lower_module_to_lir`] with the cross-check CARRIED rather than named: for a
+/// consumer that stores an `Option<AbiPassModeCrossCheck>` alongside the module
+/// and re-lowers it later (the F1 proven-output gate does exactly this, so its
+/// re-lowerings are admitted on the shipping path's evidence and on nothing
+/// weaker). `None` behaves exactly like [`lower_module_to_lir`].
+pub fn lower_module_to_lir_maybe_cross_checked(
+    module: &Module,
+    func_id: trust_ir::value::FuncId,
+    cross_check: Option<&AbiPassModeCrossCheck>,
+) -> Result<LirFunction, ModuleLirError> {
     let function =
         module.function_by_id(func_id).ok_or(ModuleLirError::MissingFunction(func_id.index()))?;
-    lower_trust_ir_function_to_lir(module, function)
+    lower_trust_ir_function_to_lir_impl(
+        module,
+        function,
+        false,
+        cross_check,
+        AssertAdmission::Refuse,
+    )
 }
 
 /// Convert a `trust_ir::Function` into a LIR `Function` using `module` for type
@@ -1606,7 +2212,23 @@ pub fn lower_trust_ir_function_to_lir(
     module: &Module,
     function: &IrFunction,
 ) -> Result<LirFunction, ModuleLirError> {
-    lower_trust_ir_function_to_lir_impl(module, function, false)
+    lower_trust_ir_function_to_lir_impl(module, function, false, None, AssertAdmission::Refuse)
+}
+
+/// [`lower_trust_ir_function_to_lir`] with a [`AbiPassModeCrossCheck`] attached.
+/// See [`lower_module_to_lir_with_abi_cross_check`].
+pub fn lower_trust_ir_function_to_lir_with_abi_cross_check(
+    module: &Module,
+    function: &IrFunction,
+    cross_check: &AbiPassModeCrossCheck,
+) -> Result<LirFunction, ModuleLirError> {
+    lower_trust_ir_function_to_lir_impl(
+        module,
+        function,
+        false,
+        Some(cross_check),
+        AssertAdmission::Refuse,
+    )
 }
 
 /// Like [`lower_trust_ir_function_to_lir`], but a `Call` to a LOCAL pure callee
@@ -1628,22 +2250,758 @@ pub fn lower_trust_ir_function_to_lir_real_calls(
     module: &Module,
     function: &IrFunction,
 ) -> Result<LirFunction, ModuleLirError> {
-    lower_trust_ir_function_to_lir_impl(module, function, true)
+    lower_trust_ir_function_to_lir_impl(module, function, true, None, AssertAdmission::Refuse)
+}
+
+/// [`lower_trust_ir_function_to_lir_real_calls`] with a
+/// [`AbiPassModeCrossCheck`] attached. The real-call arm emits a genuine
+/// cross-function `Bl`, so it is the arm where an unclassified aggregate edge
+/// would become a wrong ABI at a REAL boundary rather than an inlined one; it
+/// carries the same admission, and the same way out.
+/// See [`lower_module_to_lir_with_abi_cross_check`].
+pub fn lower_trust_ir_function_to_lir_real_calls_with_abi_cross_check(
+    module: &Module,
+    function: &IrFunction,
+    cross_check: &AbiPassModeCrossCheck,
+) -> Result<LirFunction, ModuleLirError> {
+    lower_trust_ir_function_to_lir_impl(
+        module,
+        function,
+        true,
+        Some(cross_check),
+        AssertAdmission::Refuse,
+    )
+}
+
+/// The indirect-return (`sret`) convention of `function`, read from trust-ir's
+/// `ParamAttrs::sret` exactly as trust-cg's own adapter reads it
+/// (trust-cg-lower `adapter.rs`, `[TCG-SRET-ABI]`), never re-derived from a
+/// size rule. An aggregate that rustc returns through a caller-allocated buffer
+/// (`PassMode::Indirect`) arrives as a LEADING pointer parameter marked `sret`
+/// with an EMPTY return list (trust-ir validates that shape), and the selector
+/// must bind that parameter from the indirect-result register (`X8` on AAPCS64)
+/// instead of the first argument register. Dropping the marker is the
+/// 2026-09-10 silent-wrong-value trust-cg 822fdc69 fixed: caller and callee each
+/// self-consistent, disagreeing with every LLVM-compiled neighbour.
+///
+/// Returns the function's own marker (only a leading hidden parameter is
+/// lowered; any other position fails closed, as the adapter does) and the
+/// names of the DIRECT callees whose argument 0 is such a buffer, so ISel
+/// classifies those calls' remaining arguments as if it were absent.
+#[allow(rustc::default_hash_types)]
+#[allow(rustc::default_hash_types)]
+fn sret_convention(
+    module: &Module,
+    function: &IrFunction,
+    name: &str,
+) -> Result<
+    (Option<AbiSretParam>, std::collections::HashSet<String>, std::collections::HashSet<Value>),
+    ModuleLirError,
+> {
+    fn leading_sret(attrs: &trust_ir::FuncAttrs, symbol: &str) -> Result<bool, String> {
+        match attrs.params.iter().position(|pa| pa.sret) {
+            None => Ok(false),
+            Some(0) => Ok(true),
+            Some(index) => Err(format!(
+                "[TCG-SRET-ABI] `{symbol}` declares its hidden return-buffer (sret) parameter \
+                 at index {index}; only a LEADING hidden parameter is lowered. Failing closed \
+                 rather than choosing an indirect-result register for it."
+            )),
+        }
+    }
+    let unsupported =
+        |detail: String| ModuleLirError::UnsupportedSignature { name: name.to_string(), detail };
+    let abi_sret_param = leading_sret(&function.attrs, name)
+        .map_err(unsupported)?
+        .then_some(AbiSretParam { param_index: 0 });
+    // Callee scan. `function_by_id` is the resolver the real-call arm and the
+    // inliner use, so what is marked is what is emitted. The fail-closed arm is a
+    // defensive mirror of the adapter's: an sret callee has an EMPTY return list,
+    // and this path only ever emits a real `Opcode::Call` to a callee returning
+    // one single-register scalar, so such a call is refused as unsupported before
+    // this scan runs.
+    let mut sret_arg_callees = std::collections::HashSet::new();
+    for node in function.blocks.iter().flat_map(|block| block.body.iter()) {
+        if let Inst::Call { callee, .. } = &node.inst
+            && let Some(callee_fn) = module.function_by_id(*callee)
+            && leading_sret(&callee_fn.attrs, &callee_fn.name).map_err(unsupported)?
+        {
+            sret_arg_callees.insert(callee_fn.name.clone());
+        }
+    }
+    // Indirect half (trust-cg de95c72d6, `Function::sret_arg_indirect_callees`):
+    // the adapter records, keyed by LIR callee value, every `CallIndirect` whose
+    // fn-pointer trust-ir's own provenance resolves to a declaration carrying a
+    // leading `sret`, and lowers an unresolvable pointer as the ordinary call its
+    // signature declares. This converter's real-call arm admits an indirect
+    // callee only when it is a KNOWN, composable local pure function returning
+    // exactly one single-register scalar; an sret callee has an EMPTY return
+    // list, so it can never be emitted here, and an OPEN pointer carries no
+    // expressible hidden-buffer fact on either side. The set is therefore
+    // provably empty for every LIR this converter produces. The scan below is
+    // the defensive mirror of the adapter's: a statically resolvable sret callee
+    // behind an indirect call is refused by name BEFORE emission, rather than
+    // reaching the real-call arm's generic "not composable" refusal with the ABI
+    // fact silently dropped. `resolve` is the coarse chain walk (it may resolve
+    // where the exact typed query would not), which is the safe direction for a
+    // refusal.
+    let sret_arg_indirect_callees: std::collections::HashSet<Value> =
+        std::collections::HashSet::new();
+    let provenance = trust_ir::analysis::StaticFunctionPointerAnalysis::new(function);
+    for node in function.blocks.iter().flat_map(|block| block.body.iter()) {
+        if let Inst::CallIndirect { callee, .. } = &node.inst
+            && let Some(callee_fn) =
+                resolve_static_indirect_callee(module, function, &provenance, *callee)
+            && leading_sret(&callee_fn.attrs, &callee_fn.name).map_err(unsupported)?
+        {
+            return Err(unsupported(format!(
+                "[TCG-SRET-ABI] an indirect call in `{name}` resolves statically to `{}`, \
+                 whose declaration passes a hidden return-buffer (sret) pointer as argument \
+                 0; this converter's composable indirect-call fragment admits only callees \
+                 returning one single-register scalar, so the edge is refused before \
+                 emission rather than lowered without the convention trust-cg's \
+                 `Function::sret_arg_indirect_callees` would carry for it",
+                callee_fn.name
+            )));
+        }
+    }
+    Ok((abi_sret_param, sret_arg_callees, sret_arg_indirect_callees))
+}
+
+/// Evidence — supplied by the CALLER of a lowering, never derived inside it —
+/// that every by-value aggregate crossing a call edge in the module was
+/// classified against an authority OUTSIDE trust-ir: one that knows the
+/// target's real parameter passing modes.
+///
+/// # Why a token, and why the caller must be the one to mint it
+///
+/// `StructPassingPolicy::Unclassified` is a producer saying "I performed no
+/// aggregate classification". A consumer that then classifies anyway has
+/// manufactured an ABI out of nothing, and the failure mode is not a bad
+/// diagnostic — it is a self-consistent object that disagrees with every
+/// LLVM-compiled neighbour. Nothing INSIDE this crate can repair that: the
+/// missing information (rustc's `PassMode` per argument and for the return) is
+/// simply not in the `trust_ir::Module`. So the only sound admission is an
+/// attestation from a caller that has the information and checked it.
+///
+/// The in-tree attester is `rustc_codegen_trust_cg`'s F1 frontend, which runs
+/// `validate_codegen_instance_abi_trust_ir` — a per-argument and per-return
+/// cross-check against rustc's `FnAbi`, refusing every `PassMode` outside its
+/// audited set — on the very instance it is about to lower, immediately before
+/// calling [`lower_module_to_lir_with_abi_cross_check`].
+///
+/// This token asserts NOTHING by itself and grants no proof authority: it
+/// records WHO claimed the cross-check, so a refusal trail and a reader can see
+/// which authority the admission rests on.
+///
+/// # What the token admits, and what it does not (trust-ir SPEC §17)
+///
+/// It admits a by-value aggregate edge ONLY in a module that declares
+/// `StructPassingPolicy::Unclassified` — the one policy under which a consumer
+/// places such a slot from an authority outside the module. Under `NativeC`
+/// the module claims the target's C placement, which rustc's `FnAbi` does not
+/// attest; under `AlwaysMemory` the module claims no such slot exists. Both
+/// are refused whatever the token says, and so is a recorded
+/// `ParamAttrs.pass` / `ParamAttrs.ext` / `FuncAttrs.ret` fact, which the token
+/// (minted outside the module) says nothing about.
+///
+/// The in-tree attester mints it from rustc's `FnAbi` for the lowered INSTANCE
+/// only, so it covers that function's own signature edge and no callee's.
+/// Under it the admission still scans every `CallIndirect`'s declared `sig`
+/// (`AggregateEdgeScan::IndirectEdgesOnly`): an indirect call is never spliced
+/// inline, and the real-call arm realizes an OPEN one as a `BLR` after checking
+/// only its arity and a scalar return, so an aggregate there is refused
+/// (`UnclassifiedAggregateAbi`). What the token path does NOT scan is a direct
+/// `Call`/`Invoke` callee edge. What keeps such an edge from becoming an
+/// unattested ABI boundary is the lowering, not the admission. A direct call is
+/// realized as a real `Bl` only for a callee in the single-register scalar
+/// fragment (`callee_is_real_call_composable`, re-checked at the arm). Every
+/// other direct call is spliced inline or refused, and `Invoke` is never
+/// lowered. `a_token_does_not_admit_a_realized_aggregate_call_edge`
+/// (`tests/module_to_lir_unclassified_aggregate_abi.rs`) pins both halves: the
+/// direct-call half through `Call`, the indirect half through a known-target
+/// and an open-target `CallIndirect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbiPassModeCrossCheck {
+    authority: Cow<'static, str>,
+    /// The CALLER-OWED INTEGER-EXTENSION facts of the cross-checked
+    /// function's own parameter slots (WS7.13). `None` = NOT RECORDED, which
+    /// every consumer treats as "no extension promise exists", never as a
+    /// wildcard.
+    param_extensions: Option<AbiParamExtensions>,
+}
+
+impl AbiPassModeCrossCheck {
+    /// Record that `authority` cross-checked this module's aggregate call edges
+    /// against the target's real pass modes.
+    #[must_use]
+    pub fn attested_by(authority: impl Into<Cow<'static, str>>) -> Self {
+        Self { authority: authority.into(), param_extensions: None }
+    }
+
+    /// Attach the caller-owed extension facts of the cross-checked function's
+    /// parameter slots (see [`AbiParamExtensions`]). Like the token itself,
+    /// this is an ATTESTATION the caller of a lowering makes from information
+    /// the `Module` does not carry (rustc's `ArgAttributes::arg_ext` per slot
+    /// and the target's small-argument rule); the gate CONSUMES it and grants
+    /// nothing on its own.
+    #[must_use]
+    pub fn with_param_extensions(mut self, extensions: AbiParamExtensions) -> Self {
+        self.param_extensions = Some(extensions);
+        self
+    }
+
+    /// The recorded authority, for diagnostics and provenance.
+    #[must_use]
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// The recorded parameter-extension facts, if the attester recorded any.
+    #[must_use]
+    pub fn param_extensions(&self) -> Option<&AbiParamExtensions> {
+        self.param_extensions.as_ref()
+    }
+}
+
+/// rustc's `ArgExtension` for ONE argument slot, mirrored so the bridge (which
+/// cannot see `rustc_target`) can carry it: does the CALLER owe the callee an
+/// extended value above the slot's declared width?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiArgExtension {
+    /// `ArgExtension::None` — the caller owes nothing above the declared
+    /// width, and the callee may read nothing above it.
+    None,
+    /// `ArgExtension::Zext` — the caller zero-extends the value across the
+    /// extension width the target ABI names (the `bool` contract on the Rust
+    /// ABI: `arg_attrs_for_rust_scalar`, "Booleans are always a noundef i1
+    /// that needs to be zero-extended").
+    Zext,
+    /// `ArgExtension::Sext` — the caller sign-extends.
+    Sext,
+}
+
+/// The caller-owed extension facts for a function's parameter slots, in
+/// signature order (WS7.13).
+///
+/// # Why the gate needs this, and why it must be RECORDED rather than inferred
+///
+/// A `bool` parameter arrives in a `W` register the CALLER wrote. rustc marks
+/// every bool slot `arg_ext: Zext`, and on a target whose ABI makes the caller
+/// perform that extension (Apple AArch64: "The caller of a function is
+/// responsible for signing or zero-extending any argument with fewer than 32
+/// bits") the callee may read the whole extended register and see exactly 0
+/// or 1. The proven-output gate models a bool parameter ONLY under that
+/// precondition (`W{k}[31:1] == 0`), and it can neither read `arg_ext` off a
+/// `trust_ir::Module` (the Module has no such field) nor decide what the target
+/// makes the caller owe. Both facts are therefore ATTESTED here by the caller
+/// of the lowering — in-tree, `rustc_codegen_trust_cg`'s F1 frontend, which has
+/// rustc's `FnAbi` and the session target in hand — and consumed by the gate as
+/// a named trust assumption on every caller (C callers included), spelled into
+/// the obligation's `ambient_pre` so it appears in the certificate's assumption
+/// list and not only in the evidence grade.
+///
+/// A missing entry, an extension other than `Zext`, or a target that makes no
+/// caller-side promise (`caller_extends_to_bits: None`, e.g. generic AAPCS64,
+/// where the callee may not assume the caller extended) leaves a bool
+/// parameter `Unknown` — the pre-WS7.13 fail-closed answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbiParamExtensions {
+    /// One entry per PARAMETER of the cross-checked function's signature (the
+    /// same count the ABI validator pins against rustc's `FnAbi.args`).
+    /// `None` = the slot's extension was NOT RECORDED (a non-`Direct` pass
+    /// mode has no single extension attribute); it is never read as
+    /// [`AbiArgExtension::None`].
+    pub per_param: Vec<Option<AbiArgExtension>>,
+    /// The width, in bits, to which the target ABI makes the CALLER extend a
+    /// `Zext`/`Sext` small argument — `Some(32)` on Apple AArch64. `None` means
+    /// the target makes no such promise and the callee owns the extension.
+    pub caller_extends_to_bits: Option<u32>,
+}
+
+impl AbiParamExtensions {
+    /// The extension recorded for parameter `index`, if any.
+    #[must_use]
+    pub fn extension_of(&self, index: usize) -> Option<AbiArgExtension> {
+        self.per_param.get(index).copied().flatten()
+    }
+}
+
+/// Does `ty` cross a call edge as a BY-VALUE AGGREGATE, for the purposes of the
+/// `struct_passing` admission?
+///
+/// This is the PRODUCER's predicate, held identical on purpose:
+/// `trust_thir_lower::stamp_target_info_if_vacuous`'s own
+/// `crosses_by_value_aggregate` allow-lists exactly these non-aggregates and
+/// treats everything else — *including any variant added to `Ty` later* — as an
+/// aggregate. Keeping one predicate on both sides means the consumer refuses
+/// exactly the set the producer declined to classify; an over-permissive copy
+/// here would admit precisely the modules the ruling exists to stop, so unknown
+/// must mean "aggregate".
+///
+/// It is a FAIL-CLOSED SUPERSET of the predicate trust-ir now states once
+/// (SPEC §17, `Module::is_by_value_aggregate_slot`: through one `Refine`, a
+/// `Struct`, `Tuple`, `Array`, `Enum`, `Record`, `Sequence`, `Set`, `Closure`
+/// or `Vector`). Every slot §17 calls an aggregate is non-scalar and so is
+/// refused here too; this copy also counts thin typed pointers, `FatPtr`,
+/// `Handle` and a refined scalar, which §17 places by non-aggregate rules —
+/// refusing more than the format requires, never less. Reading the format's
+/// predicate instead waits on the `first-party/trust-ir` gitlink reaching that
+/// ratification; the pinned revision predates it.
+fn crosses_by_value_aggregate(ty: &Ty) -> bool {
+    !matches!(
+        ty,
+        Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::I128
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::U128
+            | Ty::Isize
+            | Ty::Usize
+            | Ty::Char
+            | Ty::F16
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Ptr
+            | Ty::Unit
+            | Ty::Never
+    )
+}
+
+/// The module function a `CallIndirect`'s callee operand names STATICALLY, or
+/// `None` when it cannot be resolved.
+///
+/// Two static shapes name a callee: trust-ir's own (`Const FnDef` through
+/// `Copy` / `ReifyFnPointer`, the adapter's source), and this converter's
+/// KNOWN-target shape (`GlobalAddr` of a module global whose NAME is the
+/// function symbol, exactly what the real-call arm's `global_addr_provenance`
+/// resolves through `function_by_name`). `resolve` is the coarse chain walk (it
+/// may resolve where the exact typed query would not), which is the safe
+/// direction for the refusals that use it.
+fn resolve_static_indirect_callee<'m>(
+    module: &'m Module,
+    function: &IrFunction,
+    provenance: &trust_ir::analysis::StaticFunctionPointerAnalysis<'_>,
+    callee: ValueId,
+) -> Option<&'m IrFunction> {
+    if let Some(target) = provenance.resolve(callee) {
+        return module.function_by_id(target);
+    }
+    let defining = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.body.iter())
+        .find(|node| node.results.contains(&callee))?;
+    let Inst::GlobalAddr { global } = &defining.inst else {
+        return None;
+    };
+    let global = module.globals.get(global.index() as usize)?;
+    module.function_by_name(&global.name)
+}
+
+/// REFUSE BY NAME a recorded slot ABI fact this converter does not read:
+/// `ParamAttrs.pass`, a non-`None` `ParamAttrs.ext`, or any `FuncAttrs.ret`
+/// fact. See [`ModuleLirError::RecordedAbiSlotFact`].
+///
+/// Reads the lowered function's own attributes (its callers' edge), every
+/// resolvable direct `Call`/`Invoke` callee's, and every `CallIndirect` callee
+/// that resolves statically ([`resolve_static_indirect_callee`]); a
+/// `CallIndirect` through an open pointer names only a `FuncTy`, which carries
+/// no attributes. Runs under every policy and with or without a pinned target.
+fn refuse_recorded_abi_slot_facts(
+    module: &Module,
+    function: &IrFunction,
+) -> Result<(), ModuleLirError> {
+    let refuse = |detail: String| ModuleLirError::RecordedAbiSlotFact {
+        name: function.name.clone(),
+        detail,
+    };
+    let check = |subject: &IrFunction, edge: &str| -> Result<(), ModuleLirError> {
+        let attrs = &subject.attrs;
+        for (index, param) in attrs.params.iter().enumerate() {
+            if let Some(mode) = &param.pass {
+                return Err(refuse(format!(
+                    "{edge} records `ParamAttrs.pass = {}` on parameter {index}",
+                    mode.token()
+                )));
+            }
+            if let Some(token) = param.ext.token() {
+                return Err(refuse(format!(
+                    "{edge} records `ParamAttrs.ext = {token}` on parameter {index}"
+                )));
+            }
+        }
+        if !attrs.ret.is_empty() {
+            return Err(refuse(format!(
+                "{edge} records a `FuncAttrs.ret` return-slot fact ({:?})",
+                attrs.ret
+            )));
+        }
+        Ok(())
+    };
+
+    check(function, "the function's own signature (the edge its callers use)")?;
+    let provenance = trust_ir::analysis::StaticFunctionPointerAnalysis::new(function);
+    for node in function.blocks.iter().flat_map(|block| block.body.iter()) {
+        match &node.inst {
+            Inst::Call { callee, .. } | Inst::Invoke { callee, .. } => {
+                if let Some(callee_fn) = module.function_by_id(*callee) {
+                    check(callee_fn, &format!("the call edge to `{}`", callee_fn.name))?;
+                }
+            }
+            Inst::CallIndirect { callee, .. } => {
+                if let Some(callee_fn) =
+                    resolve_static_indirect_callee(module, function, &provenance, *callee)
+                {
+                    check(
+                        callee_fn,
+                        &format!(
+                            "an indirect call edge that resolves statically to `{}`",
+                            callee_fn.name
+                        ),
+                    )?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Which call edges [`first_by_value_aggregate_edge`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateEdgeScan {
+    /// Every edge the lowering reads: the function's own signature, every
+    /// direct `Call`/`Invoke` callee's, and every `CallIndirect`'s declared
+    /// `sig`. The scan when no [`AbiPassModeCrossCheck`] places anything.
+    Every,
+    /// Only the edges an [`AbiPassModeCrossCheck`] leaves OPEN under
+    /// `Unclassified`: every `CallIndirect`'s declared `sig`.
+    ///
+    /// The token places the lowered instance's OWN signature edge and nothing
+    /// else. A direct `Call` edge carrying an aggregate is never realized — the
+    /// real-call arm emits a `Bl` only for a callee that passes
+    /// [`callee_is_real_call_composable`] (every parameter and the return a
+    /// single-register scalar), re-checked at the arm itself, and every other
+    /// direct call is spliced inline or refused (`Invoke` is never lowered).
+    /// A `CallIndirect` is NEVER spliced, and the real-call arm realizes an
+    /// OPEN one as a `BLR` after checking only its arity and a scalar return;
+    /// so an aggregate on its declared `sig` is a slot nobody placed, and it is
+    /// scanned exactly as without a token.
+    IndirectEdgesOnly,
+}
+
+/// The first call edge of `function` that carries a by-value aggregate
+/// ([`crosses_by_value_aggregate`]) or whose signature cannot be resolved, as
+/// the refusal's detail; `None` when no edge the scan reads carries one.
+///
+/// THE SCAN IS A FAIL-CLOSED SUPERSET of the edges the lowering realizes. It
+/// runs BEFORE the inline pre-pass, so a call the inliner would have spliced
+/// away still counts: an inlined edge is not an ABI boundary, but deciding that
+/// here would make the admission depend on a later pass's success, and the
+/// direction of the error would be "admitted something it should have refused".
+/// Under [`AggregateEdgeScan::Every`] it reads the function's own signature (its
+/// callers' edge), every direct `Call`/`Invoke` callee's declared signature, and
+/// every `CallIndirect`'s declared `sig`; under
+/// [`AggregateEdgeScan::IndirectEdgesOnly`] only the last. An edge whose
+/// signature cannot be RESOLVED is reported rather than skipped.
+fn first_by_value_aggregate_edge(
+    module: &Module,
+    function: &IrFunction,
+    scan: AggregateEdgeScan,
+) -> Option<String> {
+    let check_edge = |ty_id: trust_ir::value::FuncTyId, edge: &str| -> Option<String> {
+        let Some(ft) = module.func_types.get(ty_id.as_usize()) else {
+            return Some(format!(
+                "{edge} names func_type id {} which the module does not carry, so whether an \
+                 aggregate crosses it cannot be decided",
+                ty_id.as_usize()
+            ));
+        };
+        for (index, param) in ft.params.iter().enumerate() {
+            if crosses_by_value_aggregate(param) {
+                return Some(format!(
+                    "{edge} passes parameter {index} ({param:?}) BY VALUE, and that is an \
+                     aggregate crossing an ABI boundary"
+                ));
+            }
+        }
+        for (index, ret) in ft.returns.iter().enumerate() {
+            if crosses_by_value_aggregate(ret) {
+                return Some(format!(
+                    "{edge} returns result {index} ({ret:?}) BY VALUE, and that is an aggregate \
+                     crossing an ABI boundary"
+                ));
+            }
+        }
+        None
+    };
+
+    let direct_edges = scan == AggregateEdgeScan::Every;
+    if direct_edges
+        && let Some(detail) =
+            check_edge(function.ty, "the function's own signature (the edge its callers use)")
+    {
+        return Some(detail);
+    }
+    for node in function.blocks.iter().flat_map(|block| block.body.iter()) {
+        let found = match &node.inst {
+            Inst::Call { callee, .. } | Inst::Invoke { callee, .. } if direct_edges => {
+                match module.function_by_id(*callee) {
+                    Some(callee_fn) => {
+                        check_edge(callee_fn.ty, &format!("the call edge to `{}`", callee_fn.name))
+                    }
+                    None => Some(format!(
+                        "a call names callee id {} which is not in the module, so the edge's \
+                         signature cannot be read",
+                        callee.index()
+                    )),
+                }
+            }
+            Inst::CallIndirect { sig, .. } => {
+                check_edge(*sig, "an indirect call edge's declared signature").map(|detail| {
+                    if direct_edges {
+                        detail
+                    } else {
+                        format!(
+                            "{detail} — and the pass-mode cross-check attached to this lowering \
+                             places only the lowered function's OWN signature edge: an indirect \
+                             call edge is never spliced inline, so no authority placed this slot"
+                        )
+                    }
+                })
+            }
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// REFUSE BY NAME rather than guess: the `struct_passing` admission (trust-ir
+/// SPEC §17, ratified 2026-09-27).
+///
+/// ONE RULE: a by-value aggregate edge is admitted ONLY in a module declaring
+/// `StructPassingPolicy::Unclassified` AND lowered with an
+/// [`AbiPassModeCrossCheck`] — the one case where the placement comes from an
+/// authority outside the module (rustc's `FnAbi`, per the token's attester).
+/// The token places the lowered instance's OWN signature edge, so under it the
+/// scan narrows to [`AggregateEdgeScan::IndirectEdgesOnly`]: a direct callee
+/// edge with an aggregate is spliced inline or refused, never realized, while a
+/// `CallIndirect` edge is never spliced and stays refused. Every other pinned
+/// case refuses the first such edge by the policy's own variant:
+///
+/// * `Unclassified` without a token — and, with one, an aggregate on a
+///   `CallIndirect`'s declared `sig` — [`ModuleLirError::UnclassifiedAggregateAbi`];
+/// * `NativeC`, with or without a token —
+///   [`ModuleLirError::NativeCAggregateAbiUnsupported`] (this converter
+///   implements no native-C aggregate ruleset);
+/// * `AlwaysMemory`, with or without a token —
+///   [`ModuleLirError::AlwaysMemoryByValueAggregate`] (the module contradicts
+///   its own policy).
+///
+/// Before that, and under EVERY policy (a pinned target or none, a token or
+/// none), a recorded `ParamAttrs.pass` / `ParamAttrs.ext` / `FuncAttrs.ret`
+/// fact is refused ([`ModuleLirError::RecordedAbiSlotFact`]).
+///
+/// `target_info: None` is a module that pins no target and so states no
+/// policy; the aggregate half stays out of scope for it
+/// (`an_unpinned_target_is_out_of_this_gate_s_scope`), a residual trust-ir's
+/// §17 names. The exhaustive `match` below is deliberate: a policy variant
+/// added to trust-ir (the proposed `PreLowered`) fails to compile here until
+/// someone decides what it admits.
+fn admit_struct_passing_policy(
+    module: &Module,
+    function: &IrFunction,
+    cross_check: Option<&AbiPassModeCrossCheck>,
+) -> Result<(), ModuleLirError> {
+    refuse_recorded_abi_slot_facts(module, function)?;
+
+    let Some(target) = module.target_info.as_ref() else {
+        return Ok(());
+    };
+    let policy = target.struct_passing;
+    // The caller has the pass modes and says it checked them — for the lowered
+    // instance's own signature, which is all rustc's `FnAbi` for that instance
+    // covers. Recorded, not re-derived — there is nothing in the Module to
+    // re-derive it from — and honoured under `Unclassified` ONLY. It narrows the
+    // scan; it never ends it (an indirect call edge is not the instance's own).
+    let scan = if policy == trust_ir::StructPassingPolicy::Unclassified && cross_check.is_some() {
+        AggregateEdgeScan::IndirectEdgesOnly
+    } else {
+        AggregateEdgeScan::Every
+    };
+    let Some(detail) = first_by_value_aggregate_edge(module, function, scan) else {
+        return Ok(());
+    };
+    let name = function.name.clone();
+    Err(match policy {
+        trust_ir::StructPassingPolicy::Unclassified => {
+            ModuleLirError::UnclassifiedAggregateAbi { name, detail }
+        }
+        trust_ir::StructPassingPolicy::NativeC => {
+            ModuleLirError::NativeCAggregateAbiUnsupported { name, detail }
+        }
+        trust_ir::StructPassingPolicy::AlwaysMemory => {
+            ModuleLirError::AlwaysMemoryByValueAggregate { name, detail }
+        }
+    })
+}
+
+/// Whether a lowering refuses `Inst::Assert` (every codegen entry point) or
+/// lowers it to the bare trap (the test oracle only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssertAdmission {
+    /// Refuse the function: [`ModuleLirError::ImplicitPanicUnfaithful`].
+    Refuse,
+    /// Lower `Assert` to `Brif(cond, cont, trap)` — the pre-2026-09-30
+    /// behaviour, reachable only through
+    /// `lower_trust_ir_function_to_lir_trap_assert_oracle`.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+    TrapOracle,
+}
+
+/// TEST ORACLE — NOT A CODEGEN ENTRY POINT. Lowers `function` exactly as every
+/// other entry point does, EXCEPT that an `Inst::Assert` is lowered to the
+/// bare `Brif(cond, cont, trap)` that [`ModuleLirError::ImplicitPanicUnfaithful`]
+/// refuses everywhere else (`real_calls` selects the real-call arm, as
+/// [`lower_trust_ir_function_to_lir_real_calls`] does).
+///
+/// It exists so the trap lowering and the proven-output gate's `Assert`-reach
+/// model — both kept for plan §5 item P — stay under test while no codegen
+/// consumer may reach them. Its bytes are faithful to trust-ir (where a failed
+/// `Assert` IS a divergence) and unfaithful to Rust (no panic message, no hook,
+/// SIGTRAP), which is exactly why nothing that ships may call it: it is
+/// `#[doc(hidden)]`, compiled only for this crate's unit tests and under the
+/// non-default `test-hooks` feature (which the compiler never enables; the
+/// census tripwire `compiler_consumer::census::no_compiler_caller` checks the
+/// plugin's, `crates/`' and `targo-trust/`'s sources and manifests for it).
+///
+/// Every call also CROSS-CHECKS the shipping path on the same input, so each
+/// test that lowers through the oracle pins the shipping refusal too: when
+/// `function` carries an `Assert` of its own, the shipping lowering must refuse
+/// it as [`ModuleLirError::ImplicitPanicUnfaithful`]; and whenever the oracle
+/// lowers successfully, the shipping lowering must either succeed (no `Assert`
+/// even after inlining) or refuse by exactly that name — never fail some other
+/// way. A violation panics: this function exists only for tests.
+///
+/// # Errors
+///
+/// Every [`ModuleLirError`] the shipping entry points return, except
+/// [`ModuleLirError::ImplicitPanicUnfaithful`].
+///
+/// # Panics
+///
+/// When the shipping lowering disagrees with the oracle as described above.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn lower_trust_ir_function_to_lir_trap_assert_oracle(
+    module: &Module,
+    function: &IrFunction,
+    real_calls: bool,
+) -> Result<LirFunction, ModuleLirError> {
+    let oracle = lower_trust_ir_function_to_lir_impl(
+        module,
+        function,
+        real_calls,
+        None,
+        AssertAdmission::TrapOracle,
+    );
+    let shipping = lower_trust_ir_function_to_lir_impl(
+        module,
+        function,
+        real_calls,
+        None,
+        AssertAdmission::Refuse,
+    );
+    let refused_by_name = matches!(&shipping, Err(ModuleLirError::ImplicitPanicUnfaithful { .. }));
+    assert!(
+        !function_has_unfaithful_assert(function) || refused_by_name,
+        "trap oracle cross-check: `{}` carries an `Assert`, but the SHIPPING lowering did not \
+         refuse it as ImplicitPanicUnfaithful: {:?}",
+        function.name,
+        shipping.as_ref().map(|_| "Ok(..)").map_err(ModuleLirError::to_string),
+    );
+    if oracle.is_ok() {
+        assert!(
+            shipping.is_ok() || refused_by_name,
+            "trap oracle cross-check: `{}` lowers under the oracle, but the SHIPPING lowering \
+             failed for another reason: {:?}",
+            function.name,
+            shipping.as_ref().map(|_| "Ok(..)").map_err(ModuleLirError::to_string),
+        );
+    }
+    oracle
 }
 
 fn lower_trust_ir_function_to_lir_impl(
     module: &Module,
     function: &IrFunction,
     real_calls: bool,
+    cross_check: Option<&AbiPassModeCrossCheck>,
+    assert_admission: AssertAdmission,
 ) -> Result<LirFunction, ModuleLirError> {
     // PRE-PASS: inline admitted local pure leaf calls. Returns the original
     // function unchanged when it contains no inlinable call. When `real_calls` is
     // set, a call to a gate-composable local pure callee is DEFERRED (left in
     // place) so the body lowering below emits a REAL `Opcode::Call` for it; all
     // other calls still go through the inliner.
+    // Trust: affirmative producer gate, checked BEFORE the inline pre-pass so a
+    // Clean body is refused by name rather than by whatever shape it happens to
+    // have. See `ModuleLirError::CleanOriginBelowCodegenGate`.
+    if function.producer == Some(trust_ir::Producer::Clean) {
+        return Err(ModuleLirError::CleanOriginBelowCodegenGate {
+            name: function.name.clone(),
+            detail: "it is the function being lowered".to_string(),
+        });
+    }
+    // Trust (bridge-abi): the `struct_passing` admission. Checked BEFORE the
+    // inline pre-pass so an `Unclassified` module carrying an aggregate call
+    // edge is refused BY NAME, rather than reaching the size-rule classifiers
+    // below and being given a convention nobody declared. See
+    // `ModuleLirError::UnclassifiedAggregateAbi`.
+    admit_struct_passing_policy(module, function, cross_check)?;
+    // Trust (plan §5 fail-open item 1): an implicit panic has no faithful
+    // lowering here, so a body carrying an `Assert` is refused BY NAME before
+    // anything is lowered — first the function's own, then (after the inline
+    // pre-pass, which admits `Assert` in a spliced callee) one an inlined
+    // callee brought in. See `ModuleLirError::ImplicitPanicUnfaithful`.
+    let refuse_asserts = assert_admission == AssertAdmission::Refuse;
+    if let Some(site) = unfaithful_assert_site(function).filter(|_| refuse_asserts) {
+        return Err(ModuleLirError::ImplicitPanicUnfaithful {
+            name: function.name.clone(),
+            detail: format!(
+                "its own body carries an `Assert` (block {}, node {})",
+                site.block.index(),
+                site.index
+            ),
+        });
+    }
     let inlined = inline_local_pure_leaf_calls(module, function, real_calls)?;
     let function: &IrFunction = inlined.as_ref();
     let name = &function.name;
+    if refuse_asserts && function_has_unfaithful_assert(function) {
+        return Err(ModuleLirError::ImplicitPanicUnfaithful {
+            name: name.clone(),
+            detail: "a callee the inline pre-pass spliced into it carries an `Assert`".to_string(),
+        });
+    }
+
+    // The sret convention (own hidden-return parameter, direct sret callees,
+    // and the indirect scan's by-name refusal) is read from the declarations
+    // BEFORE any block is lowered: the real-call arm below refuses a
+    // non-composable indirect callee generically, and the ABI fact must be
+    // named ahead of that generic refusal, not lost behind it.
+    let (abi_sret_param, sret_arg_callees, sret_arg_indirect_callees) =
+        sret_convention(module, function, name)?;
 
     // --- Signature: resolve the FuncTy and map params + the single result. ---
     let func_ty = module.func_types.get(function.ty.as_usize()).ok_or_else(|| {
@@ -1680,15 +3038,12 @@ fn lower_trust_ir_function_to_lir_impl(
         Vec::with_capacity(func_ty.params.len());
     // Positional record of BY-VALUE PAIR struct formals (<=16 bytes, exactly
     // two plain-scalar fields).
-    let mut pair_struct_sig: Vec<Option<AggMemLayout>> =
-        Vec::with_capacity(func_ty.params.len());
+    let mut pair_struct_sig: Vec<Option<AggMemLayout>> = Vec::with_capacity(func_ty.params.len());
     // Positional record of BY-VALUE NEWTYPE struct formals (one plain-scalar
     // field riding Direct as the field scalar).
-    let mut newtype_struct_sig: Vec<Option<LirType>> =
-        Vec::with_capacity(func_ty.params.len());
+    let mut newtype_struct_sig: Vec<Option<LirType>> = Vec::with_capacity(func_ty.params.len());
     // Positional record of PAIR-ENUM formals ((tag, payload) register pairs).
-    let mut pair_enum_sig: Vec<Option<PairEnumView>> =
-        Vec::with_capacity(func_ty.params.len());
+    let mut pair_enum_sig: Vec<Option<PairEnumView>> = Vec::with_capacity(func_ty.params.len());
     for p in &func_ty.params {
         if matches!(p, Ty::Unit) {
             fat_param_sig.push(None);
@@ -1758,7 +3113,7 @@ fn lower_trust_ir_function_to_lir_impl(
                         Ty::Struct(sid) => module.structs.get(sid.as_usize()).is_some_and(|def| {
                             def.fields
                                 .iter()
-                                .all(|f| scalar_field_size_align(&f.ty, name).is_ok())
+                                .all(|f| scalar_field_size_align(&f.ty, module, name).is_ok())
                         }),
                         _ => false,
                     };
@@ -1790,14 +3145,11 @@ fn lower_trust_ir_function_to_lir_impl(
                     });
                 }
                 let field_tys_plain = match p {
-                    Ty::Struct(sid) => module
-                        .structs
-                        .get(sid.as_usize())
-                        .is_some_and(|def| {
-                            def.fields
-                                .iter()
-                                .all(|f| scalar_field_size_align(&f.ty, name).is_ok())
-                        }),
+                    Ty::Struct(sid) => module.structs.get(sid.as_usize()).is_some_and(|def| {
+                        def.fields
+                            .iter()
+                            .all(|f| scalar_field_size_align(&f.ty, module, name).is_ok())
+                    }),
                     _ => false,
                 };
                 if !field_tys_plain {
@@ -1986,11 +3338,7 @@ fn lower_trust_ir_function_to_lir_impl(
             }
             entry_pair_structs.insert(
                 *param_id,
-                PairStructParam {
-                    by_decl_index: by_decl,
-                    tys,
-                    layout_order: [order[0], order[1]],
-                },
+                PairStructParam { by_decl_index: by_decl, tys, layout_order: [order[0], order[1]] },
             );
             continue;
         }
@@ -2081,10 +3429,12 @@ fn lower_trust_ir_function_to_lir_impl(
     //
     // PASS 1.6 — CHECKED-ARITH TUPLE DECOMPOSITION (fail-closed). The BRIDGE's
     // `a + b` idiom builds the MIR `(value, overflowed)` pair as a 2-field SSA
-    // TUPLE (`undef (Int,Bool)` seed + two `InsertField`s), read back by
-    // `ExtractField`. This pre-pass PROVES the tuple can be decomposed into the
-    // two scalar SSA Values it carries (NO tuple-in-memory; the pinned
-    // interpreter lacks `Ty::Tuple` `byte_size`), returning the seed/insert/
+    // TUPLE, read back by `ExtractField`. Since BMC-LANE-1 (2026-11-06) the
+    // bridge builds it with one complete `make_aggregate (Int,Bool)`; the
+    // legacy spelling, an `undef (Int,Bool)` seed plus two `InsertField`s, is
+    // still decomposed. This pre-pass PROVES the tuple can be decomposed into the
+    // two scalar SSA Values it carries (NO tuple-in-memory: a checked pair
+    // stored to memory fails closed), returning the seed/insert/
     // extract bookkeeping the body lowering consumes. Run BEFORE the scalar
     // Undef analysis so its admitted `Tuple` seeds are excluded from the scalar
     // memory-merge scan. Fail-closes on any non-decomposable aggregate.
@@ -2092,19 +3442,29 @@ fn lower_trust_ir_function_to_lir_impl(
 
     // PASS 1.7 — AGGREGATE-IN-MEMORY DECOMPOSITION (fail-closed). The BRIDGE
     // promotes a multi-block-written aggregate local to a WHOLE-aggregate stack
-    // slot and round-trips a 2-field scalar `Ty::Tuple` through it as a unit
-    // (`Alloca(Tuple)` + `Store(Tuple)` + `Load(Tuple)`, fields built/read by
-    // `InsertField`/`ExtractField`). This pre-pass PROVES the aggregate decomposes
-    // into per-field scalars laid out at the C-style field offsets
-    // (`aggregate_mem_layout`, byte-for-byte the trust-ir interpreter's
-    // `aggregate_layout`), returning the slot-layout + seed/insert/store/load/
-    // extract bookkeeping the body lowering consumes. Run AFTER the checked-arith
-    // tuple analysis so its admitted pure-SSA pairs are excluded, and BEFORE the
-    // scalar Undef analysis so the aggregate `Undef`/`Const` seeds are excluded
-    // from the scalar memory-merge scan. Fail-closes on any aggregate it cannot
-    // lay out 1:1.
-    let agg_mem =
-        analyze_aggregate_memory(module, &order, &blocks_by_id, &tuple_decompose, &ptr_params, name)?;
+    // slot and round-trips it through that slot as a unit (`Alloca` + `Store` +
+    // `Load` at the aggregate type, fields built/read by `InsertField`/
+    // `ExtractField`). This pre-pass admits a slot whose pointee is a `Ty::Tuple`,
+    // or a `repr(Rust)` `Ty::Struct`, of scalar fields, laid out at the
+    // interpreter's own layout of that type (`aggregate_mem_layout`,
+    // CG-DECLARED-LAYOUT-1: a declared `StructDef` size/align/offset triple or
+    // `Module::tuple_layouts` descriptor read and re-validated, declaration order
+    // only for a type that declares none), and used only as the pointer of a
+    // whole-aggregate Store/Load at the slot's own type (step 1b). It returns the
+    // slot-layout + seed/insert/store/load/extract bookkeeping the body lowering
+    // consumes. Run AFTER the
+    // checked-arith tuple analysis so its admitted pure-SSA pairs are excluded,
+    // and BEFORE the scalar Undef analysis so the aggregate `Undef`/`Const` seeds
+    // are excluded from the scalar memory-merge scan. Fail-closes on any aggregate
+    // it cannot decompose that way.
+    let agg_mem = analyze_aggregate_memory(
+        module,
+        &order,
+        &blocks_by_id,
+        &tuple_decompose,
+        &ptr_params,
+        name,
+    )?;
 
     // `admitted_undef_seeds` is the set of `Undef` result ValueIds we have
     // PROVEN to be exactly this dead-seed shape. Only those may be lowered (to a
@@ -2169,6 +3529,14 @@ fn lower_trust_ir_function_to_lir_impl(
     // here, and the block is a single `Trap` (a synchronous abort, mirroring the
     // VF -> LIR panic-block convention — the trap-iff-overflow semantics of MIR's
     // overflow assert without fabricating a normal return path).
+    //
+    // Trust (plan §5 fail-open item 1): UNREACHABLE from every codegen entry
+    // point while `ModuleLirError::ImplicitPanicUnfaithful` stands — the prologue
+    // refuses any body (own or inlined) that carries an `Assert`, because a bare
+    // trap is not Rust's panic. Only the test oracle
+    // (`lower_trust_ir_function_to_lir_trap_assert_oracle`) reaches it. Kept, not
+    // deleted, so item P (a faithful panic lowering) can replace the `Trap` with a
+    // call to the panic entry point and lift the refusal in one place.
     let mut trap_block: Option<Block> = None;
     // Assert-split continuation blocks (params-free) accumulate here, like the
     // edge-split trampolines, and are appended after the real blocks.
@@ -2192,7 +3560,12 @@ fn lower_trust_ir_function_to_lir_impl(
         let mut is_first_segment = true;
 
         for node in body {
-            if let Inst::Assert { cond } = &node.inst {
+            // Trust (trust-ir v52/v54): the trap carries no panic message, so
+            // the check's kind is not lowered (as for every assert before
+            // v52). A SITED assert (v54) names the entry its failure calls;
+            // a trap is not that call, so it is not taken here and falls to
+            // `lower_inst`, which refuses it by name.
+            if let Inst::Assert { cond, kind: _, site: None } = &node.inst {
                 // The assert condition is `ok` (== !overflowed): branch to the
                 // continuation when true, to the shared trap block when false.
                 let cond_v = vmap.resolve(*cond, name)?;
@@ -2243,14 +3616,8 @@ fn lower_trust_ir_function_to_lir_impl(
                             continue;
                         }
                         if let Some((tag, pay)) = pair_enum_values.get(pid) {
-                            let tag_ty = value_types
-                                .get(tag)
-                                .cloned()
-                                .unwrap_or(LirType::I64);
-                            let pay_ty = value_types
-                                .get(pay)
-                                .cloned()
-                                .unwrap_or(LirType::I64);
+                            let tag_ty = value_types.get(tag).cloned().unwrap_or(LirType::I64);
+                            let pay_ty = value_types.get(pay).cloned().unwrap_or(LirType::I64);
                             out.push((*tag, tag_ty));
                             out.push((*pay, pay_ty));
                             continue;
@@ -2319,6 +3686,7 @@ fn lower_trust_ir_function_to_lir_impl(
         lower_terminator(
             terminator,
             &vmap,
+            &value_types,
             &pair_enum_values,
             &blocks_by_id,
             &mut seg,
@@ -2415,11 +3783,36 @@ fn lower_trust_ir_function_to_lir_impl(
         // trust-cg's LirFunction carries the libm callees ISel may treat as
         // pure; the bridge asserts no libm purity, and empty is that claim.
         libm_pure_callees: Default::default(),
+        // Read from trust-ir `ParamAttrs::sret` (see `sret_convention`), never
+        // defaulted: trust-ir carries the marker (its validator requires the
+        // leading pointer parameter and the empty return list), and an absent
+        // marker on an indirect-return function is a wrong ABI, not a
+        // conservative one.
+        abi_sret_param,
+        sret_arg_callees,
+        // trust-cg de95c72d6 (L01-P5): the indirect half of the sret convention,
+        // keyed by the LIR callee value. Computed by the same scan, never
+        // defaulted — see `sret_convention` for why it is provably empty for
+        // everything this converter emits and how the impossible case refuses.
+        sret_arg_indirect_callees,
         debug_meta: Default::default(),
         debug_value_bindings: vec![],
         stack_protector: Default::default(),
         param_pointee_types: Vec::new(),
         eh_info: Default::default(),
+        // No landing pad is lowered (`eh_info` is empty), so no catch type index exists and
+        // the empty typed-catch table is exact.
+        eh_type_table: Default::default(),
+        // trust-cg U10: a prologue stack-limit check is requested by the
+        // producer's reserved function tags and acknowledged positively, never
+        // inferred from a tag (`docs/u10-prologue-stack-limit.md` §1). This
+        // converter decodes no such tag, so it requests none.
+        stack_limit: None,
+        // trust-cg L03-P9: the target features a function may assume, as an
+        // adapter ADMITTED them against its target vocabulary. This converter
+        // admits none (it never read trust-ir `FuncAttrs.target_features`), so
+        // ISel keeps the profile's baseline instructions, as before the field.
+        target_features: Vec::new(),
     })
 }
 
@@ -2614,6 +4007,20 @@ fn inline_local_pure_leaf_calls_one_pass(
             continue;
         };
 
+        // Trust: a `Producer::Clean` callee is NEVER spliced into a Rust
+        // caller's object, and the refusal names the reason instead of leaving
+        // the call for the converter's shape-blind `UnsupportedInst { Call }`.
+        // (IR-5 re-points Rust->Clean call edges at the appended Clean row, so
+        // without this check a pure-leaf Clean body — a `projection` or
+        // `select` row at tier `structural`, carrier faithfulness NOT
+        // established — would inline straight into machine code.)
+        if callee_fn.producer == Some(trust_ir::Producer::Clean) {
+            return Err(ModuleLirError::CleanOriginBelowCodegenGate {
+                name: callee_fn.name.clone(),
+                detail: format!("it is a callee of `{name}` and would have been inlined"),
+            });
+        }
+
         // RECURSIVE FLATTEN. A local NON-LEAF callee (its body itself calls)
         // fails the splices' leaf check as-is — but if its own calls inline
         // away, the flattened copy is a legitimate leaf and the ordinary
@@ -2736,7 +4143,10 @@ fn inst_block_targets(inst: &Inst) -> Vec<BlockId> {
             v.push(*default);
             v
         }
-        Inst::Invoke { normal_dest, unwind_dest, .. } => vec![*normal_dest, *unwind_dest],
+        Inst::Invoke { normal_dest, unwind_dest, .. }
+        | Inst::AssertInvoke { normal_dest, unwind_dest, .. }
+        | Inst::DropInvoke { normal_dest, unwind_dest, .. }
+        | Inst::InvokeIndirect { normal_dest, unwind_dest, .. } => vec![*normal_dest, *unwind_dest],
         _ => vec![],
     }
 }
@@ -2923,17 +4333,22 @@ fn try_inline_call(
 //   * SINGLE-RESULT  — the call binds exactly one result value.
 //   * ARITY          — one call arg per callee ENTRY-block param.
 //   * PURE + LEAF    — EVERY instruction in EVERY callee block is in the
-//                      converter-supported, side-effect-free set:
-//                        value ops {Const, BinOp, Overflow, ICmp, Cast, Copy,
-//                                   Select, Undef, InsertField, ExtractField},
-//                        proof obligations {Assert, Assume} (a failed assert is
-//                          a DIVERGENCE/trap, not an observable side effect),
+//                      converter-supported, side-effect-free set
+//                      (`is_multiblock_inlinable_value` is the authority):
+//                        value ops {Const, BinOp, UnOp, Overflow, ICmp, Cast,
+//                                   Copy, Select, Undef, InsertField,
+//                                   MakeAggregate, ExtractField},
+//                        proof obligations {Assume, Assert without a site} (a
+//                          failed assert is a DIVERGENCE/trap, not an
+//                          observable side effect),
+//                        the read-only slice lane {PtrData, PtrMetadata, GEP,
+//                          Load} (no write: see the predicate's note),
 //                        terminators {Br, CondBr, Switch, Return, Unreachable}.
-//                      Anything else — a nested Call/CallIndirect/Invoke, ANY
-//                      memory op (Load/Store/Alloca/GEP — would need slot
-//                      provenance threaded across the splice), atomics, borrow/
-//                      ARC, dealloc, frames, coroutine, EH, or dialect — makes
-//                      the callee inadmissible and FAILS CLOSED.
+//                      Anything else — a nested Call/CallIndirect/Invoke, a
+//                      memory write or allocation (Store/Alloca — would need
+//                      slot provenance threaded across the splice), atomics,
+//                      borrow/ARC, dealloc, frames, coroutine, EH, or dialect —
+//                      makes the callee inadmissible and FAILS CLOSED.
 //   * ROUTABLE RETURN — every `Return` in the callee returns exactly ONE value.
 //                      Multiple `Return`s are fine: they all `Br` to the SAME
 //                      single continuation block, which is the join carrying the
@@ -2966,12 +4381,14 @@ fn is_multiblock_inlinable_value(inst: &Inst) -> bool {
             | Inst::Select { .. }
             | Inst::Undef { .. }
             | Inst::InsertField { .. }
+            | Inst::MakeAggregate { .. }
             | Inst::ExtractField { .. }
             // Proof obligations: a failed Assert is a divergence (trap), not an
             // observable side effect; Assume is a pure constraint. Both are in
-            // the converter's supported set.
+            // the converter's supported set. A SITED assert (trust-ir v54) is
+            // not: its failure calls the site's entry.
             | Inst::Assume { .. }
-            | Inst::Assert { .. }
+            | Inst::Assert { site: None, .. }
             // The READ-ONLY slice lane: a slice-taking callee's body is
             // PtrData/PtrMetadata on its fat formal (which the splice rebinds
             // to the CALLER's fat formal), GEP off the data root, and element
@@ -3033,11 +4450,25 @@ fn remap_multiblock_inst(
             field: *field,
             value: resolve(*value)?,
         },
+        Inst::MakeAggregate { ty, variant, fields } => Inst::MakeAggregate {
+            ty: ty.clone(),
+            variant: *variant,
+            fields: fields.iter().map(|field| resolve(*field)).collect::<Result<_, _>>()?,
+        },
         Inst::ExtractField { ty, aggregate, field } => {
             Inst::ExtractField { ty: ty.clone(), aggregate: resolve(*aggregate)?, field: *field }
         }
         Inst::Assume { cond } => Inst::Assume { cond: resolve(*cond)? },
-        Inst::Assert { cond } => Inst::Assert { cond: resolve(*cond)? },
+        Inst::Assert { cond, kind, site: None } => {
+            // A kind's operands (trust-ir v52) are values of the callee too.
+            let mut kind = *kind;
+            if let Some(operands) = kind.operands_mut() {
+                for operand in operands {
+                    *operand = resolve(*operand)?;
+                }
+            }
+            Inst::Assert { cond: resolve(*cond)?, kind, site: None }
+        }
         // The read-only slice lane (see `is_multiblock_inlinable_value`).
         Inst::PtrData { ptr_ty, ptr } => {
             Inst::PtrData { ptr_ty: ptr_ty.clone(), ptr: resolve(*ptr)? }
@@ -3442,12 +4873,38 @@ fn inst_value_operands(inst: &Inst) -> Vec<ValueId> {
         Inst::InsertField { aggregate, value, .. } => vec![*aggregate, *value],
         Inst::ExtractElement { array, index, .. } => vec![*array, *index],
         Inst::InsertElement { array, index, value, .. } => vec![*array, *index, *value],
-        Inst::Assume { cond } | Inst::Assert { cond } => vec![*cond],
+        Inst::Assume { cond } => vec![*cond],
+        // An assert reads its kind's operands and a sited one its run-time
+        // location (trust-ir v52/v54); the invoke-family and no-unwind call
+        // twins (v53/v55/v56) read their callee, arguments and edge
+        // arguments. trust-ir's canonical exhaustive walk names each.
+        Inst::Assert { .. }
+        | Inst::AssertInvoke { .. }
+        | Inst::CallCannotUnwind { .. }
+        | Inst::CallIndirectCannotUnwind { .. }
+        | Inst::DropInvoke { .. }
+        | Inst::InvokeIndirect { .. } => {
+            let mut v = Vec::new();
+            inst.visit_value_operands(|operand| v.push(operand));
+            v
+        }
         Inst::Select { cond, then_val, else_val, .. } => vec![*cond, *then_val, *else_val],
         Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => vec![*ptr],
         Inst::EndBorrow { borrow_ptr } => vec![*borrow_ptr],
         Inst::Retain { ptr } | Inst::Release { ptr } | Inst::IsUnique { ptr } => vec![*ptr],
         Inst::Dealloc { ptr, .. } => vec![*ptr],
+        // Named explicitly, never left to the fall-through below: each reads
+        // registers, and an operand missing from this scan is a use the
+        // inliner's fresh-id numbering could collide with.
+        Inst::Drop { ptr, .. } => vec![*ptr],
+        Inst::MemCopy { dst, src, bytes, .. } => vec![*dst, *src, *bytes],
+        Inst::MemSet { dst, byte, bytes } => vec![*dst, *byte, *bytes],
+        Inst::MakeAggregate { fields, .. } => fields.clone(),
+        // Runtime captures are ordered SSA reads even though this converter
+        // refuses closure construction. Include them in fresh-id scans.
+        Inst::MakeClosure { captures, .. } => captures.clone(),
+        // One operand whatever the array length: the splat names its element once.
+        Inst::ArraySplat { value, .. } => vec![*value],
         // Variants with no `ValueId` operands (or whose operands are not in the
         // remappable scalar core) contribute nothing to the max scan.
         _ => vec![],
@@ -3531,6 +4988,12 @@ fn is_terminator(inst: &Inst) -> bool {
 /// Call is only ever emitted for a callee the gate can compose. This is the
 /// trust-ir mirror of `verify_output::derive_callee_pure`.
 fn callee_is_real_call_composable(module: &Module, callee: &IrFunction) -> bool {
+    // Trust: a `Producer::Clean` callee is never deferred to a real `Bl` edge
+    // either; it falls through to the inliner, which refuses it by name
+    // (`ModuleLirError::CleanOriginBelowCodegenGate`).
+    if callee.producer == Some(trust_ir::Producer::Clean) {
+        return false;
+    }
     let Some(func_ty) = module.func_types.get(callee.ty.as_usize()) else {
         return false;
     };
@@ -3655,17 +5118,22 @@ fn emit_field_addr(
 /// NOT an aggregate node (the caller falls through to the scalar/CFG machinery).
 ///
 /// Decomposes the whole-aggregate round trip into per-field scalar LIR at the
-/// C-style field offsets (`AggMemDecompose.agg_alloca_layout`, matching the
-/// trust-ir interpreter's `aggregate_layout`):
+/// field offsets of `AggMemDecompose.agg_alloca_layout` (the trust-ir
+/// interpreter's own layout of the slot's type, [`aggregate_mem_layout`]):
 ///   * `Alloca(Tuple)`   -> one sized stack slot; record its layout/field offsets.
 ///   * `Const::Aggregate`-> materialize each field constant as an `Iconst`; record
 ///                          the per-field LIR Values (NO whole-aggregate LIR).
 ///   * `Undef(Tuple)`    -> register an empty field map (fields filled by Insert).
+///   * `MakeAggregate`   -> record every field's LIR Value; NO LIR.
 ///   * `InsertField`     -> set field k's LIR Value (clone source map); NO LIR.
 ///   * `Store(Tuple)`    -> per-field Str at each field offset.
 ///   * `Load(Tuple)`     -> per-field Ldr at each field offset; record the loaded
 ///                          field Values as the result aggregate's fields.
 ///   * `ExtractField`    -> `Copy` of the resolved field's LIR Value.
+///   * field-pointer `GEP` -> `ArrayGep i8` off the slot by the field's layout
+///     offset (an `Iconst`), its pointee the field's LIR type, so the scalar
+///     `Load`/`Store` arms check the access width against the field
+///     (F1-FIELD-POINTER-AGREEMENT-1).
 #[allow(clippy::too_many_arguments)]
 fn lower_aggregate_inst(
     module: &Module,
@@ -3762,6 +5230,21 @@ fn lower_aggregate_inst(
             // resolved via the module).
             let n = aggregate_field_types(ty, module, name)?.len();
             agg_field_values.insert(result, vec![Value(u32::MAX); n]);
+            Ok(true)
+        }
+        // ---- MakeAggregate of a tracked aggregate -> every field (NO LIR). ----
+        Inst::MakeAggregate { fields: lanes, .. }
+            if result0.is_some_and(|r| agg_mem.agg_make_results.contains(&r)) =>
+        {
+            let result = result0.ok_or_else(|| ModuleLirError::UnsupportedAggregate {
+                name: name.to_string(),
+                detail: "tracked MakeAggregate has no result".into(),
+            })?;
+            let field_vals = lanes
+                .iter()
+                .map(|lane| vmap.resolve(*lane, name))
+                .collect::<Result<Vec<_>, _>>()?;
+            agg_field_values.insert(result, field_vals);
             Ok(true)
         }
         // ---- InsertField builds a tracked aggregate -> set one field (NO LIR). --
@@ -3967,6 +5450,48 @@ fn lower_aggregate_inst(
             });
             Ok(true)
         }
+        // ---- Admitted FIELD POINTER -> slot base + the field's layout offset. ----
+        // Step 1b proved this GEP's constant byte offset starts exactly field
+        // `k` of the slot's layout (the interpreter's own) and that the result is
+        // only ever the pointer of a non-volatile Load/Store at field `k`'s type.
+        // The address is materialized from the LAYOUT offset, the one the whole
+        // Store/Load arms address field `k` at, not from the trust-ir index value.
+        // The pointee is field `k`'s LIR type, so the scalar arms' width check
+        // runs against the field (the scalar GEP arm would record `I8`).
+        Inst::GEP { base, .. }
+            if result0.is_some_and(|r| agg_mem.agg_field_ptrs.contains_key(&r)) =>
+        {
+            let result = result0.expect("guarded");
+            let field = &agg_mem.agg_field_ptrs[&result];
+            let base_v = vmap.resolve(*base, name)?;
+            let slot =
+                *mem.slot_of.get(&base_v).ok_or_else(|| ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: format!(
+                        "field pointer {} has no allocated aggregate slot for its base {}",
+                        result.index(),
+                        base.index()
+                    ),
+                })?;
+            let offset = Value(*next_value);
+            *next_value += 1;
+            value_types.insert(offset, LirType::I64);
+            instructions.push(Instruction {
+                opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(field.offset) },
+                args: vec![],
+                results: vec![offset],
+            });
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, LirType::I64);
+            mem.slot_of.insert(dst, slot);
+            mem.pointee_ty.insert(dst, field.lir.clone());
+            instructions.push(Instruction {
+                opcode: Opcode::ArrayGep { elem_ty: LirType::I8 },
+                args: vec![base_v, offset],
+                results: vec![dst],
+            });
+            Ok(true)
+        }
         // Not an aggregate-slice node — fall through to the scalar machinery.
         _ => Ok(false),
     }
@@ -4028,6 +5553,7 @@ fn lower_value_inst(
     if let [result] = node.results.as_slice() {
         if tuple_decompose.admitted_tuple_seeds.contains(result)
             || tuple_decompose.insert_results.contains(result)
+            || tuple_decompose.make_results.contains(result)
         {
             return Ok(());
         }
@@ -4081,9 +5607,7 @@ fn lower_value_inst(
         // tag read at the def's canonical repr, so a mismatch is a producer/def
         // drift this converter must not paper over). This is the
         // `fn f(e: FieldlessEnum)` + `extractfield u8 %e, 0` + `switch` shape.
-        Inst::ExtractField { ty, aggregate, field }
-            if enum_tag_values.contains_key(aggregate) =>
-        {
+        Inst::ExtractField { ty, aggregate, field } if enum_tag_values.contains_key(aggregate) => {
             let result = expect_single_result(node, name)?;
             if *field != 0 {
                 return Err(ModuleLirError::UnsupportedAggregate {
@@ -4175,9 +5699,7 @@ fn lower_value_inst(
             return Ok(());
         }
         // ---- PAIR-ENUM extractfield: 0 = tag, 1 = payload — a Copy. ----
-        Inst::ExtractField { ty, aggregate, field }
-            if pair_enum_values.contains_key(aggregate) =>
-        {
+        Inst::ExtractField { ty, aggregate, field } if pair_enum_values.contains_key(aggregate) => {
             let result = expect_single_result(node, name)?;
             let (tag_v, pay_v) = pair_enum_values[aggregate];
             let src = match field {
@@ -4186,9 +5708,7 @@ fn lower_value_inst(
                 other => {
                     return Err(ModuleLirError::UnsupportedAggregate {
                         name: name.to_string(),
-                        detail: format!(
-                            "ExtractField field {other} on a (tag, payload) pair enum"
-                        ),
+                        detail: format!("ExtractField field {other} on a (tag, payload) pair enum"),
                     });
                 }
             };
@@ -4351,11 +5871,7 @@ fn lower_value_inst(
                 args: vec![addr],
                 results: vec![dst],
             });
-            if isp
-                .field_tys
-                .get(idx)
-                .is_some_and(|fty| enum_tag_read_view(module, fty).is_some())
-            {
+            if isp.field_tys.get(idx).is_some_and(|fty| enum_tag_read_view(module, fty).is_some()) {
                 enum_tag_values.insert(result, declared_lir);
             }
         }
@@ -5284,9 +6800,21 @@ fn lower_value_inst(
             // authentication that never happened. Tightening this is a separate,
             // deliberate change that must first establish the identity.
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: callee_fn.name.clone(), binding: DirectCallBinding::Interposable },
+                opcode: Opcode::Call {
+                    name: callee_fn.name.clone(),
+                    binding: DirectCallBinding::Interposable,
+                },
                 args: arg_vals,
                 results: vec![dst],
+            });
+        }
+        // Named, not left to the fall-through: neither uniform array registers
+        // nor runtime closure environments have a verified lowering here.
+        // Refuse construction even when the result is never consumed.
+        Inst::ArraySplat { .. } | Inst::MakeClosure { .. } => {
+            return Err(ModuleLirError::UnsupportedInst {
+                name: name.to_string(),
+                inst: inst_name(&node.inst),
             });
         }
         other => {
@@ -5369,6 +6897,7 @@ fn resolve_local_pointer(
 fn lower_terminator(
     term: &Inst,
     vmap: &ValueMap,
+    value_types: &HashMap<Value, LirType>,
     pair_enum_values: &HashMap<ValueId, (Value, Value)>,
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     instructions: &mut Vec<Instruction>,
@@ -5457,17 +6986,44 @@ fn lower_terminator(
         }
         Inst::Switch { value, default, default_args, cases, .. } => {
             let sel = vmap.resolve(*value, name)?;
-            let mut lir_cases = Vec::with_capacity(cases.len());
+            // The LIR case constant is a function of the SELECTOR'S WIDTH, not
+            // of the trust-ir constant alone: an 8/16-bit selector is compared
+            // zero-extended, so `i8 -3` must be encoded as 253, and a 32-bit
+            // selector wants its two's-complement value (see
+            // `mapping::encode_switch_case`). Passing the signed trust-ir value
+            // through verbatim made every NEGATIVE arm on a narrow selector —
+            // e.g. `match g { G::A => .. }` for `enum G { A = -3, B = 7 }`,
+            // whose tag is an i8 — unreachable, silently taking the default.
+            let sel_ty =
+                value_types.get(&sel).ok_or_else(|| ModuleLirError::UnencodableSwitchCase {
+                    name: name.to_string(),
+                    detail: format!(
+                        "selector value {} has no recorded LIR type, so its compare width \
+                         (and with it the case encoding) is unknown",
+                        sel.0
+                    ),
+                })?;
+            let mut raw_cases = Vec::with_capacity(cases.len());
             for case in cases {
-                let case_val = match &case.value {
-                    Constant::Int(v) => i128_to_i64(*v, name)?,
-                    Constant::Bool(b) => i64::from(*b),
+                raw_cases.push(match &case.value {
+                    Constant::Int(v) => *v,
+                    Constant::Bool(b) => i128::from(*b),
                     _ => {
                         return Err(ModuleLirError::UnsupportedSwitchCase {
                             name: name.to_string(),
                         });
                     }
-                };
+                });
+            }
+            let encoded_cases =
+                crate::mapping::encode_switch_cases(raw_cases, sel_ty).map_err(|e| {
+                    ModuleLirError::UnencodableSwitchCase {
+                        name: name.to_string(),
+                        detail: e.to_string(),
+                    }
+                })?;
+            let mut lir_cases = Vec::with_capacity(cases.len());
+            for (case, case_val) in cases.iter().zip(encoded_cases) {
                 let dest = conditional_edge_dest(
                     case.target,
                     &case.args,
@@ -5544,7 +7100,16 @@ fn conditional_edge_dest(
     // The target has params: build a trampoline that copies the edge args into
     // the target's param Values, then jumps to the real target.
     let mut tramp = Vec::new();
-    emit_edge_arg_copies(target, args, vmap, pair_enum_values, blocks_by_id, &mut tramp, next_value, name)?;
+    emit_edge_arg_copies(
+        target,
+        args,
+        vmap,
+        pair_enum_values,
+        blocks_by_id,
+        &mut tramp,
+        next_value,
+        name,
+    )?;
     tramp.push(Instruction {
         opcode: Opcode::Jump { dest: Block(target.index()) },
         args: vec![],
@@ -5722,34 +7287,43 @@ fn expect_single_result(
 // The BRIDGE's idiom for `a + b` (overflow checks on) builds the MIR
 // `(value, overflowed)` pair as a 2-field SSA TUPLE — DIFFERENT from the
 // producer's separate-SSA `Inst::Overflow -> [value, overflowed]` the prior
-// overflow slice handled. The real emitted shape (verified against
-// `trust_ir_bridge::lower_to_trust_ir` on the `CheckedBinaryOp` VF) is:
+// overflow slice handled. Since BMC-LANE-1 (2026-11-06) the emitted shape
+// (dumped from `trust_ir_bridge::lower_to_trust_ir` on the `CheckedBinaryOp` VF
+// and pinned by `bridge_checked_mul_packs_the_pair_with_one_make_aggregate` in
+// `tests/module_to_lir_checked_mul_proven_output.rs`) is:
 //
 //     %v, %o = add.overflow i32 %a, %b      ; Inst::Overflow  -> [value, flag]
+//     %t  = make_aggregate (i32,bool) [%v, %o] ; the complete pair (FULL tuple)
+//     ... extractfield bool %t, 1  -> the overflow flag (the assert reads this)
+//     ... extractfield i32  %t, 0  -> the value         (the result reads this)
+//
+// Before BMC-LANE-1 the bridge built the pair from a poison seed, and this pass
+// still decomposes that legacy spelling the same way:
+//
 //     %u  = undef (i32, bool)               ; TUPLE-typed Undef SEED
 //     %t0 = insertfield (i32,bool) %u, 0, %v   ; field 0 <- value
 //     %t  = insertfield (i32,bool) %t0, 1, %o  ; field 1 <- flag  (FULL tuple)
-//     ... extractfield bool %t, 1  -> the overflow flag (the assert reads this)
-//     ... extractfield i32  %t, 0  -> the value         (the result reads this)
 //
 // The tuple is a PURE SSA value — never stored to memory — so we DECOMPOSE it
 // into the two scalar SSA Values it carries (which already exist: the
 // `Inst::Overflow` results) WITHOUT ever materializing a `Ty::Tuple` in memory
-// (the pinned interpreter lacks `Ty::Tuple` `byte_size`, so tuple-in-memory is
-// out of scope and fails closed). The `Undef` seed and the `InsertField`s emit
-// NO LIR; each `ExtractField` becomes a `Copy` of the resolved field Value.
+// (a checked pair stored to memory is out of this slice and fails closed). The
+// constructor, or the `Undef` seed and its `InsertField`s, emit NO LIR; each
+// `ExtractField` becomes a `Copy` of the resolved field Value.
 //
 // SOUNDNESS (a wrong checked-arith mapping miscompiles): this is a MUST analysis
 // that admits a tuple ONLY when it can prove, for every tuple-typed SSA value:
-//   * its def-chain roots at a `Tuple([_, _])`-typed `Undef` SEED;
+//   * its def-chain roots at a `Tuple([_, _])`-typed `Undef` SEED, or it is a
+//     complete pair `MakeAggregate` whose two lanes are not tracked tuples;
 //   * every `InsertField` defines a DISTINCT in-range field exactly once (no
 //     double-write, no out-of-range field);
 //   * by the time ANY `ExtractField` reads field `k`, field `k` is DEFINED
-//     (the producer always builds field 0 then field 1 before either read, and
-//     trust_ir is SSA with defs-before-uses, so the straight-line def order
-//     witnesses this);
+//     (the constructor defines both fields at once; the legacy chain builds
+//     field 0 then field 1 before either read; and trust_ir is SSA with
+//     defs-before-uses, so the straight-line def order witnesses this);
 //   * NO tuple-typed value is consumed by anything but `InsertField`/
-//     `ExtractField` (no `Store`, `Return`, branch-arg, strict op, `Call`, ...).
+//     `ExtractField` (no `Store`, `Return`, branch-arg, strict op, `Call`,
+//     `MakeAggregate` lane, ...).
 // Any deviation FAILS CLOSED (`UnsupportedAggregate` / `UnsupportedUndef`), so a
 // tuple the converter cannot soundly decompose is never lowered.
 // ===========================================================================
@@ -5766,6 +7340,10 @@ struct TupleDecompose {
     /// `InsertField` result ValueIds that build an admitted tuple — these emit
     /// NO LIR; their effect is folded into the field map.
     insert_results: std::collections::HashSet<ValueId>,
+    /// `MakeAggregate` result ValueIds of a checked-arith pair, the complete
+    /// constructor the bridge emits for it — these emit NO LIR; both fields are
+    /// defined at the node.
+    make_results: std::collections::HashSet<ValueId>,
     /// For each `ExtractField` result ValueId, the scalar field `ValueId` it
     /// resolves to (the field that the read aggregate carries at that index).
     /// The `ExtractField` lowers to a `Copy` of this field's LIR Value.
@@ -5780,7 +7358,8 @@ struct TupleDecompose {
 /// `order` is the reachable block order; the analysis walks blocks (and the
 /// straight-line body within each) in that order. trust_ir SSA guarantees every
 /// value is defined before it is used and the producer emits the tuple build
-/// (seed + two `InsertField`s) strictly before any `ExtractField`, so a single
+/// (one `MakeAggregate`, or the legacy seed + two `InsertField`s) strictly
+/// before any `ExtractField`, so a single
 /// forward pass that propagates a per-tuple-value field map is a sound MUST
 /// witness: an `ExtractField` only resolves when the read field is already
 /// `Some`.
@@ -5795,10 +7374,25 @@ fn analyze_checked_arith_tuples(
     // A scalar Undef is left for `analyze_dead_undef_seeds`. Only a
     // `Tuple([scalar_int, Bool])`-typed Undef (the checked-arith pair) is a
     // candidate here; any other Tuple shape fails closed.
+    let is_checked_arith_pair = |elems: &[Ty]| {
+        elems.len() == 2
+            && matches!(elems[1], Ty::Bool)
+            && map_scalar_int_ty(&elems[0], "checked-arith value field").is_ok()
+    };
     let mut tuple_field_count: Map<ValueId, usize> = Map::new();
+    // The complete constructor of a checked-arith pair (`MakeAggregate` over the
+    // `Inst::Overflow` value and flag): both fields are defined where it is built.
+    let mut pair_makes: Set<ValueId> = Set::new();
     for &bid in order {
         let block = blocks_by_id[&bid];
         for node in &block.body {
+            if let Inst::MakeAggregate { ty: Ty::Tuple(elems), variant: None, fields } = &node.inst
+                && is_checked_arith_pair(elems)
+                && fields.len() == 2
+                && let [result] = node.results.as_slice()
+            {
+                pair_makes.insert(*result);
+            }
             if let Inst::Undef { ty: Ty::Tuple(elems) } = &node.inst {
                 let [result] = node.results.as_slice() else {
                     return Err(ModuleLirError::UnsupportedUndef {
@@ -5817,10 +7411,7 @@ fn analyze_checked_arith_tuples(
                 // default in `lower_value_inst` handles it. This keeps the two
                 // tuple slices disjoint: checked-arith owns `[Int, Bool]`,
                 // aggregate-memory owns the stored scalar tuple.
-                let is_checked_arith_pair = elems.len() == 2
-                    && matches!(elems[1], Ty::Bool)
-                    && map_scalar_int_ty(&elems[0], "checked-arith value field").is_ok();
-                if !is_checked_arith_pair {
+                if !is_checked_arith_pair(elems) {
                     continue;
                 }
                 tuple_field_count.insert(*result, elems.len());
@@ -5828,11 +7419,12 @@ fn analyze_checked_arith_tuples(
         }
     }
 
-    // Fast path: no Tuple Undef seed anywhere -> nothing to decompose.
-    if tuple_field_count.is_empty() {
+    // Fast path: no checked-arith pair anywhere -> nothing to decompose.
+    if tuple_field_count.is_empty() && pair_makes.is_empty() {
         return Ok(TupleDecompose {
             admitted_tuple_seeds: Set::new(),
             insert_results: Set::new(),
+            make_results: Set::new(),
             extract_field_src: Map::new(),
         });
     }
@@ -5859,6 +7451,7 @@ fn analyze_checked_arith_tuples(
     let mut built_seeds: Set<ValueId> = Set::new();
 
     let mut insert_results: Set<ValueId> = Set::new();
+    let mut make_results: Set<ValueId> = Set::new();
     let mut extract_field_src: Map<ValueId, ValueId> = Map::new();
 
     for &bid in order {
@@ -5867,6 +7460,25 @@ fn analyze_checked_arith_tuples(
             match &node.inst {
                 // The seed itself: already registered in `fields`. Nothing to do.
                 Inst::Undef { ty: Ty::Tuple(_) } => {}
+                // The complete constructor: every field is defined here. Its lanes
+                // are the scalar value and flag, never a tracked tuple.
+                Inst::MakeAggregate { fields: lanes, .. }
+                    if node.results.first().is_some_and(|r| pair_makes.contains(r)) =>
+                {
+                    let result = node.results[0];
+                    if lanes.iter().any(|lane| fields.contains_key(lane)) {
+                        return Err(ModuleLirError::UnsupportedAggregate {
+                            name: name.to_string(),
+                            detail: format!(
+                                "checked-arith pair {} is built from a tracked tuple value",
+                                result.index()
+                            ),
+                        });
+                    }
+                    fields.insert(result, lanes.iter().copied().map(Some).collect());
+                    root.insert(result, result);
+                    make_results.insert(result);
+                }
                 Inst::InsertField { ty, aggregate, field, value } => {
                     // Only InsertFields that build a TRACKED checked-arith tuple
                     // are folded. An InsertField whose aggregate is NOT a tracked
@@ -6016,7 +7628,7 @@ fn analyze_checked_arith_tuples(
     // (the decomposed scalar field Values carry the data).
     let admitted_tuple_seeds = built_seeds;
 
-    Ok(TupleDecompose { admitted_tuple_seeds, insert_results, extract_field_src })
+    Ok(TupleDecompose { admitted_tuple_seeds, insert_results, make_results, extract_field_src })
 }
 
 // ===========================================================================
@@ -6024,50 +7636,79 @@ fn analyze_checked_arith_tuples(
 //
 // The BRIDGE promotes a multi-block-written aggregate local to a whole-aggregate
 // stack slot (`trust_ir_bridge::lower::promote_local_to_memory` +
-// `ensure_local_storage`). The real emitted shape (verified against
-// `lower_to_trust_ir`) round-trips a 2-field scalar `Ty::Tuple` through ONE
-// stack slot AS A UNIT:
+// `ensure_local_storage`) and round-trips it through that ONE stack slot AS A
+// UNIT. Since BMC-LANE-1 (2026-11-06) the emitted shape for a 2-field scalar
+// `Ty::Tuple` (dumped from `lower_to_trust_ir` and pinned by
+// `bridge_promoted_tuple_local_is_stored_from_a_make_aggregate` in
+// `tests/module_to_lir_aggregate_mem_proven_output.rs`) is:
+//
+//     %slot = alloca (i32,i32)                        ; AGGREGATE stack slot
+//                                                     ;   (no initializing store)
+//     %t    = make_aggregate (i32,i32) [%a, %b]       ; a complete construction
+//     store (i32,i32) %t -> *%slot                    ; whole-aggregate store
+//     %ld   = load  (i32,i32) *%slot                  ; whole-aggregate load
+//     %f0   = extractfield i32 %ld, 0                  ; (the bridge loads the
+//     %f1   = extractfield i32 %ld, 1                  ;  slot again per read)
+//
+// The stored value may also be spelled as a seed under an `InsertField` chain,
+// and this pass admits that the same way: `undef (i32,i32)` (the bridge's
+// spelling of every construction before BMC-LANE-1; it now keeps the seed only
+// for a partial construction and a by-value FnOnce closure environment) or
+// `const (i32,i32) [0,0]`:
 //
 //     %base = const (i32,i32) [0,0]      ; or undef (i32,i32) seed
 //     %t0   = insertfield (i32,i32) %base, 0, %a
 //     %t    = insertfield (i32,i32) %t0,   1, %b      ; full SSA aggregate
-//     %slot = alloca (i32,i32)                        ; AGGREGATE stack slot
-//     store (i32,i32) %t -> *%slot                    ; whole-aggregate store
-//     %ld   = load  (i32,i32) *%slot                  ; whole-aggregate load
-//     %f0   = extractfield i32 %ld, 0
-//     %f1   = extractfield i32 %ld, 1
 //
 // We DECOMPOSE the aggregate into its per-field scalar SSA values and lower the
-// whole-aggregate Store/Load into PER-FIELD scalar Str/Ldr at the C-style field
-// OFFSETS within the slot (`aggregate_mem_layout`, byte-for-byte identical to
-// the trust-ir interpreter's `aggregate_layout`). The aggregate value never
-// materializes as a single machine register; field 0 lands at offset 0 and
-// field 1 at its aligned offset, exactly where the interpreter's
-// `encode_value`/`decode_value` place them, so the emitted bytes and the
-// reference interpreter agree.
+// whole-aggregate Store/Load into PER-FIELD scalar Str/Ldr at the field OFFSETS
+// of the trust-ir interpreter's own layout of the slot's type
+// (`aggregate_mem_layout`, CG-DECLARED-LAYOUT-1). The aggregate value never
+// materializes as a single machine register. For a struct with a declared
+// size/align/offset triple, or a tuple with a `Module::tuple_layouts`
+// descriptor, each field lands at its DECLARED offset (a reordered
+// `S { a@4, b@0 }` stores `b` at the slot's base); for a type that declares
+// none, at the declaration-order `aggregate_layout` offset. Either way that is
+// exactly where the interpreter's `encode_value`/`decode_value` place them, so
+// the slot image of the emitted bytes and of the reference interpreter agree.
 //
 // SOUNDNESS (a wrong aggregate lowering miscompiles): this is a MUST analysis
 // that admits an aggregate slot ONLY when it can prove, for the whole function:
-//   * the slot's `Alloca` pointee is a self-describing 2-field scalar `Ty::Tuple`
-//     whose C-layout `aggregate_mem_layout` reproduces 1:1;
-//   * EVERY `Store`/`Load` whose pointer is that slot is WHOLE-aggregate (the
-//     slot's tuple type) — a partial/scalar access into the aggregate slot, or a
-//     `GEP` re-derived address into it, fails closed (the GEP field-index idiom
-//     `idx * byte_size(field)` does NOT in general equal the C-style offset, so
-//     it is NOT admitted here);
+//   * the slot's `Alloca` pointee is a `Ty::Tuple`, or a `repr(Rust)`
+//     `Ty::Struct` the module resolves, of scalar fields, laid out by
+//     `aggregate_mem_layout` at the interpreter's own layout of that type (a
+//     declared layout is re-validated and a declaration the interpreter refuses
+//     is refused);
+//   * EVERY use of that slot is the pointer of a `Store`/`Load` at the slot's
+//     own WHOLE-aggregate type (step 1b, over trust-ir's exhaustive operand
+//     visitor) — a partial/scalar access into the aggregate slot, a `GEP`
+//     re-derived address into it (the GEP field-index idiom
+//     `idx * byte_size(field)` does NOT in general equal the C-style offset), and
+//     the slot escaping as any other operand all fail closed. This bullet was
+//     claimed before step 1b enforced it (BMC-LANE-1 hostile review #19). The
+//     one other admitted use is the base of a FIELD POINTER into a `Ty::Struct`
+//     slot (F1-FIELD-POINTER-AGREEMENT-1): `gep i8 %slot, %c` with `%c` a
+//     `const i64` equal to the start of exactly one field `k` in the slot's
+//     layout, whose result is used ONLY as the pointer of a non-volatile
+//     `Load`/`Store` at exactly field `k`'s type. Since the layout is the
+//     interpreter's own, both programs read and write exactly field `k`'s bytes;
+//     a tuple slot gets no field pointer (the producer emits none);
 //   * every stored aggregate VALUE decomposes to a per-field scalar map rooted at
 //     a `Const::Aggregate`/`Undef` base built by distinct single-write
-//     `InsertField`s, OR is itself a tracked aggregate `Load` result;
+//     `InsertField`s, OR is a complete `MakeAggregate` constructor of scalar
+//     lanes, OR is itself a tracked aggregate `Load` result;
 //   * every tracked aggregate value is consumed ONLY by `InsertField` (build),
 //     `Store` (into a slot), or `ExtractField` (read) — a tuple escaping to a
-//     return / branch-arg / strict op / `Call` fails closed.
+//     return / branch-arg / strict op / `Call`, or used as a `MakeAggregate`
+//     lane (a nested aggregate), fails closed.
 // Any deviation FAILS CLOSED (`UnsupportedAggregate`/`UnsupportedMemory`), so an
 // aggregate the converter cannot soundly decompose is never lowered.
 // ===========================================================================
 
 /// The bookkeeping the aggregate-memory lowering consumes.
 struct AggMemDecompose {
-    /// Aggregate `Alloca` result `ValueId` -> its C-style slot layout. The
+    /// Aggregate `Alloca` result `ValueId` -> its slot layout (the interpreter's
+    /// layout of the slot's type, [`aggregate_mem_layout`]). The
     /// lowering allocates ONE sized stack slot per entry.
     agg_alloca_layout: std::collections::HashMap<ValueId, AggMemLayout>,
     /// `Const::Aggregate` result `ValueId`s that seed a tracked aggregate — they
@@ -6080,6 +7721,9 @@ struct AggMemDecompose {
     /// `InsertField` result `ValueId`s that build a tracked aggregate — emit NO
     /// LIR; their effect is folded into the field map.
     agg_insert_results: std::collections::HashSet<ValueId>,
+    /// `MakeAggregate` result `ValueId`s, complete constructors of a tracked
+    /// aggregate — emit NO LIR; every field is defined at the node.
+    agg_make_results: std::collections::HashSet<ValueId>,
     /// Whole-aggregate `Store` node positions (by stored-value `ValueId`) we have
     /// proven are aggregate-slot stores — lowered to per-field Str.
     agg_store_values: std::collections::HashSet<ValueId>,
@@ -6094,6 +7738,123 @@ struct AggMemDecompose {
     /// through the incoming pointer at the C-layout field offsets. The layout
     /// is keyed by the LOAD RESULT because the root has no slot.
     agg_incoming_load_layout: std::collections::HashMap<ValueId, AggMemLayout>,
+    /// Admitted FIELD POINTERS (step 1b): `gep i8 %slot, <field start>` results
+    /// -> the field's layout offset and LIR type.
+    agg_field_ptrs: std::collections::HashMap<ValueId, AggFieldPtr>,
+}
+
+/// An admitted field pointer's lowering facts: where its field starts in the
+/// slot's layout, and the field's LIR type (the pointee its accesses are
+/// width-checked at).
+struct AggFieldPtr {
+    offset: u32,
+    lir: LirType,
+}
+
+/// One admitted field pointer into a `Ty::Struct` aggregate slot (step 1b).
+struct FieldPointer {
+    /// The aggregate slot's `Alloca` result.
+    slot: ValueId,
+    /// The field's declaration index.
+    index: usize,
+    /// The field's trust-ir type: each access through the pointer is at exactly
+    /// this type.
+    ty: Ty,
+    /// The field's offset in the slot's layout.
+    offset: u32,
+    /// The field's LIR type.
+    lir: LirType,
+}
+
+/// The `gep i8 %slot, %c` results that address exactly ONE field of a
+/// `Ty::Struct` aggregate slot (F1-FIELD-POINTER-AGREEMENT-1), the F1 producer's
+/// `lower_field_of_local_addr` spelling of `&s.f` / `s.f = v` on a promoted
+/// struct local.
+///
+/// A GEP qualifies only when ALL of these hold; any other GEP off a slot is left
+/// out, so step 1b refuses it as a slot misuse:
+/// * pointee `I8`, exactly one index, exactly one result;
+/// * the index is the result of a `const i64` (a reachable `Inst::Const` of
+///   type `Ty::I64` with an integer value `c`), and both it and the GEP result
+///   have exactly one reachable definition (the address is lowered from the
+///   layout offset, so the interpreter's runtime index must be `c`, and every
+///   use of the result must see this GEP);
+/// * the base is an admitted aggregate slot of type `Ty::Struct` (a `Ty::Tuple`
+///   slot gets none: the producer emits no tuple field pointer, so none is
+///   admitted);
+/// * exactly one field `k` of the slot's layout starts at `c`. The layout is the
+///   interpreter's own ([`aggregate_mem_layout`]): validated non-overlapping,
+///   in-bounds, naturally aligned scalar fields. So `c` in padding, inside a
+///   field, at or past the end, or negative starts no field and is refused.
+///
+/// Field `k`'s type and LIR type come from the `StructDef` and the layout; the
+/// walk in step 1b then requires every use of the result to be the pointer of
+/// a non-volatile Load/Store at exactly that type.
+fn aggregate_field_pointers(
+    module: &Module,
+    order: &[u32],
+    blocks_by_id: &HashMap<u32, &trust_ir::Block>,
+    agg_alloca_ty: &HashMap<ValueId, Ty>,
+    agg_alloca_layout: &HashMap<ValueId, AggMemLayout>,
+) -> HashMap<ValueId, FieldPointer> {
+    let mut const_i64: HashMap<ValueId, i128> = HashMap::new();
+    let mut definitions: HashMap<ValueId, usize> = HashMap::new();
+    for &bid in order {
+        let block = blocks_by_id[&bid];
+        for (param, _) in &block.params {
+            *definitions.entry(*param).or_default() += 1;
+        }
+        for node in &block.body {
+            for result in &node.results {
+                *definitions.entry(*result).or_default() += 1;
+            }
+            if let (Inst::Const { ty: Ty::I64, value: Constant::Int(c) }, [result]) =
+                (&node.inst, node.results.as_slice())
+            {
+                const_i64.insert(*result, *c);
+            }
+        }
+    }
+    let defined_once = |v: &ValueId| definitions.get(v) == Some(&1);
+    let mut pointers = HashMap::new();
+    for &bid in order {
+        for node in &blocks_by_id[&bid].body {
+            let Inst::GEP { pointee_ty: Ty::I8, base, indices, inbounds: _ } = &node.inst else {
+                continue;
+            };
+            let ([index], [result]) = (indices.as_slice(), node.results.as_slice()) else {
+                continue;
+            };
+            if !defined_once(index) || !defined_once(result) {
+                continue;
+            }
+            let (Some(Ty::Struct(sid)), Some(layout), Some(&c)) =
+                (agg_alloca_ty.get(base), agg_alloca_layout.get(base), const_i64.get(index))
+            else {
+                continue;
+            };
+            let Some(def) = module.struct_def(*sid) else { continue };
+            if def.fields.len() != layout.field_offsets.len() {
+                continue;
+            }
+            let mut starting =
+                layout.field_offsets.iter().enumerate().filter(|(_, (o, _))| i128::from(*o) == c);
+            let (Some((k, (offset, lir))), None) = (starting.next(), starting.next()) else {
+                continue;
+            };
+            pointers.insert(
+                *result,
+                FieldPointer {
+                    slot: *base,
+                    index: k,
+                    ty: def.fields[k].ty.clone(),
+                    offset: *offset,
+                    lir: lir.clone(),
+                },
+            );
+        }
+    }
+    pointers
 }
 
 impl AggMemDecompose {
@@ -6103,10 +7864,12 @@ impl AggMemDecompose {
             agg_const_seeds: std::collections::HashMap::new(),
             agg_undef_seeds: std::collections::HashSet::new(),
             agg_insert_results: std::collections::HashSet::new(),
+            agg_make_results: std::collections::HashSet::new(),
             agg_store_values: std::collections::HashSet::new(),
             agg_load_results: std::collections::HashSet::new(),
             agg_extract_field: std::collections::HashMap::new(),
             agg_incoming_load_layout: std::collections::HashMap::new(),
+            agg_field_ptrs: std::collections::HashMap::new(),
         }
     }
 
@@ -6135,14 +7898,16 @@ fn analyze_aggregate_memory(
 
     // ---- 1. Find aggregate Alloca slots (self-describing Ty::Tuple, or a
     // Ty::Struct whose StructDef the module resolves). A scalar Alloca is left to
-    // the scalar memory slice. Only an aggregate pointee enters here; its C-layout
-    // (from `aggregate_mem_layout`, resolving struct fields via the module) must
-    // reproduce the interpreter's 1:1 (fail closed otherwise). We record the slot's
-    // aggregate type so a Store/Load width can be checked against the WHOLE-
-    // aggregate type. The resolved field count (N, generalized from the initial
-    // 2-field slice) that Store/Load check against comes from the layout's
-    // `field_offsets.len()`.
+    // the scalar memory slice. Only an aggregate pointee enters here; its layout
+    // (`aggregate_mem_layout`, resolving struct fields via the module) is the
+    // interpreter's own layout of the type: a declared one read and re-validated,
+    // declaration order only when the type declares none (CG-DECLARED-LAYOUT-1).
+    // We record the slot's aggregate type so every access can be checked against
+    // the WHOLE-aggregate type (step 1b). The resolved field count (N, generalized
+    // from the initial 2-field slice) that Store/Load check against comes from the
+    // layout's `field_offsets.len()`.
     let mut agg_alloca_layout: Map<ValueId, AggMemLayout> = Map::new();
+    let mut agg_alloca_ty: Map<ValueId, Ty> = Map::new();
     for &bid in order {
         let block = blocks_by_id[&bid];
         for node in &block.body {
@@ -6165,6 +7930,119 @@ fn analyze_aggregate_memory(
                 };
                 let layout = aggregate_mem_layout(ty, module, name)?;
                 agg_alloca_layout.insert(*result, layout);
+                agg_alloca_ty.insert(*result, ty.clone());
+            }
+        }
+    }
+
+    // ---- 1b. An aggregate slot is used ONLY as the POINTER of a whole-aggregate
+    // `Store`/`Load` at the slot's own type. Trust (BMC-LANE-1 hostile review #19):
+    // the Store/Load arms below check only the accesses that ARE whole-aggregate;
+    // a scalar `Load`/`Store` through the slot, a `GEP` off it, or the slot as any
+    // other operand (a call argument, a returned pointer, a branch argument, a
+    // stored pointer value) used to fall through to the scalar memory slice. That
+    // slice resolves the slot through `slot_of` with no recorded pointee type, so
+    // its width check never fired and its `GEP` arm addresses the slot at
+    // `index * size_of(pointee)`: a valid module was miscompiled (a declared-layout
+    // `S { a@4, b@0 }` read field `a`'s bytes where the interpreter reads `b`'s).
+    // The per-field lowering is sound only for a slot that is written and read
+    // WHOLE at its own type, so every other use fails closed here. The walk is
+    // trust-ir's canonical exhaustive operand visitor, so an instruction added to
+    // trust-ir cannot slip past it.
+    //
+    // Trust (F1-FIELD-POINTER-AGREEMENT-1): the one partial access admitted is a
+    // FIELD POINTER, the F1 producer's `lower_field_of_local_addr` spelling of
+    // `&s.f` / `s.f = v` on a promoted struct local: `gep i8 %slot, %c` off a
+    // `Ty::Struct` slot with `%c` a `const i64` that starts exactly one field
+    // `k` of the slot's layout (`aggregate_field_pointers`). Since
+    // CG-DECLARED-LAYOUT-1 that layout is the interpreter's own, so `%slot + c`
+    // is field `k`'s address in both programs. Every use of such a pointer must
+    // then be the pointer of a non-volatile `Load`/`Store` at exactly field `k`'s
+    // type (the second walk below): both programs then read and write exactly
+    // field `k`'s bytes, which no other field shares, and the whole-aggregate
+    // Store/Load arms address field `k` at the same offset. Any other offset
+    // (padding, mid-field, past the end, non-constant), pointee, index count,
+    // base type or use is still refused: a field pointer whose offset is not the
+    // layout's would reproduce the p4 miscompile class.
+    let field_ptrs =
+        aggregate_field_pointers(module, order, blocks_by_id, &agg_alloca_ty, &agg_alloca_layout);
+    for &bid in order {
+        for node in &blocks_by_id[&bid].body {
+            let whole_access_ptr = match &node.inst {
+                Inst::Store { ty, ptr, value, .. }
+                    if value != ptr && agg_alloca_ty.get(ptr) == Some(ty) =>
+                {
+                    Some(*ptr)
+                }
+                Inst::Load { ty, ptr, .. } if agg_alloca_ty.get(ptr) == Some(ty) => Some(*ptr),
+                Inst::GEP { base, .. }
+                    if node.results.first().is_some_and(|r| field_ptrs.contains_key(r)) =>
+                {
+                    Some(*base)
+                }
+                _ => None,
+            };
+            let mut misuse = None;
+            node.inst.visit_value_operands(|operand| {
+                if misuse.is_none()
+                    && agg_alloca_ty.contains_key(&operand)
+                    && Some(operand) != whole_access_ptr
+                {
+                    misuse = Some(operand);
+                }
+            });
+            if let Some(slot) = misuse {
+                return Err(ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: format!(
+                        "aggregate slot {} is used by `{}` other than as the pointer of a \
+                         whole-aggregate Store/Load at the slot's own type",
+                        slot.index(),
+                        inst_name(&node.inst)
+                    ),
+                });
+            }
+            // A field pointer is used ONLY as the pointer of a non-volatile
+            // Load/Store at exactly its field's type: never stored, passed,
+            // returned, compared, cast, copied, re-derived or accessed at another
+            // type or width.
+            let field_access_ptr = match &node.inst {
+                Inst::Store { ty, ptr, value, volatile: false, .. }
+                    if value != ptr && field_ptrs.get(ptr).is_some_and(|f| &f.ty == ty) =>
+                {
+                    Some(*ptr)
+                }
+                Inst::Load { ty, ptr, volatile: false, .. }
+                    if field_ptrs.get(ptr).is_some_and(|f| &f.ty == ty) =>
+                {
+                    Some(*ptr)
+                }
+                _ => None,
+            };
+            let mut field_misuse = None;
+            node.inst.visit_value_operands(|operand| {
+                if field_misuse.is_none()
+                    && field_ptrs.contains_key(&operand)
+                    && Some(operand) != field_access_ptr
+                {
+                    field_misuse = Some(operand);
+                }
+            });
+            if let Some(pointer) = field_misuse {
+                let field = &field_ptrs[&pointer];
+                return Err(ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: format!(
+                        "field pointer {} (field {} of aggregate slot {}) is used by `{}` other \
+                         than as the pointer of a non-volatile Load/Store at the field's type \
+                         {:?}",
+                        pointer.index(),
+                        field.index,
+                        field.slot.index(),
+                        inst_name(&node.inst),
+                        field.ty
+                    ),
+                });
             }
         }
     }
@@ -6191,6 +8069,7 @@ fn analyze_aggregate_memory(
     let mut agg_const_seeds: Map<ValueId, Vec<Constant>> = Map::new();
     let mut agg_undef_seeds: Set<ValueId> = Set::new();
     let mut agg_insert_results: Set<ValueId> = Set::new();
+    let mut agg_make_results: Set<ValueId> = Set::new();
     let mut agg_store_values: Set<ValueId> = Set::new();
     let mut agg_load_results: Set<ValueId> = Set::new();
     let mut agg_extract_field: Map<ValueId, u32> = Map::new();
@@ -6231,7 +8110,7 @@ fn analyze_aggregate_memory(
                         });
                     }
                     for fty in &field_tys {
-                        scalar_field_size_align(fty, name)?;
+                        scalar_field_size_align(fty, module, name)?;
                     }
                     fields.insert(*result, vec![None; n]);
                     agg_const_seeds.insert(*result, consts.clone());
@@ -6250,10 +8129,53 @@ fn analyze_aggregate_memory(
                     };
                     let field_tys = aggregate_field_types(ty, module, name)?;
                     for fty in &field_tys {
-                        scalar_field_size_align(fty, name)?;
+                        scalar_field_size_align(fty, module, name)?;
                     }
                     fields.insert(*result, vec![None; field_tys.len()]);
                     agg_undef_seeds.insert(*result);
+                }
+                // ---- MakeAggregate: a complete constructor, every field defined.
+                Inst::MakeAggregate {
+                    ty: ty @ (Ty::Tuple(_) | Ty::Struct(_)),
+                    variant: None,
+                    fields: lanes,
+                } if node
+                    .results
+                    .first()
+                    .is_some_and(|r| !tuple_decompose.make_results.contains(r)) =>
+                {
+                    let [result] = node.results.as_slice() else {
+                        return Err(ModuleLirError::UnsupportedAggregate {
+                            name: name.to_string(),
+                            detail: "MakeAggregate must bind one result".to_string(),
+                        });
+                    };
+                    let field_tys = aggregate_field_types(ty, module, name)?;
+                    if lanes.len() != field_tys.len() {
+                        return Err(ModuleLirError::UnsupportedAggregate {
+                            name: name.to_string(),
+                            detail: format!(
+                                "MakeAggregate has {} lanes but type has {} fields",
+                                lanes.len(),
+                                field_tys.len()
+                            ),
+                        });
+                    }
+                    for fty in &field_tys {
+                        scalar_field_size_align(fty, module, name)?;
+                    }
+                    if let Some(lane) = lanes.iter().find(|lane| fields.contains_key(lane)) {
+                        return Err(ModuleLirError::UnsupportedAggregate {
+                            name: name.to_string(),
+                            detail: format!(
+                                "tracked aggregate value {} is a lane of MakeAggregate (a nested \
+                                 aggregate is out of the slice)",
+                                lane.index()
+                            ),
+                        });
+                    }
+                    fields.insert(*result, lanes.iter().copied().map(Some).collect());
+                    agg_make_results.insert(*result);
                 }
                 // ---- InsertField builds a tracked aggregate. ----
                 Inst::InsertField { ty, aggregate, field, value }
@@ -6482,10 +8404,15 @@ fn analyze_aggregate_memory(
         agg_const_seeds,
         agg_undef_seeds,
         agg_insert_results,
+        agg_make_results,
         agg_store_values,
         agg_load_results,
         agg_extract_field,
         agg_incoming_load_layout,
+        agg_field_ptrs: field_ptrs
+            .into_iter()
+            .map(|(pointer, field)| (pointer, AggFieldPtr { offset: field.offset, lir: field.lir }))
+            .collect(),
     })
 }
 
@@ -6847,6 +8774,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns,
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), name, FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -6906,6 +8834,7 @@ mod tests {
             params: vec![Ty::U64, Ty::U64],
             returns: vec![Ty::U64],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "umax", FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -6940,6 +8869,7 @@ mod tests {
             params: vec![Ty::U64, Ty::U64],
             returns: vec![Ty::I128],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "wide", FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -6979,6 +8909,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "void_fn", FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -6992,7 +8923,9 @@ mod tests {
                 rhs: ValueId::new(1),
             })
             .with_result(ValueId::new(2)),
-            InstrNode::new(Inst::Assert { cond: ValueId::new(2) }),
+            // (An `Assert { cond: %2 }` stood here until 2026-09-30; a body
+            // carrying one is now refused as an unfaithful implicit panic, and
+            // this test is about the bare `Return`, not the guard.)
             InstrNode::new(Inst::Return { values: vec![] }),
         ];
         f.blocks.push(block);
@@ -7072,6 +9005,222 @@ mod tests {
     }
 
     #[test]
+    fn newly_pinned_ir_ops_fail_closed_until_codegen_is_verified() {
+        for (op, diagnostic) in
+            [(BinOp::RotL, "rotl"), (BinOp::RotR, "rotr"), (BinOp::FCopySign, "fcopysign")]
+        {
+            assert_eq!(
+                map_int_binop(op, &Ty::I32, "new-binop"),
+                Err(ModuleLirError::UnsupportedBinOp {
+                    name: "new-binop".to_string(),
+                    op: diagnostic,
+                })
+            );
+        }
+        for (op, diagnostic) in [
+            (UnOp::CtLz, "ctlz"),
+            (UnOp::CtTz, "cttz"),
+            (UnOp::BSwap, "bswap"),
+            (UnOp::BitReverse, "bitreverse"),
+        ] {
+            assert_eq!(
+                map_int_unop(op, &Ty::I32, "new-unop"),
+                Err(ModuleLirError::UnsupportedUnOp {
+                    name: "new-unop".to_string(),
+                    op: diagnostic,
+                })
+            );
+        }
+        let id = ValueId::new(0);
+        assert_eq!(
+            inst_name(&Inst::MemCopy { dst: id, src: id, bytes: id, overlap: false }),
+            "MemCopy"
+        );
+        assert_eq!(inst_name(&Inst::MemSet { dst: id, byte: id, bytes: id }), "MemSet");
+        assert_eq!(inst_name(&Inst::Drop { ty: Ty::I32, ptr: id }), "Drop");
+        assert_eq!(inst_name(&Inst::ArraySplat { ty: Ty::I32, value: id }), "ArraySplat");
+    }
+
+    #[test]
+    fn runtime_closure_capture_scan_preserves_order_duplicates_and_maximum() {
+        // This scan also runs before validity/refusal decisions. An operand-only
+        // high id must reserve the numbering range even in malformed input.
+        let captures = vec![ValueId::new(7), ValueId::new(2), ValueId::new(7)];
+        let constructor = Inst::MakeClosure {
+            ty: trust_ir::value::ClosureTyId::new(0),
+            func: FuncId::new(0),
+            captures: captures.clone(),
+        };
+        assert_eq!(inst_value_operands(&constructor), captures);
+        let module = module_with_body(
+            "numbering",
+            vec![],
+            vec![
+                InstrNode::new(constructor).with_result(ValueId::new(3)),
+                InstrNode::new(Inst::Return { values: vec![] }),
+            ],
+        );
+        assert_eq!(max_value_id(&module.functions[0]), 7);
+    }
+
+    #[test]
+    fn runtime_closure_is_named_and_refused_even_when_unused() {
+        use trust_ir::interpret::{InterpretValue, Interpreter};
+
+        let mut module = module_with_body("runtime_closure", vec![Ty::I32], Vec::new());
+        let apparent = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I32],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("apparent closure signature");
+        let closure_ty = module
+            .add_closure_type(trust_ir::ClosureTy { func: apparent, captures: vec![Ty::I32; 2] })
+            .expect("ordered capture declaration");
+        let mut target =
+            IrFunction::new(FuncId::new(1), "closure_target", FuncTyId::new(0), BlockId::new(0));
+        let mut target_block = Block::new(BlockId::new(0));
+        target_block.params = vec![(ValueId::new(0), Ty::I32), (ValueId::new(1), Ty::I32)];
+        target_block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        target.blocks.push(target_block);
+        module.try_add_function(target).expect("physical capture-prefix target");
+        let captures = vec![ValueId::new(1), ValueId::new(0)];
+        let constructor =
+            Inst::MakeClosure { ty: closure_ty, func: FuncId::new(1), captures: captures.clone() };
+        assert_eq!(inst_name(&constructor), "MakeClosure");
+        assert_eq!(
+            inst_value_operands(&constructor),
+            captures,
+            "capture order is an SSA-read fact"
+        );
+        module.functions[0].blocks[0].body = vec![
+            InstrNode::new(constructor).with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }),
+        ];
+        let args = vec![
+            InterpretValue::int(Ty::I32, 4).unwrap(),
+            InterpretValue::int(Ty::I32, 7).unwrap(),
+        ];
+        let outcome = Interpreter::with_module(&module)
+            .execute_func(FuncId::new(0), args.clone())
+            .expect("reachable unused closure construction is valid executable IR");
+        assert_eq!(outcome.returns, vec![InterpretValue::int(Ty::I32, 7).unwrap()]);
+        assert_eq!(outcome.host_calls, 0);
+        let refusal = lower_module_to_lir(&module, FuncId::new(0))
+            .expect_err("unused runtime capture construction must not be dropped");
+        assert_eq!(
+            refusal,
+            ModuleLirError::UnsupportedInst {
+                name: "runtime_closure".to_string(),
+                inst: "MakeClosure",
+            }
+        );
+
+        module.functions[0].blocks[0].body.remove(0);
+        let scalar = Interpreter::with_module(&module)
+            .execute_func(FuncId::new(0), args)
+            .expect("scalar twin executes");
+        assert_eq!(scalar.returns, outcome.returns);
+        let lir =
+            lower_module_to_lir(&module, FuncId::new(0)).expect("scalar twin remains supported");
+        assert_eq!(lir.signature.returns, vec![LirType::I32]);
+        assert!(
+            lir.blocks
+                .values()
+                .flat_map(|block| &block.instructions)
+                .any(|inst| matches!(inst.opcode, Opcode::Return))
+        );
+    }
+
+    /// trust-ir v47's `Drop` runs a destructor and v50's `ArraySplat` builds an
+    /// array: neither is in this bridge's slice, and a destructor treated as a
+    /// no-op would model a different program. Both are refused by name.
+    #[test]
+    fn fail_closed_on_drop_and_array_splat() {
+        for want in ["Drop", "ArraySplat"] {
+            let mut module = module_with_body("new_inst", vec![Ty::I32], Vec::new());
+            let node = if want == "Drop" {
+                InstrNode::new(Inst::Drop { ty: Ty::I32, ptr: ValueId::new(0) })
+            } else {
+                let elem = module.add_type(Ty::I32).expect("Module::add_type: test fixture");
+                InstrNode::new(Inst::ArraySplat { ty: Ty::Array(elem, 4), value: ValueId::new(0) })
+                    .with_result(ValueId::new(2))
+            };
+            assert!(inst_value_operands(&node.inst).contains(&ValueId::new(0)));
+            module.functions[0].blocks[0].body =
+                vec![node, InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })];
+            let lowered = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&lowered, Err(ModuleLirError::UnsupportedInst { inst, .. }) if *inst == want),
+                "{want} must be refused by name, got {lowered:?}"
+            );
+        }
+    }
+
+    /// trust-ir v67-v69's tensor operations compute over a run-time-shaped
+    /// tensor value this bridge has no layout for: each is refused by name.
+    #[test]
+    fn fail_closed_on_tensor_ops() {
+        let tensor = Ty::Tensor(Box::new(Ty::I32), 1);
+        let v = ValueId::new(0);
+        let cases = [
+            (
+                "TensorContract",
+                Inst::TensorContract {
+                    ty: tensor.clone(),
+                    lhs: v,
+                    rhs: v,
+                    batch: Vec::new(),
+                    contract: vec![(0, 0)],
+                },
+            ),
+            ("TensorMap", Inst::TensorMap { ty: tensor.clone(), args: vec![v], body: Vec::new() }),
+            (
+                "TensorReduce",
+                Inst::TensorReduce {
+                    ty: tensor.clone(),
+                    src: v,
+                    op: trust_ir::TensorReduceOp::Add,
+                    axes: vec![0],
+                    order: trust_ir::TensorReduceOrder::RowMajor,
+                },
+            ),
+            (
+                "TensorView",
+                Inst::TensorView {
+                    ty: tensor.clone(),
+                    src: v,
+                    params: Vec::new(),
+                    exprs: Vec::new(),
+                    shape: vec![1],
+                    index: Vec::new(),
+                    fill: None,
+                },
+            ),
+            ("TensorGather", Inst::TensorGather { ty: tensor.clone(), data: v, coords: vec![v] }),
+            (
+                "TensorScatter",
+                Inst::TensorScatter { ty: tensor.clone(), init: v, src: v, coords: vec![v] },
+            ),
+        ];
+        for (want, inst) in cases {
+            assert_eq!(inst_name(&inst), want);
+            let mut module = module_with_body("tensor_inst", vec![Ty::I32], Vec::new());
+            module.functions[0].blocks[0].body = vec![
+                InstrNode::new(inst).with_result(ValueId::new(2)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }),
+            ];
+            let lowered = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&lowered, Err(ModuleLirError::UnsupportedInst { inst, .. }) if *inst == want),
+                "{want} must be refused by name, got {lowered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fail_closed_on_i128_division() {
         // i128 div/rem is libcall-routed in the AArch64 ISel (outside the
         // proven-bytes envelope), so it stays FAIL-CLOSED.
@@ -7145,10 +9294,22 @@ mod tests {
         }
     }
 
-    /// The MIR-faithful checked-add idiom: Overflow -> [res, ovf], a Select
-    /// negation, and a no-overflow Assert. Maps to CheckedSadd + Select + a
-    /// Brif-to-Trap block split, with all prior arithmetic preserved.
+    /// The checked-arithmetic idiom WITHOUT its guard: Overflow -> [res, ovf]
+    /// and the Select negation (`!overflowed`), returning the wrapped value.
+    /// This is what the `Overflow` lowering is measured on now that the
+    /// guarded MIR overflow shape — the same nodes plus `assert %6`, built by
+    /// [`checked_add_assert_body`] — is refused as an unfaithful implicit panic
+    /// (`ModuleLirError::ImplicitPanicUnfaithful`). Maps to CheckedSadd +
+    /// Select with all prior arithmetic preserved, and NO Brif/Trap.
     fn checked_add_idiom_body(op: OverflowOp, ty: Ty) -> Vec<InstrNode> {
+        let mut body = checked_add_assert_body(op, ty);
+        body.retain(|node| !matches!(node.inst, Inst::Assert { .. }));
+        body
+    }
+
+    /// The MIR-faithful GUARDED checked-arith idiom (debug overflow checks):
+    /// Overflow -> [res, ovf], a Select negation, and a no-overflow Assert.
+    fn checked_add_assert_body(op: OverflowOp, ty: Ty) -> Vec<InstrNode> {
         vec![
             // %2,%3 = <op>.overflow %0, %1
             InstrNode::new(Inst::Overflow { op, ty, lhs: ValueId::new(0), rhs: ValueId::new(1) })
@@ -7167,7 +9328,11 @@ mod tests {
             })
             .with_result(ValueId::new(6)),
             // assert %6
-            InstrNode::new(Inst::Assert { cond: ValueId::new(6) }),
+            InstrNode::new(Inst::Assert {
+                cond: ValueId::new(6),
+                kind: trust_ir::AssertKind::Unspecified,
+                site: None,
+            }),
             // return %2
             InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
         ]
@@ -7186,6 +9351,7 @@ mod tests {
                 params: vec![ty.clone(), ty.clone()],
                 returns: vec![ty.clone()],
                 is_vararg: false,
+                abi: None,
             });
             let mut f = IrFunction::new(FuncId::new(0), "cmul", FuncTyId::new(0), BlockId::new(0));
             let mut block = Block::new(BlockId::new(0));
@@ -7243,6 +9409,7 @@ mod tests {
                     params: vec![ty.clone(), ty.clone()],
                     returns: vec![ty.clone()],
                     is_vararg: false,
+                    abi: None,
                 });
                 let mut f =
                     IrFunction::new(FuncId::new(0), "cnarrow", FuncTyId::new(0), BlockId::new(0));
@@ -7285,8 +9452,9 @@ mod tests {
         );
         let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("checked-add idiom maps");
 
-        // The lowered LIR must carry exactly one CheckedSadd, one Select, one
-        // Brif (the assert), and one Trap (the shared trap block).
+        // The lowered LIR must carry exactly one CheckedSadd and one Select —
+        // and, with no `Assert` in the idiom, no Brif and no Trap: the shared
+        // trap block is never materialized for an unguarded body.
         let mut checked = 0;
         let mut select = 0;
         let mut brif = 0;
@@ -7304,8 +9472,8 @@ mod tests {
         }
         assert_eq!(checked, 1, "exactly one CheckedSadd");
         assert_eq!(select, 1, "exactly one Select (!overflowed)");
-        assert_eq!(brif, 1, "exactly one Brif (overflow assert)");
-        assert_eq!(trap, 1, "exactly one Trap (shared trap block)");
+        assert_eq!(brif, 0, "no Brif: nothing guards the unguarded idiom");
+        assert_eq!(trap, 0, "no Trap: an Assert-free body never reaches the trap block");
 
         // The CheckedSadd must bind two results [value, overflow_b1].
         let value_op = lir
@@ -7439,11 +9607,7 @@ mod tests {
             .filter(|i| matches!(i.opcode, Opcode::CheckedSadd))
             .collect();
         assert_eq!(checked.len(), 1, "exactly one CheckedSadd at I128");
-        assert_eq!(
-            checked[0].results.len(),
-            2,
-            "CheckedSadd binds [value_i128, overflow_b1]"
-        );
+        assert_eq!(checked[0].results.len(), 2, "CheckedSadd binds [value_i128, overflow_b1]");
     }
 
     #[test]
@@ -7567,6 +9731,7 @@ mod tests {
             params: vec![Ty::I128],
             returns: vec![Ty::I128],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "neg128", FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -7762,10 +9927,413 @@ mod tests {
     }
 
     #[test]
+    fn admits_make_aggregate_round_trip() {
+        // BMC-LANE-1: the bridge builds a complete aggregate with ONE
+        // `MakeAggregate`; the round trip decomposes exactly as the
+        // Const-seeded one above does: one sized slot, per-field Str and Ldr.
+        // The body returns `s.0 - s.1` (not commutative), and the test pins which
+        // value each per-field store writes and which load each operand of the
+        // subtraction reads, so a lowering that swapped or duplicated a lane fails.
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::Alloca { ty: tup.clone(), count: None, align: None })
+                .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::Store {
+                ty: tup.clone(),
+                ptr: ValueId::new(5),
+                value: ValueId::new(4),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Load {
+                ty: tup.clone(),
+                ptr: ValueId::new(5),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(6),
+                field: 0,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(6),
+                field: 1,
+            })
+            .with_result(ValueId::new(8)),
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Sub,
+                ty: Ty::I32,
+                lhs: ValueId::new(7),
+                rhs: ValueId::new(8),
+            })
+            .with_result(ValueId::new(9)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(9)] }),
+        ];
+        let module = module_with_body("agg_make", vec![Ty::I32], body);
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("a MakeAggregate-built scalar aggregate round trip must lower");
+        assert_eq!(lir.stack_slots.len(), 1);
+        assert_eq!(lir.stack_slots[0].size, 8);
+        let insts: Vec<&Instruction> = lir.blocks.values().flat_map(|b| &b.instructions).collect();
+        let stores: Vec<_> =
+            insts.iter().filter(|i| matches!(i.opcode, Opcode::Store { .. })).collect();
+        let loads: Vec<_> =
+            insts.iter().filter(|i| matches!(i.opcode, Opcode::Load { .. })).collect();
+        assert_eq!(stores.len(), 2, "two per-field stores");
+        assert_eq!(loads.len(), 2, "two per-field loads");
+        // Entry params are `Value(0..n)` positionally; the per-field stores run in
+        // offset order, so field 0 (offset 0) stores param 0 and field 1 param 1.
+        assert_eq!(
+            stores.iter().map(|store| store.args[0]).collect::<Vec<_>>(),
+            vec![Value(0), Value(1)],
+            "lane i of the constructor is stored to field i"
+        );
+        let sub = insts
+            .iter()
+            .find(|i| matches!(i.opcode, Opcode::Isub))
+            .expect("the subtraction lowers to one Isub");
+        // Each `ExtractField` lowers to a `Copy` of the field's loaded Value.
+        let through_copy = |value: Value| {
+            insts
+                .iter()
+                .find(|i| matches!(i.opcode, Opcode::Copy) && i.results == [value])
+                .map_or(value, |copy| copy.args[0])
+        };
+        assert_eq!(
+            sub.args.iter().map(|arg| through_copy(*arg)).collect::<Vec<_>>(),
+            vec![loads[0].results[0], loads[1].results[0]],
+            "`s.0 - s.1` reads field 0's load, then field 1's"
+        );
+    }
+
+    #[test]
+    fn fail_closed_on_make_aggregate_lane_count_mismatch() {
+        // A constructor naming more lanes than its type has fields is not this
+        // type's complete aggregate. The constructor is never stored, so only the
+        // MakeAggregate arm's own lane-count check can refuse it (the unrelated
+        // aggregate Alloca keeps the aggregate-memory analysis off its fast path).
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1), ValueId::new(0)],
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::Alloca { ty: tup, count: None, align: None })
+                .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(4),
+                field: 2,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(6)] }),
+        ];
+        let module = module_with_body("agg_make_long", vec![Ty::I32], body);
+        match lower_module_to_lir(&module, FuncId::new(0)) {
+            Err(ModuleLirError::UnsupportedAggregate { detail, .. }) => assert!(
+                detail.contains("lanes but type has"),
+                "refused by the lane-count check, not another arm: {detail}"
+            ),
+            other => panic!("a 3-lane constructor of a 2-field tuple must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_closed_on_a_make_aggregate_that_binds_two_results() {
+        // A constructor binds exactly one value. This one names two results, so
+        // PASS 1.6 (which claims a constructor only with one result) leaves it
+        // unclaimed, and PASS 1.7's MakeAggregate arm, which selects it by its
+        // first result, must refuse it rather than track result 4 and drop 5.
+        // The unrelated aggregate Alloca keeps PASS 1.7 off its fast path.
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_results([ValueId::new(4), ValueId::new(5)]),
+            InstrNode::new(Inst::Alloca { ty: tup, count: None, align: None })
+                .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }),
+        ];
+        let module = module_with_body("agg_make_two_results", vec![Ty::I32], body);
+        match lower_module_to_lir(&module, FuncId::new(0)) {
+            Err(ModuleLirError::UnsupportedAggregate { detail, .. }) => {
+                assert_eq!(detail, "MakeAggregate must bind one result")
+            }
+            other => panic!("a two-result constructor must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_closed_on_a_short_make_aggregate_stored_to_memory() {
+        // A constructor naming fewer lanes than its type has is not a complete
+        // aggregate; the slice refuses it rather than store an unset field.
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0)],
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::Alloca { ty: tup.clone(), count: None, align: None })
+                .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::Store {
+                ty: tup,
+                ptr: ValueId::new(5),
+                value: ValueId::new(4),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }),
+        ];
+        let module = module_with_body("agg_make_short", vec![Ty::I32], body);
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedAggregate { .. })
+        ));
+    }
+
+    /// `%in = make_aggregate (i32,i32) [p0, p1]`, then `%out` built with `%in`
+    /// as lane 0 (under the declared type `out_ty`), one `extractfield i32 %out,
+    /// 1` returned, and an unrelated `(i32,i32)` Alloca that keeps the
+    /// aggregate-memory analysis (PASS 1.7) off its fast path. `%in` is 4 and
+    /// `%out` is 5.
+    fn nested_make_aggregate_module(name: &str, out_ty: Ty) -> Module {
+        let pair = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: pair.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::MakeAggregate {
+                ty: out_ty,
+                variant: None,
+                fields: vec![ValueId::new(4), ValueId::new(0)],
+            })
+            .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::Alloca { ty: pair, count: None, align: None })
+                .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(5),
+                field: 1,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(7)] }),
+        ];
+        module_with_body(name, vec![Ty::I32], body)
+    }
+
+    #[test]
+    fn fail_closed_on_a_nested_make_aggregate_by_its_non_scalar_field_type() {
+        // A well-typed nested constructor: `%out = make_aggregate ((i32,i32),i32)
+        // [%in, p0]`. PASS 1.7's MakeAggregate arm checks every field TYPE before
+        // it looks at the lanes, and field 0 is a tuple, so the scalar-layout
+        // check refuses it. The arm's later "is a lane of MakeAggregate" check
+        // cannot fire on a well-typed constructor: every value PASS 1.7 tracks is
+        // aggregate-typed, so a tracked lane always sits in an aggregate-typed
+        // field, which this check has already refused. That later check is
+        // defence in depth for an ill-typed constructor (the next test).
+        let module = nested_make_aggregate_module(
+            "agg_make_nested",
+            Ty::Tuple(vec![Ty::Tuple(vec![Ty::I32, Ty::I32]), Ty::I32]),
+        );
+        match lower_module_to_lir(&module, FuncId::new(0)) {
+            Err(ModuleLirError::UnsupportedAggregate { detail, .. }) => assert_eq!(
+                detail,
+                "aggregate field type Tuple([I32, I32]) has no reproducible scalar C-layout in \
+                 the i8..i64/Bool aggregate-memory slice"
+            ),
+            other => panic!("a constructor with a tuple-typed field must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_closed_on_a_tracked_aggregate_as_a_make_aggregate_lane() {
+        // An ill-typed constructor: `%out = make_aggregate (i32,i32) [%in, p0]`
+        // declares two i32 fields but names the tracked aggregate `%in` as lane 0.
+        // The field types are scalar, so only the arm's lane check can refuse it;
+        // without that check the arm would record the aggregate `%in` as
+        // `%out`'s field-0 value.
+        let module =
+            nested_make_aggregate_module("agg_make_confused", Ty::Tuple(vec![Ty::I32, Ty::I32]));
+        match lower_module_to_lir(&module, FuncId::new(0)) {
+            Err(ModuleLirError::UnsupportedAggregate { detail, .. }) => assert_eq!(
+                detail,
+                "tracked aggregate value 4 is a lane of MakeAggregate (a nested aggregate is out \
+                 of the slice)"
+            ),
+            other => panic!("a tracked aggregate as a scalar lane must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admits_make_aggregate_struct_round_trip_at_mixed_field_offsets_and_widths() {
+        // A `Ty::Struct { a: u8, b: i32 }` built by ONE `MakeAggregate`, stored
+        // whole, loaded whole and read back field by field; the body returns
+        // `s.b - zext(s.a)`. The natural C layout puts `a` at offset 0 and `b` at
+        // offset 4 in an 8-byte, 4-aligned slot. The fields differ in width, so
+        // this pins which lane each per-field Store writes, at which offset and
+        // at which width: a lowering that swapped the two lanes would store the
+        // i32 parameter with a 1-byte Store at offset 0.
+        let sid = trust_ir::value::StructId::new(0);
+        let sty = Ty::Struct(sid);
+        let mut module = Module::new("t");
+        module.structs.push(trust_ir::StructDef {
+            id: sid,
+            name: "P".to_string(),
+            fields: vec![
+                trust_ir::ty::FieldDef { name: "a".to_string(), ty: Ty::U8, offset: None },
+                trust_ir::ty::FieldDef { name: "b".to_string(), ty: Ty::I32, offset: None },
+            ],
+            size: None,
+            align: None,
+            repr: trust_ir::ty::StructRepr::Rust,
+            origin: None,
+        });
+        module.func_types.push(FuncTy {
+            params: vec![Ty::U8, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+            abi: None,
+        });
+        let mut f =
+            IrFunction::new(FuncId::new(0), "agg_make_struct", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), Ty::U8));
+        b0.params.push((ValueId::new(1), Ty::I32));
+        b0.body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: sty.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Alloca { ty: sty.clone(), count: None, align: None })
+                .with_result(ValueId::new(3)),
+            InstrNode::new(Inst::Store {
+                ty: sty.clone(),
+                ptr: ValueId::new(3),
+                value: ValueId::new(2),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Load {
+                ty: sty,
+                ptr: ValueId::new(3),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::ExtractField { ty: Ty::U8, aggregate: ValueId::new(4), field: 0 })
+                .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(4),
+                field: 1,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::Cast {
+                op: CastOp::ZExt,
+                src_ty: Ty::U8,
+                dst_ty: Ty::I32,
+                operand: ValueId::new(5),
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Sub,
+                ty: Ty::I32,
+                lhs: ValueId::new(6),
+                rhs: ValueId::new(7),
+            })
+            .with_result(ValueId::new(8)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(8)] }),
+        ];
+        f.blocks.push(b0);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("a MakeAggregate-built {u8, i32} struct round trip must lower");
+        assert_eq!(lir.stack_slots.len(), 1, "one aggregate slot");
+        assert_eq!(lir.stack_slots[0].size, 8, "{{u8, i32}}: u8 @0, pad, i32 @4 -> 8 bytes");
+        assert_eq!(lir.stack_slots[0].align, 4, "{{u8, i32}} aligns to its i32 field");
+
+        let insts: Vec<&Instruction> = lir.blocks.values().flat_map(|b| &b.instructions).collect();
+        let def = |value: Value| {
+            insts
+                .iter()
+                .find(|i| i.results.contains(&value))
+                .unwrap_or_else(|| panic!("{value:?} has no defining instruction"))
+        };
+        // A field address is the slot's `StackAddr` (offset 0) or
+        // `ArrayGep<i8>(StackAddr, Iconst offset)`.
+        let offset_of = |addr: Value| -> i64 {
+            let addr_def = def(addr);
+            match &addr_def.opcode {
+                Opcode::StackAddr { .. } => 0,
+                Opcode::ArrayGep { elem_ty: LirType::I8 } => {
+                    assert!(
+                        matches!(def(addr_def.args[0]).opcode, Opcode::StackAddr { .. }),
+                        "the field address is based on the slot"
+                    );
+                    match &def(addr_def.args[1]).opcode {
+                        Opcode::Iconst { imm, .. } => *imm,
+                        other => panic!("field offset is not a constant: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected field address {other:?}"),
+            }
+        };
+        let stores: Vec<(Value, i64, LirType)> = insts
+            .iter()
+            .filter_map(|i| match &i.opcode {
+                Opcode::Store { ty, .. } => Some((i.args[0], offset_of(i.args[1]), ty.clone())),
+                _ => None,
+            })
+            .collect();
+        // Entry params are `Value(0)` (the u8) and `Value(1)` (the i32).
+        assert_eq!(
+            stores,
+            vec![(Value(0), 0, LirType::I8), (Value(1), 4, LirType::I32)],
+            "lane 0 (u8) is stored 1 byte wide at offset 0, lane 1 (i32) 4 bytes wide at offset 4"
+        );
+        let loads: Vec<(i64, LirType)> = insts
+            .iter()
+            .filter_map(|i| match &i.opcode {
+                Opcode::Load { ty, .. } => Some((offset_of(i.args[0]), ty.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            loads,
+            vec![(0, LirType::I8), (4, LirType::I32)],
+            "each field is loaded back at its own offset and width"
+        );
+    }
+
+    #[test]
     fn admits_3field_aggregate_alloca_layout() {
         // GENERALIZED (N-field slice): a 3-field scalar aggregate is now IN the
         // aggregate-memory slice. Its C-layout is reproduced 1:1 (three i32 fields
-        // -> size 12, align 4), byte-for-byte the interpreter's `aggregate_layout`.
+        // -> size 12, align 4), byte-for-byte the interpreter's `aggregate_layout`
+        // for this module, which declares no `tuple_layouts` descriptor.
         // A bare Alloca (no round-trip) lowers to one sized slot; the full 3-field
         // round-trip + proven-output lives in
         // `module_to_lir_struct_mem_proven_output.rs`.
@@ -7817,6 +10385,138 @@ mod tests {
         ));
     }
 
+    /// Trust: the `caller_calls_add_module` pair with the CALLEE's producer
+    /// chosen by the test — `TRust` is the control, `Clean` the subject. The
+    /// bodies are byte-identical, so any difference in outcome is the producer
+    /// gate and nothing else.
+    fn caller_calls_leaf_with_producer(producer: trust_ir::Producer) -> Module {
+        let mut module = Module::new("clean_gate");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+            abi: None,
+        });
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+            abi: None,
+        });
+        let mut add = IrFunction::new(FuncId::new(1), "add", FuncTyId::new(1), BlockId::new(0))
+            .with_producer(producer);
+        let x = ValueId::new(10);
+        let y = ValueId::new(11);
+        let s = ValueId::new(12);
+        let mut ab = Block::new(BlockId::new(0));
+        ab.params.push((x, Ty::I32));
+        ab.params.push((y, Ty::I32));
+        ab.body.push(
+            InstrNode::new(Inst::BinOp { op: BinOp::Add, ty: Ty::I32, lhs: x, rhs: y })
+                .with_result(s),
+        );
+        ab.body.push(InstrNode::new(Inst::Return { values: vec![s] }));
+        add.blocks.push(ab);
+
+        let mut caller =
+            IrFunction::new(FuncId::new(0), "caller", FuncTyId::new(0), BlockId::new(0))
+                .with_producer(trust_ir::Producer::TRust);
+        let a = ValueId::new(0);
+        let b = ValueId::new(1);
+        let called = ValueId::new(2);
+        let one = ValueId::new(3);
+        let out = ValueId::new(4);
+        let mut cb = Block::new(BlockId::new(0));
+        cb.params.push((a, Ty::I32));
+        cb.params.push((b, Ty::I32));
+        cb.body.push(
+            InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![a, b] })
+                .with_result(called),
+        );
+        cb.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) }).with_result(one),
+        );
+        cb.body.push(
+            InstrNode::new(Inst::BinOp { op: BinOp::Add, ty: Ty::I32, lhs: called, rhs: one })
+                .with_result(out),
+        );
+        cb.body.push(InstrNode::new(Inst::Return { values: vec![out] }));
+        caller.blocks.push(cb);
+        module.functions.push(caller);
+        module.functions.push(add);
+        module
+    }
+
+    /// Trust: a `Producer::Clean` body is refused by the producer gate BEFORE
+    /// any shape question is asked; the identical body under `TRust` lowers.
+    #[test]
+    fn clean_origin_leaf_is_refused_by_the_producer_gate() {
+        let subject = caller_calls_leaf_with_producer(trust_ir::Producer::Clean);
+        let err = lower_module_to_lir(&subject, FuncId::new(1))
+            .expect_err("a Clean-producer body must never lower to LIR");
+        match err {
+            ModuleLirError::CleanOriginBelowCodegenGate { name, detail } => {
+                assert_eq!(name, "add");
+                assert!(detail.contains("function being lowered"), "{detail}");
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+        let control = caller_calls_leaf_with_producer(trust_ir::Producer::TRust);
+        lower_module_to_lir(&control, FuncId::new(1)).expect("control: the TRust leaf lowers");
+    }
+
+    /// Trust: the inliner never splices a `Producer::Clean` callee into a Rust
+    /// caller's object. Control first: the TRust leaf IS inlined (no `Call`
+    /// survives), which is exactly the path the Clean subject is denied.
+    #[test]
+    fn clean_origin_callee_is_never_inlined_into_a_rust_caller() {
+        let control = caller_calls_leaf_with_producer(trust_ir::Producer::TRust);
+        let lir = lower_module_to_lir(&control, FuncId::new(0))
+            .expect("control: the TRust pure leaf inlines into the caller");
+        assert!(
+            lir.blocks
+                .values()
+                .flat_map(|b| b.instructions.iter())
+                .all(|i| !matches!(i.opcode, Opcode::Call { .. })),
+            "control must inline (no Call left)"
+        );
+
+        let subject = caller_calls_leaf_with_producer(trust_ir::Producer::Clean);
+        let err = lower_module_to_lir(&subject, FuncId::new(0))
+            .expect_err("a Rust caller reaching a Clean callee must refuse, not splice");
+        match err {
+            ModuleLirError::CleanOriginBelowCodegenGate { name, detail } => {
+                assert_eq!(name, "add");
+                assert!(detail.contains("callee of `caller`"), "{detail}");
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    /// Trust: the real-call lane refuses too — a Clean callee is neither
+    /// inlined nor deferred to a `Bl` edge the gate would then compose.
+    #[test]
+    fn clean_origin_callee_is_never_deferred_to_a_real_call() {
+        let control = caller_calls_leaf_with_producer(trust_ir::Producer::TRust);
+        let caller = control.function_by_id(FuncId::new(0)).expect("caller");
+        let lir = lower_trust_ir_function_to_lir_real_calls(&control, caller)
+            .expect("control: the TRust leaf is deferred to a real Call");
+        assert!(
+            lir.blocks
+                .values()
+                .flat_map(|b| b.instructions.iter())
+                .any(|i| matches!(i.opcode, Opcode::Call { .. })),
+            "control must carry a real Call edge"
+        );
+
+        let subject = caller_calls_leaf_with_producer(trust_ir::Producer::Clean);
+        let caller = subject.function_by_id(FuncId::new(0)).expect("caller");
+        assert!(matches!(
+            lower_trust_ir_function_to_lir_real_calls(&subject, caller),
+            Err(ModuleLirError::CleanOriginBelowCodegenGate { .. })
+        ));
+    }
+
     /// Build a 2-arg-i32 caller that calls a local pure leaf `add(x,y)=x+y` and
     /// then does `call_result + 1`. The caller is FuncId 0, the callee FuncId 1.
     fn caller_calls_add_module() -> Module {
@@ -7826,11 +10526,13 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         module.func_types.push(FuncTy {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
 
         // callee add(x,y) = x + y   (FuncId 1, single pure leaf block).
@@ -7900,6 +10602,203 @@ mod tests {
         assert!(iadds >= 2, "expected >= 2 Iadd (inlined add + caller +1), got {iadds}");
     }
 
+    // ── Plan §5 fail-open item 1: an implicit panic is refused BY NAME ──────
+
+    fn assert_implicit_panic_refusal(result: Result<LirFunction, ModuleLirError>, detail: &str) {
+        match result {
+            Err(e @ ModuleLirError::ImplicitPanicUnfaithful { .. }) => {
+                let ModuleLirError::ImplicitPanicUnfaithful { detail: got, .. } = &e else {
+                    unreachable!()
+                };
+                assert!(got.contains(detail), "detail `{got}` must name `{detail}`");
+                let text = e.to_string();
+                assert!(text.contains("[implicit-panic-unfaithful]"), "{text}");
+                assert!(text.contains("-Coverflow-checks=off"), "{text}");
+                assert_eq!(e.class_name(), "ImplicitPanicUnfaithful");
+            }
+            other => panic!("expected ImplicitPanicUnfaithful, got {other:?}"),
+        }
+    }
+
+    /// REGRESSION (R-8 audit finding 1): the guarded checked add — exactly the
+    /// shape the THIR producer emits for `a + b` under debug overflow checks —
+    /// used to lower to `Brif(ok, cont, trap)` + a shared `Trap` (a bare `brk`,
+    /// SIGTRAP, no panic message or hook). Every entry point refuses it now.
+    #[test]
+    fn guarded_checked_add_is_refused_as_an_unfaithful_implicit_panic() {
+        for ty in [Ty::I32, Ty::I64, Ty::U32] {
+            let mut module = module_with_body(
+                "cadd_guarded",
+                vec![ty.clone()],
+                checked_add_assert_body(OverflowOp::AddOverflow, ty.clone()),
+            );
+            module.func_types[0].params = vec![ty.clone(), ty.clone()];
+            module.functions[0].blocks[0].params =
+                vec![(ValueId::new(0), ty.clone()), (ValueId::new(1), ty.clone())];
+            let f = &module.functions[0];
+            let token = AbiPassModeCrossCheck::attested_by("test");
+            assert_implicit_panic_refusal(lower_module_to_lir(&module, FuncId::new(0)), "own body");
+            assert_implicit_panic_refusal(
+                lower_module_to_lir_with_abi_cross_check(&module, FuncId::new(0), &token),
+                "own body",
+            );
+            assert_implicit_panic_refusal(lower_trust_ir_function_to_lir(&module, f), "own body");
+            assert_implicit_panic_refusal(
+                lower_trust_ir_function_to_lir_real_calls(&module, f),
+                "own body",
+            );
+            assert_implicit_panic_refusal(
+                lower_trust_ir_function_to_lir_real_calls_with_abi_cross_check(&module, f, &token),
+                "own body",
+            );
+        }
+    }
+
+    /// NEGATIVE TWIN: the same nodes minus the `Assert` lower, and the LIR
+    /// carries no `Trap` at all — the refusal is about the guard, not about
+    /// the checked arithmetic around it.
+    #[test]
+    fn the_same_idiom_without_its_assert_lowers_with_no_trap() {
+        let guarded = checked_add_assert_body(OverflowOp::AddOverflow, Ty::I32);
+        let unguarded = checked_add_idiom_body(OverflowOp::AddOverflow, Ty::I32);
+        assert_eq!(unguarded.len() + 1, guarded.len(), "the twins differ by the Assert alone");
+        let module = module_with_body("cadd_unguarded", vec![Ty::I32], unguarded);
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("unguarded idiom lowers");
+        assert!(
+            !lir.blocks
+                .values()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(i.opcode, Opcode::Trap)),
+            "an Assert-free body must not carry a Trap"
+        );
+    }
+
+    /// REGRESSION: the inline pre-pass admits `Assert` in a spliced callee, so
+    /// a caller with no `Assert` of its own would have shipped the callee's
+    /// trap. It is refused after the splice.
+    #[test]
+    fn an_assert_reached_only_through_an_inlined_callee_is_refused() {
+        let mut module = caller_calls_add_module();
+        let add = module.functions.iter_mut().find(|f| f.name == "add").expect("callee");
+        let body = &mut add.blocks[0].body;
+        // add(x, y) = x + y, guarded: `%13 = icmp ne %12, %10 ; assert %13`
+        // (any bool condition: the refusal is syntactic).
+        body.insert(
+            1,
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Ne,
+                ty: Ty::I32,
+                lhs: ValueId::new(12),
+                rhs: ValueId::new(10),
+            })
+            .with_result(ValueId::new(13)),
+        );
+        body.insert(
+            2,
+            InstrNode::new(Inst::Assert {
+                cond: ValueId::new(13),
+                kind: trust_ir::AssertKind::Unspecified,
+                site: None,
+            }),
+        );
+        let caller = module.function_by_id(FuncId::new(0)).expect("caller");
+        assert!(!function_has_unfaithful_assert(caller), "the caller itself is Assert-free");
+        assert_implicit_panic_refusal(lower_module_to_lir(&module, FuncId::new(0)), "callee");
+        // ...and the callee, lowered on its own, is refused for its own body.
+        assert_implicit_panic_refusal(lower_module_to_lir(&module, FuncId::new(1)), "own body");
+    }
+
+    /// The predicate is syntactic: an `Assert` in a block no edge reaches is
+    /// still found, and still refused (fail-closed; reachability is not this
+    /// converter's to argue).
+    #[test]
+    fn an_assert_in_an_unreachable_block_is_still_refused() {
+        let mut module = module_with_body(
+            "dead_assert",
+            vec![Ty::I32],
+            vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })],
+        );
+        let mut dead = Block::new(BlockId::new(7));
+        dead.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                .with_result(ValueId::new(5)),
+        );
+        dead.body.push(InstrNode::new(Inst::Assert {
+            cond: ValueId::new(5),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: None,
+        }));
+        dead.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
+        module.functions[0].blocks.push(dead);
+        let site = unfaithful_assert_site(&module.functions[0]).expect("the dead Assert is found");
+        assert_eq!((site.block, site.index), (BlockId::new(7), 1));
+        assert_implicit_panic_refusal(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            "block 7, node 1",
+        );
+    }
+
+    /// Trust (trust-ir v54): an `AssertInvoke` is the same check as a sited `Assert` whose
+    /// failure enters an in-frame landing pad, so the syntactic unfaithful-panic predicate finds
+    /// it exactly as it finds an `Assert`.
+    #[test]
+    fn an_assert_invoke_is_an_unfaithful_assert_site() {
+        let mut module = module_with_body(
+            "assert_invoke",
+            vec![Ty::I32],
+            vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] })],
+        );
+        let mut checked = Block::new(BlockId::new(3));
+        checked.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
+                .with_result(ValueId::new(5)),
+        );
+        checked.body.push(InstrNode::new(Inst::AssertInvoke {
+            cond: ValueId::new(5),
+            kind: trust_ir::AssertKind::DivByZero,
+            site: trust_ir::PanicSite {
+                entry: FuncId::new(0),
+                location: trust_ir::PanicLocation::Value(ValueId::new(0)),
+            },
+            normal_dest: BlockId::new(0),
+            normal_args: vec![],
+            unwind_dest: BlockId::new(0),
+        }));
+        module.functions[0].blocks.push(checked);
+        let site = unfaithful_assert_site(&module.functions[0]).expect("the AssertInvoke is found");
+        assert_eq!((site.block, site.index), (BlockId::new(3), 1));
+    }
+
+    /// Trust (trust-ir v52/v54): the splicers admit a SITELESS assert, whatever its kind, and
+    /// never a sited one (its failure calls the site's entry, which a trap is not); a kind's
+    /// operands and a site's run-time location count as reads in the fresh-id scan.
+    #[test]
+    fn a_sited_assert_is_not_inlinable_and_its_operands_are_reads() {
+        let kinded = Inst::Assert {
+            cond: ValueId::new(1),
+            kind: trust_ir::AssertKind::BoundsCheck {
+                index: ValueId::new(2),
+                len: ValueId::new(3),
+            },
+            site: None,
+        };
+        assert!(is_multiblock_inlinable_value(&kinded));
+        assert_eq!(
+            inst_value_operands(&kinded),
+            vec![ValueId::new(1), ValueId::new(2), ValueId::new(3)]
+        );
+        let sited = Inst::Assert {
+            cond: ValueId::new(1),
+            kind: trust_ir::AssertKind::Unspecified,
+            site: Some(trust_ir::PanicSite {
+                entry: FuncId::new(0),
+                location: trust_ir::PanicLocation::Value(ValueId::new(4)),
+            }),
+        };
+        assert!(!is_multiblock_inlinable_value(&sited));
+        assert!(inst_value_operands(&sited).contains(&ValueId::new(4)));
+    }
+
     #[test]
     fn inliner_pre_pass_removes_the_call_node() {
         // White-box: the pre-pass output has zero Call insts in the caller body.
@@ -7923,6 +10822,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
 
         // A 4-block diamond callee: f(a,b) = if a <op> b { a } else { b }.
@@ -8068,6 +10968,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
 
         // leaf(x,y) = x + y  (FuncId 2).
@@ -8154,6 +11055,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         for (id, other, name) in [(0u32, 1u32, "f"), (1, 0, "g")] {
             let mut f = IrFunction::new(FuncId::new(id), name, FuncTyId::new(0), BlockId::new(0));
@@ -8214,11 +11116,13 @@ mod tests {
                 size: Some(16),
                 align: Some(8),
                 repr: Default::default(),
+                origin: None,
             });
             module.func_types.push(FuncTy {
                 params: vec![Ty::Ptr],
                 returns: vec![Ty::Usize],
                 is_vararg: false,
+                abi: None,
             });
             let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
             let mut b0 = Block::new(BlockId::new(0));
@@ -8258,11 +11162,8 @@ mod tests {
         let lir = lower_module_to_lir(&build(false), FuncId::new(0))
             .expect("incoming-root aggregate load must lower");
         let block = lir.blocks.get(&Block(0)).expect("entry");
-        let loads = block
-            .instructions
-            .iter()
-            .filter(|i| matches!(i.opcode, Opcode::Load { .. }))
-            .count();
+        let loads =
+            block.instructions.iter().filter(|i| matches!(i.opcode, Opcode::Load { .. })).count();
         assert_eq!(loads, 2, "one Ldr per scalar field");
         assert!(
             block.instructions.iter().any(|i| matches!(i.opcode, Opcode::Copy)),
@@ -8287,6 +11188,77 @@ mod tests {
         // Writing the aggregate back through the incoming pointer is refused:
         // the root is read-only and never a slot.
         assert!(lower_module_to_lir(&build(true), FuncId::new(0)).is_err());
+    }
+
+    /// Keep the unsupported aggregate-memory shape from the superseded DST
+    /// read-lane proposal refused. The landed bridge's `address_of_dst_field`
+    /// carries the incoming container length and advances its data address by
+    /// the declared field offset; it does not load the tail as a fat-pointer cell.
+    ///
+    /// This fixture instead loads a struct containing a `FatPtr(Slice)` field
+    /// through an incoming pointer. Interpreting an inline DST tail that way
+    /// would read its content bytes as a (ptr, len) pair and fabricate metadata.
+    /// `scalar_field_size_align` currently refuses fat fields in aggregate loads.
+    /// Supporting actual in-memory fat-pointer fields in the future must keep
+    /// them distinct from inline unsized tails; this test pins the present fence.
+    #[test]
+    fn incoming_ptr_aggregate_load_with_fat_field_is_refused() {
+        let agg_ty = Ty::Struct(trust_ir::value::StructId::new(0));
+        let mut module = Module::new("t");
+        module.types.push(Ty::U8);
+        let tail_ty = Ty::FatPtr(trust_ir::ty::FatPtrKind::Slice(trust_ir::value::TyId::new(0)));
+        module.structs.push(trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "OsSlice".to_string(),
+            fields: vec![trust_ir::ty::FieldDef {
+                name: "inner".to_string(),
+                ty: tail_ty.clone(),
+                offset: Some(0),
+            }],
+            size: Some(16),
+            align: Some(8),
+            repr: Default::default(),
+            origin: None,
+        });
+        // No fat RETURN (that is refused earlier, as `UnsupportedType { function
+        // return }`); the value is extracted and dropped so the refusal under test
+        // is the aggregate-memory slice's own.
+        module.func_types.push(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![],
+            is_vararg: false,
+            abi: None,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "tail", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), Ty::Ptr));
+        b0.body.push(
+            InstrNode::new(Inst::Load {
+                ty: agg_ty.clone(),
+                ptr: ValueId::new(0),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(1)),
+        );
+        b0.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: tail_ty.clone(),
+                aggregate: ValueId::new(1),
+                field: 0,
+            })
+            .with_result(ValueId::new(2)),
+        );
+        b0.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+        f.blocks.push(b0);
+        module.functions.push(f);
+
+        let err = lower_module_to_lir(&module, FuncId::new(0))
+            .expect_err("an incoming-root aggregate load with a FatPtr field must be refused");
+        assert!(
+            matches!(err, ModuleLirError::UnsupportedAggregate { .. }),
+            "the refusal must be the aggregate-memory slice's own, got {err:?}"
+        );
     }
 
     /// The PAIR-ENUM lane end to end, on the measured `Option<u64>` shape:
@@ -8333,6 +11305,7 @@ mod tests {
             params: vec![Ty::U64],
             returns: vec![ety.clone()],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "mk", FuncTyId::new(0), BlockId::new(0));
         let mut b0 = Block::new(BlockId::new(0));
@@ -8375,6 +11348,7 @@ mod tests {
             params: vec![ety.clone()],
             returns: vec![Ty::U64],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "take", FuncTyId::new(0), BlockId::new(0));
         let mut b0 = Block::new(BlockId::new(0));
@@ -8462,12 +11436,14 @@ mod tests {
             size: Some(16),
             align: Some(8),
             repr: Default::default(),
+            origin: None,
         });
         let sty = Ty::Struct(trust_ir::value::StructId::new(0));
         module.func_types.push(FuncTy {
             params: vec![sty.clone()],
             returns: vec![Ty::Usize],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
         let mut b0 = Block::new(BlockId::new(0));
@@ -8504,17 +11480,10 @@ mod tests {
 
         let lir = lower_module_to_lir(&module, FuncId::new(0))
             .expect("a 16-byte two-scalar struct formal must ride the register pair");
-        assert_eq!(
-            lir.signature.params,
-            vec![LirType::I64, LirType::I64],
-            "two register formals"
-        );
+        assert_eq!(lir.signature.params, vec![LirType::I64, LirType::I64], "two register formals");
         let block = lir.blocks.get(&Block(0)).expect("entry");
-        let copies: Vec<&Instruction> = block
-            .instructions
-            .iter()
-            .filter(|i| matches!(i.opcode, Opcode::Copy))
-            .collect();
+        let copies: Vec<&Instruction> =
+            block.instructions.iter().filter(|i| matches!(i.opcode, Opcode::Copy)).collect();
         assert_eq!(copies.len(), 2, "each field extract is a Copy of a formal");
         // Layout order put decl-field 1 ("end", offset 0) FIRST: the entry
         // block's params are [end, start], so decl-field 0's Copy must read
@@ -8564,12 +11533,14 @@ mod tests {
                 size: Some(size),
                 align: Some(8),
                 repr: Default::default(),
+                origin: None,
             });
             let sty = Ty::Struct(trust_ir::value::StructId::new(0));
             module.func_types.push(FuncTy {
                 params: vec![sty.clone()],
                 returns: vec![Ty::Usize],
                 is_vararg: false,
+                abi: None,
             });
             let mut f = IrFunction::new(FuncId::new(0), "k", FuncTyId::new(0), BlockId::new(0));
             let mut b0 = Block::new(BlockId::new(0));
@@ -8590,17 +11561,10 @@ mod tests {
 
         let lir = lower_module_to_lir(&build(24), FuncId::new(0))
             .expect("a >16-byte recorded struct formal must ride the hidden pointer");
-        assert_eq!(
-            lir.signature.params,
-            vec![LirType::I64],
-            "the formal is ONE hidden pointer"
-        );
+        assert_eq!(lir.signature.params, vec![LirType::I64], "the formal is ONE hidden pointer");
         let block = lir.blocks.get(&Block(0)).expect("entry");
         assert!(
-            block
-                .instructions
-                .iter()
-                .any(|i| matches!(i.opcode, Opcode::Iconst { imm: 8, .. })),
+            block.instructions.iter().any(|i| matches!(i.opcode, Opcode::Iconst { imm: 8, .. })),
             "field 1 loads at its recorded offset 8"
         );
         assert!(
@@ -8624,6 +11588,7 @@ mod tests {
             params: vec![Ty::Ptr],
             returns: vec![Ty::Usize],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
         let mut b0 = Block::new(BlockId::new(0));
@@ -8662,6 +11627,7 @@ mod tests {
                 params: vec![Ty::Unit, Ty::I32],
                 returns: vec![Ty::I32],
                 is_vararg: false,
+                abi: None,
             });
             let mut f = IrFunction::new(FuncId::new(0), "c", FuncTyId::new(0), BlockId::new(0));
             let mut b0 = Block::new(BlockId::new(0));
@@ -8706,6 +11672,7 @@ mod tests {
             params: vec![Ty::FatPtr(FatPtrKind::Str)],
             returns: vec![Ty::U64],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "len", FuncTyId::new(0), BlockId::new(0));
         let mut b0 = Block::new(BlockId::new(0));
@@ -8738,7 +11705,6 @@ mod tests {
     /// root stays fail-closed (`&[T]` is shared).
     #[test]
     fn fat_slice_param_splits_and_loads() {
-        use trust_ir::inst::CastOp;
         use trust_ir::ty::FatPtrKind;
         use trust_ir::value::TyId;
 
@@ -8748,6 +11714,7 @@ mod tests {
             params: vec![Ty::FatPtr(FatPtrKind::Slice(TyId::new(0))), Ty::Usize],
             returns: vec![Ty::U8],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "at", FuncTyId::new(0), BlockId::new(0));
         let s = ValueId::new(0);
@@ -8859,6 +11826,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "rec", FuncTyId::new(0), BlockId::new(0));
         let mut bb = Block::new(BlockId::new(0));
@@ -8895,6 +11863,7 @@ mod tests {
                 params: vec![Ty::I32, Ty::I32],
                 returns: vec![Ty::I32],
                 is_vararg: false,
+                abi: None,
             });
         }
         // FuncId 2: a leaf that exists but is NOT what mid calls.
@@ -8958,6 +11927,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "mb_max", FuncTyId::new(0), BlockId::new(0));
 
@@ -9070,6 +12040,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "mx", FuncTyId::new(0), BlockId::new(0));
         let (a, b) = (ValueId::new(0), ValueId::new(1));
@@ -9258,6 +12229,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "one_arm", FuncTyId::new(0), BlockId::new(0));
         let (a, b) = (ValueId::new(0), ValueId::new(1));
@@ -9346,19 +12318,27 @@ mod tests {
         ));
     }
 
-    /// Build the REAL bridge checked-arith TUPLE idiom (verified against
-    /// `trust_ir_bridge::lower_to_trust_ir` on a `CheckedBinaryOp` VF): an
-    /// `Inst::Overflow -> [value, flag]`, a `Tuple([Int,Bool])` `Undef` seed,
-    /// two `InsertField`s (field 0 = value, field 1 = flag), an `ExtractField`
-    /// of the flag, an `ICmp Eq(flag, false)` = `ok`, an `assert ok`, then in a
-    /// second block an `ExtractField` of the value and `return`. Two blocks so
-    /// the tuple decompose is exercised CROSS-block (the value read is in bb1).
+    /// Build the LEGACY bridge checked-arith TUPLE idiom, the shape
+    /// `trust_ir_bridge::lower_to_trust_ir` emitted on a `CheckedBinaryOp` VF
+    /// before BMC-LANE-1 (2026-11-06; it now packs the pair with one
+    /// `MakeAggregate`, which `bridge_checked_add_make_aggregate_module` builds
+    /// from this fixture): an `Inst::Overflow -> [value, flag]`, a
+    /// `Tuple([Int,Bool])` `Undef` seed, two `InsertField`s (field 0 = value,
+    /// field 1 = flag), an `ExtractField`
+    /// of the flag, an `ICmp Eq(flag, false)` = `ok`, then in a second block an
+    /// `ExtractField` of the value and `return`. Two blocks so the tuple
+    /// decompose is exercised CROSS-block (the value read is in bb1). The
+    /// bridge's `assert ok` after the `ICmp` is OMITTED since 2026-09-30: a
+    /// body carrying it is refused as an unfaithful implicit panic
+    /// (`ModuleLirError::ImplicitPanicUnfaithful`), and this fixture is about
+    /// the tuple decompose, which the guard never touched.
     fn bridge_checked_add_tuple_module(op: OverflowOp, ty: Ty) -> Module {
         let mut module = Module::new("t");
         module.func_types.push(FuncTy {
             params: vec![ty.clone(), ty.clone()],
             returns: vec![ty.clone()],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "add", FuncTyId::new(0), BlockId::new(0));
         let tuple_ty = Ty::Tuple(vec![ty.clone(), Ty::Bool]);
@@ -9407,7 +12387,6 @@ mod tests {
             InstrNode::new(Inst::ICmp { op: ICmpOp::Eq, ty: Ty::Bool, lhs: ef_flag, rhs: c_false })
                 .with_result(ok),
         );
-        bb0.body.push(InstrNode::new(Inst::Assert { cond: ok }));
         bb0.body.push(InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![] }));
 
         let mut bb1 = Block::new(BlockId::new(1));
@@ -9435,7 +12414,7 @@ mod tests {
         // NO tuple is materialized in memory: there must be ZERO stack slots.
         assert!(lir.stack_slots.is_empty(), "tuple decompose materializes no memory");
 
-        // Exactly one CheckedSadd, one Brif (the assert), one Trap, one Icmp.
+        // Exactly one CheckedSadd and one Icmp; no Brif and no Trap (no guard).
         let mut checked = 0;
         let mut brif = 0;
         let mut trap = 0;
@@ -9454,8 +12433,8 @@ mod tests {
             }
         }
         assert_eq!(checked, 1, "one CheckedSadd from the Overflow");
-        assert_eq!(brif, 1, "one Brif (overflow assert)");
-        assert_eq!(trap, 1, "one Trap (shared trap block)");
+        assert_eq!(brif, 0, "no Brif: the unguarded tuple idiom has no assert");
+        assert_eq!(trap, 0, "no Trap: an Assert-free body never reaches the trap block");
         assert_eq!(icmp, 1, "one Icmp (ok = flag == false)");
         // Two ExtractFields -> two Copy decompositions (flag + value); the trust_ir
         // `Inst::Copy` of the value is a third.
@@ -9491,6 +12470,97 @@ mod tests {
         );
     }
 
+    /// The pair as the bridge spells it since BMC-LANE-1: ONE complete
+    /// `MakeAggregate` over the `Overflow` results, in place of the poison seed
+    /// and its two `InsertField`s (value ids otherwise unchanged).
+    fn bridge_checked_add_make_aggregate_module(op: OverflowOp, ty: Ty) -> Module {
+        let mut module = bridge_checked_add_tuple_module(op, ty.clone());
+        let body = &mut module.functions[0].blocks[0].body;
+        body.retain(|node| !matches!(node.inst, Inst::Undef { .. } | Inst::InsertField { .. }));
+        body.insert(
+            1,
+            InstrNode::new(Inst::MakeAggregate {
+                ty: Ty::Tuple(vec![ty, Ty::Bool]),
+                variant: None,
+                fields: vec![ValueId::new(4), ValueId::new(5)],
+            })
+            .with_result(ValueId::new(8)),
+        );
+        module
+    }
+
+    #[test]
+    fn decomposes_bridge_checked_add_make_aggregate() {
+        let module = bridge_checked_add_make_aggregate_module(OverflowOp::AddOverflow, Ty::I32);
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("the complete constructor of the checked pair decomposes");
+        assert!(lir.stack_slots.is_empty(), "the pair materializes no memory");
+        let opcodes: Vec<_> =
+            lir.blocks.values().flat_map(|b| &b.instructions).map(|i| &i.opcode).collect();
+        assert_eq!(opcodes.iter().filter(|op| matches!(op, Opcode::CheckedSadd)).count(), 1);
+        assert!(
+            opcodes.iter().filter(|op| matches!(op, Opcode::Copy)).count() >= 2,
+            "both ExtractFields resolve to the constructor's lanes"
+        );
+    }
+
+    #[test]
+    fn fail_closed_on_checked_pair_make_aggregate_escaping_to_memory() {
+        // A pair claimed by the pure-SSA decomposition never reaches memory.
+        let mut module = bridge_checked_add_make_aggregate_module(OverflowOp::AddOverflow, Ty::I32);
+        let tuple_ty = Ty::Tuple(vec![Ty::I32, Ty::Bool]);
+        let body = &mut module.functions[0].blocks[0].body;
+        body.insert(
+            2,
+            InstrNode::new(Inst::Alloca { ty: tuple_ty.clone(), count: None, align: None })
+                .with_result(ValueId::new(20)),
+        );
+        body.insert(
+            3,
+            InstrNode::new(Inst::Store {
+                ty: tuple_ty,
+                ptr: ValueId::new(20),
+                value: ValueId::new(8),
+                volatile: false,
+                align: None,
+            }),
+        );
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedAggregate { .. })
+        ));
+    }
+
+    #[test]
+    fn fail_closed_on_a_checked_pair_make_aggregate_built_from_a_tracked_pair() {
+        // A second `(i32, bool)` constructor whose lane 0 is the first pair (8)
+        // rather than a scalar: `%20 = make_aggregate (i32,bool) [%8, %5]`. Both
+        // are checked-arith pairs by type, so PASS 1.6 claims both, and only its
+        // own lane check refuses the second. PASS 1.6 runs before the
+        // aggregate-memory analysis whatever the function allocates, so no
+        // Alloca is needed to reach it. `%20` is never read: the refusal is at
+        // the constructor itself. Without the check `%20` would be admitted with
+        // the pair `%8` recorded as its scalar value field.
+        let mut module = bridge_checked_add_make_aggregate_module(OverflowOp::AddOverflow, Ty::I32);
+        let body = &mut module.functions[0].blocks[0].body;
+        body.insert(
+            2,
+            InstrNode::new(Inst::MakeAggregate {
+                ty: Ty::Tuple(vec![Ty::I32, Ty::Bool]),
+                variant: None,
+                fields: vec![ValueId::new(8), ValueId::new(5)],
+            })
+            .with_result(ValueId::new(20)),
+        );
+        match lower_module_to_lir(&module, FuncId::new(0)) {
+            Err(ModuleLirError::UnsupportedAggregate { detail, .. }) => assert_eq!(
+                detail, "checked-arith pair 20 is built from a tracked tuple value",
+                "refused by PASS 1.6's lane check, not another arm"
+            ),
+            other => panic!("a pair built from a tracked pair must be refused: {other:?}"),
+        }
+    }
+
     #[test]
     fn fail_closed_on_extractfield_of_undefined_tuple_field() {
         // A tuple seed built ONLY at field 0, then ExtractField field 1 (never
@@ -9500,6 +12570,7 @@ mod tests {
             params: vec![Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "bad", FuncTyId::new(0), BlockId::new(0));
         let tuple_ty = Ty::Tuple(vec![Ty::I32, Ty::Bool]);
@@ -9613,6 +12684,7 @@ mod tests {
             params: Vec::new(),
             returns: vec![ety.clone()],
             is_vararg: false,
+            abi: None,
         });
         let mut f = IrFunction::new(FuncId::new(0), "k", FuncTyId::new(0), BlockId::new(0));
         let mut block = Block::new(BlockId::new(0));
@@ -9677,6 +12749,7 @@ mod tests {
                 params: vec![ety.clone()],
                 returns: vec![Ty::U8],
                 is_vararg: false,
+                abi: None,
             });
             let mut f = IrFunction::new(FuncId::new(0), "f", FuncTyId::new(0), BlockId::new(0));
             let mut block = Block::new(BlockId::new(0));
@@ -9893,5 +12966,1525 @@ mod tests {
             matches!(&got, Err(ModuleLirError::UnsupportedType { ty: Ty::Enum(_), .. })),
             "comparing enum-typed values must fail closed ON THE ENUM TYPE; got {got:?}"
         );
+    }
+
+    // ---- BMC-LANE-1 hostile review #19: PASS 1.7 admits an aggregate slot only
+    // when every use of it is the POINTER of a whole-aggregate Store/Load at the
+    // slot's own type. Each probe below was LOWERED before the guard (the reviewer
+    // measured p1-p4 against the committed converter); each must now be refused
+    // for the slot misuse itself, and p5, the whole round trip, must still lower.
+
+    /// `%4 = make (i32,i32) [%0, %1]; %5 = alloca (i32,i32); store %4 -> *%5`,
+    /// then `tail`.
+    fn aggregate_slot_body(tail: Vec<InstrNode>) -> Vec<InstrNode> {
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let mut body = vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tup.clone(),
+                variant: None,
+                fields: vec![ValueId::new(0), ValueId::new(1)],
+            })
+            .with_result(ValueId::new(4)),
+            InstrNode::new(Inst::Alloca { ty: tup.clone(), count: None, align: None })
+                .with_result(ValueId::new(5)),
+            InstrNode::new(Inst::Store {
+                ty: tup,
+                ptr: ValueId::new(5),
+                value: ValueId::new(4),
+                volatile: false,
+                align: None,
+            }),
+        ];
+        body.extend(tail);
+        body
+    }
+
+    /// Is the refusal the slot guard's, naming slot `slot` and the misusing `inst`?
+    fn aggregate_slot_misuse_refusal(
+        got: &Result<impl std::fmt::Debug, ModuleLirError>,
+        slot: u32,
+        inst: &str,
+    ) -> Result<(), String> {
+        let want = format!("aggregate slot {slot} is used by `{inst}` other than as the pointer");
+        if matches!(got, Err(ModuleLirError::UnsupportedMemory { detail, .. })
+            if detail.starts_with(&want))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the aggregate-slot guard to refuse `{inst}` on slot {slot}; got {got:?}"
+            ))
+        }
+    }
+
+    /// The refusal is the slot guard's, naming slot `slot` and the misusing `inst`.
+    fn assert_aggregate_slot_misuse(
+        got: &Result<impl std::fmt::Debug, ModuleLirError>,
+        slot: u32,
+        inst: &str,
+    ) {
+        if let Err(why) = aggregate_slot_misuse_refusal(got, slot, inst) {
+            panic!("{why}");
+        }
+    }
+
+    /// p1: a scalar `load i32` through the `(i32,i32)` slot.
+    #[test]
+    fn a_scalar_load_through_an_aggregate_slot_is_refused() {
+        let body = aggregate_slot_body(vec![
+            InstrNode::new(Inst::Load {
+                ty: Ty::I32,
+                ptr: ValueId::new(5),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(6)] }),
+        ]);
+        let module = module_with_body("p1_scalar_load", vec![Ty::I32], body);
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 5, "Load");
+    }
+
+    /// p2: a scalar `store i32` into the slot, then a whole load of it.
+    #[test]
+    fn a_scalar_store_into_an_aggregate_slot_is_refused() {
+        let body = aggregate_slot_body(vec![
+            InstrNode::new(Inst::Store {
+                ty: Ty::I32,
+                ptr: ValueId::new(5),
+                value: ValueId::new(1),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Load {
+                ty: Ty::Tuple(vec![Ty::I32, Ty::I32]),
+                ptr: ValueId::new(5),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(6),
+                field: 0,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(7)] }),
+        ]);
+        let module = module_with_body("p2_scalar_store", vec![Ty::I32], body);
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 5, "Store");
+    }
+
+    /// p3: `gep i32 %slot, 1` then a scalar load: the GEP arm would address the
+    /// slot at `1 * size_of(i32)`, which only coincides with field 1's C offset.
+    #[test]
+    fn a_gep_off_an_aggregate_slot_is_refused() {
+        let body = aggregate_slot_body(vec![
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(1) })
+                .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I32,
+                base: ValueId::new(5),
+                indices: vec![ValueId::new(6)],
+                inbounds: false,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::Load {
+                ty: Ty::I32,
+                ptr: ValueId::new(7),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(8)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(8)] }),
+        ]);
+        let module = module_with_body("p3_gep", vec![Ty::I32], body);
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 5, "GEP");
+    }
+
+    /// p4, the measured miscompile: `struct S { a: i32 @ 4, b: i32 @ 0 }` (a
+    /// DECLARED, reordered layout, as the producer's `register_struct` fills from
+    /// rustc), stored whole from `(a, b) = (7, 9)` and read back by a scalar
+    /// `load i32` at the slot's base. The interpreter lays the slot out at the
+    /// declared offsets and returns `b` = 9; the converter laid it out in
+    /// declaration order and returned `a` = 7. It must be refused.
+    #[test]
+    fn a_scalar_load_of_a_declared_layout_struct_slot_is_refused_where_it_miscompiled() {
+        use trust_ir::interpret::{InterpretValue, Interpreter};
+        let sid = trust_ir::value::StructId::new(0);
+        let sty = Ty::Struct(sid);
+        let mut module = module_with_body(
+            "p4_declared_layout",
+            vec![Ty::I32],
+            vec![
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: sty.clone(),
+                    variant: None,
+                    fields: vec![ValueId::new(0), ValueId::new(1)],
+                })
+                .with_result(ValueId::new(2)),
+                InstrNode::new(Inst::Alloca { ty: sty.clone(), count: None, align: None })
+                    .with_result(ValueId::new(3)),
+                InstrNode::new(Inst::Store {
+                    ty: sty,
+                    ptr: ValueId::new(3),
+                    value: ValueId::new(2),
+                    volatile: false,
+                    align: None,
+                }),
+                InstrNode::new(Inst::Load {
+                    ty: Ty::I32,
+                    ptr: ValueId::new(3),
+                    volatile: false,
+                    align: None,
+                })
+                .with_result(ValueId::new(4)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(4)] }),
+            ],
+        );
+        module.structs.push(trust_ir::StructDef {
+            id: sid,
+            name: "S".to_string(),
+            fields: vec![
+                trust_ir::ty::FieldDef { name: "a".to_string(), ty: Ty::I32, offset: Some(4) },
+                trust_ir::ty::FieldDef { name: "b".to_string(), ty: Ty::I32, offset: Some(0) },
+            ],
+            size: Some(8),
+            align: Some(4),
+            repr: trust_ir::ty::StructRepr::Rust,
+            origin: None,
+        });
+        let args = vec![
+            InterpretValue::int(Ty::I32, 7).expect("fits"),
+            InterpretValue::int(Ty::I32, 9).expect("fits"),
+        ];
+        let outcome = Interpreter::with_module(&module)
+            .execute_func(FuncId::new(0), args)
+            .expect("the module executes on the reference interpreter");
+        let [returned] = outcome.returns.as_slice() else {
+            panic!("one returned value, got {:?}", outcome.returns)
+        };
+        assert_eq!(
+            returned,
+            &InterpretValue::int(Ty::I32, 9).expect("fits"),
+            "the interpreter reads the declared offset 0, field `b` = 9"
+        );
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 3, "Load");
+    }
+
+    // ---- CG-DECLARED-LAYOUT-1: an aggregate slot is laid out at the trust-ir
+    // interpreter's own layout of its type. A struct that declares
+    // size/align/`FieldDef::offset`, and a tuple with a `Module::tuple_layouts`
+    // descriptor, are laid out at the DECLARED offsets (until 2026-11-10 both were
+    // laid out in declaration order); a declaration the interpreter refuses is
+    // refused. The byte-level gate (emitted bytes vs the interpreter's slot image)
+    // is `tests/module_to_lir_struct_mem_proven_output.rs`.
+
+    /// `(a, b) -> a - b` over `ty`: `make ty [a, b]; alloca ty; store; load;
+    /// extract 0, 1; sub`. Executable on the reference interpreter.
+    fn declared_round_trip_module(name: &str, ty: Ty) -> Module {
+        module_with_body(
+            name,
+            vec![Ty::I32],
+            vec![
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: ty.clone(),
+                    variant: None,
+                    fields: vec![ValueId::new(0), ValueId::new(1)],
+                })
+                .with_result(ValueId::new(2)),
+                InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: None })
+                    .with_result(ValueId::new(3)),
+                InstrNode::new(Inst::Store {
+                    ty: ty.clone(),
+                    ptr: ValueId::new(3),
+                    value: ValueId::new(2),
+                    volatile: false,
+                    align: None,
+                }),
+                InstrNode::new(Inst::Load {
+                    ty: ty.clone(),
+                    ptr: ValueId::new(3),
+                    volatile: false,
+                    align: None,
+                })
+                .with_result(ValueId::new(4)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::I32,
+                    aggregate: ValueId::new(4),
+                    field: 0,
+                })
+                .with_result(ValueId::new(5)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::I32,
+                    aggregate: ValueId::new(4),
+                    field: 1,
+                })
+                .with_result(ValueId::new(6)),
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::Sub,
+                    ty: Ty::I32,
+                    lhs: ValueId::new(5),
+                    rhs: ValueId::new(6),
+                })
+                .with_result(ValueId::new(7)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(7)] }),
+            ],
+        )
+    }
+
+    /// The `i32` struct `S { a, b }` with the given declared triple.
+    fn declared_struct(
+        size: Option<u64>,
+        align: Option<u64>,
+        offsets: [Option<u64>; 2],
+    ) -> trust_ir::StructDef {
+        trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "S".to_string(),
+            fields: vec![
+                trust_ir::ty::FieldDef { name: "a".to_string(), ty: Ty::I32, offset: offsets[0] },
+                trust_ir::ty::FieldDef { name: "b".to_string(), ty: Ty::I32, offset: offsets[1] },
+            ],
+            size,
+            align,
+            repr: trust_ir::ty::StructRepr::Rust,
+            origin: None,
+        }
+    }
+
+    fn declared_struct_module(def: trust_ir::StructDef) -> Module {
+        let mut module = declared_round_trip_module(
+            "declared_struct",
+            Ty::Struct(trust_ir::value::StructId::new(0)),
+        );
+        module.structs.push(def);
+        module
+    }
+
+    /// The target the producer stamps on a module whose tuples it describes
+    /// (`tuple_layout_ledger`); the interpreter refuses a tuple descriptor on a
+    /// module with none (`LayoutError::TupleLayoutTargetMissing`).
+    fn producer_target() -> trust_ir::TargetInfo {
+        trust_ir::TargetInfo {
+            triple: "arm64-apple-macosx".to_string(),
+            pointer_size: 8,
+            endianness: trust_ir::Endianness::Little,
+            abi: None,
+            struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+        }
+    }
+
+    /// `(i32, i32)` with a `Module::tuple_layouts` descriptor per `rows`, on the
+    /// producer's target.
+    fn described_tuple_module(rows: &[(u64, u64, Vec<u64>)]) -> Module {
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let mut module = declared_round_trip_module("described_tuple", tup.clone());
+        module.target_info = Some(producer_target());
+        let tuple_type = module.add_type(tup).expect("Module::add_type: test fixture");
+        for (size, align, field_offsets) in rows {
+            module.tuple_layouts.push(trust_ir::TupleLayoutDescriptor {
+                tuple_type,
+                size: *size,
+                align: *align,
+                field_offsets: field_offsets.clone(),
+            });
+        }
+        module
+    }
+
+    /// The byte offset in its slot of every LIR `Store`, in emission order, with
+    /// the stored value: the address is the slot's `StackAddr` (offset 0) or an
+    /// `ArrayGep i8` off it by an `Iconst` (`emit_field_addr`'s two spellings).
+    fn lir_store_offsets(lir: &LirFunction) -> Vec<(Value, u32, i64)> {
+        let insts: Vec<&Instruction> = lir.blocks.values().flat_map(|b| &b.instructions).collect();
+        let def = |v: Value| insts.iter().find(|i| i.results.contains(&v)).copied();
+        insts
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Store { .. }))
+            .map(|store| {
+                let addr = def(store.args[1]).expect("the store address is defined");
+                match (&addr.opcode, addr.args.as_slice()) {
+                    (Opcode::StackAddr { slot }, []) => (store.args[0], *slot, 0),
+                    (Opcode::ArrayGep { elem_ty: LirType::I8 }, [base, idx]) => {
+                        let Some(Opcode::StackAddr { slot }) = def(*base).map(|b| &b.opcode) else {
+                            panic!("field address is not slot-relative: {addr:?}")
+                        };
+                        let Some(Opcode::Iconst { imm, .. }) = def(*idx).map(|i| &i.opcode) else {
+                            panic!("field offset is not a constant: {addr:?}")
+                        };
+                        (store.args[0], *slot, *imm)
+                    }
+                    other => panic!("unexpected field address {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    fn interpret_round_trip(module: &Module, a: i128, b: i128) -> Result<i128, String> {
+        use trust_ir::interpret::{InterpretValue, Interpreter};
+        let args = vec![
+            InterpretValue::int(Ty::I32, a).expect("fits"),
+            InterpretValue::int(Ty::I32, b).expect("fits"),
+        ];
+        let outcome = Interpreter::with_module(module)
+            .execute_func(FuncId::new(0), args)
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(outcome.returns[0].as_int().expect("integer return").as_signed())
+    }
+
+    /// `S { a@4, b@0 }`: the slot is the declared 8 bytes, `a` (param 0) is stored
+    /// at 4 and `b` (param 1) at 0, and the value is the interpreter's.
+    #[test]
+    fn a_declared_struct_layout_places_each_field_at_its_declared_offset() {
+        let module = declared_struct_module(declared_struct(Some(8), Some(4), [Some(4), Some(0)]));
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("declared layout lowers");
+        assert_eq!(lir.stack_slots.len(), 1);
+        assert_eq!((lir.stack_slots[0].size, lir.stack_slots[0].align), (8, 4));
+        let a = Value(0);
+        let b = Value(1);
+        assert_eq!(
+            lir_store_offsets(&lir),
+            vec![(a, 0, 4), (b, 0, 0)],
+            "field a (param 0) at its declared offset 4, field b (param 1) at 0"
+        );
+        assert_eq!(interpret_round_trip(&module, 7, 9), Ok(-2));
+    }
+
+    /// A declared size larger than the declaration-order one (rustc may pad)
+    /// sizes the slot; the fields keep their declared offsets.
+    #[test]
+    fn a_declared_struct_size_and_alignment_size_the_slot() {
+        let module = declared_struct_module(declared_struct(Some(16), Some(8), [Some(8), Some(0)]));
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("declared layout lowers");
+        assert_eq!((lir.stack_slots[0].size, lir.stack_slots[0].align), (16, 8));
+        assert_eq!(lir_store_offsets(&lir), vec![(Value(0), 0, 8), (Value(1), 0, 0)]);
+        assert_eq!(interpret_round_trip(&module, 7, 9), Ok(-2));
+    }
+
+    /// `(i32, i32)` described at `[4, 0]`: laid out at the descriptor's offsets.
+    #[test]
+    fn a_described_tuple_places_each_element_at_its_descriptor_offset() {
+        let module = described_tuple_module(&[(8, 4, vec![4, 0])]);
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("described tuple lowers");
+        assert_eq!((lir.stack_slots[0].size, lir.stack_slots[0].align), (8, 4));
+        assert_eq!(lir_store_offsets(&lir), vec![(Value(0), 0, 4), (Value(1), 0, 0)]);
+        assert_eq!(interpret_round_trip(&module, 7, 9), Ok(-2));
+    }
+
+    /// A type that declares no layout keeps the declaration-order one (the
+    /// interpreter's `aggregate_layout`), for a struct and a tuple alike, and a
+    /// descriptor for ANOTHER tuple does not move it.
+    #[test]
+    fn an_undeclared_layout_stays_in_declaration_order() {
+        let plain = declared_struct_module(declared_struct(None, None, [None, None]));
+        let lir = lower_module_to_lir(&plain, FuncId::new(0)).expect("plain struct lowers");
+        assert_eq!(lir_store_offsets(&lir), vec![(Value(0), 0, 0), (Value(1), 0, 4)]);
+
+        let mut other =
+            declared_round_trip_module("other_tuple", Ty::Tuple(vec![Ty::I32, Ty::I32]));
+        other.target_info = Some(producer_target());
+        let described = other
+            .add_type(Ty::Tuple(vec![Ty::I64, Ty::I32]))
+            .expect("Module::add_type: test fixture");
+        other.tuple_layouts.push(trust_ir::TupleLayoutDescriptor {
+            tuple_type: described,
+            size: 16,
+            align: 8,
+            field_offsets: vec![8, 0],
+        });
+        let lir = lower_module_to_lir(&other, FuncId::new(0)).expect("undescribed tuple lowers");
+        assert_eq!(lir_store_offsets(&lir), vec![(Value(0), 0, 0), (Value(1), 0, 4)]);
+        assert_eq!(interpret_round_trip(&other, 7, 9), Ok(-2));
+    }
+
+    /// Every declaration the reference interpreter refuses is refused here too,
+    /// by the declared-layout reader — never repaired into a layout of our own.
+    /// Each row is executed on the interpreter first, which must refuse it.
+    #[test]
+    fn a_declared_layout_the_interpreter_refuses_is_refused() {
+        let structs: [(&str, trust_ir::StructDef); 9] = [
+            ("size without align", declared_struct(Some(8), None, [Some(4), Some(0)])),
+            ("align without size", declared_struct(None, Some(4), [Some(4), Some(0)])),
+            ("offset without size/align", declared_struct(None, None, [Some(4), None])),
+            ("sized field with no offset", declared_struct(Some(8), Some(4), [Some(4), None])),
+            ("misaligned offset", declared_struct(Some(12), Some(4), [Some(2), Some(8)])),
+            ("overlapping fields", declared_struct(Some(8), Some(4), [Some(0), Some(0)])),
+            ("field past the size", declared_struct(Some(8), Some(4), [Some(4), Some(8)])),
+            ("size not a multiple of align", declared_struct(Some(6), Some(4), [Some(4), Some(0)])),
+            ("over-aligned field", declared_struct(Some(8), Some(2), [Some(4), Some(0)])),
+        ];
+        for (why, def) in structs {
+            let module = declared_struct_module(def);
+            assert!(
+                interpret_round_trip(&module, 7, 9).is_err(),
+                "{why}: the interpreter must refuse this declaration"
+            );
+            let got = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&got, Err(ModuleLirError::UnsupportedAggregate { .. })),
+                "{why}: the converter must refuse it; got {got:?}"
+            );
+        }
+        // `(size, align, field_offsets)` per descriptor row.
+        type Descriptors = Vec<(u64, u64, Vec<u64>)>;
+        let tuples: [(&str, Descriptors, bool); 4] = [
+            ("overlapping elements", vec![(8, 4, vec![0, 0])], true),
+            ("element past the size", vec![(8, 4, vec![4, 8])], true),
+            ("two descriptors for one tuple", vec![(8, 4, vec![4, 0]), (8, 4, vec![0, 4])], true),
+            ("a descriptor on a module with no target", vec![(8, 4, vec![4, 0])], false),
+        ];
+        for (why, rows, targeted) in tuples {
+            let mut module = described_tuple_module(&rows);
+            if !targeted {
+                module.target_info = None;
+            }
+            assert!(
+                interpret_round_trip(&module, 7, 9).is_err(),
+                "{why}: the interpreter must refuse this descriptor"
+            );
+            let got = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&got, Err(ModuleLirError::UnsupportedAggregate { .. })),
+                "{why}: the converter must refuse it; got {got:?}"
+            );
+        }
+    }
+
+    /// A declared layout on a target this converter's 64-bit little-endian field
+    /// table does not describe is refused; the same declaration on aarch64 lowers.
+    #[test]
+    fn a_declared_layout_on_another_target_layout_is_refused() {
+        use trust_ir::Endianness::{Big, Little};
+        let target = |triple: &str, pointer_size, endianness| trust_ir::TargetInfo {
+            triple: triple.to_string(),
+            pointer_size,
+            endianness,
+            abi: None,
+            struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+        };
+        let declared = || declared_struct(Some(8), Some(4), [Some(4), Some(0)]);
+        let mut on_aarch64 = declared_struct_module(declared());
+        on_aarch64.target_info = Some(target("aarch64-apple-darwin", 8, Little));
+        let lir = lower_module_to_lir(&on_aarch64, FuncId::new(0)).expect("aarch64 lowers");
+        assert_eq!(lir_store_offsets(&lir), vec![(Value(0), 0, 4), (Value(1), 0, 0)]);
+        assert_eq!(interpret_round_trip(&on_aarch64, 7, 9), Ok(-2));
+        for (triple, pointer_size, endianness) in [
+            ("wasm32-unknown-unknown", 4, Little),
+            ("i686-unknown-linux-gnu", 4, Little),
+            ("aarch64_be-unknown-linux-gnu", 8, Big),
+        ] {
+            let mut module = declared_struct_module(declared());
+            module.target_info = Some(target(triple, pointer_size, endianness));
+            let got = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&got, Err(ModuleLirError::UnsupportedAggregate { detail, .. })
+                    if detail.contains("canonical-scalar layout this converter")),
+                "{triple}: a declared layout must be refused; got {got:?}"
+            );
+        }
+    }
+
+    /// An undeclared `S { a: i32, b: i32, n: usize }` round-tripped through its
+    /// slot, returning `a - b`.
+    fn pointer_width_field_module() -> Module {
+        let s = Ty::Struct(trust_ir::value::StructId::new(0));
+        let mut module = module_with_body(
+            "pointer_width_field",
+            vec![Ty::I32],
+            vec![
+                InstrNode::new(Inst::Const { ty: Ty::Usize, value: Constant::Int(3) })
+                    .with_result(ValueId::new(2)),
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: s.clone(),
+                    variant: None,
+                    fields: vec![ValueId::new(0), ValueId::new(1), ValueId::new(2)],
+                })
+                .with_result(ValueId::new(3)),
+                InstrNode::new(Inst::Alloca { ty: s.clone(), count: None, align: None })
+                    .with_result(ValueId::new(4)),
+                InstrNode::new(Inst::Store {
+                    ty: s.clone(),
+                    ptr: ValueId::new(4),
+                    value: ValueId::new(3),
+                    volatile: false,
+                    align: None,
+                }),
+                InstrNode::new(Inst::Load {
+                    ty: s,
+                    ptr: ValueId::new(4),
+                    volatile: false,
+                    align: None,
+                })
+                .with_result(ValueId::new(5)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::I32,
+                    aggregate: ValueId::new(5),
+                    field: 0,
+                })
+                .with_result(ValueId::new(6)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::I32,
+                    aggregate: ValueId::new(5),
+                    field: 1,
+                })
+                .with_result(ValueId::new(7)),
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::Sub,
+                    ty: Ty::I32,
+                    lhs: ValueId::new(6),
+                    rhs: ValueId::new(7),
+                })
+                .with_result(ValueId::new(8)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(8)] }),
+            ],
+        );
+        let field = |name: &str, ty: Ty| trust_ir::ty::FieldDef {
+            name: name.to_string(),
+            ty,
+            offset: None,
+        };
+        module.structs.push(trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "S".to_string(),
+            fields: vec![field("a", Ty::I32), field("b", Ty::I32), field("n", Ty::Usize)],
+            size: None,
+            align: None,
+            repr: trust_ir::ty::StructRepr::Rust,
+            origin: None,
+        });
+        module
+    }
+
+    /// A `usize` field is laid out at 8 bytes only where the interpreter sizes it
+    /// at 8: a target-free module and a target with 8-byte pointers. On a 32-bit
+    /// target the interpreter sizes it at 4, so the converter refuses instead of
+    /// laying the slot out from its 64-bit field table.
+    #[test]
+    fn a_pointer_width_field_is_laid_out_only_at_an_8_byte_pointer_width() {
+        let target = |triple: &str, pointer_size| trust_ir::TargetInfo {
+            triple: triple.to_string(),
+            pointer_size,
+            endianness: trust_ir::Endianness::Little,
+            abi: None,
+            struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+        };
+        for target_info in [None, Some(target("aarch64-apple-darwin", 8))] {
+            let mut module = pointer_width_field_module();
+            module.target_info = target_info.clone();
+            let lir = lower_module_to_lir(&module, FuncId::new(0))
+                .unwrap_or_else(|e| panic!("{target_info:?}: the slot must lower; got {e:?}"));
+            assert_eq!(lir.stack_slots.len(), 1);
+            assert_eq!((lir.stack_slots[0].size, lir.stack_slots[0].align), (16, 8));
+            let offsets: Vec<i64> =
+                lir_store_offsets(&lir).iter().map(|&(_, _, offset)| offset).collect();
+            assert_eq!(offsets, vec![0, 4, 8], "{target_info:?}: a@0, b@4, n@8");
+            assert_eq!(interpret_round_trip(&module, 7, 9), Ok(-2), "{target_info:?}");
+        }
+        for (triple, pointer_size) in [("wasm32-unknown-unknown", 4), ("i686-unknown-linux-gnu", 4)]
+        {
+            let mut module = pointer_width_field_module();
+            module.target_info = Some(target(triple, pointer_size));
+            let got = lower_module_to_lir(&module, FuncId::new(0));
+            assert!(
+                matches!(&got, Err(ModuleLirError::UnsupportedAggregate { detail, .. })
+                    if detail.contains("is pointer-width and the module's target has 4-byte pointers")),
+                "{triple}: a pointer-width field must be refused; got {got:?}"
+            );
+        }
+    }
+
+    /// The slot returned as a pointer escapes.
+    #[test]
+    fn an_aggregate_slot_that_is_returned_is_refused() {
+        let returned = aggregate_slot_body(vec![InstrNode::new(Inst::Return {
+            values: vec![ValueId::new(5)],
+        })]);
+        let module = module_with_body("slot_returned", vec![Ty::Ptr], returned);
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 5, "Return");
+    }
+
+    /// The slot read whole at a type that is not the slot's (same arity, wider
+    /// fields). Its own test, so a mutant of the guard is measured on it alone
+    /// (BMC-LANE-1 hostile review 4, F6: it shared a test with the returned slot
+    /// and never ran under the step-1b mutant).
+    #[test]
+    fn an_aggregate_slot_read_whole_at_another_type_is_refused() {
+        let wider = aggregate_slot_body(vec![
+            InstrNode::new(Inst::Load {
+                ty: Ty::Tuple(vec![Ty::I64, Ty::I64]),
+                ptr: ValueId::new(5),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I64,
+                aggregate: ValueId::new(6),
+                field: 1,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(7)] }),
+        ]);
+        let module = module_with_body("slot_read_wider", vec![Ty::I64], wider);
+        assert_aggregate_slot_misuse(&lower_module_to_lir(&module, FuncId::new(0)), 5, "Load");
+    }
+
+    /// The slot as other operands, each refused at the instruction that uses it
+    /// (BMC-LANE-1 hostile reviews 4, F5, and 5, B-L1). A hand-written check over
+    /// `Load`/`Store`/`GEP`/`Return` in place of trust-ir's operand visitor passes
+    /// every probe above and fails here. The rows are a sample, not every position
+    /// the visitor reaches (`CallIndirect`, `InsertField`'s value, the atomics, a
+    /// `MakeAggregate` lane, `BinOp`, ... are not pinned one by one); the guard's
+    /// walk is the exhaustive one. Three rows (`Call`, `Cast`, `Store` into itself)
+    /// are also refused by later arms when step 1b is off, so for them the message
+    /// check is what fails.
+    #[test]
+    fn an_aggregate_slot_as_any_other_operand_is_refused() {
+        let slot = ValueId::new(5);
+        let tup = Ty::Tuple(vec![Ty::I32, Ty::I32]);
+        let cond = || {
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Eq,
+                ty: Ty::I32,
+                lhs: ValueId::new(0),
+                rhs: ValueId::new(1),
+            })
+            .with_result(ValueId::new(6))
+        };
+        let ret = || InstrNode::new(Inst::Return { values: vec![] });
+        let block_with_ptr_param = |id: u32, param: u32| {
+            let mut block = Block::new(BlockId::new(id));
+            block.params.push((ValueId::new(param), Ty::Ptr));
+            block.body = vec![ret()];
+            block
+        };
+        let one_block = |name: &str, tail: Vec<InstrNode>| {
+            module_with_body(name, vec![], aggregate_slot_body(tail))
+        };
+
+        let mut cases: Vec<(&str, Module)> = Vec::new();
+
+        let mut br = one_block(
+            "slot_br_arg",
+            vec![InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![slot] })],
+        );
+        br.functions[0].blocks.push(block_with_ptr_param(1, 6));
+        cases.push(("Br", br));
+
+        let mut cond_br = one_block(
+            "slot_cond_br_arg",
+            vec![
+                cond(),
+                InstrNode::new(Inst::CondBr {
+                    cond: ValueId::new(6),
+                    then_target: BlockId::new(1),
+                    then_args: vec![slot],
+                    else_target: BlockId::new(2),
+                    else_args: vec![],
+                }),
+            ],
+        );
+        cond_br.functions[0].blocks.push(block_with_ptr_param(1, 7));
+        let mut else_block = Block::new(BlockId::new(2));
+        else_block.body = vec![ret()];
+        cond_br.functions[0].blocks.push(else_block);
+        cases.push(("CondBr", cond_br));
+
+        let mut call = one_block(
+            "slot_call_arg",
+            vec![InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![slot] }), ret()],
+        );
+        call.func_types.push(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![],
+            is_vararg: false,
+            abi: None,
+        });
+        let mut callee =
+            IrFunction::new(FuncId::new(1), "takes_ptr", FuncTyId::new(1), BlockId::new(0));
+        callee.blocks.push(block_with_ptr_param(0, 0));
+        call.functions.push(callee);
+        cases.push(("Call", call));
+
+        cases.push((
+            "Store",
+            one_block(
+                "slot_stored_as_value",
+                vec![
+                    InstrNode::new(Inst::Alloca { ty: Ty::Ptr, count: None, align: None })
+                        .with_result(ValueId::new(6)),
+                    InstrNode::new(Inst::Store {
+                        ty: Ty::Ptr,
+                        ptr: ValueId::new(6),
+                        value: slot,
+                        volatile: false,
+                        align: None,
+                    }),
+                    ret(),
+                ],
+            ),
+        ));
+        // The slot stored into ITSELF at its own type: pins the guard's `value != ptr`.
+        cases.push((
+            "Store",
+            one_block(
+                "slot_stored_into_itself",
+                vec![
+                    InstrNode::new(Inst::Store {
+                        ty: tup,
+                        ptr: slot,
+                        value: slot,
+                        volatile: false,
+                        align: None,
+                    }),
+                    ret(),
+                ],
+            ),
+        ));
+        // A `Switch` edge argument, default and case: the terminator other than
+        // `Br`/`CondBr` that carries block arguments.
+        for (name, default_args, case_args) in [
+            ("slot_switch_default_arg", vec![slot], vec![]),
+            ("slot_switch_case_arg", vec![], vec![slot]),
+        ] {
+            let (default_param, case_param) = (!default_args.is_empty(), !case_args.is_empty());
+            let mut switch = one_block(
+                name,
+                vec![InstrNode::new(Inst::Switch {
+                    value: ValueId::new(0),
+                    default: BlockId::new(1),
+                    default_args,
+                    cases: vec![trust_ir::inst::SwitchCase {
+                        value: Constant::Int(1),
+                        target: BlockId::new(2),
+                        args: case_args,
+                    }],
+                    exhaustive_enum_unreachable: false,
+                })],
+            );
+            for (id, param, takes) in [(1, 6, default_param), (2, 7, case_param)] {
+                let mut block = Block::new(BlockId::new(id));
+                if takes {
+                    block.params.push((ValueId::new(param), Ty::Ptr));
+                }
+                block.body = vec![ret()];
+                switch.functions[0].blocks.push(block);
+            }
+            cases.push(("Switch", switch));
+        }
+        // A `GEP` INDEX: the slot used as an offset into another allocation, not as
+        // the base.
+        cases.push((
+            "GEP",
+            one_block(
+                "slot_as_gep_index",
+                vec![
+                    InstrNode::new(Inst::Alloca { ty: Ty::I8, count: None, align: None })
+                        .with_result(ValueId::new(6)),
+                    InstrNode::new(Inst::GEP {
+                        pointee_ty: Ty::I8,
+                        base: ValueId::new(6),
+                        indices: vec![slot],
+                        inbounds: false,
+                    })
+                    .with_result(ValueId::new(7)),
+                    ret(),
+                ],
+            ),
+        ));
+        cases.push((
+            "Copy",
+            one_block(
+                "slot_copied",
+                vec![
+                    InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: slot })
+                        .with_result(ValueId::new(6)),
+                    ret(),
+                ],
+            ),
+        ));
+        cases.push((
+            "Select",
+            one_block(
+                "slot_selected",
+                vec![
+                    cond(),
+                    InstrNode::new(Inst::Select {
+                        ty: Ty::Ptr,
+                        cond: ValueId::new(6),
+                        then_val: slot,
+                        else_val: slot,
+                    })
+                    .with_result(ValueId::new(7)),
+                    ret(),
+                ],
+            ),
+        ));
+        cases.push((
+            "Cast",
+            one_block(
+                "slot_cast_to_int",
+                vec![
+                    InstrNode::new(Inst::Cast {
+                        op: trust_ir::inst::CastOp::PtrToInt,
+                        src_ty: Ty::Ptr,
+                        dst_ty: Ty::I64,
+                        operand: slot,
+                    })
+                    .with_result(ValueId::new(6)),
+                    ret(),
+                ],
+            ),
+        ));
+        cases.push((
+            "ICmp",
+            one_block(
+                "slot_compared",
+                vec![
+                    InstrNode::new(Inst::ICmp {
+                        op: ICmpOp::Eq,
+                        ty: Ty::Ptr,
+                        lhs: slot,
+                        rhs: slot,
+                    })
+                    .with_result(ValueId::new(6)),
+                    ret(),
+                ],
+            ),
+        ));
+
+        // Every case is checked before the verdict, so a mutant's log names each
+        // route it reopens.
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(inst, module)| {
+                aggregate_slot_misuse_refusal(&lower_module_to_lir(module, FuncId::new(0)), 5, inst)
+                    .err()
+                    .map(|why| format!("{}: {why}", module.functions[0].name))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {} cases:\n{}",
+            failures.len(),
+            cases.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// p5, the control: the whole round trip (whole store, whole load at the slot's
+    /// own type, `ExtractField`) still lowers, so the guard refuses only the misuse.
+    #[test]
+    fn a_whole_round_trip_through_an_aggregate_slot_still_lowers() {
+        let body = aggregate_slot_body(vec![
+            InstrNode::new(Inst::Load {
+                ty: Ty::Tuple(vec![Ty::I32, Ty::I32]),
+                ptr: ValueId::new(5),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(6)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(6),
+                field: 1,
+            })
+            .with_result(ValueId::new(7)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(7)] }),
+        ]);
+        let module = module_with_body("p5_round_trip", vec![Ty::I32], body);
+        let got = lower_module_to_lir(&module, FuncId::new(0));
+        assert!(got.is_ok(), "a whole round trip must still lower; got {got:?}");
+    }
+
+    // ---- F1-FIELD-POINTER-AGREEMENT-1: step 1b admits one partial access, a
+    // FIELD POINTER: `gep i8 %slot, %c` off a `Ty::Struct` slot, `%c` a
+    // `const i64` that starts exactly one field of the slot's layout (the
+    // interpreter's own, CG-DECLARED-LAYOUT-1), used only as the pointer of a
+    // non-volatile Load/Store at that field's type. The F1 producer's
+    // `lower_field_of_local_addr` spells `&s.f` / `s.f = v` this way. Everything
+    // else stays refused; these tests pin both sides. The byte-level gate (ay over
+    // the emitted bytes, the interpreter's slot image as the offset oracle) is
+    // `tests/module_to_lir_struct_mem_proven_output.rs`, TESTS 18-21.
+
+    /// `S` (`Module::structs[0]`) with `fields` as (type, declared offset) and an
+    /// optional declared `(size, align)`.
+    fn field_struct(
+        fields: &[(Ty, Option<u64>)],
+        declared: Option<(u64, u64)>,
+    ) -> trust_ir::StructDef {
+        trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "S".to_string(),
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (ty, offset))| trust_ir::ty::FieldDef {
+                    name: format!("f{i}"),
+                    ty: ty.clone(),
+                    offset: *offset,
+                })
+                .collect(),
+            size: declared.map(|(size, _)| size),
+            align: declared.map(|(_, align)| align),
+            repr: trust_ir::ty::StructRepr::Rust,
+            origin: None,
+        }
+    }
+
+    /// `%2 = alloca S` (`S` = `def`), then `tail`, in the entry block whose two
+    /// `i32` params are `%0`, `%1`.
+    fn field_pointer_module(
+        name: &str,
+        def: trust_ir::StructDef,
+        returns: Vec<Ty>,
+        tail: Vec<InstrNode>,
+    ) -> Module {
+        let sty = Ty::Struct(trust_ir::value::StructId::new(0));
+        let mut body = vec![
+            InstrNode::new(Inst::Alloca { ty: sty, count: None, align: None })
+                .with_result(ValueId::new(2)),
+        ];
+        body.extend(tail);
+        let mut module = module_with_body(name, returns, body);
+        module.structs.push(def);
+        module
+    }
+
+    /// `%off = const <ty> <offset>; %ptr = gep i8 %2, %off`.
+    fn field_gep_typed(off: u32, ptr: u32, ty: Ty, offset: i128) -> [InstrNode; 2] {
+        [
+            InstrNode::new(Inst::Const { ty, value: Constant::Int(offset) })
+                .with_result(ValueId::new(off)),
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: ValueId::new(2),
+                indices: vec![ValueId::new(off)],
+                inbounds: true,
+            })
+            .with_result(ValueId::new(ptr)),
+        ]
+    }
+
+    /// The producer's spelling: `%off = const i64 <offset>; %ptr = gep i8 %2, %off`.
+    fn field_gep(off: u32, ptr: u32, offset: i128) -> [InstrNode; 2] {
+        field_gep_typed(off, ptr, Ty::I64, offset)
+    }
+
+    fn field_store(ty: Ty, ptr: u32, value: u32) -> InstrNode {
+        InstrNode::new(Inst::Store {
+            ty,
+            ptr: ValueId::new(ptr),
+            value: ValueId::new(value),
+            volatile: false,
+            align: None,
+        })
+    }
+
+    fn field_load(ty: Ty, ptr: u32, result: u32) -> InstrNode {
+        InstrNode::new(Inst::Load { ty, ptr: ValueId::new(ptr), volatile: false, align: None })
+            .with_result(ValueId::new(result))
+    }
+
+    /// `s.f0 = %0` through a field pointer at `offsets[0]`, `s.f1 = %1` at
+    /// `offsets[1]`, then `s` read WHOLE and `f0 - f1` returned (`-`, so a
+    /// lowering that swapped the two fields changes the result).
+    fn fill_then_whole_load(offsets: [i128; 2]) -> Vec<InstrNode> {
+        let sty = Ty::Struct(trust_ir::value::StructId::new(0));
+        let [c0, g0] = field_gep(3, 4, offsets[0]);
+        let [c1, g1] = field_gep(5, 6, offsets[1]);
+        vec![
+            c0,
+            g0,
+            field_store(Ty::I32, 4, 0),
+            c1,
+            g1,
+            field_store(Ty::I32, 6, 1),
+            field_load(sty, 2, 7),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(7),
+                field: 0,
+            })
+            .with_result(ValueId::new(8)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::I32,
+                aggregate: ValueId::new(7),
+                field: 1,
+            })
+            .with_result(ValueId::new(9)),
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Sub,
+                ty: Ty::I32,
+                lhs: ValueId::new(8),
+                rhs: ValueId::new(9),
+            })
+            .with_result(ValueId::new(10)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(10)] }),
+        ]
+    }
+
+    /// The refusal is the field-pointer walk's, naming the pointer, its field and
+    /// slot, and the misusing `inst`.
+    fn field_pointer_misuse_refusal(
+        got: &Result<impl std::fmt::Debug, ModuleLirError>,
+        pointer: u32,
+        field: usize,
+        inst: &str,
+    ) -> Result<(), String> {
+        let want = format!(
+            "field pointer {pointer} (field {field} of aggregate slot 2) is used by `{inst}` \
+             other than as the pointer of a non-volatile Load/Store at the field's type"
+        );
+        if matches!(got, Err(ModuleLirError::UnsupportedMemory { detail, .. })
+            if detail.starts_with(&want))
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected the field-pointer guard to refuse `{inst}` on pointer {pointer}; got \
+                 {got:?}"
+            ))
+        }
+    }
+
+    /// The two `i32` field layouts the admitted shapes are checked at: undeclared
+    /// (declaration order, `f0 @ 0, f1 @ 4`), the producer's reordered
+    /// `S { a @ 4, b @ 0 }`, and a padded `S { a @ 8, b @ 0 }` in 16 bytes.
+    fn two_i32_field_layouts() -> Vec<(&'static str, trust_ir::StructDef, [u32; 2])> {
+        vec![
+            ("undeclared", field_struct(&[(Ty::I32, None), (Ty::I32, None)], None), [0, 4]),
+            (
+                "S { a @ 4, b @ 0 }",
+                field_struct(&[(Ty::I32, Some(4)), (Ty::I32, Some(0))], Some((8, 4))),
+                [4, 0],
+            ),
+            (
+                "S { a @ 8, b @ 0 } in 16",
+                field_struct(&[(Ty::I32, Some(8)), (Ty::I32, Some(0))], Some((16, 8))),
+                [8, 0],
+            ),
+        ]
+    }
+
+    /// The admitted fill: field pointers at the slot layout's offsets, a Store of
+    /// each param at its field's type, then a whole load. Each field pointer
+    /// lowers to an `ArrayGep i8` off the slot's `StackAddr` by the field's layout
+    /// offset, the param is stored there at 32 bits, and the reference
+    /// interpreter computes `7 - 9` on the same module, the reordered and padded
+    /// declarations included.
+    #[test]
+    fn a_field_pointer_fill_lowers_at_the_slot_layout_offsets() {
+        for (label, def, offsets) in two_i32_field_layouts() {
+            let module = field_pointer_module(
+                "field_ptr_fill",
+                def,
+                vec![Ty::I32],
+                fill_then_whole_load(offsets.map(i128::from)),
+            );
+            assert_eq!(interpret_round_trip(&module, 7, 9), Ok(-2), "{label}: the interpreter");
+            let lir = lower_module_to_lir(&module, FuncId::new(0))
+                .unwrap_or_else(|e| panic!("{label}: the field-pointer fill must lower: {e:?}"));
+            assert_eq!(lir.stack_slots.len(), 1, "{label}: one aggregate slot");
+            assert_eq!(
+                lir_store_offsets(&lir),
+                vec![(Value(0), 0, i64::from(offsets[0])), (Value(1), 0, i64::from(offsets[1]))],
+                "{label}: param k is stored through field k's pointer at its layout offset"
+            );
+            let insts: Vec<&Instruction> =
+                lir.blocks.values().flat_map(|b| &b.instructions).collect();
+            assert_eq!(
+                insts
+                    .iter()
+                    .filter(|i| i.opcode == Opcode::Store { ty: LirType::I32, align: None })
+                    .count(),
+                2,
+                "{label}: one 32-bit store per field pointer"
+            );
+        }
+    }
+
+    /// A field read through a field pointer after a whole store reads that field.
+    #[test]
+    fn a_field_pointer_load_after_a_whole_store_reads_its_field() {
+        for (label, def, offsets) in two_i32_field_layouts() {
+            for (field, want) in [(0usize, 7i128), (1, 9)] {
+                let sty = Ty::Struct(trust_ir::value::StructId::new(0));
+                let [c, g] = field_gep(4, 5, i128::from(offsets[field]));
+                let module = field_pointer_module(
+                    "field_ptr_load",
+                    def.clone(),
+                    vec![Ty::I32],
+                    vec![
+                        InstrNode::new(Inst::MakeAggregate {
+                            ty: sty.clone(),
+                            variant: None,
+                            fields: vec![ValueId::new(0), ValueId::new(1)],
+                        })
+                        .with_result(ValueId::new(3)),
+                        field_store(sty, 2, 3),
+                        c,
+                        g,
+                        field_load(Ty::I32, 5, 6),
+                        InstrNode::new(Inst::Return { values: vec![ValueId::new(6)] }),
+                    ],
+                );
+                assert_eq!(interpret_round_trip(&module, 7, 9), Ok(want), "{label} field {field}");
+                let got = lower_module_to_lir(&module, FuncId::new(0));
+                assert!(
+                    got.is_ok(),
+                    "{label} field {field}: a field-pointer load must lower; {got:?}"
+                );
+            }
+        }
+    }
+
+    /// Offsets that start no field of the slot's layout: padding, inside a field,
+    /// at and past the end, negative, and (on the producer's reordered
+    /// `{ a: u8 @ 6, b: i16 @ 4, c: u32 @ 0 }`) field `b`'s DECLARATION-ORDER
+    /// offset 2, which is inside `c` in the declared layout. Each GEP is refused as
+    /// a slot misuse.
+    #[test]
+    fn a_field_pointer_at_an_offset_that_starts_no_field_is_refused() {
+        let ret = || InstrNode::new(Inst::Return { values: vec![] });
+        let one_store = |offset: i128| {
+            let [c, g] = field_gep(3, 4, offset);
+            vec![c, g, field_store(Ty::U8, 4, 0), ret()]
+        };
+        let u8_i32 = || field_struct(&[(Ty::U8, None), (Ty::I32, None)], None);
+        let reordered = field_struct(
+            &[(Ty::U8, Some(6)), (Ty::I16, Some(4)), (Ty::U32, Some(0))],
+            Some((8, 4)),
+        );
+        let cases: Vec<(&str, trust_ir::StructDef, i128)> = vec![
+            ("padding", u8_i32(), 1),
+            ("inside a field", u8_i32(), 5),
+            ("at the end", u8_i32(), 8),
+            ("past the end", u8_i32(), 12),
+            ("negative", u8_i32(), -4),
+            ("a declaration-order offset inside a declared field", reordered, 2),
+        ];
+        let failures: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(why, def, offset)| {
+                let module =
+                    field_pointer_module("field_ptr_offset", def, vec![], one_store(offset));
+                aggregate_slot_misuse_refusal(
+                    &lower_module_to_lir(&module, FuncId::new(0)),
+                    2,
+                    "GEP",
+                )
+                .err()
+                .map(|e| format!("{why}: {e}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A GEP off a struct slot that is not the producer's constant byte offset: a
+    /// runtime offset, a constant of another type, a wider pointee
+    /// (`idx * size_of(i32)`), two indices, an index or pointer with a second
+    /// definition. And a byte GEP off a TUPLE slot at a field start: tuples get no
+    /// field pointers.
+    #[test]
+    fn a_slot_gep_that_is_not_a_struct_field_pointer_is_refused() {
+        let ret = || InstrNode::new(Inst::Return { values: vec![] });
+        let gep = |pointee_ty: Ty, indices: Vec<u32>| {
+            InstrNode::new(Inst::GEP {
+                pointee_ty,
+                base: ValueId::new(2),
+                indices: indices.into_iter().map(ValueId::new).collect(),
+                inbounds: true,
+            })
+            .with_result(ValueId::new(4))
+        };
+        let const_at = |ty: Ty, value: i128| {
+            InstrNode::new(Inst::Const { ty, value: Constant::Int(value) })
+                .with_result(ValueId::new(3))
+        };
+        let cases: Vec<(&str, Vec<InstrNode>)> = vec![
+            ("runtime offset", vec![gep(Ty::I8, vec![0]), field_store(Ty::I32, 4, 1), ret()]),
+            (
+                "i32 constant",
+                vec![const_at(Ty::I32, 4), gep(Ty::I8, vec![3]), field_store(Ty::I32, 4, 1), ret()],
+            ),
+            (
+                "u64 constant",
+                vec![const_at(Ty::U64, 4), gep(Ty::I8, vec![3]), field_store(Ty::I32, 4, 1), ret()],
+            ),
+            // `gep i32 %slot, 4` is byte 16 (past the end) to the interpreter, while
+            // byte 4 starts field 1: only the pointee check refuses it.
+            (
+                "i32 pointee",
+                vec![
+                    const_at(Ty::I64, 4),
+                    gep(Ty::I32, vec![3]),
+                    field_store(Ty::I32, 4, 1),
+                    ret(),
+                ],
+            ),
+            (
+                "two indices",
+                vec![
+                    const_at(Ty::I64, 4),
+                    gep(Ty::I8, vec![3, 3]),
+                    field_store(Ty::I32, 4, 1),
+                    ret(),
+                ],
+            ),
+            // Not SSA: the index or the pointer has a second definition, so the
+            // interpreter's runtime index (or the pointer a use sees) need not be
+            // the constant the address is lowered from.
+            (
+                "index defined twice",
+                vec![
+                    const_at(Ty::I64, 4),
+                    const_at(Ty::I64, 0),
+                    gep(Ty::I8, vec![3]),
+                    field_store(Ty::I32, 4, 1),
+                    ret(),
+                ],
+            ),
+            (
+                "pointer defined twice",
+                vec![
+                    const_at(Ty::I64, 4),
+                    gep(Ty::I8, vec![3]),
+                    gep(Ty::I8, vec![3]),
+                    field_store(Ty::I32, 4, 1),
+                    ret(),
+                ],
+            ),
+        ];
+        let mut failures: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(why, tail)| {
+                let module = field_pointer_module(
+                    "struct_slot_gep",
+                    field_struct(&[(Ty::I32, None), (Ty::I32, None)], None),
+                    vec![],
+                    tail,
+                );
+                aggregate_slot_misuse_refusal(
+                    &lower_module_to_lir(&module, FuncId::new(0)),
+                    2,
+                    "GEP",
+                )
+                .err()
+                .map(|e| format!("{why}: {e}"))
+            })
+            .collect();
+        // The tuple slot `%5` of `aggregate_slot_body`, byte GEP at field 1's start.
+        let tuple = module_with_body(
+            "tuple_byte_gep",
+            vec![Ty::I32],
+            aggregate_slot_body(vec![
+                InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(4) })
+                    .with_result(ValueId::new(6)),
+                InstrNode::new(Inst::GEP {
+                    pointee_ty: Ty::I8,
+                    base: ValueId::new(5),
+                    indices: vec![ValueId::new(6)],
+                    inbounds: true,
+                })
+                .with_result(ValueId::new(7)),
+                field_load(Ty::I32, 7, 8),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(8)] }),
+            ]),
+        );
+        if let Err(e) =
+            aggregate_slot_misuse_refusal(&lower_module_to_lir(&tuple, FuncId::new(0)), 5, "GEP")
+        {
+            failures.push(format!("tuple slot: {e}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A field pointer accessed at any type but its field's (another width, the
+    /// same width and another type), volatile, or used as anything but the
+    /// pointer of that access, including the p4 class through a field pointer:
+    /// on `S { a: u8 @ 4, b: i32 @ 0 }`, offset 4 is `a`, and a 32-bit store
+    /// there (where a declaration-order `b @ 4` would put it) is refused.
+    #[test]
+    fn a_field_pointer_used_other_than_at_its_field_type_is_refused() {
+        let ret = || InstrNode::new(Inst::Return { values: vec![] });
+        let ret5 = || InstrNode::new(Inst::Return { values: vec![ValueId::new(5)] });
+        let i32_pair = || field_struct(&[(Ty::I32, None), (Ty::I32, None)], None);
+        let volatile_load = InstrNode::new(Inst::Load {
+            ty: Ty::I32,
+            ptr: ValueId::new(4),
+            volatile: true,
+            align: None,
+        })
+        .with_result(ValueId::new(5));
+        let volatile_store = InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: ValueId::new(4),
+            value: ValueId::new(0),
+            volatile: true,
+            align: None,
+        });
+        let regep = InstrNode::new(Inst::GEP {
+            pointee_ty: Ty::I8,
+            base: ValueId::new(4),
+            indices: vec![ValueId::new(3)],
+            inbounds: true,
+        })
+        .with_result(ValueId::new(5));
+        let call_with_ptr = vec![
+            InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![ValueId::new(4)] }),
+            ret(),
+        ];
+        // (inst, field index, struct, returns, tail after the field GEP at offset 4)
+        type MisuseCase = (&'static str, usize, trust_ir::StructDef, Vec<Ty>, Vec<InstrNode>);
+        let cases: Vec<MisuseCase> = vec![
+            ("Load", 1, i32_pair(), vec![Ty::I64], vec![field_load(Ty::I64, 4, 5), ret5()]),
+            ("Load", 1, i32_pair(), vec![Ty::I8], vec![field_load(Ty::I8, 4, 5), ret5()]),
+            // Same width, other type: the walk compares types, not widths.
+            ("Load", 1, i32_pair(), vec![Ty::U32], vec![field_load(Ty::U32, 4, 5), ret5()]),
+            ("Store", 1, i32_pair(), vec![], vec![field_store(Ty::I64, 4, 0), ret()]),
+            ("Store", 1, i32_pair(), vec![], vec![field_store(Ty::U32, 4, 0), ret()]),
+            ("Load", 1, i32_pair(), vec![Ty::I32], vec![volatile_load, ret5()]),
+            ("Store", 1, i32_pair(), vec![], vec![volatile_store, ret()]),
+            // The pointer stored into its own field at the field's type.
+            ("Store", 1, i32_pair(), vec![], vec![field_store(Ty::I32, 4, 4), ret()]),
+            (
+                "Return",
+                1,
+                i32_pair(),
+                vec![Ty::Ptr],
+                vec![InstrNode::new(Inst::Return { values: vec![ValueId::new(4)] })],
+            ),
+            ("GEP", 1, i32_pair(), vec![], vec![regep, ret()]),
+            (
+                "Store",
+                1,
+                i32_pair(),
+                vec![],
+                vec![
+                    InstrNode::new(Inst::Alloca { ty: Ty::Ptr, count: None, align: None })
+                        .with_result(ValueId::new(5)),
+                    field_store(Ty::Ptr, 5, 4),
+                    ret(),
+                ],
+            ),
+            (
+                "Copy",
+                1,
+                i32_pair(),
+                vec![],
+                vec![
+                    InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: ValueId::new(4) })
+                        .with_result(ValueId::new(5)),
+                    ret(),
+                ],
+            ),
+            (
+                "ICmp",
+                1,
+                i32_pair(),
+                vec![],
+                vec![
+                    InstrNode::new(Inst::ICmp {
+                        op: ICmpOp::Eq,
+                        ty: Ty::Ptr,
+                        lhs: ValueId::new(4),
+                        rhs: ValueId::new(4),
+                    })
+                    .with_result(ValueId::new(5)),
+                    ret(),
+                ],
+            ),
+            (
+                "Cast",
+                1,
+                i32_pair(),
+                vec![],
+                vec![
+                    InstrNode::new(Inst::Cast {
+                        op: trust_ir::inst::CastOp::PtrToInt,
+                        src_ty: Ty::Ptr,
+                        dst_ty: Ty::I64,
+                        operand: ValueId::new(4),
+                    })
+                    .with_result(ValueId::new(5)),
+                    ret(),
+                ],
+            ),
+            ("Call", 1, i32_pair(), vec![], call_with_ptr),
+            (
+                "Store",
+                0,
+                field_struct(&[(Ty::U8, Some(4)), (Ty::I32, Some(0))], Some((8, 4))),
+                vec![],
+                vec![field_store(Ty::I32, 4, 0), ret()],
+            ),
+        ];
+        let failures: Vec<String> = cases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, (inst, field, def, returns, tail))| {
+                let [c, g] = field_gep(3, 4, 4);
+                let mut body = vec![c, g];
+                body.extend(tail);
+                let mut module = field_pointer_module("field_ptr_misuse", def, returns, body);
+                if inst == "Call" {
+                    module.func_types.push(FuncTy {
+                        params: vec![Ty::Ptr],
+                        returns: vec![],
+                        is_vararg: false,
+                        abi: None,
+                    });
+                    let mut callee = IrFunction::new(
+                        FuncId::new(1),
+                        "takes_ptr",
+                        FuncTyId::new(1),
+                        BlockId::new(0),
+                    );
+                    let mut block = Block::new(BlockId::new(0));
+                    block.params.push((ValueId::new(0), Ty::Ptr));
+                    block.body = vec![InstrNode::new(Inst::Return { values: vec![] })];
+                    callee.blocks.push(block);
+                    module.functions.push(callee);
+                }
+                field_pointer_misuse_refusal(
+                    &lower_module_to_lir(&module, FuncId::new(0)),
+                    4,
+                    field,
+                    inst,
+                )
+                .err()
+                .map(|e| format!("row {row}: {e}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{} rows:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// A field pointer passed along a CFG edge escapes the walk's reach: refused at
+    /// the branch.
+    #[test]
+    fn a_field_pointer_passed_as_a_block_argument_is_refused() {
+        let [c, g] = field_gep(3, 4, 4);
+        let mut module = field_pointer_module(
+            "field_ptr_br_arg",
+            field_struct(&[(Ty::I32, None), (Ty::I32, None)], None),
+            vec![],
+            vec![
+                c,
+                g,
+                InstrNode::new(Inst::Br { target: BlockId::new(1), args: vec![ValueId::new(4)] }),
+            ],
+        );
+        let mut next = Block::new(BlockId::new(1));
+        next.params.push((ValueId::new(5), Ty::Ptr));
+        next.body =
+            vec![field_store(Ty::I32, 5, 0), InstrNode::new(Inst::Return { values: vec![] })];
+        module.functions[0].blocks.push(next);
+        if let Err(e) =
+            field_pointer_misuse_refusal(&lower_module_to_lir(&module, FuncId::new(0)), 4, 1, "Br")
+        {
+            panic!("{e}");
+        }
     }
 }

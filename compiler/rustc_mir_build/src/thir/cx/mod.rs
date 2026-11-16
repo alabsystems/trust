@@ -2,27 +2,35 @@
 //! structures into the THIR. The `builder` is generally ignorant of the tcx,
 //! etc., and instead goes through the `Cx` for most of its work.
 
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::steal::Steal;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items::LangItem;
-use rustc_hir::{self as hir, HirId, find_attr};
-use rustc_middle::bug;
+use rustc_hir::{self as hir, HirId};
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::bug;
 
 /// Query implementation for [`TyCtxt::thir_body`].
 pub(crate) fn thir_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner_def: LocalDefId,
 ) -> Result<(&'tcx Steal<Thir<'tcx>>, ExprId), ErrorGuaranteed> {
-    debug_assert!(!tcx.is_type_const(owner_def.to_def_id()), "thir_body queried for type_const");
+    if cfg!(debug_assertions)
+        && matches!(tcx.def_kind(owner_def), DefKind::Const | DefKind::AssocConst)
+    {
+        debug_assert!(
+            tcx.const_of_item(owner_def.to_def_id()).is_none(),
+            "thir_body queried for directly represented const item: {owner_def:?}"
+        );
+    }
 
     // Trust (P1 follow-on): serve the check-THIR from an ACCEPTED witness replay
     // instead of rebuilding it. The entry exists only after
     // `trust_build_check_thir` passed the SAME taint gate and the linear checker
-    // accepted the root (trust_replay.rs), and type_consts are never minted, so
+    // accepted the root (trust_replay.rs), and directly represented consts are never minted, so
     // this is a pure performance reuse of an already-validated THIR. Empty on any
     // miss/reject => normal build below (fail-safe). Downstream consumers get a
     // normal `&Steal<Thir>` with unchanged steal semantics.
@@ -72,7 +80,16 @@ pub(crate) fn trust_build_check_thir<'tcx>(
     def: LocalDefId,
     results: &'tcx ty::TypeckResults<'tcx>,
 ) -> Result<(Thir<'tcx>, ExprId), ErrorGuaranteed> {
-    debug_assert!(!tcx.is_type_const(def.to_def_id()), "trust_build_check_thir on type_const");
+    // Upstream 1.101 removed the mgca `type const` DefKind flag; the
+    // equivalent exclusion is upstream `thir_body`'s own: directly
+    // represented const items have no THIR body to check.
+    debug_assert!(
+        !matches!(
+            tcx.def_kind(def.to_def_id()),
+            rustc_hir::def::DefKind::Const | rustc_hir::def::DefKind::AssocConst
+        ) || tcx.const_of_item(def.to_def_id()).is_none(),
+        "trust_build_check_thir on directly represented const"
+    );
 
     let body = tcx.hir_body_owned_by(def);
     let mut cx: ThirBuildCx<'tcx> = ThirBuildCx::new_with_results(tcx, def, results);
@@ -104,7 +121,7 @@ pub(crate) fn trust_build_check_thir<'tcx>(
     // Return the root ExprId too so the accepted check-THIR can be reused as
     // the body's real THIR (the single-build follow-on); the checker itself
     // walks every `thir.exprs` node and does not need this expr.
-    let expr = cx.mirror_expr(body.value);
+    let expr = cx.mirror_expr(&body.value);
     Ok((cx.thir, expr))
 }
 
@@ -171,7 +188,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
         Self {
             tcx,
             thir: Thir::new(body_type),
-            typing_env: ty::TypingEnv::post_typeck_until_borrowck_for_mir_build(tcx, def),
+            typing_env: ty::TypingEnv::post_typeck_through_borrowck_for_mir_build(tcx, def),
             typeck_results,
             body_owner: def.to_def_id(),
             apply_adjustments: !find_attr!(tcx, hir_id, CustomMir(..)),

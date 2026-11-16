@@ -62,12 +62,15 @@
 //! iterating over an empty list.
 use trust_types::{CounterexampleValue, VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load(json: &str) -> VerifiableFunction {
     serde_json::from_str(json).expect("fixture MIR must deserialize")
 }
 
 fn router() -> trust_router::Router {
-    trust_router::Router::deterministic_in_process_ay(30_000)
+    test_router::deterministic_test_router()
 }
 
 /// Every generated VC of `func`, paired with its verdict from the SAME in-process ay

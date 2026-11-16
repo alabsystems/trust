@@ -3,7 +3,7 @@
 // N*M = 4*4 = 16 times, each adding a widened u8 (<= 255), so `t <= 16 * 255 = 4080 <
 // u32::MAX`. rustc keeps the per-iteration add-overflow check; Trust discharges it BY
 // DEFAULT via the accumulator bound with the trip count `K` taken as the PRODUCT of both
-// loops' const trip counts (`total_loop_iterations`). Pairs with the discriminating
+// loops' const trip counts (`block_execution_bound`: the loops CONTAINING the add). Pairs with the discriminating
 // overflow mutant `nested_2d_overflow` and the unbounded-inner-loop soundness mutant
 // `nested_while_unbounded`.
 pub fn nested_2d_sum(a: &[[u8; 4]; 4]) -> u32 {

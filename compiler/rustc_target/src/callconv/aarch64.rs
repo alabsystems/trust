@@ -3,7 +3,7 @@ use std::iter;
 use rustc_abi::{BackendRepr, HasDataLayout, Primitive, TyAbiInterface};
 
 use crate::callconv::{ArgAbi, FnAbi, Reg, RegKind, Uniform};
-use crate::spec::{HasTargetSpec, RustcAbi, Target};
+use crate::spec::{Arch, HasTargetSpec, RustcAbi, Target};
 
 /// Indicates the variant of the AArch64 ABI we are compiling for.
 /// Used to accommodate Apple and Microsoft's deviations from the usual AAPCS ABI.
@@ -32,10 +32,11 @@ where
 
         let valid_unit = match unit.kind {
             RegKind::Integer => false,
+            RegKind::PpcF128 => unreachable!(),
             // The softfloat ABI treats floats like integers, so they
             // do not get homogeneous aggregate treatment.
             RegKind::Float => cx.target_spec().rustc_abi != Some(RustcAbi::Softfloat),
-            RegKind::Vector { .. } => size.bits() == 64 || size.bits() == 128,
+            RegKind::Vector { .. } => unit.size.bits() == 64 || unit.size.bits() == 128,
         };
 
         valid_unit.then_some(Uniform::consecutive(unit, size))
@@ -56,7 +57,7 @@ fn softfloat_float_abi<Ty>(target: &Target, arg: &mut ArgAbi<'_, Ty>) {
         && let Primitive::Float(f) = s.primitive()
     {
         arg.cast_to(Reg { kind: RegKind::Integer, size: f.size() });
-    } else if let BackendRepr::ScalarPair(s1, s2) = arg.layout.backend_repr
+    } else if let BackendRepr::ScalarPair { a: s1, b: s2, b_offset: _ } = arg.layout.backend_repr
         && (matches!(s1.primitive(), Primitive::Float(_))
             || matches!(s2.primitive(), Primitive::Float(_)))
     {
@@ -144,7 +145,7 @@ where
         // See: <https://github.com/llvm/llvm-project/blob/5e691a1c9b0ad22689d4a434ddf4fed940e58dec/clang/lib/CodeGen/TargetInfo.cpp#L5816-L5823>
         arg.layout.unadjusted_abi_align
     } else {
-        arg.layout.align.abi
+        arg.layout.align
     };
     if size.bits() <= 128 {
         if align.bits() == 128 {
@@ -166,10 +167,26 @@ where
         classify_ret(cx, &mut fn_abi.ret, kind);
     }
 
-    for arg in fn_abi.args.iter_mut() {
+    // On Arm64EC the variadic portion of a c-variadic call follows the MS x64 ABI:
+    // "Any argument that doesn't fit in 8 bytes, or is not 1, 2, 4, or 8 bytes, must
+    // be passed by reference".
+    let c_variadic = fn_abi.c_variadic;
+    let fixed_count = fn_abi.fixed_count as usize;
+    let is_arm64ec = cx.target_spec().arch == Arch::Arm64EC;
+
+    for (idx, arg) in fn_abi.args.iter_mut().enumerate() {
         if arg.is_ignore() {
             continue;
         }
+
+        if is_arm64ec && c_variadic && idx >= fixed_count {
+            let size = arg.layout.size.bytes();
+            if size > 8 || !size.is_power_of_two() {
+                arg.make_indirect();
+                continue;
+            }
+        }
+
         classify_arg(cx, arg, kind);
     }
 }

@@ -87,8 +87,13 @@ pub(crate) struct DoctorConfigStatus {
     pub(crate) detail: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) level: String,
-    pub(crate) timeout_ms: u64,
-    pub(crate) function_budget_ms: u64,
+    /// The one effort count's scale `k` (`[trust] effort`).
+    pub(crate) effort: u64,
+    /// The backstop, per mille of the reference clocks (`[trust] backstop`).
+    pub(crate) backstop: u32,
+    /// The budget profile header line: the id, its bounds and the derived
+    /// clocks.
+    pub(crate) budget_profile: String,
     pub(crate) configured_codegen_backend: Option<String>,
     pub(crate) configured_hardened: Option<bool>,
     pub(crate) configured_trust_profile: Option<String>,
@@ -106,6 +111,107 @@ pub(crate) struct DoctorCompilerStatus {
     pub(crate) trust_verify: Option<bool>,
     pub(crate) json_transport: Option<bool>,
     pub(crate) check_report_mode: DoctorCheckReportMode,
+    /// The selected compiler's build commit and its age (`trustc -vV`). A
+    /// delivered seal does not move while main does, so its age is how far
+    /// this machine's verifier lags what has landed.
+    pub(crate) toolchain_age: Option<DoctorToolchainAge>,
+}
+
+/// Past this age `targo trust doctor` warns that the toolchain is stale. It
+/// does not change readiness: an old seal still verifies what it verifies.
+pub(crate) const TOOLCHAIN_STALE_AFTER_DAYS: i64 = 42;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DoctorToolchainAge {
+    pub(crate) commit_hash: Option<String>,
+    pub(crate) commit_date: String,
+    /// Whole days from `commit_date` to today (UTC); `None` when the clock is
+    /// before the epoch or the date does not parse.
+    pub(crate) age_days: Option<i64>,
+    pub(crate) stale: bool,
+}
+
+/// Read `commit-hash:` and `commit-date:` from `trustc -vV` output.
+pub(crate) fn parse_toolchain_age(
+    verbose_version: &str,
+    today_days: Option<i64>,
+) -> Option<DoctorToolchainAge> {
+    let field = |key: &str| {
+        verbose_version.lines().find_map(|line| {
+            line.strip_prefix(key)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != "unknown")
+                .map(str::to_string)
+        })
+    };
+    let commit_date = field("commit-date:")?;
+    let age_days = days_from_civil_date(&commit_date)
+        .zip(today_days)
+        .map(|(built, today)| today - built)
+        .filter(|age| *age >= 0);
+    Some(DoctorToolchainAge {
+        commit_hash: field("commit-hash:"),
+        commit_date,
+        age_days,
+        stale: age_days.is_some_and(|age| age > TOOLCHAIN_STALE_AFTER_DAYS),
+    })
+}
+
+/// Days since 1970-01-01 of a `YYYY-MM-DD` date (proleptic Gregorian).
+fn days_from_civil_date(date: &str) -> Option<i64> {
+    let mut parts = date.splitn(3, '-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
+}
+
+fn today_days_utc() -> Option<i64> {
+    let seconds =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds / 86_400).ok()
+}
+
+/// The age probe's production bound: the selected compiler's `-vV` host probe
+/// (`exact_rustc_host_triple_budget`, `pipeline/run.rs`) uses the same.
+const TOOLCHAIN_AGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn detect_toolchain_age(rustc: &Path) -> Option<DoctorToolchainAge> {
+    detect_toolchain_age_within(
+        rustc,
+        crate::bounded_process::resolve_probe_deadline(TOOLCHAIN_AGE_PROBE_TIMEOUT),
+    )
+}
+
+/// `rustc -vV` as the host probe runs it: a cleared environment, a deadline and a
+/// 64 KiB output cap. A compiler that hangs (an exec stuck at `_dyld_start`, say),
+/// fails or floods gives no age, and doctor goes on to its other checks.
+fn detect_toolchain_age_within(
+    rustc: &Path,
+    timeout: std::time::Duration,
+) -> Option<DoctorToolchainAge> {
+    let mut command = std::process::Command::new(rustc);
+    command.arg("-vV").env_clear();
+    let output = crate::bounded_process::output_with_exact_deadline(
+        &mut command,
+        &format!("selected compiler {} -vV age probe", rustc.display()),
+        64 * 1024,
+        timeout,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_toolchain_age(&String::from_utf8_lossy(&output.stdout), today_days_utc())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,8 +358,9 @@ pub(crate) fn load_doctor_config(crate_root: &Path) -> (TrustConfig, DoctorConfi
             detail,
             enabled: config.enabled,
             level: config.level.clone(),
-            timeout_ms: config.timeout_ms,
-            function_budget_ms: config.function_budget_ms,
+            effort: config.effort.conflicts_per_node,
+            backstop: config.backstop.per_mille,
+            budget_profile: crate::determinism_report::budget_profile(config).header_line(),
             configured_codegen_backend: config.codegen_backend.clone(),
             configured_hardened: config.hardened,
             configured_trust_profile: config.trust_profile.clone(),
@@ -262,10 +369,12 @@ pub(crate) fn load_doctor_config(crate_root: &Path) -> (TrustConfig, DoctorConfi
 
     match resolve_trust_config(crate_root, None) {
         Ok(resolved) => {
-            let mut detail = resolved
-                .workspace_defaults_from
-                .as_ref()
-                .map(|workspace| format!("unset keys inherited from {}", workspace.display()));
+            let mut detail = resolved.member_manifest.as_ref().map(|member| {
+                format!(
+                    "{} is a workspace member; its policy is the workspace root's",
+                    member.display()
+                )
+            });
             let (kind, path) = match resolved.source {
                 TrustConfigSource::Manifest(path) => (DoctorConfigSourceKind::Manifest, path),
                 TrustConfigSource::LegacyFile(path) => {
@@ -396,6 +505,29 @@ fn build_doctor_daily_driver_status(
     status
 }
 
+/// The terminal line for the compiler's build commit and age, with the stale
+/// warning past [`TOOLCHAIN_STALE_AFTER_DAYS`].
+pub(crate) fn describe_toolchain_age(age: Option<&DoctorToolchainAge>) -> Option<String> {
+    let age = age?;
+    let commit = age.commit_hash.as_deref().map(|hash| {
+        let short = hash.get(..10).unwrap_or(hash);
+        format!("{short}, ")
+    });
+    let commit = commit.unwrap_or_default();
+    let mut line = match age.age_days {
+        Some(days) => format!("built from: {commit}{} ({days} days ago)", age.commit_date),
+        None => format!("built from: {commit}{}", age.commit_date),
+    };
+    if age.stale {
+        line.push_str(&format!(
+            "\n  warning: this toolchain is more than {TOOLCHAIN_STALE_AFTER_DAYS} days old; \
+             work landed on Trust's main since then does not run here until a newer Trust \
+             toolchain is installed"
+        ));
+    }
+    Some(line)
+}
+
 pub(crate) fn describe_config_source(config: &DoctorConfigStatus) -> String {
     match config.source {
         DoctorConfigSourceKind::Manifest | DoctorConfigSourceKind::LegacyFile => {
@@ -477,7 +609,7 @@ fn doctor_next_steps(report: &DoctorReport) -> Vec<String> {
 
     if report.solvers.routed_available == 0 {
         steps.push(
-            "Install `ay` or set AY_PATH, or build/link a Trust toolchain with in-process native verifier suites, so compiler-backed source verification has a routed solver."
+            "No solver in this report is routed for compiler-backed source verification, which runs the `ay` linked into the Trust compiler: omit `--solver`, or pass `--solver ay`."
                 .to_string(),
         );
     }
@@ -492,7 +624,52 @@ fn doctor_next_steps(report: &DoctorReport) -> Vec<String> {
 }
 
 pub(crate) fn is_source_solver_routed(name: &str) -> bool {
-    matches!(name, "ay")
+    name == COMPILER_LINKED_SOURCE_SOLVER
+}
+
+/// Plan P4 / T4.1: the source solver the Trust compiler links. Compiler-backed
+/// source verification routes through it whether or not an external `ay` is
+/// installed; an external `ay` binary is used only by `verify-binary`.
+pub(crate) const COMPILER_LINKED_SOURCE_SOLVER: &str = "ay";
+
+/// The routing column of a solver row in `doctor` and `solvers`.
+fn source_routing_label(
+    solver: &solver_detect::SolverInfo,
+    verifier_suites: &[DoctorVerifierSuiteStatus],
+) -> &'static str {
+    if is_source_solver_routed(&solver.name) {
+        "source-routed: linked into trustc"
+    } else if doctor_solver_has_native_source_route(&solver.name, verifier_suites) {
+        "in-process source-routed"
+    } else if solver.available {
+        "detected-only"
+    } else {
+        "not source-routed"
+    }
+}
+
+/// A solver row's probe error. For the compiler-linked solver it concerns only
+/// the external binary `verify-binary` runs.
+fn print_solver_diagnostic(solver: &solver_detect::SolverInfo) {
+    let Some(diagnostic) = &solver.diagnostic else { return };
+    let diagnostic = solver_detect::terminal_safe(diagnostic);
+    if is_source_solver_routed(&solver.name) {
+        eprintln!("             external binary for verify-binary: {diagnostic}");
+    } else {
+        eprintln!("             ERROR: {diagnostic}");
+    }
+}
+
+/// Where a solver row's binary is. For the compiler-linked solver the path is
+/// the external binary `verify-binary` runs, not what source verification uses.
+fn solver_path_suffix(solver: &solver_detect::SolverInfo) -> String {
+    let Some(path) = solver.path.as_deref() else { return String::new() };
+    let path = solver_detect::terminal_safe(&path.display().to_string());
+    if is_source_solver_routed(&solver.name) {
+        format!(" (external binary for verify-binary at {path})")
+    } else {
+        format!(" at {path}")
+    }
 }
 
 pub(crate) fn supported_source_solver_names() -> &'static str {
@@ -559,6 +736,9 @@ pub(crate) fn build_doctor_report(sub_args: &SubcommandArgs) -> DoctorReport {
             compiler_discovery.as_ref().map(|discovery| discovery.rustc.as_path()),
             capabilities.map(|caps| caps.trust_verify),
         ),
+        toolchain_age: compiler_discovery
+            .as_ref()
+            .and_then(|discovery| detect_toolchain_age(&discovery.rustc)),
     };
 
     let verifier_suites = verifier_suite_statuses();
@@ -608,6 +788,13 @@ pub(crate) fn mark_doctor_in_process_solver_routes(
 ) {
     for solver in solvers {
         if solver.available {
+            continue;
+        }
+        if is_source_solver_routed(&solver.name) {
+            // Plan P4 / T4.1: no external binary is needed for source
+            // verification; the probe's result speaks only for verify-binary.
+            solver.available = true;
+            solver.version = Some("linked into trustc".to_string());
             continue;
         }
         if let Some(suite) = doctor_native_suite_for_solver(&solver.name, verifier_suites) {
@@ -892,6 +1079,9 @@ pub(crate) fn print_doctor_terminal(report: &DoctorReport) {
         Some(source) => eprintln!("  discovery: {}", source.label()),
         None => eprintln!("  discovery: unresolved"),
     }
+    if let Some(line) = describe_toolchain_age(report.compiler.toolchain_age.as_ref()) {
+        eprintln!("  {line}");
+    }
     eprintln!(
         "  Trust toolchain surface: {}",
         describe_linked_toolchain(
@@ -951,8 +1141,7 @@ pub(crate) fn print_doctor_terminal(report: &DoctorReport) {
     eprintln!("  source: {}", describe_config_source(&report.config));
     eprintln!("  enabled: {}", report.config.enabled);
     eprintln!("  level: {}", report.config.level);
-    eprintln!("  timeout_ms: {}", report.config.timeout_ms);
-    eprintln!("  function_budget_ms: {}", report.config.function_budget_ms);
+    eprintln!("  {}", report.config.budget_profile);
     if let Some(backend) = report.config.configured_codegen_backend.as_deref() {
         eprintln!("  configured backend: {backend}");
     }
@@ -981,33 +1170,19 @@ pub(crate) fn print_doctor_terminal(report: &DoctorReport) {
     }
     for solver in &report.solvers.solvers {
         let status = if solver.available { "FOUND" } else { "MISSING" };
-        let routing = if is_source_solver_routed(&solver.name) {
-            "source-routed"
-        } else if doctor_solver_has_native_source_route(&solver.name, &report.verifier_suites) {
-            "in-process source-routed"
-        } else {
-            "not source-routed"
-        };
+        let routing = source_routing_label(solver, &report.verifier_suites);
         let version = solver
             .version
             .as_deref()
             .map(|value| format!(" ({})", solver_detect::terminal_safe(value)))
             .unwrap_or_default();
-        let path = solver
-            .path
-            .as_deref()
-            .map(|path| {
-                format!(" at {}", solver_detect::terminal_safe(&path.display().to_string()))
-            })
-            .unwrap_or_default();
+        let path = solver_path_suffix(solver);
         eprintln!(
             "  [{status:>7}] {:<10} {} [{routing}]{version}{path}",
             solver_detect::terminal_safe(&solver.name),
             solver_detect::terminal_safe(&solver.description)
         );
-        if let Some(diagnostic) = &solver.diagnostic {
-            eprintln!("             ERROR: {}", solver_detect::terminal_safe(diagnostic));
-        }
+        print_solver_diagnostic(solver);
     }
     eprintln!();
     eprintln!("Verifier suites:");
@@ -1069,15 +1244,7 @@ pub(crate) fn print_solvers_terminal(
     eprintln!();
     for solver in solvers {
         let status = if solver.available { "FOUND" } else { "MISSING" };
-        let routing = if is_source_solver_routed(&solver.name) {
-            "source-routed"
-        } else if doctor_solver_has_native_source_route(&solver.name, verifier_suites) {
-            "in-process source-routed"
-        } else if solver.available {
-            "detected-only"
-        } else {
-            "not source-routed"
-        };
+        let routing = source_routing_label(solver, verifier_suites);
         let levels = if solver.proof_levels.is_empty() {
             String::new()
         } else {
@@ -1088,21 +1255,13 @@ pub(crate) fn print_solvers_terminal(
             .as_deref()
             .map(|value| format!(" ({})", solver_detect::terminal_safe(value)))
             .unwrap_or_default();
-        let path = solver
-            .path
-            .as_deref()
-            .map(|path| {
-                format!(" at {}", solver_detect::terminal_safe(&path.display().to_string()))
-            })
-            .unwrap_or_default();
+        let path = solver_path_suffix(solver);
         eprintln!(
             "  [{status:>7}] {:<10} {}{levels} [{routing}]{version}{path}",
             solver_detect::terminal_safe(&solver.name),
             solver_detect::terminal_safe(&solver.description)
         );
-        if let Some(diagnostic) = &solver.diagnostic {
-            eprintln!("             ERROR: {}", solver_detect::terminal_safe(diagnostic));
-        }
+        print_solver_diagnostic(solver);
     }
 
     let (availability_summary, routing_summary) =
@@ -1114,7 +1273,7 @@ pub(crate) fn print_solvers_terminal(
     if routed_available == 0 {
         eprintln!();
         eprintln!(
-            "No routed source solver found. Install ay, set AY_PATH, or build/link Trust with in-process native verifier suites."
+            "No solver listed here is routed for compiler-backed source verification, which runs the `ay` linked into the Trust compiler: omit `--solver`, or pass `--solver ay`."
         );
     } else if available > routed_available {
         eprintln!();
@@ -1134,7 +1293,7 @@ fn solver_summary_lines(
     (
         format!("Solver availability: {available}/{total} available"),
         format!(
-            "Source verification routing: {routed_available}/{total} routed ({}, plus compiled native suites)",
+            "Source verification routing: {routed_available}/{total} routed ({} linked into trustc, plus compiled native suites)",
             supported_source_solver_names()
         ),
     )
@@ -1208,8 +1367,9 @@ mod tests {
                 detail: None,
                 enabled: true,
                 level: "L1".to_string(),
-                timeout_ms: 5_000,
-                function_budget_ms: 120_000,
+                effort: trust_types::determinism::EffortScale::BUILTIN.conflicts_per_node,
+                backstop: trust_types::determinism::Backstop::BUILTIN.per_mille,
+                budget_profile: trust_types::determinism::BudgetProfile::builtin().header_line(),
                 configured_codegen_backend: None,
                 configured_hardened: None,
                 configured_trust_profile: None,
@@ -1405,6 +1565,7 @@ mod tests {
             trust_verify: Some(true),
             json_transport: Some(true),
             check_report_mode: DoctorCheckReportMode::NativeCompiler,
+            toolchain_age: None,
         });
         let capable_suites = fully_capable_default_native_suites();
 
@@ -1468,6 +1629,60 @@ mod tests {
         );
     }
 
+    /// Plan P4 / T4.1: compiler-backed source verification runs the `ay` linked
+    /// into trustc, so a missing external `ay` neither unroutes it nor makes
+    /// doctor tell the user to install one. A found external `ay` keeps its
+    /// probe identity, which is what `verify-binary` runs.
+    #[test]
+    fn test_linked_ay_is_routed_without_an_external_binary() {
+        let mut missing = available_solver();
+        missing.available = false;
+        missing.path = None;
+        missing.version = None;
+        missing.diagnostic = Some("`ay` was not found beside targo-trust or on PATH".to_string());
+        let found = available_solver();
+        let mut other = available_solver();
+        other.name = "cvc5".to_string();
+        other.available = false;
+        other.path = None;
+        let suites = fully_capable_default_native_suites();
+
+        let mut solvers = vec![missing, found.clone(), other];
+        mark_doctor_in_process_solver_routes(&mut solvers, &suites);
+
+        assert!(solvers[0].available, "the linked ay needs no external binary");
+        assert_eq!(solvers[0].version.as_deref(), Some("linked into trustc"));
+        assert_eq!(source_routing_label(&solvers[0], &suites), "source-routed: linked into trustc");
+        assert_eq!(
+            (&solvers[1].path, &solvers[1].version),
+            (&found.path, &found.version),
+            "an external ay keeps its probe identity"
+        );
+        assert!(solver_path_suffix(&solvers[1]).contains("external binary for verify-binary"));
+        assert!(!solvers[2].available, "an unrouted solver is not marked by the ay rule");
+
+        let mut report = report_with_compiler(DoctorCompilerStatus {
+            path: Some(PathBuf::from("/tmp/trust/bin/trustc")),
+            discovery_source: None,
+            discovery_error: None,
+            linked_toolchain_status: LinkedTrustToolchainStatusKind::Visible,
+            linked_toolchain_path: Some(PathBuf::from("/tmp/trust/bin/trustc")),
+            linked_toolchain_detail: None,
+            daily_driver: ready_daily_driver_status(),
+            trust_verify: Some(true),
+            json_transport: Some(true),
+            check_report_mode: DoctorCheckReportMode::NativeCompiler,
+            toolchain_age: None,
+        });
+        report.solvers.routed_available = 0;
+        let steps = doctor_next_steps(&report);
+        assert!(
+            steps.iter().all(|step| !step.contains("Install `ay`") && !step.contains("AY_PATH")),
+            "no next step may send the user after an external ay for source verification: \
+             {steps:?}"
+        );
+    }
+
     #[test]
     fn test_solver_summary_distinguishes_inventory_from_source_routes() {
         let (availability, routing) = solver_summary_lines(6, 4, 6);
@@ -1476,7 +1691,7 @@ mod tests {
         assert!(!availability.contains("route"));
         assert_eq!(
             routing,
-            "Source verification routing: 4/6 routed (ay, plus compiled native suites)"
+            "Source verification routing: 4/6 routed (ay linked into trustc, plus compiled native suites)"
         );
     }
 
@@ -1501,6 +1716,7 @@ mod tests {
             trust_verify: None,
             json_transport: None,
             check_report_mode: DoctorCheckReportMode::NativeRequired,
+            toolchain_age: None,
         });
 
         let steps = doctor_next_steps(&report);
@@ -1510,5 +1726,77 @@ mod tests {
             && step.contains("trustfmt")
             && step.contains("trust-analyzer")));
         assert!(steps.iter().any(|step| step.contains("daily-driver toolchain surface")));
+    }
+
+    #[test]
+    fn toolchain_age_reads_trustc_verbose_version_and_warns_past_the_limit() {
+        let vv = "rustc 1.101.0-dev (29ebb403d 2026-10-28) (trustc 0.12.0+g29ebb403d)\n\
+                  binary: trustc\n\
+                  commit-hash: 29ebb403de7a102850d6cb10a62d5cc3baf723ed\n\
+                  commit-date: 2026-10-28\n\
+                  host: aarch64-apple-darwin\n";
+        let built = super::days_from_civil_date("2026-10-28").expect("date parses");
+        assert_eq!(super::days_from_civil_date("1970-01-01"), Some(0));
+        assert_eq!(super::days_from_civil_date("2000-03-01"), Some(11_017));
+
+        let fresh = super::parse_toolchain_age(vv, Some(built + 16)).expect("age parses");
+        assert_eq!(fresh.commit_hash.as_deref(), Some("29ebb403de7a102850d6cb10a62d5cc3baf723ed"));
+        assert_eq!(fresh.commit_date, "2026-10-28");
+        assert_eq!(fresh.age_days, Some(16));
+        assert!(!fresh.stale);
+        let line = super::describe_toolchain_age(Some(&fresh)).expect("line");
+        assert_eq!(line, "built from: 29ebb403de, 2026-10-28 (16 days ago)");
+
+        let at_limit = super::parse_toolchain_age(vv, Some(built + 42)).unwrap();
+        assert!(!at_limit.stale, "the limit itself is not stale");
+        let stale = super::parse_toolchain_age(vv, Some(built + 43)).unwrap();
+        assert!(stale.stale);
+        assert!(
+            super::describe_toolchain_age(Some(&stale)).unwrap().contains("more than 42 days old"),
+        );
+
+        let unknown = "rustc 1.101.0-dev\ncommit-hash: unknown\ncommit-date: unknown\n";
+        assert_eq!(super::parse_toolchain_age(unknown, Some(built)), None);
+        let clockless = super::parse_toolchain_age(vv, None).unwrap();
+        assert_eq!(clockless.age_days, None);
+        assert!(!clockless.stale);
+    }
+
+    /// A compiler whose `-vV` never returns must not hang `targo trust doctor`.
+    /// Control: the production probe, under the harness's stretched deadline
+    /// (`resolve_probe_deadline`), reads a fake compiler that answers. A fixed
+    /// short deadline there would fail on a loaded Mac, where a newly written
+    /// script can wait in the system's program check before it starts.
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_age_probe_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake trustc");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake trustc");
+            path
+        };
+        let answers = fake(
+            "answers",
+            "printf 'rustc 1.101.0-dev\\ncommit-hash: 29ebb403de7a102850d6cb10a62d5cc3baf723ed\\n\
+             commit-date: 2026-10-28\\nhost: aarch64-apple-darwin\\n'",
+        );
+        let control = super::detect_toolchain_age(&answers).expect("the control compiler's age is read");
+        assert_eq!(control.commit_date, "2026-10-28");
+
+        let hangs = fake("hangs", "exec /bin/sleep 60");
+        let started = std::time::Instant::now();
+        assert!(
+            super::detect_toolchain_age_within(&hangs, std::time::Duration::from_millis(500)).is_none(),
+            "a compiler that never answers has no age"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the probe waited {:?} for a hung compiler",
+            started.elapsed()
+        );
     }
 }

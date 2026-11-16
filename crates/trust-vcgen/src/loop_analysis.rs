@@ -1,7 +1,7 @@
 // trust_vcgen/loop_analysis.rs: Structured loop analysis from MIR CFG
 //
 // Builds on the basic back-edge detection in termination.rs with richer
-// loop information: exit blocks, induction variables with init/step/bound,
+// loop information: exit blocks, induction variables with their initial value,
 // and natural loop membership via dominator-free heuristics on MIR's
 // structured block layout.
 //
@@ -11,29 +11,16 @@
 use trust_types::fx::FxHashSet;
 use trust_types::*;
 
-/// Direction an induction variable moves on each iteration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StepDirection {
-    Ascending,
-    Descending,
-}
-
 /// An induction variable detected inside a loop.
+///
+/// Carries exactly what production reads: `chc::build_init_args` matches
+/// `local_idx` and inlines `init` as the invariant's initial state.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields read in tests; struct populated by detect_loops
 pub(crate) struct InductionVar {
     /// Local variable index in the function body.
     pub(crate) local_idx: usize,
-    /// Human-readable variable name.
-    pub(crate) name: String,
     /// Initial value formula (assigned before the loop or at loop entry).
     pub(crate) init: Option<Formula>,
-    /// Step size per iteration (positive = ascending, negative = descending).
-    pub(crate) step: i128,
-    /// Direction of change.
-    pub(crate) direction: StepDirection,
-    /// Upper or lower bound from the loop condition, if detected.
-    pub(crate) bound: Option<Formula>,
 }
 
 /// Rich loop information extracted from the MIR CFG.
@@ -77,6 +64,26 @@ impl LoopInfo {
     }
 }
 
+/// True iff any block in `func.body.blocks` has a CFG back-edge (`succ.0 <= block.id.0`).
+#[must_use]
+pub(crate) fn has_back_edge(func: &VerifiableFunction) -> bool {
+    if let Some(tp) = crate::generate::cached_terminator_presence_for_body(&func.body) {
+        return tp.has_back_edge;
+    }
+    for block in &func.body.blocks {
+        let mut found = false;
+        for_each_successor(&block.terminator, |succ| {
+            if succ.0 <= block.id.0 {
+                found = true;
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect natural loops in the CFG by finding back-edges.
 ///
 /// A back-edge is a CFG edge where the target block ID <= the source block ID.
@@ -87,36 +94,58 @@ impl LoopInfo {
 /// that fall outside the loop body.
 #[must_use]
 pub fn detect_loops(func: &VerifiableFunction) -> Vec<LoopInfo> {
+    if crate::generate::cached_terminator_presence_for_body(&func.body)
+        .is_some_and(|tp| !tp.has_back_edge)
+    {
+        return Vec::new();
+    }
     let mut loops = Vec::new();
+    let mut dense_blocks: Option<bool> = None;
 
     for block in &func.body.blocks {
-        let successors = block_successors(&block.terminator);
-        for succ in successors {
+        for_each_successor(&block.terminator, |succ| {
             if succ.0 <= block.id.0 {
                 let header = succ;
                 let latch = block.id;
+                let is_dense = *dense_blocks.get_or_insert_with(|| {
+                    func.body.blocks.iter().enumerate().all(|(i, bb)| bb.id.0 == i)
+                });
 
-                let body_set: FxHashSet<usize> = func
-                    .body
-                    .blocks
-                    .iter()
-                    .filter(|bb| bb.id.0 >= header.0 && bb.id.0 <= latch.0)
-                    .map(|bb| bb.id.0)
-                    .collect();
-
-                let body_blocks: Vec<BlockId> = body_set.iter().map(|&id| BlockId(id)).collect();
-
-                // Exit blocks: successors of body blocks that are NOT in the body
+                let cap = latch.0.saturating_sub(header.0).saturating_add(1);
                 let mut exit_blocks = Vec::new();
-                for &body_id in &body_set {
-                    if let Some(bb) = func.body.blocks.get(body_id) {
-                        for s in block_successors(&bb.terminator) {
-                            if !body_set.contains(&s.0) && !exit_blocks.contains(&s) {
-                                exit_blocks.push(s);
-                            }
+                let body_blocks: Vec<BlockId> = if is_dense {
+                    let body_blocks: Vec<BlockId> = (header.0..=latch.0).map(BlockId).collect();
+                    if let Some(slice) = func.body.blocks.get(header.0..=latch.0) {
+                        for bb in slice {
+                            for_each_successor(&bb.terminator, |s| {
+                                if (s.0 < header.0 || s.0 > latch.0) && !exit_blocks.contains(&s) {
+                                    exit_blocks.push(s);
+                                }
+                            });
                         }
                     }
-                }
+                    body_blocks
+                } else {
+                    let mut body_set: FxHashSet<usize> =
+                        FxHashSet::with_capacity_and_hasher(cap, Default::default());
+                    let mut body_blocks: Vec<BlockId> = Vec::with_capacity(cap);
+                    for bb in &func.body.blocks {
+                        if bb.id.0 >= header.0 && bb.id.0 <= latch.0 && body_set.insert(bb.id.0) {
+                            body_blocks.push(bb.id);
+                        }
+                    }
+                    // Exit blocks: successors of body blocks that are NOT in the body
+                    for &body_id in &body_blocks {
+                        if let Some(bb) = func.body.blocks.get(body_id.0) {
+                            for_each_successor(&bb.terminator, |s| {
+                                if !body_set.contains(&s.0) && !exit_blocks.contains(&s) {
+                                    exit_blocks.push(s);
+                                }
+                            });
+                        }
+                    }
+                    body_blocks
+                };
 
                 loops.push(LoopInfo {
                     header,
@@ -126,7 +155,7 @@ pub fn detect_loops(func: &VerifiableFunction) -> Vec<LoopInfo> {
                     induction_vars: Vec::new(),
                 });
             }
-        }
+        });
     }
 
     // Populate induction variables for each loop
@@ -143,17 +172,15 @@ pub fn detect_loops(func: &VerifiableFunction) -> Vec<LoopInfo> {
 /// 1. Is assigned as `var = var +/- constant` in the loop body
 /// 2. Has an integer type
 ///
-/// We also attempt to find the initial value (from assignments before the loop)
-/// and the loop bound (from comparisons in the header block).
+/// We also attempt to find the initial value (from assignments before the loop).
 #[must_use]
 pub(crate) fn find_induction_variables(
     loop_info: &LoopInfo,
     func: &VerifiableFunction,
 ) -> Vec<InductionVar> {
-    let body_set: FxHashSet<usize> = loop_info.body_blocks.iter().map(|b| b.0).collect();
     let mut vars = Vec::new();
 
-    for &body_id in &body_set {
+    for &BlockId(body_id) in &loop_info.body_blocks {
         let Some(block) = func.body.blocks.get(body_id) else {
             continue;
         };
@@ -163,37 +190,22 @@ pub(crate) fn find_induction_variables(
                     continue;
                 }
                 let local_idx = place.local;
+                // Already found this variable?
+                if vars.iter().any(|v: &InductionVar| v.local_idx == local_idx) {
+                    continue;
+                }
+                if detect_step(rvalue, local_idx).is_none() {
+                    continue;
+                }
                 let Some(decl) = func.body.locals.get(local_idx) else {
                     continue;
                 };
                 if !decl.ty.is_integer() {
                     continue;
                 }
-                // Already found this variable?
-                if vars.iter().any(|v: &InductionVar| v.local_idx == local_idx) {
-                    continue;
-                }
 
-                let step = detect_step(rvalue, local_idx);
-                if let Some(step_val) = step {
-                    let name = decl.name.clone().unwrap_or_else(|| format!("_{local_idx}"));
-                    let direction = if step_val > 0 {
-                        StepDirection::Ascending
-                    } else {
-                        StepDirection::Descending
-                    };
-                    let init = find_init_value(func, loop_info, local_idx);
-                    let bound = find_loop_bound(func, loop_info, local_idx);
-
-                    vars.push(InductionVar {
-                        local_idx,
-                        name,
-                        init,
-                        step: step_val,
-                        direction,
-                        bound,
-                    });
-                }
+                let init = find_init_value(func, loop_info, local_idx);
+                vars.push(InductionVar { local_idx, init });
             }
         }
     }
@@ -250,76 +262,47 @@ fn find_init_value(
     if crate::local_defs::is_parameter(func, local_idx) {
         return None;
     }
-    for block in &func.body.blocks {
+    crate::find_local_write_stmt(func, &func.body.blocks, local_idx, |block, stmt| {
         // Only look in blocks before the loop header
         if block.id.0 >= loop_info.header.0 {
-            break;
+            return Some(None);
         }
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt
-                && place.local == local_idx
-                && place.projections.is_empty()
-                && let Rvalue::Use(op) = rvalue
-            {
-                return Some(crate::operand_to_formula(func, op));
-            }
+        if let Statement::Assign { place, rvalue, .. } = stmt
+            && place.local == local_idx
+            && place.projections.is_empty()
+            && let Rvalue::Use(op) = rvalue
+        {
+            return Some(Some(crate::operand_to_formula(func, op)));
         }
-    }
-    None
+        None
+    })
+    .flatten()
 }
 
-/// Find the loop bound from the header block's comparison involving the given local.
-fn find_loop_bound(
-    func: &VerifiableFunction,
-    loop_info: &LoopInfo,
-    local_idx: usize,
-) -> Option<Formula> {
-    let header_block = func.body.blocks.get(loop_info.header.0)?;
-
-    for stmt in &header_block.stmts {
-        if let Statement::Assign { rvalue, .. } = stmt {
-            match rvalue {
-                // i < bound or i <= bound
-                Rvalue::BinaryOp(BinOp::Lt | BinOp::Le, Operand::Copy(lhs), rhs)
-                    if lhs.local == local_idx && lhs.projections.is_empty() =>
-                {
-                    return Some(crate::operand_to_formula(func, rhs));
-                }
-                // bound > i or bound >= i
-                Rvalue::BinaryOp(BinOp::Gt | BinOp::Ge, rhs, Operand::Copy(lhs))
-                    if lhs.local == local_idx && lhs.projections.is_empty() =>
-                {
-                    return Some(crate::operand_to_formula(func, rhs));
-                }
-                // i > bound (descending loop)
-                Rvalue::BinaryOp(BinOp::Gt | BinOp::Ge, Operand::Copy(lhs), rhs)
-                    if lhs.local == local_idx && lhs.projections.is_empty() =>
-                {
-                    return Some(crate::operand_to_formula(func, rhs));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    None
-}
-
-/// Get all successor block IDs from a terminator.
-fn block_successors(term: &Terminator) -> Vec<BlockId> {
+/// Visit all successor block IDs from a terminator without allocating a `Vec`.
+pub(crate) fn for_each_successor(term: &Terminator, mut f: impl FnMut(BlockId)) {
     match term {
-        Terminator::Goto(target) => vec![*target],
+        Terminator::Goto(target)
+        | Terminator::Assert { target, .. }
+        | Terminator::Drop { target, .. } => f(*target),
         Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut succs: Vec<BlockId> = targets.iter().map(|(_, t)| *t).collect();
-            succs.push(*otherwise);
-            succs
+            for &(_, t) in targets {
+                f(t);
+            }
+            f(*otherwise);
         }
-        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => vec![],
-        Terminator::Call { target, .. } => target.iter().copied().collect(),
-        Terminator::Assert { target, .. } => vec![*target],
-        Terminator::Drop { target, .. } => vec![*target],
-        Terminator::Opaque { targets, .. } => targets.clone(),
-        _ => vec![],
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unreachable => {}
+        Terminator::Call { target, .. } => {
+            if let Some(t) = *target {
+                f(t);
+            }
+        }
+        Terminator::Opaque { targets, .. } => {
+            for &t in targets {
+                f(t);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -431,6 +414,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -492,6 +476,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -606,6 +591,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -637,6 +623,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -688,18 +675,14 @@ mod tests {
 
         let ivars = &loops[0].induction_vars;
         // `i` (local 2) is incremented by 1
-        let i_var = ivars.iter().find(|v| v.name == "i");
+        let i_var = ivars.iter().find(|v| v.local_idx == 2);
         assert!(i_var.is_some(), "should detect `i` as induction variable");
         let i_var = i_var.unwrap();
-        assert_eq!(i_var.step, 1);
-        assert_eq!(i_var.direction, StepDirection::Ascending);
-        assert!(i_var.init.is_some(), "should find init value for i");
         assert!(
             matches!(&i_var.init, Some(Formula::Int(0))),
             "init should be 0, got: {:?}",
             i_var.init
         );
-        assert!(i_var.bound.is_some(), "should find bound for i");
     }
 
     #[test]
@@ -709,25 +692,8 @@ mod tests {
         assert_eq!(loops.len(), 1);
 
         let ivars = &loops[0].induction_vars;
-        let n_var = ivars.iter().find(|v| v.name == "n");
-        assert!(n_var.is_some(), "should detect `n` as induction variable");
-        let n_var = n_var.unwrap();
-        assert_eq!(n_var.step, -1);
-        assert_eq!(n_var.direction, StepDirection::Descending);
-    }
-
-    #[test]
-    fn test_induction_var_bound_detection() {
-        let func = sum_loop_function();
-        let loops = detect_loops(&func);
-        let ivars = &loops[0].induction_vars;
-        let i_var = ivars.iter().find(|v| v.name == "i").unwrap();
-        // Bound should reference variable `n`
-        assert!(
-            matches!(&i_var.bound, Some(Formula::Var(name, Sort::Int)) if name == "n"),
-            "bound should be variable n, got: {:?}",
-            i_var.bound
-        );
+        // `n` (local 1) is decremented by 1
+        assert!(ivars.iter().any(|v| v.local_idx == 1), "should detect `n` as induction variable");
     }
 
     #[test]
@@ -745,7 +711,7 @@ mod tests {
         let ivars = &loops[0].induction_vars;
         // No simple induction variables expected in binary search
         assert!(
-            ivars.is_empty() || !ivars.iter().any(|v| v.name == "low"),
+            ivars.is_empty() || !ivars.iter().any(|v| v.local_idx == 3),
             "low should not be a simple induction var (low = mid + 1, not low = low + 1)"
         );
     }
@@ -763,7 +729,7 @@ mod tests {
         let loops = detect_loops(&func);
         let ivars = find_induction_variables(&loops[0], &func);
         assert!(!ivars.is_empty(), "should find at least one induction variable");
-        assert!(ivars.iter().any(|v| v.name == "i"), "should find `i` as induction variable");
+        assert!(ivars.iter().any(|v| v.local_idx == 2), "should find `i` as induction variable");
     }
 
     #[test]

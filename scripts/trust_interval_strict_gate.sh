@@ -31,9 +31,9 @@
 #     is asserted and `unreachable` is asserted ABSENT.
 #  3. A pass never seen to fail is not evidence. Nine mutations run: seven that
 #     must refute, and TWO that must NOT (H and I below).
-#  4. `TRUSTFLAGS` is silently dropped if misspelled, so the certify lane can
-#     look like it ran when it did not. The flag path is proved by feeding it a
-#     bogus policy and requiring the compiler to reject it BY NAME.
+#  4. The certify lane must be seen to run, not assumed. `--certify` selects
+#     it (TRUSTFLAGS is not read since T7a), and the Gate line names the lane
+#     that graded the run, so the certify step requires `[certify lane`.
 #  5. Proofs cover overflow and discharged contracts — NOT whether the answer is
 #     right.
 #
@@ -108,26 +108,11 @@ TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 [ -x "$(dirname "$TARGO")/trustc" ] \
   || { echo "REFUSE: no sibling trustc beside $TARGO — the stage1 sysroot is not assembled"; exit 2; }
 
-# PREFLIGHT: `crates/Cargo.toml` must LOAD. A workspace member listed without a
-# manifest on disk makes every `targo trust check` in this workspace exit 2 with
-# no `Gate:` line — indistinguishable, to every assertion below, from the §9.2
-# seal failure and from a real crate regression. Name the real cause instead.
-MISSING_MEMBERS="$(python3 - "$REPO_ROOT/crates" <<'PY'
-import os, re, sys
-root = sys.argv[1]
-s = open(os.path.join(root, "Cargo.toml")).read()
-m = re.search(r'^members\s*=\s*\[(.*?)^\]', s, re.S | re.M)
-if m:
-    for name in re.findall(r'^\s*"([^"]+)",\s*$', m.group(1), re.M):
-        if not os.path.exists(os.path.join(root, name, "Cargo.toml")):
-            print(name)
-PY
-)"
-[ -z "$MISSING_MEMBERS" ] || {
-  echo "REFUSE: crates/Cargo.toml lists member(s) with no manifest on disk:"
-  echo "$MISSING_MEMBERS" | sed 's/^/          /'
-  echo "        Every targo run in this workspace exits 2 with no Gate: line until"
-  echo "        that is fixed. This is NOT a trust-interval result."
+# Ask Targo to load the canonical workspace before attributing a load failure
+# to the contract under test. Native metadata resolves members and manifests.
+"$TARGO" metadata --locked --no-deps --format-version 1 \
+  --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null || {
+  echo "REFUSE: Targo cannot load the canonical workspace"
   exit 2
 }
 
@@ -138,9 +123,9 @@ trap 'restore; rm -f "$BACKUP"' EXIT INT TERM
 
 fails=0
 LOG=""
-run() { # run [policy]; sets RC and LOG
+run() { # run [lane flag]; sets RC and LOG
   LOG="$(mktemp)"
-  ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-interval ) > "$LOG" 2>&1
+  ( cd "$REPO_ROOT/crates" && "$TARGO" trust check --all-rows ${1:+"$1"} -p trust-interval ) > "$LOG" 2>&1
   RC=$?
   require_env "${STEP:-run}"
   no_rustc_error "${STEP:-run}"
@@ -157,7 +142,7 @@ runtests() { # sets RC and LOG
   RC=$?
   require_env "${STEP:-tests}"
 }
-gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
+gate_line() { grep -oE 'Gate: [A-Z-]+ \[[a-z-]+ lane, exit [0-9]+\]' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
 # ---------------------------------------------------------------------------
@@ -289,24 +274,19 @@ rm -f "$LOG"
 
 mut_end
 # ---------------------------------------------------------------------------
-# 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
-#    A misspelled TRUSTFLAGS is dropped, so first prove the flag path reaches
-#    the compiler by requiring a bogus policy to be REJECTED BY NAME. Without
-#    this control, "certify passed" is indistinguishable from "certify never
-#    ran".
+# 2. THE SAME PASS UNDER `--certify` (the compiler's `certify` policy).
+#    The lane flag selects the compiler's `certify` policy, and the Gate line
+#    names the lane that graded the run, so `[certify lane, exit 0]` is the
+#    evidence that certify ran. (A bogus-policy control proved the TRUSTFLAGS
+#    route reached the compiler; it went with that channel, DECISION_QUEUE T7a.)
 # ---------------------------------------------------------------------------
-STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
-run "-Ztrust-policy=bogus_not_a_policy"
-grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
-  || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
-rm -f "$LOG"
-
-run "-Ztrust-policy=certify"
+STEP="THE SAME PASS UNDER '--certify'"; mut_begin
+run "--certify"
 require_env "certify"
 G="$(gate_line)"
 [ -n "$G" ] || fail "certify: no Gate: line"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
-case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
+case "$G" in *"PASS [certify lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";; esac
 grep -qE 'Summary: 70 proved, 0 failed, .*0 inconclusive \(70 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 [ "$(grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1)" = "$PRISTINE_KINDS" ] \
@@ -414,11 +394,17 @@ mutate '    let d: u32 = hi - lo;
     (d as u64) + 1'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation D: an Assert behind a CALL bundled — §9.1 is stale and must be re-measured  $G"; else mut_ok "mutation D (is_empty call folded into span_len)  rc=$RC  $G"; fi
+# §9.1 AMENDED 2026-09-15: a CALL before the Assert no longer breaks entry-prefix
+# bundling. Measured on this crate the same day (`repro-intD`): 70 proved / 70,
+# 29/29 complete, exit 0, zero refusal notes. Re-pointed from "must refuse" to a
+# capability pin — the arm now goes red if the refusal ever comes back.
+if [ "$RC" -ne 0 ]; then fail "mutation D: a CALL before the Assert is REFUSED again (rc=$RC) — the 2026-09-15 capability in §9.1 regressed  $G"; else mut_ok "mutation D (is_empty call folded into span_len) bundles  rc=$RC  $G"; fi
 grep -q 'member has a guarded or non-entry-prefix Assert' "$LOG" \
-  || fail "mutation D: the bundle did not refuse a non-entry-prefix Assert — $(grep -oE 'native TrustIr bundle for .*' "$LOG" | head -1)"
-grep -q 'refused Assert-bearing member `trust_interval::span_len`' "$LOG" \
-  || fail "mutation D: span_len was not the refused member"
+  && fail "mutation D: a non-entry-prefix refusal note reappeared — §9.1's amendment is no longer the whole story"
+grep -q 'Coverage: 29/29 eligible function bodies verified (complete)' "$LOG" \
+  || fail "mutation D: coverage moved under the folded call"
+grep -qE 'Summary: 70 proved, 0 failed, .*0 inconclusive \(70 total\)' "$LOG" \
+  || fail "mutation D: the folded call moved the row counts — $(grep -oE 'Summary:.*' "$LOG" | head -1)"
 rm -f "$LOG"; restore
 
 mut_end
@@ -444,9 +430,18 @@ mutate '    let hi: u32 = if ahi < bhi { ahi } else { bhi };
 }'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation E: a select-derived subtraction PROVED — §11.1 is stale; re-measure and simplify this crate  $G"; else mut_ok "mutation E (span_len inlined into overlap_len over two selects)  rc=$RC  $G"; fi
+# §11.1 AMENDED 2026-09-15: a select-derived subtraction now PROVES. Measured
+# the same day (`repro-intE`): 73 proved / 73, 29/29 complete, exit 0, and
+# `overlap_len` keeps every row. The inlined body is `span_len`'s own, which
+# §11.1 already records as 4/4 — so the delegation this crate performs is no
+# longer forced by the fragment. Re-pointed to pin the capability.
+if [ "$RC" -ne 0 ]; then fail "mutation E: a select-derived subtraction is REFUSED again (rc=$RC) — the 2026-09-15 capability in §11.1 regressed  $G"; else mut_ok "mutation E (span_len inlined into overlap_len over two selects) proves  rc=$RC  $G"; fi
 grep -q 'verification failed for `trust_interval::overlap_len`' "$LOG" \
-  || fail "mutation E: overlap_len did not lose a row"
+  && fail "mutation E: overlap_len lost a row — §11.1's amendment is no longer the whole story"
+grep -q 'Coverage: 29/29 eligible function bodies verified (complete)' "$LOG" \
+  || fail "mutation E: coverage moved under the inlined subtraction"
+grep -qE 'Summary: 73 proved, 0 failed, .*0 inconclusive \(73 total\)' "$LOG" \
+  || fail "mutation E: the inlined body did not produce the measured 73 rows — $(grep -oE 'Summary:.*' "$LOG" | head -1)"
 rm -f "$LOG"; restore
 
 mut_end
@@ -504,15 +499,53 @@ mutate '    let d: u32 = blo - ahi;
     d - 1'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation G: gap proved without its structurally-required guard — §2.5 is stale, delete the dead guard  $G"; else mut_ok "mutation G (gap's dead-but-required d==0 guard deleted)  rc=$RC  $G"; fi
-grep -qE 'trust_interval::gap \[INCONCLUSIVE\].*[1-9][0-9]* unknown' "$LOG" \
-  || fail "mutation G: gap did not lose a row — $(grep -oE 'trust_interval::gap \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
+# THE GUARD PATTERN PINNED FROM §2.5, AS APPLIED TO gap, CLOSED 2026-09-16 — the
+# "dead-but-required" guard is now just dead. (§2.5's OWN case is `x % c` with a
+# VARIABLE modulus; gap is a guarded subtraction, a different shape, and the modulus
+# case is NOT measured here. This arm inherited the loose citation.) Measured on
+# stage1 6430d6b06 (archive lane ra-intG): with `if d == 0 { return 0; }` deleted, gap
+# [VERIFIED] (3 obligations: 3 proved), every overflow:sub row PROVED, 70/70 — the SAME
+# counts as pristine, so the guard added nothing the compiler could not see from
+# `blo > ahi` (d >= 1, hence d - 1 cannot underflow). The 2026-09-15 note recorded the
+# mechanism moving; this records the boundary closing. G2 is the control that proves the
+# compiler is reasoning about the subtraction, not tolerating it.
+if [ "$RC" -ne 0 ]; then fail "mutation G: gap is REFUSED again without its guard (rc=$RC) — the 2026-09-16 closure of this guard pattern regressed  $G"; else mut_ok "mutation G (gap's dead d==0 guard deleted) PROVES  rc=$RC  $G"; fi
+grep -qE 'trust_interval::gap \[VERIFIED\] \(3 obligations: 3 proved, 0 runtime-checked, 0 failed, 0 unknown' "$LOG" \
+  || fail "mutation G: gap did not verify all 3 rows without the guard — $(grep -oE 'trust_interval::gap \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -qE '\[(UNKNOWN|FAILED|RUNTIME-CHECKED)\] \[overflow:sub\]' "$LOG" \
+  && fail "mutation G: a subtraction row is not PROVED — $(grep -oE '\[(UNKNOWN|FAILED|RUNTIME-CHECKED)\] \[overflow:sub\][^(]*' "$LOG" | head -2 | tr '\n' ' ')"
+grep -qE 'Summary: 70 proved, 0 failed, 0 runtime-checked, .*0 inconclusive \(70 total\)' "$LOG" \
+  || fail "mutation G: the counts moved from pristine's 70/70, so the deleted guard was not dead after all — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 grep -q 'refused Assert-bearing member `trust_interval::gap`' "$LOG" \
-  || fail "mutation G: gap was not named as the refused bundle member"
-grep -q 'verification failed for `trust_interval::distance`' "$LOG" \
-  || fail "mutation G: the refusal was not raised against the CALLER — the attribution direction changed and the note above is stale"
+  && fail "mutation G: the bundle-member refusal came back — re-measure before trusting this arm"
 rm -f "$LOG"; restore
 
+mut_end
+
+# ---------------------------------------------------------------------------
+# MUTATION G2 — the CONTROL for G. `d - 2` DOES underflow: `blo > ahi` gives d >= 1 and
+#    d = 1 is reachable (blo = ahi + 1). A compiler that merely stopped LOOKING at the
+#    subtraction would pass this; one that reasons about it must REFUTE it. Measured on
+#    6430d6b06 (ra-intG-ctrl): refused, gap [VIOLATIONS] (4 obligations: 2 proved,
+#    2 failed), one [FAILED] [overflow:sub], exit 1.
+# ---------------------------------------------------------------------------
+STEP="MUTATION G2 (§2.5 control)"; mut_begin
+mutate '    let d: u32 = blo - ahi;
+    if d == 0 {
+        return 0;
+    }
+    d - 1' '    let d: u32 = blo - ahi;
+    d - 2'
+run
+G="$(gate_line)"
+if [ "$RC" -eq 0 ]; then fail "mutation G2: a REACHABLE underflow (d - 2 at d = 1) PASSED — G's proof is tolerance, not reasoning  $G"; else mut_ok "mutation G2 (d - 2: a reachable underflow) refuted  rc=$RC  $G"; fi
+grep -qE 'trust_interval::gap \[VIOLATIONS\] \(4 obligations: 2 proved, 0 runtime-checked, 2 failed, 0 unknown' "$LOG" \
+  || fail "mutation G2: gap did not carry exactly the refuted subtraction and its twin — $(grep -oE 'trust_interval::gap \[[A-Z ]+\] \([^;]*' "$LOG" | head -1)"
+grep -qE '\[FAILED\] \[overflow:sub\]' "$LOG" \
+  || fail "mutation G2: the underflow went unproved rather than REFUTED — a capability gap, not a caught bug"
+grep -q 'verification failed for `trust_interval::gap`' "$LOG" \
+  || fail "mutation G2: gap did not hard-error on a reachable underflow"
+rm -f "$LOG"; restore
 mut_end
 # ---------------------------------------------------------------------------
 # 10. THE TESTS, AND THE TWO MUTATIONS THEY ALONE CAN CATCH.

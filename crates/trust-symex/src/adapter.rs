@@ -123,7 +123,8 @@ pub fn replay_with_trace(
         let block = &blocks[current_block];
 
         // Capture per-statement snapshots if configured.
-        if config.capture_per_statement {
+        if config.capture_per_statement && !block.stmts.is_empty() {
+            let pre_snapshot = snapshot_state(&executor.state);
             for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
                 // Execute this single statement by running the full block
                 // mechanism is too coarse; instead, capture state before/after.
@@ -136,17 +137,17 @@ pub fn replay_with_trace(
                     description: desc,
                     // Snapshot will be updated after block execution
                     // for now, capture the pre-state.
-                    state_snapshot: snapshot_state(&executor.state),
+                    state_snapshot: pre_snapshot.clone(),
                 });
             }
         }
 
         match executor.execute_block(block) {
             Ok(BlockResult::Continue(next)) => {
-                // Record post-block state.
+                // Record post-block state once and reuse for per-statement updates and the goto step.
+                let post_snapshot = snapshot_state(&executor.state);
                 if config.capture_per_statement {
                     // Update the last trace entries for this block with post-state.
-                    let post_snapshot = snapshot_state(&executor.state);
                     for step in trace.iter_mut().rev() {
                         if step.block_idx == current_block && step.stmt_idx.is_some() {
                             step.state_snapshot = post_snapshot.clone();
@@ -159,7 +160,7 @@ pub fn replay_with_trace(
                     block_idx: current_block,
                     stmt_idx: None,
                     description: format!("goto bb{next}"),
-                    state_snapshot: snapshot_state(&executor.state),
+                    state_snapshot: post_snapshot,
                 });
                 current_block = next;
             }

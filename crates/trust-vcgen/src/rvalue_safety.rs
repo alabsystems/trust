@@ -18,9 +18,7 @@ use trust_types::{
     SourceSpan, Ty, VcKind, VerifiableFunction, VerificationCondition,
 };
 
-use crate::{
-    local_ty_ref, operand_to_formula, place_to_var_name, slice_len_formula, step_place_ty_cow,
-};
+use crate::{local_ty_ref, place_to_var_name, step_place_ty_cow};
 
 /// Check an rvalue for Discriminant and Aggregate safety violations.
 ///
@@ -36,7 +34,6 @@ pub(crate) fn check_rvalue_safety(
     match rvalue {
         // Discriminant read — place must hold an enum/ADT type.
         Rvalue::Discriminant(place) => {
-            let place_name = place_to_var_name(func, place);
             // verifier-perf: borrowed resolve — this is a pure variant inspection
             // (is the discriminant read on an ADT/Datatype?), never a move, so never
             // clone the (possibly fat recursive-ADT) declared root.
@@ -76,6 +73,7 @@ pub(crate) fn check_rvalue_safety(
                 Some(t) if !matches!(t, Ty::Adt { .. } | Ty::Datatype { .. } | Ty::Coroutine { .. })
             );
             if definitely_not_adt {
+                let place_name = place_to_var_name(func, place);
                 // The discriminant is read on a type that is not an ADT/enum.
                 // Formula: the place's "type tag" != ADT_TAG, which is trivially
                 // satisfiable, meaning a solver will confirm the violation.
@@ -198,6 +196,14 @@ fn check_direct_projection_load(
     stmt_span: &SourceSpan,
     vcs: &mut Vec<VerificationCondition>,
 ) {
+    let Some(last_bounds_idx) = place.projections.iter().rposition(|projection| {
+        matches!(
+            projection,
+            Projection::Index(_) | Projection::ConstantIndex { .. } | Projection::Subslice { .. }
+        )
+    }) else {
+        return;
+    };
     // verifier-perf: walk the declared type by REFERENCE (no fat-root clone). Each VC
     // builder takes `&Ty` and the projection step borrows the subtree (only the synthetic
     // `Subslice`/`OpaqueCast` steps allocate); the fat recursive-ADT root is never cloned.
@@ -207,7 +213,7 @@ fn check_direct_projection_load(
     };
     let mut prefix = trust_types::Place::local(place.local);
 
-    for projection in &place.projections {
+    for (proj_idx, projection) in place.projections[..=last_bounds_idx].iter().enumerate() {
         match projection {
             Projection::Index(index_local) => {
                 if let Some(vc) =
@@ -245,6 +251,9 @@ fn check_direct_projection_load(
             _ => {}
         }
 
+        if proj_idx == last_bounds_idx {
+            break;
+        }
         let Some(next_ty) = step_place_ty_cow(ty, projection) else {
             return;
         };
@@ -261,11 +270,9 @@ fn index_projection_vc(
     stmt_span: &SourceSpan,
 ) -> Option<VerificationCondition> {
     let len = collection_len_formula(func, collection, collection_ty)?;
-    let index_place = trust_types::Place::local(index_local);
-    let index_operand = Operand::Copy(index_place);
-    let index_ty = crate::operand_ty_cow(func, &index_operand);
-    let index = operand_to_formula(func, &index_operand);
-    let violation = index_bounds_violation(index, index_ty.as_deref(), len);
+    let index_ty = crate::local_ty_ref(func, index_local);
+    let index = crate::place_to_formula(func, &trust_types::Place::local(index_local));
+    let violation = index_bounds_violation(index, index_ty, len);
 
     Some(VerificationCondition {
         kind: projection_vc_kind(&Projection::Index(index_local), collection_ty),
@@ -300,18 +307,31 @@ fn constant_index_projection_vc(
     stmt_span: &SourceSpan,
 ) -> Option<VerificationCondition> {
     let len = collection_len_formula(func, collection, collection_ty)?;
-    let mut violations = vec![Formula::Le(
-        Box::new(len.clone()),
-        Box::new(Formula::Int(i128::try_from(offset).ok()?)),
-    )];
-    if min_length > 0 {
-        violations.push(Formula::Lt(
-            Box::new(len),
-            Box::new(Formula::Int(i128::try_from(min_length).ok()?)),
-        ));
-    }
-
-    let violation = any_violation(violations);
+    let offset_f = Formula::Int(i128::try_from(offset).ok()?);
+    // Trust: a FROM-START `[offset of min_length]` reads element `offset`, in
+    // range iff `offset < len` (violation `len <= offset`). A FROM-END one reads
+    // element `len - offset` (`[.., x]` is `[1 of 1 from end]`, element
+    // `len - 1`), in range iff `1 <= offset <= len` (violation `len < offset`;
+    // `offset == 0` would name element `len`, out of range for every length).
+    // Using the from-start violation for both refuted every `[.., x]` read at
+    // `len == offset` — a real in-range element.
+    let violation = if min_length > 0 {
+        let min_len_f = Formula::Int(i128::try_from(min_length).ok()?);
+        let first = if !from_end {
+            Formula::Le(Box::new(len.clone()), Box::new(offset_f))
+        } else if offset == 0 {
+            Formula::Bool(true)
+        } else {
+            Formula::Lt(Box::new(len.clone()), Box::new(offset_f))
+        };
+        any_violation(vec![first, Formula::Lt(Box::new(len), Box::new(min_len_f))])
+    } else if !from_end {
+        Formula::Le(Box::new(len), Box::new(offset_f))
+    } else if offset == 0 {
+        Formula::Bool(true)
+    } else {
+        Formula::Lt(Box::new(len), Box::new(offset_f))
+    };
     Some(VerificationCondition {
         kind: projection_vc_kind(
             &Projection::ConstantIndex { offset, min_length, from_end },
@@ -395,12 +415,43 @@ pub(crate) fn collection_len_formula(
         // index on `[T; M]` is NOT dischargeable by a guard on `N` (M != N).
         Ty::SymArray { len_sym, .. } => Some(crate::sym_array_len_formula(len_sym)),
         Ty::Slice { .. } => {
-            slice_len_formula(func, &Operand::Copy(slice_metadata_place(func, collection)))
+            let meta = slice_metadata_place_cow(func, collection);
+            crate::place_slice_len_formula(func, &meta)
         }
         Ty::Ref { inner, .. } if matches!(inner.as_ref(), Ty::Slice { .. }) => {
-            slice_len_formula(func, &Operand::Copy(collection.clone()))
+            crate::place_slice_len_formula(func, collection)
         }
         _ => None,
+    }
+}
+
+fn slice_metadata_place_cow<'a>(
+    func: &VerifiableFunction,
+    collection: &'a trust_types::Place,
+) -> std::borrow::Cow<'a, trust_types::Place> {
+    let Some(Projection::Deref) = collection.projections.last() else {
+        return std::borrow::Cow::Borrowed(collection);
+    };
+
+    let prefix = &collection.projections[..collection.projections.len() - 1];
+    let is_slice_ref = if prefix.is_empty() {
+        matches!(
+            crate::local_ty_ref(func, collection.local),
+            Some(Ty::Ref { inner, .. }) if matches!(inner.as_ref(), Ty::Slice { .. })
+        )
+    } else {
+        matches!(
+            crate::place_prefix_ty_cow(func, collection.local, prefix).as_deref(),
+            Some(Ty::Ref { inner, .. }) if matches!(inner.as_ref(), Ty::Slice { .. })
+        )
+    };
+    if is_slice_ref {
+        std::borrow::Cow::Owned(trust_types::Place {
+            local: collection.local,
+            projections: prefix.to_vec(),
+        })
+    } else {
+        std::borrow::Cow::Borrowed(collection)
     }
 }
 
@@ -408,20 +459,7 @@ pub(crate) fn slice_metadata_place(
     func: &VerifiableFunction,
     collection: &trust_types::Place,
 ) -> trust_types::Place {
-    let Some(Projection::Deref) = collection.projections.last() else {
-        return collection.clone();
-    };
-
-    let mut base = collection.clone();
-    base.projections.pop();
-    if matches!(
-        crate::place_ty_cow(func, &base).as_deref(),
-        Some(Ty::Ref { inner, .. }) if matches!(inner.as_ref(), Ty::Slice { .. })
-    ) {
-        base
-    } else {
-        collection.clone()
-    }
+    slice_metadata_place_cow(func, collection).into_owned()
 }
 
 pub(crate) fn index_bounds_violation(
@@ -440,15 +478,28 @@ pub(crate) fn index_bounds_violation(
 }
 
 fn any_violation(mut violations: Vec<Formula>) -> Formula {
-    if violations.len() == 1 {
-        violations.pop().expect("one violation")
-    } else {
-        Formula::Or(violations)
+    match violations.pop() {
+        Some(only) if violations.is_empty() => only,
+        Some(last) => {
+            violations.push(last);
+            Formula::Or(violations)
+        }
+        None => Formula::Or(violations),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disjunction_preserves_empty_singleton_and_order() {
+        use trust_types::Formula;
+        let a = Formula::Int(1);
+        let b = Formula::Int(2);
+        assert_eq!(super::any_violation(Vec::new()), Formula::Or(Vec::new()));
+        assert_eq!(super::any_violation(vec![a.clone()]), a);
+        assert_eq!(super::any_violation(vec![b.clone(), a.clone()]), Formula::Or(vec![b, a]));
+    }
+
     use trust_types::{
         BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
         Terminator, VerifiableBody, VerifiableFunction,
@@ -485,6 +536,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -503,10 +555,14 @@ mod tests {
                             adt_kind: None,
                             layout: None,
                             name: "MyEnum".into(),
-                            fields: vec![("discriminant".into(), Ty::u32())],
-                            variants: Vec::new(),
+                            fields: vec![("discriminant".into(), Ty::u32())].into(),
+                            variants: Vec::new().into(),
                             disc_index_safe: false,
-                            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+                            faithful_enum_repr: None,
+                            enum_layout: None,
+                            arbitrary_precision: None,
+                            validity_wrapper: None,
+                        },
                         name: Some("e".into()),
                     },
                     LocalDecl { index: 2, ty: Ty::u32(), name: Some("d".into()) },
@@ -528,6 +584,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -602,6 +659,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -641,6 +699,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -738,6 +797,7 @@ mod tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         };
         let vcs = crate::generate_vcs(&func);
         let arr_vcs: Vec<_> = vcs
@@ -760,7 +820,7 @@ mod sym_array_tests {
 
     /// Build a trivial function whose local `_1` has a const-generic array type
     /// `[u8; N]` (`Ty::SymArray`), for the `collection_len_formula` tests.
-    fn sym_array_func(len_sym: ConstLen) -> VerifiableFunction {
+    pub(super) fn sym_array_func(len_sym: ConstLen) -> VerifiableFunction {
         VerifiableFunction {
             name: "sym_array".to_string(),
             def_path: "test::sym_array".to_string(),
@@ -787,6 +847,7 @@ mod sym_array_tests {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -833,5 +894,70 @@ mod sym_array_tests {
         // And it is byte-identical to the length symbol.
         let len = collection_len_formula(&func, &Place::local(1), &func.body.locals[1].ty).unwrap();
         assert_eq!(value_f, len, "guard value N and array length N must be the SAME term");
+    }
+}
+
+// Trust: the bounds violation of a `ConstantIndex` read, per direction.
+#[cfg(test)]
+mod constant_index_violation_tests {
+    use trust_types::{ConstLen, Formula, Place, Sort, SourceSpan};
+
+    use super::*;
+
+    /// The violation formula for `a[offset of min_length (from_end)]` on
+    /// `a: [u8; N]`, whose length is the symbol `N`.
+    fn violation(offset: usize, min_length: usize, from_end: bool) -> Formula {
+        let func =
+            super::sym_array_tests::sym_array_func(ConstLen { index: 1, name: "N".to_string() });
+        let ty = func.body.locals[1].ty.clone();
+        constant_index_projection_vc(
+            &func,
+            &Place::local(1),
+            &ty,
+            offset,
+            min_length,
+            from_end,
+            &SourceSpan::default(),
+        )
+        .expect("a ConstantIndex row on an array")
+        .formula
+    }
+
+    fn n() -> Box<Formula> {
+        Box::new(Formula::var("__trust_constparam_1_N", Sort::Int))
+    }
+
+    fn int(v: i128) -> Box<Formula> {
+        Box::new(Formula::Int(v))
+    }
+
+    /// From the start, `[k of _]` reads element `k`: out of range iff `N <= k`.
+    #[test]
+    fn from_start_reads_element_offset() {
+        assert_eq!(violation(1, 0, false), Formula::Le(n(), int(1)));
+        assert_eq!(
+            violation(1, 2, false),
+            Formula::Or(vec![Formula::Le(n(), int(1)), Formula::Lt(n(), int(2))])
+        );
+    }
+
+    /// From the end, `[k of _ from end]` reads element `N - k`: out of range iff
+    /// `N < k`. `N == k` reads element 0, which is in range — the old shared
+    /// `N <= k` refuted exactly that case (`[.., x]` on a one-element slice).
+    #[test]
+    fn from_end_reads_element_len_minus_offset() {
+        assert_eq!(violation(1, 0, true), Formula::Lt(n(), int(1)));
+        assert_eq!(violation(2, 0, true), Formula::Lt(n(), int(2)));
+        assert_eq!(
+            violation(1, 1, true),
+            Formula::Or(vec![Formula::Lt(n(), int(1)), Formula::Lt(n(), int(1))])
+        );
+    }
+
+    /// `[0 of _ from end]` would read element `N`, out of range for every `N`.
+    /// rustc never emits it; if it appears the row must fail, not prove.
+    #[test]
+    fn from_end_offset_zero_is_always_out_of_range() {
+        assert_eq!(violation(0, 0, true), Formula::Bool(true));
     }
 }

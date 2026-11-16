@@ -6,7 +6,7 @@ use crate::fs::TryLockError;
 use crate::hash::Hash;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
-pub use crate::sys::fs::common::{Dir, copy, remove_dir_all};
+pub use crate::sys::fs::common::{Dir, ExtraHomeDirs, ExtraMediaDirs, copy, remove_dir_all};
 use crate::sys::pal::{helpers, unsupported};
 use crate::sys::time::SystemTime;
 
@@ -144,6 +144,14 @@ impl FileType {
 
     const fn from_attr(attr: u64) -> Self {
         Self(attr & r_efi::protocols::file::DIRECTORY != 0)
+    }
+}
+
+impl ReadDir {
+    pub fn dir(&self) -> io::Result<Dir> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        Dir::open(&self.0.path(), &options)
     }
 }
 
@@ -360,12 +368,7 @@ impl File {
         let off = match pos {
             SeekFrom::Start(p) => p,
             SeekFrom::End(p) => {
-                // Seeking to position 0xFFFFFFFFFFFFFFFF causes the current position to be set to the end of the file.
-                if p == 0 {
-                    0xFFFFFFFFFFFFFFFF
-                } else {
-                    self.file_attr()?.size().checked_add_signed(p).ok_or(NEG_OFF_ERR)?
-                }
+                self.file_attr()?.size().checked_add_signed(p).ok_or(NEG_OFF_ERR)?
             }
             SeekFrom::Current(p) => self.tell()?.checked_add_signed(p).ok_or(NEG_OFF_ERR)?,
         };
@@ -479,7 +482,16 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     f.set_file_info(new_info)
 }
 
+pub fn rename_noreplace(_old: &Path, _new: &Path) -> io::Result<()> {
+    unsupported()
+}
+
 pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
+    // UEFI does not support symlinks
+    set_perm_nofollow(p, perm)
+}
+
+pub fn set_perm_nofollow(p: &Path, perm: FilePermissions) -> io::Result<()> {
     let f = uefi_fs::File::from_path(p, file::MODE_READ | file::MODE_WRITE, 0)?;
     set_perm_inner(&f, perm)
 }

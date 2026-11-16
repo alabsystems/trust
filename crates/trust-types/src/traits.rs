@@ -501,13 +501,33 @@ mod tests {
     fn test_build_vtable() {
         let mut resolver = TraitResolver::new();
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "VecIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "VecIter".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
             Ty::u32(),
         ));
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "SliceIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "SliceIter".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
             Ty::u32(),
         ));
 
@@ -522,10 +542,30 @@ mod tests {
     #[test]
     fn test_devirtualize() {
         let mut resolver = TraitResolver::new();
-        let vec_iter = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "VecIter".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
-        let slice_iter = Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "SliceIter".to_string(), fields: vec![],
-            disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let vec_iter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "VecIter".to_string(),
+            fields: vec![].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
+        let slice_iter = Ty::Adt {
+            adt_kind: None,
+            layout: None,
+            variants: Vec::new().into(),
+            name: "SliceIter".to_string(),
+            fields: vec![].into(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            enum_layout: None,
+            arbitrary_precision: None,
+            validity_wrapper: None,
+        };
         resolver.add_impl(make_iterator_impl(vec_iter.clone(), Ty::u32()));
         resolver.add_impl(make_iterator_impl(slice_iter.clone(), Ty::u32()));
 
@@ -625,6 +665,7 @@ mod tests {
                     unwind: UnwindEdge::Unreachable,
                     is_unsafe_sig: false,
                     callee_identity: None,
+                    callee_key: None,
                     is_foreign: false,
                     func: "std::clone::Clone::clone".to_string(),
                     args: vec![],
@@ -649,8 +690,18 @@ mod tests {
         let mut resolver = TraitResolver::new();
         resolver.add_impl(make_clone_impl(Ty::i32()));
         resolver.add_impl(make_iterator_impl(
-            Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "MyIter".to_string(), fields: vec![],
-                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
+            Ty::Adt {
+                adt_kind: None,
+                layout: None,
+                variants: Vec::new().into(),
+                name: "MyIter".to_string(),
+                fields: vec![].into(),
+                disc_index_safe: false,
+                faithful_enum_repr: None,
+                enum_layout: None,
+                arbitrary_precision: None,
+                validity_wrapper: None,
+            },
             Ty::u32(),
         ));
 

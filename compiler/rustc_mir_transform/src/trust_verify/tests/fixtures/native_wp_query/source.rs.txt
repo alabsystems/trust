@@ -1,0 +1,7 @@
+pub fn identity(x: bool) -> bool
+    ensures result == x
+{ x }
+
+pub fn wrong(x: bool) -> bool
+    ensures result == x
+{ false }

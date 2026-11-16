@@ -1,0 +1,160 @@
+# LANE ASSIGNMENTS for tests/upstream-rust/test-exceptions.toml
+#
+# Author: Andrew Yates | Copyright 2026 Andrew Yates | License: Apache-2.0
+#
+# =====================================================================
+# WHY THIS IS A SIDECAR AND NOT A FIELD ON THE ROW
+# =====================================================================
+#
+# The `lane` field BELONGS on `[[exceptions]]` in test-exceptions.toml. It is
+# here instead because `TestException` in
+# `crates/trust-upstream-compat/src/model.rs` carries
+# `#[serde(deny_unknown_fields)]`. Adding `lane = "..."` to a row today makes the WHOLE
+# ledger unparseable, which fails
+# `crates/trust-upstream-compat/src/tests.rs::parse_production_test_exception_ledger_validates_against_review_date`
+# (it `include_str!`s this very directory's ledger at tests.rs:15-16 and
+# `.expect()`s the parse) and takes `trust-upstream-compat prove` — the release
+# gate — down with it. So the assignment lives beside the ledger and is enforced by
+# `check_exception_lanes.py`, which treats a MISSING assignment as a hard
+# failure. That is what makes the field REQUIRED in practice.
+#
+# FOLD-IN MIGRATION (three edits):
+#   1. model.rs `TestException`: add a required, non-empty list of
+#      `{ lane, measured_on, evidence }` observations (no `#[serde(default)]`
+#      — required is the point) with a `#[serde(rename_all = "snake_case")]
+#      pub enum TestExceptionLane { Vanilla, Default, Verified }`.
+#   2. validate.rs `validate_test_exception`: reject `Verified` while no
+#      verified lane exists (mirror `verified_lane_available` below), reject a
+#      lane observed twice, and reject a lane whose claim contradicts the run
+#      that produced the row. porting.rs `failure_covering_exception` must then
+#      net only rows observed on the lane it runs (`--trust-vanilla`).
+#   3. Move each row's `[[lanes]]` observations below onto it and delete this
+#      file (and `check_exception_lanes.py`'s sidecar reading).
+#
+# =====================================================================
+# WHAT THE THREE LANES ARE — compiletest's, by the flag `x.py test` gets
+# =====================================================================
+#
+# vanilla   — `--trust-vanilla`. Compiles are `-Ztrust-verify=off`, the driver
+#             is the `rustc` hardlink, `needs-trust-verify` tests are ignored,
+#             run-make recipes get a `-Ztrust-verify=off` wrapper, and test
+#             binaries run with `TRUST_NO_VERIFY=1` for nested compiles.
+# default   — no lane flag: `x.py test --stage 2 tests/<suite>`, exactly what
+#             the harness `suite.*` rows run. compiletest's OWN compiles are
+#             still `-Ztrust-verify=off`, but it is NOT the vanilla lane: the
+#             driver is the `trustc` hardlink, `needs-trust-verify` tests run,
+#             inherited run-make recipes get the `-Ztrust-verify=off` wrapper
+#             while Trust's own (`trust*`) recipes get the real driver, and
+#             nested compiles get no `TRUST_NO_VERIFY`
+#             (compiletest `common.rs::trust_verification_lane`,
+#             `runtest/run_make.rs`, `runtest.rs`, `directives/needs.rs`).
+# verified  — `--trust-verified`: verification ON at the SHIPPING default,
+#             `-Ztrust-verify=on -Ztrust-policy=strict`.
+#
+# The split exists because the failure populations differ in the direction
+# that matters: under `TrustPolicy::Strict` a refutation with a counterexample
+# HARD-FAILS the build, and false refutations are a real, repeatedly-shipped
+# class. A waiver written from a verification-off run tells you nothing about
+# whether the same test survives the shipping default. Before this file, one
+# undifferentiated `[[exceptions]]` row could be cited by either run, so a
+# vanilla waiver could silently net a verified failure.
+#
+# A run applies ONLY the rows observed on its own lane: the `suite.*` rows run
+# through `check_exception_lanes.py --run`, which `--skip`s exactly those.
+
+schema_version = "0.1.0"
+
+# =====================================================================
+# THE MEASURED PREMISE — do not edit without re-measuring
+# =====================================================================
+#
+# WAS false; the lane was WIRED on 2026-09-01. History, because a `vanilla` row
+# written before that date is a claim about the world below:
+#
+#   Until 2026-09-01 there was no verified lane and no flag to ask for one.
+#   `configure_compiletest_rustc` appended `-Ztrust-verify=off` whenever
+#   `rustc_supports_trust_verification || trust_vanilla()`, and bootstrap set
+#   the first half true for every `stage > 0 && !download-rustc`. The
+#   disjunction had NO NEGATIVE ARM, so on any `x.py test --stage 2` — with or
+#   without `--trust-vanilla` — every test compile was verification-off.
+#   Dropping `--trust-vanilla` gave the BRANDED lane, not a verified one.
+#
+# What changed (`src/tools/compiletest/`, `src/bootstrap/`):
+#
+#   common.rs   TRUST_VERIFIED_RUSTC_FLAGS = ["-Ztrust-verify=on",
+#               "-Ztrust-policy=strict"]; `TrustVerificationLane` replaces the
+#               boolean with three states, and `Config::trust_verification_lane`
+#               reduces EXACTLY to the old disjunction whenever
+#               `--trust-verified` is absent.
+#   lib.rs      `--trust-verified` pushes TRUST_VERIFIED_SENTINEL; refused
+#               together with `--trust-vanilla`, and refused without
+#               `--rustc-supports-trust-verification`.
+#   test.rs     bootstrap forwards the flag and refuses the lane on a compiler
+#               that has no verifier.
+#
+# `check_exception_lanes.py` RE-DERIVES all of that from the source files on
+# every run (`VERIFIED_LANE_CHAIN`), so the flag below is cross-checked rather
+# than believed: a `true` the code does not support is a hard finding, and a
+# PARTIALLY-wired lane is refused outright rather than resolved either way.
+#
+# WHAT THIS FLAG DOES AND DOES NOT CERTIFY. It says the lane can be RUN. It does
+# NOT say anyone has run it — as of 2026-09-01 nobody has, because
+# `x.py test --stage 2` needs a stage2 build and is not read-only. The
+# measurement burden sits on the ROW: every `[[lanes]]` entry must carry a
+# `measured_on` date and `evidence` naming the run it came from, and for a
+# `verified` row that evidence must cite a log whose summary shows BOTH
+# positive controls from VERIFIED-LANE-RUNBOOK.md step 3 — `needs-trust-verify`
+# tests RUNNING (not ignored), and the `fn divide(x: i32, y: i32) -> i32 { x / y }`
+# canary REFUSED with `Trust verification:` evidence. A verified run that shows
+# neither did not verify, and none of its rows may be recorded.
+verified_lane_available = true
+verified_lane_landed_by = "Wired 2026-09-01 in src/tools/compiletest/{common.rs,lib.rs,runtest/run_make.rs} and src/bootstrap/src/core/{config/flags.rs,build_steps/test.rs}: the opt-in `--trust-verified` lane, mutually exclusive with `--trust-vanilla`. Proven by unit test, not by a suite run: compiletest `common/tests.rs::trust_verified_lane_is_opt_in_and_default_is_unchanged` (the verified lane appends exactly `-Ztrust-verify=on -Ztrust-policy=strict` and never the isolation flag) and `::trust_lane_selection_truth_table_preserves_the_default` (the default lane's flag vector is byte-identical when the flag is absent); bootstrap `flags.rs::trust_lane_flag_tests`. NO verified suite run has been recorded yet — a `lane = \"verified\"` row must cite one, with both VERIFIED-LANE-RUNBOOK.md step-3 positive controls visible in its log."
+
+# Every active id in test-exceptions.toml appears here once PER LANE it was
+# observed failing on. A test failing on two lanes is two observations: two
+# rows here for its one [[exceptions]] row. Not two exception rows: the release
+# proof requires every active exception to match an observed result, and
+# porting.rs nets the first row for a path, so a second one would never match.
+#   id          the [[exceptions]] id it assigns a lane to
+#   lane        "vanilla" | "default" | "verified"
+#   measured_on YYYY-MM-DD — when the lane claim was last established
+#   evidence    where the observation lives; a run id or artifact path
+
+[[lanes]]
+id = "test-exc.lexer.str-as-char-4.prime-superset"
+lane = "vanilla"
+measured_on = "2026-08-23"
+evidence = "Divergence re-measured 2026-08-23 against upstream nightly on the verification-off lane (the row's own note records Trust emitting 4 errors where upstream emits 2). Prime-notation lexing is a grammar-surface divergence and is independent of -Ztrust-verify; it has never been observed under the shipping strict default because no lane runs it."
+
+[[lanes]]
+id = "test-exc.lexer.str-as-char-4.prime-superset"
+lane = "default"
+measured_on = "2026-09-29"
+evidence = "`python3 x.py test --stage 2 tests/ui` (suite.ui, default lane) on 5f8066c410: 22686 passed, 3 failed, this test among them (docs/issues/2026-09-29-stage2-suite-sweep.md). Reproduced on stage2 9a2bb840d5 with the lane's own compile, `trustc -Ztrust-verify=off --edition 2021`: exit 0, only `unused macro definition`, where the test expects two errors."
+
+[[lanes]]
+id = "test-exc.lexer.str-as-char-3.prime-superset"
+lane = "vanilla"
+measured_on = "2026-07-12"
+evidence = "Companion of str-as-char-4, same verification-off replay; blocked from restoration by the revision-keying gate defect recorded at the end of test-exceptions.toml."
+
+# RETIRED 2026-10-09: the two test-exc.linking.*.strict-exec-drift lane rows,
+# with their exceptions (evidence in test-exceptions.toml).
+
+# RETIRED 2026-09-25: test-exc.tait.65679-free-alias-mir-built-cycle
+# Exact default and vanilla reproducer compiles now succeed on qualified ae9c2c1d.
+# The normalization repair f4cee5c40f already predates that compiler.
+# Evidence: docs/archive/session-reports/2026-09-25-opaque-cycle-retirement/README.md
+# The original upstream test remains admitted; future failures have no waiver.
+
+[[lanes]]
+id = "test-exc.hygiene.unpretty-debug-lifetimes.symbol-width-wrap"
+lane = "vanilla"
+measured_on = "2026-08-23"
+evidence = "Measured 2026-08-23: Trust renders `ident` as 1000#0 vs upstream 992#0, pushing the macro-rule line past MARGIN=78. A pretty-printer layout fact in rustc_ast_pretty, independent of -Ztrust-verify."
+
+[[lanes]]
+id = "test-exc.hygiene.unpretty-debug-lifetimes.symbol-width-wrap"
+lane = "default"
+measured_on = "2026-09-29"
+evidence = "`python3 x.py test --stage 2 tests/ui` (suite.ui, default lane) on 5f8066c410: 22686 passed, 3 failed, this test among them (docs/issues/2026-09-29-stage2-suite-sweep.md). Reproduced on stage2 9a2bb840d5 with `trustc -Ztrust-verify=off -Zunpretty=expanded,hygiene`: after the test's `\\d+#` -> `0#` normalization, lines 18-19 wrap as `... /* 0#0` / `*/>) =>`, not the expected `... /* 0#0 */>)` / `=>`."

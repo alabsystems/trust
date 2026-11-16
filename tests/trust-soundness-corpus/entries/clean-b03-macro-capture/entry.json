@@ -1,0 +1,25 @@
+{
+  "id": "clean-b03-macro-capture",
+  "class": "Clean/Carcara reader, fix 36 (B03)",
+  "title": "a define-fun parameter captured a global its macro body mentions: h was read as the identity",
+  "origin": [
+    "clean 4993e9d5c (carcara fix 36/37), third-party/carcara/carcara/tests/problem_reading.rs refutations_of_misread_problems_are_refused B03"
+  ],
+  "lang": "smt",
+  "source": "repro.json",
+  "reproducer": {
+    "cert": "repro.json",
+    "claim": "the problem is unsatisfiable (the certificate refutes it)"
+  },
+  "twin": {
+    "cert": "twin.json",
+    "claim": "unsatisfiable, with a correct refutation, and it contains the reproducer's construct: the same macros: h's parameter x shadows the global x that k names, so (h 5) is the global x and (not (= (h 5) x)) is unsatisfiable; the refutation reads it so (refl on x)"
+  },
+  "witness": {
+    "solver": "ay",
+    "expect": "sat",
+    "input": "the reproducer's problem script, with (get-model) after every check-sat",
+    "observed": "sat at every check, with a model under which an independent evaluator (smt_model_check in the runner) finds every assertion and assumption in scope true"
+  },
+  "construct": "(define-fun h ((x Int)) Int k)"
+}

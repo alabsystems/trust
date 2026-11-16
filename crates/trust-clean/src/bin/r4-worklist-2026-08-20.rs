@@ -1,10 +1,11 @@
 // r4-worklist-2026-08-20: WHERE is the remaining not-fully-faithful population?
 //
 // WHY THIS EXISTS. `corpus-census-2026-07-24` reports how many functions certify
-// and `r4-fallback-diagnose-2026-08-13` explains the MirSem-fallback rows — but
-// the fallback population has been 0 since the teardown exit criterion was met,
-// so that tool now prints nothing while ~1200 corpus functions still do not
-// certify. A count of what certifies is not a work list for what does not.
+// and `r4-fallback-diagnose-2026-08-13` (since deleted) explained the
+// MirSem-fallback rows — but the fallback population has been 0 since the
+// teardown exit criterion was met, so that tool printed nothing while ~1200
+// corpus functions still do not certify. A count of what certifies is not a
+// work list for what does not.
 //
 // This prints the NOT-FULLY-FAITHFUL population grouped by the pillar that
 // blocks it, using `diagnose_fully_faithful_gate` (which the crate documents as

@@ -179,10 +179,10 @@ fn compute_simplicity(kind: &ProposalKind) -> f64 {
 
     // Nesting penalty
     let max_depth = body
-        .chars()
-        .fold((0i32, 0i32), |(max, cur), ch| match ch {
-            '(' => (max.max(cur + 1), cur + 1),
-            ')' => (max, (cur - 1).max(0)),
+        .bytes()
+        .fold((0i32, 0i32), |(max, cur), b| match b {
+            b'(' => (max.max(cur + 1), cur + 1),
+            b')' => (max, (cur - 1).max(0)),
             _ => (max, cur),
         })
         .0;
@@ -268,14 +268,14 @@ fn estimate_coverage(kind: &ProposalKind) -> f64 {
 }
 
 /// Extract the body string from a ProposalKind.
-fn extract_body(kind: &ProposalKind) -> String {
+fn extract_body(kind: &ProposalKind) -> &str {
     match kind {
         ProposalKind::AddPrecondition { spec_body }
         | ProposalKind::AddPostcondition { spec_body }
-        | ProposalKind::AddInvariant { spec_body } => spec_body.clone(),
-        ProposalKind::SafeArithmetic { replacement, .. } => replacement.clone(),
+        | ProposalKind::AddInvariant { spec_body } => spec_body,
+        ProposalKind::SafeArithmetic { replacement, .. } => replacement,
         ProposalKind::AddBoundsCheck { check_expr }
-        | ProposalKind::AddNonZeroCheck { check_expr } => check_expr.clone(),
+        | ProposalKind::AddNonZeroCheck { check_expr } => check_expr,
     }
 }
 

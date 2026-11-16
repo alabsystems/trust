@@ -45,6 +45,9 @@
 
 use trust_types::{Formula, VcKind, VerifiableFunction, VerificationResult};
 
+#[path = "support/test_router.rs"]
+mod test_router;
+
 fn load() -> VerifiableFunction {
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -78,7 +81,7 @@ fn the_join_weakened_bounds_row_is_no_longer_falsely_refuted() {
     let func = load();
     let rows = bounds_rows(&func);
     assert!(!rows.is_empty(), "the `a[n as usize]` bounds obligation must exist");
-    let router = trust_router::Router::deterministic_in_process_ay(30_000);
+    let router = test_router::deterministic_test_router();
     for vc in &rows {
         let results = router.verify_all(std::slice::from_ref(vc));
         let (_, result) = results.into_iter().next().expect("one verdict per VC");

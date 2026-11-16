@@ -9,6 +9,19 @@ done
 echo "check_dependency_cycle_anchor.py requires Python 3.11+ (tomllib)" >&2
 exit 2
 ":"""
+import os as _floor_os
+import shutil as _floor_shutil
+import sys as _floor_sys
+
+# Trust: python floor, second half. `python3 check_dependency_cycle_anchor.py` reads the sh block above
+# as a string, so an old `python3` (3.9 on macOS CommandLineTools) re-execs here.
+if __name__ == "__main__" and _floor_sys.version_info < (3, 11):
+    for _floor_candidate in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _floor_path = _floor_shutil.which(_floor_candidate)
+        if _floor_path:
+            _floor_argv = [_floor_path, _floor_os.path.abspath(__file__), *_floor_sys.argv[1:]]
+            _floor_os.execv(_floor_path, _floor_argv)
+    _floor_sys.exit("check_dependency_cycle_anchor.py requires Python 3.11+ (tomllib); none found on PATH")
 __doc__ = """Validate the first-party dependency constellation.
 
 The validator derives its authority from committed Cargo/Lake surfaces and
@@ -21,13 +34,16 @@ submodule.  Ignored untracked paths are allowed because evidence authority is
 read exclusively from committed objects.
 
 Python 3.11 or newer is required because manifests are parsed with tomllib.
-Normal validation and preterminal derivation are deterministic and offline.
-``--verify-remote`` adds a config-isolated, non-mutating ``git ls-remote``
-check that Trust and every terminal pin are exactly canonical remote main.
+Constellation derivation is deterministic and offline except for ONE live
+sample per judged revision: trust-wp's canonical remote ``main``, taken by a
+config-isolated, non-mutating ``git ls-remote`` (P1 below), and, only when the
+bound trust-wp store lacks a commit the judgement reads, one by-sha fetch of
+those commits that writes no ref (``fetch_absent_trust_wp_objects``).  ``--verify-remote``
+additionally requires Trust and every pin to be exactly canonical remote main.
 
 THE REVISION IS SELECTED, NOT ASSUMED.  Every read in one judgement — receipt,
-``.gitmodules``, gitlinks, exclusion policy, manifests — is taken at the same
-tree-ish, and which one is a choice:
+``.gitmodules``, gitlinks, exclusion policy, manifests, policy markers — is
+taken at the same tree-ish, and which one is a choice:
 
     --rev REV        an explicit commit-ish
     --push-context   the revision(s) the push in flight would publish, read
@@ -39,16 +55,53 @@ tree-ish, and which one is a choice:
 when no receipt is committed there, which is the same coherence check without
 the inventory comparison.  It never weakens what counts as incoherent.
 
-An immutable committed policy marker makes every later TrustWP gitlink move a
-permanent terminal claim.  Judging that selected revision then requires the
-remote witness and exact full terminal cut; neither a stale checkout, R2, a
-tracked legacy receipt, nor malformed W1 authority can downgrade the harness.
+TRUSTWP TERMINAL POLICY v3 (2026-09-21, recorded in
+docs/first-party-pin-ledger.md under "TrustWP forward publication policy v2",
+amendment block).  ``first-party/trust-wp`` is the one sibling whose own
+``spikes/DEPENDS.lock`` points back into this repository, so its gitlink gets
+these rules on top of the cohort rule every sibling gets:
+
+  P1  PRESERVATION FLOOR.  trust-wp remote ``main``, sampled live at every
+      judging, must contain B ``1de995e192…`` (hence W0 ``e7c353690e…``).  The
+      ancestry is read from the bound submodule's object store.  A TrustWP
+      commit the judgement reads (this main, B, every judged move's ends) that
+      the store lacks is first fetched BY SHA from the canonical URL, writing
+      no ref (``fetch_absent_trust_wp_objects``, 2026-10-24); one still absent
+      is a refusal that names the fetch.  This is the whole of what
+      "published history is never rewritten" needs.
+  P2  FORWARD OR CANONICAL PIN MOVES.  Every single-parent move X -> Y of the
+      gitlink in the judged history since the v1 marker's activation is
+      admissible iff (a) X is a raw ancestor of Y; or (b) Y is an
+      ancestor-or-equal of trust-wp remote ``main`` and ``spikes/DEPENDS.lock``
+      is byte-identical at X and Y (a re-anchoring onto the canonical line with
+      unchanged bindings); or (c) it is a same-lock backward move restored by
+      an immediate single-parent child.  Anything else is refused with X, Y and
+      the clause that failed.  A marked merge may adopt one marked parent's
+      binding when every other marked parent's is (a)- or (b)-admissible away
+      from it.  Backward moves are otherwise ``fast.pin-regression``'s business.
+  P3  BINDING COHERENCE — the same cohort rule as every other sibling.  At the
+      pinned trust-wp commit ``spikes/DEPENDS.lock`` must parse (five rows,
+      branch ``main``, 40-hex) and each row must be an ancestor-or-equal of the
+      gitlink it names (the ``trust`` row: of the judged Trust commit).
+  P4  NO TERMINAL STATE.  ``.trust-terminal-policy-v3`` must be present and
+      byte-exact at the judged revision; an edited or deleted copy anywhere in
+      the judged history is refused.  The v1 and v2 markers stay as history: the
+      v1 marker still names where the judged history begins, the v2 marker is
+      only accepted as its historical ``state=pre-v2`` bytes, and an ``armed``
+      v2 marker anywhere in the judged history is refused outright.  There is
+      no R0/W1/R1, no Armed/Terminal state and no terminal claim.
+
+Everything the v1/v2 terminal cut carried is DELETED, not dormant: the external
+receipt (``trust.constellation.first-party.v3``) no longer has a
+``wp_trust_anchor`` member at all (it was ``null`` outside a terminal cut and
+never tracked), ``--require-wp-trust-anchor`` is gone, and a ``refs/heads/main``
+push is judged like any other push (no prospective old-main authentication).
 """
 
 import argparse
-import base64
 import configparser
 import fnmatch
+import hashlib
 import json
 import os
 import posixpath
@@ -56,10 +109,12 @@ import re
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NoReturn, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import remote_tips as rt
 
 try:
     import tomllib
@@ -80,18 +135,18 @@ ROOT_URL = "https://github.com/alabsystems/trust.git"
 WP_DEPENDS_PATH = "spikes/DEPENDS.lock"
 WP_DEPENDS_REPOSITORIES = {"ay", "clean", "trust", "trust-cg", "trust-ir"}
 WP_ROOT_DELTA_PATH = "first-party/trust-wp"
-WP_W1_REQUIRED_DELTAS = {"Cargo.toml", "VISION.md", WP_DEPENDS_PATH}
-WP_AY_SHORT_WIDTH = 8
+# The v1 marker (2026-08-29) names where the judged TrustWP history BEGINS: the
+# gitlink moves judged by P2 are those on the marked subgraph since its unique
+# activation.  Its bytes are immutable history.
 TERMINAL_POLICY_MARKER_PATH = ".trust-terminal-policy-v1"
 TERMINAL_POLICY_MARKER = (
     b"trust.constellation.terminal-policy.v1\n"
     b"policy=trust-wp-root-cycle\n"
 )
+# The v2 marker (2026-09-02) is history under v3.  The checker reads it only to
+# refuse anything but its historical pre-v2 bytes: an `armed` v2 marker is the
+# state machine the 2026-09-21 ruling deleted, and is refused outright (P4).
 TERMINAL_POLICY_V2_MARKER_PATH = ".trust-terminal-policy-v2"
-TERMINAL_POLICY_V2_W0 = "e7c353690e1b58a4e830edc9facb0e4396164585"
-TERMINAL_POLICY_V2_PRESERVATION_FLOOR = (
-    "1de995e192aabec74646d4d53642df05fa59466f"
-)
 TERMINAL_POLICY_V2_PRE_MARKER = (
     b"trust.constellation.terminal-policy.v2\n"
     b"state=pre-v2\n"
@@ -99,25 +154,31 @@ TERMINAL_POLICY_V2_PRE_MARKER = (
     b"w0=e7c353690e1b58a4e830edc9facb0e4396164585\n"
     b"preservation-floor=1de995e192aabec74646d4d53642df05fa59466f\n"
 )
+# W0 is the frozen pin the v1/v2 policies were written against; B is the
+# published floor every later TrustWP main must contain (P1).  Both are ratified
+# constants of the 2026-09-21 ruling and are spelled into the v3 marker.
+TRUST_WP_W0 = "e7c353690e1b58a4e830edc9facb0e4396164585"
+TRUST_WP_PRESERVATION_FLOOR = "1de995e192aabec74646d4d53642df05fa59466f"
+TERMINAL_POLICY_V3_MARKER_PATH = ".trust-terminal-policy-v3"
+TERMINAL_POLICY_V3_POLICY_ID = "trust.constellation.terminal-policy.v3"
+
+
+def render_terminal_policy_v3_marker(w0: str, preservation_floor: str) -> bytes:
+    """The one canonical v3 marker: every row fixed by the 2026-09-21 ruling."""
+    return (
+        f"{TERMINAL_POLICY_V3_POLICY_ID}\n"
+        "policy=trust-wp-cohort-forward\n"
+        "supersedes=trust-wp-root-cycle-forward\n"
+        f"w0={w0}\n"
+        f"preservation-floor={preservation_floor}\n"
+        "ruled=2026-09-21\n"
+    ).encode("ascii")
+
+
+TERMINAL_POLICY_V3_MARKER = render_terminal_policy_v3_marker(
+    TRUST_WP_W0, TRUST_WP_PRESERVATION_FLOOR
+)
 TERMINAL_POLICY_HISTORY_LIMIT = 100_000
-WP_ROOT_ANCHOR_KEYS = {
-    "authority_repository",
-    "authority_commit",
-    "authority_path",
-    "anchor_repository",
-    "anchor_commit",
-    "terminal_repository",
-    "terminal_commit",
-    "only_tree_delta",
-    "anchor_gitlink",
-    "terminal_gitlink",
-}
-WP_ROOT_ANCHOR_V2_EXTRA_KEYS = {
-    "policy_version",
-    "preservation_floor",
-    "predecessor_commit",
-    "root_bindings",
-}
 GENERATION_CUT_REASON = (
     "finite exact-SHA generation cut; dependency predates this consumer generation"
 )
@@ -212,8 +273,41 @@ class UnresolvableAtRevision(AnchorError):
         self.options = list(options)
 
 
+class HistoryFinding(AnchorError):
+    """Refusals that are properties of the judged HISTORY alone, all of them.
+
+    A history finding is recorded only where the refused fact is read from
+    committed objects (and, for P2's clause (b), the one live trust-wp main
+    sample), never where an object, a remote or a host could not be read.  The
+    same history judged from any clone gives the same messages, so ``main``
+    prints each as a ``FINDING:`` line, which the pre-push hook compares
+    between a push and its destination (INHERITED-RED, docs/DECISION_QUEUE.md).
+    Every other refusal prints none, so the hook can never take an unreadable
+    store for a red the destination already has.
+
+    THE SET IS COMPLETE OR IT SAYS SO (2026-10-25, docs/DECISION_QUEUE.md
+    CONSTELLATION-ALL-FINDINGS).  A history finding no longer stops the
+    judgement: the walk records it and goes on, so a red destination's finding
+    can never hide a refusal the push adds behind it (until then the gate
+    stopped at its first refusal and printed that one key as the complete set,
+    so a push adding a P2 move, a later-sorting mint or any later check's red
+    to a red main was graded INHERITED).  ``main`` prints ``FINDINGS:
+    complete`` only when every check of every judged revision ran to its end
+    and every refusal was a history finding.
+    """
+
+    def __init__(self, messages: Sequence[str]) -> None:
+        super().__init__("\n".join(messages))
+        self.findings = list(messages)
+
+
 def fail(message: str) -> NoReturn:
     raise AnchorError(message)
+
+
+def finding_key(message: str) -> str:
+    """The one-line ``FINDING:`` key of a history finding's message."""
+    return " | ".join(line.strip() for line in message.splitlines() if line.strip())
 
 
 def authority_git_environment() -> dict[str, str]:
@@ -240,17 +334,14 @@ def authority_git_environment() -> dict[str, str]:
     return environment
 
 
-def remote_git_environment(
-    ceiling: Path, *, authorization_header: str | None = None
-) -> dict[str, str]:
+def remote_git_environment(ceiling: Path) -> dict[str, str]:
     """Return a config-isolated environment for canonical remote probes.
 
     In particular, ``url.*.insteadOf`` must not be able to redirect a named
     GitHub authority to an attacker-controlled repository.  A remote probe has
     no repository cwd and reads neither system nor user Git configuration.
     Config-selected credential helpers are deliberately absent from this
-    transport process.  When needed, a separately acquired credential is
-    reintroduced only as the constructed GitHub-scoped authorization header.
+    transport process. GitHub authentication belongs to native Agh.
     """
     environment = authority_git_environment()
     transport_overrides = {
@@ -283,31 +374,6 @@ def remote_git_environment(
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_SYSTEM"] = os.devnull
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
-    environment["GIT_CEILING_DIRECTORIES"] = str(ceiling.resolve())
-    environment["GIT_TERMINAL_PROMPT"] = "0"
-    if authorization_header is not None:
-        # Reintroduce one constructed, host-scoped setting after deleting all
-        # ambient config injection.  It supplies credentials but cannot select
-        # or rewrite the transport URL.
-        environment["GIT_CONFIG_COUNT"] = "1"
-        environment["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraHeader"
-        environment["GIT_CONFIG_VALUE_0"] = authorization_header
-    return environment
-
-
-def credential_git_environment(ceiling: Path) -> dict[str, str]:
-    """Allow normal credential helpers without using their config for transport."""
-    environment = authority_git_environment()
-    for key in list(environment):
-        if key in {
-            "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_NOSYSTEM",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_CONFIG_SYSTEM",
-        } or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
-            environment.pop(key, None)
     environment["GIT_CEILING_DIRECTORIES"] = str(ceiling.resolve())
     environment["GIT_TERMINAL_PROMPT"] = "0"
     return environment
@@ -727,21 +793,6 @@ def committed_tree_entries(repo: Path, commit: str) -> dict[str, tuple[str, str,
     return entries
 
 
-def changed_committed_tree_paths(repo: Path, before: str, after: str) -> list[str]:
-    """Compare literal committed entry maps without consulting diff config.
-
-    In particular, ``submodule.*.ignore`` must not be able to hide an extra
-    gitlink change from either side of the terminal publication cut.
-    """
-    before_entries = committed_tree_entries(repo, before)
-    after_entries = committed_tree_entries(repo, after)
-    return sorted(
-        path
-        for path in set(before_entries) | set(after_entries)
-        if before_entries.get(path) != after_entries.get(path)
-    )
-
-
 def require_regular_committed_authority(
     repo: Path, commit: str, path: str, label: str
 ) -> None:
@@ -751,16 +802,6 @@ def require_regular_committed_authority(
     mode, object_type, _oid = entry
     if object_type != "blob" or mode not in {"100644", "100755"}:
         fail(f"{label} must be a regular committed blob, not mode {mode} type {object_type}")
-
-
-def committed_gitlink(repo: Path, commit: str, path: str, label: str) -> str:
-    entry = committed_tree_entries(repo, commit).get(path)
-    if entry is None:
-        fail(f"{label} is not committed")
-    mode, object_type, oid = entry
-    if mode != "160000" or object_type != "commit":
-        fail(f"{label} must be a committed gitlink, not mode {mode} type {object_type}")
-    return require_sha(oid, label)
 
 
 def require_unmodified_history_view(repo: Path, label: str) -> None:
@@ -806,47 +847,14 @@ def require_unmodified_history_view(repo: Path, label: str) -> None:
         fail(f"{label} is shallow; complete parent authority is required")
 
 
-def raw_commit_parents(repo: Path, commit: str, label: str) -> list[str]:
-    """Read literal parent headers with replacement/graft semantics disabled."""
-    commit = require_sha(commit, f"{label} commit")
-    object_type = decode_text(
-        run_git(repo, ["cat-file", "-t", commit]), f"{label} object type"
-    ).strip()
-    if object_type != "commit":
-        fail(f"{label} {commit} is not a commit object")
-    raw = run_git(repo, ["cat-file", "commit", commit])
-    header, separator, _message = raw.partition(b"\n\n")
-    if separator != b"\n\n":
-        fail(f"{label} {commit} has no raw commit header terminator")
-    parents: list[str] = []
-    tree_rows = 0
-    for line in header.split(b"\n"):
-        if line.startswith(b"tree "):
-            tree_rows += 1
-            try:
-                require_sha(line[5:].decode("ascii", "strict"), f"{label} tree")
-            except UnicodeDecodeError as error:
-                fail(f"{label} tree header is not ASCII: {error}")
-        elif line.startswith(b"parent "):
-            try:
-                parent = line[7:].decode("ascii", "strict")
-            except UnicodeDecodeError as error:
-                fail(f"{label} parent header is not ASCII: {error}")
-            parents.append(require_sha(parent, f"{label} parent"))
-        elif line.startswith(b"parent"):
-            fail(f"{label} contains malformed raw parent header {line!r}")
-    if tree_rows != 1:
-        fail(f"{label} must contain exactly one raw tree header; observed {tree_rows}")
-    return parents
-
-
 def parse_wp_depends_lock(raw: bytes) -> dict[str, str]:
-    """Parse the terminal TrustWP cycle authority without accepting aliases.
+    """Parse TrustWP's ``spikes/DEPENDS.lock`` without accepting aliases.
 
-    The five-row shape is part of TrustWP's spike-suite reproducibility guard.
-    Only the ``trust`` row supplies the root-cycle edge here, but accepting a
-    duplicate, unknown, or malformed sibling row would make that row ambiguous
-    under a future parser or hand audit.
+    The five-row shape is part of TrustWP's spike-suite reproducibility guard,
+    and under v3 every row is a cohort binding judged by P3 (the ``trust`` row
+    is the edge back into this repository).  Accepting a duplicate, unknown, or
+    malformed row would make a binding ambiguous under a future parser or hand
+    audit, so the shape is exact.
     """
     text = decode_text(raw, "trust-wp:spikes/DEPENDS.lock")
     pins: dict[str, str] = {}
@@ -888,246 +896,6 @@ def parse_wp_depends_lock(raw: bytes) -> dict[str, str]:
     return pins
 
 
-def active_manifest_git_revisions(
-    data: dict[str, Any], dependency: str, label: str
-) -> list[str]:
-    """Return direct active Git revisions for one dependency in a Cargo root."""
-    tables: list[tuple[str, object]] = []
-    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-        tables.append((f"/{section}", data.get(section)))
-    workspace = data.get("workspace")
-    if isinstance(workspace, dict):
-        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-            tables.append((f"/workspace/{section}", workspace.get(section)))
-    target = data.get("target")
-    if isinstance(target, dict):
-        for target_name, target_table in target.items():
-            if not isinstance(target_table, dict):
-                continue
-            for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-                tables.append(
-                    (f"/target/{target_name}/{section}", target_table.get(section))
-                )
-    patches = data.get("patch")
-    if isinstance(patches, dict):
-        for source, table in patches.items():
-            tables.append((f"/patch/{source}", table))
-    tables.append(("/replace", data.get("replace")))
-
-    revisions: list[str] = []
-    for base, table in tables:
-        if not isinstance(table, dict):
-            continue
-        for alias, spec in table.items():
-            if not isinstance(spec, dict) or "git" not in spec:
-                continue
-            repository = first_party_url(
-                spec["git"], f"{label}:{base}/{alias}.git"
-            )
-            if repository == dependency:
-                revisions.append(
-                    require_sha(spec.get("rev"), f"{label}:{base}/{alias}.rev")
-                )
-    return revisions
-
-
-def validate_wp_terminal_authority_bindings(
-    repo_root: Path,
-    wp_checkout: Path,
-    terminal_wp: str,
-    commits: dict[str, str],
-) -> None:
-    """Bind W1's active TrustIR and AY claims to the terminal constellation."""
-    cargo_raw = committed_blob(wp_checkout, terminal_wp, "Cargo.toml")
-    cargo = parse_toml(cargo_raw, "terminal TrustWP Cargo.toml")
-    trust_ir_revisions = active_manifest_git_revisions(
-        cargo, "trust-ir", "terminal TrustWP Cargo.toml"
-    )
-    if not trust_ir_revisions:
-        fail("terminal TrustWP Cargo.toml has no active TrustIR Git revision")
-    stale_ir = sorted(
-        revision for revision in trust_ir_revisions if revision != commits["trust-ir"]
-    )
-    if stale_ir:
-        fail(
-            "terminal TrustWP Cargo.toml active TrustIR Git revisions must all "
-            f"equal the root terminal trust-ir binding {commits['trust-ir']}; "
-            f"observed={sorted(trust_ir_revisions)}"
-        )
-
-    ay_checkout = repo_root / SUBMODULES["ay"][0]
-    require_regular_committed_authority(
-        ay_checkout,
-        commits["ay"],
-        "Cargo.toml",
-        "terminal AY workspace manifest authority",
-    )
-    ay_manifest = parse_toml(
-        committed_blob(ay_checkout, commits["ay"], "Cargo.toml"),
-        "terminal AY Cargo.toml",
-    )
-    ay_workspace = ay_manifest.get("workspace")
-    ay_package = (
-        ay_workspace.get("package") if isinstance(ay_workspace, dict) else None
-    )
-    ay_version = ay_package.get("version") if isinstance(ay_package, dict) else None
-    if (
-        not isinstance(ay_version, str)
-        or re.fullmatch(r"[0-9A-Za-z.+-]+", ay_version) is None
-    ):
-        fail("terminal AY Cargo.toml workspace.package.version is missing or malformed")
-
-    cargo_text = decode_text(cargo_raw, "terminal TrustWP Cargo.toml")
-    ay_marker_lines = []
-    for line in cargo_text.splitlines():
-        normalized_line = unicodedata.normalize("NFKC", line)
-        if re.match(
-            r"^\s*#+\s*current(?:[\s_-]+)ay(?:[\s_-]+)authority\b",
-            normalized_line,
-            flags=re.IGNORECASE,
-        ):
-            ay_marker_lines.append(line)
-    if len(ay_marker_lines) != 1:
-        fail(
-            "terminal TrustWP Cargo.toml must contain exactly one machine-checkable "
-            "Current AY authority marker and no case/punctuation lookalikes"
-        )
-    ay_claim = re.fullmatch(
-        r"# Current AY authority: version=(\S+) commit=([0-9a-f]{40})",
-        ay_marker_lines[0],
-    )
-    if ay_claim is None:
-        fail(
-            "terminal TrustWP Cargo.toml AY authority marker must use the exact "
-            "case, punctuation, and two-field shape"
-        )
-    observed_ay_claim = ay_claim.groups()
-    if observed_ay_claim != (ay_version, commits["ay"]):
-        fail(
-            "terminal TrustWP Cargo.toml Current AY authority marker differs from "
-            f"the committed AY authority: marker={observed_ay_claim}, "
-            f"expected={(ay_version, commits['ay'])}"
-        )
-
-    vision_text = decode_text(
-        committed_blob(wp_checkout, terminal_wp, "VISION.md"),
-        "terminal TrustWP VISION.md",
-    )
-    vision_rows = []
-    for line in vision_text.splitlines():
-        cells = line.split("|")
-        if len(cells) >= 3 and unicodedata.normalize(
-            "NFKC", cells[1].strip()
-        ).casefold() == "trust-wp-ay":
-            vision_rows.append(line)
-    if len(vision_rows) != 1:
-        fail(
-            "terminal TrustWP VISION.md must contain exactly one active "
-            "trust-wp-ay row"
-        )
-    expected_vision_claim = (
-        f"AY v{ay_version} backend at `{commits['ay'][:WP_AY_SHORT_WIDTH]}` "
-        "on current `main`"
-    )
-    expected_vision_row = (
-        "| trust-wp-ay | Building | See current review artifacts | "
-        f"AYEncoder with native ADT theory, {expected_vision_claim}, "
-        "separation logic encoding |"
-    )
-    if vision_rows[0] != expected_vision_row:
-        fail(
-            "terminal TrustWP VISION.md trust-wp-ay row must exactly bind the "
-            f"committed AY authority; expected {expected_vision_row!r}"
-        )
-
-
-def render_terminal_policy_v2_armed(
-    predecessor_commit: str, root_bindings: dict[str, str]
-) -> bytes:
-    """Render the one canonical armed-v2 marker.
-
-    R0 commits this independently reviewable policy value.  Receipt material is
-    later derived from it; it is never permitted to select these identities.
-    """
-    predecessor = require_sha(
-        predecessor_commit, "terminal-policy v2 predecessor P"
-    )
-    if set(root_bindings) != set(SUBMODULES):
-        fail(
-            "terminal-policy v2 root binding vector must name exactly all nine "
-            f"repositories: missing={sorted(set(SUBMODULES) - set(root_bindings))}, "
-            f"extra={sorted(set(root_bindings) - set(SUBMODULES))}"
-        )
-    bindings = {
-        name: require_sha(root_bindings[name], f"terminal-policy v2 root.{name}")
-        for name in sorted(SUBMODULES)
-    }
-    if bindings["trust-wp"] != TERMINAL_POLICY_V2_W0:
-        fail(
-            "terminal-policy v2 armed R0 must preserve the exact W0 gitlink: "
-            f"expected={TERMINAL_POLICY_V2_W0}, observed={bindings['trust-wp']}"
-        )
-    lines = [
-        "trust.constellation.terminal-policy.v2",
-        "state=armed",
-        "policy=trust-wp-root-cycle-forward",
-        f"w0={TERMINAL_POLICY_V2_W0}",
-        f"preservation-floor={TERMINAL_POLICY_V2_PRESERVATION_FLOOR}",
-        f"predecessor={predecessor}",
-    ]
-    lines.extend(f"root.{name}={bindings[name]}" for name in sorted(bindings))
-    return ("\n".join(lines) + "\n").encode("ascii")
-
-
-def parse_terminal_policy_v2_armed(raw: bytes) -> dict[str, Any]:
-    """Parse armed-v2 only by round-tripping its canonical byte spelling."""
-    try:
-        text = raw.decode("ascii", "strict")
-    except UnicodeDecodeError as error:
-        fail(f"terminal-policy v2 marker is not ASCII: {error}")
-    lines = text.splitlines()
-    expected_prefix = [
-        "trust.constellation.terminal-policy.v2",
-        "state=armed",
-        "policy=trust-wp-root-cycle-forward",
-        f"w0={TERMINAL_POLICY_V2_W0}",
-        f"preservation-floor={TERMINAL_POLICY_V2_PRESERVATION_FLOOR}",
-    ]
-    expected_count = len(expected_prefix) + 1 + len(SUBMODULES)
-    if lines[: len(expected_prefix)] != expected_prefix or len(lines) != expected_count:
-        fail(
-            "terminal-policy v2 armed marker has malformed fixed fields or row "
-            f"count; expected={expected_count}, observed={len(lines)}"
-        )
-    predecessor_row = lines[len(expected_prefix)]
-    if not predecessor_row.startswith("predecessor="):
-        fail("terminal-policy v2 armed marker is missing canonical predecessor row")
-    predecessor = require_sha(
-        predecessor_row.removeprefix("predecessor="),
-        "terminal-policy v2 predecessor P",
-    )
-    binding_lines = lines[len(expected_prefix) + 1 :]
-    expected_names = sorted(SUBMODULES)
-    bindings: dict[str, str] = {}
-    for expected_name, row in zip(expected_names, binding_lines):
-        prefix = f"root.{expected_name}="
-        if not row.startswith(prefix):
-            fail(
-                "terminal-policy v2 armed root vector is not in canonical exact "
-                f"order; expected row for {expected_name!r}, observed={row!r}"
-            )
-        bindings[expected_name] = require_sha(
-            row.removeprefix(prefix), f"terminal-policy v2 root.{expected_name}"
-        )
-    canonical = render_terminal_policy_v2_armed(predecessor, bindings)
-    if raw != canonical:
-        fail(
-            "terminal-policy v2 armed marker differs from its canonical bytes "
-            "(including final newline and duplicate/extra-field policy)"
-        )
-    return {"predecessor_commit": predecessor, "root_bindings": bindings}
-
-
 def raw_commit_is_ancestor(
     reader: RawObjectReader, ancestor: str, descendant: str, label: str
 ) -> bool:
@@ -1153,594 +921,278 @@ def raw_commit_is_ancestor(
     return False
 
 
-def validate_terminal_policy_v2_wp_history(
-    repo_root: Path, predecessor: str
-) -> None:
-    """Prove W0 -> ... -> B -> ... -> P from literal local TrustWP objects."""
-    wp_checkout = repo_root / SUBMODULES["trust-wp"][0]
-    require_unmodified_history_view(wp_checkout, "terminal-policy v2 TrustWP history")
-    with RawObjectReader(wp_checkout, "terminal-policy v2 TrustWP history") as reader:
-        if not raw_commit_is_ancestor(
-            reader,
-            TERMINAL_POLICY_V2_W0,
-            TERMINAL_POLICY_V2_PRESERVATION_FLOOR,
-            "terminal-policy v2 W0-to-B preservation",
-        ):
-            fail(
-                "terminal-policy v2 preservation floor B is not a raw descendant "
-                f"of exact W0: W0={TERMINAL_POLICY_V2_W0}, "
-                f"B={TERMINAL_POLICY_V2_PRESERVATION_FLOOR}"
-            )
-        if not raw_commit_is_ancestor(
-            reader,
-            TERMINAL_POLICY_V2_PRESERVATION_FLOOR,
-            predecessor,
-            "terminal-policy v2 B-to-P preservation",
-        ):
-            fail(
-                "terminal-policy v2 predecessor P does not preserve published "
-                f"floor B: B={TERMINAL_POLICY_V2_PRESERVATION_FLOOR}, P={predecessor}"
-            )
+def git_blob_oid(content: bytes) -> str:
+    """The SHA-1 object id Git assigns to ``content`` stored as a blob."""
+    return hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
 
 
-def terminal_wp_policy_v2_state(
-    repo_root: Path, root_commit: str, commits: dict[str, str]
-) -> dict[str, Any]:
-    """Authenticate the forward-only PreV2 -> Armed(R0) -> Terminal(R1) state.
+def parse_terminal_policy_v3(raw: bytes) -> None:
+    """Accept only the canonical v3 marker bytes, naming the first difference.
 
-    The pre marker may propagate through ordinary raw merges.  Exactly one raw
-    single-parent commit may replace it with a canonical armed marker; that
-    commit is R0.  Once armed, the only further admissible judged revision is
-    R0's raw sole child R1, so an intervening commit, merge, second cut, or
-    move/revert history cannot be reinterpreted as the terminal publication.
+    The marker carries no state and no variable field: every row is fixed by
+    the 2026-09-21 ruling.  It is still read row by row rather than compared
+    once, so a forged or edited marker is refused with the row that differs --
+    duplicate, reordered, extra, short, uppercase, or non-terminated authority
+    lands on a named row or on the row count -- and the byte comparison at the
+    end is the round trip that closes anything the rows did not (the same
+    strictness the v2 armed-marker parser applied).
     """
-    require_unmodified_history_view(repo_root, "Trust terminal-policy v2 history")
-    root_commit = require_sha(root_commit, "Trust terminal-policy v2 HEAD")
-    with RawObjectReader(repo_root, "Trust terminal-policy v2 history") as reader:
-        snapshots: dict[
-            str,
-            tuple[
-                str,
-                list[str],
-                str,
-                tuple[str, str] | None,
-                dict[str, Any] | None,
-            ],
-        ] = {}
-
-        def snapshot(
-            commit: str, label: str
-        ) -> tuple[
-            str,
-            list[str],
-            str,
-            tuple[str, str] | None,
-            dict[str, Any] | None,
-        ]:
-            cached = snapshots.get(commit)
-            if cached is not None:
-                return cached
-            tree, parents = parse_raw_commit(reader, commit, label)
-            entry = raw_tree_path_entry(
-                reader, tree, TERMINAL_POLICY_V2_MARKER_PATH, f"{label} marker"
-            )
-            policy: dict[str, Any] | None = None
-            if entry is None:
-                kind = "absent"
-            else:
-                mode, oid = entry
-                if mode != "100644":
-                    fail(
-                        "Trust terminal-policy v2 marker must be a non-executable "
-                        f"regular blob (mode 100644), not mode {mode} at {commit}"
-                    )
-                raw = reader.read(oid, "blob", f"{label} marker")
-                if raw == TERMINAL_POLICY_V2_PRE_MARKER:
-                    kind = "pre"
-                else:
-                    policy = parse_terminal_policy_v2_armed(raw)
-                    kind = "armed"
-            cached = (tree, parents, kind, entry, policy)
-            snapshots[commit] = cached
-            return cached
-
-        pending = [root_commit]
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in visited:
-                continue
-            if len(visited) >= TERMINAL_POLICY_HISTORY_LIMIT:
-                fail(
-                    "Trust terminal-policy v2 raw DAG walk exceeded its bounded "
-                    f"limit of {TERMINAL_POLICY_HISTORY_LIMIT} commits"
-                )
-            visited.add(current)
-            _tree, parents, _kind, _entry, _policy = snapshot(
-                current, "Trust terminal-policy v2 raw DAG history"
-            )
-            pending.extend(parent for parent in parents if parent not in visited)
-
-        introductions: list[str] = []
-        transitions: list[str] = []
-        for commit in sorted(visited):
-            _tree, parents, kind, entry, policy = snapshots[commit]
-            parent_kinds = [snapshots[parent][2] for parent in parents]
-            marked_parents = [
-                parent
-                for parent, parent_kind in zip(parents, parent_kinds)
-                if parent_kind != "absent"
-            ]
-            if kind == "absent":
-                if marked_parents:
-                    fail(
-                        "Trust terminal-policy v2 marker was deleted on a raw DAG "
-                        f"edge: child={commit}, marked_parents={marked_parents}"
-                    )
-                continue
-            if kind == "pre":
-                armed_parents = [
-                    parent
-                    for parent, parent_kind in zip(parents, parent_kinds)
-                    if parent_kind == "armed"
-                ]
-                if armed_parents:
-                    fail(
-                        "Trust terminal-policy v2 armed state was downgraded to "
-                        f"PreV2: child={commit}, armed_parents={armed_parents}"
-                    )
-                if not marked_parents:
-                    if len(parents) != 1 or parent_kinds != ["absent"]:
-                        fail(
-                            "Trust terminal-policy v2 PreV2 introduction must be a "
-                            f"raw single-parent commit: commit={commit}, "
-                            f"parents={parents}, parent_states={parent_kinds}"
-                        )
-                    introductions.append(commit)
-                continue
-
-            assert kind == "armed" and entry is not None and policy is not None
-            armed_parents = [
-                parent
-                for parent, parent_kind in zip(parents, parent_kinds)
-                if parent_kind == "armed"
-            ]
-            if not armed_parents:
-                if len(parents) != 1 or parent_kinds != ["pre"]:
-                    fail(
-                        "Trust terminal-policy v2 Armed R0 transition must be a "
-                        f"raw single-parent PreV2 child: commit={commit}, "
-                        f"parents={parents}, parent_states={parent_kinds}"
-                    )
-                transitions.append(commit)
-            else:
-                if len(armed_parents) != len(parents):
-                    fail(
-                        "Trust terminal-policy v2 armed history may not merge an "
-                        f"unarmed lineage: commit={commit}, parents={parents}, "
-                        f"parent_states={parent_kinds}"
-                    )
-                changed_markers = {
-                    parent: snapshots[parent][3]
-                    for parent in armed_parents
-                    if snapshots[parent][3] != entry
-                }
-                if changed_markers:
-                    fail(
-                        "Trust terminal-policy v2 armed marker changed after R0: "
-                        f"child={commit}, mismatched_parents={changed_markers}"
-                    )
-
-        if not introductions:
-            if any(snapshots[commit][2] != "absent" for commit in visited):
-                fail("Trust terminal-policy v2 marked history has no PreV2 introduction")
-            return {"state": "PreV2", "introduced": False}
-        if len(introductions) != 1:
-            fail(
-                "Trust terminal-policy v2 must have one unique PreV2 raw "
-                f"introduction; observed={introductions}"
-            )
-        head_kind = snapshots[root_commit][2]
-        if head_kind == "absent":
-            fail(
-                "Trust terminal-policy v2 HEAD is unmarked after its unique "
-                f"introduction {introductions[0]}"
-            )
-        if not transitions:
-            if head_kind != "pre":
-                fail("Trust terminal-policy v2 armed HEAD has no authenticated R0")
-            return {
-                "state": "PreV2",
-                "introduced": True,
-                "introduction_commit": introductions[0],
-            }
-        if len(transitions) != 1:
-            fail(
-                "Trust terminal-policy v2 must have one unique Armed R0 "
-                f"transition; observed={transitions}"
-            )
-        r0 = transitions[0]
-        policy = snapshots[r0][4]
-        assert policy is not None
-        r0_submodules = committed_submodules(repo_root, r0)
-        r0_bindings = {
-            name: commit for name, (_path, _url, commit) in r0_submodules.items()
-        }
-        if r0_bindings != policy["root_bindings"]:
-            fail(
-                "Trust terminal-policy v2 Armed R0 tree differs from the exact "
-                f"nine-vector committed by its policy: policy={policy['root_bindings']}, "
-                f"observed={r0_bindings}"
-            )
-        # Re-evaluate the preserved v1 tripwire at R0 itself, even when the
-        # candidate under judgement is Terminal R1.  Looking only at R1 makes
-        # the required W0 -> W1 move true while losing the distinction between
-        # a clean PreV2 history and an earlier W0 -> X -> W0 move/revert that
-        # was laundered before arming.
-        if terminal_wp_policy_claimed(repo_root, r0, r0_bindings):
-            fail(
-                "terminal-policy v2 Armed R0 has prior v1 TrustWP-move history; "
-                "R0 must still bind exact W0 with no move/revert claim"
-            )
-        validate_terminal_policy_v2_wp_history(
-            repo_root, policy["predecessor_commit"]
+    try:
+        text = raw.decode("ascii", "strict")
+    except UnicodeDecodeError as error:
+        fail(f"terminal-policy v3 marker is not ASCII: {error}")
+    if not text.endswith("\n"):
+        fail("terminal-policy v3 marker is not newline-terminated")
+    rows = text[:-1].split("\n")
+    expected_rows = TERMINAL_POLICY_V3_MARKER.decode("ascii")[:-1].split("\n")
+    if len(rows) != len(expected_rows):
+        fail(
+            "terminal-policy v3 marker row count differs from canonical: "
+            f"observed={len(rows)}, expected={len(expected_rows)}"
         )
-        result = {
-            "r0": r0,
-            "policy": policy,
-            "introduction_commit": introductions[0],
-        }
-        if root_commit == r0:
-            if commits != policy["root_bindings"]:
-                fail("Trust terminal-policy v2 Armed R0 current bindings drifted")
-            result["state"] = "Armed"
-            return result
-        root_parents = snapshots[root_commit][1]
-        if root_parents != [r0]:
+    for index, (row, expected) in enumerate(zip(rows, expected_rows), start=1):
+        if row != expected:
             fail(
-                "Trust terminal-policy v2 Terminal R1 must be R0's direct raw "
-                f"sole child; R0={r0}, candidate={root_commit}, parents={root_parents}"
+                f"terminal-policy v3 marker row {index} differs from canonical: "
+                f"observed={row!r}, expected={expected!r}"
             )
-        expected_terminal_bindings = dict(policy["root_bindings"])
-        expected_terminal_bindings["trust-wp"] = commits["trust-wp"]
-        if commits != expected_terminal_bindings:
-            fail(
-                "Trust terminal-policy v2 Terminal R1 changed a non-TrustWP member "
-                f"of the armed nine-vector: expected={expected_terminal_bindings}, "
-                f"observed={commits}"
-            )
-        if commits["trust-wp"] == TERMINAL_POLICY_V2_W0:
-            fail("Trust terminal-policy v2 Terminal R1 did not advance TrustWP from W0")
-        result["state"] = "Terminal"
-        result["r1"] = root_commit
-        return result
+    if raw != TERMINAL_POLICY_V3_MARKER:
+        fail("terminal-policy v3 marker differs from its canonical bytes")
 
 
-def derive_wp_root_anchor(
-    repo_root: Path,
-    root_commit: str,
-    commits: dict[str, str],
+def local_commit_type(checkout: Path, commit: str) -> str | None:
+    """``cat-file -t`` under the authority environment; ``None`` when absent."""
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "cat-file", "-t", commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=authority_git_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.decode("ascii", "replace").strip()
+
+
+def local_is_ancestor(checkout: Path, ancestor: str, descendant: str) -> tuple[bool, str]:
+    """``git merge-base --is-ancestor`` in one checkout's own object store.
+
+    This is the cohort reading every sibling gets (``verify_local_objects``):
+    containment through any parent.  Returns the verdict and any diagnostic.
+    """
+    if ancestor == descendant:
+        return True, ""
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "merge-base", "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=authority_git_environment(),
+        check=False,
+    )
+    return completed.returncode == 0, completed.stderr.decode("utf-8", "replace").strip()
+
+
+def validate_trust_wp_binding_coherence(
+    repo_root: Path, root_commit: str, commits: dict[str, str]
 ) -> dict[str, str]:
-    """Authenticate the one permitted TrustWP -> Trust generation cut.
+    """P3: every ``spikes/DEPENDS.lock`` row is behind-or-at the pin it names.
 
-    W1 is taken only from R1's committed gitlink and R0 only from R1's raw sole
-    parent.  The committed ``W1:spikes/DEPENDS.lock`` Trust row must independently
-    agree with that R0.  The hash cycle is broken in exactly one place: R1's
-    complete tree delta must be the TrustWP gitlink from W0 to W1.
+    The lock at the PINNED trust-wp commit must parse, and each of its five
+    rows must be an ancestor-or-equal of the corresponding root gitlink -- the
+    ``trust`` row of the judged Trust commit itself -- read from that sibling's
+    own object store exactly as the cohort rule reads every other referenced
+    commit.  Equality is not required: siblings advance between trust-wp
+    refreshes, and a row that is merely behind is coherent.  A row that is
+    AHEAD of its gitlink, or off its line, is the incoherence this refuses.
+
+    Each store is read with replacement refs, legacy grafts, shallow history
+    and alternates refused (``require_unmodified_history_view``), as the
+    trust-wp store is: a graft in ``.git/modules/first-party/<name>`` could
+    otherwise make an ahead row read as an ancestor.
     """
-    require_unmodified_history_view(repo_root, "Trust root")
-    root_type = run_git(repo_root, ["cat-file", "-t", root_commit]).decode(
-        "ascii", "strict"
-    ).strip()
-    if root_type != "commit":
-        fail(f"root terminal {root_commit} is not a commit object")
-
-    terminal_wp = commits["trust-wp"]
-    linked_terminal_wp = committed_gitlink(
-        repo_root, root_commit, WP_ROOT_DELTA_PATH, "root terminal TrustWP gitlink"
+    root_commit = require_sha(root_commit, "Trust binding-coherence root")
+    wp_path = SUBMODULES["trust-wp"][0]
+    wp_checkout = repo_root / wp_path
+    pinned_wp = require_sha(commits["trust-wp"], f"{wp_path} gitlink")
+    require_regular_committed_authority(
+        wp_checkout,
+        pinned_wp,
+        WP_DEPENDS_PATH,
+        f"trust-wp:{WP_DEPENDS_PATH} at the pinned TrustWP commit {pinned_wp}",
     )
-    if linked_terminal_wp != terminal_wp:
-        fail(
-            "root terminal TrustWP gitlink differs from the terminal repository binding: "
-            f"gitlink={linked_terminal_wp}, binding={terminal_wp}"
-        )
-
-    wp_checkout = repo_root / SUBMODULES["trust-wp"][0]
-    require_unmodified_history_view(wp_checkout, "terminal TrustWP")
-    root_parents = raw_commit_parents(repo_root, root_commit, "root terminal R1")
-    if len(root_parents) != 1:
-        fail(
-            "root terminal must have exactly one raw parent R0; "
-            f"terminal={root_commit}, parents={root_parents}"
-        )
-    anchor = root_parents[0]
-    anchor_type = run_git(repo_root, ["cat-file", "-t", anchor]).decode(
-        "ascii", "strict"
-    ).strip()
-    if anchor_type != "commit":
-        fail(f"root terminal raw parent R0 {anchor} is not a local commit object")
-
-    changed = changed_committed_tree_paths(repo_root, anchor, root_commit)
-    if changed != [WP_ROOT_DELTA_PATH]:
-        fail(
-            "root terminal's only tree delta from the TrustWP anchor must be "
-            f"{WP_ROOT_DELTA_PATH!r}; observed={changed}"
-        )
-
-    anchor_wp = committed_gitlink(
-        repo_root, anchor, WP_ROOT_DELTA_PATH, "root anchor TrustWP gitlink"
-    )
-    if anchor_wp == terminal_wp:
-        fail("root terminal TrustWP gitlink did not advance from its anchor value")
-    anchor_wp_type = decode_text(
-        run_git(wp_checkout, ["cat-file", "-t", anchor_wp]),
-        "root anchor TrustWP W0 object type",
-    ).strip()
-    if anchor_wp_type != "commit":
-        fail(f"root anchor TrustWP W0 {anchor_wp} is not a local commit object")
-    wp_parents = raw_commit_parents(wp_checkout, terminal_wp, "terminal TrustWP W1")
-    if wp_parents != [anchor_wp]:
-        fail(
-            "terminal TrustWP W1 must be the root anchor gitlink W0's direct "
-            f"single-parent child: W1={terminal_wp}, W0={anchor_wp}, "
-            f"parents={wp_parents}"
-        )
-
-    wp_changed = changed_committed_tree_paths(wp_checkout, anchor_wp, terminal_wp)
-    missing_required = sorted(WP_W1_REQUIRED_DELTAS - set(wp_changed))
-    disallowed = sorted(
-        path
-        for path in wp_changed
-        if path not in WP_W1_REQUIRED_DELTAS
-        and PurePosixPath(path).name != "Cargo.lock"
-    )
-    if missing_required or disallowed:
-        fail(
-            "terminal TrustWP W0 -> W1 tree delta violates the exact publication "
-            "allow-policy: required non-lock changes are Cargo.toml, VISION.md, "
-            f"and {WP_DEPENDS_PATH}; every other change must be a Cargo.lock; "
-            f"missing_required={missing_required}, disallowed={disallowed}"
-        )
-    for path in sorted(WP_W1_REQUIRED_DELTAS):
-        require_regular_committed_authority(
-            wp_checkout, anchor_wp, path, f"TrustWP W0 required authority {path}"
-        )
-        require_regular_committed_authority(
-            wp_checkout, terminal_wp, path, f"TrustWP W1 required authority {path}"
-        )
-    for path in wp_changed:
-        if PurePosixPath(path).name == "Cargo.lock":
-            require_regular_committed_authority(
-                wp_checkout, anchor_wp, path, f"TrustWP W0 tracked lock {path}"
-            )
-            require_regular_committed_authority(
-                wp_checkout, terminal_wp, path, f"TrustWP W1 lock delta {path}"
-            )
-
-    pins = parse_wp_depends_lock(
-        committed_blob(wp_checkout, terminal_wp, WP_DEPENDS_PATH)
-    )
-    if pins["trust"] != anchor:
-        fail(
-            "terminal TrustWP spikes/DEPENDS.lock Trust pin must exactly equal "
-            f"root terminal's raw sole parent R0: pin={pins['trust']}, R0={anchor}"
-        )
-    for repository in sorted(WP_DEPENDS_REPOSITORIES - {"trust"}):
-        if pins[repository] != commits[repository]:
+    pins = parse_wp_depends_lock(committed_blob(wp_checkout, pinned_wp, WP_DEPENDS_PATH))
+    for repository in sorted(WP_DEPENDS_REPOSITORIES):
+        row = pins[repository]
+        if repository == "trust":
+            checkout = repo_root
+            terminal = root_commit
+            store = "the Trust checkout"
+            subject = f"the judged Trust commit {root_commit}"
+        else:
+            checkout = repo_root / SUBMODULES[repository][0]
+            terminal = commits[repository]
+            store = SUBMODULES[repository][0]
+            subject = f"the {store} gitlink {terminal}"
+        require_unmodified_history_view(checkout, f"{repository} binding-coherence store")
+        object_type = local_commit_type(checkout, row)
+        if object_type != "commit":
             fail(
-                "terminal TrustWP spikes/DEPENDS.lock sibling pin differs from "
-                f"the root terminal binding for {repository}: "
-                f"pin={pins[repository]}, binding={commits[repository]}"
+                f"trust-wp:{WP_DEPENDS_PATH} {repository} row {row} is not a local "
+                f"commit object in {store}"
+                + (f" (found {object_type})" if object_type else "")
+                + " (P3 binding coherence)"
             )
-    validate_wp_terminal_authority_bindings(
-        repo_root, wp_checkout, terminal_wp, commits
-    )
-
-    return {
-        "authority_repository": "trust-wp",
-        "authority_commit": terminal_wp,
-        "authority_path": WP_DEPENDS_PATH,
-        "anchor_repository": "trust",
-        "anchor_commit": anchor,
-        "terminal_repository": "trust",
-        "terminal_commit": root_commit,
-        "only_tree_delta": WP_ROOT_DELTA_PATH,
-        "anchor_gitlink": anchor_wp,
-        "terminal_gitlink": terminal_wp,
-    }
+        ancestor, detail = local_is_ancestor(checkout, row, terminal)
+        if not ancestor:
+            fail(
+                f"trust-wp:{WP_DEPENDS_PATH} {repository} row {row} is not an "
+                f"ancestor-or-equal of {subject} (P3 binding coherence: the row "
+                "is ahead of, or off the line of, the pin it names)"
+                + (f": {detail}" if detail else "")
+            )
+    return pins
 
 
-def derive_wp_root_anchor_v2(
+def validate_trust_wp_policy(
     repo_root: Path,
     root_commit: str,
     commits: dict[str, str],
-    policy_state: dict[str, Any],
-) -> dict[str, Any]:
-    """Authenticate the forward-only P -> W1 and R0 -> R1 publication cut."""
-    if policy_state.get("state") != "Terminal":
-        fail("terminal-policy v2 root-anchor derivation requires Terminal state")
-    r0 = require_sha(policy_state.get("r0"), "terminal-policy v2 R0")
-    policy = policy_state.get("policy")
-    if not isinstance(policy, dict):
-        fail("terminal-policy v2 Terminal state is missing its armed policy")
-    predecessor = require_sha(
-        policy.get("predecessor_commit"), "terminal-policy v2 predecessor P"
-    )
-    root_bindings_value = policy.get("root_bindings")
-    if not isinstance(root_bindings_value, dict):
-        fail("terminal-policy v2 armed policy is missing its root binding vector")
-    root_bindings = {
-        name: require_sha(root_bindings_value.get(name), f"terminal-policy v2 root.{name}")
-        for name in sorted(SUBMODULES)
-    }
-    if set(root_bindings_value) != set(SUBMODULES):
-        fail("terminal-policy v2 armed policy root binding vector is not exact")
+    wp_remote_main: str,
+    findings: list[str] | None = None,
+) -> dict[str, object]:
+    """Judge ``first-party/trust-wp`` under terminal-policy v3: P1, P2 and P4.
 
-    require_unmodified_history_view(repo_root, "Trust terminal-policy v2 root")
-    root_parents = raw_commit_parents(
-        repo_root, root_commit, "terminal-policy v2 root terminal R1"
-    )
-    if root_parents != [r0]:
-        fail(
-            "terminal-policy v2 root terminal R1 must have exact raw sole parent "
-            f"R0={r0}; observed={root_parents}"
-        )
-    changed = changed_committed_tree_paths(repo_root, r0, root_commit)
-    if changed != [WP_ROOT_DELTA_PATH]:
-        fail(
-            "terminal-policy v2 R0 -> R1 only tree delta must be "
-            f"{WP_ROOT_DELTA_PATH!r}; observed={changed}"
-        )
-    anchor_wp = committed_gitlink(
-        repo_root, r0, WP_ROOT_DELTA_PATH, "terminal-policy v2 R0 TrustWP gitlink"
-    )
-    if anchor_wp != TERMINAL_POLICY_V2_W0:
-        fail(
-            "terminal-policy v2 R0 TrustWP gitlink differs from exact W0: "
-            f"expected={TERMINAL_POLICY_V2_W0}, observed={anchor_wp}"
-        )
-    terminal_wp = committed_gitlink(
-        repo_root,
-        root_commit,
-        WP_ROOT_DELTA_PATH,
-        "terminal-policy v2 R1 TrustWP gitlink",
-    )
-    if terminal_wp != commits["trust-wp"]:
-        fail(
-            "terminal-policy v2 R1 TrustWP gitlink differs from the current "
-            f"repository binding: gitlink={terminal_wp}, binding={commits['trust-wp']}"
-        )
+    EVERY HISTORY FINDING, NOT THE FIRST (HistoryFinding).  A refusal that is
+    a property of the history is recorded and the judgement goes on to its
+    end.  With ``findings`` given, each distinct one is appended there as it is
+    found and the call returns normally, so the caller can run its later checks
+    and still print what was found if one of those fails; without it, the call
+    raises one ``HistoryFinding`` carrying them all once the judgement is done.
+    Any other refusal raises at once, as before.
 
-    wp_checkout = repo_root / SUBMODULES["trust-wp"][0]
-    require_unmodified_history_view(wp_checkout, "terminal-policy v2 TrustWP")
-    wp_parents = raw_commit_parents(
-        wp_checkout, terminal_wp, "terminal-policy v2 TrustWP W1"
-    )
-    if wp_parents != [predecessor]:
-        fail(
-            "terminal-policy v2 TrustWP W1 must have exact raw sole parent P: "
-            f"W1={terminal_wp}, P={predecessor}, parents={wp_parents}"
-        )
+    ``wp_remote_main`` is the live sample of trust-wp's canonical ``main``
+    (``sample_trust_wp_remote_main``); everything else is read from literal
+    local objects with replacement refs, grafts, shallow history, alternates
+    and lazy fetch disabled, and every walk is bounded.
 
-    wp_changed = changed_committed_tree_paths(wp_checkout, predecessor, terminal_wp)
-    missing_required = sorted(WP_W1_REQUIRED_DELTAS - set(wp_changed))
-    disallowed = sorted(
-        path
-        for path in wp_changed
-        if path not in WP_W1_REQUIRED_DELTAS
-        and PurePosixPath(path).name != "Cargo.lock"
-    )
-    if missing_required or disallowed:
-        fail(
-            "terminal-policy v2 TrustWP P -> W1 tree delta violates the exact "
-            "publication allow-policy: required non-lock changes are Cargo.toml, "
-            f"VISION.md, and {WP_DEPENDS_PATH}; every other change must be a "
-            f"Cargo.lock; missing_required={missing_required}, disallowed={disallowed}"
-        )
-    for path in sorted(WP_W1_REQUIRED_DELTAS):
-        require_regular_committed_authority(
-            wp_checkout, predecessor, path, f"TrustWP P required authority {path}"
-        )
-        require_regular_committed_authority(
-            wp_checkout, terminal_wp, path, f"TrustWP W1 required authority {path}"
-        )
-    for path in wp_changed:
-        if PurePosixPath(path).name == "Cargo.lock":
-            require_regular_committed_authority(
-                wp_checkout, predecessor, path, f"TrustWP P tracked lock {path}"
-            )
-            require_regular_committed_authority(
-                wp_checkout, terminal_wp, path, f"TrustWP W1 lock delta {path}"
-            )
+    WHERE THE JUDGED HISTORY BEGINS.  The v1 marker has one unique raw
+    single-parent introduction in the complete ancestry DAG; that activation is
+    where TrustWP gitlink moves start being judged.  It may propagate through a
+    merge whose first parent is an older unmarked branch: every marked parent
+    must descend from that same introduction, while every unmarked parent must
+    publish no TrustWP binding the pre-activation history had not already
+    published (``audit_inactive_parent``: each commit's binding is a raw
+    parent's or one its own pre-activation ancestry carried, a restoration).  Deleting, editing, or ambiguously
+    re-introducing the marker is refused exactly as before.
 
-    pins = parse_wp_depends_lock(
-        committed_blob(wp_checkout, terminal_wp, WP_DEPENDS_PATH)
-    )
-    if pins["trust"] != r0:
-        fail(
-            "terminal-policy v2 TrustWP spikes/DEPENDS.lock Trust pin must "
-            f"exactly equal R0: pin={pins['trust']}, R0={r0}"
-        )
-    for repository in sorted(WP_DEPENDS_REPOSITORIES - {"trust"}):
-        if pins[repository] != root_bindings[repository]:
-            fail(
-                "terminal-policy v2 TrustWP spikes/DEPENDS.lock sibling pin "
-                f"differs from armed R0 for {repository}: pin={pins[repository]}, "
-                f"R0-binding={root_bindings[repository]}"
-            )
-    validate_wp_terminal_authority_bindings(
-        repo_root, wp_checkout, terminal_wp, commits
-    )
+    THE MARKED SUBGRAPH DECIDES THE JUDGED BINDING, alone.  HEAD must be
+    marked; every marked commit must descend through a marked parent; and the
+    binding changes along the marked subgraph in exactly two shapes:
 
-    return {
-        "authority_repository": "trust-wp",
-        "authority_commit": terminal_wp,
-        "authority_path": WP_DEPENDS_PATH,
-        "anchor_repository": "trust",
-        "anchor_commit": r0,
-        "terminal_repository": "trust",
-        "terminal_commit": root_commit,
-        "only_tree_delta": WP_ROOT_DELTA_PATH,
-        "anchor_gitlink": TERMINAL_POLICY_V2_W0,
-        "terminal_gitlink": terminal_wp,
-        "policy_version": "trust.constellation.terminal-policy.v2",
-        "preservation_floor": TERMINAL_POLICY_V2_PRESERVATION_FLOOR,
-        "predecessor_commit": predecessor,
-        "root_bindings": root_bindings,
-    }
+      * a ONE-PARENT marked commit that moves the gitlink X -> Y.  It is
+        admissible (P2) iff
+          (a) Y contains X in its raw ancestry (forward, through any parent --
+              the reading ``fast.pin-regression`` gives every other gitlink);
+          (b) Y is an ancestor-or-equal of trust-wp remote ``main`` and the
+              committed ``spikes/DEPENDS.lock`` is byte-identical at X and Y
+              -- a re-anchoring onto the canonical line with unchanged
+              bindings (the ``8325008ba62`` shape, ``9cbcc2cb -> 684821d0``);
+          (c) Y is a strict raw ancestor of X, the lock is byte-identical, and
+              an immediate single-parent marked child of that root commit
+              restores exactly X (the same-lock backward recovery, per root
+              edge: a later identical rollback needs its own restoration).
+        Anything else is refused, naming X, Y and which clause failed.  A
+        side with no regular committed lock is never read as "identical".
+      * a marked MERGE that adopts one marked parent's binding while every
+        other marked parent's binding is (a)- or (b)-admissible away from it.
+        That is the shape a merge-heavy main produces after any admissible
+        move -- a branch forked before the move merged with main after it, in
+        either direction.  A merge may not publish a binding no marked parent
+        carried, and may not drop a binding that is not so advanced.
 
+    By induction the judged revision therefore carries the pre-activation
+    binding advanced only by admissible moves, whatever an unmarked lineage
+    did.  Nothing here asks trust-wp a stricter question than the lane asks of
+    ``ay`` or ``trust-mc``: forward is the cohort reading, (b) is the same
+    "on canonical main" fact ``fast.submodule-remote-reachability`` publishes,
+    and the lock's bindings are P3's cohort question.
 
-def terminal_wp_policy_claimed(
-    repo_root: Path, root_commit: str, commits: dict[str, str]
-) -> bool:
-    """Persistently select terminal mode after the marker-authorized WP move.
+    THE MARKERS (P4).  ``.trust-terminal-policy-v3`` must be present and
+    byte-exact at the judged revision (a missing marker is a refusal that
+    carries the fix; an edited one names the row) and may be neither edited
+    nor deleted anywhere in the judged history.  ``.trust-terminal-policy-v2``
+    is accepted only as its historical ``state=pre-v2`` bytes; an ``armed``
+    v2 marker anywhere in the judged history is refused outright.
 
-    The exact marker has one unique raw single-parent introduction in the
-    complete ancestry DAG.  It may propagate through a merge whose first parent
-    is an older unmarked branch: every marked parent must descend from that same
-    introduction, while every unmarked parent must publish no TrustWP binding
-    the pre-activation history had not already published.  The merge must retain
-    the marked binding.  Thus merging an old branch cannot erase the regime or
-    smuggle a side-branch WP move into it.
-
-    THE MARKED SUBGRAPH IS WHAT DECIDES THE JUDGED BINDING, and it decides it
-    alone.  HEAD must be marked; every marked commit must descend through a
-    marked parent; a marked commit with several parents must retain every marked
-    parent's binding; and the only shape that may change the binding is an
-    ordinary one-parent marked commit, which sets the claim.  By induction the
-    judged revision therefore carries the pre-activation binding unless the claim
-    is set, whatever an unmarked lineage did.  The inactive-lineage audit below
-    is that lineage's own hygiene -- it refuses a pin authored off the regime --
-    and it must not be read as the thing that protects the tip.
-
-    Every commit, parent, tree, marker, and relevant WP gitlink is read as a
-    literal local object under the shared no-lazy-fetch authority environment.
-    The whole raw DAG walk is bounded.  A WP move on the ordinary marked line
-    permanently selects terminal mode; an ambiguous merge or a minted
-    inactive-lineage binding is rejected instead of being interpreted as a valid
-    R1 claim.
+    THE FLOOR (P1).  trust-wp remote ``main`` must contain B.  The object must
+    be present in the bound submodule's store (the refusal names the fetch);
+    a main that does not contain B is rewritten published history.
     """
     require_unmodified_history_view(repo_root, "Trust terminal-policy history")
     root_commit = require_sha(root_commit, "Trust terminal-policy HEAD")
     terminal_wp = require_sha(
         commits["trust-wp"], "Trust terminal-policy current TrustWP binding"
     )
+    wp_remote_main = require_sha(wp_remote_main, "trust-wp remote main")
     if (
         not isinstance(TERMINAL_POLICY_HISTORY_LIMIT, int)
         or isinstance(TERMINAL_POLICY_HISTORY_LIMIT, bool)
         or TERMINAL_POLICY_HISTORY_LIMIT < 1
     ):
         fail("terminal-policy raw history walk limit must be a positive integer")
+    v3_oid = git_blob_oid(TERMINAL_POLICY_V3_MARKER)
+    pre_v2_oid = git_blob_oid(TERMINAL_POLICY_V2_PRE_MARKER)
+    wp_path = SUBMODULES["trust-wp"][0]
+    # This judgement's own findings, and the caller's sink (which may already
+    # hold an earlier revision's): a finding both share is still this one's.
+    found_here: list[str] = []
+    sink: list[str] = found_here if findings is None else findings
+
+    def history_finding(message: str) -> None:
+        """Record one history refusal; the judgement goes on (HistoryFinding)."""
+        if message not in found_here:
+            found_here.append(message)
+        if sink is not found_here and message not in sink:
+            sink.append(message)
 
     with RawObjectReader(repo_root, "Trust terminal-policy history") as reader:
+        # Per commit: tree, parents, v1 state, v1 entry, v3 state, v3 entry,
+        # v2 state ("absent" or "pre"; anything else has already refused).
         snapshots: dict[
-            str, tuple[str, list[str], str, tuple[str, str] | None]
+            str,
+            tuple[str, list[str], str, tuple[str, str] | None, str, tuple[str, str] | None, str],
         ] = {}
         marker_oid: str | None = None
 
+        def refuse_non_historical_v2_marker(commit: str, tree: str, label: str) -> str:
+            entry = raw_tree_path_entry(
+                reader, tree, TERMINAL_POLICY_V2_MARKER_PATH, f"{label} v2 marker"
+            )
+            if entry is None:
+                return "absent"
+            if entry == ("100644", pre_v2_oid):
+                return "pre"
+            mode, oid = entry
+            raw = b""
+            if mode in {"100644", "100755"}:
+                raw = reader.read(oid, "blob", f"{label} v2 marker")
+            if raw.startswith(
+                b"trust.constellation.terminal-policy.v2\nstate=armed\n"
+            ):
+                fail(
+                    f"Trust terminal-policy v2 marker at {commit} is ARMED; the v2 "
+                    "Armed/Terminal state machine is superseded by v3 and an armed "
+                    "v2 marker is refused outright (P4, ruling 2026-09-21)"
+                )
+            fail(
+                f"Trust terminal-policy v2 marker at {commit} is not the historical "
+                f"pre-v2 bytes: entry={entry}; under v3 the v2 marker is history and "
+                "may only be carried unedited (P4)"
+            )
+
         def snapshot(
             commit: str, label: str
-        ) -> tuple[str, list[str], str, tuple[str, str] | None]:
+        ) -> tuple[str, list[str], str, tuple[str, str] | None, str, tuple[str, str] | None, str]:
             cached = snapshots.get(commit)
             if cached is not None:
                 return cached
@@ -1754,7 +1206,17 @@ def terminal_wp_policy_claimed(
                 marker_state = "exact"
             else:
                 marker_state = "invalid"
-            cached = (tree, parents, marker_state, marker_entry)
+            v2_state = refuse_non_historical_v2_marker(commit, tree, label)
+            v3_entry = raw_tree_path_entry(
+                reader, tree, TERMINAL_POLICY_V3_MARKER_PATH, f"{label} v3 marker"
+            )
+            if v3_entry is None:
+                v3_state = "absent"
+            elif v3_entry == ("100644", v3_oid):
+                v3_state = "exact"
+            else:
+                v3_state = "invalid"
+            cached = (tree, parents, marker_state, marker_entry, v3_state, v3_entry, v2_state)
             snapshots[commit] = cached
             return cached
 
@@ -1786,11 +1248,49 @@ def terminal_wp_policy_claimed(
                 "Trust terminal-policy marker content differs from the exact "
                 "committed v1 policy"
             )
+        head_v3 = raw_tree_path_entry(
+            reader,
+            head_tree,
+            TERMINAL_POLICY_V3_MARKER_PATH,
+            "Trust terminal-policy v3 HEAD marker",
+        )
+        if head_v3 is None:
+            raise UnresolvableAtRevision(
+                f"Trust terminal-policy v3 marker {TERMINAL_POLICY_V3_MARKER_PATH!r} "
+                f"is missing at the judged revision {root_commit}; v3 governs every "
+                "judging since the 2026-09-21 ruling (docs/first-party-pin-ledger.md) "
+                "and there is no pre-v3 lane to fall back to",
+                [
+                    "Options:",
+                    "  * judging a push: --push-context judges the revision being PUSHED;",
+                    "      a topic that predates v3 must merge main first",
+                    "  * judging a named revision: --rev origin/main (or any commit",
+                    "      carrying the marker)",
+                    "  * this clone's HEAD is stale: git fetch origin, then compare",
+                    f"      git cat-file -t HEAD:{TERMINAL_POLICY_V3_MARKER_PATH}",
+                    f"      git cat-file -t origin/main:{TERMINAL_POLICY_V3_MARKER_PATH}",
+                ],
+            )
+        head_v3_mode, head_v3_oid = head_v3
+        if head_v3_mode != "100644":
+            fail(
+                "Trust terminal-policy v3 marker must be a non-executable regular "
+                f"blob (mode 100644), not mode {head_v3_mode}"
+            )
+        parse_terminal_policy_v3(
+            reader.read(head_v3_oid, "blob", "Trust terminal-policy v3 HEAD marker")
+        )
+        head_v2 = refuse_non_historical_v2_marker(
+            root_commit, head_tree, "Trust terminal-policy HEAD"
+        )
         snapshots[root_commit] = (
             head_tree,
             head_parents,
             "exact",
             head_marker,
+            "exact",
+            head_v3,
+            head_v2,
         )
 
         # Authenticate the complete ancestry DAG, not only whichever parent a
@@ -1809,7 +1309,7 @@ def terminal_wp_policy_claimed(
                     f"limit of {TERMINAL_POLICY_HISTORY_LIMIT} commits"
                 )
             visited.add(current)
-            _tree, parents, _state, _entry = snapshot(
+            _tree, parents, _state, _entry, _v3, _v3_entry, _v2 = snapshot(
                 current, "Trust terminal-policy raw DAG history"
             )
             pending.extend(parent for parent in parents if parent not in visited)
@@ -1824,11 +1324,44 @@ def terminal_wp_policy_claimed(
                 "Trust terminal-policy raw DAG contains malformed marker state: "
                 f"commit={invalid[0][0]}, entry={invalid[0][1]}"
             )
+        invalid_v3 = sorted(
+            (commit, snapshots[commit][5])
+            for commit in visited
+            if snapshots[commit][4] == "invalid"
+        )
+        if invalid_v3:
+            fail(
+                "Trust terminal-policy v3 raw DAG contains a forged or edited "
+                f"marker: commit={invalid_v3[0][0]}, entry={invalid_v3[0][1]} (P4)"
+            )
 
         introductions: list[str] = []
         for commit in sorted(visited):
-            _tree, parents, state, _entry = snapshots[commit]
+            _tree, parents, state, _entry, v3_state, _v3_entry, v2_state = snapshots[commit]
             parent_states = [snapshots[parent][2] for parent in parents]
+            if v3_state == "absent":
+                v3_marked_parents = [
+                    parent for parent in parents if snapshots[parent][4] == "exact"
+                ]
+                if v3_marked_parents:
+                    fail(
+                        "Trust terminal-policy v3 marker was deleted on a raw DAG "
+                        f"edge: child={commit}, marked_parents={v3_marked_parents} (P4)"
+                    )
+            if v2_state == "absent":
+                # The v2 marker stays in the tree unedited as history (P4);
+                # deleting it is refused exactly as deleting v1 or v3 is, and
+                # re-adding it later does not launder the edge.
+                v2_marked_parents = [
+                    parent for parent in parents if snapshots[parent][6] == "pre"
+                ]
+                if v2_marked_parents:
+                    fail(
+                        "Trust terminal-policy v2 marker was deleted on a raw DAG "
+                        f"edge: child={commit}, marked_parents={v2_marked_parents}; "
+                        "under v3 the v2 marker is history and stays in the tree "
+                        "unedited (P4)"
+                    )
             if state == "absent":
                 marked_parents = [
                     parent
@@ -1862,7 +1395,7 @@ def terminal_wp_policy_claimed(
                 f"single-parent introduction; observed={introductions}"
             )
         activation_commit = introductions[0]
-        activation_tree, activation_parents, _state, _entry = snapshots[
+        _activation_tree, activation_parents, _state, _entry, _v3, _v3_entry, _v2 = snapshots[
             activation_commit
         ]
         activation_parent = activation_parents[0]
@@ -1928,6 +1461,53 @@ def terminal_wp_policy_claimed(
 
         preactivation_ancestors = ancestors(activation_parent)
 
+        published_cache: dict[str, str | None] = {}
+
+        def preactivation_published(side_child: str, child_wp: str) -> bool:
+            """True iff a PRE-ACTIVATION raw ancestor of ``side_child`` carried ``child_wp``.
+
+            A commit that RESTORES a binding its own pre-activation ancestry
+            already published introduces nothing the regime never saw, so it is
+            no mint (2026-10-24, docs/DECISION_QUEUE.md CONSTELLATION-RESTORE).
+            The search is confined to ``side_child``'s own raw ancestry
+            intersected with the pre-activation history: a binding seen only on
+            a parallel pre-activation line, only on the marked line after
+            activation, or nowhere at all still mints.  It runs only for a
+            commit that failed the parent test, nearest ancestors first, so a
+            restoration is found in a few tree reads; a refusal reads every
+            pre-activation ancestor's binding once (cached across calls).
+            """
+            seen: set[str] = set()
+            queue = list(snapshots[side_child][1])
+            head = 0
+            while head < len(queue):
+                ancestor = queue[head]
+                head += 1
+                if ancestor in seen:
+                    continue
+                seen.add(ancestor)
+                if ancestor not in snapshots:
+                    fail(
+                        "Trust terminal-policy raw DAG ancestry escaped the "
+                        f"authenticated walk at {ancestor}"
+                    )
+                queue.extend(snapshots[ancestor][1])
+                if ancestor not in preactivation_ancestors:
+                    continue
+                if ancestor not in published_cache:
+                    entry = raw_tree_path_entry(
+                        reader,
+                        snapshots[ancestor][0],
+                        WP_ROOT_DELTA_PATH,
+                        f"Trust terminal-policy pre-activation ancestor {ancestor}",
+                    )
+                    published_cache[ancestor] = (
+                        entry[1] if entry is not None and entry[0] == "160000" else None
+                    )
+                if published_cache[ancestor] == child_wp:
+                    return True
+            return False
+
         def audit_inactive_parent(child: str, inactive_parent: str) -> None:
             """Prove one unmarked merge parent MINTS no TrustWP binding.
 
@@ -1935,12 +1515,32 @@ def terminal_wp_policy_claimed(
             ancestry already present before activation.  The lineage must reach
             it -- an exclusive set that never rejoins is an unauthenticated
             import -- and no exclusive commit may publish a TrustWP gitlink that
-            none of its own raw parents already carried.  By induction from the
-            frontier, every binding on the branch is one the pre-activation
-            history had already published, so the branch cannot introduce a pin
-            the regime never saw.  An authored move is refused by that rule
-            directly, and so is a move later reverted, because the move commit
-            mints on its own.
+            neither one of its own raw parents nor one of its own pre-activation
+            raw ancestors already carried.  By induction from the frontier,
+            every binding on the branch is one the pre-activation history had
+            already published, so the branch cannot introduce a pin the regime
+            never saw.  An authored move is refused by that rule directly, and
+            so is a move later reverted, because the move commit mints on its
+            own.
+
+            RESTORATION IS NOT A MINT (2026-10-24, docs/DECISION_QUEUE.md
+            CONSTELLATION-RESTORE).  Until then the test was the parent clause
+            alone, which is stronger than the invariant above: a commit that
+            goes BACK to a binding its own pre-activation ancestry had already
+            published satisfies the invariant yet failed the test.  The one
+            commit in Trust's history of that shape is the July `git stash`
+            index commit 1b0fe79fc1 (parent 38cb00023f binds 5443d384; the
+            index binds eb18c757, which R1 e58771678e, an ancestor of that
+            parent, pinned), recorded on main by the preservation merge
+            1fedcff19d; it made every push red.  The clause is confined to the
+            commit's OWN ancestry (``preactivation_published``): a binding
+            only a parallel pre-activation line pinned, only the marked line
+            pinned after activation, or nobody pinned still mints, a parentless
+            commit has no ancestry to restore from, and marked merges still
+            only adopt.  MAIN-REDS-1's addendum (5d882bda04) allowed any binding
+            some pre-activation commit carried; the merge that met it kept this
+            narrower clause, which admits the same history and refuses the
+            parallel-line shape that one admitted.
 
             THE RULE IS PER-COMMIT, NOT PER-EDGE, and that distinction is the
             whole repair.  A merge inside the exclusive set has parents with
@@ -1958,19 +1558,39 @@ def terminal_wp_policy_claimed(
             None of this weakens the tip: an inactive lineage cannot reach the
             judged binding at all (see this function's own docstring).
             """
+            def inactive_wp(commit: str, label: str) -> str | None:
+                """The TrustWP binding an inactive-lineage commit publishes.
+
+                None for a PARENTLESS commit whose tree has no
+                ``first-party/trust-wp`` entry at all (2026-11-11,
+                docs/DECISION_QUEUE.md CONSTELLATION-UNBOUND-ROOT): it carries
+                no binding, so it can mint none. It contributes no binding as a
+                parent either, so a child must still justify its own binding
+                from its other parents or its own pre-activation ancestry, and
+                it adds no frontier. The shape on main is a ``git stash -u``
+                untracked-files commit, kept reachable by the preservation merge
+                ``3ca41eb1a3``. A commit with a parent that drops the gitlink, or
+                a parentless one that carries any entry at that path, is still
+                refused.
+                """
+                tree, parents = snapshots[commit][0], snapshots[commit][1]
+                if not parents and raw_tree_path_entry(reader, tree, WP_ROOT_DELTA_PATH, label) is None:
+                    return None
+                return commit_wp(commit, label)
+
             inactive_ancestors = ancestors(inactive_parent)
             exclusive = inactive_ancestors - preactivation_ancestors
             if not exclusive:
                 frontier = {inactive_parent}
             else:
                 frontier: set[str] = set()
-                for side_child in exclusive:
+                for side_child in sorted(exclusive):
                     if snapshots[side_child][2] != "absent":
-                        fail(
+                        history_finding(
                             "Trust terminal-policy inactive merge lineage carries "
                             f"marker state at {side_child}"
                         )
-                    child_wp = commit_wp(
+                    child_wp = inactive_wp(
                         side_child,
                         f"Trust terminal-policy inactive child {side_child}",
                     )
@@ -1979,26 +1599,38 @@ def terminal_wp_policy_claimed(
                         if side_parent in preactivation_ancestors:
                             frontier.add(side_parent)
                         elif side_parent not in exclusive:
-                            fail(
+                            history_finding(
                                 "Trust terminal-policy inactive lineage has an "
                                 f"unauthenticated ancestry frontier at {side_parent}"
                             )
-                        parent_wps[side_parent] = commit_wp(
+                        parent_wp = inactive_wp(
                             side_parent,
                             f"Trust terminal-policy inactive parent {side_parent}",
                         )
-                    if child_wp not in parent_wps.values():
+                        if parent_wp is not None:
+                            parent_wps[side_parent] = parent_wp
+                    if child_wp is not None and child_wp not in parent_wps.values() and not preactivation_published(
+                        side_child, child_wp
+                    ):
                         # A parentless exclusive commit lands here too: it
                         # publishes a binding out of nowhere, which is the same
                         # defect with an emptier witness.
-                        fail(
+                        history_finding(
                             "Trust terminal-policy inactive merge lineage minted a "
                             "TrustWP gitlink no raw parent published: "
                             f"merge={child}, commit={side_child}, "
                             f"commit_wp={child_wp}, parent_wps={parent_wps}"
                         )
-            if not frontier:
-                fail(
+            # The frontier anchors the induction over the lineage's bindings. A
+            # lineage that is one unbound root carries no binding, so there is
+            # nothing to anchor: the untracked-files parent of a `git stash -u`
+            # commit taken on the marked line (CONSTELLATION-UNBOUND-ROOT).
+            # Every other lineage that never rejoins is still refused.
+            unbound_root = exclusive == {inactive_parent} and inactive_wp(
+                inactive_parent, f"Trust terminal-policy inactive parent {inactive_parent}"
+            ) is None
+            if not frontier and not unbound_root:
+                history_finding(
                     "Trust terminal-policy inactive merge lineage never rejoins "
                     f"pre-activation ancestry: merge={child}, "
                     f"parent={inactive_parent}"
@@ -2012,7 +1644,16 @@ def terminal_wp_policy_claimed(
                     "Trust terminal-policy inactive pre-activation frontier",
                 )
 
-        claimed = False
+        # Every binding change on the marked subgraph, as TrustWP
+        # (before, after) pairs.  Whether a pair is admissible cannot be read
+        # from the root tree; it is decided from TrustWP's own literal objects
+        # once the marked subgraph has been authenticated in full.
+        # Single-parent moves and merge adoptions are kept apart because the
+        # recovery clause (c) exists for moves only.  The root child identity
+        # is kept: restoring one occurrence must never clear a later occurrence
+        # of the same WP (before, after) pair.
+        moves: list[tuple[str, str, str, str]] = []
+        adoptions: list[tuple[str, str, dict[str, str]]] = []
         activation_wp = commit_wp(
             activation_commit, "Trust terminal-policy activation child"
         )
@@ -2020,10 +1661,17 @@ def terminal_wp_policy_claimed(
             activation_parent, "Trust terminal-policy activation parent"
         )
         if activation_wp != activation_parent_wp:
-            claimed = True
+            moves.append(
+                (
+                    activation_commit,
+                    activation_parent_wp,
+                    activation_wp,
+                    f"Trust terminal-policy activation {activation_commit}",
+                )
+            )
 
         for child in sorted(visited):
-            child_tree, parents, state, _entry = snapshots[child]
+            _child_tree, parents, state, _entry, _v3, _v3_entry, _v2 = snapshots[child]
             if state != "exact" or child == activation_commit:
                 continue
             marked_parents = [
@@ -2033,10 +1681,15 @@ def terminal_wp_policy_claimed(
                 parent for parent in parents if snapshots[parent][2] == "absent"
             ]
             if not marked_parents:
-                fail(
+                history_finding(
                     "Trust terminal-policy marked commit does not descend through "
                     f"a marked raw parent: commit={child}"
                 )
+                # No marked parent: no move or adoption to read here, but what
+                # its unmarked parents carry is still judged, to the end.
+                for inactive_parent in inactive_parents:
+                    audit_inactive_parent(child, inactive_parent)
+                continue
             child_wp = commit_wp(
                 child, f"Trust terminal-policy marked child {child}"
             )
@@ -2053,22 +1706,215 @@ def terminal_wp_policy_claimed(
                     for parent, parent_wp in marked_parent_wps.items()
                     if parent_wp != child_wp
                 }
-                if mismatched:
-                    fail(
+                if child_wp not in marked_parent_wps.values():
+                    # A merge may adopt a marked parent's binding, never mint
+                    # one -- whatever an unmarked parent or a conflict
+                    # resolution carried.  A new binding takes a one-parent
+                    # commit, where it is judged as a move.
+                    history_finding(
                         "Trust terminal-policy propagation merge did not retain "
                         "every marked-parent TrustWP binding: "
-                        f"child={child}, child_wp={child_wp}, mismatched={mismatched}"
+                        f"child={child}, child_wp={child_wp}, mismatched={mismatched} "
+                        "(no marked parent published child_wp)"
                     )
+                elif mismatched:
+                    adoptions.append((child, child_wp, mismatched))
             elif next(iter(marked_parent_wps.values())) != child_wp:
-                # An ordinary one-parent marked commit is the only admissible
-                # shape for R1.  Remember the move permanently; the exact R1
-                # validator will decide whether this commit is that cut.
-                claimed = True
+                moves.append(
+                    (
+                        child,
+                        next(iter(marked_parent_wps.values())),
+                        child_wp,
+                        f"Trust terminal-policy marked child {child}",
+                    )
+                )
 
             for inactive_parent in inactive_parents:
                 audit_inactive_parent(child, inactive_parent)
-        return claimed
 
+        single_parent_children: dict[str, list[str]] = {}
+        for child in sorted(visited):
+            _tree, parents, state, _entry, _v3, _v3_entry, _v2 = snapshots[child]
+            if state == "exact" and len(parents) == 1:
+                single_parent_children.setdefault(parents[0], []).append(child)
+        restorations = {
+            child: [
+                restoration
+                for restoration in single_parent_children.get(child, [])
+                if commit_wp(
+                    restoration,
+                    f"Trust terminal-policy restoration child {restoration}",
+                ) == before
+            ]
+            for child, before, _after, _label in moves
+        }
+
+    # From here every fact is TrustWP's own: commits, parents, lock blobs and
+    # ancestry, read as literal objects from the bound checkout.
+    wp_checkout = repo_root / wp_path
+    require_unmodified_history_view(
+        wp_checkout, "Trust terminal-policy TrustWP binding history"
+    )
+    # Every TrustWP commit read below, fetched by sha first when this store
+    # lacks it (fetch_absent_trust_wp_objects; no ref is written).
+    wanted_wp = [wp_remote_main, TRUST_WP_PRESERVATION_FLOOR]
+    for _child, before, after, _label in moves:
+        wanted_wp.extend((before, after))
+    for _child, adopted_wp, mismatched_wps in adoptions:
+        wanted_wp.append(adopted_wp)
+        wanted_wp.extend(mismatched_wps.values())
+    _absent_wp, fetch_detail = fetch_absent_trust_wp_objects(
+        wp_checkout, [require_sha(sha, "TrustWP commit to read") for sha in wanted_wp]
+    )
+    recovered: list[dict[str, object]] = []
+    with RawObjectReader(
+        wp_checkout, "Trust terminal-policy TrustWP binding history"
+    ) as wp_reader:
+        # P1: the preservation floor.
+        if local_commit_type(wp_checkout, wp_remote_main) != "commit":
+            fail(
+                f"trust-wp remote main {wp_remote_main} is not present in the bound "
+                f"{wp_path} object store, so the preservation floor cannot be "
+                f"judged ({fetch_detail or 'no fetch was attempted'}); fetch it "
+                f"first: git -C {wp_path} fetch origin main (P1)"
+            )
+        if not raw_commit_is_ancestor(
+            wp_reader,
+            TRUST_WP_PRESERVATION_FLOOR,
+            wp_remote_main,
+            "terminal-policy v3 preservation floor",
+        ):
+            fail(
+                f"trust-wp remote main {wp_remote_main} does not contain the "
+                f"preservation floor B {TRUST_WP_PRESERVATION_FLOOR} (hence W0 "
+                f"{TRUST_WP_W0}): published TrustWP history has been rewritten, or "
+                "the sampled main is not the canonical line (P1)"
+            )
+
+        lock_cache: dict[str, str | None] = {}
+
+        def committed_lock(commit: str, label: str) -> str | None:
+            """The lock blob id at one TrustWP commit; None unless a regular blob."""
+            if commit in lock_cache:
+                return lock_cache[commit]
+            tree, _parents = parse_raw_commit(wp_reader, commit, label)
+            entry = raw_tree_path_entry(
+                wp_reader, tree, WP_DEPENDS_PATH, f"{label} {WP_DEPENDS_PATH}"
+            )
+            value: str | None = None
+            if entry is not None and entry[0] in {"100644", "100755"}:
+                value = entry[1]
+            lock_cache[commit] = value
+            return value
+
+        def same_lock(x: str, y: str, label: str) -> bool:
+            lock_x = committed_lock(x, f"{label} TrustWP {x}")
+            lock_y = committed_lock(y, f"{label} TrustWP {y}")
+            return lock_x is not None and lock_y is not None and lock_x == lock_y
+
+        def describe_lock(commit: str, label: str) -> str:
+            value = committed_lock(commit, f"{label} TrustWP {commit}")
+            return "absent-or-non-regular" if value is None else value
+
+        def forward(x: str, y: str, label: str) -> bool:
+            return raw_commit_is_ancestor(wp_reader, x, y, f"{label} forward ancestry")
+
+        def canonical(y: str, label: str) -> bool:
+            return raw_commit_is_ancestor(
+                wp_reader, y, wp_remote_main, f"{label} canonical-main ancestry"
+            )
+
+        for child, before, after, label in moves:
+            before = require_sha(before, f"{label} TrustWP gitlink before the move")
+            after = require_sha(after, f"{label} TrustWP gitlink after the move")
+            if forward(before, after, label):
+                continue
+            lock_same = same_lock(before, after, label)
+            if lock_same and canonical(after, label):
+                continue
+            backward = raw_commit_is_ancestor(
+                wp_reader, after, before, f"{label} recovery reverse ancestry"
+            )
+            if lock_same and backward and restorations[child]:
+                recovered.append(
+                    {
+                        "backward_root_commit": child,
+                        "before_wp": before,
+                        "after_wp": after,
+                        "restoration_root_commits": restorations[child],
+                        "regular_identical_depends_lock": True,
+                    }
+                )
+                continue
+            lock_note = (
+                f"{WP_DEPENDS_PATH} differs (X={describe_lock(before, label)}, "
+                f"Y={describe_lock(after, label)})"
+            )
+            clause_b = (
+                lock_note
+                if not lock_same
+                else f"Y is not an ancestor-or-equal of trust-wp remote main {wp_remote_main}"
+            )
+            if not lock_same:
+                clause_c = lock_note
+            elif not backward:
+                clause_c = "Y is not a strict raw ancestor of X"
+            else:
+                clause_c = (
+                    f"no immediate single-parent child of {child} restores X"
+                )
+            history_finding(
+                f"Trust terminal-policy v3 refuses the {wp_path} gitlink move at "
+                f"{child}: X={before} -> Y={after}; "
+                "(a) not forward: X is not a raw ancestor of Y; "
+                f"(b) not a canonical re-anchoring: {clause_b}; "
+                f"(c) not a recovered same-lock backward move: {clause_c} (P2)"
+            )
+
+        for child, child_wp, mismatched in adoptions:
+            label = f"Trust terminal-policy propagation merge {child}"
+            dropped = {
+                parent: parent_wp
+                for parent, parent_wp in mismatched.items()
+                if not (
+                    forward(parent_wp, child_wp, label)
+                    or (
+                        same_lock(parent_wp, child_wp, label)
+                        and canonical(child_wp, label)
+                    )
+                )
+            }
+            if dropped:
+                history_finding(
+                    "Trust terminal-policy propagation merge did not retain "
+                    "every marked-parent TrustWP binding: "
+                    f"child={child}, child_wp={child_wp}, mismatched={dropped} "
+                    "(retained means equal to child_wp, or admissibly advanced to "
+                    "it: child_wp contains the parent's, or child_wp is on trust-wp "
+                    f"remote main with the same {WP_DEPENDS_PATH})"
+                )
+
+    if found_here and findings is None:
+        raise HistoryFinding(found_here)
+    if recovered and not found_here:
+        # Keep --print-receipt stdout machine-readable.  This is a diagnostic
+        # of rechecked raw objects, never a receipt or alternative authority.
+        print(
+            "DEPENDENCY CONSTELLATION SAME-LOCK RECOVERY "
+            + json.dumps(
+                {"root_commit": root_commit, "recovered_edges": recovered},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+    return {
+        "activation_commit": activation_commit,
+        "moves": len(moves),
+        "recovered": len(recovered),
+        "wp_remote_main": wp_remote_main,
+        # Non-empty only when ``findings`` was given (otherwise it raised).
+        "findings": list(found_here),
+    }
 
 def committed_submodules(
     repo_root: Path, root_revision: str = "HEAD"
@@ -2384,98 +2230,20 @@ def validate_receipt(value: object) -> dict[str, Any]:
     }
 
 
-def validate_wp_root_anchor(value: object, label: str = "wp_trust_anchor") -> dict[str, Any]:
-    if not isinstance(value, dict):
-        fail(f"{label} must be an object")
-    is_v2 = "policy_version" in value
-    expected_keys = (
-        WP_ROOT_ANCHOR_KEYS | WP_ROOT_ANCHOR_V2_EXTRA_KEYS
-        if is_v2
-        else WP_ROOT_ANCHOR_KEYS
-    )
-    require_exact_keys(value, expected_keys, label)
-    constants = {
-        "authority_repository": "trust-wp",
-        "authority_path": WP_DEPENDS_PATH,
-        "anchor_repository": "trust",
-        "terminal_repository": "trust",
-        "only_tree_delta": WP_ROOT_DELTA_PATH,
-    }
-    for key, expected in constants.items():
-        if value[key] != expected:
-            fail(f"{label}.{key} must be exactly {expected!r}")
-    normalized = {
-        **constants,
-        "authority_commit": require_sha(
-            value["authority_commit"], f"{label}.authority_commit"
-        ),
-        "anchor_commit": require_sha(value["anchor_commit"], f"{label}.anchor_commit"),
-        "terminal_commit": require_sha(
-            value["terminal_commit"], f"{label}.terminal_commit"
-        ),
-        "anchor_gitlink": require_sha(
-            value["anchor_gitlink"], f"{label}.anchor_gitlink"
-        ),
-        "terminal_gitlink": require_sha(
-            value["terminal_gitlink"], f"{label}.terminal_gitlink"
-        ),
-    }
-    if normalized["authority_commit"] != normalized["terminal_gitlink"]:
-        fail(f"{label} authority commit and terminal gitlink must be identical")
-    if normalized["anchor_gitlink"] == normalized["terminal_gitlink"]:
-        fail(f"{label} must record a real TrustWP gitlink advance")
-    if normalized["anchor_commit"] == normalized["terminal_commit"]:
-        fail(f"{label} root anchor and terminal commits must differ")
-    if is_v2:
-        if value["policy_version"] != "trust.constellation.terminal-policy.v2":
-            fail(
-                f"{label}.policy_version must be exactly "
-                "'trust.constellation.terminal-policy.v2'"
-            )
-        if value["preservation_floor"] != TERMINAL_POLICY_V2_PRESERVATION_FLOOR:
-            fail(
-                f"{label}.preservation_floor must equal exact published B "
-                f"{TERMINAL_POLICY_V2_PRESERVATION_FLOOR}"
-            )
-        predecessor = require_sha(
-            value["predecessor_commit"], f"{label}.predecessor_commit"
-        )
-        root_bindings_value = value["root_bindings"]
-        if not isinstance(root_bindings_value, dict):
-            fail(f"{label}.root_bindings must be an object")
-        require_exact_keys(root_bindings_value, set(SUBMODULES), f"{label}.root_bindings")
-        root_bindings = {
-            name: require_sha(
-                root_bindings_value[name], f"{label}.root_bindings.{name}"
-            )
-            for name in sorted(SUBMODULES)
-        }
-        if normalized["anchor_gitlink"] != TERMINAL_POLICY_V2_W0:
-            fail(
-                f"{label}.anchor_gitlink must equal exact W0 "
-                f"{TERMINAL_POLICY_V2_W0}"
-            )
-        if root_bindings["trust-wp"] != TERMINAL_POLICY_V2_W0:
-            fail(f"{label}.root_bindings.trust-wp must equal exact W0")
-        normalized.update(
-            {
-                "policy_version": "trust.constellation.terminal-policy.v2",
-                "preservation_floor": TERMINAL_POLICY_V2_PRESERVATION_FLOOR,
-                "predecessor_commit": predecessor,
-                "root_bindings": root_bindings,
-            }
-        )
-    return normalized
-
-
-def validate_external_receipt(
-    value: object, *, require_wp_trust_anchor: bool = False
-) -> dict[str, Any]:
+def validate_external_receipt(value: object) -> dict[str, Any]:
     """Validate the untracked v3 evidence shape.
 
     V3 deliberately carries the concrete Trust commit instead of a
     self-referential sentinel.  It is therefore external evidence and cannot
     be made a tracked blob in the commit it authenticates.
+
+    SCHEMA CHANGE (2026-09-21).  Receipts written before terminal-policy v3
+    carried a ``wp_trust_anchor`` member -- ``null`` outside a terminal cut,
+    and under the v2 cut extended with ``policy_version``,
+    ``preservation_floor``, ``predecessor_commit`` and ``root_bindings``.  The
+    cut is deleted, so the member is gone rather than left permanently null;
+    the schema id is unchanged because no receipt of this shape is ever
+    tracked or read back (it is printed, compared once, and discarded).
     """
     if not isinstance(value, dict):
         fail("external receipt top level must be an object")
@@ -2488,7 +2256,6 @@ def validate_external_receipt(
         "surfaces",
         "direct_edges",
         "anchors",
-        "wp_trust_anchor",
     }
     require_exact_keys(value, external_keys, "external receipt")
     if value["schema"] != EXTERNAL_SCHEMA:
@@ -2501,20 +2268,8 @@ def validate_external_receipt(
         fail("external receipt self.repository must be exactly 'trust'")
     self_commit = require_sha(self_value["commit"], "external receipt self.commit")
 
-    anchor_value = value["wp_trust_anchor"]
-    if anchor_value is None:
-        if require_wp_trust_anchor:
-            fail("external receipt omits required TrustWP Trust anchor evidence")
-        root_anchor = None
-    else:
-        root_anchor = validate_wp_root_anchor(anchor_value)
-        if root_anchor["terminal_commit"] != self_commit:
-            fail("wp_trust_anchor terminal commit must equal external receipt self.commit")
-
     legacy_value = {
-        key: item
-        for key, item in value.items()
-        if key not in {"schema", "self", "wp_trust_anchor"}
+        key: item for key, item in value.items() if key not in {"schema", "self"}
     }
     legacy_value.update(
         {
@@ -2523,37 +2278,7 @@ def validate_external_receipt(
         }
     )
     normalized = validate_receipt(legacy_value)
-    if (
-        root_anchor is not None
-        and root_anchor["terminal_gitlink"] != normalized["repositories"]["trust-wp"]
-    ):
-        fail(
-            "wp_trust_anchor terminal gitlink must equal repositories.trust-wp.commit"
-        )
-    if root_anchor is not None and root_anchor.get("policy_version") == (
-        "trust.constellation.terminal-policy.v2"
-    ):
-        armed_bindings = root_anchor["root_bindings"]
-        assert isinstance(armed_bindings, dict)
-        mismatched = {
-            name: {
-                "armed_r0": armed_bindings[name],
-                "terminal_r1": normalized["repositories"][name],
-            }
-            for name in sorted(set(SUBMODULES) - {"trust-wp"})
-            if armed_bindings[name] != normalized["repositories"][name]
-        }
-        if mismatched:
-            fail(
-                "wp_trust_anchor v2 armed R0 vector differs from terminal R1 "
-                f"for non-TrustWP repositories: {mismatched}"
-            )
-    normalized.update(
-        {
-            "self_commit": self_commit,
-            "wp_trust_anchor": root_anchor,
-        }
-    )
+    normalized["self_commit"] = self_commit
     return normalized
 
 
@@ -4080,20 +3805,12 @@ def verify_local_objects(
         if object_type != "commit":
             fail(f"{dependency} referenced object {commit} is not a commit")
         terminal = commits[dependency]
-        if commit != terminal:
-            ancestor = subprocess.run(
-                ["git", "-C", str(checkout), "merge-base", "--is-ancestor", commit, terminal],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                env=authority_git_environment(),
-                check=False,
+        ancestor, detail = local_is_ancestor(checkout, commit, terminal)
+        if not ancestor:
+            fail(
+                f"{dependency} referenced commit {commit} is not an ancestor of terminal {terminal}"
+                + (f": {detail}" if detail else "")
             )
-            if ancestor.returncode != 0:
-                detail = ancestor.stderr.decode("utf-8", "replace").strip()
-                fail(
-                    f"{dependency} referenced commit {commit} is not an ancestor of terminal {terminal}"
-                    + (f": {detail}" if detail else "")
-                )
 
 
 def compare_inventory(label: str, expected: list[dict[str, Any]], actual: list[dict[str, Any]]) -> None:
@@ -4110,115 +3827,235 @@ def compare_inventory(label: str, expected: list[dict[str, Any]], actual: list[d
         )
 
 
-def github_authorization_header(url: str, ceiling: Path) -> str | None:
-    """Obtain GitHub credentials separately from the isolated transport config."""
-    parsed = urlsplit(url)
+def sample_remote_main(name: str, url: str) -> str:
+    """Sample canonical main through the shared authenticated Agh inventory.
+
+    Local fixtures retain the isolated Git probe. Neither route adopts caller
+    configuration or substitutes a tracking ref for the actual live sample.
+    """
     try:
-        port = parsed.port
+        github = rt.github_repository(url) is not None
     except ValueError as error:
-        fail(f"canonical remote URL has malformed port authority: {error}")
-    if not (
-        parsed.scheme == "https"
-        and parsed.hostname == "github.com"
-        and parsed.username is None
-        and parsed.password is None
-        and port is None
-        and not parsed.query
-        and not parsed.fragment
-    ):
-        return None
-    request = (
-        f"protocol=https\nhost=github.com\npath={parsed.path.lstrip('/')}\n\n"
-    ).encode("utf-8")
-    completed = subprocess.run(
-        ["git", "credential", "fill"],
-        cwd=ceiling,
-        input=request,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=credential_git_environment(ceiling),
-        check=False,
-    )
+        fail(f"invalid canonical {name} remote: {error}")
+    with tempfile.TemporaryDirectory(prefix="trust-remote-main-") as temporary:
+        ceiling = Path(temporary)
+        environment = remote_git_environment(ceiling)
+        if github:
+            store = ceiling / "witness.git"
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", "--bare", "--template=", str(store)],
+                cwd=temporary, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=environment, check=False,
+            )
+            if initialized.returncode != 0:
+                detail = initialized.stderr.decode("utf-8", "replace").strip()
+                fail(f"cannot prepare {name} remote type witnesses: {detail}")
+            completed = rt.remote_refs(
+                url, git_dir=store, env=environment, cwd=ceiling,
+                timeout=rt.LS_REMOTE_TIMEOUT_S,
+            )
+            rows = completed.stdout.splitlines()
+            # The shared reader validates the complete heads/pins inventory;
+            # this policy still judges exactly its single canonical main.
+            rows = [row for row in rows if row.partition("\t")[2] == "refs/heads/main"]
+            detail = (completed.stderr or completed.stdout).strip()
+        else:
+            completed = subprocess.run(
+                ["git", "ls-remote", "--exit-code", url, "refs/heads/main"],
+                cwd=temporary, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=environment, check=False,
+            )
+            rows = completed.stdout.decode("ascii", "strict").splitlines()
+            detail = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
     if completed.returncode != 0:
-        return None
-    fields: dict[str, str] = {}
-    for raw_row in completed.stdout.splitlines():
-        raw_key, separator, raw_value = raw_row.partition(b"=")
-        if separator != b"=":
-            fail("Git credential helper returned a malformed protocol row")
-        try:
-            key = raw_key.decode("ascii", "strict")
-            value = raw_value.decode("utf-8", "strict")
-        except UnicodeDecodeError as error:
-            fail(f"Git credential helper returned malformed text: {error}")
-        if key in fields:
-            fail(f"Git credential helper returned duplicate field {key!r}")
-        fields[key] = value
-    if fields.get("protocol", "https") != "https" or fields.get(
-        "host", "github.com"
-    ) != "github.com":
-        fail("Git credential helper changed the canonical GitHub authority")
-    username = fields.get("username")
-    password = fields.get("password")
-    auth_type = fields.get("authtype")
-    credential = fields.get("credential")
-    has_basic = username is not None or password is not None
-    has_typed = auth_type is not None or credential is not None
-    if has_basic and has_typed:
-        fail("Git credential helper returned conflicting credential sources")
-    if has_basic:
-        if not username or not password:
-            fail("Git credential helper returned an incomplete Basic credential")
-        if any(character in username + password for character in "\r\n\0"):
-            fail("Git credential helper returned malformed Basic credential text")
-        encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
-            "ascii"
+        fail(f"cannot resolve {name} remote main at {url}: {detail}")
+    if len(rows) != 1:
+        fail(
+            f"{name} remote main probe must return exactly one refs/heads/main row; "
+            f"observed={rows}"
         )
-        return f"Authorization: Basic {encoded}"
-    if has_typed:
-        if not auth_type or not credential:
-            fail("Git credential helper returned an incomplete typed credential")
-        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", auth_type):
-            fail("Git credential helper returned a malformed authorization type")
-        if any(character in credential for character in "\r\n\0"):
-            fail("Git credential helper returned a malformed authorization credential")
-        return f"Authorization: {auth_type} {credential}"
-    return None
+    sha, separator, ref = rows[0].partition("\t")
+    if separator != "\t" or ref != "refs/heads/main":
+        fail(f"{name} remote main probe returned a malformed row: {rows[0]!r}")
+    return require_sha(sha, f"{name} remote main")
 
 
 def verify_one_remote_main(name: str, url: str, commit: str) -> None:
-    with tempfile.TemporaryDirectory(prefix="trust-remote-main-") as temporary:
-        ceiling = Path(temporary)
+    observed = sample_remote_main(name, url)
+    if observed != commit:
+        fail(
+            f"{name} terminal {commit} is not exactly remote main; "
+            f"observed={[observed + chr(9) + 'refs/heads/main']}"
+        )
 
-        def probe(authorization_header: str | None) -> subprocess.CompletedProcess[bytes]:
-            return subprocess.run(
-                ["git", "ls-remote", "--exit-code", url, "refs/heads/main"],
-                cwd=temporary,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=remote_git_environment(
-                    ceiling, authorization_header=authorization_header
-                ),
-                check=False,
+
+def sample_trust_wp_remote_main() -> str:
+    """The one live sample every judging takes: trust-wp's canonical main.
+
+    P1 and P2(b) are stated against this value.  It is a separate function so
+    the self-tests can replace exactly this network read and nothing else.
+    """
+    return sample_remote_main("trust-wp", SUBMODULES["trust-wp"][1])
+
+
+def trust_wp_fetch_url() -> str:
+    """Where absent TrustWP commits are fetched from, by sha: the canonical URL.
+
+    A separate function so the self-tests point it at their own fixture
+    remote; nothing else about the fetch is replaced.
+    """
+    return SUBMODULES["trust-wp"][1]
+
+
+TRUST_WP_FETCH_TIMEOUT_S = 180
+# What a server says when it will not serve a sha, as opposed to "I could not
+# reach the server" (scripts/lib/remote_tips.py reads the same markers).
+FETCH_REFUSAL_MARKERS = (
+    "not our ref",
+    "couldn't find remote ref",
+    "no such remote ref",
+    "unadvertised object",
+)
+
+
+def absent_commits(checkout: Path, shas: Sequence[str]) -> list[str]:
+    """The subset of ``shas`` that ``checkout``'s own store does not hold as commits."""
+    wanted = list(dict.fromkeys(shas))
+    if not wanted:
+        return []
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input="".join(f"{sha}\n" for sha in wanted).encode("ascii"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=authority_git_environment(),
+        check=False,
+    )
+    held = set()
+    for row in completed.stdout.decode("ascii", "replace").splitlines():
+        fields = row.split()
+        if len(fields) == 2 and fields[1] == "commit":
+            held.add(fields[0])
+    return [sha for sha in wanted if sha not in held]
+
+
+def incomplete_trust_wp_sources(checkout: Path, shas: Sequence[str]) -> list[str]:
+    """Source snapshots P1/P2 cannot yet read, including commit-only intake.
+
+    A genuinely absent lock path stays a policy refusal. Missing Git objects
+    along that path are acquisition failures, never proof that the path is absent.
+    """
+    wanted = list(dict.fromkeys(shas))
+    for sha in wanted:
+        require_sha(sha, "TrustWP source identity")
+    missing = set(absent_commits(checkout, wanted))
+    for sha in wanted:
+        if sha in missing:
+            continue
+        entries = subprocess.run(
+            ["git", "-C", str(checkout), "ls-tree", "-r", "-z", sha, "--", WP_DEPENDS_PATH],
+            capture_output=True, env=authority_git_environment(), check=False,
+        )
+        if entries.returncode != 0:
+            missing.add(sha)
+            continue
+        for entry in entries.stdout.split(b"\0"):
+            if not entry:
+                continue
+            metadata, separator, _path = entry.partition(b"\t")
+            fields = metadata.split()
+            if separator != b"\t" or len(fields) != 3:
+                fail("Git returned malformed TrustWP source inventory")
+            available = subprocess.run(
+                ["git", "-C", str(checkout), "cat-file", "-e", fields[2].decode("ascii")],
+                capture_output=True, env=authority_git_environment(), check=False,
             )
+            if available.returncode != 0:
+                missing.add(sha)
+    return [sha for sha in wanted if sha in missing]
 
-        authorization: str | None = None
-        completed = probe(None)
-        if completed.returncode != 0:
-            authorization = github_authorization_header(url, ceiling)
-            if authorization is not None:
-                completed = probe(authorization)
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
-        if authorization is not None:
-            secret = authorization.rpartition(" ")[2]
-            detail = detail.replace(authorization, "Authorization: <redacted>")
-            detail = detail.replace(secret, "<redacted>")
-        fail(f"cannot resolve {name} remote main at {url}: {detail}")
-    rows = completed.stdout.decode("ascii", "strict").splitlines()
-    expected = f"{commit}\trefs/heads/main"
-    if rows != [expected]:
-        fail(f"{name} terminal {commit} is not exactly remote main; observed={rows}")
+
+def fetch_absent_trust_wp_objects(checkout: Path, shas: Sequence[str]) -> tuple[list[str], str]:
+    """Acquire missing exact TrustWP source objects through native Agh.
+
+    P1/P2 read DEPENDS.lock blobs, so commit-only ancestry is insufficient.
+    The shared source intake preserves caller refs, HEAD and FETCH_HEAD and
+    checks the requested commit and tree. Literal local fixtures keep their
+    isolated Git route and the existing per-operation timeout.
+    """
+    absent = incomplete_trust_wp_sources(checkout, shas)
+    if not absent:
+        return [], ""
+    url = trust_wp_fetch_url()
+    details: list[str] = []
+    try:
+        github = rt.github_repository(url) is not None
+    except ValueError as error:
+        fail(f"invalid canonical trust-wp remote: {error}")
+    with tempfile.TemporaryDirectory(prefix="trust-wp-fetch-") as temporary:
+        ceiling = Path(temporary)
+        environment = remote_git_environment(ceiling)
+        if github:
+            for sha in absent:
+                completed = rt.fetch_exact_source(
+                    url, checkout, sha, env=environment,
+                    timeout=TRUST_WP_FETCH_TIMEOUT_S,
+                )
+                if completed.returncode != 0:
+                    detail = (completed.stderr or completed.stdout).strip()
+                    details.append(f"{sha[:12]}: {detail or f'Agh source intake exit {completed.returncode}'}")
+        else:
+            git_dir = decode_text(
+                run_git(checkout, ["rev-parse", "--absolute-git-dir"]),
+                "trust-wp absolute git dir",
+            ).strip()
+
+            def fetch(batch: Sequence[str]) -> tuple[int, str]:
+                try:
+                    completed = subprocess.run(
+                        [
+                            "git", "--git-dir", git_dir, "fetch", "--quiet",
+                            "--no-write-fetch-head", "--no-tags", "--no-recurse-submodules",
+                            "--no-prune", "--no-auto-maintenance", "--refmap=", url, *batch,
+                        ],
+                        cwd=temporary, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+                        timeout=TRUST_WP_FETCH_TIMEOUT_S, check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    return 124, f"timed out after {TRUST_WP_FETCH_TIMEOUT_S}s"
+                detail = (completed.stderr or completed.stdout).decode("utf-8", "replace").strip()
+                return completed.returncode, detail.splitlines()[-1] if detail else ""
+
+            code, detail = fetch(absent)
+            if code != 0 and len(absent) > 1 and any(
+                marker in detail.lower() for marker in FETCH_REFUSAL_MARKERS
+            ):
+                for sha in incomplete_trust_wp_sources(checkout, absent):
+                    one_code, one_detail = fetch([sha])
+                    if one_code != 0:
+                        details.append(f"{sha[:12]}: {one_detail}")
+            elif code != 0:
+                details.append(detail or f"git fetch exit {code}")
+    still = incomplete_trust_wp_sources(checkout, absent)
+    fetched = [sha for sha in absent if sha not in still]
+    if fetched:
+        print(
+            f"trust-wp: fetched {len(fetched)} absent commit(s) by sha from {url} "
+            f"(no ref, no FETCH_HEAD written): {', '.join(sha[:12] for sha in fetched)}",
+            file=sys.stderr,
+        )
+    if github:
+        for sha in still:
+            if not any(detail.startswith(sha[:12] + ":") for detail in details):
+                details.append(f"{sha[:12]}: complete source still unavailable after Agh source intake")
+    summary = "; ".join(details)
+    if still:
+        summary = (
+            f"a by-sha fetch from {url} did not bring {', '.join(sha[:12] for sha in still)}"
+            + (f" ({summary})" if summary else "")
+        )
+    return absent, summary
 
 
 def verify_remote_main(
@@ -4228,74 +4065,6 @@ def verify_remote_main(
         verify_one_remote_main(name, SUBMODULES[name][1], commit)
     if root_commit is not None:
         verify_one_remote_main("trust", ROOT_URL, root_commit)
-
-
-def verify_terminal_policy_v2_remote_main(
-    repo_root: Path,
-    policy_state: dict[str, Any],
-    commits: dict[str, str],
-    *,
-    root_commit: str,
-    prospective_root_old: str | None,
-) -> None:
-    """Verify v2 endpoints, with real pre-push old-main semantics.
-
-    Before R1, TrustWP remote main is P while R0 deliberately still binds W0.
-    During a Trust-main push, the remote cannot already name the new commit; the
-    hook therefore authenticates the advertised old SHA both against the raw
-    required parent and a fresh canonical ``ls-remote`` sample.  A normal
-    post-push invocation instead requires the judged revision itself to be
-    remote main.
-    """
-    state = policy_state.get("state")
-    if state not in {"Armed", "Terminal"}:
-        fail("terminal-policy v2 remote verification requires Armed or Terminal state")
-    policy = policy_state.get("policy")
-    if not isinstance(policy, dict):
-        fail("terminal-policy v2 remote verification is missing armed policy")
-    bindings_value = policy.get("root_bindings")
-    if not isinstance(bindings_value, dict) or set(bindings_value) != set(SUBMODULES):
-        fail("terminal-policy v2 remote verification has malformed root bindings")
-    bindings = {
-        name: require_sha(bindings_value[name], f"terminal-policy v2 root.{name}")
-        for name in sorted(SUBMODULES)
-    }
-    for name in sorted(set(SUBMODULES) - {"trust-wp"}):
-        if commits[name] != bindings[name]:
-            fail(
-                f"terminal-policy v2 current {name} binding differs from Armed R0"
-            )
-        verify_one_remote_main(name, SUBMODULES[name][1], bindings[name])
-    if state == "Armed":
-        wp_remote = require_sha(
-            policy.get("predecessor_commit"), "terminal-policy v2 predecessor P"
-        )
-    else:
-        wp_remote = require_sha(
-            commits["trust-wp"], "terminal-policy v2 terminal TrustWP W1"
-        )
-    verify_one_remote_main("trust-wp", SUBMODULES["trust-wp"][1], wp_remote)
-
-    if prospective_root_old is None:
-        expected_remote_root = root_commit
-    else:
-        parents = raw_commit_parents(
-            repo_root, root_commit, f"terminal-policy v2 prospective {state} root"
-        )
-        if len(parents) != 1:
-            fail(
-                "terminal-policy v2 prospective root publication requires a raw "
-                f"single-parent transition; state={state}, parents={parents}"
-            )
-        expected_old = parents[0]
-        if prospective_root_old != expected_old:
-            fail(
-                "terminal-policy v2 advertised old Trust remote main differs from "
-                f"the required direct parent: advertised={prospective_root_old}, "
-                f"required={expected_old}, state={state}"
-            )
-        expected_remote_root = prospective_root_old
-    verify_one_remote_main("trust", ROOT_URL, expected_remote_root)
 
 
 def load_exclusion_policy(
@@ -4347,16 +4116,8 @@ def derive_receipt(
     exclusions: list[dict[str, str]],
     *,
     verify_remote: bool = False,
-    require_wp_trust_anchor: bool = False,
     external_evidence: bool = True,
-    prospective_root_old: str | None = None,
 ) -> dict[str, object]:
-    if require_wp_trust_anchor and not verify_remote:
-        fail(
-            "terminal TrustWP anchor evidence requires remote-main verification; "
-            "derive_receipt(require_wp_trust_anchor=True) must also set "
-            "verify_remote=True"
-        )
     root_revision = require_sha(root_revision, "judged root revision")
     if external_evidence:
         clean_head = committed_clean_head(repo_root)
@@ -4382,35 +4143,7 @@ def derive_receipt(
                 commit,
                 f"{name} terminal checkout",
             )
-    v1_terminal_wp_mode = terminal_wp_policy_claimed(
-        repo_root, root_revision, commits
-    )
-    v2_state = terminal_wp_policy_v2_state(repo_root, root_revision, commits)
-    v2_phase = v2_state["state"]
-    v2_active = v2_phase in {"Armed", "Terminal"}
-    if v2_phase == "Armed" and v1_terminal_wp_mode:
-        fail(
-            "terminal-policy v2 Armed R0 has prior v1 TrustWP-move history; "
-            "R0 must still bind exact W0 with no move/revert claim"
-        )
-    if v2_phase == "Terminal" and not v1_terminal_wp_mode:
-        fail(
-            "terminal-policy v2 Terminal R1 did not activate the preserved v1 "
-            "TrustWP-move tripwire"
-        )
-    if v2_phase == "Armed" and require_wp_trust_anchor:
-        fail("terminal-policy v2 is Armed at R0 but has no Terminal R1 anchor yet")
-    terminal_wp_mode = (
-        require_wp_trust_anchor
-        or v1_terminal_wp_mode
-        or v2_phase == "Terminal"
-    )
-    remote_mode = verify_remote or v1_terminal_wp_mode or v2_active
-    require_external_receipt_untracked(
-        repo_root,
-        root_revision,
-        terminal_wp_mode=terminal_wp_mode or v2_active,
-    )
+    require_external_receipt_untracked(repo_root, root_revision)
     bindings = [
         {"repository": name, "path": path, "url": url, "commit": commit}
         for name, (path, url, commit) in sorted(submodules.items())
@@ -4421,25 +4154,8 @@ def derive_receipt(
     validate_resolutions(surfaces, commits)
     anchors = required_anchors(edges, commits)
     verify_local_objects(repo_root, surfaces, edges, commits)
-    if v2_phase == "Terminal":
-        wp_trust_anchor = derive_wp_root_anchor_v2(
-            repo_root, root_revision, commits, v2_state
-        )
-    elif terminal_wp_mode:
-        wp_trust_anchor = derive_wp_root_anchor(repo_root, root_revision, commits)
-    else:
-        wp_trust_anchor = None
-    if remote_mode:
-        if v2_active:
-            verify_terminal_policy_v2_remote_main(
-                repo_root,
-                v2_state,
-                commits,
-                root_commit=root_revision,
-                prospective_root_old=prospective_root_old,
-            )
-        else:
-            verify_remote_main(commits, root_commit=root_revision)
+    if verify_remote:
+        verify_remote_main(commits, root_commit=root_revision)
     receipt: dict[str, object] = {
         "schema": EXTERNAL_SCHEMA,
         "self": {"repository": "trust", "commit": root_revision},
@@ -4452,12 +4168,8 @@ def derive_receipt(
         "surfaces": surfaces,
         "direct_edges": edges,
         "anchors": anchors,
-        "wp_trust_anchor": wp_trust_anchor,
     }
-    validate_external_receipt(
-        receipt,
-        require_wp_trust_anchor=terminal_wp_mode or v2_phase == "Terminal",
-    )
+    validate_external_receipt(receipt)
     return receipt
 
 
@@ -4568,22 +4280,12 @@ def committed_clean_head(repo_root: Path) -> str:
     return head
 
 
-def require_external_receipt_untracked(
-    repo_root: Path, root_commit: str, *, terminal_wp_mode: bool
-) -> None:
+def require_external_receipt_untracked(repo_root: Path, root_commit: str) -> None:
     entries = committed_tree_entries(repo_root, root_commit)
-    forbidden = {EXTERNAL_RECEIPT_PATH}
-    if terminal_wp_mode:
-        # A legacy v2 receipt also cannot survive R0 -> R1: it would either
-        # bind W0 forever or require a second R1 tree delta.  Refuse it rather
-        # than let a conditional harness select the weaker historical mode.
-        forbidden.add(RECEIPT_PATH)
-    tracked = sorted(forbidden & set(entries))
-    if tracked:
+    if EXTERNAL_RECEIPT_PATH in entries:
         fail(
-            "v3 constellation evidence must remain external/untracked"
-            + (" in terminal TrustWP anchor mode" if terminal_wp_mode else "")
-            + f"; tracked={tracked}"
+            "v3 constellation evidence must remain external/untracked; "
+            f"tracked={[EXTERNAL_RECEIPT_PATH]}"
         )
 
 
@@ -4612,7 +4314,9 @@ def require_external_receipt_untracked(
 # scripts/hooks/pre-push exports the ref lines as TRUST_PUSHED_REFS and the same
 # row text runs in both runners. UNSET means no push is in flight and the
 # subject WIDENS to HEAD rather than narrowing to nothing, and a `SUBJECT:` line
-# always says which reading was taken.
+# always says which reading was taken. SET but publishing no terminal-state
+# candidate (see below) judges the terminal state the push leaves in place —
+# the destination's main — never nothing.
 #
 # WHICH PUSHED REF IS A TERMINAL-STATE CANDIDATE. This gate judges whether a
 # revision may become the repository's terminal state. That is a property of
@@ -4636,12 +4340,38 @@ def require_external_receipt_untracked(
 # on 2026-08-29, NO archive ref could be pushed through this hook at all.
 #
 # This is an ALLOWLIST and it fails closed twice over. An unrecognised namespace
-# is judged, a missing remote ref is judged, and if filtering leaves nothing the
-# subject WIDENS to HEAD rather than passing on an empty set — so the exemption
-# can only ever remove refs that were never terminal candidates, and can never
-# be the reason a push passes.
+# is judged, and a missing remote ref is judged. And if filtering leaves nothing
+# — an archive-only, pin-only or delete-only push — the subject is still never
+# empty: it becomes the terminal state that push LEAVES IN PLACE, the
+# destination's main as this clone last fetched it (`refs/remotes/<remote>/main`),
+# so the exemption can only ever remove refs that were never terminal
+# candidates, and can never be the reason a push passes.
+#
+# Why the destination's main and not this clone's HEAD. Until 2026-09-27 such a
+# push widened to HEAD — which such a push does not publish, so the verdict
+# depended only on what happened to be checked out. Archiving the CHECKED-OUT
+# retired branch (`git push origin HEAD:refs/archive/<date>/<branch>`) was then
+# refused on the very sha the exemption had just set aside, and deleting a
+# remote branch was refused whenever the clone sat on a stale or WIP commit:
+# the "judge HEAD regardless of what is pushed" pathology above, on an
+# unquarantinable lane. The destination's main is what every consumer resolves
+# the terminal state through, and such a push leaves it unchanged.
+#
+# The destination. The hook exports git's second pre-push argument as
+# TRUST_PUSH_REMOTE, and git's second argument is the remote's URL, not its
+# name; so the name is recovered by matching that value against this clone's
+# `remote.<name>.url` / `remote.<name>.pushurl` (or taking it verbatim when it
+# already IS a configured name), with `origin` when nothing matches.
+#
+# Two cases still widen to HEAD, so nothing passes on an empty or stale set:
+# the destination's main does not resolve in this clone (never fetched, or no
+# such remote), and the push DELETES the destination's main (`refs/heads/main`
+# with an all-zero local sha) — the remote-tracking copy then names a main that
+# will not survive the push, and judging it would judge a ghost.
 # ---------------------------------------------------------------------------
 PUSH_REFS_ENV = "TRUST_PUSHED_REFS"
+PUSH_REMOTE_ENV = "TRUST_PUSH_REMOTE"
+TERMINAL_MAIN_REF = "refs/heads/main"
 
 NON_TERMINAL_REF_PREFIXES = ("refs/archive/", "refs/pins/")
 
@@ -4691,9 +4421,11 @@ def pushed_revisions() -> list[tuple[str, str]] | None:
     """The (sha, ref) pairs a push in flight would publish.
 
     ``None`` means no push is in flight — the variable is UNSET, so the caller
-    widens to its historical default.  An empty LIST means a push that updates
-    no ref (empty-but-set), which also has nothing narrower to judge.  Deletions
-    publish no tree and are dropped; duplicate shas are judged once.
+    widens to its historical default.  An empty LIST means a push that
+    publishes no terminal-state candidate (empty-but-set, or every line a
+    deletion or a preservation-namespace ref); the caller then judges the
+    terminal state that push leaves in place (``push_left_terminal_state``).
+    Deletions publish no tree and are dropped; duplicate shas are judged once.
 
     A revision landing outside a terminal-state namespace is dropped too, and
     the drop is PRINTED rather than silent — see ``NON_TERMINAL_REF_PREFIXES``.
@@ -4728,102 +4460,96 @@ def pushed_revisions() -> list[tuple[str, str]] | None:
     return revisions
 
 
-def pushed_main_old_for_source(source: str) -> str | None:
-    """Return the advertised old Trust main for this prospective source.
+def push_deletes_terminal_main() -> bool:
+    """Does the push in flight DELETE the destination's main?
 
-    Only an actual ``refs/heads/main`` update gets prospective semantics.
-    Topic/archive publication cannot claim that the new revision is in flight
-    toward canonical main, and therefore remains subject to ordinary post-push
-    remote equality.
+    Fail-closed on shape: a deletion line (all-zero local sha) whose remote ref
+    is missing counts, because it cannot be shown NOT to be main.
     """
-    raw = os.environ.get(PUSH_REFS_ENV)
-    if raw is None:
-        return None
-    source = require_sha(source, "prospective pushed Trust revision")
-    matches: list[str] = []
-    for line in raw.splitlines():
+    for line in os.environ.get(PUSH_REFS_ENV, "").splitlines():
         fields = line.split()
-        if len(fields) < 3 or fields[1] != source or fields[2] != "refs/heads/main":
+        if len(fields) < 2:
             continue
-        if len(fields) != 4:
-            fail(
-                "terminal-policy v2 prospective main push row must contain exactly "
-                f"local-ref local-sha remote-ref remote-sha; observed={fields}"
-            )
-        old = fields[3]
-        if old == "0" * 40:
-            fail("terminal-policy v2 refuses creation of canonical Trust main")
-        matches.append(require_sha(old, "prospective advertised old Trust main"))
-    if len(matches) > 1:
-        fail(
-            "terminal-policy v2 prospective push repeats canonical Trust main "
-            f"for one revision: advertised_old={matches}"
-        )
-    return matches[0] if matches else None
+        local_sha = fields[1]
+        remote_ref = fields[2] if len(fields) >= 3 else ""
+        if set(local_sha) == {"0"} and remote_ref in ("", TERMINAL_MAIN_REF):
+            return True
+    return False
 
 
-def authenticate_terminal_policy_v2_main_transition(
-    repo_root: Path,
-    root_commit: str,
-    new_state: dict[str, Any],
-    advertised_old: str,
-) -> None:
-    """Bind every canonical-main update to its fresh old v2 state.
+def push_destination_remote(repo_root: Path) -> tuple[str, str]:
+    """(remote name, how it was found) for the push in flight.
 
-    Candidate-only policy selection is insufficient for a pre-push hook: a
-    force/replacement update can point canonical main from an Armed/Terminal
-    revision to a disconnected unmarked or PreV2 commit.  Authenticate the
-    advertised old SHA against canonical remote main, parse that exact local
-    commit with the same raw-history policy, and permit only monotone movement
-    within the identical marker introduction and R0 lineage.
+    ``TRUST_PUSH_REMOTE`` carries git's second pre-push argument, which is the
+    destination URL (the name is the first).  A value that is a configured
+    remote NAME is taken as is; otherwise it is matched against every
+    ``remote.<name>.url`` / ``remote.<name>.pushurl`` in this clone.  Several
+    matches prefer ``origin``, else the first by name; none falls back to
+    ``origin``.  Every outcome is reported, so the reading is never silent.
     """
-    root_commit = require_sha(root_commit, "prospective pushed Trust revision")
-    advertised_old = require_sha(advertised_old, "prospective advertised old Trust main")
-    old_submodules = committed_submodules(repo_root, advertised_old)
-    old_commits = {
-        name: commit for name, (_path, _url, commit) in old_submodules.items()
-    }
-    old_state = terminal_wp_policy_v2_state(repo_root, advertised_old, old_commits)
+    value = os.environ.get(PUSH_REMOTE_ENV, "").strip()
+    if not value:
+        return "origin", f"{PUSH_REMOTE_ENV} unset; assuming origin"
+    listed = run_git(
+        repo_root,
+        ["config", "--null", "--get-regexp", r"^remote\..*\.(push)?url$"],
+        check=False,
+    ).decode("utf-8", "replace")
+    names: set[str] = set()
+    by_url: set[str] = set()
+    for entry in listed.split("\0"):
+        if not entry:
+            continue
+        key, _sep, url = entry.partition("\n")
+        match = re.fullmatch(r"remote\.(.+)\.(?:push)?url", key)
+        if match is None:
+            continue
+        names.add(match.group(1))
+        if url == value:
+            by_url.add(match.group(1))
+    if value in names:
+        return value, f"{PUSH_REMOTE_ENV} names remote {value!r}"
+    if by_url:
+        chosen = "origin" if "origin" in by_url else sorted(by_url)[0]
+        return chosen, f"{PUSH_REMOTE_ENV} is the URL of remote {chosen!r}"
+    return "origin", f"{PUSH_REMOTE_ENV} {value!r} matches no configured remote; assuming origin"
 
-    # Do not impose v2's networked transition protocol on legacy history that
-    # predates the marker on both sides.  The moment either side has introduced
-    # v2, however, the advertised old identity must be freshly authenticated.
-    if (
-        old_state.get("introduction_commit") is None
-        and new_state.get("introduction_commit") is None
-    ):
-        return
-    verify_one_remote_main("trust", ROOT_URL, advertised_old)
 
-    old_phase = old_state.get("state")
-    new_phase = new_state.get("state")
-    if old_phase in {"Armed", "Terminal"} and new_phase not in {"Armed", "Terminal"}:
-        fail(
-            "terminal-policy v2 canonical main may not downgrade an active old "
-            f"state: old={old_phase}, new={new_phase}"
+def push_left_terminal_state(repo_root: Path) -> tuple[str, str] | None:
+    """The terminal state a push that publishes no candidate leaves in place.
+
+    That is the destination's main as this clone last fetched it.  ``None``
+    (after printing the reason) when it cannot stand for that state — the push
+    deletes main, or the remote-tracking ref does not resolve — and the caller
+    then widens to HEAD, so the subject is never empty.
+    """
+    if push_deletes_terminal_main():
+        print(
+            "SUBJECT: HEAD (push in flight publishes no terminal-state candidate and "
+            f"DELETES {TERMINAL_MAIN_REF}; the remote-tracking main would not survive it)"
         )
-    old_intro = old_state.get("introduction_commit")
-    new_intro = new_state.get("introduction_commit")
-    if old_intro is not None and new_intro != old_intro:
-        fail(
-            "terminal-policy v2 canonical main may not delete, replace, or re-add "
-            "its authenticated marker lineage: "
-            f"old_introduction={old_intro}, new_introduction={new_intro}"
+        return None
+    remote, how = push_destination_remote(repo_root)
+    tracking = f"refs/remotes/{remote}/main"
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{tracking}^{{commit}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=authority_git_environment(),
+        check=False,
+    )
+    resolved = completed.stdout.decode("ascii", "replace").strip()
+    if completed.returncode != 0 or not SHA_RE.match(resolved):
+        print(
+            "SUBJECT: HEAD (push in flight publishes no terminal-state candidate, and "
+            f"{tracking} does not resolve in this clone; {how})"
         )
-    if old_phase not in {"Armed", "Terminal"}:
-        return
-    if old_state.get("r0") != new_state.get("r0") or old_state.get("policy") != new_state.get("policy"):
-        fail(
-            "terminal-policy v2 canonical main changed its authenticated Armed "
-            "R0 policy lineage"
-        )
-    if old_phase == "Terminal" and (
-        new_phase != "Terminal" or root_commit != advertised_old
-    ):
-        fail(
-            "terminal-policy v2 canonical main is already Terminal and may not "
-            f"move or be replaced: old={advertised_old}, candidate={root_commit}"
-        )
+        return None
+    print(
+        f"SUBJECT: {remote}/main [{resolved[:12]}] (push in flight publishes no "
+        f"terminal-state candidate; judging the terminal state it leaves in place; {how})"
+    )
+    return resolved, f"{remote}/main [{resolved[:12]}] (left in place by the push)"
 
 
 def select_sources(repo_root: Path, args: argparse.Namespace) -> list[tuple[str, str]]:
@@ -4835,11 +4561,15 @@ def select_sources(repo_root: Path, args: argparse.Namespace) -> list[tuple[str,
         if pushed is None:
             print(f"SUBJECT: HEAD (no push in flight; {PUSH_REFS_ENV} unset)")
         elif not pushed:
-            # Set but yielding nothing: a push whose refs are all deletions, or
-            # one with no ref updates at all. Either way it publishes no tree,
-            # so there is nothing narrower than HEAD to judge — and widening is
-            # the fail-closed choice, because an empty subject would PASS.
-            print(f"SUBJECT: HEAD (push in flight updates no ref that publishes a tree)")
+            # Set but yielding nothing: every line a deletion or a
+            # preservation-namespace ref, or no ref updates at all. Such a push
+            # publishes no terminal-state candidate, so what it leaves as the
+            # terminal state is the destination's main — judge THAT, never an
+            # empty set (which would PASS) and never this clone's HEAD (which
+            # the push does not publish). HEAD only when that main is unknown.
+            left = push_left_terminal_state(repo_root)
+            if left is not None:
+                return [left]
         else:
             print(f"SUBJECT: push ({len(pushed)} ref update(s))")
             return [
@@ -4857,8 +4587,21 @@ def select_sources(repo_root: Path, args: argparse.Namespace) -> list[tuple[str,
     return [(head, f"HEAD [{head[:12]}]")]
 
 
-def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: str) -> None:
-    """Validate the constellation at ONE commit; every read takes that one."""
+def judge_source(
+    repo_root: Path,
+    args: argparse.Namespace,
+    source: str,
+    label: str,
+    findings: list[str],
+) -> bool:
+    """Validate the constellation at ONE commit; every read takes that one.
+
+    A history finding (HistoryFinding) is appended to ``findings`` and every
+    later check still runs; any other refusal raises.  A revision with a
+    finding prints no OK line and writes no receipt.  Returns False only when a
+    finding stopped a check short of its end (``--print-observed``, which
+    compares nothing), so ``main`` withholds ``FINDINGS: complete``.
+    """
     generating = args.print_receipt or args.write_receipt
     derived_only = False
     source_submodules = committed_submodules(repo_root, source)
@@ -4866,19 +4609,21 @@ def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: 
         name: commit
         for name, (_path, _url, commit) in source_submodules.items()
     }
-    auto_terminal_wp_mode = terminal_wp_policy_claimed(
-        repo_root, source, source_commits
+    # TrustWP terminal policy v3, once per judged revision and ahead of either
+    # lane: the live trust-wp main sample (P1, P2b), the marker and move
+    # judgement (P1, P2, P4), then the lock's cohort bindings (P3).
+    wp_policy = validate_trust_wp_policy(
+        repo_root, source, source_commits, sample_trust_wp_remote_main(), findings
     )
-    v2_state = terminal_wp_policy_v2_state(repo_root, source, source_commits)
-    auto_v2_mode = v2_state["state"] in {"Armed", "Terminal"}
-    auto_policy_mode = auto_terminal_wp_mode or auto_v2_mode
-    prospective_root_old = (
-        pushed_main_old_for_source(source) if args.push_context else None
+    found = bool(wp_policy["findings"])
+    validate_trust_wp_binding_coherence(repo_root, source, source_commits)
+    policy_line = (
+        "  trust-wp terminal-policy v3: remote main "
+        f"{str(wp_policy['wp_remote_main'])[:12]} contains B (P1); "
+        f"{wp_policy['moves']} gitlink move(s) since v1 activation admissible"
+        + (f", {wp_policy['recovered']} by same-lock recovery" if wp_policy["recovered"] else "")
+        + f" (P2); {WP_DEPENDS_PATH} rows 5/5 ancestor-or-equal (P3); marker exact (P4)"
     )
-    if prospective_root_old is not None:
-        authenticate_terminal_policy_v2_main_transition(
-            repo_root, source, v2_state, prospective_root_old
-        )
     if not generating and args.derive_when_receipt_absent:
         # Presence is asked of the SAME revision every other read takes. The
         # shell conditional this replaced asked `test -f` of the WORKING TREE,
@@ -4888,14 +4633,6 @@ def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: 
             generating = True
             derived_only = True
 
-    # Once the immutable history records any WP move, validation may never
-    # choose the legacy receipt lane again.  A tracked/stale receipt is itself
-    # rejected by derive_receipt's terminal policy instead of becoming a
-    # downgrade switch.
-    if auto_policy_mode and not generating:
-        generating = True
-        derived_only = True
-
     if generating:
         exclusions = load_exclusion_policy(repo_root, source, args.exclusions_path, label)
         receipt = derive_receipt(
@@ -4903,21 +4640,19 @@ def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: 
             source,
             exclusions,
             verify_remote=args.verify_remote,
-            require_wp_trust_anchor=args.require_wp_trust_anchor,
             external_evidence=not derived_only,
-            prospective_root_old=(prospective_root_old if auto_v2_mode else None),
         )
+        if found:
+            # Every check ran; a refused history prints no OK and writes
+            # no receipt.
+            return True
         rendered = render_receipt(receipt)
         if derived_only:
-            suffix = " + REMOTE MAIN" if args.verify_remote or auto_policy_mode else ""
-            reason = (
-                "immutable terminal policy"
-                if auto_policy_mode
-                else "no committed receipt"
-            )
-            print(f"DEPENDENCY CONSTELLATION OK{suffix} ({label}; derived, {reason})")
+            suffix = " + REMOTE MAIN" if args.verify_remote else ""
+            print(f"DEPENDENCY CONSTELLATION OK{suffix} ({label}; derived, no committed receipt)")
             print("  root gitlinks: 9/9 exact")
             print("  committed Cargo/Lake surfaces, direct edges, and generation cuts: exact")
+            print(policy_line)
         elif args.print_receipt:
             print(rendered, end="")
         else:
@@ -4935,8 +4670,12 @@ def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: 
                 f"{external_path}"
             )
             print(f"  source: {label} (do not stage this self-binding evidence)")
-        return
+        return True
 
+    if found and args.print_observed:
+        # The observed inventory is a diagnostic of an accepted history; a
+        # refused one stops here, so this judgement is not a complete one.
+        return False
     verify_constellation(
         repo_root,
         root_commit=source,
@@ -4947,9 +4686,12 @@ def judge_source(repo_root: Path, args: argparse.Namespace, source: str, label: 
     )
     if not args.print_observed:
         suffix = " + REMOTE MAIN" if args.verify_remote else ""
-        print(f"DEPENDENCY CONSTELLATION OK{suffix} ({label})")
-        print("  root gitlinks: 9/9 exact")
-        print("  committed Cargo/Lake surfaces, direct edges, and generation cuts: exact")
+        if not found:
+            print(f"DEPENDENCY CONSTELLATION OK{suffix} ({label})")
+            print("  root gitlinks: 9/9 exact")
+            print("  committed Cargo/Lake surfaces, direct edges, and generation cuts: exact")
+            print(policy_line)
+    return True
 
 
 def render_receipt(receipt: dict[str, object]) -> str:
@@ -5092,7 +4834,7 @@ source = "git+{url}?rev={rev}#{rev}"
 """
 
 
-def _st_run(repo: Path, args: Sequence[str]) -> str:
+def _st_run(repo: Path, args: Sequence[str], stdin: bytes | None = None) -> str:
     completed = subprocess.run(
         [
             "git",
@@ -5106,6 +4848,7 @@ def _st_run(repo: Path, args: Sequence[str]) -> str:
             "commit.gpgsign=false",
             *args,
         ],
+        input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -5152,24 +4895,34 @@ def _st_root_commit(root: Path, pins: dict[str, str], policy: str | None, messag
     return _st_run(root, ["rev-parse", "HEAD"])
 
 
-def _st_judge(root: Path, argv: Sequence[str], pushed: str | None) -> tuple[int, str]:
-    """Run the real CLI in-process and return (exit code, everything it printed)."""
+def _st_judge(
+    root: Path, argv: Sequence[str], pushed: str | None, push_remote: str | None = None
+) -> tuple[int, str]:
+    """Run the real CLI in-process and return (exit code, everything it printed).
+
+    Both push-context variables are set exactly as given (``None`` = unset) and
+    restored afterwards, so the hook's own values, present when this selftest
+    runs as a push-profile lane, never leak into a fixture judgement.
+    """
     import contextlib
     import io
 
-    saved = os.environ.get(PUSH_REFS_ENV)
-    if pushed is None:
-        os.environ.pop(PUSH_REFS_ENV, None)
-    else:
-        os.environ[PUSH_REFS_ENV] = pushed
+    wanted = {PUSH_REFS_ENV: pushed, PUSH_REMOTE_ENV: push_remote}
+    saved = {name: os.environ.get(name) for name in wanted}
+    for name, value in wanted.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = main(["--repo-root", str(root), *argv])
     finally:
-        os.environ.pop(PUSH_REFS_ENV, None)
-        if saved is not None:
-            os.environ[PUSH_REFS_ENV] = saved
+        for name, value in saved.items():
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
     return code, out.getvalue() + err.getvalue()
 
 
@@ -5239,10 +4992,48 @@ def selftest() -> int:
         root = Path(raw).resolve() / "trust"
         root.mkdir(parents=True)
         _st_run(root, ["init", "-q", "-b", "main"])
+        # A genesis commit first: trust-wp's lock names a Trust commit, and P3
+        # needs that row to be an ancestor of every judged revision.
+        _st_run(root, ["commit", "-q", "--allow-empty", "--no-verify", "-m", "trust genesis"])
+        genesis = _st_run(root, ["rev-parse", "HEAD"])
 
         pins: dict[str, str] = {}
         for name in sorted(SUBMODULES):
+            if name == "trust-wp":
+                continue
             pins[name] = _st_sibling(root, name, {"README.md": f"{name}\n"}, f"{name} base")
+        # trust-wp last, so its lock can bind every cohort row to a real
+        # sibling commit (each an ancestor-or-equal of the gitlink, P3) and
+        # the trust row to genesis.  Its base commit plays W0.
+        wp_lock = "".join(
+            f"{name} main {sha}\n"
+            for name, sha in (
+                ("clean", pins["clean"]),
+                ("trust-ir", pins["trust-ir"]),
+                ("trust-cg", pins["trust-cg"]),
+                ("trust", genesis),
+                ("ay", pins["ay"]),
+            )
+        )
+        w0 = _st_sibling(
+            root, "trust-wp", {"README.md": "trust-wp\n", WP_DEPENDS_PATH: wp_lock}, "trust-wp W0"
+        )
+        pins["trust-wp"] = w0
+        wp = root / SUBMODULES["trust-wp"][0]
+        # Published floor B is W0's child on main; main then advances past B.
+        floor = _st_sibling(root, "trust-wp", {"published.txt": "floor B\n"}, "published floor B")
+        wp_main = _st_sibling(root, "trust-wp", {"later.txt": "past B\n"}, "trust-wp main past B")
+        # Off-main lines from W0: two same-lock commits for the backward and
+        # sideways shapes, and one whose lock blob differs but still parses
+        # to the same rows (a comment) so P2 -- not P3 -- is what refuses it.
+        _st_run(wp, ["checkout", "-q", "-b", "side", w0])
+        side_one = _st_sibling(root, "trust-wp", {"side-one.txt": "side\n"}, "side line one")
+        side_two = _st_sibling(root, "trust-wp", {"side-two.txt": "more\n"}, "side line two")
+        _st_run(wp, ["checkout", "-q", "-b", "relocked", w0])
+        relocked = _st_sibling(
+            root, "trust-wp", {WP_DEPENDS_PATH: "# refreshed\n" + wp_lock}, "lock blob differs"
+        )
+        _st_run(wp, ["checkout", "-q", "main"])
         # ny's seven Clean surfaces must name a revision `clean` actually holds;
         # naming clean's head makes the reference terminal, so the fixture's
         # coherence never depends on clean's real history.
@@ -5261,7 +5052,26 @@ def selftest() -> int:
         _st_run(ir, ["checkout", "-q", "main"])
 
         policy = json.dumps({"schema": EXCLUSIONS_SCHEMA, "exclusions": []}, indent=2) + "\n"
-        _st_root_commit(root, pins, policy, "coherent pre-policy constellation")
+        pre_policy = _st_root_commit(root, pins, policy, "coherent pre-policy constellation")
+        # Two pre-activation side lines, each pinning its own trust-wp commit,
+        # recorded on main by an `-s ours` merge that keeps W0: the history a
+        # restoration (rows 30-32) may and may not reach back into.
+        side_lines: list[str] = []
+        for side_pin, label in ((side_one, "line one"), (side_two, "line two")):
+            _st_run(root, ["checkout", "-q", "--detach", pre_policy])
+            side_lines.append(
+                _st_root_commit(root, {**pins, "trust-wp": side_pin}, policy, f"pre-activation side {label}")
+            )
+        _st_run(root, ["checkout", "-q", "main"])
+        pre_merge = _st_run(
+            root,
+            [
+                "commit-tree", f"{pre_policy}^{{tree}}", "-p", pre_policy,
+                "-p", side_lines[0], "-p", side_lines[1],
+                "-m", "pre-activation merge of both side lines (-s ours, keeps W0)",
+            ],
+        )
+        _st_run(root, ["update-ref", "refs/heads/main", pre_merge, pre_policy])
         marker = root / TERMINAL_POLICY_MARKER_PATH
         marker.write_bytes(TERMINAL_POLICY_MARKER)
         _st_run(root, ["add", "--", TERMINAL_POLICY_MARKER_PATH])
@@ -5269,6 +5079,13 @@ def selftest() -> int:
             root,
             ["commit", "-q", "--no-verify", "-m", "activate immutable terminal policy"],
         )
+        pre_v3 = _st_run(root, ["rev-parse", "HEAD"])
+        # The v3 marker names W0 and B; here those are the synthetic commits,
+        # so the marker and the module constants are rebound together below.
+        synthetic_marker = render_terminal_policy_v3_marker(w0, floor)
+        (root / TERMINAL_POLICY_V3_MARKER_PATH).write_bytes(synthetic_marker)
+        _st_run(root, ["add", "--", TERMINAL_POLICY_V3_MARKER_PATH])
+        _st_run(root, ["commit", "-q", "--no-verify", "-m", "declare terminal-policy v3"])
         good = _st_run(root, ["rev-parse", "HEAD"])
 
         pins_bad = dict(pins)
@@ -5288,158 +5105,853 @@ def selftest() -> int:
         bad = _st_root_commit(root, pins_bad, policy, "incoherent constellation")
 
         no_policy = _st_root_commit(root, pins_bad, None, "policy deleted")
-        # Leave the checkout on the LAST commit, so every --rev/--push-context
-        # assertion below that names an earlier revision is also a statement
-        # that HEAD was not what got judged.
+
+        # trust-wp commits for the P3 negatives: a lock whose ay row is AHEAD
+        # of the ay gitlink the root will pin, and one that does not parse.
+        _st_run(wp, ["checkout", "-q", "-b", "ahead", w0])
+        lock_ahead = _st_sibling(
+            root,
+            "trust-wp",
+            {WP_DEPENDS_PATH: wp_lock.replace(pins["ay"], pins_bad["ay"])},
+            "lock row ahead of its gitlink",
+        )
+        _st_run(wp, ["checkout", "-q", "-b", "garbage", w0])
+        lock_garbage = _st_sibling(
+            root, "trust-wp", {WP_DEPENDS_PATH: "not a lock\n"}, "unparseable lock"
+        )
+        _st_run(wp, ["checkout", "-q", "main"])
+
+        def root_child(
+            parent: str,
+            child_pins: dict[str, str],
+            message: str,
+            *,
+            v3_marker: bytes | None = None,
+            v2_marker: bytes | None = None,
+        ) -> str:
+            """One root commit on top of ``parent``, off main, with its own pins."""
+            _st_run(root, ["checkout", "-q", "--detach", parent])
+            if v3_marker is not None:
+                (root / TERMINAL_POLICY_V3_MARKER_PATH).write_bytes(v3_marker)
+                _st_run(root, ["add", "--", TERMINAL_POLICY_V3_MARKER_PATH])
+            if v2_marker is not None:
+                (root / TERMINAL_POLICY_V2_MARKER_PATH).write_bytes(v2_marker)
+                _st_run(root, ["add", "--", TERMINAL_POLICY_V2_MARKER_PATH])
+            return _st_root_commit(root, child_pins, policy, message)
+
+        forged = root_child(
+            good, pins, "forge the v3 marker",
+            v3_marker=synthetic_marker.replace(b"ruled=2026-09-21", b"ruled=2026-09-22"),
+        )
+        armed = root_child(
+            good, pins, "arm the superseded v2 policy",
+            v2_marker=(
+                b"trust.constellation.terminal-policy.v2\nstate=armed\n"
+                b"policy=trust-wp-root-cycle-forward\n"
+                + f"w0={w0}\npreservation-floor={floor}\npredecessor={wp_main}\n".encode("ascii")
+            ),
+        )
+        relock_forward = root_child(
+            good, {**pins, "trust-wp": relocked}, "forward move with a changed lock"
+        )
+        off_main = root_child(good, {**pins, "trust-wp": side_two}, "forward move off main")
+        rolled_back = root_child(
+            off_main, {**pins, "trust-wp": side_one}, "backward move, off main"
+        )
+        restored = root_child(rolled_back, {**pins, "trust-wp": side_two}, "restore the pin")
+        sideways_relock = root_child(
+            off_main, {**pins, "trust-wp": relocked}, "sideways move with a differing lock"
+        )
+        reanchored = root_child(
+            off_main, {**pins, "trust-wp": floor}, "sideways re-anchoring onto canonical main"
+        )
+        ahead = root_child(good, {**pins, "trust-wp": lock_ahead}, "pin a lock row ahead of ay")
+        garbage = root_child(good, {**pins, "trust-wp": lock_garbage}, "pin an unparseable lock")
+
+        def stash_merge(index_pin: str, label: str) -> tuple[str, str]:
+            """The 1fedcff19d shape: a `git stash` on pre-activation side line
+            one (which pins side one) whose index commit carries ``index_pin``,
+            recorded on the marked line by an `-s ours` merge keeping good's
+            tree.  Returns (index commit, merge)."""
+            index = root_child(side_lines[0], {**pins, "trust-wp": index_pin}, f"index on side: {label}")
+            wip = _st_run(
+                root,
+                ["commit-tree", f"{index}^{{tree}}", "-p", side_lines[0], "-p", index,
+                 "-m", f"WIP on side: {label}"],
+            )
+            merge = _st_run(
+                root,
+                ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", wip,
+                 "-m", f"Merge preserve/stash ({label}; ancestry only, -s ours)"],
+            )
+            return index, merge
+
+        def untracked_stash_merge(untracked_tree: str, label: str) -> tuple[str, str]:
+            """A `git stash -u` on side line one, recorded like stash_merge: its
+            index commit stages nothing (side one's pin) and its third parent is a
+            PARENTLESS untracked-files commit with ``untracked_tree``.
+            Returns (untracked commit, merge)."""
+            # Nothing staged: the index commit has its parent's tree.
+            index = _st_run(root, ["commit-tree", f"{side_lines[0]}^{{tree}}", "-p", side_lines[0],
+                                   "-m", f"index on side: {label}"])
+            untracked = _st_run(root, ["commit-tree", untracked_tree, "-m", f"untracked files on side: {label}"])
+            wip = _st_run(
+                root,
+                ["commit-tree", f"{index}^{{tree}}", "-p", side_lines[0], "-p", index, "-p", untracked,
+                 "-m", f"WIP on side: {label}"],
+            )
+            merge = _st_run(
+                root,
+                ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", wip,
+                 "-m", f"Merge preserve/stash -u ({label}; ancestry only, -s ours)"],
+            )
+            return untracked, merge
+
+        # Row 38: an untracked-files tree holds only untracked files, no first-party/.
+        untracked_blob = _st_run(root, ["hash-object", "-w", "--stdin"], stdin=b"fn untracked() {}\n")
+        untracked_src = _st_run(root, ["mktree"], stdin=f"100644 blob {untracked_blob}\tlib.rs\n".encode())
+        untracked_tree = _st_run(root, ["mktree"], stdin=f"040000 tree {untracked_src}\tcrates\n".encode())
+        unbound_untracked, unbound_root_merge = untracked_stash_merge(untracked_tree, "untracked files")
+        # Row 41: the main-history shape (3ca41eb1a3): a `git stash -u` taken ON
+        # the marked line, so the stash commit is itself marked and its
+        # untracked-files commit is a direct unmarked parent, a lineage of one.
+        marked_index = _st_run(root, ["commit-tree", f"{good}^{{tree}}", "-p", good, "-m", "index on main: nothing staged"])
+        marked_untracked = _st_run(root, ["commit-tree", untracked_tree, "-m", "untracked files on main"])
+        marked_stash = _st_run(
+            root,
+            ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", marked_index, "-p", marked_untracked,
+             "-m", "WIP on main: stash -u"],
+        )
+        marked_stash_merge = _st_run(
+            root,
+            ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", marked_stash,
+             "-m", "Preserve rescued local work (ancestry only, -s ours)"],
+        )
+        # Row 39: the same shape whose parentless commit DOES carry a binding,
+        # one nobody published: it mints, as any parentless commit with one does.
+        bound_tree = _st_run(root, ["rev-parse", f"{root_child(side_lines[0], {**pins, 'trust-wp': relocked}, 'scratch')}^{{tree}}"])
+        bound_untracked, bound_root_merge = untracked_stash_merge(bound_tree, "parentless binding")
+        # Row 42: the same position, but the lone parentless parent carries a
+        # binding: it still never rejoins, and it mints.
+        bound_marked_stash = _st_run(
+            root,
+            ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", marked_index, "-p", bound_untracked,
+             "-m", "WIP on main: stash -u of a bound tree"],
+        )
+        # Row 40: an inactive commit WITH a parent that drops the gitlink is no
+        # unbound root: it is refused before any mint test.
+        dropped_tree = _st_run(root, ["mktree"], stdin=b"".join(
+            line.encode() + b"\n"
+            for line in _st_run(root, ["ls-tree", f"{side_lines[0]}^{{tree}}"]).splitlines()
+            if not line.endswith("\tfirst-party")
+        ))
+        dropped = _st_run(root, ["commit-tree", dropped_tree, "-p", side_lines[0], "-m", "side drops first-party/"])
+        dropped_merge = _st_run(
+            root,
+            ["commit-tree", f"{good}^{{tree}}", "-p", good, "-p", dropped,
+             "-m", "Merge a side line that dropped the TrustWP gitlink (-s ours)"],
+        )
+        # Restores W0, which the side line's own pre-activation ancestry pinned.
+        restore_index, restore_merge = stash_merge(w0, "restores W0")
+        # Pins side two: pre-activation, but only on the OTHER side line.
+        parallel_index, parallel_merge = stash_merge(side_two, "parallel line's pin")
+        # Pins a commit no pre-activation commit ever pinned.
+        fresh_index, fresh_merge = stash_merge(relocked, "unpublished pin")
+        # Rows 34-37: pushes on top of a destination already red on an inactive
+        # mint (parallel_merge), each adding a red of its own behind it
+        # (CONSTELLATION-ALL-FINDINGS).  A refused P2 move: forward off main,
+        # then sideways onto a differing lock.
+        red_forward = root_child(
+            parallel_merge, {**pins, "trust-wp": side_two}, "red main: forward move off main"
+        )
+        red_plus_move = root_child(
+            red_forward, {**pins, "trust-wp": relocked}, "red main: sideways move, differing lock"
+        )
+        # A second, new mint, merged on top of the red one; two of them, so one
+        # merge sorts after parallel_merge whatever the shas come out as.
+        red_plus_mints: list[tuple[str, str]] = []
+        for tag in ("a", "b"):
+            mint_index = root_child(
+                side_lines[0], {**pins, "trust-wp": relocked}, f"red main: new mint {tag}"
+            )
+            red_plus_mints.append(
+                (
+                    mint_index,
+                    _st_run(
+                        root,
+                        ["commit-tree", f"{parallel_merge}^{{tree}}", "-p", parallel_merge,
+                         "-p", mint_index, "-m", f"red main: merge new mint {tag} (-s ours)"],
+                    ),
+                )
+            )
+        # A red a later check finds (P3: a lock row ahead of its gitlink),
+        # reached by an admissible forward move.
+        red_plus_p3 = root_child(
+            parallel_merge, {**pins, "trust-wp": lock_ahead}, "red main: lock row ahead of ay"
+        )
+
+        # trust-wp's "canonical remote" for the by-sha fetch (row 33): a bare
+        # clone of the store holding one commit the store does not, a main
+        # that advanced past the store's last fetch.
+        wp_remote = Path(raw).resolve() / "remotes" / "trust-wp.git"
+        _st_run(root, ["clone", "-q", "--bare", "--no-local", str(wp), str(wp_remote)])
+        remote_only = _st_run(
+            wp_remote,
+            ["commit-tree", f"{wp_main}^{{tree}}", "-p", wp_main, "-m", "remote main advances"],
+        )
+        _st_run(wp_remote, ["update-ref", "refs/heads/main", remote_only])
+
+        # Leave the checkout on the LAST main commit, so every --rev and
+        # --push-context assertion below that names another revision is also
+        # a statement that HEAD was not what got judged.
+        _st_run(root, ["checkout", "-q", "main"])
         head = _st_run(root, ["rev-parse", "HEAD"])
         check("selftest fixture: HEAD is the policy-less revision", head == no_policy)
 
         derive = ["--derive-when-receipt-absent"]
 
-        # 1. GREEN: a coherent constellation passes, at a revision that is NOT HEAD.
-        code, text = _st_judge(root, ["--rev", good, *derive], None)
-        check(
-            "GREEN  --rev <coherent> passes while HEAD is incoherent",
-            code == 0 and "DEPENDENCY CONSTELLATION OK" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 2. RED: the same selector, pointed at the incoherent revision, refuses.
-        code, text = _st_judge(root, ["--rev", bad, *derive], None)
-        check(
-            "RED    --rev <incoherent> refuses (divergent trust-ir reference)",
-            code == 1 and "is not an ancestor of terminal" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 3. The pre-push path judges the revision being PUSHED, not HEAD —
-        #    proven in both directions so it cannot be passing by accident.
-        code, text = _st_judge(root, ["--push-context", *derive], f"refs/heads/main {good} refs/heads/main {bad}")
-        check(
-            "GREEN  --push-context judges the pushed coherent revision",
-            code == 0 and "SUBJECT: push (1 ref update(s))" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-        code, text = _st_judge(root, ["--push-context", *derive], f"refs/heads/main {bad} refs/heads/main {good}")
-        check(
-            "RED    --push-context judges the pushed incoherent revision",
-            code == 1 and "is not an ancestor of terminal" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 4. A deletion publishes no tree, so it must not be judged as one — and
-        #    with nothing left to judge the subject WIDENS to HEAD rather than
-        #    silently passing on an empty set.
-        code, text = _st_judge(
-            root, ["--push-context", *derive], f"refs/heads/main {'0' * 40} refs/heads/main {good}"
-        )
-        check(
-            "RED    a push that only DELETES widens to HEAD, never passes vacuously",
-            code == 1 and "no push in flight" not in text and "updates no ref" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 5. UNSET means no push is in flight: widen to HEAD, the historical
-        #    default. HEAD here has no policy, so this is also the fail-closed
-        #    case — and its refusal must carry the fix (v7/D3).
-        code, text = _st_judge(root, ["--push-context", *derive], None)
-        check(
-            f"RED    ${PUSH_REFS_ENV} unset widens to HEAD and says so",
-            code == 1 and f"SUBJECT: HEAD (no push in flight; {PUSH_REFS_ENV} unset)" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-        check(
-            "FIX    a policy that will not resolve names the revision and the options",
-            "exclusion policy" in text
-            and no_policy[:12] in text
-            and "--push-context" in text
-            and "--rev" in text,
-            "the refusal did not carry revision + options",
-        )
-
-        # 6. The gate must not be satisfiable by pointing it at nothing.
-        code, text = _st_judge(root, ["--rev", "refs/heads/does-not-exist", *derive], None)
-        check(
-            "RED    an unresolvable --rev refuses rather than falling back to HEAD",
-            code == 1 and "does not name a commit" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 7. --derive-when-receipt-absent must not be a way to pass: it removes
-        #    the inventory comparison, never the coherence check. Assertion 2
-        #    already carries it; this asserts the receipt-absent REFUSAL is the
-        #    only thing it suppressed.
-        code, text = _st_judge(root, ["--rev", good], None)
-        check(
-            "RED    without --derive-when-receipt-absent, an absent receipt refuses",
-            code == 1 and "constellation receipt" in text and "--derive-when-receipt-absent" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 8. RETIRED HISTORY IS ARCHIVABLE. A sha published where nothing can
-        #    resolve it as the terminal state is not a landing candidate, so it
-        #    is not judged as one — while the coherent main update in the SAME
-        #    push still is. Proven together, because an exemption that also
-        #    stopped judging main would pass this row by disabling the gate.
-        code, text = _st_judge(
-            root,
-            ["--push-context", *derive],
-            f"refs/heads/main {good} refs/heads/main {good}\n"
-            f"{bad} {bad} refs/archive/2026-08-31/retired {'0' * 40}",
-        )
-        check(
-            "GREEN  an archive ref is not judged, while main in the same push IS",
-            code == 0
-            and "not a terminal-state candidate, not judged: refs/archive/" in text
-            and "SUBJECT: push (1 ref update(s))" in text,
-            f"exit {code}: {text.strip().splitlines()[:3]}",
-        )
-
-        # 9. The exemption is scoped to the NAMESPACE, never to the sha: the
-        #    very revision archived above is still refused at refs/heads/main.
-        code, text = _st_judge(
-            root, ["--push-context", *derive], f"{bad} {bad} refs/heads/main {good}"
-        )
-        check(
-            "RED    the same sha pushed to refs/heads/main is still refused",
-            code == 1 and "is not an ancestor of terminal" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
-
-        # 10. An archive-only push must not pass VACUOUSLY. With every pushed
-        #     ref exempt the subject widens to HEAD, exactly as a delete-only
-        #     push does — the fixture's HEAD carries no policy, so it refuses.
-        code, text = _st_judge(
-            root,
-            ["--push-context", *derive],
-            f"{bad} {bad} refs/archive/2026-08-31/retired {'0' * 40}",
-        )
-        check(
-            "RED    an archive-ONLY push widens to HEAD, never passes vacuously",
-            code == 1 and "updates no ref" in text,
-            f"exit {code}: {text.strip().splitlines()[:3]}",
-        )
-
-        # 11. The allowlist is a PREFIX on the remote ref and nothing looser. A
-        #     branch merely NAMED archive/... lives under refs/heads/ and is an
-        #     ordinary landing candidate; it must still be judged.
-        code, text = _st_judge(
-            root,
-            ["--push-context", *derive],
-            f"{bad} {bad} refs/heads/archive/2026-08-31/retired {'0' * 40}",
-        )
-        check(
-            "RED    a lookalike refs/heads/archive/... branch is judged, not exempt",
-            code == 1 and "is not an ancestor of terminal" in text,
-            f"exit {code}: {text.strip().splitlines()[:2]}",
-        )
+        # ONLY the live trust-wp ls-remote sample is stubbed (to the synthetic
+        # trust-wp main), and W0/B are rebound to the synthetic base and floor
+        # the fixture's marker names.  Every other read is the real one.
+        print("  note: the live trust-wp remote-main sample is STUBBED to the synthetic")
+        print("        trust-wp main, and the by-sha fetch URL to a bare clone of it;")
+        print("        W0/B are the synthetic base/floor; nothing else is")
+        remote = {"main": wp_main}
+        module_globals = globals()
+        rebound = {
+            "TRUST_WP_W0": w0,
+            "TRUST_WP_PRESERVATION_FLOOR": floor,
+            "TERMINAL_POLICY_V3_MARKER": synthetic_marker,
+            "sample_trust_wp_remote_main": lambda: remote["main"],
+            "trust_wp_fetch_url": lambda: str(wp_remote),
+        }
+        originals = {name: module_globals[name] for name in rebound}
+        module_globals.update(rebound)
+        try:
+            _selftest_assertions(
+                check, root, derive,
+                dict(
+                    genesis=genesis, pre_v3=pre_v3, good=good, bad=bad,
+                    no_policy=no_policy, forged=forged, armed=armed,
+                    relock_forward=relock_forward, off_main=off_main,
+                    rolled_back=rolled_back, restored=restored,
+                    sideways_relock=sideways_relock, reanchored=reanchored,
+                    ahead=ahead, garbage=garbage, w0=w0, floor=floor,
+                    wp_main=wp_main, side_one=side_one, side_two=side_two,
+                    restore_merge=restore_merge, restore_index=restore_index,
+                    unbound_root_merge=unbound_root_merge, unbound_untracked=unbound_untracked,
+                    bound_root_merge=bound_root_merge, bound_untracked=bound_untracked,
+                    dropped_merge=dropped_merge, dropped=dropped,
+                    marked_stash_merge=marked_stash_merge, bound_marked_stash=bound_marked_stash,
+                    parallel_merge=parallel_merge, parallel_index=parallel_index,
+                    fresh_merge=fresh_merge, fresh_index=fresh_index,
+                    relocked=relocked, remote_only=remote_only,
+                    red_forward=red_forward, red_plus_move=red_plus_move,
+                    red_plus_mint_a=red_plus_mints[0][1], red_mint_index_a=red_plus_mints[0][0],
+                    red_plus_mint_b=red_plus_mints[1][1], red_mint_index_b=red_plus_mints[1][0],
+                    red_plus_p3=red_plus_p3,
+                ),
+                remote,
+            )
+        finally:
+            module_globals.update(originals)
 
     if failures:
         print(f"SELFTEST FAILED: {len(failures)} assertion(s): {failures}")
         return 1
     print("SELFTEST OK: the gate passes a coherent constellation, refuses an incoherent")
-    print("one, and judges the revision it is pointed at rather than this clone's HEAD.")
+    print("one, judges the revision it is pointed at rather than this clone's HEAD, and")
+    print("holds trust-wp to terminal-policy v3 (P1-P4) with each negative refused.")
     return 0
+
+
+def _selftest_assertions(
+    check: Any,
+    root: Path,
+    derive: list[str],
+    n: dict[str, str],
+    remote: dict[str, str],
+) -> None:
+    good, bad, no_policy = n["good"], n["bad"], n["no_policy"]
+
+    def first_lines(text: str, count: int = 2) -> list[str]:
+        return text.strip().splitlines()[:count]
+
+    # 1. GREEN: a coherent constellation passes, at a revision that is NOT HEAD.
+    code, text = _st_judge(root, ["--rev", good, *derive], None)
+    check(
+        "GREEN  --rev <coherent> passes while HEAD is incoherent",
+        code == 0 and "DEPENDENCY CONSTELLATION OK" in text
+        and "trust-wp terminal-policy v3" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 2. RED: the same selector, pointed at the incoherent revision, refuses.
+    code, text = _st_judge(root, ["--rev", bad, *derive], None)
+    check(
+        "RED    --rev <incoherent> refuses (divergent trust-ir reference)",
+        code == 1 and "is not an ancestor of terminal" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 3. The pre-push path judges the revision being PUSHED, not HEAD —
+    #    proven in both directions so it cannot be passing by accident.
+    code, text = _st_judge(root, ["--push-context", *derive], f"refs/heads/main {good} refs/heads/main {bad}")
+    check(
+        "GREEN  --push-context judges the pushed coherent revision",
+        code == 0 and "SUBJECT: push (1 ref update(s))" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+    code, text = _st_judge(root, ["--push-context", *derive], f"refs/heads/main {bad} refs/heads/main {good}")
+    check(
+        "RED    --push-context judges the pushed incoherent revision",
+        code == 1 and "is not an ancestor of terminal" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 4. A deletion publishes no tree, so it must not be judged as one. With
+    #    nothing left to judge, the subject is the terminal state the push
+    #    leaves in place (origin/main) — and this fixture has NO remote-tracking
+    #    main, so it WIDENS to HEAD rather than silently passing on an empty set.
+    code, text = _st_judge(
+        root, ["--push-context", *derive], f"(delete) {'0' * 40} refs/heads/topic {good}"
+    )
+    check(
+        "RED    a delete-only push with no remote-tracking main widens to HEAD, never passes vacuously",
+        code == 1 and "no push in flight" not in text
+        and "refs/remotes/origin/main does not resolve" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 5. UNSET means no push is in flight: widen to HEAD, the historical
+    #    default. HEAD here has no policy, so this is also the fail-closed
+    #    case — and its refusal must carry the fix (v7/D3).
+    code, text = _st_judge(root, ["--push-context", *derive], None)
+    check(
+        f"RED    ${PUSH_REFS_ENV} unset widens to HEAD and says so",
+        code == 1 and f"SUBJECT: HEAD (no push in flight; {PUSH_REFS_ENV} unset)" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+    check(
+        "FIX    a policy that will not resolve names the revision and the options",
+        "exclusion policy" in text
+        and no_policy[:12] in text
+        and "--push-context" in text
+        and "--rev" in text,
+        "the refusal did not carry revision + options",
+    )
+
+    # 6. The gate must not be satisfiable by pointing it at nothing.
+    code, text = _st_judge(root, ["--rev", "refs/heads/does-not-exist", *derive], None)
+    check(
+        "RED    an unresolvable --rev refuses rather than falling back to HEAD",
+        code == 1 and "does not name a commit" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 7. --derive-when-receipt-absent must not be a way to pass: it removes
+    #    the inventory comparison, never the coherence check. Assertion 2
+    #    already carries it; this asserts the receipt-absent REFUSAL is the
+    #    only thing it suppressed.
+    code, text = _st_judge(root, ["--rev", good], None)
+    check(
+        "RED    without --derive-when-receipt-absent, an absent receipt refuses",
+        code == 1 and "constellation receipt" in text and "--derive-when-receipt-absent" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 8. RETIRED HISTORY IS ARCHIVABLE. A sha published where nothing can
+    #    resolve it as the terminal state is not a landing candidate, so it
+    #    is not judged as one — while the coherent main update in the SAME
+    #    push still is. Proven together, because an exemption that also
+    #    stopped judging main would pass this row by disabling the gate.
+    code, text = _st_judge(
+        root,
+        ["--push-context", *derive],
+        f"refs/heads/main {good} refs/heads/main {good}\n"
+        f"{bad} {bad} refs/archive/2026-08-31/retired {'0' * 40}",
+    )
+    check(
+        "GREEN  an archive ref is not judged, while main in the same push IS",
+        code == 0
+        and "not a terminal-state candidate, not judged: refs/archive/" in text
+        and "SUBJECT: push (1 ref update(s))" in text,
+        f"exit {code}: {text.strip().splitlines()[:3]}",
+    )
+
+    # 9. The exemption is scoped to the NAMESPACE, never to the sha: the
+    #    very revision archived above is still refused at refs/heads/main.
+    code, text = _st_judge(
+        root, ["--push-context", *derive], f"{bad} {bad} refs/heads/main {good}"
+    )
+    check(
+        "RED    the same sha pushed to refs/heads/main is still refused",
+        code == 1 and "is not an ancestor of terminal" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # 10. An archive-only push must not pass VACUOUSLY. With every pushed
+    #     ref exempt the subject is the destination's main, and with no
+    #     remote-tracking main it widens to HEAD, exactly as a delete-only
+    #     push does — the fixture's HEAD carries no policy, so it refuses.
+    #     Rows 25-29 judge the same pushes WITH a remote-tracking main.
+    code, text = _st_judge(
+        root,
+        ["--push-context", *derive],
+        f"{bad} {bad} refs/archive/2026-08-31/retired {'0' * 40}",
+    )
+    check(
+        "RED    an archive-ONLY push with no remote-tracking main widens to HEAD, never passes vacuously",
+        code == 1 and "refs/remotes/origin/main does not resolve" in text,
+        f"exit {code}: {text.strip().splitlines()[:3]}",
+    )
+
+    # 11. The allowlist is a PREFIX on the remote ref and nothing looser. A
+    #     branch merely NAMED archive/... lives under refs/heads/ and is an
+    #     ordinary landing candidate; it must still be judged.
+    code, text = _st_judge(
+        root,
+        ["--push-context", *derive],
+        f"{bad} {bad} refs/heads/archive/2026-08-31/retired {'0' * 40}",
+    )
+    check(
+        "RED    a lookalike refs/heads/archive/... branch is judged, not exempt",
+        code == 1 and "is not an ancestor of terminal" in text,
+        f"exit {code}: {text.strip().splitlines()[:2]}",
+    )
+
+    # ---- terminal-policy v3 (P1-P4): each negative refused with its named
+    # ---- message, each admissible shape green.  Numbering continues.
+
+    # 12. RED: no v3 marker at the judged revision (the v1-only commit).  The
+    #     refusal carries the fix, like every other stale-revision refusal.
+    code, text = _st_judge(root, ["--rev", n["pre_v3"], *derive], None)
+    check(
+        "RED    P4 a revision without the v3 marker is refused, with options",
+        code == 1 and "terminal-policy v3 marker" in text and "is missing" in text
+        and "--rev origin/main" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 13. RED: a forged/edited v3 marker names the row that differs.
+    code, text = _st_judge(root, ["--rev", n["forged"], *derive], None)
+    check(
+        "RED    P4 a forged v3 marker is refused naming the differing row",
+        code == 1 and "terminal-policy v3 marker row 6 differs" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 14. RED: an armed v2 marker is refused outright.
+    code, text = _st_judge(root, ["--rev", n["armed"], *derive], None)
+    check(
+        "RED    P4 an armed v2 marker is refused outright",
+        code == 1 and "v2 marker" in text and "ARMED" in text and "refused outright" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 15. RED: trust-wp remote main that does not contain B (W0 itself).
+    remote["main"] = n["w0"]
+    code, text = _st_judge(root, ["--rev", good, *derive], None)
+    remote["main"] = n["wp_main"]
+    check(
+        "RED    P1 a remote main missing the preservation floor B is refused",
+        code == 1 and "does not contain the preservation floor B" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 16. RED: the sampled main is not in the local object store: name the fetch.
+    remote["main"] = "f" * 40
+    code, text = _st_judge(root, ["--rev", good, *derive], None)
+    remote["main"] = n["wp_main"]
+    check(
+        "RED    P1 a remote main absent from the object store names the fetch",
+        code == 1 and "is not present in the bound first-party/trust-wp object store" in text
+        and "git -C first-party/trust-wp fetch origin main" in text
+        # An unreadable store is no finding about the history: no FINDING
+        # line, so the hook can never grade it a red main already has.
+        and "FINDING:" not in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 17. GREEN: a forward move whose lock blob CHANGED is admissible (P2a);
+    #     the bindings inside it are P3's question, and here they still hold.
+    code, text = _st_judge(root, ["--rev", n["relock_forward"], *derive], None)
+    check(
+        "GREEN  P2(a) a forward move with a changed lock is admissible",
+        code == 0 and "1 gitlink move(s) since v1 activation admissible" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 18. GREEN then RED: forward off main, then backward without a restoration.
+    code, text = _st_judge(root, ["--rev", n["off_main"], *derive], None)
+    check(
+        "GREEN  P2(a) a forward move onto an off-main line is admissible",
+        code == 0 and "DEPENDENCY CONSTELLATION OK" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+    code, text = _st_judge(root, ["--rev", n["rolled_back"], *derive], None)
+    check(
+        "RED    P2 a backward move without recovery is refused naming X, Y and the clauses",
+        code == 1
+        and f"X={n['side_two']} -> Y={n['side_one']}" in text
+        and "(a) not forward" in text
+        and "(b) not a canonical re-anchoring: Y is not an ancestor-or-equal" in text
+        and "(c) not a recovered same-lock backward move: no immediate single-parent child" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 19. GREEN: the same backward move, restored by an immediate child (P2c).
+    code, text = _st_judge(root, ["--rev", n["restored"], *derive], None)
+    check(
+        "GREEN  P2(c) a same-lock backward move restored by its immediate child is admissible",
+        code == 0 and "1 by same-lock recovery" in text
+        and "DEPENDENCY CONSTELLATION SAME-LOCK RECOVERY" in text,
+        f"exit {code}: {first_lines(text, 3)}",
+    )
+
+    # 20. RED: a sideways move whose lock differs.
+    code, text = _st_judge(root, ["--rev", n["sideways_relock"], *derive], None)
+    check(
+        "RED    P2 a sideways move with a differing lock is refused on the lock",
+        code == 1 and "(b) not a canonical re-anchoring: spikes/DEPENDS.lock differs" in text
+        and "(c) not a recovered same-lock backward move: spikes/DEPENDS.lock differs" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 21. GREEN: the 8325008ba62 shape -- sideways onto canonical main with the
+    #     lock byte-identical (P2b).
+    code, text = _st_judge(root, ["--rev", n["reanchored"], *derive], None)
+    check(
+        "GREEN  P2(b) a same-lock sideways move onto canonical main is admissible",
+        code == 0 and "2 gitlink move(s) since v1 activation admissible" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 22. RED: a lock row AHEAD of the gitlink it names (P3).
+    code, text = _st_judge(root, ["--rev", n["ahead"], *derive], None)
+    check(
+        "RED    P3 a lock row ahead of its gitlink is refused",
+        code == 1 and "spikes/DEPENDS.lock ay row" in text
+        and "is not an ancestor-or-equal of the first-party/ay gitlink" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 23. RED: an unparseable lock at the pinned trust-wp commit (P3).
+    code, text = _st_judge(root, ["--rev", n["garbage"], *derive], None)
+    check(
+        "RED    P3 an unparseable lock at the pinned trust-wp commit is refused",
+        code == 1 and "trust-wp:spikes/DEPENDS.lock line 1" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 24. The pre-push row on the SAME shapes: the judged revision is the one
+    #     being pushed, for an admissible and a refused move alike.
+    code, text = _st_judge(
+        root, ["--push-context", *derive],
+        f"refs/heads/main {n['reanchored']} refs/heads/main {n['off_main']}",
+    )
+    check(
+        "GREEN  --push-context judges a pushed canonical re-anchoring green",
+        code == 0 and "SUBJECT: push (1 ref update(s))" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+    code, text = _st_judge(
+        root, ["--push-context", *derive],
+        f"refs/heads/main {n['rolled_back']} refs/heads/main {n['off_main']}",
+    )
+    check(
+        "RED    --push-context judges a pushed unrecovered backward move red",
+        code == 1 and "(a) not forward" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # ---- an UNMARKED merge parent (audit_inactive_parent): a restoration of
+    # ---- a binding the commit's own pre-activation ancestry pinned is no
+    # ---- mint; every other new binding is (docs/DECISION_QUEUE.md
+    # ---- CONSTELLATION-RESTORE, 2026-10-24).
+
+    # 30. GREEN: the stash-shaped lineage whose index commit restores W0.
+    code, text = _st_judge(root, ["--rev", n["restore_merge"], *derive], None)
+    check(
+        "GREEN  an inactive lineage RESTORING its own pre-activation binding is no mint",
+        code == 0 and "DEPENDENCY CONSTELLATION OK" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 31. RED: the same shape pinning what only a PARALLEL pre-activation line
+    #     pinned -- the clause reads the commit's own ancestry, not all history.
+    code, text = _st_judge(root, ["--rev", n["parallel_merge"], *derive], None)
+    check(
+        "RED    an inactive lineage pinning only a parallel line's binding mints",
+        code == 1 and "minted a TrustWP gitlink no raw parent published" in text
+        and f"commit={n['parallel_index']}" in text
+        and f"commit_wp={n['side_two']}" in text
+        # A history finding prints its one-line key for the hook (INHERITED-RED).
+        and "FINDING: CONSTELLATION-INVALID Trust terminal-policy inactive merge lineage minted" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 32. RED: the same shape pinning a commit no pre-activation commit pinned.
+    code, text = _st_judge(root, ["--rev", n["fresh_merge"], *derive], None)
+    check(
+        "RED    an inactive lineage pinning an unpublished binding mints",
+        code == 1 and "minted a TrustWP gitlink no raw parent published" in text
+        and f"commit={n['fresh_index']}" in text
+        and f"commit_wp={n['relocked']}" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 38. GREEN: a `git stash -u` lineage whose parentless untracked-files
+    #     commit has no first-party/trust-wp entry: it carries no binding, so
+    #     it mints none (CONSTELLATION-UNBOUND-ROOT, 2026-11-11).
+    code, text = _st_judge(root, ["--rev", n["unbound_root_merge"], *derive], None)
+    check(
+        "GREEN  an inactive parentless commit with no TrustWP entry mints nothing",
+        code == 0 and "DEPENDENCY CONSTELLATION OK" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 39. RED: the same shape whose parentless commit carries a binding nobody
+    #     published: parentless, it has no ancestry to restore from.
+    code, text = _st_judge(root, ["--rev", n["bound_root_merge"], *derive], None)
+    check(
+        "RED    an inactive parentless commit carrying an unpublished binding mints",
+        code == 1 and "minted a TrustWP gitlink no raw parent published" in text
+        and f"commit={n['bound_untracked']}" in text and "parent_wps={}" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 40. RED: an inactive commit WITH a parent that drops the gitlink is
+    #     refused; only a parentless commit may carry no binding.
+    code, text = _st_judge(root, ["--rev", n["dropped_merge"], *derive], None)
+    check(
+        "RED    an inactive commit that drops the TrustWP gitlink is refused",
+        code == 1 and f"inactive child {n['dropped']} is missing committed TrustWP gitlink" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 41. GREEN: the main-history shape, a `git stash -u` taken on the marked
+    #     line: its untracked-files commit is a lone unbound root and needs no
+    #     frontier (CONSTELLATION-UNBOUND-ROOT).
+    code, text = _st_judge(root, ["--rev", n["marked_stash_merge"], *derive], None)
+    check(
+        "GREEN  a marked `git stash -u` commit's unbound untracked parent needs no frontier",
+        code == 0 and "DEPENDENCY CONSTELLATION OK" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 42. RED: the same position with a parentless parent that carries a
+    #     binding: it never rejoins, and it mints.
+    code, text = _st_judge(root, ["--rev", n["bound_marked_stash"], *derive], None)
+    check(
+        "RED    a lone parentless parent carrying a binding never rejoins and mints",
+        code == 1 and "never rejoins pre-activation ancestry" in text
+        and "minted a TrustWP gitlink no raw parent published" in text,
+        f"exit {code}: {first_lines(text)}",
+    )
+
+    # 33. GREEN: trust-wp's remote main moved past this store's last fetch.
+    #     The judgement fetches that commit by sha first and writes no ref
+    #     (PUSH-PATH-CLONE-STATE, 2026-10-24); before, this was row 16's refusal.
+    wp_store = root / SUBMODULES["trust-wp"][0]
+    refs_before = _st_run(wp_store, ["for-each-ref"])
+    absent_before = absent_commits(wp_store, [n["remote_only"]])
+    remote["main"] = n["remote_only"]
+    code, text = _st_judge(root, ["--rev", good, *derive], None)
+    remote["main"] = n["wp_main"]
+    git_dir = Path(_st_run(wp_store, ["rev-parse", "--absolute-git-dir"]))
+    check(
+        "GREEN  P1 a remote main this store never fetched is fetched by sha, writing no ref",
+        absent_before == [n["remote_only"]]
+        and code == 0 and "DEPENDENCY CONSTELLATION OK" in text
+        and f"fetched 1 absent commit(s) by sha" in text
+        and not absent_commits(wp_store, [n["remote_only"]])
+        and _st_run(wp_store, ["for-each-ref"]) == refs_before
+        and not (git_dir / "FETCH_HEAD").exists(),
+        f"exit {code}: {first_lines(text, 3)}",
+    )
+
+    # ---- EVERY history finding, not the first (HistoryFinding,
+    # ---- CONSTELLATION-ALL-FINDINGS, 2026-10-25).  The hook grades a red
+    # ---- INHERITED when the push's keys are all the destination's and the
+    # ---- set says `complete`; so a push that adds a red behind a red main's
+    # ---- must print that red's key, or withhold `complete`.  Until this
+    # ---- change the gate stopped at its first refusal and printed that one
+    # ---- key as the complete set: rows 34, 35 and 37 printed exactly the
+    # ---- destination's key, and row 36 printed it with `complete`.
+
+    def finding_keys(text: str) -> set[str]:
+        return {
+            line[len("FINDING: "):]
+            for line in text.splitlines()
+            if line.startswith("FINDING: ")
+        }
+
+    def says_complete(text: str) -> bool:
+        return "FINDINGS: complete" in text.splitlines()
+
+    dest_code, dest_text = _st_judge(root, ["--rev", n["parallel_merge"], *derive], None)
+    dest_keys = finding_keys(dest_text)
+    check(
+        "RED    a red destination names its one finding, complete",
+        dest_code == 1 and len(dest_keys) == 1 and says_complete(dest_text),
+        f"exit {dest_code}: keys={sorted(dest_keys)}",
+    )
+
+    # 34. A refused P2 move on top of the red destination: the P2 pass runs
+    #     after the merge audit, so it was never reached.
+    code, text = _st_judge(root, ["--rev", n["red_forward"], *derive], None)
+    check(
+        "RED    an admissible move on a red destination adds no key",
+        code == 1 and finding_keys(text) == dest_keys and says_complete(text),
+        f"exit {code}: keys={sorted(finding_keys(text))}",
+    )
+    code, text = _st_judge(root, ["--rev", n["red_plus_move"], *derive], None)
+    added = finding_keys(text) - dest_keys
+    check(
+        "RED    a refused P2 move behind a red destination's finding prints its own key, complete",
+        code == 1 and dest_keys <= finding_keys(text) and says_complete(text)
+        and len(added) == 1
+        and f"v3 refuses the first-party/trust-wp gitlink move at {n['red_plus_move']}"
+        in next(iter(added), ""),
+        f"exit {code}: added={sorted(added)}",
+    )
+
+    # 35. A second, new mint merged on top of the red one, in both sha orders.
+    for tag in ("a", "b"):
+        code, text = _st_judge(root, ["--rev", n[f"red_plus_mint_{tag}"], *derive], None)
+        added = finding_keys(text) - dest_keys
+        check(
+            f"RED    a new mint behind a red destination's mint prints its own key ({tag})",
+            code == 1 and dest_keys <= finding_keys(text) and says_complete(text)
+            and any(
+                f"merge={n[f'red_plus_mint_{tag}']}, commit={n[f'red_mint_index_{tag}']}" in key
+                for key in added
+            ),
+            f"exit {code}: added={sorted(added)}",
+        )
+
+    # 36. A red a LATER check finds (P3, after the policy pass): named, and
+    #     the set is not complete, so it can never be inherited.
+    code, text = _st_judge(root, ["--rev", n["red_plus_p3"], *derive], None)
+    check(
+        "RED    a later check's red behind a red destination's finding withholds complete",
+        code == 1 and "spikes/DEPENDS.lock ay row" in text
+        and finding_keys(text) == dest_keys and not says_complete(text),
+        f"exit {code}: {first_lines(text, 4)}",
+    )
+
+    # 37. A two-ref push whose first ref carries the red destination's finding:
+    #     the second ref is judged too, and its own red is keyed.
+    code, text = _st_judge(
+        root, ["--push-context", *derive],
+        f"refs/heads/main {n['parallel_merge']} refs/heads/main {good}\n"
+        f"refs/heads/topic {n['sideways_relock']} refs/heads/topic {'0' * 40}",
+    )
+    added = finding_keys(text) - dest_keys
+    check(
+        "RED    a multi-ref push judges every ref past the first one's red, complete",
+        code == 1 and "SUBJECT: push (2 ref update(s))" in text
+        and dest_keys <= finding_keys(text) and says_complete(text)
+        and any(f"gitlink move at {n['sideways_relock']}" in key for key in added),
+        f"exit {code}: added={sorted(added)}",
+    )
+
+    # ---- a push that publishes NO terminal-state candidate (archive-only,
+    # ---- delete-only) is judged on the terminal state it leaves in place,
+    # ---- the destination's main — never on this clone's HEAD, never on nothing.
+    #
+    # The clone sits on the retired pre-v3 commit (the checked-out branch being
+    # archived), which the lane refuses on its own; the destination's main is
+    # coherent.  Before 2026-09-27 rows 25 and 26 refused on that HEAD.
+    zero = "0" * 40
+    pre_v3 = n["pre_v3"]
+    _st_run(root, ["remote", "add", "origin", "/nonexistent/trust.git"])
+    _st_run(root, ["remote", "add", "canon", "https://example.invalid/canon/trust.git"])
+    _st_run(root, ["update-ref", "refs/remotes/origin/main", good])
+    _st_run(root, ["checkout", "-q", "--detach", pre_v3])
+    try:
+        archive_head = f"HEAD {pre_v3} refs/archive/2026-09-27/retired {zero}"
+        delete_topic = f"(delete) {zero} refs/heads/topic {good}"
+
+        # 25. GREEN: archiving the checked-out retired branch.
+        code, text = _st_judge(root, ["--push-context", *derive], archive_head)
+        check(
+            "GREEN  an archive-only push of a retired HEAD is judged on origin/main, not HEAD",
+            code == 0
+            and "not a terminal-state candidate, not judged: refs/archive/" in text
+            and f"SUBJECT: origin/main [{good[:12]}]" in text
+            and "DEPENDENCY CONSTELLATION OK" in text,
+            f"exit {code}: {first_lines(text, 3)}",
+        )
+
+        # 26. GREEN: deleting a remote branch from a clone on a stale commit.
+        code, text = _st_judge(root, ["--push-context", *derive], delete_topic)
+        check(
+            "GREEN  a delete-only push from a stale HEAD is judged on origin/main, not HEAD",
+            code == 0 and f"SUBJECT: origin/main [{good[:12]}]" in text,
+            f"exit {code}: {first_lines(text, 3)}",
+        )
+
+        # 27. RED: deleting main itself. The remote-tracking main will not
+        #     survive the push, so it is not what gets judged: HEAD is.
+        code, text = _st_judge(
+            root, ["--push-context", *derive], f"(delete) {zero} refs/heads/main {good}"
+        )
+        check(
+            "RED    a push that DELETES main never judges the deleted main; it widens to HEAD",
+            code == 1 and "DELETES refs/heads/main" in text
+            and "SUBJECT: origin/main" not in text
+            and "terminal-policy v3 marker" in text,
+            f"exit {code}: {first_lines(text, 3)}",
+        )
+
+        # 28. The destination is recovered from the URL the hook exports (git's
+        #     second pre-push argument), never assumed: with `canon` coherent
+        #     and origin incoherent, the URL of `canon` judges canon/main, and
+        #     a URL no remote carries falls back to origin — and refuses.
+        _st_run(root, ["update-ref", "refs/remotes/canon/main", good])
+        _st_run(root, ["update-ref", "refs/remotes/origin/main", bad])
+        code, text = _st_judge(
+            root, ["--push-context", *derive], archive_head,
+            "https://example.invalid/canon/trust.git",
+        )
+        check(
+            "GREEN  TRUST_PUSH_REMOTE as a URL resolves to its remote name (canon/main judged)",
+            code == 0 and f"SUBJECT: canon/main [{good[:12]}]" in text
+            and "is the URL of remote 'canon'" in text,
+            f"exit {code}: {first_lines(text, 3)}",
+        )
+        code, text = _st_judge(
+            root, ["--push-context", *derive], archive_head, "https://example.invalid/other.git",
+        )
+        check(
+            "RED    an unmatched TRUST_PUSH_REMOTE falls back to origin/main and judges it",
+            code == 1 and f"SUBJECT: origin/main [{bad[:12]}]" in text
+            and "matches no configured remote" in text
+            and "is not an ancestor of terminal" in text,
+            f"exit {code}: {first_lines(text, 3)}",
+        )
+
+        # 29. RED: the same archive-only and delete-only pushes, with the
+        #     destination's main itself incoherent, still refuse — the reading
+        #     moved off HEAD, never onto nothing.
+        for label, pushed in (("archive-only", archive_head), ("delete-only", delete_topic)):
+            code, text = _st_judge(root, ["--push-context", *derive], pushed)
+            check(
+                f"RED    the {label} push still refuses when its destination main is incoherent",
+                code == 1 and f"SUBJECT: origin/main [{bad[:12]}]" in text
+                and "is not an ancestor of terminal" in text,
+                f"exit {code}: {first_lines(text, 3)}",
+            )
+    finally:
+        _st_run(root, ["checkout", "-q", "main"])
+        _st_run(root, ["update-ref", "-d", "refs/remotes/origin/main"])
+        _st_run(root, ["update-ref", "-d", "refs/remotes/canon/main"])
+        _st_run(root, ["remote", "remove", "canon"])
+        _st_run(root, ["remote", "remove", "origin"])
+
+
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -5464,20 +5976,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     generation.add_argument(
         "--print-receipt",
         action="store_true",
-        help=(
-            "render untracked v3 evidence from committed, clean HEAD; any WP "
-            "gitlink move after the immutable policy marker automatically enables "
-            "terminal/remote mode"
-        ),
+        help="render untracked v3 evidence from committed, clean HEAD",
     )
     generation.add_argument(
         "--write-receipt",
         action="store_true",
-        help=(
-            "atomically write untracked v3 evidence from committed, clean HEAD "
-            "with the same marker-persistent terminal/remote upgrade as "
-            "--print-receipt"
-        ),
+        help="atomically write untracked v3 evidence from committed, clean HEAD",
     )
     parser.add_argument(
         "--external-receipt-path",
@@ -5493,15 +5997,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--verify-remote",
         action="store_true",
         help="also require Trust and every terminal dependency to equal canonical remote main (networked, non-mutating)",
-    )
-    parser.add_argument(
-        "--require-wp-trust-anchor",
-        action="store_true",
-        help=(
-            "terminal R1 mode: authenticate W1:spikes/DEPENDS.lock's Trust anchor "
-            "and require R1 to be its direct WP-gitlink-only child; requires "
-            "--verify-remote"
-        ),
     )
     revision = parser.add_mutually_exclusive_group()
     revision.add_argument(
@@ -5536,6 +6031,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.selftest:
         return selftest()
+    # Every judged revision's history findings, in the order found; each is
+    # one FINDING key (HistoryFinding).
+    findings: list[str] = []
+    complete = True
     try:
         repo_root = Path(
             run_git(args.repo_root, ["rev-parse", "--show-toplevel"])
@@ -5545,26 +6044,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (args.print_receipt or args.write_receipt) and args.print_observed:
             fail("--print-observed cannot be combined with receipt generation")
         generating = args.print_receipt or args.write_receipt
-        if args.require_wp_trust_anchor and not generating:
-            fail("--require-wp-trust-anchor requires --print-receipt or --write-receipt")
-        if args.require_wp_trust_anchor and not args.verify_remote:
-            fail(
-                "--require-wp-trust-anchor also requires --verify-remote so R1 and W1 "
-                "are authenticated as canonical remote main"
-            )
         sources = select_sources(repo_root, args)
         if generating and len(sources) > 1:
             fail("external receipt generation judges one revision; a multi-ref push names several")
         for source, label in sources:
-            judge_source(repo_root, args, source, label)
+            # Every revision is judged to its end, whatever an earlier one
+            # found: a multi-ref push's later ref is never hidden behind the
+            # first one's red.
+            if not judge_source(repo_root, args, source, label, findings):
+                complete = False
     except (AnchorError, OSError, UnicodeDecodeError) as error:
         print("DEPENDENCY CONSTELLATION FAILED:", file=sys.stderr)
+        for message in findings:
+            print(f"  - CONSTELLATION-INVALID  {message}", file=sys.stderr)
         print(f"  - CONSTELLATION-INVALID  {error}", file=sys.stderr)
+        # Any other refusal is unkeyed: the findings are named, but the set is
+        # not complete, so the hook can never grade this red INHERITED.
+        print_finding_keys(findings, complete=False)
         # v7/D3: the refusal carries its own fix options when it has them.
         for line in getattr(error, "options", ()):
             print(f"    {line}", file=sys.stderr)
         return 1
+    if findings:
+        print("DEPENDENCY CONSTELLATION FAILED:", file=sys.stderr)
+        for message in findings:
+            print(f"  - CONSTELLATION-INVALID  {message}", file=sys.stderr)
+        print_finding_keys(findings, complete=complete)
+        return 1
     return 0
+
+
+def print_finding_keys(findings: Sequence[str], *, complete: bool) -> None:
+    """The stable keys the pre-push hook compares with the destination's.
+
+    One line per history finding, whatever its message holds.  ``FINDINGS:
+    complete`` follows only when every check of every judged revision ran to
+    its end and nothing else refused (HistoryFinding): the hook grades a red
+    INHERITED only from a complete set (scripts/hooks/pre-push INHERITED-RED).
+    """
+    for message in findings:
+        print(f"FINDING: CONSTELLATION-INVALID {finding_key(message)}", file=sys.stderr)
+    if findings and complete:
+        print("FINDINGS: complete", file=sys.stderr)
 
 
 if __name__ == "__main__":

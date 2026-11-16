@@ -63,7 +63,7 @@ fn iter_callee(func: &VerifiableFunction) -> String {
 /// source takes the second road — which is exactly the row the shipped compiler
 /// reported for the control run and did NOT report for the exploit run.
 fn unbounded_alloc_vc_count(func: &VerifiableFunction) -> usize {
-    generate_unbounded_allocation_vcs(func)
+    generate_unbounded_allocation_vcs_on_64_bit(func)
         .iter()
         .filter(|vc| match &vc.kind {
             VcKind::UnsupportedMir { kind, .. } => kind.contains("UnboundedAllocation"),

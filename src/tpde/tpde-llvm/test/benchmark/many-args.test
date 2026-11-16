@@ -1,0 +1,19 @@
+# NOTE: Do not autogenerate
+# SPDX-FileCopyrightText: 2025 Contributors to TPDE <https://tpde.org>
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# RUN: python3 %s 8000 | tpde-llc --target=x86_64 | %objdump | FileCheck %s
+# RUN: python3 %s 8000 | tpde-llc --target=aarch64 | %objdump | FileCheck %s
+
+# Test for a function with many used arguments.
+
+# CHECK: <f>:
+
+import sys
+
+n = int(sys.argv[1])
+print(f"define i32 @f(i32 %s0{', i32 ' * n}) {{")
+for i in range(n):
+    print(f"  %s{i + 1} = add i32 %s{i}, %{i}")
+print(f'  ret i32 %s{n}')
+print('}')

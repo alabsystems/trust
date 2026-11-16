@@ -1,4 +1,4 @@
-// ignore-tidy-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
+// ignore-tidy-file-filelength -- pre-existing size, recorded 2026-08-21; do not grow casually
 // targo trust: Cargo subcommand for Trust verification
 //
 // Usage:
@@ -24,19 +24,40 @@ use std::{env, fs};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+// The committed obligation baseline and `targo trust diff --baseline` (T9).
+mod agent_delta;
+mod audit_comparison;
+mod baseline;
 mod benchmark_cli;
 mod bounded_process;
-mod cache_cli;
+#[cfg(unix)]
+mod native_metadata_root;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod native_root_transport;
+#[cfg(unix)]
+mod native_dependency_root;
+#[cfg(unix)]
+mod native_workload_root;
 mod cargo_cache_materialization_cli;
 mod cli;
+mod verifier_input_export;
+mod compiler_memory;
+mod compiler_admission;
 mod config;
 mod controlled_git;
+// The daily-driver corpora under two compilers: `targo trust gate corpus-delta`.
+mod corpus_delta;
 mod dep_evidence;
 mod dep_tcb;
-mod diff;
+// Determinism accounting (docs/design/2026-09-29-incremental-deterministic-
+// trust-results.md §3.6-§3.7): the budget profile a run used, each published
+// row's stop cause, the unit outcome and the verdict vector.
+mod determinism_report;
 mod diff_git;
 mod diff_report;
 mod doctor;
+mod probe_scheduler;
+mod tool_identity;
 mod durable_io;
 mod examples_cli;
 mod exploit_find;
@@ -46,24 +67,39 @@ mod hardened_lab;
 mod init;
 mod input_limits;
 mod intent;
+mod lean_build;
 mod lean_cli;
+mod meter;
+mod obligations;
+mod package_record;
+mod paired_qualification;
 mod pipeline;
+mod process_lifecycle;
 mod project_root;
 mod proof_concurrency;
 mod proof_concurrency_producer;
 mod release_cli;
+mod repo_cli;
 mod report;
 mod report_query;
 mod rewrite_loop;
 mod rust_vs_trust;
+mod saved_report;
 mod script_cli;
+// The cut's typed consumer comparison: `targo trust gate compare-seal`.
+mod seal_comparison;
 mod self_improve;
 mod self_verify_cli;
+#[cfg(unix)]
+mod smoke_socket_root;
 mod solver_detect;
 mod source_analysis;
 mod spec_cli;
+mod stability;
 mod stage2_tools;
+mod store_cli;
 mod temporal_cli;
+mod test_target_panics;
 mod trust_added;
 mod types;
 mod verify_binary_evidence;
@@ -77,9 +113,11 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_binary_unchecked_tests;
 
 use cli::{SubcommandArgs, parse_subcommand_args, print_usage, print_usage_stdout};
-use config::{DEFAULT_CODEGEN_BACKEND, DEFAULT_TRUST_PROFILE, TrustConfig};
+use config::{DEFAULT_CODEGEN_BACKEND, TrustConfig};
 // tests.rs uses `super::DoctorReport` etc. These are pulled in here so
 // the `super::` spelling resolves in test scope; under cargo check the
 // compiler doesn't see tests.rs as a direct consumer (it sees them via
@@ -194,10 +232,20 @@ impl BinarySolverRoute {
 
 fn version_text() -> String {
     format!(
-        "targo-trust {version}\ntrust.identity=targo trust\ntrust.command=targo trust\ntrust.package=targo-trust\ntrust.source_package={source_package}\ntrust.version={version}\ntrust-repo-commit-hash: {trust_repo_commit_hash}\n",
+        "targo-trust {version}\ntrust.identity=targo trust\ntrust.command=targo trust\ntrust.package=targo-trust\ntrust.source_package={source_package}\ntrust.version={version}\ntrust-repo-commit-hash: {trust_repo_commit_hash}\ntrust-oracle-compiler-commit-hash: {oracle_compiler_hash}\ntrust-oracle-compiler-release: {oracle_compiler_release}\n",
         source_package = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         trust_repo_commit_hash = embedded_trust_repo_commit_hash(option_env!("CFG_VER_HASH")),
+        oracle_compiler_hash = match tool_identity::oracle_compiler_hash() {
+            Ok(Some(hash)) => hash,
+            Ok(None) => UNBOUND_TRUST_REPO_COMMIT,
+            Err(_) => "invalid",
+        },
+        oracle_compiler_release = match tool_identity::oracle_compiler_release() {
+            Ok(Some(release)) => release,
+            Ok(None) => UNBOUND_TRUST_REPO_COMMIT,
+            Err(_) => "invalid",
+        },
     )
 }
 
@@ -251,7 +299,31 @@ fn clamp_umask_for_verified_artifacts() {
 fn clamp_umask_for_verified_artifacts() {}
 
 fn main() -> ExitCode {
+    // SAFETY: FIRST native entry, before oracle binding, descriptors or workers.
+    if let Err(error) = unsafe { probe_scheduler::capture_at_entry() } {
+        eprintln!("targo trust: inherited compiler probe custody unavailable: {error}");
+        return ExitCode::from(75);
+    }
     clamp_umask_for_verified_artifacts();
+    // Tool source and a retained compiler are separately stamped at build time.
+    // Ordinary builds keep the same-source binding. Clean's exact admission
+    // remains unchanged and cannot be redirected by runtime environment.
+    let oracle_compiler_hash = match tool_identity::oracle_compiler_hash() {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("targo trust: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = tool_identity::retained_daemon_build() {
+        eprintln!("targo trust: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = clean_elab::oracle_compiler::bind_host_toolchain(oracle_compiler_hash) {
+        eprintln!("targo trust: {error}");
+        return ExitCode::FAILURE;
+    }
+    process_lifecycle::start();
 
     // Trust: Windows' main-thread stack (~1 MB) is far smaller than Unix's
     // (~8 MB default), so the deeply-recursive verifier / proof-report processing
@@ -263,13 +335,35 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(512 * 1024 * 1024);
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("targo-trust-main".to_string())
         .stack_size(stack_size)
         .spawn(run_main)
-        .expect("failed to spawn targo-trust main worker thread")
-        .join()
-        .unwrap_or(ExitCode::FAILURE)
+        .expect("failed to spawn targo-trust main worker thread");
+    let code = worker.join().unwrap_or(ExitCode::FAILURE);
+    drain_audit_ledger();
+    // `finish` here, not on the worker, so a worker that panicked in a stop holds too.
+    process_lifecycle::signals::finish(code)
+}
+
+/// T3 L4 (C06a): with `TRUST_ELIDE_AUDIT` set, write the entries this process recorded
+/// (its CAP hits and noted stops; targo opens no body scope, so all are crate-level) to
+/// `<dir>/elide-audit-targo-<pid>.tsv`, beside the compilers' files. Measurement only.
+fn drain_audit_ledger() {
+    let rows: Vec<String> = trust_types::audit_ledger::take_crate_level()
+        .iter()
+        .map(|entry| {
+            trust_types::audit_ledger::row_line(
+                entry.kind(),
+                &["targo", "-", "-", "crate"],
+                &entry.columns(),
+            )
+        })
+        .collect();
+    trust_types::audit_ledger::append_rows(
+        &format!("elide-audit-targo-{}.tsv", std::process::id()),
+        &rows,
+    );
 }
 
 fn run_main() -> ExitCode {
@@ -298,18 +392,24 @@ fn run_main() -> ExitCode {
         Some("check") if lean_cli::selects_lean_lane(&args[start + 1..]) => {
             lean_cli::run_check(&args[start + 1..])
         }
-        Some("check") => run_subcommand(Subcommand::Check, &args[start + 1..]),
+        Some("check") => {
+            // TRUST-26: the Kani/Creusot zero-authority disclosures run after
+            // `check` exactly as after `build` — one shared call, so the two
+            // verbs cannot disagree about what a green run covered.
+            let check_result = run_subcommand(Subcommand::Check, &args[start + 1..]);
+            pipeline::disclose_zero_authority_ingestion_lanes(
+                pipeline::CompileVerb::Check,
+                check_result,
+                &args[start + 1..],
+            )
+        }
         Some("test") => run_subcommand(Subcommand::Test, &args[start + 1..]),
-        // Compiling Clean to an artifact is the `clean compile` leg, which
-        // judges nothing; routing it through `build` would let a caller read a
-        // successful compile as a discharged proof. Point at the lane that
-        // actually checks instead of guessing.
+        // The explicit standalone IR-library artifact carries checked source
+        // snapshots and bounded carrier-faithful bodies. It is not an
+        // executable or release proof; the Lean dispatcher refuses unsupported
+        // output modes and computational declarations without a body gate.
         Some("build") if lean_cli::selects_lean_lane(&args[start + 1..]) => {
-            eprintln!(
-                "targo trust build: a Clean/Lean operand has no build lane — `targo trust check \
-                 <file.lean>` kernel-checks it"
-            );
-            ExitCode::from(2)
+            lean_build::run(&args[start + 1..])
         }
         Some("build") => {
             // Compile first, then apply the post-build evidence boundaries.
@@ -323,14 +423,17 @@ fn run_main() -> ExitCode {
             // opt-in is rejected with an explicit unbound-evidence setup
             // error; Kani and Creusot opt-ins DISCLOSE and proceed (v5 §3.2
             // zero-authority ingestion lanes — the Creusot disclosure names
-            // the tippy reader as the migration path). A package with no
-            // active temporal engine edge, Kani dependency, or
-            // Creusot-family dependency is a no-op pass-through. See
-            // temporal_cli::gate_build, pipeline::kani_gate::gate_build, and
-            // pipeline::creusot_gate::gate_build.
+            // the tippy reader as the migration path), through the same
+            // shared call the `check` arm makes. A package with no active
+            // temporal engine edge, Kani dependency, or Creusot-family
+            // dependency is a no-op pass-through. See temporal_cli::gate_build
+            // and pipeline::disclose_zero_authority_ingestion_lanes.
             let build_result = temporal_cli::gate_build(build_result, &args[start + 1..]);
-            let build_result = pipeline::kani_gate::gate_build(build_result, &args[start + 1..]);
-            pipeline::creusot_gate::gate_build(build_result, &args[start + 1..])
+            pipeline::disclose_zero_authority_ingestion_lanes(
+                pipeline::CompileVerb::Build,
+                build_result,
+                &args[start + 1..],
+            )
         }
         // `kani` is NOT a rename, so this arm deliberately names no replacement
         // subcommand: the Route-2 shim was deleted outright (R2 deletion D-A)
@@ -352,9 +455,9 @@ fn run_main() -> ExitCode {
                 "targo trust: `kani` has been removed (R2 deletion D-A) and has no replacement \
                  subcommand; harnesses are written with the native `#[kani::harness]` attribute, \
                  and a package that declares a `kani` dependency is DISCLOSED — not rejected — \
-                 by the post-build boundary in `targo trust build`, because Kani is a \
-                 zero-authority ingestion lane (two-language design v5 §3.2). Use `targo trust \
-                 check` for the verdicts Trust actually stands behind."
+                 by the post-compile boundary in `targo trust check` and `targo trust build`, \
+                 because Kani is a zero-authority ingestion lane (two-language design v5 §3.2). \
+                 Use `targo trust check` for the verdicts Trust actually stands behind."
             );
             ExitCode::from(2)
         }
@@ -368,6 +471,15 @@ fn run_main() -> ExitCode {
         Some("examples") => examples_cli::run_examples_subcommand(&args[start + 1..]),
         Some("self-improve") => self_improve::run_self_improve_subcommand(&args[start + 1..]),
         Some("deps") => script_cli::run_deps_subcommand(&args[start + 1..]),
+        // The cut's consumer check is routed here, beside script_cli's gate
+        // table and not in it: that file is a pinned land-escape audit subject.
+        Some("gate") if args.get(start + 1).map(String::as_str) == Some("compare-seal") => {
+            seal_comparison::run_subcommand(&args[start + 2..])
+        }
+        // The corpus delta, routed beside the gate table for the same reason.
+        Some("gate") if args.get(start + 1).map(String::as_str) == Some("corpus-delta") => {
+            corpus_delta::run_subcommand(&args[start + 2..])
+        }
         Some("gate") => script_cli::run_gate_subcommand(&args[start + 1..]),
         Some("falsify") => script_cli::run_falsify_subcommand(&args[start + 1..]),
         Some("survey") => script_cli::run_survey_subcommand(&args[start + 1..]),
@@ -407,13 +519,23 @@ fn run_main() -> ExitCode {
         Some("report") => run_subcommand(Subcommand::Report, &args[start + 1..]),
         Some("loop") => run_subcommand(Subcommand::Loop, &args[start + 1..]),
         Some("diff") => run_subcommand(Subcommand::Diff, &args[start + 1..]),
+        // The determinism instrument (plan §3.8, T4.7): legs of `check`
+        // under pairs of conditions, compared by their records.
+        Some("stability") => stability::run_subcommand(&args[start + 1..]),
+        // The edit-loop scoreboard (plan step 1): where an agent's time went,
+        // read from the timing records the toolchain already writes.
+        Some("meter") => meter::run_subcommand(&args[start + 1..]),
+        // Live-edit-loop step 2 (DELTA): the rows that changed since a
+        // snapshot token, read from the records a check already wrote.
+        Some("delta") => agent_delta::run_subcommand(&args[start + 1..]),
         Some("init") => run_init_subcommand(&args[start + 1..]),
         Some("temporal") => temporal_cli::run_temporal_subcommand(&args[start + 1..]),
         Some("solvers") => run_subcommand(Subcommand::Solvers, &args[start + 1..]),
         Some("doctor") => run_doctor_subcommand(&args[start + 1..]),
+        // TG6: STORE-1's explicit re-check of the local kernel fact store.
+        Some("store") => store_cli::run_store_subcommand(&args[start + 1..]),
         Some("reflect-clean") => run_reflect_clean_subcommand(&args[start + 1..]),
         Some("prove") => run_prove_subcommand(&args[start + 1..]),
-        Some("cache") => cache_cli::dispatch(&args[start + 1..]),
         Some("proof-cert") => dep_evidence::run_subcommand(&args[start + 1..]),
         Some("help") | Some("--help") | None => {
             print_usage_stdout();
@@ -615,7 +737,12 @@ fn parse_proof_dump_coverage(stderr: &str) -> ProofDumpCoverage {
 /// bounded RELATIVE TO the trusted MirSem model + trusted rustc front-end reflection,
 /// over the straight-line-scalar + single-branch fragment — alongside the
 /// verification-DEPTH headline (FULLY-FAITHFUL rate), never an unconditional
-/// "all of Trust proven". Produce dumps with the tracked
+/// "all of Trust proven". `--budget-secs` (default 30) is the wall-clock
+/// budget of EACH dumped function, and each step of the Lean↔Clean bridge gate
+/// gets `trust_clean::trustir_bridge::BRIDGE_STEP_BUDGET_SCALE` times it; a
+/// unit that spends its budget earns no credit (a declined function, or an
+/// `incomplete` scorecard when a gate step times out). Produce dumps with the
+/// tracked
 /// `-Ztrust-dump=mir-only:<dir>` compiler option during a
 /// nonfatal Trust build. See
 /// docs/TRUST-BASE-AND-SCOPE.md (TCB + scope) and
@@ -842,6 +969,11 @@ fn run_prove_subcommand(args: &[String]) -> ExitCode {
     // clear every real body's true single-invocation runtime while still catching
     // genuine non-termination. `--budget-secs` is explicit, validated, and
     // recorded in the command line; ambient environment cannot change proof work.
+    // The same budget, scaled by the gate's calibrated
+    // `BRIDGE_STEP_BUDGET_SCALE`, bounds each step of the Lean↔Clean bridge gate
+    // below: a budget that covered only the functions left the gate — the bulk
+    // of the work on a small corpus — unbounded (`--budget-secs=1` over one
+    // function waited more than 8 minutes on it in a debug build).
     let mut sc = match prove_dump_dir_with_budget(&dir, budget_secs) {
         Ok(s) => s,
         Err(e) => {
@@ -869,12 +1001,23 @@ fn run_prove_subcommand(args: &[String]) -> ExitCode {
     // backed by a live run, not a stale citation. All 18 arms plus the composed
     // conjunction are always checked. FAIL-CLOSED: a gate failure is
     // reported loudly below and sc.bridge_agreement stays None (bridge_line then
-    // states "not run — no claim"); it never silently passes.
-    let bridge_gate_error = sc.attach_bridge_agreement().err().map(|e| e.to_string());
+    // states "not run — no claim"); it never silently passes. Each gate step is
+    // bounded by `bridge_step_budget_secs(--budget-secs)`; a step that spends it
+    // is a TIMEOUT — the gate is INCOMPLETE (unknown), which withholds the claim
+    // exactly as a refusal does but is reported as what it is, never as a
+    // rejection or a pass.
+    let bridge_gate = sc.attach_bridge_agreement_with_budget(budget_secs).err();
+    let bridge_gate_incomplete =
+        bridge_gate.as_ref().is_some_and(trust_clean::BridgeGateError::is_incomplete);
+    let bridge_gate_error = bridge_gate.map(|e| e.to_string());
 
     if parsed.json {
-        let status = if sc.kernel_rejected == 0 && bridge_gate_error.is_none() {
+        let status = if sc.kernel_rejected > 0 {
+            "rejected"
+        } else if bridge_gate_error.is_none() {
             "measured"
+        } else if bridge_gate_incomplete {
+            "incomplete"
         } else {
             "rejected"
         };
@@ -883,6 +1026,7 @@ fn run_prove_subcommand(args: &[String]) -> ExitCode {
             "status": status,
             "claim_boundary": "Coverage measurement over the declared dump population; incomplete, declined, SMT-only, or unsupported work receives no proof credit.",
             "budget_secs_per_function": budget_secs,
+            "bridge_gate_budget_secs_per_step": trust_clean::bridge_step_budget_secs(budget_secs),
             "scorecard": &sc,
             "bridge_gate_error": bridge_gate_error.as_deref(),
         });
@@ -945,7 +1089,15 @@ fn run_prove_subcommand(args: &[String]) -> ExitCode {
         // with forms, side conditions, and fail-closed controls stated plainly.
         println!("  {}", sc.bridge_line());
         if let Some(err) = &bridge_gate_error {
-            eprintln!("  ✗ Lean↔Clean bridge gate FAILED CLOSED (no agreement is claimed): {err}");
+            if bridge_gate_incomplete {
+                eprintln!(
+                    "  ⏱ Lean↔Clean bridge gate INCOMPLETE (unknown — no agreement is claimed): {err}"
+                );
+            } else {
+                eprintln!(
+                    "  ✗ Lean↔Clean bridge gate FAILED CLOSED (no agreement is claimed): {err}"
+                );
+            }
         }
         // The faithfulness META-THEOREM (goal #4 capstone): the checked-by-construction MirSem
         // refinement — the Clean denotation is kernel-proven (by induction) to equal the MIR
@@ -974,7 +1126,8 @@ fn run_prove_subcommand(args: &[String]) -> ExitCode {
     if bridge_gate_error.is_some() {
         // The bridge is default-on and is part of the proof claim printed
         // above. Reporting its failure while returning success made the
-        // documented fail-closed gate advisory in practice.
+        // documented fail-closed gate advisory in practice. An INCOMPLETE
+        // (timed-out) gate fails the command too: nothing was established.
         return ExitCode::FAILURE;
     }
     // `--require-axioms=N` is the full §6 gate. This producer establishes an
@@ -6864,16 +7017,7 @@ fn produce_convert_checked_certificate_artifacts_for_decompilation(
         );
         request.replay_transcript_digest = candidate.replay_transcript_digest.as_deref();
         match produce_checked_certificate_artifact(&checker, request, export_dir) {
-            Ok(artifact_ref) => match accept_convert_checked_certificate_production_artifact(
-                export_dir,
-                candidate,
-                &export,
-                artifact_ref,
-                runner,
-                &proof_export_artifact_ref.metadata_path,
-                &proof_export_artifact_ref.proof_path,
-                &source_backpropagation_gate,
-            ) {
+            Ok(artifact_ref) => match accept_convert_checked_certificate_production_artifact(ConvertCertificateAcceptanceInput { export_dir, candidate, export: &export, artifact_ref, runner, proof_export_metadata_path: &proof_export_artifact_ref.metadata_path, proof_export_payload_path: &proof_export_artifact_ref.proof_path, source_backpropagation_gate: &source_backpropagation_gate }) {
                 Ok(success) => {
                     artifact_paths.push(success.artifact_path);
                     manifest.add_certificate(success.manifest_entry);
@@ -6946,16 +7090,19 @@ fn produce_convert_checked_certificate_artifacts_for_decompilation(
     ProducedCheckedCertificateArtifacts { report, artifact_paths }
 }
 
-fn accept_convert_checked_certificate_production_artifact(
-    export_dir: &Path,
-    candidate: &ConvertProofExportCandidate,
-    export: &SolverProofExport,
+struct ConvertCertificateAcceptanceInput<'a> {
+    export_dir: &'a Path,
+    candidate: &'a ConvertProofExportCandidate,
+    export: &'a SolverProofExport,
     artifact_ref: trust_proof_cert::CheckedBinaryCertificateArtifactRef,
-    runner: &CheckedBinaryCertificateExternalCheckerRunner,
-    proof_export_metadata_path: &Path,
-    proof_export_payload_path: &Path,
-    source_backpropagation_gate: &CheckedBinaryCertificateSourceBackpropagationGate,
-) -> Result<ConvertCheckedCertificateProductionSuccess, ConvertCheckedCertificateBlockerRecord> {
+    runner: &'a CheckedBinaryCertificateExternalCheckerRunner,
+    proof_export_metadata_path: &'a Path,
+    proof_export_payload_path: &'a Path,
+    source_backpropagation_gate: &'a CheckedBinaryCertificateSourceBackpropagationGate,
+}
+
+fn accept_convert_checked_certificate_production_artifact(input: ConvertCertificateAcceptanceInput<'_>) -> Result<ConvertCheckedCertificateProductionSuccess, ConvertCheckedCertificateBlockerRecord> {
+    let ConvertCertificateAcceptanceInput { export_dir, candidate, export, artifact_ref, runner, proof_export_metadata_path, proof_export_payload_path, source_backpropagation_gate } = input;
     let artifact = load_checked_certificate_artifact_ref(&artifact_ref).map_err(|error| {
         convert_checked_certificate_production_blocker(
             "checked-certificate-artifact-readback-failed",
@@ -9029,7 +9176,17 @@ fn binary_vc_router_with_memory_limit(
     let ceiling_mb = per_job_solver_memory_ceiling_mb(explicit_limit);
     match solver_route {
         BinarySolverRoute::AYIncremental => {
-            let session = IncrementalAYSession::new().with_memory_limit_mb(ceiling_mb);
+            // The `ay` shipped beside this targo-trust, never whichever `ay`
+            // PATH offers. Without one, every binary VC is Unknown, naming the
+            // path it could not spawn. (trustc spawns no `ay` since plan P4 /
+            // T4.1: it links its own. This route is the last subprocess one,
+            // until T3's C20.)
+            let solver = trust_router::ay_discovery::ay_beside_current_exe().map_or_else(
+                || "<targo-trust's own directory is unknown>/ay".to_string(),
+                |ay| ay.to_string_lossy().into_owned(),
+            );
+            let session =
+                IncrementalAYSession::with_solver_path(solver).with_memory_limit_mb(ceiling_mb);
             Router::with_backends(vec![Box::new(session)])
                 .with_memory_guard(MemoryGuard::new(ceiling_mb))
         }
@@ -9733,7 +9890,22 @@ fn solver_result_fields(
     result: &trust_types::VerificationResult,
     replay_attempt: Option<BinaryReplayAttempt<'_>>,
 ) -> BinarySolverResultFields {
-    match result {
+    // Trust (TRUST-02): the un-forgeable-Proved gate, applied at this report
+    // chokepoint exactly as trust-router's `raw_result_to_outcome` and
+    // trust-report's `result_to_outcome` apply it. The only route here
+    // (`binary_vc_router`) is the subprocess `IncrementalAYSession`, which sends
+    // no `:produce-proofs`, so every `unsat` it returns — push/pop delta,
+    // per-process fallback, or nonlinear relaxation — is
+    // `ProofStrength::smt_unsat_unvalidated()` (`AssuranceLevel::Unchecked`).
+    // Reading that label as `proved` put `verification status: proved` and exit
+    // 0 on an unvalidated solver answer, on the push/pop lane where the ay
+    // split-loop false `unsat` (fixed by ay bd8c45923) lived. Below the named
+    // reporting floor it is reported `unknown`, carrying the gate's reason. The dispatch record
+    // is built from the RAW result (`binary_solver_dispatch_record`), so the
+    // solver's answer stays in the proof evidence (status `Unsat`), which is
+    // what a checked certificate binds to.
+    let gated = result.clone().require_reporting_floor();
+    match &gated {
         trust_types::VerificationResult::Proved {
             time_ms, proof_certificate: Some(bytes), ..
         } => BinarySolverResultFields {
@@ -10344,6 +10516,7 @@ fn lifted_replay_function(function: &trust_lift::LiftedFunction) -> VerifiableFu
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -11538,6 +11711,8 @@ fn vc_kind_key(kind: &VcKind) -> String {
         VcKind::DoubleFree => "double_free".to_string(),
         VcKind::AliasingViolation { .. } => "aliasing_violation".to_string(),
         VcKind::LifetimeViolation => "lifetime_violation".to_string(),
+        // TINV: one counting bucket per point; the description carries ty and site.
+        VcKind::TypeInvariant { point, .. } => format!("type_invariant:{}", point.as_tag()),
         _ => normalize_vc_kind_description(&kind.description()),
     }
 }
@@ -14511,25 +14686,67 @@ fn run_subcommand(subcommand: Subcommand, args: &[String]) -> ExitCode {
 pub(crate) fn run_subcommand_with_live_report(
     subcommand: Subcommand,
     args: &[String],
-    mut live_report_consumer: Option<
-        &mut dyn FnMut(&report::LiveCanonicalReport) -> Result<(), String>,
-    >,
+    live_report_consumer: Option<pipeline::run::LiveReportConsumer<'_>>,
     render_output: bool,
 ) -> ExitCode {
+    run_subcommand_with_diagnostics(subcommand, args, live_report_consumer, None, render_output)
+}
+
+pub(crate) fn run_subcommand_with_diagnostics(
+    subcommand: Subcommand,
+    args: &[String],
+    mut live_report_consumer: Option<pipeline::run::LiveReportConsumer<'_>>,
+    mut diagnostic_observer: Option<pipeline::run::CompilerDiagnosticObserver<'_>>,
+    render_output: impl Into<pipeline::run::ReportRendering>,
+) -> ExitCode {
+    let render_output = render_output.into();
     if wrapper_help_requested(args) {
         print_usage_stdout();
         return ExitCode::SUCCESS;
     }
+    // Live-edit-loop step 2 (DELTA): an agent's own `check` (no in-process
+    // consumer reading the run, the report on stdout) snapshots its records
+    // and prints what changed since the base; `--since` and `--all-rows` are
+    // its options, never Cargo's.
+    let delta_args;
+    let (args, agent_delta) = if subcommand == Subcommand::Check
+        && live_report_consumer.is_none()
+        && render_output == pipeline::run::ReportRendering::Stdout
+    {
+        let mut owned = args.to_vec();
+        match agent_delta::DeltaRequest::take_from(&mut owned) {
+            Ok(request) => {
+                delta_args = owned;
+                (delta_args.as_slice(), Some(request))
+            }
+            Err(error) => {
+                pipeline::run::report_setup_failure(
+                    &mut diagnostic_observer,
+                    format_args!("targo trust: {error}"),
+                );
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        (args, None)
+    };
     let exact_unsafe_memory_report_command =
         is_exact_unsafe_memory_report_command(subcommand, args);
     let mut sub_args = match parse_subcommand_args(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("targo trust: {e}");
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {e}"));
             return ExitCode::from(2);
         }
     };
     restore_cargo_all_alias(subcommand, &mut sub_args);
+
+    if sub_args.dump_verifier_inputs.is_some()
+        && (subcommand != Subcommand::Check || sub_args.standalone || sub_args.is_single_file || sub_args.rewrite)
+    {
+        eprintln!("targo trust: --dump-verifier-inputs requires normal Cargo check, without standalone, single-file or rewrite mode");
+        return ExitCode::from(2);
+    }
 
     if subcommand == Subcommand::Test && sub_args.is_single_file {
         eprintln!(
@@ -14539,17 +14756,37 @@ pub(crate) fn run_subcommand_with_live_report(
     }
 
     if let Some(error) = focused_check_request_error(subcommand, &sub_args) {
-        eprintln!("targo trust: {error}");
+        pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
         return ExitCode::from(2);
     }
     if let Some(error) = rewrite_request_error(subcommand, &sub_args) {
-        eprintln!("targo trust: {error}");
+        pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
         return ExitCode::from(2);
     }
 
-    // Handle `diff` subcommand separately -- it compares reports, not runs.
+    // T9: the baseline options belong to one command each.
+    if sub_args.baseline.is_some() && subcommand != Subcommand::Diff {
+        eprintln!("targo trust: --baseline is a `diff` option (`targo trust diff --baseline <file>`)");
+        return ExitCode::from(2);
+    }
+    if sub_args.save_baseline.is_some()
+        && (subcommand != Subcommand::Check
+            || sub_args.standalone
+            || sub_args.rewrite
+            || sub_args.focused_function.is_some())
+    {
+        eprintln!(
+            "targo trust: --save-baseline is a plain `check` option: it records a whole verified \
+             run, so it does not combine with another subcommand, --standalone, --rewrite or \
+             --function"
+        );
+        return ExitCode::from(2);
+    }
+
+    // Handle `diff` subcommand separately: a git-ref audit, or a live check
+    // compared against the committed obligation baseline.
     if subcommand == Subcommand::Diff {
-        return diff_report::run_diff(&sub_args, &resolve_project_root(&sub_args).root);
+        return diff_report::run_diff(&sub_args, args, &resolve_project_root(&sub_args).root);
     }
 
     // Handle `solvers` subcommand -- detect and report solver status.
@@ -14568,22 +14805,6 @@ pub(crate) fn run_subcommand_with_live_report(
     // Trust policy is anchored to the project root, not the launch directory.
     let resolved_project_root = resolve_project_root(&sub_args);
     let crate_root = resolved_project_root.root.clone();
-    // Surface profile opt-outs before compilation. Strict/full runs override
-    // them in canonical child flags; advisory/survey runs preserve them and
-    // warn that strict coverage is not being claimed.
-    if source_subcommand_compiles_for_safety_diagnostics(subcommand) {
-        let bypasses = match detect_safety_check_bypasses(&crate_root) {
-            Ok(bypasses) => bypasses,
-            Err(error) => {
-                eprintln!("targo trust: error: {error}");
-                eprintln!(
-                    "  safety-profile discovery requires bounded, readable regular Cargo manifests"
-                );
-                return ExitCode::from(2);
-            }
-        };
-        warn_safety_check_bypasses(&bypasses, sub_args.strict_artifact_policy());
-    }
     let unsafe_memory_report_request = if exact_unsafe_memory_report_command {
         if sub_args.report_dir.is_none() {
             sub_args.report_dir = Some(default_unsafe_memory_report_dir(&crate_root));
@@ -14592,13 +14813,13 @@ pub(crate) fn run_subcommand_with_live_report(
     } else {
         None
     };
-    let config = match TrustConfig::load_for_verification(
+    let mut config = match TrustConfig::load_for_verification(
         &crate_root,
         resolved_project_root.manifest_path.as_deref(),
     ) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("targo trust: error: {error}");
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: {error}"));
             eprintln!(
                 "  verifier entrypoints require a readable, valid `[{}]` table, or none at all",
                 config::TRUST_TABLE
@@ -14606,7 +14827,100 @@ pub(crate) fn run_subcommand_with_live_report(
             return ExitCode::from(2);
         }
     };
+    // DECISION_QUEUE T7a: TRUSTFLAGS is no longer a per-run channel. An
+    // ambient one changes nothing, and says so once, before anything is
+    // resolved or announced, naming where each selection now lives.
+    if let Some(notice) = pipeline::ignored_trustflags_notice(
+        std::env::var_os("TRUSTFLAGS").as_deref(),
+        std::env::var_os("CARGO_ENCODED_TRUSTFLAGS").as_deref(),
+    ) {
+        eprintln!("targo trust: note: {notice}");
+    }
+    // `--worker-threads` is the run's one spelling of the verifier
+    // worker-thread cap; the budget profile records it (plan §3.6).
+    config.worker_threads = sub_args.worker_threads;
+    // `--no-proc-macro-isolation` is the run's one spelling of the choice.
+    config.proc_macro_isolation = sub_args.proc_macro_isolation;
+    // Resolve project requirements with the authenticated sibling Cargo
+    // resolver before banners, gate controls, Units, or session/cache identity.
+    // Explicit standalone audits and direct single-file runs keep their own
+    // existing configuration semantics. Discovery is reused by compilation.
+    let policy_deadline = if !sub_args.standalone && !sub_args.is_single_file {
+        match pipeline::project_policy::setup_deadline() {
+            Ok(deadline) => Some(deadline),
+            Err(error) => {
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let project_policy_compiler = if policy_deadline.is_some() {
+        discover_native_rustc_checked()
+    } else {
+        None
+    };
+    if let Some(deadline) = policy_deadline {
+        let Some(discovery) = project_policy_compiler.as_ref() else {
+            // Project-policy resolution is anchored on the canonical
+            // compiler; without one this is the ordinary missing-compiler
+            // setup failure, reported in its canonical form.
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: no canonical compiler can anchor project-policy resolution"));
+            return report_trust_compiler_not_found();
+        };
+        let resolved =
+            pipeline::project_policy::resolve_project_policy(&sub_args, &config, &discovery.rustc, deadline);
+        let policy = match resolved {
+            Ok(policy) => policy,
+            Err(error) => {
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
+                return ExitCode::from(2);
+            }
+        };
+        if let Err(error) = policy.adopt(&mut sub_args, &mut config) {
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
+            return ExitCode::from(2);
+        }
+        // Policy may change cfg-affecting safety defaults. Require a fixed
+        // point under the exact adopted lane instead of guessing cfg matches.
+        match pipeline::project_policy::resolve_project_policy(&sub_args, &config, &discovery.rustc, deadline)
+        {
+            Ok(rechecked) if rechecked == policy => {}
+            Ok(_) => {
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: project policy changes its own effective target cfg requirements"));
+                return ExitCode::from(2);
+            }
+            Err(error) => {
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: {error}"));
+                return ExitCode::from(2);
+            }
+        }
+        // Requirements the project chose are named before any banner, so a
+        // lane, level or profile from a project file is never
+        // indistinguishable from one typed on the command line.
+        if let Some(line) = policy.disclosure() {
+            eprintln!("targo trust: {line}");
+        }
+    }
     apply_configured_trust_profile(&mut sub_args, &config);
+    // Surface profile opt-outs before compilation. Strict/full runs override
+    // them in canonical child flags; advisory/survey runs preserve them and
+    // warn that strict coverage is not being claimed.
+    if source_subcommand_compiles_for_safety_diagnostics(subcommand) {
+        let bypasses = match detect_safety_check_bypasses(&crate_root) {
+            Ok(bypasses) => bypasses,
+            Err(error) => {
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: {error}"));
+                eprintln!(
+                    "  safety-profile discovery requires bounded, readable regular Cargo manifests"
+                );
+                return ExitCode::from(2);
+            }
+        };
+        warn_safety_check_bypasses(&bypasses, sub_args.strict_artifact_policy());
+    }
+
     // Evidence-grade invocations always pin a backend. Leaving this unset lets
     // ambient rustflags or a project-controlled custom target select an
     // in-process backend that can forge compiler transport.
@@ -14617,9 +14931,40 @@ pub(crate) fn run_subcommand_with_live_report(
             .or(config.codegen_backend.as_deref())
             .unwrap_or(DEFAULT_CODEGEN_BACKEND),
     );
-    if sub_args.hardened {
-        let profile = sub_args.trust_profile.as_deref().unwrap_or(DEFAULT_TRUST_PROFILE);
-        eprintln!("targo trust: hardened profile `{profile}` enabled");
+    // One resolution of the lane's profile, the same `hardened_profile_name`
+    // that `run_compiler` sends the compiler and checks the project
+    // requirements against, so the banner and the compile can never name
+    // different ones.
+    let lane_profile = pipeline::hardened::hardened_profile_name(
+        sub_args.hardened,
+        sub_args.trust_profile.as_deref(),
+    );
+    if let Some(profile) = lane_profile {
+        // The banner is not decoration: `report.rs` parses this exact line back
+        // out of the compiler diagnostics to fill `hardened.profile.name` in the
+        // proof record. So it is checked against the registry at the point the
+        // claim is made, not only at the two places a label can enter (the
+        // `--trust-profile` flag and the `[trust] trust_profile` key, both of
+        // which now refuse an unregistered one). Every path that reaches here
+        // has already been validated, which is exactly why this costs nothing
+        // and why a future path that forgets cannot announce hardening it will
+        // not request.
+        if trust_vcgen::canonical_profile(profile).is_none() {
+            eprintln!("targo trust: error: unregistered hardened profile `{profile}`");
+            eprintln!(
+                "  a profile selects the hardened obligation set; announcing an unregistered one \
+                 would claim hardening that no obligation backs"
+            );
+            eprintln!(
+                "  registered profiles: {}",
+                trust_vcgen::known_hardened_profiles().join(", ")
+            );
+            return ExitCode::from(2);
+        }
+        eprintln!(
+            "targo trust: hardened profile `{profile}` enabled; `--no-hardened` turns it off \
+             unless the project's Cargo configuration requires it"
+        );
     }
     if !config.enabled {
         if sub_args.focused_function.is_some() {
@@ -14629,9 +14974,7 @@ pub(crate) fn run_subcommand_with_live_report(
             );
             return ExitCode::from(2);
         }
-        eprintln!(
-            "targo trust: error: verification disabled by `enabled = false` in the project configuration"
-        );
+        pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: verification disabled by `enabled = false` in the project configuration"));
         eprintln!(
             "  targo trust verifier entrypoints are fail-closed; remove `enabled = false` before requesting proof evidence"
         );
@@ -14641,7 +14984,8 @@ pub(crate) fn run_subcommand_with_live_report(
     // Only accept solver requests that are actually routed by
     // compiler-backed source verification. Detection can know about more tools,
     // but accepting them here would imply native routing that does not exist.
-    let mut selected_ay_path = None;
+    // Plan P4 / T4.1: the one routed solver, ay, is linked into trustc, which
+    // selects no solver executable, so an accepted request selects nothing.
     if let Some(ref solver_name) = sub_args.solver {
         if !is_source_solver_routed(solver_name) {
             eprintln!(
@@ -14656,25 +15000,7 @@ pub(crate) fn run_subcommand_with_live_report(
             );
             return ExitCode::from(2);
         }
-
-        let info = solver_detect::detect_solver(solver_name);
-        if !info.available {
-            eprintln!("targo trust: requested solver `{solver_name}` is unavailable");
-            if let Some(diagnostic) = &info.diagnostic {
-                eprintln!("  {diagnostic}");
-            }
-            eprintln!("  Install it or set AY_PATH before using `--solver {solver_name}`.");
-            return ExitCode::from(2);
-        } else if let Some(ref path) = info.path {
-            eprintln!("targo trust: requesting solver `{solver_name}` at {}", path.display());
-            if solver_name == "ay" {
-                selected_ay_path = Some(path.clone());
-            }
-        }
-        if solver_name == "ay" && selected_ay_path.is_none() {
-            eprintln!("targo trust: requested solver `ay` has no executable path");
-            return ExitCode::from(2);
-        }
+        eprintln!("targo trust: requesting solver `{solver_name}`, the one linked into the compiler");
     }
 
     if sub_args.standalone {
@@ -14687,18 +15013,16 @@ pub(crate) fn run_subcommand_with_live_report(
         return ExitCode::from(2);
     }
 
-    // Standalone mode is explicit only. Defaults must use the Trust compiler.
-    let native_rustc = discover_native_rustc_checked();
+    // Cargo policy adoption reused one discovery. Direct single-file mode
+    // retains discovery at this original point; standalone returned above.
+    let native_rustc = project_policy_compiler.or_else(discover_native_rustc_checked);
     let native_capabilities =
         native_rustc.as_ref().map(|discovery| detect_native_rustc_capabilities(&discovery.rustc));
 
     if let (Some(discovery), Some(capabilities)) = (native_rustc, native_capabilities) {
         let rustc = discovery.rustc;
         if !capabilities.trust_verify {
-            eprintln!(
-                "targo trust: error: discovered compiler does not support Trust verification: {}",
-                rustc.display()
-            );
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: discovered compiler does not support Trust verification: {}", rustc.display()));
             eprintln!(
                 "Use canonical `trustc` from this checkout; --standalone is only a non-proof source audit."
             );
@@ -14706,9 +15030,7 @@ pub(crate) fn run_subcommand_with_live_report(
         }
 
         if !capabilities.json_transport {
-            eprintln!(
-                "targo trust: error: native source verification requires structured Trust JSON transport (-Z trust-verify-output=json)"
-            );
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: native source verification requires structured Trust JSON transport (-Z trust-verify-output=json)"));
             eprintln!("  Discovered compiler: {} ({})", rustc.display(), discovery.source.label());
             eprintln!(
                 "  Human-readable Trust diagnostics are not accepted for default native verification."
@@ -14720,9 +15042,7 @@ pub(crate) fn run_subcommand_with_live_report(
         }
 
         if sub_args.strict_artifact_policy() && !capabilities.authenticated_coverage {
-            eprintln!(
-                "targo trust: error: strict native verification requires authenticated, session-bound coverage transport"
-            );
+            pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: strict native verification requires authenticated, session-bound coverage transport"));
             eprintln!("  Discovered compiler: {} ({})", rustc.display(), discovery.source.label());
             eprintln!(
                 "  This compiler supports generic Trust JSON, but did not prove the current coverage authentication protocol."
@@ -14753,7 +15073,6 @@ pub(crate) fn run_subcommand_with_live_report(
                 &config,
                 selected_codegen_backend,
                 capabilities.json_transport,
-                selected_ay_path.as_deref(),
             );
         }
 
@@ -14776,56 +15095,94 @@ pub(crate) fn run_subcommand_with_live_report(
         ) {
             Ok(args) => args,
             Err(error) => {
-                eprintln!("targo trust: error: {error}");
+                pipeline::run::report_setup_failure(&mut diagnostic_observer, format_args!("targo trust: error: {error}"));
                 return ExitCode::from(2);
             }
         };
         let mut focused_exit = None;
         let focused_format = sub_args.format;
-        let has_live_consumer = focused_function.is_some() || live_report_consumer.is_some();
-        let mut dispatch_live_report = |live: &report::LiveCanonicalReport| {
-            if let Some(function) = focused_function.as_deref() {
-                focused_exit = Some(report_query::run_live_focused_check_query(
-                    live,
-                    function,
-                    focused_format,
-                ));
-            }
-            if let Some(consumer) = live_report_consumer.as_mut() {
-                consumer(live)?;
-            }
-            Ok(())
+        // T9: `--save-baseline` reads the run's obligation records off the
+        // live report, which exists only for a coverage-complete run.
+        let save_baseline = sub_args.save_baseline.clone();
+        let mut baseline_records: Option<obligations::ObligationRecords> = None;
+        let has_live_consumer = focused_function.is_some()
+            || live_report_consumer.is_some()
+            || save_baseline.is_some();
+        let has_diagnostic_observer = diagnostic_observer.is_some();
+        // A focused check prints that function's rows, not the changed-only
+        // view: say so rather than drop `--since` silently.
+        if let (Some(function), Some(token)) = (
+            focused_function.as_deref(),
+            agent_delta.as_ref().and_then(|request| request.since.as_deref()),
+        ) {
+            eprintln!(
+                "targo trust: note: --since {token} is ignored with --function `{function}`: a \
+                 focused check prints that function's rows, not the changed-only view"
+            );
+        }
+        let exit_code = {
+            let mut dispatch_diagnostics = |batch: &pipeline::run::CompilerRunDiagnostics| {
+                if let Some(observer) = diagnostic_observer.as_mut() { observer(batch); }
+            };
+            let run_diagnostic_observer = has_diagnostic_observer.then_some(
+                &mut dispatch_diagnostics as &mut dyn FnMut(&pipeline::run::CompilerRunDiagnostics),
+            );
+            let mut dispatch_live_report = |live: &report::LiveCanonicalReport| {
+                if let Some(function) = focused_function.as_deref() {
+                    focused_exit = Some(report_query::run_live_focused_check_query(
+                        live,
+                        function,
+                        focused_format,
+                    ));
+                }
+                if save_baseline.is_some() {
+                    baseline_records = live.obligation_records().cloned();
+                }
+                if let Some(consumer) = live_report_consumer.as_mut() {
+                    consumer(live)?;
+                }
+                Ok(())
+            };
+            let live_report_consumer = has_live_consumer.then_some(
+                &mut dispatch_live_report
+                    as &mut dyn FnMut(&report::LiveCanonicalReport) -> Result<(), String>,
+            );
+            run_compiler(CompilerRun {
+                cmd_args: &compile_args,
+                rustc_path: &rustc,
+                config: &config,
+                selected_codegen_backend,
+                supports_json_transport: capabilities.json_transport,
+                strict_artifact_policy: sub_args.strict_artifact_policy(),
+                strict_result_gate: sub_args.strict_result_gate(),
+                certify_gate: sub_args.certify_lane(),
+                allow_l0_gaps: sub_args.allow_l0_gaps_lane(),
+                memory_safe_policy: sub_args.memory_safe && !sub_args.survey,
+                survey: sub_args.survey,
+                hardened: sub_args.hardened,
+                trust_profile: sub_args.trust_profile.as_deref(),
+                spec_emit_dir: sub_args.spec_emit_dir.as_deref().map(Path::new),
+                dump_verifier_inputs: sub_args.dump_verifier_inputs.as_deref().map(Path::new),
+                format: render_format,
+                report_dir: sub_args.report_dir.as_deref(),
+                unsafe_memory_report: unsafe_memory_report_request.as_ref(),
+                live_report_consumer,
+                diagnostic_observer: run_diagnostic_observer,
+                render_output,
+                ephemeral_single_file_output: sub_args.is_single_file
+                    && !matches!(compile_cmd, Subcommand::Build | Subcommand::Test)
+                    && !has_output_path_flag(&sub_args.passthrough),
+                test_target_panics: sub_args.test_target_panic_policy(),
+                agent_delta: agent_delta.as_ref().filter(|_| focused_function.is_none()),
+            })
         };
-        let live_report_consumer = has_live_consumer.then_some(
-            &mut dispatch_live_report
-                as &mut dyn FnMut(&report::LiveCanonicalReport) -> Result<(), String>,
-        );
-        let exit_code = run_compiler(CompilerRun {
-            cmd_args: &compile_args,
-            rustc_path: &rustc,
-            config: &config,
-            selected_codegen_backend,
-            supports_json_transport: capabilities.json_transport,
-            strict_artifact_policy: sub_args.strict_artifact_policy(),
-            strict_result_gate: sub_args.strict_result_gate(),
-            certify_gate: sub_args.certify_lane(),
-            allow_l0_gaps: sub_args.allow_l0_gaps_lane(),
-            memory_safe_policy: sub_args.memory_safe && !sub_args.survey,
-            survey: sub_args.survey,
-            hardened: sub_args.hardened,
-            trust_profile: sub_args.trust_profile.as_deref(),
-            ay_path: selected_ay_path.as_deref(),
-            spec_emit_dir: sub_args.spec_emit_dir.as_deref().map(Path::new),
-            format: render_format,
-            report_dir: sub_args.report_dir.as_deref(),
-            unsafe_memory_report: unsafe_memory_report_request.as_ref(),
-            live_report_consumer,
-            render_output,
-            ephemeral_single_file_output: sub_args.is_single_file
-                && !matches!(compile_cmd, Subcommand::Build | Subcommand::Test)
-                && !has_output_path_flag(&sub_args.passthrough),
-        });
-        drop(dispatch_live_report);
+        if let Some(path) = save_baseline.as_deref() {
+            return baseline::finish_save_baseline(
+                Path::new(path),
+                baseline_records.as_ref(),
+                exit_code,
+            );
+        }
         if let Some(function) = focused_function.as_deref() {
             if exit_code != ExitCode::SUCCESS && exit_code != ExitCode::FAILURE {
                 if exit_code == ExitCode::from(2) {
@@ -14855,6 +15212,15 @@ pub(crate) fn run_subcommand_with_live_report(
         return exit_code;
     }
 
+    pipeline::run::observe_setup_failure(&mut diagnostic_observer, "targo trust: Trust compiler not found".into());
+    report_trust_compiler_not_found()
+}
+
+// The one canonical setup diagnostic for "no canonical trustc was discovered".
+// Every crate-mode path that needs the compiler before compiling (the
+// project-policy query included) reports through this, so a missing compiler
+// is always named as such, with its discovery order and remedy, exit 2.
+fn report_trust_compiler_not_found() -> ExitCode {
     eprintln!("targo trust: error: Trust compiler not found");
     eprintln!();
     eprintln!("Discovery order:");
@@ -14882,7 +15248,8 @@ pub(crate) fn run_subcommand_with_live_report(
 /// crate-mode source command, however, it is Cargo's historical spelling of
 /// `--workspace` and must reach the child frontend. Normalize it here, where
 /// the subcommand context is known, rather than making binary commands inherit
-/// a stray Cargo flag.
+/// a stray Cargo flag. Use the same separator-aware list as the compile and
+/// post-build gates, so the selector never becomes a test-binary argument.
 fn restore_cargo_all_alias(subcommand: Subcommand, sub_args: &mut SubcommandArgs) {
     if !sub_args.is_single_file
         && sub_args.all_functions
@@ -14894,9 +15261,8 @@ fn restore_cargo_all_alias(subcommand: Subcommand, sub_args: &mut SubcommandArgs
                 | Subcommand::Report
                 | Subcommand::Loop
         )
-        && !sub_args.passthrough.iter().any(|arg| arg == "--workspace" || arg == "--all")
     {
-        sub_args.passthrough.push("--workspace".to_string());
+        sub_args.passthrough = sub_args.crate_mode_cargo_args();
     }
 }
 
@@ -15054,36 +15420,42 @@ fn run_init_subcommand(args: &[String]) -> ExitCode {
         init::scaffold_crate(&crate_root)
     };
 
-    // Scaffold the policy table into the manifest the project already has.
-    match config::discover_manifest(&crate_root) {
-        Some(manifest_path) => match config::read_trust_table(&manifest_path) {
-            Ok(Some(_)) => {
+    // Scaffold the policy table into the manifest the project already has:
+    // its workspace root's when it is a member, where the one policy of the
+    // workspace lives (a member's own table is refused, DECISION_QUEUE T7c-4).
+    let policy_table = config::policy_manifest(&crate_root).and_then(|manifest| match manifest {
+        Some(manifest_path) => {
+            config::read_trust_table(&manifest_path).map(|table| Some((manifest_path, table)))
+        }
+        None => Ok(None),
+    });
+    match policy_table {
+        Ok(Some((manifest_path, Some(_)))) => {
+            eprintln!(
+                "targo trust: {} already declares [{}], skipping",
+                manifest_path.display(),
+                config::TRUST_TABLE
+            );
+        }
+        Ok(Some((manifest_path, None))) => match init::append_trust_table(&manifest_path) {
+            Ok(()) => {
                 eprintln!(
-                    "targo trust: {} already declares [{}], skipping",
-                    manifest_path.display(),
-                    config::TRUST_TABLE
+                    "targo trust: added [{}] to {}",
+                    config::TRUST_TABLE,
+                    manifest_path.display()
                 );
             }
-            Ok(None) => match init::append_trust_table(&manifest_path) {
-                Ok(()) => {
-                    eprintln!(
-                        "targo trust: added [{}] to {}",
-                        config::TRUST_TABLE,
-                        manifest_path.display()
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "targo trust: warning: failed to write {}: {e}",
-                        manifest_path.display()
-                    );
-                }
-            },
-            Err(error) => {
-                eprintln!("targo trust: warning: {error}");
+            Err(e) => {
+                eprintln!(
+                    "targo trust: warning: failed to write {}: {e}",
+                    manifest_path.display()
+                );
             }
         },
-        None => {
+        Err(error) => {
+            eprintln!("targo trust: warning: {error}");
+        }
+        Ok(None) => {
             eprintln!(
                 "targo trust: warning: no manifest at {}; nowhere to declare [{}]",
                 crate_root.display(),
@@ -15197,6 +15569,28 @@ mod main_tests {
         let mut binary = parse_subcommand_args(&["--all".to_string()]).expect("parse --all");
         restore_cargo_all_alias(Subcommand::Diff, &mut binary);
         assert!(binary.passthrough.is_empty(), "non-compile command must not inherit Cargo flags");
+    }
+
+    #[test]
+    fn crate_mode_all_alias_precedes_forwarded_test_arguments() {
+        for subcommand in [
+            Subcommand::Check,
+            Subcommand::Build,
+            Subcommand::Test,
+            Subcommand::Report,
+            Subcommand::Loop,
+        ] {
+            let mut parsed = parse_subcommand_args(&[
+                "--all".to_string(),
+                "--".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ])
+            .expect("parse workspace selection with forwarded arguments");
+            restore_cargo_all_alias(subcommand, &mut parsed);
+            assert_eq!(parsed.passthrough, ["--workspace", "--", "--nocapture"]);
+            assert_eq!(parsed.crate_mode_cargo_args(), parsed.passthrough);
+        }
     }
 
     #[test]
@@ -15390,7 +15784,7 @@ fn bounded(x: i32) -> i32 { x + 1 }\n";
 
         let parsed_html = parse_subcommand_args(&html_args).expect("parse HTML format");
         assert_eq!(run_solvers(&parsed_html), ExitCode::from(2));
-        assert_eq!(diff_report::run_diff(&parsed_html, Path::new(".")), ExitCode::from(2));
+        assert_eq!(diff_report::run_diff(&parsed_html, &[], Path::new(".")), ExitCode::from(2));
         assert_eq!(run_standalone_check(&parsed_html, Path::new(".")), ExitCode::from(2));
 
         let json_args = ["--format=json".to_string()];
@@ -15454,7 +15848,7 @@ debug-assertions = false
         {
             assert!(source_subcommand_compiles_for_safety_diagnostics(subcommand));
         }
-        for subcommand in [Subcommand::Diff, Subcommand::Solvers, Subcommand::Init] {
+        for subcommand in [Subcommand::Diff, Subcommand::Solvers] {
             assert!(!source_subcommand_compiles_for_safety_diagnostics(subcommand));
         }
     }

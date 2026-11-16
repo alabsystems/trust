@@ -330,21 +330,21 @@ impl ParsedFunctionSpec {
 
     /// Conjoin all preconditions into a single formula (or `true` if empty).
     pub fn combined_precondition(&self) -> Formula {
-        combine_formulas(self.precondition_formulas())
+        combine_parsed_specs(&self.requires)
     }
 
     /// Conjoin all postconditions into a single formula (or `true` if empty).
     pub fn combined_postcondition(&self) -> Formula {
-        combine_formulas(self.postcondition_formulas())
+        combine_parsed_specs(&self.ensures)
     }
 }
 
-/// Conjoin a list of formulas. Returns `Bool(true)` for empty list.
-fn combine_formulas(formulas: Vec<&Formula>) -> Formula {
-    match formulas.len() {
-        0 => Formula::Bool(true),
-        1 => formulas[0].clone(),
-        _ => Formula::And(formulas.into_iter().cloned().collect()),
+/// Conjoin a slice of parsed specs. Returns `Bool(true)` for empty slice.
+fn combine_parsed_specs(specs: &[ParsedSpec]) -> Formula {
+    match specs {
+        [] => Formula::Bool(true),
+        [only] => only.formula.clone(),
+        many => Formula::And(many.iter().map(|s| s.formula.clone()).collect()),
     }
 }
 

@@ -58,9 +58,9 @@ pub fn api(x: u32) -> u32 {
 
 // The poison trigger: mere PRESENCE of a coroutine body in the crate.
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `flip_with_async_present::helper::{closure#0}`
-    //~| ERROR Trust strict verification failed for `flip_with_async_present::helper::{closure#0}`: coroutine executor-protocol premise is unproved
-    //~| ERROR Trust strict verification failed for `flip_with_async_present::helper::{closure#0}`: 3 obligation(s) were not fully verified
+    //~^ ERROR Trust strict verification failed for `flip_with_async_present::helper::{closure#0}`: coroutine executor-protocol premise is unproved
+    // RE-PINNED 2026-09-14: the premise abort is the coroutine body's only strict
+    // diagnostic; the Level-0 WARN and the "3 obligation(s)" count ERROR no longer fire.
     x
 }
 //~? RAW Trust: ASSUMPTION [coroutine] `flip_with_async_present::helper::{closure#0}`

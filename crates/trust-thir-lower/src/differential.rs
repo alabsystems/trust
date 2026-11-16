@@ -98,7 +98,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use rustc_middle::mir;
 use rustc_middle::ty::{TyCtxt, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
-use trust_ir::interpret::{InterpretErrorCode, InterpretValue, InterpretValueKind, Interpreter};
+use trust_ir::interpret::{
+    ArrayValue, InterpretErrorCode, InterpretValue, InterpretValueKind, Interpreter,
+};
 use trust_ir::{
     Block, CastOp, Constant, FuncId, FuncTy, Function, Inst, InstrNode, Module, ObligationKind, Ty,
     ValueId,
@@ -327,16 +329,13 @@ pub fn deferred_to_seam_parts(
     unsupported_is_empty && (contains_call || !pending_consts_is_empty)
 }
 
-/// Trust: the DIRECT interpretation differential's STRUCTURAL SKIP — the one predicate on
-/// `Lowered` that routes a body away from [`compare`]'s sampled interpretation.
-///
-/// [`compare`] evaluates this before it builds the MIR-side oracle and returns
-/// `DiffMode::NotRun` when it holds (see the cross-module call guard, step 0.5). Nothing else in
-/// `Lowered` does this: in particular `Lowered::symbolic` is NEVER READ by `compare` — its only
-/// consumer outside the coverage census is `crate_module::record` → `BodyRecord::symbolic` →
-/// `splice_ok`. Producer lanes whose value model is degraded therefore FORCE `contains_call`
-/// (`LowerCx::register_union_lane`, `LowerCx::register_enum_param_lane`) rather than relying on
-/// `symbolic`, which would leave the manufactured-agreement channel open.
+/// Trust: the direct interpretation differential's call-related structural skip.
+/// [`compare`] returns `DiffMode::NotRun` when it holds (the cross-module call guard),
+/// independently of the declared-opaque provenance refusal. `Lowered::symbolic` is never
+/// read by `compare`; each provenance class needs its own comparison guard.
+/// Producer lanes whose value model is degraded therefore force `contains_call`
+/// (`LowerCx::register_union_lane`, `LowerCx::register_enum_param_lane`) rather than relying
+/// on `symbolic`, which would leave the manufactured-agreement channel open.
 ///
 /// Extracted as a named `TyCtxt`-free predicate so those lanes' confinement can be pinned by a
 /// unit test end to end, instead of resting on a reading of `compare`'s control flow.
@@ -369,6 +368,15 @@ pub fn compare<'tcx>(
             "{} unsupported THIR shape(s); differential not run (coverage gap)",
             thir_side.unsupported.len()
         ));
+        return (report, None);
+    }
+
+    // Declared provenance survives typeck revealing the liberated return signature. It is
+    // independent of contains_call: a scalar opaque return can contain no call at all.
+    if thir_side.unsubstituted_opaque_return {
+        report.equal = false;
+        report.mode = DiffMode::NotRun;
+        report.notes.push("unsubstituted body declares an opaque return (coverage-only)".into());
         return (report, None);
     }
 
@@ -514,12 +522,13 @@ pub fn compare<'tcx>(
 
     // (1.5) Oracle interpretability guard: a non-interpretable oracle is NOT a trap reference.
     //
-    // The trusted MIR-side bridge builds a `CheckedBinaryOp` result tuple by seeding an
-    // `Inst::Undef` aggregate and `InsertField`-ing both fields into it (trust-ir-bridge
-    // lower.rs ~12455-12482, taken when the operands are non-symbolic — which function params
-    // always are on the oracle side). The reference interpreter, however, executes `Inst::Undef`
-    // EAGERLY as `UndefinedBehavior` (trust-ir interpret.rs ~502) before the InsertFields run,
-    // so such an oracle traps on EVERY input — even non-overflowing ones. That trap is an
+    // The trusted MIR-side bridge once built every aggregate, including the `CheckedBinaryOp`
+    // result tuple, by seeding an `Inst::Undef` aggregate and `InsertField`-ing its fields.
+    // Since BMC-LANE-1 a COMPLETE construction is one `MakeAggregate` (or `ArraySplat`), which
+    // executes; partial flat-enum constructions and closure environments still carry the seed.
+    // The reference interpreter executes an aggregate `Inst::Undef` EAGERLY as
+    // `UndefinedBehavior` before the InsertFields run, so an oracle that reaches such a seed
+    // traps on EVERY input — even non-overflowing ones. That trap is an
     // oracle-construction artifact, not a source-level trap rustc would produce; counting it as a
     // genuine trap (`is_trap`) would manufacture a false `MirOracle` "THIR returned X but the
     // oracle proved a trap" divergence. We therefore skip such bodies as coverage-only (`NotRun`):
@@ -539,9 +548,10 @@ pub fn compare<'tcx>(
         );
         return (report, Some(vf));
     }
-    // Trust (B9-B1, oracle dead-seed rewrite): the bridge seeds CheckedBinaryOp tuples and
-    // aggregate constructions with `Inst::Undef` that is PROVEN fully overwritten before any
-    // observation (`classify_undefs`: single-use chain of InsertFields covering every field).
+    // Trust (B9-B1, oracle dead-seed rewrite): an oracle built before BMC-LANE-1, or a
+    // remaining seeded construction, carries an `Inst::Undef` that is PROVEN fully overwritten
+    // before any observation (`classify_undefs`: single-use chain of InsertFields covering every
+    // field).
     // Such a seed carries no semantics — substitute a typed ZERO constant in a CLONE of the
     // oracle and interpret that (the bridge, trust-mc, the pinned interpreter, and the flip gate
     // are all untouched; this differential is LOG-ONLY). A LIVE havoc (an Undef whose value can
@@ -691,12 +701,24 @@ fn constant_materializes_uncomparable_identity(value: &Constant) -> bool {
         Constant::Record(fields) => {
             fields.iter().any(|(_, value)| constant_materializes_uncomparable_identity(value))
         }
+        // v50 uniform array: every lane IS its one element, so the element answers for all
+        // `len` of them (never walks `len`).
+        Constant::Splat { elem, .. } => constant_materializes_uncomparable_identity(elem),
         Constant::Int(_)
         | Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::Float(_)
         | Constant::Bool(_)
-        | Constant::PhantomData => false,
+        | Constant::PhantomData
+        // v49 unwritten lane: no identity of any kind.
+        | Constant::Uninit => false,
+        // Trust: a trust-ir v70 tensor weight names its bytes by digest in each module's
+        // own blob table. This comparator never compares the two tables, and neither
+        // producer mints a blob, so a body holding one is outside what it has been
+        // qualified on: held as uncomparable (coverage-only), never sampled.
+        Constant::TensorBlob { .. } => true,
+        // Level R (trust-ir amendment S): a module constant has no extension.
+        Constant::Ext(e) => e.unreachable(),
     }
 }
 
@@ -706,8 +728,19 @@ fn constant_materializes_uncomparable_identity(value: &Constant) -> bool {
 /// identity and no observable final memory, so the faithful-MIR oracle's multi-block promotion
 /// of a `mut` scalar-enum local through it agrees with the direct-THIR SSA form. Uses the same
 /// sentinel-remap escape probe as `nodes_using`; fails closed (empty set) if no sentinel is free.
+///
+/// Trust (2026-09-28, trust-ir v50): a slot's pointer may also be the `base` of a `GEP` whose
+/// results are themselves used only in these positions, transitively — an element step INTO
+/// the cell. That is how both producers now read an array's sub-array back through memory (the
+/// `rest @ ..` middle, the MIR `Subslice`): `Alloca` + `Store` + `GEP` + `Load`, constant size
+/// where the old copy was one instruction pair per element. A `GEP` result carries the slot's
+/// allocation (`eval_gep` keeps it and only moves the offset), so every access through one is an
+/// access to the same private cell, and an out-of-bounds one traps inside the interpreter
+/// outcome that is compared. The returned set holds each private slot AND its derived pointers,
+/// so a `Store` through a derived pointer is recognized as a store into the private cell.
+/// Cost: one pass to index `GEP`s by base, then the probe once per candidate slot, as before.
 fn private_nonescaping_slots(func: &Function) -> HashSet<ValueId> {
-    let mut candidates: HashSet<ValueId> = HashSet::new();
+    let mut candidates: Vec<ValueId> = Vec::new();
     for blk in &func.blocks {
         for node in &blk.body {
             if matches!(node.inst, Inst::Alloca { .. }) {
@@ -715,38 +748,63 @@ fn private_nonescaping_slots(func: &Function) -> HashSet<ValueId> {
             }
         }
     }
+    let mut private: HashSet<ValueId> = HashSet::new();
     if candidates.is_empty() {
-        return candidates;
+        return private;
     }
     let max_id = func.max_value_id();
     if max_id == u32::MAX {
-        candidates.clear(); // no sentinel available -> fail closed
-        return candidates;
+        return private; // no sentinel available -> fail closed
     }
     let sentinel = ValueId::new(max_id + 1);
-    candidates.retain(|&cand| {
-        let map: HashMap<ValueId, ValueId> = std::iter::once((cand, sentinel)).collect();
-        for blk in &func.blocks {
-            for node in &blk.body {
-                let mut probe = node.inst.clone();
-                trust_ir::mem2reg::rewrite_inst(&mut probe, &map);
-                // A benign Load/Store `ptr` use of the slot is fine: restore it, then require
-                // the probe to be otherwise unchanged. Any surviving diff means the slot
-                // appears in a non-`ptr` position -> it escapes.
-                match &mut probe {
-                    Inst::Load { ptr, .. } | Inst::Store { ptr, .. } if *ptr == sentinel => {
-                        *ptr = cand;
-                    }
-                    _ => {}
-                }
-                if probe != node.inst {
-                    return false;
+    let mut geps_by_base: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for blk in &func.blocks {
+        for node in &blk.body {
+            if let Inst::GEP { base, .. } = &node.inst {
+                geps_by_base.entry(*base).or_default().extend(node.results.iter().copied());
+            }
+        }
+    }
+    for cand in candidates {
+        // The slot's pointer family: the slot, and every `GEP` result derived from it.
+        let mut family: Vec<ValueId> = vec![cand];
+        let mut in_family: HashSet<ValueId> = std::iter::once(cand).collect();
+        let mut next = 0;
+        while let Some(&member) = family.get(next) {
+            next += 1;
+            for &derived in geps_by_base.get(&member).into_iter().flatten() {
+                if in_family.insert(derived) {
+                    family.push(derived);
                 }
             }
         }
-        true
-    });
-    candidates
+        let map: HashMap<ValueId, ValueId> = family.iter().map(|&m| (m, sentinel)).collect();
+        let stays_private = func.blocks.iter().flat_map(|blk| &blk.body).all(|node| {
+            let mut probe = node.inst.clone();
+            trust_ir::mem2reg::rewrite_inst(&mut probe, &map);
+            // A benign use of a family pointer — a Load/Store `ptr`, or a `GEP` `base` (whose
+            // results are family members, checked in their own uses) — is fine: restore it,
+            // then require the probe to be otherwise unchanged. Any surviving diff means a
+            // family pointer appears in a non-address position -> the slot escapes.
+            match (&mut probe, &node.inst) {
+                (Inst::Load { ptr, .. }, Inst::Load { ptr: orig, .. })
+                | (Inst::Store { ptr, .. }, Inst::Store { ptr: orig, .. })
+                    if *ptr == sentinel =>
+                {
+                    *ptr = *orig;
+                }
+                (Inst::GEP { base, .. }, Inst::GEP { base: orig, .. }) if *base == sentinel => {
+                    *base = *orig;
+                }
+                _ => {}
+            }
+            probe == node.inst
+        });
+        if stays_private {
+            private.extend(family);
+        }
+    }
+    private
 }
 
 /// Trust (vtable slice 7): the PAIRED promoted-global admission set — the names a
@@ -784,18 +842,26 @@ fn private_nonescaping_slots(func: &Function) -> HashSet<ValueId> {
 /// * **Address-free type.** A paired global whose type contains a pointer would let a
 ///   `Load`-through manufacture an address VALUE outside the audited closure
 ///   (`promoted_addr_closure`); every population type is scalar/aggregate-of-scalars.
+///
+/// Trust (R8-SEAM, `docs/DECISION_QUEUE.md`, taken 2026-10-05): the candidates are enumerated from
+/// `bm`'s globals, not `am`'s. The pairing admits a name exactly when it carries a mint prefix,
+/// is unique on BOTH sides and the unique pair passes every predicate below; enumerating either
+/// side's globals visits exactly those pairs, once each, and the predicates are pure, so the set
+/// is the same set. At the crate seam `am` is the whole assembled crate module and `bm` the
+/// closure-sized oracle bundle, and the `am`-side enumeration scanned every global of `am` once
+/// per promoted global of `am`, per comparison.
 fn paired_admitted_promoted_globals(am: &Module, bm: &Module) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for ga in &am.globals {
-        if !(ga.name.starts_with("__trust_promoted_") || ga.name.starts_with("__trust_bytes_")) {
+    for gb in &bm.globals {
+        if !(gb.name.starts_with("__trust_promoted_") || gb.name.starts_with("__trust_bytes_")) {
             continue;
         }
-        if am.globals.iter().filter(|g| g.name == ga.name).count() != 1 {
-            continue; // duplicated name on the A side -> ambiguous pairing, refuse
+        if bm.globals.iter().filter(|g| g.name == gb.name).count() != 1 {
+            continue; // duplicated name on the B side -> ambiguous pairing, refuse
         }
-        let mut bs = bm.globals.iter().filter(|g| g.name == ga.name);
-        let (Some(gb), None) = (bs.next(), bs.next()) else {
-            continue; // absent or duplicated on the B side -> unpaired/ambiguous, refuse
+        let mut gas = am.globals.iter().filter(|g| g.name == gb.name);
+        let (Some(ga), None) = (gas.next(), gas.next()) else {
+            continue; // absent or duplicated on the A side -> unpaired/ambiguous, refuse
         };
         if ga.mutable || gb.mutable {
             continue;
@@ -1614,9 +1680,22 @@ fn demanded_column_ty(func: &Function, sig: &FuncTy, r: ValueId, declared: &Ty) 
                     merge(&mut demand, ty.clone())?;
                 }
             }
-            Inst::Assert { cond } | Inst::Assume { cond } => {
+            Inst::Assume { cond } => {
                 if *cond == r {
                     merge(&mut demand, Ty::Bool)?;
+                }
+            }
+            Inst::Assert { cond, kind, site } => {
+                if *cond == r {
+                    merge(&mut demand, Ty::Bool)?;
+                }
+                // trust-ir v52: a kind's operands are `usize` (the validator's typing).
+                if kind.operands().is_some_and(|operands| operands.contains(&r)) {
+                    merge(&mut demand, Ty::Usize)?;
+                }
+                // v54: a run-time panic location is a pointer — out of model.
+                if site.and_then(|site| site.location_value()) == Some(r) {
+                    return None;
                 }
             }
             Inst::CondBr { cond, then_args, else_args, .. } => {
@@ -1874,7 +1953,8 @@ fn first_unmodeled_observation(
                     //     other addressable object can reach the return: any other
                     //     `GlobalAddr` fails the arm below, any escaping `Alloca` fails its
                     //     own arm, a private slot's address by definition never leaves
-                    //     Load/Store ptr position, and (since slice 13, replacing the
+                    //     Load/Store ptr position (or an in-cell GEP base whose results stay
+                    //     in those positions), and (since slice 13, replacing the
                     //     call-free bound) a call boundary cannot smuggle one in — call
                     //     results are never tracked, a tracked call ARGUMENT requires the
                     //     seeded callee audit which refuses return positions, and a
@@ -1942,8 +2022,9 @@ fn first_unmodeled_observation(
                         ));
                     }
 
-                    // Trust: a store INTO a private non-escaping slot writes memory no
-                    // observer can read; every other store still fails closed below.
+                    // Trust: a store INTO a private non-escaping slot (through the slot or a
+                    // pointer GEP-derived from it — both are in `private_slots`) writes memory
+                    // no observer can read; every other store still fails closed below.
                     Inst::Store { ptr, .. } if private_slots.contains(ptr) => continue,
 
                     // Trust (vtable slice 7): a shared `Borrow` of an admitted address is a
@@ -2014,12 +2095,296 @@ fn first_unmodeled_observation(
 /// the assembled crate module's spliced entry vs the linked oracle BUNDLE's positional entry —
 /// converting call-bearing clean bodies (the former clean-skip-direct-call class) into real
 /// verdicts. Every note string is byte-identical to the pre-B9-A wording (classifier-stable).
+///
+/// Trust (R8-SEAM, `docs/DECISION_QUEUE.md`, taken 2026-10-05): the body is the pre-R8-SEAM one
+/// split at its own step boundaries with no statement changed — [`plan_comparison`] (steps 2-6),
+/// step 7's wrappers built in COPIES of the two modules ([`build_pointee_wrapper`]),
+/// [`sample_entries`] (step 7's sampled interpretation) and [`conclude_comparison`] (step 8 and
+/// the observation tail) — so that [`compare_entries_in_place`] runs the same steps with the
+/// wrappers appended to, and removed from, two modules the caller owns. In a test build every
+/// call also runs that spelling on copies and the pre-R8-SEAM body itself
+/// (`differential/compare_entries_reference.rs`) and asserts all three reports are one report.
 pub(crate) fn compare_entries(
     thir_module: &Module,
     thir_entry: FuncId,
     oracle: &Module,
     oracle_entry: FuncId,
 ) -> DiffReport {
+    let report = compare_entries_copying(thir_module, thir_entry, oracle, oracle_entry);
+    #[cfg(test)]
+    compare_entries_reference::cross_check(thir_module, thir_entry, oracle, oracle_entry, &report);
+    report
+}
+
+/// Trust (R8-SEAM): [`compare_entries`] on two modules the caller OWNS, without copying either.
+///
+/// Step 7's materialized-referent wrappers ([`append_pointee_wrapper`]) are appended to `thir_module`
+/// and `oracle` themselves — one func type and one function at the end of each, which is exactly
+/// the content of the copy [`build_pointee_wrapper`] returns — and removed again before step 8,
+/// also on unwind, so both modules are returned as they came. Each step reads what it read in the
+/// copying spelling, with one difference: while the samples run, `returns_agree` and
+/// `decoded_enum_sample_suffix` are handed the module WITH the wrapper appended rather than the
+/// module without it. Both read only type tables by existing id (`struct_def`, `enum_def`, `ty`,
+/// `func_type`), which the appended func type and function do not change, so the report is the
+/// same report: same samples, same refusals, nothing admitted that the copying spelling did not
+/// admit. The second value says whether the pointer lane appended wrappers.
+pub(crate) fn compare_entries_in_place(
+    thir_module: &mut Module,
+    thir_entry: FuncId,
+    oracle: &mut Module,
+    oracle_entry: FuncId,
+) -> (DiffReport, bool) {
+    #[cfg(test)]
+    let before = (thir_module.clone(), oracle.clone());
+    let out = compare_entries_appending(thir_module, thir_entry, oracle, oracle_entry);
+    #[cfg(test)]
+    {
+        assert!(*thir_module == before.0, "R8-SEAM: the THIR side was not restored");
+        assert!(*oracle == before.1, "R8-SEAM: the oracle side was not restored");
+        compare_entries_reference::cross_check(thir_module, thir_entry, oracle, oracle_entry, &out.0);
+    }
+    out
+}
+
+/// What steps 2-6 of [`compare_entries`] decided, for steps 7-8.
+struct ComparisonPlan {
+    thir_sig: FuncTy,
+    oracle_sig: FuncTy,
+    pointer_lane: Option<PointerLane>,
+    classes: Vec<ParamClass>,
+    aggregate_tags: BTreeSet<&'static str>,
+    enum_samples: Vec<Option<Vec<(usize, Vec<i128>)>>>,
+    struct_samples: Vec<Option<Vec<Vec<i128>>>>,
+    per_param: Vec<Vec<i128>>,
+}
+
+impl ComparisonPlan {
+    /// The referent step 7 materializes: `(param index, THIR-side pointee, oracle-side pointee)`.
+    fn referent(&self) -> Option<(usize, &Ty, &Ty)> {
+        match &self.pointer_lane {
+            Some(PointerLane::Scalar { index, pointee }) => Some((*index, pointee, pointee)),
+            Some(PointerLane::Aggregate { index, pointee_a, pointee_b }) => {
+                Some((*index, pointee_a, pointee_b))
+            }
+            Some(PointerLane::AggregateCeiling { .. })
+            | Some(PointerLane::AggregateSignatureSplit { .. })
+            | None => None,
+        }
+    }
+}
+
+/// What step 7's sampled interpretation found, for step 8.
+struct Sampled {
+    checked: usize,
+    value_samples: usize,
+    return_comparability_gap: Option<(Vec<i128>, String)>,
+}
+
+/// Step 7's execution sides when the pointer lane wraps the entries: `(module, entry, signature)`.
+struct ExecSides<'e> {
+    thir: (&'e Module, FuncId, &'e FuncTy),
+    oracle: (&'e Module, FuncId, &'e FuncTy),
+}
+
+/// [`compare_entries`] as it ran before R8-SEAM: the wrappers are built in copies.
+fn compare_entries_copying(
+    thir_module: &Module,
+    thir_entry: FuncId,
+    oracle: &Module,
+    oracle_entry: FuncId,
+) -> DiffReport {
+    let plan = match plan_comparison(thir_module, thir_entry, oracle, oracle_entry) {
+        Ok(plan) => plan,
+        Err(report) => return report,
+    };
+    // (7) Differential interpretation: run both modules on every sample, compare return vectors.
+    //
+    // Asymmetry is deliberate. The MIR-side is the TRUSTED oracle; the THIR-side is UNDER TEST. So:
+    //   * If only the ORACLE errors with an *incapacity* code (e.g. a SignatureMismatch from the
+    //     MIR-bridge typing a constant at the wrong width — a known oracle limitation), that is NOT
+    //     evidence the THIR lowering is wrong. We downgrade to coverage-only (`NotRun`), never a
+    //     divergence verdict. The oracle erroring with a genuine *trap* (`Panic`/`UB`) while the
+    //     THIR side produced a value IS a real divergence (the THIR failed to trap).
+    //   * If only the THIR side errors, it is a verdict against THIR ONLY for THIR-internal defect
+    //     codes (malformed IR, signature/type errors, traps); infra limits (fuel/unsupported) are
+    //     coverage-only.
+    //   * `Err`/`Err` is an agreement only when both reproduce the *same genuine trap*.
+    // `Agreed` further requires at least one `(Ok, Ok)` value sample, so a value-returning function
+    // can never pass vacuously on trap-only agreement.
+    // Trust (Q1): materialize the referent. Both sides get an identically-shaped wrapper that
+    // allocates the pointee, stores the sampled value, and calls the entry with the slot; the
+    // sample column is over the POINTEE type, so `exec_sig` (not the entry signature) is what the
+    // args site marshals against.
+    //
+    // `first_unmodeled_observation` below is deliberately NOT re-pointed at the wrapper — it stays
+    // on `thir_entry`/`oracle_entry`. `wrappers_agree` is what pays for that: the wrapper's own
+    // memory effects go uncompared, which is sound only because the two wrappers are the same
+    // program, and that is ASSERTED here rather than argued.
+    //
+    // Trust (Slice B): THE REFERENT IS TWO-SIDED. `pointee_a` builds the THIR wrapper and
+    // `pointee_b` builds the ORACLE's — never one shared value. For `PointerLane::Scalar` the
+    // two ARE the same `Ty` (the lane requires `a == b`), so the pair spelling is byte-identical
+    // in behaviour there; for an aggregate they are two module-local `StructId`s naming the same
+    // proven layout in two different tables, and feeding one side's id to the other is the
+    // manufactured-agreement trap the module docs name. The proven pair is handed to
+    // `wrappers_agree` so its exemption is keyed on exactly these two types and no others.
+    let mut wrapped: Option<(Module, FuncId, FuncTy, Module, FuncId, FuncTy)> = None;
+    if let Some((index, pointee_a, pointee_b)) = plan.referent() {
+        let built = build_pointee_wrapper(thir_module, thir_entry, &plan.thir_sig, index, pointee_a)
+            .zip(build_pointee_wrapper(oracle, oracle_entry, &plan.oracle_sig, index, pointee_b));
+        let Some(((tm, tf, ts), (om, of, os))) = built else {
+            return wrapper_construction_failed();
+        };
+        // Scoped so the two wrapper borrows END before the modules move into `wrapped` below.
+        if let Err(report) = wrappers_are_one_program(
+            &plan,
+            (tm.function_by_id(tf), thir_entry),
+            (om.function_by_id(of), oracle_entry),
+        ) {
+            return report;
+        }
+        wrapped = Some((tm, tf, ts, om, of, os));
+    }
+    let exec = wrapped
+        .as_ref()
+        .map(|(tm, tf, ts, om, of, os)| ExecSides { thir: (tm, *tf, ts), oracle: (om, *of, os) });
+    match sample_entries(thir_module, thir_entry, oracle, oracle_entry, &plan, exec) {
+        Ok(sampled) => conclude_comparison(thir_module, thir_entry, oracle, oracle_entry, &plan, sampled),
+        Err(report) => report,
+    }
+}
+
+/// [`compare_entries_in_place`]'s body: [`compare_entries_copying`] with the wrappers appended to
+/// the two modules and removed again ([`AppendedWrappers`]) instead of built in copies.
+fn compare_entries_appending(
+    thir_module: &mut Module,
+    thir_entry: FuncId,
+    oracle: &mut Module,
+    oracle_entry: FuncId,
+) -> (DiffReport, bool) {
+    let plan = match plan_comparison(thir_module, thir_entry, oracle, oracle_entry) {
+        Ok(plan) => plan,
+        Err(report) => return (report, false),
+    };
+    let Some((index, pointee_a, pointee_b)) = plan.referent() else {
+        let report = match sample_entries(thir_module, thir_entry, oracle, oracle_entry, &plan, None)
+        {
+            Ok(sampled) => {
+                conclude_comparison(thir_module, thir_entry, oracle, oracle_entry, &plan, sampled)
+            }
+            Err(report) => report,
+        };
+        return (report, false);
+    };
+    let sampled = {
+        let appended = AppendedWrappers::new(thir_module, oracle);
+        let built =
+            append_pointee_wrapper(appended.thir, thir_entry, &plan.thir_sig, index, pointee_a).zip(
+                append_pointee_wrapper(appended.oracle, oracle_entry, &plan.oracle_sig, index, pointee_b),
+            );
+        let Some(((tf, ts), (of, os))) = built else {
+            return (wrapper_construction_failed(), true);
+        };
+        if let Err(report) = wrappers_are_one_program(
+            &plan,
+            (appended.thir.function_by_id(tf), thir_entry),
+            (appended.oracle.function_by_id(of), oracle_entry),
+        ) {
+            return (report, true);
+        }
+        let exec = ExecSides { thir: (&*appended.thir, tf, &ts), oracle: (&*appended.oracle, of, &os) };
+        // `appended` is dropped at the end of this block: both wrappers are removed before step 8.
+        sample_entries(&*appended.thir, thir_entry, &*appended.oracle, oracle_entry, &plan, Some(exec))
+    };
+    let report = match sampled {
+        Ok(sampled) => conclude_comparison(thir_module, thir_entry, oracle, oracle_entry, &plan, sampled),
+        Err(report) => report,
+    };
+    (report, true)
+}
+
+/// Trust (R8-SEAM): the wrappers [`compare_entries_appending`] appended, removed on drop — also on
+/// unwind. [`append_pointee_wrapper`] appends one func type and one function to a module and
+/// nothing else (the wrapper carries no proof annotation, so `add_function` synthesizes no
+/// obligation row); truncating the three tables to their lengths before is the module as it came.
+struct AppendedWrappers<'m> {
+    thir: &'m mut Module,
+    oracle: &'m mut Module,
+    lens: [(usize, usize, usize); 2],
+}
+
+impl<'m> AppendedWrappers<'m> {
+    fn new(thir: &'m mut Module, oracle: &'m mut Module) -> Self {
+        let lens = |m: &Module| (m.functions.len(), m.func_types.len(), m.proof_obligations.len());
+        let lens = [lens(thir), lens(oracle)];
+        AppendedWrappers { thir, oracle, lens }
+    }
+}
+
+impl Drop for AppendedWrappers<'_> {
+    fn drop(&mut self) {
+        for (module, (functions, func_types, obligations)) in
+            [(&mut *self.thir, self.lens[0]), (&mut *self.oracle, self.lens[1])]
+        {
+            module.functions.truncate(functions);
+            module.func_types.truncate(func_types);
+            module.proof_obligations.truncate(obligations);
+        }
+    }
+}
+
+/// Step 7's refusal when a wrapper cannot be built (both spellings).
+fn wrapper_construction_failed() -> DiffReport {
+    let mut report = DiffReport::default();
+    report.mode = DiffMode::NotRun;
+    report.notes.push(
+        "could not build sample argument (coverage-only skip): referent wrapper \
+         construction failed"
+            .to_string(),
+    );
+    report
+}
+
+/// Step 7's assertion that the two wrappers are the same program (both spellings).
+fn wrappers_are_one_program(
+    plan: &ComparisonPlan,
+    (wa, thir_entry): (Option<&Function>, FuncId),
+    (wb, oracle_entry): (Option<&Function>, FuncId),
+) -> Result<(), DiffReport> {
+    let Some((index, pointee_a, pointee_b)) = plan.referent() else { return Ok(()) };
+    // The referent exemption is passed ONLY for the aggregate lane. The scalar lane keeps
+    // exact structural equality end to end — `None` here is what makes that a checkable
+    // statement rather than a claim, and `wrappers_agree_across_identically_shaped_sides`
+    // (which passes `None` on both of its assertions) pins it.
+    let exemption = match &plan.pointer_lane {
+        Some(PointerLane::Aggregate { .. }) => Some((index, pointee_a, pointee_b)),
+        _ => None,
+    };
+    let agreement = match (wa, wb) {
+        (Some(wa), Some(wb)) => wrappers_agree(wa, thir_entry, wb, oracle_entry, exemption),
+        _ => Err("a wrapper is unresolvable after construction".to_string()),
+    };
+    if let Err(why) = agreement {
+        let mut report = DiffReport::default();
+        report.mode = DiffMode::NotRun;
+        report.notes.push(format!(
+            "returns/traps not sampled: the two materialized-referent wrappers are not the \
+             same program ({why}); the uncompared-wrapper argument does not hold \
+             (coverage-only skip)"
+        ));
+        return Err(report);
+    }
+    Ok(())
+}
+
+/// Steps 2-6 of [`compare_entries`], verbatim: entry lookup, signature resolution, the
+/// interpretability and signature gates, and the sample space. `Err` is the step's refusal.
+fn plan_comparison(
+    thir_module: &Module,
+    thir_entry: FuncId,
+    oracle: &Module,
+    oracle_entry: FuncId,
+) -> Result<ComparisonPlan, DiffReport> {
     let mut report = DiffReport::default();
     // (2) Both lowerings place the body's function at FuncId::new(0).
     let thir_fn = match thir_module.function_by_id(thir_entry) {
@@ -2028,7 +2393,7 @@ pub(crate) fn compare_entries(
             report.equal = false;
             report.mode = DiffMode::NotRun;
             report.notes.push("THIR-side module has no FuncId(0) (coverage-only skip)".to_string());
-            return report;
+            return Err(report);
         }
     };
     let oracle_fn = match oracle.function_by_id(oracle_entry) {
@@ -2037,7 +2402,7 @@ pub(crate) fn compare_entries(
             report.equal = false;
             report.mode = DiffMode::NotRun;
             report.notes.push("oracle module has no FuncId(0) (coverage-only skip)".to_string());
-            return report;
+            return Err(report);
         }
     };
 
@@ -2047,7 +2412,7 @@ pub(crate) fn compare_entries(
         None => {
             report.mode = DiffMode::NotRun;
             report.notes.push("THIR-side func type missing (coverage-only skip)".to_string());
-            return report;
+            return Err(report);
         }
     };
     let oracle_sig: &FuncTy = match oracle.func_type(oracle_fn.ty) {
@@ -2055,7 +2420,7 @@ pub(crate) fn compare_entries(
         None => {
             report.mode = DiffMode::NotRun;
             report.notes.push("oracle func type missing (coverage-only skip)".to_string());
-            return report;
+            return Err(report);
         }
     };
 
@@ -2065,7 +2430,7 @@ pub(crate) fn compare_entries(
     if thir_sig.is_vararg || oracle_sig.is_vararg {
         report.mode = DiffMode::NotRun;
         report.notes.push("vararg signature is non-interpretable (coverage-only skip)".to_string());
-        return report;
+        return Err(report);
     }
     // Trust (Q1): decide the pointer-param INPUT lane before classifying, because three of its
     // conditions are whole-signature (exactly one read pointer, every other param id-free, no
@@ -2189,7 +2554,7 @@ pub(crate) fn compare_entries(
                                  is READ (dereferenced/reborrowed/passed) on at least one side — \
                                  opaque null sampling refused (coverage-only skip)"
                             ));
-                            return report;
+                            return Err(report);
                         }
                         (Err(e), _) | (_, Err(e)) => {
                             report.mode = DiffMode::NotRun;
@@ -2197,7 +2562,7 @@ pub(crate) fn compare_entries(
                                 "ptr-leaf-read probe failed for aggregate param {i}: {e} \
                                  (coverage-only skip)"
                             ));
-                            return report;
+                            return Err(report);
                         }
                     }
                     aggregate_tags.extend(lanes);
@@ -2218,7 +2583,7 @@ pub(crate) fn compare_entries(
                          coverage-only skip"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 }
                 AggregateParamAdmission::Refused => {}
             }
@@ -2233,7 +2598,7 @@ pub(crate) fn compare_entries(
             report.notes.push(
                 "non-scalar parameter type is non-interpretable (coverage-only skip)".to_string(),
             );
-            return report;
+            return Err(report);
         }
         // Fail-closed opacity proof, on BOTH sides.
         match (param_never_read(thir_fn, i), param_never_read(oracle_fn, i)) {
@@ -2265,7 +2630,7 @@ pub(crate) fn compare_entries(
                          marshallable (leaf/depth/name/placeholder admission refused); \
                          coverage-only skip"
                     ));
-                    return report;
+                    return Err(report);
                 }
                 if matches!(
                     &pointer_lane,
@@ -2278,18 +2643,18 @@ pub(crate) fn compare_entries(
                          body that has never reached step (5) cannot publish a divergence; \
                          coverage-only skip"
                     ));
-                    return report;
+                    return Err(report);
                 }
                 report.notes.push(format!(
                     "param {i} ({t}) is READ (dereferenced/used) — opaque sampling refused \
                      (coverage-only skip)"
                 ));
-                return report;
+                return Err(report);
             }
             (Err(e), _) | (_, Err(e)) => {
                 report.mode = DiffMode::NotRun;
                 report.notes.push(format!("opacity scan failed ({e}); coverage-only skip"));
-                return report;
+                return Err(report);
             }
         }
     }
@@ -2310,7 +2675,7 @@ pub(crate) fn compare_entries(
             "scalar param count {} exceeds differential cap {} (coverage-only skip)",
             scalar_params, MAX_PARAMS
         ));
-        return report;
+        return Err(report);
     }
 
     // (5) Interface divergence: the two front-ends must agree on the signature. Comparison is
@@ -2355,7 +2720,7 @@ pub(crate) fn compare_entries(
                      coverage-only skip (fail-closed)"
                         .to_string(),
                 );
-                return report;
+                return Err(report);
             }
             report.equal = false;
             report.mode = DiffMode::MirOracle;
@@ -2363,7 +2728,7 @@ pub(crate) fn compare_entries(
                 "signature divergence: THIR {:?}->{:?} vs MIR {:?}->{:?}",
                 thir_sig.params, thir_sig.returns, oracle_sig.params, oracle_sig.returns
             ));
-            return report;
+            return Err(report);
         }
         Err(why) => {
             report.equal = false;
@@ -2371,7 +2736,7 @@ pub(crate) fn compare_entries(
             report.notes.push(format!(
                 "signature comparability failure ({why}); coverage-only skip (fail-closed)"
             ));
-            return report;
+            return Err(report);
         }
     }
 
@@ -2419,7 +2784,7 @@ pub(crate) fn compare_entries(
             "ADT-interior literal byte arithmetic ({why}); the interpreter derives its own ADT \
              layout and would execute an offset it did not derive; coverage-only skip"
         ));
-        return report;
+        return Err(report);
     }
 
     // (6) Sample space: cross-product of per-SCALAR-param boundary+mid values (one empty
@@ -2472,7 +2837,7 @@ pub(crate) fn compare_entries(
                          referent type unavailable"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 };
                 per_param.push(sample_values(&pointee));
             }
@@ -2496,7 +2861,7 @@ pub(crate) fn compare_entries(
                          aggregate referent type unavailable"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 };
                 let Some(samples) = aggregate_abstract_samples(thir_module, &pointee) else {
                     report.mode = DiffMode::NotRun;
@@ -2505,7 +2870,7 @@ pub(crate) fn compare_entries(
                          referent sample description unavailable"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 };
                 per_param.push((0..samples.len() as i128).collect());
                 struct_samples[i] = Some(samples);
@@ -2524,7 +2889,7 @@ pub(crate) fn compare_entries(
                          description unavailable"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 };
                 per_param.push((0..samples.len() as i128).collect());
                 struct_samples[i] = Some(samples);
@@ -2541,7 +2906,7 @@ pub(crate) fn compare_entries(
                          description unavailable"
                             .to_string(),
                     );
-                    return report;
+                    return Err(report);
                 };
                 per_param.push((0..samples.len() as i128).collect());
                 enum_samples[i] = Some(samples);
@@ -2549,89 +2914,38 @@ pub(crate) fn compare_entries(
             ParamClass::Opaque => {}
         }
     }
-    // (7) Differential interpretation: run both modules on every sample, compare return vectors.
-    //
-    // Asymmetry is deliberate. The MIR-side is the TRUSTED oracle; the THIR-side is UNDER TEST. So:
-    //   * If only the ORACLE errors with an *incapacity* code (e.g. a SignatureMismatch from the
-    //     MIR-bridge typing a constant at the wrong width — a known oracle limitation), that is NOT
-    //     evidence the THIR lowering is wrong. We downgrade to coverage-only (`NotRun`), never a
-    //     divergence verdict. The oracle erroring with a genuine *trap* (`Panic`/`UB`) while the
-    //     THIR side produced a value IS a real divergence (the THIR failed to trap).
-    //   * If only the THIR side errors, it is a verdict against THIR ONLY for THIR-internal defect
-    //     codes (malformed IR, signature/type errors, traps); infra limits (fuel/unsupported) are
-    //     coverage-only.
-    //   * `Err`/`Err` is an agreement only when both reproduce the *same genuine trap*.
-    // `Agreed` further requires at least one `(Ok, Ok)` value sample, so a value-returning function
-    // can never pass vacuously on trap-only agreement.
-    // Trust (Q1): materialize the referent. Both sides get an identically-shaped wrapper that
-    // allocates the pointee, stores the sampled value, and calls the entry with the slot; the
-    // sample column is over the POINTEE type, so `exec_sig` (not the entry signature) is what the
-    // args site marshals against.
-    //
-    // `first_unmodeled_observation` below is deliberately NOT re-pointed at the wrapper — it stays
-    // on `thir_entry`/`oracle_entry`. `wrappers_agree` is what pays for that: the wrapper's own
-    // memory effects go uncompared, which is sound only because the two wrappers are the same
-    // program, and that is ASSERTED here rather than argued.
-    //
-    // Trust (Slice B): THE REFERENT IS TWO-SIDED. `pointee_a` builds the THIR wrapper and
-    // `pointee_b` builds the ORACLE's — never one shared value. For `PointerLane::Scalar` the
-    // two ARE the same `Ty` (the lane requires `a == b`), so the pair spelling is byte-identical
-    // in behaviour there; for an aggregate they are two module-local `StructId`s naming the same
-    // proven layout in two different tables, and feeding one side's id to the other is the
-    // manufactured-agreement trap the module docs name. The proven pair is handed to
-    // `wrappers_agree` so its exemption is keyed on exactly these two types and no others.
-    let mut wrapped: Option<(Module, FuncId, FuncTy, Module, FuncId, FuncTy)> = None;
-    let referent: Option<(usize, &Ty, &Ty)> = match &pointer_lane {
-        Some(PointerLane::Scalar { index, pointee }) => Some((*index, pointee, pointee)),
-        Some(PointerLane::Aggregate { index, pointee_a, pointee_b }) => {
-            Some((*index, pointee_a, pointee_b))
-        }
-        Some(PointerLane::AggregateCeiling { .. })
-        | Some(PointerLane::AggregateSignatureSplit { .. })
-        | None => None,
-    };
-    if let Some((index, pointee_a, pointee_b)) = referent {
-        let built = build_pointee_wrapper(thir_module, thir_entry, thir_sig, index, pointee_a)
-            .zip(build_pointee_wrapper(oracle, oracle_entry, oracle_sig, index, pointee_b));
-        let Some(((tm, tf, ts), (om, of, os))) = built else {
-            report.mode = DiffMode::NotRun;
-            report.notes.push(
-                "could not build sample argument (coverage-only skip): referent wrapper \
-                 construction failed"
-                    .to_string(),
-            );
-            return report;
-        };
-        // The referent exemption is passed ONLY for the aggregate lane. The scalar lane keeps
-        // exact structural equality end to end — `None` here is what makes that a checkable
-        // statement rather than a claim, and `wrappers_agree_across_identically_shaped_sides`
-        // (which passes `None` on both of its assertions) pins it.
-        let exemption = match &pointer_lane {
-            Some(PointerLane::Aggregate { .. }) => Some((index, pointee_a, pointee_b)),
-            _ => None,
-        };
-        // Scoped so the two wrapper borrows END before the modules move into `wrapped` below.
-        let agreement = match (tm.function_by_id(tf), om.function_by_id(of)) {
-            (Some(wa), Some(wb)) => wrappers_agree(wa, thir_entry, wb, oracle_entry, exemption),
-            _ => Err("a wrapper is unresolvable after construction".to_string()),
-        };
-        if let Err(why) = agreement {
-            report.mode = DiffMode::NotRun;
-            report.notes.push(format!(
-                "returns/traps not sampled: the two materialized-referent wrappers are not the \
-                 same program ({why}); the uncompared-wrapper argument does not hold \
-                 (coverage-only skip)"
-            ));
-            return report;
-        }
-        wrapped = Some((tm, tf, ts, om, of, os));
-    }
-    let (thir_exec_module, thir_exec_entry, thir_exec_sig) = match &wrapped {
-        Some((m, f, s, ..)) => (m, *f, s),
+    Ok(ComparisonPlan {
+        thir_sig: thir_sig.clone(),
+        oracle_sig: oracle_sig.clone(),
+        pointer_lane,
+        classes,
+        aggregate_tags,
+        enum_samples,
+        struct_samples,
+        per_param,
+    })
+}
+
+/// Step 7 of [`compare_entries`], verbatim: the sampled interpretation of both sides, on the
+/// wrapped entries when `exec` is given. `Err` is the step's verdict or refusal.
+fn sample_entries(
+    thir_module: &Module,
+    thir_entry: FuncId,
+    oracle: &Module,
+    oracle_entry: FuncId,
+    plan: &ComparisonPlan,
+    exec: Option<ExecSides<'_>>,
+) -> Result<Sampled, DiffReport> {
+    let mut report = DiffReport::default();
+    let ComparisonPlan {
+        thir_sig, oracle_sig, classes, enum_samples, struct_samples, per_param, ..
+    } = plan;
+    let (thir_exec_module, thir_exec_entry, thir_exec_sig) = match &exec {
+        Some(ExecSides { thir, .. }) => *thir,
         None => (thir_module, thir_entry, thir_sig),
     };
-    let (oracle_exec_module, oracle_exec_entry, oracle_exec_sig) = match &wrapped {
-        Some((.., m, f, s)) => (m, *f, s),
+    let (oracle_exec_module, oracle_exec_entry, oracle_exec_sig) = match &exec {
+        Some(ExecSides { oracle, .. }) => *oracle,
         None => (oracle, oracle_entry, oracle_sig),
     };
 
@@ -2683,7 +2997,7 @@ pub(crate) fn compare_entries(
                 report
                     .notes
                     .push(format!("could not build sample argument (coverage-only skip): {why}"));
-                return report;
+                return Err(report);
             }
         };
         let decoded =
@@ -2736,7 +3050,7 @@ pub(crate) fn compare_entries(
                                 "DIVERGENCE on input {:?}{decoded}: THIR returned {:?}, MIR oracle returned {:?}",
                                 tuple, a.returns, b.returns
                             ));
-                            return report;
+                            return Err(report);
                         }
                     }
                     Err(why) => {
@@ -2767,7 +3081,7 @@ pub(crate) fn compare_entries(
                          defect masked by the oracle's incapacity, NOT a trap agreement",
                         tuple, ea, eb
                     ));
-                    return report;
+                    return Err(report);
                 } else {
                     report.equal = false;
                     report.mode = DiffMode::NotRun;
@@ -2776,7 +3090,7 @@ pub(crate) fn compare_entries(
                          coverage-only skip",
                         tuple, ea, eb
                     ));
-                    return report;
+                    return Err(report);
                 }
             }
             // Only the ORACLE errored. Incapacity ⇒ coverage-only; a real trap ⇒ THIR failed to trap.
@@ -2789,7 +3103,7 @@ pub(crate) fn compare_entries(
                         "DIVERGENCE on input {:?}{decoded}: THIR returned {:?} but MIR oracle proved a trap ({})",
                         tuple, a.returns, eb
                     ));
-                    return report;
+                    return Err(report);
                 }
                 report.equal = false;
                 report.mode = DiffMode::NotRun;
@@ -2798,7 +3112,7 @@ pub(crate) fn compare_entries(
                      NOT a THIR divergence",
                     eb
                 ));
-                return report;
+                return Err(report);
             }
             // Only the THIR side errored. A verdict against THIR only for THIR-internal defects.
             (Err(ea), Ok(b)) => {
@@ -2810,18 +3124,33 @@ pub(crate) fn compare_entries(
                         "DIVERGENCE on input {:?}{decoded}: THIR errored ({}) but MIR oracle returned {:?}",
                         tuple, ea, b.returns
                     ));
-                    return report;
+                    return Err(report);
                 }
                 report.equal = false;
                 report.mode = DiffMode::NotRun;
                 report
                     .notes
                     .push(format!("THIR side hit an infra limit ({}); coverage-only skip", ea));
-                return report;
+                return Err(report);
             }
         }
     }
 
+    Ok(Sampled { checked, value_samples, return_comparability_gap })
+}
+
+/// Step 8 and the observation tail of [`compare_entries`], verbatim.
+fn conclude_comparison(
+    thir_module: &Module,
+    thir_entry: FuncId,
+    oracle: &Module,
+    oracle_entry: FuncId,
+    plan: &ComparisonPlan,
+    sampled: Sampled,
+) -> DiffReport {
+    let mut report = DiffReport::default();
+    let ComparisonPlan { classes, aggregate_tags, .. } = plan;
+    let Sampled { checked, value_samples, return_comparability_gap } = sampled;
     // (8) Agreement requires at least one real value sample (never a vacuous trap-only pass).
     if value_samples == 0 {
         report.equal = false;
@@ -2938,6 +3267,7 @@ pub(crate) fn compare_entries(
     });
     report
 }
+
 
 /// Comparison depth cap for `tys_agree`/`value_agree`. The producer refuses recursive Adts
 /// (`adt_visit_stack`), so any chain deeper than this is either an oracle-side recursive def or
@@ -3415,6 +3745,40 @@ fn tys_agree(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) -> Result<boo
              Array); coverage-only"
                 .to_string(),
         ),
+        // Trust (lane seq-carrier): the OWNED-SEQUENCE spelling split, the exact
+        // array-vs-tuple shape above. The two sides describe `Vec<T>` at two
+        // different levels ON PURPOSE and neither is wrong:
+        //   * the PRODUCER lowers rustc's `ty::Adt(Vec)` structurally, so it
+        //     spells the real 24-byte three-word layout — measured on the sealed
+        //     pack `f558ea288`, `pub fn id_vec(v: Vec<u64>) -> Vec<u64> { v }`
+        //     emits `struct @std::vec::Vec<u64> { struct.7, usize } size=24
+        //     align=8 id=8` over a registered RawVec/Unique/NonNull chain;
+        //   * the ORACLE is fed by `trust-mir-extract`, which replaces that
+        //     expansion WHOLESALE with `trust_types::Ty::Seq { elem }` precisely
+        //     so the element type survives (the expansion mentions `T` nowhere),
+        //     and `trust-ir-bridge`'s `map_type_ctx` therefore spells it
+        //     `Ty::Sequence(elem)`.
+        // Before this arm the pair fell to the raw-equality leaf below →
+        // `Ok(false)` → a MANUFACTURED "signature divergence" for every
+        // `Vec`-typed position, the moment the oracle stopped hard-erroring on
+        // `Ty::Seq` at the `map_type` wall. `Err` keeps it coverage-only
+        // (`NotRun`), the closure-split / enum-split / array-vs-tuple precedent.
+        // QUARANTINE, on the same terms as those: this rule carries no sequence
+        // provenance, is coverage accounting only, and MUST NOT be cited as
+        // parity evidence. An `Agreed` over these pairs must first align the two
+        // spellings — it may never be bought by weakening this arm.
+        //
+        // SCOPED TO THE MEASURED SPELLING, deliberately. `Ty::Struct` is what the
+        // producer was measured to emit; a DEGRADED producer-side `Ty::Unit` needs
+        // no arm here because `tys_agree_modulo_degraded_unit` already reclassifies
+        // that `Ok(false)` into the Err channel, and widening this pattern to `Unit`
+        // would additionally swallow a genuine `()`-vs-sequence mismatch. Any other
+        // producer spelling should be MEASURED before it is added, not assumed.
+        (Ty::Struct(_), Ty::Sequence(_)) | (Ty::Sequence(_), Ty::Struct(_)) => Err(
+            "owned-sequence spelling split (producer expands Vec<T> structurally, oracle \
+             spells Ty::Sequence); coverage-only"
+                .to_string(),
+        ),
         // Table-free leaves (scalars/Ptr/Unit/Never/Bool/floats) compare directly; any
         // CROSS-KIND pair also lands here as a plain inequality (a real divergence).
         _ => Ok(a == b),
@@ -3493,6 +3857,39 @@ fn values_agree_list(
     }
 }
 
+/// [`values_agree_list`] over two interpreter arrays, with the same verdict: unequal lengths
+/// disagree; any element pair that disagrees makes the arrays disagree (whatever else refused);
+/// otherwise the first refusal is the answer; otherwise they agree. Decided on the arrays'
+/// SHARED STRUCTURE (`ArrayValue::try_zip_with`): a uniform run is compared once against the
+/// other side's stored values, never once per element of the run.
+fn array_values_agree(
+    am: &Module,
+    bm: &Module,
+    xs: &ArrayValue,
+    ys: &ArrayValue,
+    depth: u32,
+) -> Result<bool, String> {
+    if xs.len() != ys.len() {
+        return Ok(false);
+    }
+    let mut first_gap: Option<String> = None;
+    let zipped = xs.try_zip_with(ys, |x, y| match value_agree(am, bm, x, y, depth) {
+        Ok(true) => Ok(x.clone()),
+        Ok(false) => Err(()),
+        Err(why) => {
+            if first_gap.is_none() {
+                first_gap = Some(format!("array element: {why}"));
+            }
+            Ok(x.clone())
+        }
+    });
+    match (zipped, first_gap) {
+        (Err(()), _) => Ok(false),
+        (Ok(_), Some(why)) => Err(why),
+        (Ok(_), None) => Ok(true),
+    }
+}
+
 fn value_agree(
     am: &Module,
     bm: &Module,
@@ -3507,11 +3904,18 @@ fn value_agree(
         return Ok(false);
     }
     match (&x.kind, &y.kind) {
-        (InterpretValueKind::Aggregate(xs), InterpretValueKind::Aggregate(ys))
-        | (InterpretValueKind::Array(xs), InterpretValueKind::Array(ys))
+        (InterpretValueKind::Aggregate(xs), InterpretValueKind::Aggregate(ys)) => {
+            values_agree_list(am, bm, xs, ys, depth - 1)
+        }
+        // COMPILE-FORCED by trust-ir v50: array and vector values are the interpreter's
+        // structured `ArrayValue` (a uniform run is ONE stored value), not a `Vec`. Same verdict
+        // as the list comparison, decided on the two values' shared structure. A sequence value
+        // is held the same way since trust-ir's persistent sequences (it was a `Vec` compared as
+        // a list).
+        (InterpretValueKind::Array(xs), InterpretValueKind::Array(ys))
         | (InterpretValueKind::Vector(xs), InterpretValueKind::Vector(ys))
         | (InterpretValueKind::Sequence(xs), InterpretValueKind::Sequence(ys)) => {
-            values_agree_list(am, bm, xs, ys, depth - 1)
+            array_values_agree(am, bm, xs, ys, depth - 1)
         }
         // These payloads contain ids minted independently by each module/execution. Raw equality
         // can false-green when both counters happen to allocate the same number. Establishing
@@ -3521,8 +3925,12 @@ fn value_agree(
         | (_, InterpretValueKind::Closure { .. })
         | (InterpretValueKind::FnDef(_), _)
         | (_, InterpretValueKind::FnDef(_))
-        | (InterpretValueKind::Frame(_), _)
-        | (_, InterpretValueKind::Frame(_)) => {
+        // Trust (2026-09-20): `Frame` became a STRUCT variant (it carries
+        // `lineage`) in the trust-ir the pin moved to. `{ .. }` matches exactly
+        // the set `(_)` did, so this arm's meaning is unchanged — every frame
+        // still refuses, which is what the comment above it promises.
+        | (InterpretValueKind::Frame { .. }, _)
+        | (_, InterpretValueKind::Frame { .. }) => {
             Err("callable/frame identity comparison is not modeled".to_string())
         }
         // Everything else — scalar kinds, pointers, and any CROSS-KIND pair (plain
@@ -3545,7 +3953,7 @@ pub(crate) fn oracle_has_const_false_assert(module: &Module) -> bool {
                             false_ids.insert(r);
                         }
                     }
-                    Inst::Assert { cond } if false_ids.contains(cond) => return true,
+                    Inst::Assert { cond, .. } if false_ids.contains(cond) => return true,
                     _ => {}
                 }
             }
@@ -3582,7 +3990,9 @@ fn const_false_assert_sites(module: &Module) -> Vec<(usize, usize, usize)> {
                             false_ids.insert(r);
                         }
                     }
-                    Inst::Assert { cond } if false_ids.contains(cond) => sites.push((fi, bi, ni)),
+                    Inst::Assert { cond, .. } if false_ids.contains(cond) => {
+                        sites.push((fi, bi, ni))
+                    }
                     _ => {}
                 }
             }
@@ -3835,7 +4245,7 @@ pub(crate) fn neutralize_drop_glue_markers(module: &mut Module) -> DropGlueMarke
                 InstrNode::new(Inst::Const { ty: Ty::Bool, value: Constant::Bool(true) })
                     .with_result(true_id),
             );
-            if let Inst::Assert { cond } = &mut blk.body[ni + 1].inst {
+            if let Inst::Assert { cond, .. } = &mut blk.body[ni + 1].inst {
                 *cond = true_id;
                 audit.neutralized += 1;
             }
@@ -4089,8 +4499,9 @@ fn module_has_undef(module: &Module) -> bool {
 /// Trust (B9-B1): classification of a module's `Inst::Undef` occurrences. The reference
 /// interpreter executes `Inst::Undef` EAGERLY as `UndefinedBehavior` (a sound over-approximation
 /// of the poison-seed reading), so an oracle that REACHES one traps on every input. But the
-/// bridge's dominant Undef use is a DEAD SEED: an aggregate immediately and fully overwritten by
-/// an InsertField chain before any observation — semantically inert. `DeadSeeds` = every Undef
+/// bridge's remaining Undef use (and, before BMC-LANE-1, its dominant one) is a DEAD SEED: an
+/// aggregate immediately and fully overwritten by an InsertField chain before any observation —
+/// semantically inert. `DeadSeeds` = every Undef
 /// in the module is such a proven-dead seed (substitutable); `Live` = at least one Undef could
 /// be observed (fail-closed skip); `None` = no Undef at all.
 pub(crate) enum UndefClass {
@@ -4382,7 +4793,10 @@ fn zero_const_depth(module: &Module, ty: &Ty, fuel: u32) -> Option<Constant> {
         Ty::Array(id, n) => {
             let elem = module.ty(*id)?;
             let z = zero_const_depth(module, elem, fuel)?;
-            Some(Constant::Array(vec![z; *n as usize]))
+            // trust-ir v50: `n` copies of the element's zero in CONSTANT size — one
+            // `Constant::splat`, the canonical spelling the producer's seeds use (the slice-7
+            // pairing compares initializers bit-exactly) — never `n` constants.
+            Some(Constant::splat(z, *n))
         }
         // Trust (B3-1b E5): a first-class enum zero-seeds as VARIANT 0 at its
         // EFFECTIVE discriminant (never the index) with recursively zero-seeded
@@ -4548,9 +4962,10 @@ pub(crate) fn rewrite_bool_not_icmp(module: &mut Module) {
 }
 
 /// Trust (vtable slice 12): rewrite `InsertField { ty: Ty::Array(..), aggregate, field,
-/// value }` — the bridge's ARRAY-LITERAL aggregate spelling (`Rvalue::Aggregate(Array)`
-/// emits an InsertField chain over the `Undef [T x N]` seed, measured on
-/// const-vecs-and-slices::y) — into the interpreter-native positional-write idiom the
+/// value }` — the bridge's ARRAY-LITERAL aggregate spelling before BMC-LANE-1
+/// (`Rvalue::Aggregate(Array)` emitted an InsertField chain over the `Undef [T x N]` seed,
+/// measured on const-vecs-and-slices::y; it is now one `MakeAggregate`/`ArraySplat`, which the
+/// interpreter executes natively) — into the interpreter-native positional-write idiom the
 /// bridge's own REPEAT lane already uses: a fresh `Const I64 field` node + `InsertElement
 /// { ty, array, index, value }`. Semantically identical (a positional write into lane
 /// `field`); required because the PINNED interpreter's `eval_insert_field` has arms for
@@ -4655,21 +5070,27 @@ pub(crate) fn substitute_dead_seeds(mut module: Module) -> Module {
 ///   with `ty` equal to the alloca's (a second store — borrow-use-issue-46875's
 ///   `_1 = const 7` AFTER `_2 = &_1`, where an initializer-`5` global would be a WRONG
 ///   final memory — refuses);
-/// * every OTHER use of `p` is a single-result shared `Borrow { ptr: p }` (≥ 1),
-///   located in the STORE'S OWN BLOCK at a LATER position — positional order within one
-///   block is execution order, which is what proves no alias to the slot exists before
-///   the store runs (an alias read of the pre-store UNINIT slot would trap where the
-///   always-initialized global does not). A `Load` (`read_local` after storage exists),
-///   a `BorrowMut`, a `Copy` of `p` (the `&raw const` lane), a GEP, a call/branch/
-///   return operand, or a cross-block borrow all refuse. Use detection is the
-///   sentinel-remap probe (`private_nonescaping_slots`), so an operand position this
-///   list never anticipated fails CLOSED;
+/// * every OTHER use of `p` is a single-result SHARED REFERENCE of `p` (≥ 1): a
+///   `Borrow { ptr: p }`, or — the oracle's spelling of `&_2` since 2026-10-08, when the
+///   MIR bridge stopped spelling a thin reference as a permission instruction (trust-ir
+///   docs/SPEC_RATIFICATIONS.md, "A Rust reference carries no permission instruction") —
+///   a `Copy { ty: Ptr, operand: p }` carrying the `SharedBorrow` claim and no
+///   `UniqueBorrow` claim, each located in the STORE'S OWN BLOCK at a LATER position —
+///   positional order within one block is execution order, which is what proves no alias
+///   to the slot exists before the store runs (an alias read of the pre-store UNINIT slot
+///   would trap where the always-initialized global does not). A `Load` (`read_local`
+///   after storage exists), a `BorrowMut`, a `UniqueBorrow`-claimed `Copy` (`&mut _2`), a
+///   claim-free `Copy` of `p` (the `&raw const` lane), a GEP, a call/branch/return
+///   operand, or a cross-block reference all refuse. Use detection is the sentinel-remap
+///   probe (`private_nonescaping_slots`), so an operand position this list never
+///   anticipated fails CLOSED;
 /// * `v` const-folds to a data-only constant: defined by `Inst::Const` (identity-bearing
 ///   constants — `FnDef`/`SymbolAddr`/`Closure` — refused via
 ///   `constant_materializes_uncomparable_identity`), through `Inst::Copy` hops (the
-///   operand-materialization copy above), or by an `InsertField` chain over such (the
-///   bridge's aggregate build after `substitute_dead_seeds` replaced its dead `Undef`
-///   seed — `Foo(const 3)` folds to `Aggregate([Int 3])`; run this AFTER the dead-seed
+///   operand-materialization copy above), by a complete `MakeAggregate` of such (the
+///   bridge's aggregate build since BMC-LANE-1 — `Foo(const 3)` folds to
+///   `Aggregate([Int 3])`), or by an `InsertField` chain over such (a seeded build after
+///   `substitute_dead_seeds` replaced its dead `Undef` seed; run this AFTER the dead-seed
 ///   substitution). The chain nodes stay in place afterwards (pure, allocation-free).
 ///
 /// # The rewrite
@@ -4677,9 +5098,9 @@ pub(crate) fn substitute_dead_seeds(mut module: Module) -> Module {
 /// Append `Global { name: "__trust_promoted_{n}", ty, mutable: false, initializer:
 /// Some(folded k), linkage: Internal }` — the THIR mint's exact shape — then replace the
 /// `Alloca` ITSELF with `Inst::GlobalAddr { global }` keeping the SAME result id `p`,
-/// and DELETE the `Store`. The `Borrow`s stay: `Borrow` of `p` is a pure pointer
-/// pass-through in the interpreter, and a shared borrow of a global's stable address is
-/// exactly what the source program means.
+/// and DELETE the `Store`. The references stay: a `Borrow` or claim-carrying `Copy` of
+/// `p` is a pure pointer pass-through in the interpreter, and a shared reference of a
+/// global's stable address is exactly what the source program means.
 ///
 /// REPLACING THE ALLOCA IN PLACE is the load-bearing move, not style:
 /// `InterpretPointer` raw-compares `{ allocation, offset }`, and allocation ids are
@@ -4807,6 +5228,21 @@ pub(crate) fn respell_promoted_slots_as_globals(module: &mut Module) -> usize {
                             Inst::Borrow { ptr } if *ptr == p && unode.results.len() == 1 => {
                                 borrows.push((ubi, uni));
                             }
+                            // The same shared reference in the MIR bridge's spelling
+                            // since 2026-10-08: a thin `Copy` of the slot address
+                            // carrying the `SharedBorrow` claim. A claim-free `Copy`
+                            // (`&raw const`) and a `UniqueBorrow`-claimed one (`&mut`)
+                            // still take the refusing arm below.
+                            Inst::Copy { ty: Ty::Ptr, operand }
+                                if *operand == p
+                                    && unode.results.len() == 1
+                                    && unode.proofs.contains(&trust_ir::ProofAnnotation::SharedBorrow)
+                                    && !unode
+                                        .proofs
+                                        .contains(&trust_ir::ProofAnnotation::UniqueBorrow) =>
+                            {
+                                borrows.push((ubi, uni));
+                            }
                             _ => {
                                 ok = false; // second store, mutable/raw escape, load, ...
                                 break 'audit;
@@ -4854,6 +5290,13 @@ pub(crate) fn respell_promoted_slots_as_globals(module: &mut Module) -> usize {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            // v41, pre-v41 meanings: an internal promoted constant asks for no explicit
+            // section, makes no visibility claim, and wants no `#[used]` retention (a
+            // promotion nothing references SHOULD be droppable). See the note at the
+            // first `Global` site in `lib.rs`.
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         let func = &mut module.functions[plan.func];
         let (bi, ni) = plan.alloca;
@@ -5054,6 +5497,13 @@ pub(crate) fn respell_thir_array_slots_as_globals(module: &Module) -> Option<Mod
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            // v41, pre-v41 meanings: an internal promoted constant asks for no explicit
+            // section, makes no visibility claim, and wants no `#[used]` retention (a
+            // promotion nothing references SHOULD be droppable). See the note at the
+            // first `Global` site in `lib.rs`.
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         let func = &mut out.functions[plan.func];
         let (bi, ni) = plan.alloca;
@@ -5079,9 +5529,10 @@ pub(crate) fn respell_thir_array_slots_as_globals(module: &Module) -> Option<Mod
 
 /// Fold the stored value's defining chain to a data-only `Constant`, or refuse.
 /// `Const` of a non-identity constant is a leaf; `Copy` is the bridge's
-/// operand-materialization hop and folds through; `InsertField` over a foldable
-/// aggregate with a foldable element folds structurally (the bridge's
-/// post-`substitute_dead_seeds` aggregate build). Everything else — params, `BinOp`
+/// operand-materialization hop and folds through; a complete `MakeAggregate` of
+/// foldable lanes (the bridge's aggregate build) and `InsertField` over a foldable
+/// aggregate with a foldable element (the post-`substitute_dead_seeds` build of a
+/// partial construction) fold structurally. Everything else — params, `BinOp`
 /// results, loads, symbolic carriers — refuses, which keeps runtime-valued slots
 /// (locals-in-const-fn's `bar(mut i)`) out by construction. A param has no defining
 /// node at all, so it refuses through the `defs` lookup.
@@ -5090,40 +5541,142 @@ fn fold_stored_constant(
     v: ValueId,
     depth: u32,
 ) -> Option<Constant> {
+    match fold_stored_value(defs, v, depth)? {
+        Folded::Done(c) => Some(c),
+        // A list the chain wrote into, spelled canonically ONCE, here at the top (v50 §3.1): a
+        // list that is uniform only partway through the chain stays a list for the writes after
+        // it, so a later write cannot meet a `Splat` it would have to refuse.
+        Folded::List(elems) => canonical_written_array(elems),
+        // v50: a uniform seed (`Constant::Splat`) the chain wrote into. No write: the seed
+        // itself. Every lane written: the seed survives in no lane, and the array is exactly
+        // the writes — as many as the chain has instructions, so spelling them is
+        // proportional to the program. A seed lane surviving beside a written one would need
+        // one constant per lane of the ARRAY, which nothing in the program bounds, so that
+        // fold refuses (the slot keeps its `stored-value-not-constant` decline).
+        Folded::SplatWrites { elem, len, writes } => {
+            if writes.is_empty() {
+                Some(Constant::splat(elem, len))
+            } else if writes.len() as u64 == len {
+                canonical_written_array(writes.into_values().collect())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The canonical spelling of an array the chain WROTE, or a refusal.
+///
+/// `Constant::array` identifies the list spellings of ONE array value (`Array`, `Aggregate`, raw
+/// `Bytes`) when it decides uniformity, and keeps the FIRST element's spelling for the `Splat`.
+/// Over elements the chain wrote one by one that identification is not a re-spelling but a
+/// verdict: `[Aggregate([1, 2]), Array([1, 2])]` written into a `[(u8, u16); 2]` slot — the second
+/// element ill-typed at a tuple — would collapse to `Splat { Aggregate([1, 2]), 2 }`, a
+/// well-typed constant that no longer carries the write the comparison exists to judge.
+/// Ratification review 2026-09-28: collapse only a BIT-EXACT uniform list
+/// (`Constant::is_uniform_list`); a list uniform only up to spelling refuses the fold, and the
+/// slot keeps its `stored-value-not-constant` decline — a refusal, never an agreement.
+fn canonical_written_array(elems: Vec<Constant>) -> Option<Constant> {
+    let bit_exact = Constant::is_uniform_list(&elems);
+    match Constant::array(elems) {
+        Constant::Splat { .. } if !bit_exact => None,
+        canonical => Some(canonical),
+    }
+}
+
+/// What [`fold_stored_constant`] carries up a chain: a finished constant; an array LIST the
+/// chain has written into, not yet re-spelled canonically (that happens once, at the top); or a
+/// v50 uniform seed plus the constant-index writes applied to it so far, kept SPARSE so a write
+/// into a `Constant::Splat` never costs the array's length.
+enum Folded {
+    Done(Constant),
+    List(Vec<Constant>),
+    SplatWrites { elem: Constant, len: u64, writes: std::collections::BTreeMap<u64, Constant> },
+}
+
+fn fold_stored_value(defs: &HashMap<ValueId, &Inst>, v: ValueId, depth: u32) -> Option<Folded> {
     if depth == 0 {
         return None;
     }
     match defs.get(&v)? {
         Inst::Const { value, .. } if !constant_materializes_uncomparable_identity(value) => {
-            Some(value.clone())
+            Some(Folded::Done(value.clone()))
         }
-        Inst::Copy { operand, .. } => fold_stored_constant(defs, *operand, depth - 1),
+        Inst::Copy { operand, .. } => fold_stored_value(defs, *operand, depth - 1),
+        // v50 uniform array REGISTER: `[v; n]` where `v` itself folds to the constant `e` is the
+        // constant `Constant::splat(e, n)` — the value the producer spells `Const(Splat)` when
+        // the element is a literal, and `ArraySplat` when it is not (a local, an aggregate, a
+        // nested repeat). O(1) in `n`. `Constant::splat` answers `[e]` at `n == 1`, the list
+        // spelling a one-element constant has.
+        Inst::ArraySplat { ty: Ty::Array(_, n), value } => {
+            let elem = fold_stored_constant(defs, *value, depth - 1)?;
+            Some(Folded::Done(Constant::splat(elem, *n)))
+        }
+        // The bridge's COMPLETE constructor (BMC-LANE-1): every lane is named, so the fold is the
+        // lanes' constants. A struct or tuple folds to `Constant::Aggregate`, the constant the
+        // retired zero-seed + `InsertField` chain folded to; an array to a LIST, spelled
+        // canonically once at the top like any written array. An enum constructor refuses.
+        Inst::MakeAggregate { ty, variant: None, fields } => {
+            let elems = fields
+                .iter()
+                .map(|field| fold_stored_constant(defs, *field, depth - 1))
+                .collect::<Option<Vec<_>>>()?;
+            match ty {
+                Ty::Array(..) => Some(Folded::List(elems)),
+                Ty::Struct(_) | Ty::Tuple(_) => Some(Folded::Done(Constant::Aggregate(elems))),
+                _ => None,
+            }
+        }
         Inst::InsertField { aggregate, field, value, .. } => {
-            let mut agg = fold_stored_constant(defs, *aggregate, depth - 1)?;
+            let Folded::Done(mut agg) = fold_stored_value(defs, *aggregate, depth - 1)? else {
+                return None;
+            };
             let elem = fold_stored_constant(defs, *value, depth - 1)?;
             let Constant::Aggregate(elems) = &mut agg else { return None };
             let slot = elems.get_mut(*field as usize)?;
             *slot = elem;
-            Some(agg)
+            Some(Folded::Done(agg))
         }
         // Trust (vtable slice 12): the ARRAY positional write — the repeat lane's native
         // spelling and the `rewrite_array_insert_fields` output. The index must itself
         // resolve to a defining `Const Int` (the bridge/rewrite always emit one; a runtime
-        // index refuses the fold), in-bounds of the folded `Constant::Array`. The variant
-        // gate is exact: an InsertElement over anything but an Array constant refuses —
-        // the seed's `zero_const` spelling IS `Constant::Array`, so a fold that arrives
-        // here with another variant is not the proven shape.
+        // index refuses the fold), in-bounds of the folded array. The variant gate is exact:
+        // an InsertElement over anything but an array constant refuses — the seed's
+        // `zero_const` spelling IS an array constant (`Constant::Array`, or since v50 its
+        // canonical `Constant::Splat` when uniform), so a fold that arrives here with another
+        // variant is not the proven shape. A written list stays a list up the chain and is
+        // re-spelled canonically once, at the top (v50 §3.1), so a chain whose writes make it
+        // uniform yields the `Splat` the producer would emit.
         Inst::InsertElement { array, index, value, .. } => {
-            let mut agg = fold_stored_constant(defs, *array, depth - 1)?;
+            let agg = fold_stored_value(defs, *array, depth - 1)?;
             let elem = fold_stored_constant(defs, *value, depth - 1)?;
             let idx = match defs.get(index)? {
-                Inst::Const { value: Constant::Int(i), .. } => usize::try_from(*i).ok()?,
+                Inst::Const { value: Constant::Int(i), .. } => u64::try_from(*i).ok()?,
                 _ => return None,
             };
-            let Constant::Array(elems) = &mut agg else { return None };
-            let slot = elems.get_mut(idx)?;
-            *slot = elem;
-            Some(agg)
+            match agg {
+                Folded::Done(Constant::Array(mut elems)) | Folded::List(mut elems) => {
+                    let slot = elems.get_mut(usize::try_from(idx).ok()?)?;
+                    *slot = elem;
+                    Some(Folded::List(elems))
+                }
+                Folded::Done(Constant::Splat { elem: seed, len }) => {
+                    if idx >= len {
+                        return None;
+                    }
+                    let mut writes = std::collections::BTreeMap::new();
+                    writes.insert(idx, elem);
+                    Some(Folded::SplatWrites { elem: *seed, len, writes })
+                }
+                Folded::SplatWrites { elem: seed, len, mut writes } => {
+                    if idx >= len {
+                        return None;
+                    }
+                    writes.insert(idx, elem);
+                    Some(Folded::SplatWrites { elem: seed, len, writes })
+                }
+                Folded::Done(_) => None,
+            }
         }
         _ => None,
     }
@@ -6901,6 +7454,9 @@ fn struct_layout_agrees(am: &Module, bm: &Module, a: &Ty, b: &Ty, depth: u32) ->
 /// Every OTHER position in the wrapper is id-free (`pointer_lane_param_ok` guarantees the
 /// pass-through types are), so the referent is the sole position `wrappers_agree` cannot compare
 /// by plain equality.
+///
+/// Trust (R8-SEAM): a COPY of `module` with [`append_pointee_wrapper`]'s wrapper appended — the
+/// copying spelling [`compare_entries`] keeps for the hook's per-body modules.
 fn build_pointee_wrapper(
     module: &Module,
     entry: FuncId,
@@ -6908,11 +7464,27 @@ fn build_pointee_wrapper(
     index: usize,
     pointee: &Ty,
 ) -> Option<(Module, FuncId, FuncTy)> {
+    let mut out = module.clone();
+    let (func_id, wrapper_sig) = append_pointee_wrapper(&mut out, entry, sig, index, pointee)?;
+    Some((out, func_id, wrapper_sig))
+}
+
+/// Trust (R8-SEAM): [`build_pointee_wrapper`]'s wrapper appended to `module` ITSELF: one func type
+/// at the end of `func_types` and one function at the end of `functions`, exactly what that
+/// function's copy carries beyond `module` — or, on `None`, nothing at all (every fallible step
+/// runs before the module is touched; the copying spelling computed the same values in another
+/// order, and none of them depends on the other's mutation: the id reads `functions`, the
+/// signature id `func_types`).
+fn append_pointee_wrapper(
+    module: &mut Module,
+    entry: FuncId,
+    sig: &FuncTy,
+    index: usize,
+    pointee: &Ty,
+) -> Option<(FuncId, FuncTy)> {
     let mut wrapper_sig = sig.clone();
     *wrapper_sig.params.get_mut(index)? = pointee.clone();
 
-    let mut out = module.clone();
-    let ty_id = out.add_func_type(wrapper_sig.clone());
     // The wrapper's id must be PROVABLY ABSENT from this module, and `functions.len()` does not
     // establish that for an arbitrary Trust-IR input. Current producer modules are dense after
     // assembly, but this helper also operates on independently supplied modules, whose ids may be
@@ -6920,7 +7492,7 @@ fn build_pointee_wrapper(
     // minted at 2 would collide — `function_by_id(2)` resolves index-first and could dispatch the
     // callee's own call to the wrapper. One past the observed maximum is absent for both dense and
     // sparse modules; `checked_add` fails the lane closed at the top of the id space.
-    let func_id = FuncId::new(match out.functions.iter().map(|f| f.id.index()).max() {
+    let func_id = FuncId::new(match module.functions.iter().map(|f| f.id.index()).max() {
         Some(max) => max.checked_add(1)?,
         None => 0,
     });
@@ -6932,6 +7504,11 @@ fn build_pointee_wrapper(
     let results: Vec<ValueId> = (0..sig.returns.len())
         .map(|i| ValueId::new(u32::try_from(wrapper_sig.params.len() + 1 + i).unwrap()))
         .collect();
+    // Every fallible step is above this line; the module is touched only below it, by two table
+    // doors that refuse instead of panicking (trust-ir D1b). A refused door leaves the module as
+    // it came: `add_func_type` changes no table on `Err`, and the function door's refusal pops the
+    // one signature row this function added. So `None` still means nothing at all.
+    let ty_id = module.add_func_type(wrapper_sig.clone()).ok()?;
 
     let mut block = Block::new(trust_ir::BlockId::new(0));
     for (id, ty) in param_ids.iter().zip(&wrapper_sig.params) {
@@ -6961,8 +7538,11 @@ fn build_pointee_wrapper(
     let mut func =
         Function::new(func_id, "__trust_diff_pointee_wrapper", ty_id, trust_ir::BlockId::new(0));
     func.blocks = vec![block];
-    out.add_function(func);
-    Some((out, func_id, wrapper_sig))
+    if module.try_add_function(func).is_err() {
+        module.func_types.pop();
+        return None;
+    }
+    Some((func_id, wrapper_sig))
 }
 
 /// Trust (Q1): DISCHARGE the wrapper-skipping debt.
@@ -7126,6 +7706,19 @@ impl Iterator for CartesianProduct<'_> {
     }
 }
 
+// Trust (R8-SEAM): the pre-R8-SEAM `compare_entries`, `build_pointee_wrapper` and
+// `paired_admitted_promoted_globals`, verbatim — the test-build oracle every
+// `compare_entries`/`compare_entries_in_place` call is checked against, and, in every build, the
+// differential the pre-R8-SEAM crate seam (`crate_module/seam_reference.rs`) runs under the
+// TEST-ONLY `-Ztrust-ir-seam-reference` hook, so that hook compares the old seam end to end (both
+// files' old code) against the new one. No other production path reaches it.
+#[path = "differential/compare_entries_reference.rs"]
+pub(crate) mod compare_entries_reference;
+
+#[cfg(test)]
+#[path = "differential/assert_operand_demand_tests.rs"]
+mod assert_operand_demand_tests;
+
 #[cfg(test)]
 mod tests {
     use trust_ir::interpret::InterpretErrorCode as C;
@@ -7227,11 +7820,14 @@ mod tests {
     ) -> Module {
         let (mut module, target) = module_with_tagged_enum(name, target_is_id_one, variants);
         let enum_ty = Ty::Enum(target);
-        let sig = module.add_func_type(FuncTy {
-            params: vec![enum_ty.clone()],
-            returns: vec![Ty::Bool],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![enum_ty.clone()],
+                returns: vec![Ty::Bool],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let v = ValueId::new;
         let mut block = Block::new(trust_ir::BlockId::new(0)).with_param(v(0), enum_ty);
         if constant_false {
@@ -7263,7 +7859,7 @@ mod tests {
         let mut function =
             Function::new(FuncId::new(0), "detect_last", sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -7272,16 +7868,22 @@ mod tests {
         let (mut thir, thir_enum) = module_with_tagged_enum("thir", false, 2);
         let (mut oracle, oracle_enum) = module_with_tagged_enum("oracle", true, 2);
         let params = |enum_id| vec![Ty::I32, Ty::Enum(enum_id), Ty::Unit, Ty::Bool];
-        let thir_sig_id = thir.add_func_type(FuncTy {
-            params: params(thir_enum),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
-        let oracle_sig_id = oracle.add_func_type(FuncTy {
-            params: params(oracle_enum),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let thir_sig_id = thir
+            .add_func_type(FuncTy {
+                params: params(thir_enum),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let oracle_sig_id = oracle
+            .add_func_type(FuncTy {
+                params: params(oracle_enum),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let classes =
             vec![ParamClass::Scalar, ParamClass::Enum, ParamClass::Opaque, ParamClass::Scalar];
         let samples = vec![None, Some(vec![(0, Vec::new()), (1, vec![42])]), None, None];
@@ -7388,11 +7990,14 @@ mod tests {
     #[test]
     fn build_side_args_rejects_malformed_recipe_shapes() {
         let (mut module, enum_id) = module_with_tagged_enum("malformed", false, 2);
-        let sig_id = module.add_func_type(FuncTy {
-            params: vec![Ty::I32, Ty::Enum(enum_id), Ty::Unit, Ty::Bool],
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let sig_id = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::I32, Ty::Enum(enum_id), Ty::Unit, Ty::Bool],
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let sig = module.func_type(sig_id).expect("signature");
         let classes =
             vec![ParamClass::Scalar, ParamClass::Enum, ParamClass::Opaque, ParamClass::Scalar];
@@ -7462,11 +8067,14 @@ mod tests {
         let build = |name: &str, target_is_id_one: bool| {
             let (mut module, enum_id) = module_with_tagged_enum(name, target_is_id_one, 2);
             let enum_ty = Ty::Enum(enum_id);
-            let sig = module.add_func_type(FuncTy {
-                params: vec![enum_ty.clone(); MAX_PARAMS + 1],
-                returns: vec![Ty::Bool],
-                is_vararg: false,
-            });
+            let sig = module
+                .add_func_type(FuncTy {
+                    params: vec![enum_ty.clone(); MAX_PARAMS + 1],
+                    returns: vec![Ty::Bool],
+                    is_vararg: false,
+                    abi: None,
+                })
+                .expect("Module::add_func_type: test fixture");
             let v = ValueId::new;
             let mut block = Block::new(trust_ir::BlockId::new(0));
             for index in 0..=MAX_PARAMS {
@@ -7482,7 +8090,7 @@ mod tests {
             let mut function =
                 Function::new(FuncId::new(0), "too_many", sig, trust_ir::BlockId::new(0));
             function.blocks.push(block);
-            module.add_function(function);
+            module.try_add_function(function).expect("Module::try_add_function: test fixture");
             module
         };
 
@@ -7498,10 +8106,12 @@ mod tests {
 
     fn single_block_module(name: &str, params: Vec<Ty>, returns: Vec<Ty>, block: Block) -> Module {
         let mut module = Module::new(name.to_string());
-        let sig = module.add_func_type(FuncTy { params, returns, is_vararg: false });
+        let sig = module
+            .add_func_type(FuncTy { params, returns, is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), name, sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -7614,6 +8224,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let env_ty = Ty::Struct(sid);
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -7644,11 +8255,13 @@ mod tests {
             .with_result(v(4)),
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
-        let sig = module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        let sig = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "ptr_env_seed", sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         assert!(matches!(classify_undefs(&module), UndefClass::DeadSeeds));
         let normalized = substitute_dead_seeds(module);
@@ -7673,6 +8286,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let walk_ty = Ty::Struct(sid);
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -7692,11 +8306,17 @@ mod tests {
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
         let sig = module
-            .add_func_type(FuncTy { params: vec![], returns: vec![walk_ty], is_vararg: false });
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![walk_ty],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "unit_field_seed", sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
 
         assert!(matches!(classify_undefs(&module), UndefClass::DeadSeeds));
         let normalized = substitute_dead_seeds(module);
@@ -7750,6 +8370,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let flat_ty = Ty::Struct(sid);
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -7768,11 +8389,17 @@ mod tests {
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
         let sig = module
-            .add_func_type(FuncTy { params: vec![], returns: vec![flat_ty], is_vararg: false });
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![flat_ty],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "flat_enum_seed", sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         assert!(matches!(classify_undefs(&module), UndefClass::Live));
     }
 
@@ -7788,7 +8415,7 @@ mod tests {
         let v = ValueId::new;
         // Oracle side: struct { [u32 x 4] } built from a covered Array-constant lane.
         let mut oracle = Module::new("array_lane_seed");
-        let elem_tid = oracle.add_type(Ty::U32);
+        let elem_tid = oracle.add_type(Ty::U32).expect("Module::add_type: test fixture");
         let sid = oracle.add_struct(StructDef {
             id: StructId::new(0),
             name: "TupleNonPathType".into(),
@@ -7800,6 +8427,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let struct_ty = Ty::Struct(sid);
         assert!(
@@ -7831,11 +8459,17 @@ mod tests {
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
         let sig = oracle
-            .add_func_type(FuncTy { params: vec![], returns: vec![struct_ty], is_vararg: false });
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![struct_ty],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "array_lane_seed", sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        oracle.add_function(function);
+        oracle.try_add_function(function).expect("Module::try_add_function: test fixture");
         assert!(
             matches!(classify_undefs(&oracle), UndefClass::DeadSeeds),
             "the covered struct seed over an Array lane is now substitutable"
@@ -7855,6 +8489,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let t_ty = Ty::Struct(tsid);
         let mut tb = Block::new(trust_ir::BlockId::new(0));
@@ -7871,11 +8506,18 @@ mod tests {
             .with_result(v(0)),
         );
         tb.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
-        let tsig =
-            thir.add_func_type(FuncTy { params: vec![], returns: vec![t_ty], is_vararg: false });
-        let mut tf = Function::new(FuncId::new(0), "array_lane_seed", tsig, trust_ir::BlockId::new(0));
+        let tsig = thir
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![t_ty],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut tf =
+            Function::new(FuncId::new(0), "array_lane_seed", tsig, trust_ir::BlockId::new(0));
         tf.blocks.push(tb);
-        thir.add_function(tf);
+        thir.try_add_function(tf).expect("Module::try_add_function: test fixture");
 
         // The trap half: the unlocked pair must HOLD at the quarantine, never mint a verdict.
         let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
@@ -7896,8 +8538,8 @@ mod tests {
     fn tuple_vs_array_pair_is_quarantined_not_a_verdict() {
         let mut am = Module::new("a");
         let mut bm = Module::new("b");
-        let ta = am.add_type(Ty::I64);
-        let tb = bm.add_type(Ty::I64);
+        let ta = am.add_type(Ty::I64).expect("Module::add_type: test fixture");
+        let tb = bm.add_type(Ty::I64).expect("Module::add_type: test fixture");
         assert!(tys_agree(&am, &bm, &Ty::Tuple(vec![Ty::I64; 3]), &Ty::Array(tb, 3), 8).is_err());
         assert!(tys_agree(&am, &bm, &Ty::Array(ta, 3), &Ty::Tuple(vec![Ty::I64; 3]), 8).is_err());
     }
@@ -7915,7 +8557,7 @@ mod tests {
         let v = ValueId::new;
         // Tested side: the slice-15 producer ctor.
         let mut thir = Module::new("thir_first_class_array");
-        let t_tid = thir.add_type(Ty::I32);
+        let t_tid = thir.add_type(Ty::I32).expect("Module::add_type: test fixture");
         let t_arr = Ty::Array(t_tid, 3);
         let mut tb = Block::new(trust_ir::BlockId::new(0));
         tb.body.push(
@@ -7957,7 +8599,7 @@ mod tests {
 
         // Oracle side: the bridge's Undef seed + InsertField-over-Array chain.
         let mut oracle = Module::new("oracle_first_class_array");
-        let o_tid = oracle.add_type(Ty::I32);
+        let o_tid = oracle.add_type(Ty::I32).expect("Module::add_type: test fixture");
         let o_arr = Ty::Array(o_tid, 3);
         let mut ob = Block::new(trust_ir::BlockId::new(0));
         ob.body.push(InstrNode::new(Inst::Undef { ty: o_arr.clone() }).with_result(v(0)));
@@ -8005,9 +8647,9 @@ mod tests {
     fn first_class_array_pair_mismatches_are_real_divergences() {
         let mut am = Module::new("a");
         let mut bm = Module::new("b");
-        let ta = am.add_type(Ty::I32);
-        let tb = bm.add_type(Ty::I32);
-        let tb64 = bm.add_type(Ty::I64);
+        let ta = am.add_type(Ty::I32).expect("Module::add_type: test fixture");
+        let tb = bm.add_type(Ty::I32).expect("Module::add_type: test fixture");
+        let tb64 = bm.add_type(Ty::I64).expect("Module::add_type: test fixture");
         // Same element, same length: agree.
         assert!(matches!(tys_agree(&am, &bm, &Ty::Array(ta, 4), &Ty::Array(tb, 4), 8), Ok(true)));
         // Length mismatch: a real Ok(false), not a quarantine.
@@ -8028,7 +8670,7 @@ mod tests {
     fn first_class_array_slot_respell_reaches_agreed() {
         let v = ValueId::new;
         let mut module = Module::new("thir_inline_slice_fc");
-        let elem_tid = module.add_type(Ty::U8);
+        let elem_tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(elem_tid, 3);
         let fat_ty = Ty::FatPtr(trust_ir::FatPtrKind::Slice(elem_tid));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -8117,7 +8759,7 @@ mod tests {
     fn array_insert_element_chain_is_dead_seed_and_interprets() {
         let v = ValueId::new;
         let mut module = Module::new("repeat_chain");
-        let tid = module.add_type(Ty::I32);
+        let tid = module.add_type(Ty::I32).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(tid, 2);
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.body.push(
@@ -8170,7 +8812,7 @@ mod tests {
         let v = ValueId::new;
         // Partial coverage: [T x 2] with only lane 0 written, final value returned.
         let mut m1 = Module::new("partial");
-        let tid = m1.add_type(Ty::I32);
+        let tid = m1.add_type(Ty::I32).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(tid, 2);
         let mut b1 = Block::new(trust_ir::BlockId::new(0));
         b1.body.push(
@@ -8195,7 +8837,7 @@ mod tests {
 
         // Runtime index: the index is a PARAM, not a const — unresolvable, Live.
         let mut m2 = Module::new("runtime_idx");
-        let tid2 = m2.add_type(Ty::I32);
+        let tid2 = m2.add_type(Ty::I32).expect("Module::add_type: test fixture");
         let arr_ty2 = Ty::Array(tid2, 1);
         let mut b2 = Block::new(trust_ir::BlockId::new(0));
         b2.params.push((v(0), Ty::I64));
@@ -8222,7 +8864,7 @@ mod tests {
     fn zero_len_array_undef_is_sole_inhabitant_dead_seed() {
         let v = ValueId::new;
         let mut module = Module::new("zero_len");
-        let tid = module.add_type(Ty::Bool);
+        let tid = module.add_type(Ty::Bool).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(tid, 0);
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.body.push(InstrNode::new(Inst::Undef { ty: arr_ty.clone() }).with_result(v(0)));
@@ -8241,7 +8883,7 @@ mod tests {
     fn array_insert_fields_rewrite_to_insert_elements_and_interpret() {
         let v = ValueId::new;
         let mut module = Module::new("literal_chain");
-        let tid = module.add_type(Ty::U8);
+        let tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(tid, 2);
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.body.push(
@@ -8292,10 +8934,12 @@ mod tests {
         returns: Vec<Ty>,
         block: Block,
     ) -> Module {
-        let sig = module.add_func_type(FuncTy { params, returns, is_vararg: false });
+        let sig = module
+            .add_func_type(FuncTy { params, returns, is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let mut function = Function::new(FuncId::new(0), name, sig, trust_ir::BlockId::new(0));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -8338,8 +8982,12 @@ mod tests {
                     .with_result(cond),
             );
             block.body.push(
-                InstrNode::new(Inst::Assert { cond })
-                    .with_proof(trust_ir::ProofAnnotation::NoPanic),
+                InstrNode::new(Inst::Assert {
+                    cond,
+                    kind: trust_ir::AssertKind::Unspecified,
+                    site: None,
+                })
+                .with_proof(trust_ir::ProofAnnotation::NoPanic),
             );
         }
         block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
@@ -8608,7 +9256,7 @@ mod tests {
     fn thir_inline_array_slice_module(elems: [i128; 3]) -> Module {
         let v = ValueId::new;
         let mut module = Module::new("thir_inline_slice");
-        let elem_tid = module.add_type(Ty::U8);
+        let elem_tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         let tuple_ty = Ty::Tuple(vec![Ty::U8; 3]);
         let fat_ty = Ty::FatPtr(trust_ir::FatPtrKind::Slice(elem_tid));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -8669,8 +9317,8 @@ mod tests {
     fn oracle_inline_array_slice_module(elems: [i128; 3]) -> Module {
         let v = ValueId::new;
         let mut module = Module::new("oracle_inline_slice");
-        let fat_tid = module.add_type(Ty::U8);
-        let arr_tid = module.add_type(Ty::U8);
+        let fat_tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        let arr_tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         let arr_ty = Ty::Array(arr_tid, 3);
         let fat_ty = Ty::FatPtr(trust_ir::FatPtrKind::Slice(fat_tid));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -8887,7 +9535,7 @@ mod tests {
         let mut am = Module::new("a");
         let mut bm = Module::new("b");
         let _ = am.add_type(Ty::U8);
-        let tb = bm.add_type(Ty::U8);
+        let tb = bm.add_type(Ty::U8).expect("Module::add_type: test fixture");
         assert!(promoted_pair_tys_agree(&am, &bm, &Ty::Tuple(vec![Ty::U8; 2]), &Ty::Array(tb, 2)));
         // Length mismatch refuses.
         assert!(!promoted_pair_tys_agree(&am, &bm, &Ty::Tuple(vec![Ty::U8; 3]), &Ty::Array(tb, 2)));
@@ -8912,7 +9560,7 @@ mod tests {
         let v = ValueId::new;
         // THIR: const Array([]) + alloca + store + ptr_from_parts + ret (measured).
         let mut thir = Module::new("thir_zero");
-        let t_tid = thir.add_type(Ty::U16);
+        let t_tid = thir.add_type(Ty::U16).expect("Module::add_type: test fixture");
         let t_arr = Ty::Array(t_tid, 0);
         let t_fat = Ty::FatPtr(trust_ir::FatPtrKind::Slice(t_tid));
         let mut tb = Block::new(trust_ir::BlockId::new(0));
@@ -8951,8 +9599,8 @@ mod tests {
 
         // Oracle: alloca + Undef [u16 x 0] + store + borrow + borrow + ptr_from_parts.
         let mut oracle = Module::new("oracle_zero");
-        let o_fat_tid = oracle.add_type(Ty::U16);
-        let o_arr_tid = oracle.add_type(Ty::U16);
+        let o_fat_tid = oracle.add_type(Ty::U16).expect("Module::add_type: test fixture");
+        let o_arr_tid = oracle.add_type(Ty::U16).expect("Module::add_type: test fixture");
         let o_arr = Ty::Array(o_arr_tid, 0);
         let o_fat = Ty::FatPtr(trust_ir::FatPtrKind::Slice(o_fat_tid));
         let mut ob = Block::new(trust_ir::BlockId::new(0));
@@ -9034,6 +9682,9 @@ mod tests {
             linkage: trust_ir::Linkage::External,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         m
     }
@@ -9150,6 +9801,9 @@ mod tests {
                 linkage: trust_ir::Linkage::External,
                 tls: None,
                 align: None,
+                section: None,
+                visibility: trust_ir::Visibility::Default,
+                retained: false,
             });
         }
         let v = ValueId::new;
@@ -9217,6 +9871,9 @@ mod tests {
             linkage: trust_ir::Linkage::External,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         let v = ValueId::new;
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -9253,6 +9910,9 @@ mod tests {
             linkage: trust_ir::Linkage::External,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         let v = ValueId::new;
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -9291,10 +9951,33 @@ mod tests {
         assert!(const_param_column_compare(&thir, &oracle).is_none());
     }
 
-    /// The MEASURED oracle spelling of `const A: *const i32 = &raw const *&2;`
-    /// (const-address-of::A, dumped via the slice-6 probe): hoisted alloca, const, an
-    /// operand-materialization copy, store, shared borrow, pointer copy, ret.
+    /// The oracle spelling of `const A: *const i32 = &raw const *&2;`
+    /// (const-address-of::A, measured via the slice-6 probe): hoisted alloca, const, an
+    /// operand-materialization copy, store, shared reference, pointer copy, ret. The
+    /// shared reference is spelled as `reference` builds it: the MIR bridge's spelling
+    /// since 2026-10-08 (a `Copy` of the slot address carrying `SharedBorrow`), or the
+    /// permission instruction it spelled before (`Borrow`), which the arm keeps for
+    /// hand-built input.
     fn once_stored_escaping_slot_module() -> Module {
+        once_stored_escaping_slot_module_with(shared_reference_copy)
+    }
+
+    /// The MIR bridge's spelling of a shared `&_2` since 2026-10-08 (trust-ir SPEC "A
+    /// Rust reference carries no permission instruction").
+    fn shared_reference_copy(of: ValueId, result: ValueId) -> InstrNode {
+        InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: of })
+            .with_result(result)
+            .with_proof(trust_ir::ProofAnnotation::SharedBorrow)
+    }
+
+    /// The permission-instruction spelling of the same shared reference.
+    fn shared_reference_borrow(of: ValueId, result: ValueId) -> InstrNode {
+        InstrNode::new(Inst::Borrow { ptr: of }).with_result(result)
+    }
+
+    fn once_stored_escaping_slot_module_with(
+        reference: fn(ValueId, ValueId) -> InstrNode,
+    ) -> Module {
         let v = ValueId::new;
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.body.push(
@@ -9315,7 +9998,7 @@ mod tests {
             volatile: false,
             align: None,
         }));
-        block.body.push(InstrNode::new(Inst::Borrow { ptr: v(0) }).with_result(v(3)));
+        block.body.push(reference(v(0), v(3)));
         block.body.push(
             InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: v(3) }).with_result(v(4)),
         );
@@ -9325,9 +10008,21 @@ mod tests {
 
     #[test]
     fn respell_rewrites_the_exact_once_stored_escaping_slot_and_preserves_interpretation() {
-        let before = once_stored_escaping_slot_module();
+        for (spelling, reference) in [
+            ("claim-carrying Copy", shared_reference_copy as fn(ValueId, ValueId) -> InstrNode),
+            ("Borrow", shared_reference_borrow),
+        ] {
+            respell_rewrites_and_preserves_interpretation(spelling, reference);
+        }
+    }
+
+    fn respell_rewrites_and_preserves_interpretation(
+        spelling: &str,
+        reference: fn(ValueId, ValueId) -> InstrNode,
+    ) {
+        let before = once_stored_escaping_slot_module_with(reference);
         let mut after = before.clone();
-        assert_eq!(respell_promoted_slots_as_globals(&mut after), 1);
+        assert_eq!(respell_promoted_slots_as_globals(&mut after), 1, "{spelling}");
 
         // The mint mirrors the THIR wave-16 shape: named, initializer-bearing, immutable.
         assert_eq!(after.globals.len(), 1);
@@ -9339,15 +10034,15 @@ mod tests {
         assert!(matches!(g.linkage, trust_ir::Linkage::Internal));
 
         // The Alloca becomes the GlobalAddr IN PLACE under the SAME result id (the
-        // allocation-order argument), the Store is deleted, the Borrow stays a Borrow,
-        // and the (now dead, pure) Const/Copy chain is left alone.
+        // allocation-order argument), the Store is deleted, the reference stays as it
+        // was spelled, and the (now dead, pure) Const/Copy chain is left alone.
         let body = &after.functions[0].blocks[0].body;
         assert_eq!(body.len(), 6);
         assert!(matches!(body[0].inst, Inst::GlobalAddr { .. }));
         assert_eq!(body[0].results, vec![ValueId::new(0)]);
         assert!(matches!(body[1].inst, Inst::Const { .. }));
         assert!(matches!(body[2].inst, Inst::Copy { .. }));
-        assert!(matches!(body[3].inst, Inst::Borrow { .. }));
+        assert_eq!(body[3], reference(ValueId::new(0), ValueId::new(3)), "{spelling}");
         assert!(matches!(body[4].inst, Inst::Copy { .. }));
         assert!(matches!(body[5].inst, Inst::Return { .. }));
 
@@ -9426,6 +10121,35 @@ mod tests {
             block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
             single_block_module("raw_escape_slot", vec![], vec![Ty::Ptr], block)
         };
+        // (b') The MUTABLE reference in the MIR bridge's spelling: a `Copy` of the slot
+        // carrying `UniqueBorrow` (`&mut _2`). Only a shared reference joins the rewrite,
+        // exactly as the `Borrow` arm admits no `BorrowMut`.
+        let unique_reference = {
+            let v = ValueId::new;
+            let mut block = Block::new(trust_ir::BlockId::new(0));
+            block.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(2) })
+                    .with_result(v(1)),
+            );
+            block.body.push(
+                InstrNode::new(Inst::Alloca { ty: Ty::I32, count: None, align: None })
+                    .with_result(v(0)),
+            );
+            block.body.push(InstrNode::new(Inst::Store {
+                ty: Ty::I32,
+                ptr: v(0),
+                value: v(1),
+                volatile: false,
+                align: None,
+            }));
+            block.body.push(
+                InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: v(0) })
+                    .with_result(v(2))
+                    .with_proof(trust_ir::ProofAnnotation::UniqueBorrow),
+            );
+            block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
+            single_block_module("unique_reference_slot", vec![], vec![Ty::Ptr], block)
+        };
         // (c) A runtime-valued store — locals-in-const-fn's `bar(mut i)`: the stored
         // value is the PARAM, not a foldable constant.
         let runtime_valued = {
@@ -9448,7 +10172,7 @@ mod tests {
             single_block_module("runtime_valued_slot", vec![Ty::I32], vec![Ty::Ptr], block)
         };
 
-        for module in [reassigned, raw_escape, runtime_valued] {
+        for module in [reassigned, raw_escape, unique_reference, runtime_valued] {
             let mut touched = module.clone();
             assert_eq!(respell_promoted_slots_as_globals(&mut touched), 0);
             assert_eq!(touched, module, "a refused candidate must leave the module untouched");
@@ -9511,6 +10235,420 @@ mod tests {
     }
 
     #[test]
+    fn respell_folds_the_complete_constructor() {
+        // The same `_3 = Foo(const 3); _2 = &_3` as the bridge spells it since BMC-LANE-1: one
+        // `MakeAggregate`, no seed. `&Pair { a: 7, b: 8 }`: a struct constructor folds to the
+        // `Aggregate` of its lanes in declaration order, as a tuple does. And `&[1, 2, 3]`: an
+        // array constructor folds to the array.
+        let v = ValueId::new;
+        for (ty, lanes, want) in [
+            (
+                Ty::Tuple(vec![Ty::I64]),
+                vec![3],
+                Constant::Aggregate(vec![Constant::Int(3)]),
+            ),
+            (
+                Ty::Struct(trust_ir::StructId::new(0)),
+                vec![7, 8],
+                Constant::Aggregate(vec![Constant::Int(7), Constant::Int(8)]),
+            ),
+            (
+                Ty::Array(trust_ir::TyId::new(0), 3),
+                vec![1, 2, 3],
+                Constant::Array(vec![Constant::Int(1), Constant::Int(2), Constant::Int(3)]),
+            ),
+        ] {
+            let mut block = Block::new(trust_ir::BlockId::new(0));
+            let mut fields = Vec::new();
+            for (index, lane) in lanes.iter().enumerate() {
+                block.body.push(
+                    InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(*lane) })
+                        .with_result(v(index as u32)),
+                );
+                fields.push(v(index as u32));
+            }
+            let n = lanes.len() as u32;
+            block.body.push(
+                InstrNode::new(Inst::MakeAggregate { ty: ty.clone(), variant: None, fields })
+                    .with_result(v(n)),
+            );
+            block.body.push(
+                InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: None })
+                    .with_result(v(n + 1)),
+            );
+            block.body.push(InstrNode::new(Inst::Store {
+                ty: ty.clone(),
+                ptr: v(n + 1),
+                value: v(n),
+                volatile: false,
+                align: None,
+            }));
+            block.body.push(InstrNode::new(Inst::Borrow { ptr: v(n + 1) }).with_result(v(n + 2)));
+            block.body.push(InstrNode::new(Inst::Return { values: vec![v(n + 2)] }));
+            let mut module =
+                single_block_module("complete_promoted_slot", vec![], vec![Ty::Ptr], block);
+            if let Ty::Array(tid, n) = ty {
+                let elem = module.add_type(Ty::I64).expect("Module::add_type: test fixture");
+                assert_eq!(Ty::Array(elem, n), Ty::Array(tid, n), "the fixture's element id");
+            }
+            if let Ty::Struct(sid) = ty {
+                let registered = module.add_struct(sdef_named(
+                    0,
+                    "Pair",
+                    vec![sfield("a", Ty::I64), sfield("b", Ty::I64)],
+                ));
+                assert_eq!(registered, sid, "the fixture's struct id");
+            }
+
+            assert_eq!(respell_promoted_slots_as_globals(&mut module), 1, "{ty:?}");
+            let g = &module.globals[0];
+            assert_eq!(g.ty, ty);
+            assert_eq!(g.initializer, Some(want), "{ty:?}");
+        }
+    }
+
+    // Trust (BMC-LANE-1 review, CONS-2): what the `MakeAggregate` arm of `fold_stored_value`
+    // refuses. `respell_folds_the_complete_constructor` above pins what it folds.
+
+    /// `_2 = &_3` over a slot `_3` stored ONCE from `stored`, the shape the constructor tests
+    /// below share: `block` already defines `stored` and uses no value id from `next` on; this
+    /// appends the slot (`v(next)`, of type `ty`), its one `Store`, a shared `Borrow` of it
+    /// (`v(next + 1)`) and the `Return` of that borrow, then adds the function to `module`.
+    fn once_stored_borrowed_slot(
+        module: Module,
+        params: Vec<Ty>,
+        mut block: Block,
+        ty: &Ty,
+        stored: ValueId,
+        next: u32,
+    ) -> Module {
+        let v = ValueId::new;
+        block.body.push(
+            InstrNode::new(Inst::Alloca { ty: ty.clone(), count: None, align: None })
+                .with_result(v(next)),
+        );
+        block.body.push(InstrNode::new(Inst::Store {
+            ty: ty.clone(),
+            ptr: v(next),
+            value: stored,
+            volatile: false,
+            align: None,
+        }));
+        block.body.push(InstrNode::new(Inst::Borrow { ptr: v(next) }).with_result(v(next + 1)));
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(next + 1)] }));
+        single_block_module_with(module, "constructor_slot", params, vec![Ty::Ptr], block)
+    }
+
+    /// A refused row: no slot fires, no global is minted, and the module is left as it was.
+    fn assert_constructor_slot_refused(row: &str, module: &Module) {
+        let mut touched = module.clone();
+        assert_eq!(respell_promoted_slots_as_globals(&mut touched), 0, "{row}: no slot fires");
+        assert!(touched.globals.is_empty(), "{row}: no global is minted");
+        assert_eq!(&touched, module, "{row}: a refused candidate leaves the module untouched");
+    }
+
+    /// A refused row's twin, which differs from it only in the stored value: the slot fires once
+    /// and mints `__trust_promoted_0` at `ty` with exactly the initializer `want`. The twin shows
+    /// that the row is refused for its stored value and not for the slot around it.
+    fn assert_constructor_slot_fires(row: &str, module: &Module, ty: &Ty, want: Constant) {
+        let mut touched = module.clone();
+        assert_eq!(respell_promoted_slots_as_globals(&mut touched), 1, "{row}: the slot fires");
+        assert_eq!(touched.globals.len(), 1, "{row}: one global is minted");
+        let g = &touched.globals[0];
+        assert_eq!(g.name, "__trust_promoted_0", "{row}");
+        assert_eq!(&g.ty, ty, "{row}");
+        assert_eq!(g.initializer, Some(want), "{row}");
+    }
+
+    /// `enum Choice { Empty, Payload(i64) }`, discriminants 0 and 1 at a `u8` tag.
+    fn add_choice_enum(module: &mut Module) -> Ty {
+        let id = module
+            .add_enum_def(
+                EnumDef::new(
+                    EnumId::new(0),
+                    "Choice",
+                    vec![
+                        EnumVariant {
+                            name: "Empty".into(),
+                            fields: vec![],
+                            field_names: Vec::new(),
+                        },
+                        EnumVariant {
+                            name: "Payload".into(),
+                            fields: vec![Ty::I64],
+                            field_names: Vec::new(),
+                        },
+                    ],
+                )
+                .with_discriminants(vec![Some(0), Some(1)])
+                .with_repr(EnumTagRepr::U8),
+            )
+            .expect("Module::add_enum_def: test fixture");
+        Ty::Enum(id)
+    }
+
+    #[test]
+    fn respell_refuses_a_constructor_that_names_a_variant() {
+        let v = ValueId::new;
+        // `&Choice::Payload(5)`: an enum constructor. Its tag is set by the variant and is not
+        // one of its lanes, so the lanes alone, `Aggregate([5])`, are not its value. The arm
+        // matches only `variant: None`, and its type match has no `Ty::Enum` lane either.
+        let mut module = Module::new("enum_constructor_slot");
+        let enum_ty = add_choice_enum(&mut module);
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(5) }).with_result(v(0)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::MakeAggregate {
+                ty: enum_ty.clone(),
+                variant: Some(1),
+                fields: vec![v(0)],
+            })
+            .with_result(v(1)),
+        );
+        let constructed = once_stored_borrowed_slot(module, vec![], block, &enum_ty, v(1), 2);
+        let errors = trust_ir_build::validate_module(&constructed);
+        assert!(errors.is_empty(), "the enum row is a well-formed module: {errors:?}");
+        assert_constructor_slot_refused("enum constructor at variant 1", &constructed);
+
+        // Its twin stores the same value as one `Const` in the `[tag, payload..]` value model,
+        // which the fold takes as it is.
+        let mut module = Module::new("enum_const_slot");
+        let enum_ty = add_choice_enum(&mut module);
+        let tagged = Constant::Aggregate(vec![Constant::Int(1), Constant::Int(5)]);
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.body.push(
+            InstrNode::new(Inst::Const { ty: enum_ty.clone(), value: tagged.clone() })
+                .with_result(v(0)),
+        );
+        let twin = once_stored_borrowed_slot(module, vec![], block, &enum_ty, v(0), 1);
+        assert_constructor_slot_fires("enum Const twin", &twin, &enum_ty, tagged);
+
+        // A `variant` on a tuple constructor is malformed, and the validator refuses it. The
+        // fold refuses it by the `variant: None` pattern alone: the tuple type would fold.
+        let tuple_ty = Ty::Tuple(vec![Ty::I64]);
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(5) }).with_result(v(0)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tuple_ty.clone(),
+                variant: Some(0),
+                fields: vec![v(0)],
+            })
+            .with_result(v(1)),
+        );
+        let malformed = once_stored_borrowed_slot(
+            Module::new("tuple_variant_slot"),
+            vec![],
+            block,
+            &tuple_ty,
+            v(1),
+            2,
+        );
+        assert!(
+            trust_ir_build::validate_module(&malformed).iter().any(|e| matches!(
+                e,
+                trust_ir_build::validate::ValidationError::InvalidMakeAggregate { .. }
+            )),
+            "the validator refuses a variant on a tuple constructor"
+        );
+        assert_constructor_slot_refused("tuple constructor carrying variant 0", &malformed);
+    }
+
+    #[test]
+    fn respell_refuses_a_constructor_with_a_runtime_lane() {
+        // A runtime lane inside a constructor: `&Pair { a: 3, b: i }` with `i` a parameter (the
+        // runtime value of locals-in-const-fn's `bar(mut i)`), and `&Pair { a: 3, b: 1 + 3 }`,
+        // at a struct, a tuple and an array. A lane that does not fold to a constant refuses the
+        // whole constructor, and the fold evaluates no arithmetic. Each type's twin, whose second
+        // lane is the constant 4, fires.
+        #[derive(Clone, Copy, Debug)]
+        enum Lane {
+            Param,
+            Sum,
+            Const,
+        }
+        let v = ValueId::new;
+        let build = |ty: &Ty, second: Lane| -> Module {
+            let mut module = Module::new("runtime_lane_slot");
+            if let Ty::Struct(sid) = ty {
+                let registered = module.add_struct(sdef_named(
+                    0,
+                    "Pair",
+                    vec![sfield("a", Ty::I64), sfield("b", Ty::I64)],
+                ));
+                assert_eq!(registered, *sid, "the fixture's struct id");
+            }
+            if let Ty::Array(tid, _) = ty {
+                let elem = module.add_type(Ty::I64).expect("Module::add_type: test fixture");
+                assert_eq!(elem, *tid, "the fixture's element id");
+            }
+            let mut block = Block::new(trust_ir::BlockId::new(0));
+            let mut params = Vec::new();
+            // Lane 0 is `v(0)`, the constant 3; lane 1 is `v(1)`.
+            block.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(3) })
+                    .with_result(v(0)),
+            );
+            match second {
+                Lane::Param => {
+                    block = block.with_param(v(1), Ty::I64);
+                    params.push(Ty::I64);
+                }
+                Lane::Sum => {
+                    block.body.push(
+                        InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(1) })
+                            .with_result(v(2)),
+                    );
+                    block.body.push(
+                        InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(3) })
+                            .with_result(v(3)),
+                    );
+                    block.body.push(
+                        InstrNode::new(Inst::BinOp {
+                            op: trust_ir::BinOp::Add,
+                            ty: Ty::I64,
+                            lhs: v(2),
+                            rhs: v(3),
+                        })
+                        .with_result(v(1)),
+                    );
+                }
+                Lane::Const => {
+                    block.body.push(
+                        InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(4) })
+                            .with_result(v(1)),
+                    );
+                }
+            }
+            block.body.push(
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: ty.clone(),
+                    variant: None,
+                    fields: vec![v(0), v(1)],
+                })
+                .with_result(v(4)),
+            );
+            once_stored_borrowed_slot(module, params, block, ty, v(4), 5)
+        };
+        for (ty, twin) in [
+            (
+                Ty::Struct(trust_ir::StructId::new(0)),
+                Constant::Aggregate(vec![Constant::Int(3), Constant::Int(4)]),
+            ),
+            (
+                Ty::Tuple(vec![Ty::I64, Ty::I64]),
+                Constant::Aggregate(vec![Constant::Int(3), Constant::Int(4)]),
+            ),
+            (
+                Ty::Array(trust_ir::TyId::new(0), 2),
+                Constant::Array(vec![Constant::Int(3), Constant::Int(4)]),
+            ),
+        ] {
+            for lane in [Lane::Param, Lane::Sum] {
+                let module = build(&ty, lane);
+                let row = format!("{ty:?} with a {lane:?} lane");
+                let errors = trust_ir_build::validate_module(&module);
+                assert!(errors.is_empty(), "{row} is a well-formed module: {errors:?}");
+                assert_constructor_slot_refused(&row, &module);
+            }
+            let row = format!("{ty:?} with every lane a Const");
+            assert_constructor_slot_fires(&row, &build(&ty, Lane::Const), &ty, twin);
+        }
+    }
+
+    #[test]
+    fn respell_refuses_a_constructor_outside_struct_tuple_and_array() {
+        let v = ValueId::new;
+        // One constant lane, `v(0) = 5`, constructed at `ty` as `v(1)`.
+        let constructed = |module: Module, ty: &Ty| -> Module {
+            let mut block = Block::new(trust_ir::BlockId::new(0));
+            block.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::I64, value: Constant::Int(5) })
+                    .with_result(v(0)),
+            );
+            block.body.push(
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: ty.clone(),
+                    variant: None,
+                    fields: vec![v(0)],
+                })
+                .with_result(v(1)),
+            );
+            once_stored_borrowed_slot(module, vec![], block, ty, v(1), 2)
+        };
+        let is_invalid_make_aggregate = |e: &trust_ir_build::validate::ValidationError| {
+            matches!(e, trust_ir_build::validate::ValidationError::InvalidMakeAggregate { .. })
+        };
+
+        // A record `Point { x: 5 }`: the validator accepts a record constructor, the one type
+        // outside struct, tuple and array that it accepts with no variant. A record's constant is
+        // `Constant::Record` (named fields), not `Aggregate`, and the arm has no record lane.
+        let point = |module: &mut Module| -> Ty {
+            Ty::Record(module.add_record(trust_ir::RecordDef {
+                id: trust_ir::RecordId::new(0),
+                name: "Point".into(),
+                fields: vec![sfield("x", Ty::I64)],
+            }))
+        };
+        let mut module = Module::new("record_constructor_slot");
+        let record_ty = point(&mut module);
+        let record = constructed(module, &record_ty);
+        let errors = trust_ir_build::validate_module(&record);
+        assert!(errors.is_empty(), "the record row is a well-formed module: {errors:?}");
+        assert_constructor_slot_refused("record constructor", &record);
+        // Its twin stores the record as one `Const`, which the fold takes as it is.
+        let mut module = Module::new("record_const_slot");
+        let record_ty = point(&mut module);
+        let named = Constant::Record(vec![("x".into(), Constant::Int(5))]);
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.body.push(
+            InstrNode::new(Inst::Const { ty: record_ty.clone(), value: named.clone() })
+                .with_result(v(0)),
+        );
+        let twin = once_stored_borrowed_slot(module, vec![], block, &record_ty, v(0), 1);
+        assert_constructor_slot_fires("record Const twin", &twin, &record_ty, named);
+
+        // A closure with one `i64` capture: the module builder spells the closure type, and the
+        // validator refuses a constructor at it. Folding its lane would mint `Aggregate([5])`,
+        // not a closure constant.
+        let mut module = Module::new("closure_constructor_slot");
+        let apparent = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let closure_ty = Ty::Closure(
+            module
+                .add_closure_type(trust_ir::ClosureTy { func: apparent, captures: vec![Ty::I64] })
+                .expect("Module::add_closure_type: test fixture"),
+        );
+        let closure = constructed(module, &closure_ty);
+        assert!(
+            trust_ir_build::validate_module(&closure).iter().any(is_invalid_make_aggregate),
+            "the validator refuses a closure constructor"
+        );
+        assert_constructor_slot_refused("closure constructor", &closure);
+
+        // An enum constructor with no variant is malformed, and the validator refuses it. It
+        // reaches the type match, which has no `Ty::Enum` lane: folding would drop the tag.
+        let mut module = Module::new("enum_without_variant_slot");
+        let enum_ty = add_choice_enum(&mut module);
+        let untagged = constructed(module, &enum_ty);
+        assert!(
+            trust_ir_build::validate_module(&untagged).iter().any(is_invalid_make_aggregate),
+            "the validator refuses an enum constructor with no variant"
+        );
+        assert_constructor_slot_refused("enum constructor with no variant", &untagged);
+    }
+
+    #[test]
     fn enum_zero_const_uses_effective_discriminant_and_variant_zero_payload_lanes() {
         let mut module = Module::new("enum_zero_const");
         let enum_id = module.add_enum_def(
@@ -9532,7 +10670,8 @@ mod tests {
             )
             .with_discriminants(vec![Some(11), None])
             .with_repr(trust_ir::EnumTagRepr::U8),
-        );
+        )
+        .expect("Module::add_enum_def: test fixture");
         assert_eq!(
             zero_const(&module, &Ty::Enum(enum_id)),
             Some(Constant::Aggregate(vec![
@@ -9553,7 +10692,8 @@ mod tests {
                 }],
             )
             .with_discriminants(vec![Some(5)]),
-        );
+        )
+        .expect("Module::add_enum_def: test fixture");
         // Trust (vtable slice 11): the Ptr variant lane now spells the wave-PS null pointer.
         // Sound in every reachable context: the enum arm of `zero_const` is reached only for an
         // enum RECURSIVELY inside a Tuple/Struct seed (a top-level `Ty::Enum` Undef never
@@ -9719,6 +10859,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let outer_sid = m.add_struct(StructDef {
             id: StructId::new(1),
@@ -9730,15 +10871,19 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         });
         let inner_ty = IrTy::Struct(inner_sid);
         let outer_ty = IrTy::Struct(outer_sid);
 
-        let fty = m.add_func_type(FuncTy {
-            params: vec![],
-            returns: vec![IrTy::Bool, IrTy::U64, IrTy::U64, IrTy::U64],
-            is_vararg: false,
-        });
+        let fty = m
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![IrTy::Bool, IrTy::U64, IrTy::U64, IrTy::U64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let v = ValueId::new;
         let mut blk = Block::new(BlockId::new(0));
         // Slot + initial value: Outer { inner: Inner { flag: true, gen1: 41, lazy: 5 }, other: 9 }.
@@ -9844,7 +10989,7 @@ mod tests {
         blk.body.push(InstrNode::new(Inst::Return { values: vec![v(9), v(10), v(11), v(12)] }));
         let mut f = IrFunction::new(FuncId::new(0), "wave31_probe", fty, BlockId::new(0));
         f.blocks.push(blk);
-        m.add_function(f);
+        m.try_add_function(f).expect("Module::try_add_function: test fixture");
 
         let outcome = Interpreter::with_module(&m)
             .execute_func(FuncId::new(0), vec![])
@@ -9875,11 +11020,14 @@ mod tests {
         let v = ValueId::new;
         let mut m = Module::new(name.to_string());
         // Shared signature: (i64) -> i64.
-        let sig = m.add_func_type(FuncTy {
-            params: vec![IrTy::I64],
-            returns: vec![IrTy::I64],
-            is_vararg: false,
-        });
+        let sig = m
+            .add_func_type(FuncTy {
+                params: vec![IrTy::I64],
+                returns: vec![IrTy::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         // entry (FuncId 0): entry block takes the i64 param, calls callee, returns the result.
         let mut eb = Block::new(BlockId::new(0)).with_param(v(0), IrTy::I64);
@@ -9890,7 +11038,7 @@ mod tests {
         eb.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
         let mut entry = IrFunction::new(FuncId::new(0), "entry", sig, BlockId::new(0));
         entry.blocks.push(eb);
-        m.add_function(entry);
+        m.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         // callee (FuncId 1): identity (`return y`) or constant-0 (`return 0`), ignoring the arg.
         let mut cb = Block::new(BlockId::new(0)).with_param(v(0), IrTy::I64);
@@ -9906,7 +11054,7 @@ mod tests {
         cb.body.push(InstrNode::new(Inst::Return { values: vec![ret] }));
         let mut callee = IrFunction::new(FuncId::new(1), "callee", sig, BlockId::new(0));
         callee.blocks.push(cb);
-        m.add_function(callee);
+        m.try_add_function(callee).expect("Module::try_add_function: test fixture");
         m
     }
 
@@ -9916,8 +11064,14 @@ mod tests {
         use trust_ir::{Block, BlockId, Function as IrFunction, InstrNode};
 
         let mut m = Module::new(name.to_string());
-        let sig =
-            m.add_func_type(FuncTy { params: Vec::new(), returns: Vec::new(), is_vararg: false });
+        let sig = m
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut entry_block = Block::new(BlockId::new(0));
         entry_block
@@ -9926,13 +11080,13 @@ mod tests {
         entry_block.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
         let mut entry = IrFunction::new(FuncId::new(0), "entry", sig, BlockId::new(0));
         entry.blocks.push(entry_block);
-        m.add_function(entry);
+        m.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut callee_block = Block::new(BlockId::new(0));
         callee_block.body.push(InstrNode::new(Inst::Return { values: Vec::new() }));
         let mut callee = IrFunction::new(FuncId::new(1), "callee", sig, BlockId::new(0));
         callee.blocks.push(callee_block);
-        m.add_function(callee);
+        m.try_add_function(callee).expect("Module::try_add_function: test fixture");
         m
     }
 
@@ -9945,6 +11099,9 @@ mod tests {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
     }
 
@@ -9970,11 +11127,14 @@ mod tests {
     fn global_store_module(name: &str, stored: i128, returned: i128) -> Module {
         let mut module = Module::new(name.to_string());
         add_mutable_i64_global(&mut module, "GLOBAL", 0);
-        let sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut block = Block::new(trust_ir::BlockId::new(0));
         append_global_store(&mut block, stored);
         block.body.push(
@@ -9984,7 +11144,7 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }));
         let mut entry = Function::new(FuncId::new(0), "entry", sig, trust_ir::BlockId::new(0));
         entry.blocks.push(block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -9992,16 +11152,22 @@ mod tests {
     fn effectful_callee_module(name: &str, stored: i128, returned: i128) -> Module {
         let mut module = Module::new(name.to_string());
         add_mutable_i64_global(&mut module, "GLOBAL", 0);
-        let entry_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
-        let unit_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let entry_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let unit_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut entry_block = Block::new(trust_ir::BlockId::new(0));
         entry_block
@@ -10015,7 +11181,7 @@ mod tests {
         let mut entry =
             Function::new(FuncId::new(0), "entry", entry_sig, trust_ir::BlockId::new(0));
         entry.blocks.push(entry_block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut callee_block = Block::new(trust_ir::BlockId::new(0));
         append_global_store(&mut callee_block, stored);
@@ -10023,18 +11189,21 @@ mod tests {
         let mut callee =
             Function::new(FuncId::new(1), "effect", unit_sig, trust_ir::BlockId::new(0));
         callee.blocks.push(callee_block);
-        module.add_function(callee);
+        module.try_add_function(callee).expect("Module::try_add_function: test fixture");
         module
     }
 
     fn returned_global_pointer_module(name: &str, symbol: &str, initializer: i128) -> Module {
         let mut module = Module::new(name.to_string());
         add_mutable_i64_global(&mut module, symbol, initializer);
-        let sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::Ptr],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::Ptr],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.body.push(
             InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) })
@@ -10043,22 +11212,28 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(0)] }));
         let mut entry = Function::new(FuncId::new(0), "entry", sig, trust_ir::BlockId::new(0));
         entry.blocks.push(block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
         module
     }
 
     fn returned_fndef_module(name: &str, target_return: i128) -> Module {
         let mut module = Module::new(name.to_string());
-        let target_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
-        let entry_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::Func(target_sig)],
-            is_vararg: false,
-        });
+        let target_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let entry_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::Func(target_sig)],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut entry_block = Block::new(trust_ir::BlockId::new(0));
         entry_block.body.push(
@@ -10072,7 +11247,7 @@ mod tests {
         let mut entry =
             Function::new(FuncId::new(0), "entry", entry_sig, trust_ir::BlockId::new(0));
         entry.blocks.push(entry_block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut target_block = Block::new(trust_ir::BlockId::new(0));
         target_block.body.push(
@@ -10083,7 +11258,7 @@ mod tests {
         let mut target =
             Function::new(FuncId::new(1), "target", target_sig, trust_ir::BlockId::new(0));
         target.blocks.push(target_block);
-        module.add_function(target);
+        module.try_add_function(target).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -10092,16 +11267,22 @@ mod tests {
     /// and across sampled executions.
     fn sampled_callable_and_scalar_module(name: &str, true_scalar: i128) -> Module {
         let mut module = Module::new(name.to_string());
-        let target_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
-        let entry_sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Bool],
-            returns: vec![Ty::Func(target_sig), Ty::I64],
-            is_vararg: false,
-        });
+        let target_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let entry_sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Bool],
+                returns: vec![Ty::Func(target_sig), Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let v = ValueId::new;
         let mut entry_block = Block::new(trust_ir::BlockId::new(0)).with_param(v(0), Ty::Bool);
         entry_block.body.push(
@@ -10131,7 +11312,7 @@ mod tests {
         let mut entry =
             Function::new(FuncId::new(0), "entry", entry_sig, trust_ir::BlockId::new(0));
         entry.blocks.push(entry_block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut target_block = Block::new(trust_ir::BlockId::new(0));
         target_block.body.push(
@@ -10141,7 +11322,7 @@ mod tests {
         let mut target =
             Function::new(FuncId::new(1), "target", target_sig, trust_ir::BlockId::new(0));
         target.blocks.push(target_block);
-        module.add_function(target);
+        module.try_add_function(target).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -10149,16 +11330,22 @@ mod tests {
     fn pure_entry_with_unrelated_effect(name: &str, stored: i128) -> Module {
         let mut module = Module::new(name.to_string());
         add_mutable_i64_global(&mut module, "UNRELATED", 0);
-        let entry_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
-        let unit_sig = module.add_func_type(FuncTy {
-            params: Vec::new(),
-            returns: Vec::new(),
-            is_vararg: false,
-        });
+        let entry_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let unit_sig = module
+            .add_func_type(FuncTy {
+                params: Vec::new(),
+                returns: Vec::new(),
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut entry_block = Block::new(trust_ir::BlockId::new(0));
         entry_block.body.push(
@@ -10169,7 +11356,7 @@ mod tests {
         let mut entry =
             Function::new(FuncId::new(0), "entry", entry_sig, trust_ir::BlockId::new(0));
         entry.blocks.push(entry_block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut unrelated_block = Block::new(trust_ir::BlockId::new(0));
         append_global_store(&mut unrelated_block, stored);
@@ -10177,7 +11364,7 @@ mod tests {
         let mut unrelated =
             Function::new(FuncId::new(1), "unrelated_effect", unit_sig, trust_ir::BlockId::new(0));
         unrelated.blocks.push(unrelated_block);
-        module.add_function(unrelated);
+        module.try_add_function(unrelated).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -10295,6 +11482,435 @@ mod tests {
         );
     }
 
+    /// Trust (2026-09-28, trust-ir v50): interpreter arrays are compared on their STRUCTURE with
+    /// the list comparison's verdict — equal uniform runs agree, a different element or one
+    /// differing lane in a long run disagrees, a list and a splat of the same elements agree —
+    /// and the answer at a `2^62`-element run costs what the run is stored as, not its length.
+    /// (`2^62`, not a merely large length: an element-wise regression then fails at once with
+    /// `capacity overflow` instead of trying to fill terabytes — the 2026-09-21 incident shape.)
+    #[test]
+    fn array_values_agree_on_structure_whatever_the_length() {
+        use trust_ir::interpret::ArrayValue;
+        let mut module = Module::new("arrays");
+        let tid = module.add_type(Ty::Bool).expect("Module::add_type: test fixture");
+        let b = |v| InterpretValue { ty: Ty::Bool, kind: InterpretValueKind::Bool(v) };
+        let arr = |a: ArrayValue| InterpretValue {
+            ty: Ty::Array(tid, a.len()),
+            kind: InterpretValueKind::Array(a),
+        };
+        for len in [2u64, 1 << 62] {
+            let t = arr(ArrayValue::splat(b(true), len));
+            assert_eq!(value_agree(&module, &module, &t, &t.clone(), TY_CMP_DEPTH), Ok(true));
+            let f = arr(ArrayValue::splat(b(false), len));
+            assert_eq!(value_agree(&module, &module, &t, &f, TY_CMP_DEPTH), Ok(false));
+            let one_off =
+                arr(ArrayValue::splat(b(true), len).set(len - 1, b(false)).expect("in bounds"));
+            assert_eq!(value_agree(&module, &module, &t, &one_off, TY_CMP_DEPTH), Ok(false));
+        }
+        let list = arr(ArrayValue::from_vec(vec![b(true), b(true)]));
+        let splat = arr(ArrayValue::splat(b(true), 2));
+        assert_eq!(value_agree(&module, &module, &list, &splat, TY_CMP_DEPTH), Ok(true));
+    }
+
+    /// Trust (2026-09-28, trust-ir v50): the dead-seed zero of an array type is ONE
+    /// `Constant::Splat` whatever the length — the old `vec![z; n]` built `n` constants and
+    /// `capacity overflow`-ICEd at a huge `n` — in the canonical spelling the producer's seeds
+    /// use (`[]` for none, a one-element list for one). The huge lengths are ones whose
+    /// element-wise build overflows at once (`capacity overflow`), so a regression is a cheap
+    /// panic here, never a machine-sized allocation.
+    #[test]
+    fn zero_const_of_an_array_is_one_splat_whatever_the_length() {
+        let mut module = Module::new("zero");
+        let tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        for n in [2u64, 1 << 62, u64::MAX] {
+            assert_eq!(
+                zero_const(&module, &Ty::Array(tid, n)),
+                Some(Constant::Splat { elem: Box::new(Constant::Int(0)), len: n })
+            );
+        }
+        assert_eq!(zero_const(&module, &Ty::Array(tid, 0)), Some(Constant::Array(Vec::new())));
+        assert_eq!(
+            zero_const(&module, &Ty::Array(tid, 1)),
+            Some(Constant::Array(vec![Constant::Int(0)]))
+        );
+    }
+
+    /// Trust (2026-09-28, trust-ir v50): folding an `InsertElement` chain over a uniform seed
+    /// (`Constant::Splat`) is SPARSE. A chain that writes every lane folds to exactly its
+    /// writes (re-spelled canonically, so equal writes are a `Splat`); a chain that leaves a
+    /// seed lane beside a written one refuses — and at a `2^62`-lane seed it refuses without
+    /// ever building the array (a length whose element-wise build overflows at once, so a
+    /// regression panics cheaply instead of filling memory).
+    #[test]
+    fn folding_writes_into_a_uniform_seed_is_sparse() {
+        fn fold_chain(len: u64, writes: &[(u64, i128)]) -> Option<Constant> {
+            let mut module = Module::new("fold");
+            let tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
+            let arr_ty = Ty::Array(tid, len);
+            let mut insts: Vec<(ValueId, Inst)> = vec![(
+                ValueId::new(0),
+                Inst::Const { ty: arr_ty.clone(), value: Constant::splat(Constant::Int(0), len) },
+            )];
+            let mut cur = ValueId::new(0);
+            let mut next = 1u32;
+            for &(index, value) in writes {
+                let (i, v, out) = (ValueId::new(next), ValueId::new(next + 1), ValueId::new(next + 2));
+                next += 3;
+                insts.push((i, Inst::Const { ty: Ty::Usize, value: Constant::Int(i128::from(index)) }));
+                insts.push((v, Inst::Const { ty: Ty::U8, value: Constant::Int(value) }));
+                insts.push((
+                    out,
+                    Inst::InsertElement { ty: arr_ty.clone(), array: cur, index: i, value: v },
+                ));
+                cur = out;
+            }
+            let defs: HashMap<ValueId, &Inst> = insts.iter().map(|(id, inst)| (*id, inst)).collect();
+            fold_stored_constant(&defs, cur, 64)
+        }
+        assert_eq!(fold_chain(3, &[]), Some(Constant::splat(Constant::Int(0), 3)));
+        assert_eq!(
+            fold_chain(3, &[(0, 5), (1, 5), (2, 6)]),
+            Some(Constant::Array(vec![Constant::Int(5), Constant::Int(5), Constant::Int(6)]))
+        );
+        assert_eq!(
+            fold_chain(3, &[(2, 5), (0, 5), (1, 5)]),
+            Some(Constant::splat(Constant::Int(5), 3)),
+            "equal writes over every lane are the canonical Splat"
+        );
+        assert_eq!(fold_chain(3, &[(0, 5), (1, 5)]), None, "a seed lane survives");
+        assert_eq!(fold_chain(3, &[(3, 5)]), None, "out of bounds");
+        assert_eq!(fold_chain(1 << 62, &[(7, 5)]), None, "sparse refusal at any length");
+    }
+
+    /// Trust (2026-09-28, trust-ir v50): an `ArraySplat` register over a foldable element folds
+    /// to exactly the constant the producer spells `Const(Splat)`, so a promoted slot one side
+    /// spells `[v; n]` as a register pairs with the other side's constant, whichever spelling
+    /// each producer chose (a scalar, a tuple, a nested repeat, `()`). At `n == 1` both are the
+    /// one-element list. A register element (a param: no defining node) refuses.
+    #[test]
+    fn an_array_splat_folds_to_the_splat_constant_of_its_element() {
+        let v = ValueId::new;
+        let mut module = Module::new("splat_fold");
+        let u8_tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        let elems: [(Ty, Constant); 4] = [
+            (Ty::U8, Constant::Int(5)),
+            (
+                Ty::Tuple(vec![Ty::U8, Ty::U8]),
+                Constant::Aggregate(vec![Constant::Int(1), Constant::Int(2)]),
+            ),
+            (Ty::Array(u8_tid, 2), Constant::splat(Constant::Int(0), 2)),
+            (Ty::Unit, Constant::PhantomData),
+        ];
+        for (elem_ty, c) in elems {
+            let elem_tid =
+                module.add_type(elem_ty.clone()).expect("Module::add_type: test fixture");
+            for n in [1u64, 2, 3] {
+                let arr_ty = Ty::Array(elem_tid, n);
+                let insts = [
+                    (v(0), Inst::Const { ty: elem_ty.clone(), value: c.clone() }),
+                    (v(1), Inst::ArraySplat { ty: arr_ty.clone(), value: v(0) }),
+                    (v(2), Inst::Const { ty: arr_ty, value: Constant::splat(c.clone(), n) }),
+                ];
+                let defs: HashMap<ValueId, &Inst> =
+                    insts.iter().map(|(id, inst)| (*id, inst)).collect();
+                let via_register = fold_stored_constant(&defs, v(1), 64);
+                assert_eq!(via_register, fold_stored_constant(&defs, v(2), 64), "{c:?} x {n}");
+                assert_eq!(via_register, Some(Constant::splat(c.clone(), n)), "{c:?} x {n}");
+            }
+        }
+        let insts = [(v(1), Inst::ArraySplat { ty: Ty::Array(u8_tid, 4), value: v(0) })];
+        let defs: HashMap<ValueId, &Inst> = insts.iter().map(|(id, inst)| (*id, inst)).collect();
+        assert_eq!(fold_stored_constant(&defs, v(1), 64), None, "a register element refuses");
+    }
+
+    /// A list that turns uniform partway through a write chain stays a list until the top of
+    /// the chain: `[1, 2]`, then lane 1 := 1 (uniform `[1, 1]` for a moment), then lane 0 := 7
+    /// folds to `[7, 1]`. Re-spelling the middle as a `Splat` made the last write meet a seed
+    /// with a surviving lane, and the fold refused.
+    #[test]
+    fn a_write_chain_over_a_list_is_spelled_canonically_once_at_the_top() {
+        let v = ValueId::new;
+        let c = Constant::Int;
+        let mut module = Module::new("list_fold");
+        let tid = module.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        let arr_ty = Ty::Array(tid, 2);
+        let insts = [
+            (v(0), Inst::Const { ty: arr_ty.clone(), value: Constant::Array(vec![c(1), c(2)]) }),
+            (v(1), Inst::Const { ty: Ty::Usize, value: c(1) }),
+            (v(2), Inst::Const { ty: Ty::U8, value: c(1) }),
+            (
+                v(3),
+                Inst::InsertElement { ty: arr_ty.clone(), array: v(0), index: v(1), value: v(2) },
+            ),
+            (v(4), Inst::Const { ty: Ty::Usize, value: c(0) }),
+            (v(5), Inst::Const { ty: Ty::U8, value: c(7) }),
+            (v(6), Inst::InsertElement { ty: arr_ty, array: v(3), index: v(4), value: v(5) }),
+        ];
+        let defs: HashMap<ValueId, &Inst> = insts.iter().map(|(id, inst)| (*id, inst)).collect();
+        assert_eq!(
+            fold_stored_constant(&defs, v(3), 64),
+            Some(Constant::splat(c(1), 2)),
+            "a chain whose top is uniform is the canonical Splat"
+        );
+        assert_eq!(fold_stored_constant(&defs, v(6), 64), Some(Constant::Array(vec![c(7), c(1)])));
+    }
+
+    /// Ratification review 2026-09-28 (the RED this restores): a written array that is uniform
+    /// only UP TO SPELLING refuses the fold instead of collapsing. `Constant::array` treats
+    /// `Aggregate([1, 2])` and `Array([1, 2])` as one class and keeps the FIRST spelling, so a
+    /// chain writing both into a `[(u8, u16); 2]` slot — the second ill-typed at a tuple — folded
+    /// at `2b05b645a1` to the well-typed `Splat { Aggregate([1, 2]), 2 }`, and the comparison
+    /// judged a constant the chain never wrote. Both the list path and the all-lanes-written
+    /// seed path refuse; a BIT-EXACT uniform list still folds to the canonical `Splat`.
+    #[test]
+    fn a_written_array_uniform_only_up_to_spelling_refuses_the_fold() {
+        let v = ValueId::new;
+        let c = Constant::Int;
+        let mut module = Module::new("spelling_fold");
+        let pair_ty = Ty::Tuple(vec![Ty::U8, Ty::U16]);
+        let tid = module.add_type(pair_ty.clone()).expect("Module::add_type: test fixture");
+        let arr_ty = Ty::Array(tid, 2);
+        let agg = || Constant::Aggregate(vec![c(1), c(2)]);
+        let arr = || Constant::Array(vec![c(1), c(2)]);
+        let chain = |seed: Constant, lane0: Constant, lane1: Constant| {
+            vec![
+                (v(0), Inst::Const { ty: arr_ty.clone(), value: seed }),
+                (v(1), Inst::Const { ty: Ty::Usize, value: c(0) }),
+                (v(2), Inst::Const { ty: pair_ty.clone(), value: lane0 }),
+                (
+                    v(3),
+                    Inst::InsertElement {
+                        ty: arr_ty.clone(),
+                        array: v(0),
+                        index: v(1),
+                        value: v(2),
+                    },
+                ),
+                (v(4), Inst::Const { ty: Ty::Usize, value: c(1) }),
+                (v(5), Inst::Const { ty: pair_ty.clone(), value: lane1 }),
+                (
+                    v(6),
+                    Inst::InsertElement {
+                        ty: arr_ty.clone(),
+                        array: v(3),
+                        index: v(4),
+                        value: v(5),
+                    },
+                ),
+            ]
+        };
+        let fold = |insts: &Vec<(ValueId, Inst)>| {
+            let defs: HashMap<ValueId, &Inst> =
+                insts.iter().map(|(id, inst)| (*id, inst)).collect();
+            fold_stored_constant(&defs, v(6), 64)
+        };
+        let list_seed = || {
+            Constant::Array(vec![
+                Constant::Aggregate(vec![c(9), c(9)]),
+                Constant::Aggregate(vec![c(8), c(8)]),
+            ])
+        };
+        let splat_seed = || Constant::splat(Constant::Aggregate(vec![c(0), c(0)]), 2);
+        for seed in [list_seed(), splat_seed()] {
+            assert_eq!(fold(&chain(seed.clone(), agg(), arr())), None, "mixed spelling: {seed:?}");
+            assert_eq!(
+                fold(&chain(seed, agg(), agg())),
+                Some(Constant::splat(agg(), 2)),
+                "control: a bit-exact uniform write is the canonical Splat"
+            );
+        }
+    }
+
+    /// Ratification review 2026-09-28: the GEP "pointer family" of a private slot admits a
+    /// derived pointer ONLY in an address position (a `Load`/`Store` `ptr`, a `GEP` `base`). Each
+    /// other use of a derived pointer — stored as a VALUE, passed to a call, cast to an integer,
+    /// compared, used as a GEP INDEX, or reached one GEP further down — is an escape, and the
+    /// slot must stay out of `private_nonescaping_slots`. A probe widened to restore any of these
+    /// positions fails here.
+    #[test]
+    fn a_derived_pointer_in_any_non_address_position_escapes_its_slot() {
+        let v = ValueId::new;
+        let build = |escape: Vec<Inst>| -> Module {
+            let mut m = Module::new("escape");
+            let tid = m.add_type(Ty::U16).expect("Module::add_type: test fixture");
+            let arr_ty = Ty::Array(tid, 4);
+            let mut b = Block::new(trust_ir::BlockId::new(0));
+            b.body.push(
+                InstrNode::new(Inst::Alloca { ty: arr_ty, count: None, align: None })
+                    .with_result(v(1)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::Usize, value: Constant::Int(1) })
+                    .with_result(v(2)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::GEP {
+                    pointee_ty: Ty::U16,
+                    base: v(1),
+                    indices: vec![v(2)],
+                    inbounds: false,
+                })
+                .with_result(v(3)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::Alloca { ty: Ty::Ptr, count: None, align: None })
+                    .with_result(v(4)),
+            );
+            for (i, inst) in escape.into_iter().enumerate() {
+                b.body.push(InstrNode::new(inst).with_result(v(10 + i as u32)));
+            }
+            b.body.push(InstrNode::new(Inst::Return { values: vec![] }));
+            single_block_module_with(m, "escape", vec![], vec![], b)
+        };
+        let private_after = |escape: Vec<Inst>| {
+            private_nonescaping_slots(&build(escape).functions[0]).contains(&v(1))
+        };
+        // Control: a derived pointer used only as a `Load` address keeps the slot private.
+        assert!(private_after(vec![Inst::Load {
+            ty: Ty::U16,
+            ptr: v(3),
+            volatile: false,
+            align: None
+        }]));
+        let escapes: [(&str, Vec<Inst>); 6] = [
+            (
+                "stored as a value",
+                vec![Inst::Store { ty: Ty::Ptr, ptr: v(4), value: v(3), volatile: false, align: None }],
+            ),
+            ("a call argument", vec![Inst::Call { callee: FuncId::new(9), args: vec![v(3)] }]),
+            (
+                "cast to an integer",
+                vec![Inst::Cast {
+                    op: CastOp::PtrToInt,
+                    src_ty: Ty::Ptr,
+                    dst_ty: Ty::Usize,
+                    operand: v(3),
+                }],
+            ),
+            ("compared", vec![Inst::ICmp { op: trust_ir::ICmpOp::Eq, ty: Ty::Ptr, lhs: v(3), rhs: v(4) }]),
+            (
+                "a GEP index",
+                vec![Inst::GEP {
+                    pointee_ty: Ty::U8,
+                    base: v(4),
+                    indices: vec![v(3)],
+                    inbounds: false,
+                }],
+            ),
+            (
+                "one GEP further down, then passed to a call",
+                vec![
+                    Inst::GEP { pointee_ty: Ty::U16, base: v(3), indices: vec![v(2)], inbounds: false },
+                    Inst::Call { callee: FuncId::new(9), args: vec![v(10)] },
+                ],
+            ),
+        ];
+        for (what, escape) in escapes {
+            assert!(!private_after(escape), "a derived pointer {what} must escape its slot");
+        }
+    }
+
+    /// Trust (2026-09-28, trust-ir v50): the constant-size sub-array read both producers now emit
+    /// for a `rest @ ..` middle or a MIR `Subslice` — spill the array to a slot, `GEP` to the
+    /// first lane, `Load` the sub-array — is a PRIVATE cell: the slot and its derived pointer are
+    /// in `private_nonescaping_slots`, so the body reaches `Agreed` against the direct spelling
+    /// of the same value instead of being held as allocation/provenance state. A derived pointer
+    /// that escapes (here: returned) keeps the slot out of the set.
+    #[test]
+    fn a_sub_array_read_through_a_private_slot_reaches_agreed() {
+        let v = ValueId::new;
+        let source = || Constant::Array((1..=4).map(Constant::Int).collect());
+        let spill = |escape: bool| -> Module {
+            let mut m = Module::new("spill");
+            let tid = m.add_type(Ty::U16).expect("Module::add_type: test fixture");
+            let src_ty = Ty::Array(tid, 4);
+            let mut b = Block::new(trust_ir::BlockId::new(0));
+            b.body.push(
+                InstrNode::new(Inst::Const { ty: src_ty.clone(), value: source() })
+                    .with_result(v(0)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::Alloca { ty: src_ty.clone(), count: None, align: None })
+                    .with_result(v(1)),
+            );
+            b.body.push(InstrNode::new(Inst::Store {
+                ty: src_ty,
+                ptr: v(1),
+                value: v(0),
+                volatile: false,
+                align: None,
+            }));
+            b.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::Usize, value: Constant::Int(1) })
+                    .with_result(v(2)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::GEP {
+                    pointee_ty: Ty::U16,
+                    base: v(1),
+                    indices: vec![v(2)],
+                    inbounds: true,
+                })
+                .with_result(v(3)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::Load {
+                    ty: Ty::Array(tid, 2),
+                    ptr: v(3),
+                    volatile: false,
+                    align: None,
+                })
+                .with_result(v(4)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::Const { ty: Ty::Usize, value: Constant::Int(1) })
+                    .with_result(v(5)),
+            );
+            b.body.push(
+                InstrNode::new(Inst::ExtractElement { ty: Ty::U16, array: v(4), index: v(5) })
+                    .with_result(v(6)),
+            );
+            let (returns, values) = if escape {
+                (vec![Ty::U16, Ty::Ptr], vec![v(6), v(3)])
+            } else {
+                (vec![Ty::U16], vec![v(6)])
+            };
+            b.body.push(InstrNode::new(Inst::Return { values }));
+            single_block_module_with(m, "spill", vec![], returns, b)
+        };
+        let spilled = spill(false);
+        let private = private_nonescaping_slots(&spilled.functions[0]);
+        assert!(private.contains(&v(1)) && private.contains(&v(3)), "{private:?}");
+        assert!(
+            private_nonescaping_slots(&spill(true).functions[0]).is_empty(),
+            "a returned derived pointer escapes"
+        );
+
+        // The direct spelling of the same value: lane 2 of the source.
+        let mut m = Module::new("direct");
+        let tid = m.add_type(Ty::U16).expect("Module::add_type: test fixture");
+        let mut b = Block::new(trust_ir::BlockId::new(0));
+        b.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::Array(tid, 4), value: source() })
+                .with_result(v(0)),
+        );
+        b.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::Usize, value: Constant::Int(2) })
+                .with_result(v(1)),
+        );
+        b.body.push(
+            InstrNode::new(Inst::ExtractElement { ty: Ty::U16, array: v(0), index: v(1) })
+                .with_result(v(2)),
+        );
+        b.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
+        let direct = single_block_module_with(m, "direct", vec![], vec![Ty::U16], b);
+        for (a, b) in [(&direct, &spilled), (&spilled, &direct)] {
+            let report = compare_entries(a, FuncId::new(0), b, FuncId::new(0));
+            assert_eq!(report.mode, DiffMode::Agreed, "notes: {:?}", report.notes);
+            assert!(report.equal);
+        }
+    }
+
     #[test]
     fn nested_callable_constants_and_frame_values_fail_closed() {
         let callable = Constant::Aggregate(vec![Constant::Array(vec![Constant::Closure {
@@ -10304,11 +11920,82 @@ mod tests {
         assert!(constant_materializes_uncomparable_identity(&callable));
 
         let module = Module::new("frame_identity");
-        let frame = InterpretValue { ty: Ty::Ptr, kind: InterpretValueKind::Frame(0) };
+        // Trust (2026-09-20): `Frame` is a STRUCT variant in the trust-ir this
+        // tree now pins — `{ lineage, slots }` where the handle carries its own
+        // immutable slot snapshot. The test's point is unchanged: two frames
+        // with EQUAL synthetic lineage counters must still not establish
+        // cross-execution identity, so build the same degenerate handle
+        // (lineage 0, no slots) the old `Frame(0)` denoted.
+        let frame = InterpretValue {
+            ty: Ty::Ptr,
+            kind: InterpretValueKind::Frame { lineage: 0, slots: std::sync::Arc::from([]) },
+        };
         assert!(
             value_agree(&module, &module, &frame, &frame, TY_CMP_DEPTH).is_err(),
             "equal synthetic frame counters must never establish cross-execution identity"
         );
+    }
+
+    /// trust-ir v50 made the interpreter's array a rope (`ArrayValue`) and added the splat
+    /// spellings. Agreement stays ELEMENT-WISE whatever the spelling, and a splat constant
+    /// carries an uncomparable identity exactly when its one element does.
+    #[test]
+    fn array_values_agree_element_wise_whatever_their_spelling() {
+        let mut module = Module::new("array_spellings");
+        let elem = module.add_type(Ty::I32).expect("Module::add_type: test fixture");
+        let int = |v: i128| InterpretValue::int(Ty::I32, v).expect("i32");
+        let array = |values: ArrayValue| InterpretValue {
+            ty: Ty::Array(elem, values.len()),
+            kind: InterpretValueKind::Array(values),
+        };
+        let agree = |x: &InterpretValue, y: &InterpretValue| {
+            value_agree(&module, &module, x, y, TY_CMP_DEPTH).expect("comparable")
+        };
+        let zeros = array(ArrayValue::splat(int(0), 4));
+        assert!(agree(&zeros, &array(ArrayValue::from_vec(vec![int(0); 4]))));
+        assert!(!agree(&zeros, &array(ArrayValue::from_vec(vec![int(0), int(0), int(1), int(0)]))));
+        assert!(agree(&array(ArrayValue::splat(int(7), 4)), &array(ArrayValue::splat(int(7), 4))));
+        assert!(!agree(&array(ArrayValue::splat(int(7), 4)), &array(ArrayValue::splat(int(8), 4))));
+        assert_eq!(
+            array_values_agree(
+                &module,
+                &module,
+                &ArrayValue::splat(int(0), 4),
+                &ArrayValue::splat(int(0), 3),
+                TY_CMP_DEPTH
+            ),
+            Ok(false)
+        );
+
+        let fn_def = Constant::FnDef(FuncId::new(0));
+        assert!(constant_materializes_uncomparable_identity(&Constant::Splat {
+            elem: Box::new(fn_def),
+            len: 2
+        }));
+        assert!(!constant_materializes_uncomparable_identity(&Constant::Splat {
+            elem: Box::new(Constant::Int(0)),
+            len: 2
+        }));
+        assert!(!constant_materializes_uncomparable_identity(&Constant::Uninit));
+    }
+
+    /// Trust: a trust-ir v70 `Constant::TensorBlob` is classified by name as uncomparable,
+    /// bare and nested in an aggregate, so a body that materializes one is held
+    /// (coverage-only) instead of sampled. The scalar twin stays comparable.
+    #[test]
+    fn a_tensor_weight_blob_is_uncomparable_identity() {
+        let blob = Constant::TensorBlob {
+            digest: trust_ir::blob::BlobDigest::of(&[0, 0, 0, 0]),
+            dims: vec![1],
+        };
+        assert!(constant_materializes_uncomparable_identity(&blob));
+        assert!(constant_materializes_uncomparable_identity(&Constant::Aggregate(vec![
+            Constant::Int(0),
+            blob,
+        ])));
+        assert!(!constant_materializes_uncomparable_identity(&Constant::Aggregate(vec![
+            Constant::Int(0),
+        ])));
     }
 
     #[test]
@@ -10601,11 +12288,14 @@ mod tests {
         use trust_ir::{BlockId, Function as IrFunction};
         let v = ValueId::new;
         let mut m = Module::new(name.to_string());
-        let sig = m.add_func_type(FuncTy {
-            params: vec![Ty::I64, Ty::I64],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let sig = m
+            .add_func_type(FuncTy {
+                params: vec![Ty::I64, Ty::I64],
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut eb = Block::new(BlockId::new(0)).with_param(v(0), Ty::I64).with_param(v(1), Ty::I64);
         eb.body.push(
@@ -10620,7 +12310,7 @@ mod tests {
         eb.body.push(InstrNode::new(Inst::Return { values: vec![v(3)] }));
         let mut entry = IrFunction::new(FuncId::new(0), "entry", sig, BlockId::new(0));
         entry.blocks.push(eb);
-        m.add_function(entry);
+        m.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut cb = Block::new(BlockId::new(0)).with_param(v(0), Ty::I64).with_param(v(1), Ty::I64);
         cb.body.push(
@@ -10635,7 +12325,7 @@ mod tests {
         cb.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
         let mut callee = IrFunction::new(FuncId::new(1), "callee", sig, BlockId::new(0));
         callee.blocks.push(cb);
-        m.add_function(callee);
+        m.try_add_function(callee).expect("Module::try_add_function: test fixture");
         m
     }
 
@@ -10919,6 +12609,7 @@ mod tests {
                 size: Some(0),
                 align: Some(1),
                 repr: StructRepr::Rust,
+                origin: None,
             });
             module.add_enum(EnumDef::new(
                 EnumId::new(i),
@@ -10944,6 +12635,7 @@ mod tests {
             size: Some(size),
             align: Some(8),
             repr: StructRepr::Transparent,
+            origin: None,
         };
         let zst = |id: StructId, name: &str| StructDef {
             id,
@@ -10952,6 +12644,7 @@ mod tests {
             size: Some(0),
             align: Some(1),
             repr: StructRepr::Rust,
+            origin: None,
         };
 
         // Struct table, nested-first (the producer's registration order):
@@ -10974,6 +12667,7 @@ mod tests {
             size: Some(8),
             align: Some(8),
             repr: StructRepr::Rust,
+            origin: None,
         });
         // e0 Option<Arc<Level>> — niche-encoded over the non-null pointer.
         module.add_enum(
@@ -11016,6 +12710,7 @@ mod tests {
             size: Some(8),
             align: Some(8),
             repr: StructRepr::Rust,
+            origin: None,
         });
         module.add_struct(ptr_struct(sid(5), "NonNull<ArcInner<Name>>", 8));
         module.add_struct(zst(sid(6), "PhantomData<ArcInner<Name>>"));
@@ -11030,6 +12725,7 @@ mod tests {
             size: Some(8),
             align: Some(8),
             repr: StructRepr::Rust,
+            origin: None,
         });
         // `Arc<str>`: the recorded rustc size is 16 (a FAT pointer) while the
         // producer's current spelling of the deep `*const ArcInner<str>` lane
@@ -11050,6 +12746,7 @@ mod tests {
             size: Some(16),
             align: Some(8),
             repr: StructRepr::Rust,
+            origin: None,
         });
         // e1 NameInner { Anon, Str(Arc<Name>, Arc<str>), Num(Arc<Name>, u64) }.
         module.add_enum(
@@ -11083,6 +12780,7 @@ mod tests {
             size: Some(32),
             align: Some(8),
             repr: StructRepr::Rust,
+            origin: None,
         });
         // e2 Level { Zero, Succ(LevelArc), Max(LevelArc, LevelArc),
         //            IMax(LevelArc, LevelArc), Param(Name) }.
@@ -11141,13 +12839,14 @@ mod tests {
     #[test]
     fn level_shape_binary_codec_round_trips_byte_stably() {
         let (module, level) = level_shape_module("level_codec", 0);
-        let bytes = trust_ir::binary::serialize_module(&module);
+        let bytes =
+            trust_ir::binary::serialize_module(&module).expect("serialize_module: test fixture");
         let decoded =
             trust_ir::binary::deserialize_module(&bytes).expect("Level module deserializes");
         assert_eq!(decoded.enums, module.enums, "enum defs (incl. niche descriptor) round-trip");
         assert_eq!(decoded.structs, module.structs, "struct defs round-trip");
         assert_eq!(
-            trust_ir::binary::serialize_module(&decoded),
+            trust_ir::binary::serialize_module(&decoded).expect("serialize_module: test fixture"),
             bytes,
             "re-serialization is byte-stable"
         );
@@ -11167,17 +12866,20 @@ mod tests {
         // A trivial body's signature over the shape: `fn(&Level) -> bool`
         // (the borrow is the producer's thin `Ty::Ptr`) and the by-value
         // `fn(Level) -> bool`.
-        let by_ref = FuncTy { params: vec![Ty::Ptr], returns: vec![Ty::Bool], is_vararg: false };
+        let by_ref =
+            FuncTy { params: vec![Ty::Ptr], returns: vec![Ty::Bool], is_vararg: false, abi: None };
         assert_eq!(sig_tys_agree(&thir, &oracle, &by_ref, &by_ref), Ok(true));
         let by_value_thir = FuncTy {
             params: vec![Ty::Enum(thir_level)],
             returns: vec![Ty::Bool],
             is_vararg: false,
+            abi: None,
         };
         let by_value_oracle = FuncTy {
             params: vec![Ty::Enum(oracle_level)],
             returns: vec![Ty::Bool],
             is_vararg: false,
+            abi: None,
         };
         assert_eq!(sig_tys_agree(&thir, &oracle, &by_value_thir, &by_value_oracle), Ok(true));
     }
@@ -11227,6 +12929,7 @@ mod tests {
             size: None,
             align: None,
             repr: trust_ir::StructRepr::Rust,
+            origin: None,
         }
     }
 
@@ -11255,11 +12958,14 @@ mod tests {
     fn memory_region_reader(name: &str, swap_names: bool, read_field: u32) -> Module {
         let mut module = memory_region_module(name, swap_names);
         let region = Ty::Struct(trust_ir::StructId::new(1));
-        let sig = module.add_func_type(FuncTy {
-            params: vec![region.clone()],
-            returns: vec![Ty::Usize],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![region.clone()],
+                returns: vec![Ty::Usize],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let v = ValueId::new;
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.params.push((v(0), region));
@@ -11274,7 +12980,7 @@ mod tests {
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
         let mut function = Function::new(FuncId::new(0), "region_read", sig, block.id);
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -11452,6 +13158,7 @@ mod tests {
             params: vec![Ty::Struct(trust_ir::StructId::new(1))],
             returns: vec![ret],
             is_vararg: false,
+            abi: None,
         }
     }
 
@@ -11529,8 +13236,12 @@ mod tests {
         let nthir = mixed_ptr_module("v_new_thir");
         let noracle = mixed_ptr_module("v_new_oracle");
         let mixed = Ty::Struct(trust_ir::StructId::new(0));
-        let nsig =
-            |ret: Ty| FuncTy { params: vec![mixed.clone()], returns: vec![ret], is_vararg: false };
+        let nsig = |ret: Ty| FuncTy {
+            params: vec![mixed.clone()],
+            returns: vec![ret],
+            is_vararg: false,
+            abi: None,
+        };
         let ptr_leaf: BTreeSet<&'static str> = BTreeSet::from(["ptr-leaf"]);
 
         assert_eq!(
@@ -11643,7 +13354,12 @@ mod tests {
 
         // And it is a conjunct of admission, not a free-standing helper.
         let placeholder = fieldless_module("datatype::Nat");
-        let sig = FuncTy { params: vec![unit.clone()], returns: vec![Ty::U8], is_vararg: false };
+        let sig = FuncTy {
+            params: vec![unit.clone()],
+            returns: vec![Ty::U8],
+            is_vararg: false,
+            abi: None,
+        };
         assert_eq!(
             aggregate_param_admission(&placeholder, &placeholder, &unit, &unit, &sig, &sig),
             AggregateParamAdmission::Refused
@@ -11695,11 +13411,14 @@ mod tests {
                 vec![sfield("a", Ty::U8), sfield("pad", Ty::Unit)],
             ));
             let sty = Ty::Struct(trust_ir::StructId::new(0));
-            let sig = module.add_func_type(FuncTy {
-                params: vec![sty.clone()],
-                returns: vec![Ty::U8],
-                is_vararg: false,
-            });
+            let sig = module
+                .add_func_type(FuncTy {
+                    params: vec![sty.clone()],
+                    returns: vec![Ty::U8],
+                    is_vararg: false,
+                    abi: None,
+                })
+                .expect("Module::add_func_type: test fixture");
             let v = ValueId::new;
             let mut block = Block::new(trust_ir::BlockId::new(0));
             block.params.push((v(0), sty));
@@ -11710,7 +13429,7 @@ mod tests {
             block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
             let mut function = Function::new(FuncId::new(0), "read", sig, block.id);
             function.blocks.push(block);
-            module.add_function(function);
+            module.try_add_function(function).expect("Module::try_add_function: test fixture");
             module
         };
         let report = compare_entries(&mk("unit_thir"), FuncId::new(0), &mk("unit_oracle"), FuncId::new(0));
@@ -11916,6 +13635,9 @@ mod tests {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         }
     }
 
@@ -11945,6 +13667,65 @@ mod tests {
         assert_eq!(report.mode, DiffMode::Agreed, "notes: {:?}", report.notes);
         assert!(report.equal);
         assert_eq!(report.samples_checked, 1);
+    }
+
+    /// Trust (2026-09-28, trust-ir v50): the promoted `&[x; 4]` whose element the oracle holds
+    /// in a register — `[copy _1; 4]`, a tuple, a nested repeat — stores ONE `ArraySplat` into
+    /// its once-stored escaping slot. The respell folds it (`fold_stored_value`'s `ArraySplat`
+    /// arm) to the same `Constant::Splat` the producer's promoted global carries, so the
+    /// bit-exact pairing admits the pair and the body reaches `Agreed`. Without that arm the
+    /// respell declined (`stored-value-not-constant`) and the body was held.
+    #[test]
+    fn promoted_array_splat_slot_pairs_with_the_producers_splat_global() {
+        let v = ValueId::new;
+        let splat = Constant::splat(Constant::Int(5), 4);
+        // Oracle: alloca [u8; 4], const 5, array_splat, store, borrow, copy, ret.
+        let mut oracle = Module::new("oracle_splat_slot");
+        let o_tid = oracle.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        let o_arr = Ty::Array(o_tid, 4);
+        let mut ob = Block::new(trust_ir::BlockId::new(0));
+        ob.body.push(
+            InstrNode::new(Inst::Alloca { ty: o_arr.clone(), count: None, align: None })
+                .with_result(v(0)),
+        );
+        ob.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::U8, value: Constant::Int(5) }).with_result(v(1)),
+        );
+        ob.body.push(
+            InstrNode::new(Inst::ArraySplat { ty: o_arr.clone(), value: v(1) }).with_result(v(2)),
+        );
+        ob.body.push(InstrNode::new(Inst::Store {
+            ty: o_arr,
+            ptr: v(0),
+            value: v(2),
+            volatile: false,
+            align: None,
+        }));
+        ob.body.push(InstrNode::new(Inst::Borrow { ptr: v(0) }).with_result(v(3)));
+        ob.body.push(InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: v(3) }).with_result(v(4)));
+        ob.body.push(InstrNode::new(Inst::Return { values: vec![v(4)] }));
+        let mut oracle =
+            single_block_module_with(oracle, "oracle_splat_slot", vec![], vec![Ty::Ptr], ob);
+        assert_eq!(respell_promoted_slots_as_globals(&mut oracle), 1, "the ArraySplat store folds");
+        assert_eq!(oracle.globals[0].initializer, Some(splat.clone()));
+
+        // Producer: the promoted global carrying the same constant + global_addr + ret.
+        let mut thir = Module::new("thir_splat_global");
+        let t_tid = thir.add_type(Ty::U8).expect("Module::add_type: test fixture");
+        let mut tb = Block::new(trust_ir::BlockId::new(0));
+        tb.body.push(
+            InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) }).with_result(v(0)),
+        );
+        tb.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
+        let mut thir =
+            single_block_module_with(thir, "thir_splat_global", vec![], vec![Ty::Ptr], tb);
+        let mut global = promoted_global(Some(splat), false);
+        global.ty = Ty::Array(t_tid, 4);
+        thir.globals.push(global);
+
+        let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
+        assert_eq!(report.mode, DiffMode::Agreed, "notes: {:?}", report.notes);
+        assert!(report.equal);
     }
 
     #[test]
@@ -11988,6 +13769,9 @@ mod tests {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         // Insert the extra touch AFTER the paired chain (before the Return) so the
         // allocation order of the RETURNED pointer is unchanged and step (7) agrees —
@@ -12015,6 +13799,9 @@ mod tests {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         });
         let addr = ValueId::new(9);
         let loaded = ValueId::new(10);
@@ -12162,11 +13949,14 @@ mod tests {
         let v = ValueId::new;
         let build = |name: &str| {
             let mut module = Module::new(name);
-            let entry_sig = module.add_func_type(FuncTy {
-                params: vec![],
-                returns: vec![Ty::Ptr],
-                is_vararg: false,
-            });
+            let entry_sig = module
+                .add_func_type(FuncTy {
+                    params: vec![],
+                    returns: vec![Ty::Ptr],
+                    is_vararg: false,
+                    abi: None,
+                })
+                .expect("Module::add_func_type: test fixture");
             let mut entry_block = Block::new(trust_ir::BlockId::new(0));
             entry_block.body.push(
                 InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![] })
@@ -12175,13 +13965,16 @@ mod tests {
             entry_block.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
             let mut entry = Function::new(FuncId::new(0), "entry", entry_sig, entry_block.id);
             entry.blocks.push(entry_block);
-            module.add_function(entry);
+            module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
-            let callee_sig = module.add_func_type(FuncTy {
-                params: vec![],
-                returns: vec![Ty::Ptr],
-                is_vararg: false,
-            });
+            let callee_sig = module
+                .add_func_type(FuncTy {
+                    params: vec![],
+                    returns: vec![Ty::Ptr],
+                    is_vararg: false,
+                    abi: None,
+                })
+                .expect("Module::add_func_type: test fixture");
             let mut callee_block = Block::new(trust_ir::BlockId::new(0));
             callee_block.body.push(
                 InstrNode::new(Inst::GlobalAddr { global: GlobalId::new(0) })
@@ -12190,7 +13983,7 @@ mod tests {
             callee_block.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
             let mut callee = Function::new(FuncId::new(1), "callee", callee_sig, callee_block.id);
             callee.blocks.push(callee_block);
-            module.add_function(callee);
+            module.try_add_function(callee).expect("Module::try_add_function: test fixture");
             module.globals.push(promoted_global(Some(Constant::Int(2)), false));
             module
         };
@@ -12219,16 +14012,20 @@ mod tests {
     fn linked_arg_module(name: &str, callee_uses: CalleeUse) -> Module {
         let v = ValueId::new;
         let mut module = Module::new(name);
-        let entry_sig =
-            module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
-        let callee_sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Ptr],
-            returns: match callee_uses {
-                CalleeUse::ReturnsIt => vec![Ty::Ptr],
-                _ => vec![],
-            },
-            is_vararg: false,
-        });
+        let entry_sig = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
+        let callee_sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Ptr],
+                returns: match callee_uses {
+                    CalleeUse::ReturnsIt => vec![Ty::Ptr],
+                    _ => vec![],
+                },
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         let mut entry_block = Block::new(trust_ir::BlockId::new(0));
         entry_block.body.push(
@@ -12246,7 +14043,7 @@ mod tests {
         entry_block.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         let mut entry = Function::new(FuncId::new(0), "entry", entry_sig, entry_block.id);
         entry.blocks.push(entry_block);
-        module.add_function(entry);
+        module.try_add_function(entry).expect("Module::try_add_function: test fixture");
 
         let mut callee_block = Block::new(trust_ir::BlockId::new(0));
         callee_block.params.push((v(0), Ty::Ptr));
@@ -12286,7 +14083,7 @@ mod tests {
         }
         let mut callee = Function::new(FuncId::new(1), "leaf", callee_sig, callee_block.id);
         callee.blocks.push(callee_block);
-        module.add_function(callee);
+        module.try_add_function(callee).expect("Module::try_add_function: test fixture");
         module.globals.push(promoted_global(Some(Constant::Int(2)), false));
         module
     }
@@ -12370,6 +14167,9 @@ mod tests {
                 linkage: trust_ir::Linkage::Internal,
                 tls: None,
                 align: None,
+                section: None,
+                visibility: trust_ir::Visibility::Default,
+                retained: false,
             });
             // The callee gains its own admitted-global observation: address + LOAD (a
             // live use, so the dead-address arm cannot absorb it).
@@ -12440,6 +14240,9 @@ mod tests {
                 linkage: trust_ir::Linkage::Internal,
                 tls: None,
                 align: None,
+                section: None,
+                visibility: trust_ir::Visibility::Default,
+                retained: false,
             });
             if with_extra {
                 module.globals.push(trust_ir::Global {
@@ -12450,6 +14253,9 @@ mod tests {
                     linkage: trust_ir::Linkage::Internal,
                     tls: None,
                     align: None,
+                    section: None,
+                    visibility: trust_ir::Visibility::Default,
+                    retained: false,
                 });
             }
             module
@@ -12512,6 +14318,9 @@ mod tests {
             linkage: trust_ir::Linkage::Internal,
             tls: None,
             align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
         }
     }
 
@@ -12543,7 +14352,7 @@ mod tests {
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
         let mut module = single_block_module("thir_bytes_fat", vec![], vec![fat], block);
-        module.add_type(Ty::U8);
+        module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         module.globals.push(bytes_global("__trust_bytes_0", bytes));
         module
     }
@@ -12577,7 +14386,7 @@ mod tests {
         );
         block.body.push(InstrNode::new(Inst::Return { values: vec![v(3)] }));
         let mut module = single_block_module("oracle_bytes_fat", vec![], vec![fat], block);
-        module.add_type(Ty::U8);
+        module.add_type(Ty::U8).expect("Module::add_type: test fixture");
         module.globals.push(bytes_global("__trust_bytes_0", bytes));
         module
     }
@@ -12631,7 +14440,7 @@ mod tests {
             );
             block.body.push(InstrNode::new(Inst::Return { values: vec![v(next + 1)] }));
             let mut module = single_block_module(name, vec![], vec![fat], block);
-            module.add_type(Ty::U8);
+            module.add_type(Ty::U8).expect("Module::add_type: test fixture");
             module.globals.push(bytes_global("__trust_bytes_0", b"hi"));
             module
         };
@@ -12656,7 +14465,7 @@ mod tests {
         );
         thir_block.body.push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
         let mut thir = single_block_module("thir_thin_bytes", vec![], vec![Ty::Ptr], thir_block);
-        thir.add_type(Ty::U8);
+        thir.add_type(Ty::U8).expect("Module::add_type: test fixture");
         thir.globals.push(bytes_global("__trust_bytes_0", b"jjj"));
 
         let mut oracle_block = Block::new(trust_ir::BlockId::new(0));
@@ -12667,7 +14476,7 @@ mod tests {
         oracle_block.body.push(InstrNode::new(Inst::Return { values: vec![v(1)] }));
         let mut oracle =
             single_block_module("oracle_thin_bytes", vec![], vec![Ty::Ptr], oracle_block);
-        oracle.add_type(Ty::U8);
+        oracle.add_type(Ty::U8).expect("Module::add_type: test fixture");
         oracle.globals.push(bytes_global("__trust_bytes_0", b"jjj"));
 
         let report = compare_entries(&thir, FuncId::new(0), &oracle, FuncId::new(0));
@@ -12724,7 +14533,7 @@ mod tests {
         meta_block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
         let mut meta =
             single_block_module("audit_meta", vec![], vec![fat_slice.clone()], meta_block);
-        meta.add_type(Ty::U8);
+        meta.add_type(Ty::U8).expect("Module::add_type: test fixture");
         meta.globals.push(bytes_global("__trust_bytes_0", b"foo"));
         assert!(promoted_addr_closure(&meta.functions[0], &meta, &paired, &HashSet::new()).is_none());
 
@@ -12753,7 +14562,7 @@ mod tests {
             vec![Ty::FatPtr(trust_ir::FatPtrKind::TraitObject { trait_id: 7 })],
             dyn_block,
         );
-        dyn_m.add_type(Ty::U8);
+        dyn_m.add_type(Ty::U8).expect("Module::add_type: test fixture");
         dyn_m.globals.push(bytes_global("__trust_bytes_0", b"foo"));
         assert!(promoted_addr_closure(&dyn_m.functions[0], &dyn_m, &paired, &HashSet::new()).is_none());
 
@@ -12778,21 +14587,21 @@ mod tests {
     #[test]
     fn first_class_struct_payload_enum_ctor_pair_reaches_agreed() {
         let v = ValueId::new;
-        let payload_fields =
-            |m: &mut Module| -> trust_ir::value::StructId {
-                m.add_struct(trust_ir::StructDef {
-                    id: trust_ir::value::StructId::new(0),
-                    name: "Payload".into(),
-                    fields: vec![
-                        trust_ir::ty::FieldDef { name: "a".into(), ty: Ty::U32, offset: Some(0) },
-                        trust_ir::ty::FieldDef { name: "b".into(), ty: Ty::U64, offset: Some(8) },
-                    ],
-                    size: Some(16),
-                    align: Some(8),
-                    repr: trust_ir::ty::StructRepr::Rust,
-                });
-                trust_ir::value::StructId::new(0)
-            };
+        let payload_fields = |m: &mut Module| -> trust_ir::value::StructId {
+            m.add_struct(trust_ir::StructDef {
+                id: trust_ir::value::StructId::new(0),
+                name: "Payload".into(),
+                fields: vec![
+                    trust_ir::ty::FieldDef { name: "a".into(), ty: Ty::U32, offset: Some(0) },
+                    trust_ir::ty::FieldDef { name: "b".into(), ty: Ty::U64, offset: Some(8) },
+                ],
+                size: Some(16),
+                align: Some(8),
+                repr: trust_ir::ty::StructRepr::Rust,
+                origin: None,
+            });
+            trust_ir::value::StructId::new(0)
+        };
         let enum_def = |sid: trust_ir::value::StructId| {
             trust_ir::EnumDef::new(
                 trust_ir::value::EnumId::new(0),
@@ -12986,7 +14795,15 @@ mod tests {
         align: Option<u64>,
         repr: StructRepr,
     ) -> StructDef {
-        StructDef { id: StructId::new(id), name: name.to_string(), fields, size, align, repr }
+        StructDef {
+            id: StructId::new(id),
+            name: name.to_string(),
+            fields,
+            size,
+            align,
+            repr,
+            origin: None,
+        }
     }
 
     /// One module holding one struct def at id 0.
@@ -13202,11 +15019,14 @@ mod tests {
 
     /// `fn(ptr) -> i32 { *ptr }` — the Slice-A shape: the param is used ONLY as a plain load ptr.
     fn q1_deref_entry(module: &mut Module) -> FuncId {
-        let sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Ptr],
-            returns: vec![Ty::I32],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![Ty::I32],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.params.push((ValueId::new(0), Ty::Ptr));
         block.body.push(
@@ -13222,7 +15042,7 @@ mod tests {
         let id = FuncId::new(u32::try_from(module.functions.len()).unwrap());
         let mut f = Function::new(id, "deref", sig, trust_ir::BlockId::new(0));
         f.blocks = vec![block];
-        module.add_function(f);
+        module.try_add_function(f).expect("Module::try_add_function: test fixture");
         id
     }
 
@@ -13238,11 +15058,14 @@ mod tests {
     #[test]
     fn pointee_recovery_refuses_a_pointer_that_escapes() {
         let mut module = Module::new("m");
-        let sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Ptr],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.params.push((ValueId::new(0), Ty::Ptr));
         // A PtrToInt observes the address, whose value is an allocation-order artifact.
@@ -13259,7 +15082,7 @@ mod tests {
         let id = FuncId::new(0);
         let mut f = Function::new(id, "escapes", sig, trust_ir::BlockId::new(0));
         f.blocks = vec![block];
-        module.add_function(f);
+        module.try_add_function(f).expect("Module::try_add_function: test fixture");
         let f = module.function_by_id(id).unwrap();
         assert_eq!(sole_pointee_load(f, 0).unwrap(), None);
     }
@@ -13284,6 +15107,128 @@ mod tests {
         }
     }
 
+    /// Trust (R8-SEAM): THE POINTER LANE END TO END, in both spellings. Two `deref` entries are
+    /// compared through the materialized-referent wrappers: once agreeing, once with the oracle
+    /// flipping the loaded value's low bit. `compare_entries_in_place` reports what the copying
+    /// `compare_entries` reports, takes the lane (it appended wrappers), and hands both modules
+    /// back as they came — so the seam, which runs it on its one working copy, keeps the verdict
+    /// the whole-module copy per comparison gave. (In a test build both calls are also checked
+    /// against the verbatim pre-R8-SEAM body, `differential/compare_entries_reference.rs`.)
+    #[test]
+    fn the_pointer_lane_in_place_is_the_pointer_lane_on_copies() {
+        let key = |r: &DiffReport| (r.equal, r.notes.clone(), r.samples_checked, r.mode);
+        let mut thir = Module::new("thir");
+        let te = q1_deref_entry(&mut thir);
+        for flip in [false, true] {
+            let mut oracle = Module::new("oracle");
+            let oe = q1_deref_entry(&mut oracle);
+            if flip {
+                let body = &mut oracle.functions[0].blocks[0].body;
+                let ret = body.pop().expect("the return");
+                body.push(
+                    InstrNode::new(Inst::Const { ty: Ty::I32, value: Constant::Int(1) })
+                        .with_result(ValueId::new(2)),
+                );
+                body.push(
+                    InstrNode::new(Inst::BinOp {
+                        op: trust_ir::BinOp::Xor,
+                        ty: Ty::I32,
+                        lhs: ValueId::new(1),
+                        rhs: ValueId::new(2),
+                    })
+                    .with_result(ValueId::new(3)),
+                );
+                drop(ret);
+                body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(3)] }));
+            }
+            let copying = compare_entries(&thir, te, &oracle, oe);
+            let expected = if flip { DiffMode::MirOracle } else { DiffMode::Agreed };
+            assert_eq!(copying.mode, expected, "flip {flip}: {:?}", copying.notes);
+            let (thir_before, oracle_before) = (thir.clone(), oracle.clone());
+            let (in_place, wrapped) = compare_entries_in_place(&mut thir, te, &mut oracle, oe);
+            assert!(wrapped, "flip {flip}: the pointer lane appended its wrappers");
+            assert_eq!(key(&in_place), key(&copying), "flip {flip}");
+            assert!(thir == thir_before && oracle == oracle_before, "flip {flip}: restored");
+        }
+    }
+
+    /// Trust (R8-SEAM): the promoted-global pairing enumerated from the oracle side is the pairing
+    /// enumerated from the THIR side (the verbatim pre-R8-SEAM body, in
+    /// `differential/compare_entries_reference.rs`), on every admission and refusal shape: paired,
+    /// unpaired on either side, duplicated on either side, mutable, initializer-less, content-
+    /// different, and outside the mint grammar — both ways round.
+    #[test]
+    fn the_promoted_global_pairing_is_the_same_set_from_either_side() {
+        let global = |name: &str, value: i128, mutable: bool, init: bool| trust_ir::Global {
+            name: name.to_string(),
+            ty: Ty::I32,
+            mutable,
+            initializer: init.then_some(Constant::Int(value)),
+            linkage: trust_ir::Linkage::Internal,
+            tls: None,
+            align: None,
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+        };
+        let module = |name: &str, globals: Vec<trust_ir::Global>| {
+            let mut m = Module::new(name);
+            m.globals = globals;
+            m
+        };
+        let a = module("a", vec![
+            global("__trust_promoted_0", 1, false, true),
+            global("__trust_promoted_1", 2, false, true),
+            global("__trust_promoted_2", 3, false, true),
+            global("__trust_promoted_2", 3, false, true),
+            global("__trust_bytes_3", 4, true, true),
+            global("__trust_bytes_4", 5, false, false),
+            global("__trust_promoted_5", 6, false, true),
+            global("plain_6", 7, false, true),
+            global("__trust_promoted_7", 8, false, true),
+        ]);
+        let b = module("b", vec![
+            global("__trust_promoted_0", 1, false, true),
+            global("__trust_promoted_2", 3, false, true),
+            global("__trust_bytes_3", 4, false, true),
+            global("__trust_bytes_4", 5, false, false),
+            global("__trust_promoted_5", 9, false, true),
+            global("plain_6", 7, false, true),
+            global("__trust_promoted_7", 8, false, true),
+            global("__trust_promoted_7", 8, false, true),
+            global("__trust_promoted_8", 10, false, true),
+        ]);
+        for (x, y) in [(&a, &b), (&b, &a), (&a, &a), (&b, &b)] {
+            assert_eq!(
+                paired_admitted_promoted_globals(x, y),
+                compare_entries_reference::paired_admitted_promoted_globals(x, y),
+                "{} against {}",
+                x.name,
+                y.name
+            );
+        }
+        let paired = paired_admitted_promoted_globals(&a, &b);
+        assert_eq!(paired, BTreeSet::from(["__trust_promoted_0".to_string()]), "the one admitted pair");
+    }
+
+    /// Trust (R8-SEAM): the in-place wrapper is the copied one. Appending to a module gives exactly
+    /// the module `build_pointee_wrapper` returns, and a lane that cannot be wrapped (an index past
+    /// the signature) leaves the module untouched.
+    #[test]
+    fn the_appended_wrapper_is_the_copied_wrapper() {
+        let mut module = Module::new("m");
+        let entry = q1_deref_entry(&mut module);
+        let sig = module.func_type(module.function_by_id(entry).unwrap().ty).unwrap().clone();
+        let (copied, cid, csig) = build_pointee_wrapper(&module, entry, &sig, 0, &Ty::I32).unwrap();
+        let mut appended = module.clone();
+        let (aid, asig) = append_pointee_wrapper(&mut appended, entry, &sig, 0, &Ty::I32).unwrap();
+        assert!(appended == copied);
+        assert_eq!((aid, asig), (cid, csig));
+        let before = module.clone();
+        assert!(append_pointee_wrapper(&mut module, entry, &sig, 5, &Ty::I32).is_none());
+        assert!(module == before, "a refused wrapper touches nothing");
+    }
+
     /// The wrapper must be registered in the func-type table, or the interpreter hard-errors
     /// `signature_mismatch` on EVERY body. Pinned as a behaviour, not a comment.
     #[test]
@@ -13306,14 +15251,15 @@ mod tests {
     fn wrapper_id_does_not_collide_in_a_sparse_input_module() {
         let mut module = Module::new("m");
         let entry = q1_deref_entry(&mut module);
-        let csig =
-            module.add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false });
+        let csig = module
+            .add_func_type(FuncTy { params: vec![], returns: vec![], is_vararg: false, abi: None })
+            .expect("Module::add_func_type: test fixture");
         let sparse = FuncId::new(2);
         let mut callee = Function::new(sparse, "callee", csig, trust_ir::BlockId::new(0));
         let mut cb = Block::new(trust_ir::BlockId::new(0));
         cb.body.push(InstrNode::new(Inst::Return { values: vec![] }));
         callee.blocks = vec![cb];
-        module.add_function(callee);
+        module.try_add_function(callee).expect("Module::try_add_function: test fixture");
         assert_eq!(module.functions.len(), 2, "len() == 2 while the max id is 2: the trap");
 
         let esig = module.func_type(module.function_by_id(entry).unwrap().ty).unwrap().clone();
@@ -13382,11 +15328,14 @@ mod tests {
     /// `#[derive(Clone)]`-on-`Copy` shape: `fn(ptr) -> S { *ptr }` — the param is used ONLY as a
     /// plain load ptr, and the loaded type is a whole struct.
     fn slice_b_aggregate_entry(module: &mut Module, referent: &Ty) -> FuncId {
-        let sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Ptr],
-            returns: vec![referent.clone()],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![referent.clone()],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut block = Block::new(trust_ir::BlockId::new(0));
         block.params.push((ValueId::new(0), Ty::Ptr));
         block.body.push(
@@ -13402,7 +15351,7 @@ mod tests {
         let id = FuncId::new(u32::try_from(module.functions.len()).unwrap());
         let mut f = Function::new(id, "clone_like", sig, trust_ir::BlockId::new(0));
         f.blocks = vec![block];
-        module.add_function(f);
+        module.try_add_function(f).expect("Module::try_add_function: test fixture");
         id
     }
 
@@ -13841,6 +15790,7 @@ mod tests {
             params: vec![Ty::Struct(StructId::new(0))],
             returns: vec![Ty::Struct(StructId::new(0))],
             is_vararg: false,
+            abi: None,
         };
         let classes = [ParamClass::PtrToAggregate];
         let enum_samples = [None];
@@ -13939,6 +15889,7 @@ mod tests {
             size: None,
             align: None,
             repr: StructRepr::Rust,
+            origin: None,
         });
         let outer = module.add_struct(StructDef {
             id: trust_ir::StructId::new(1),
@@ -13950,12 +15901,16 @@ mod tests {
             size: None,
             align: None,
             repr: StructRepr::Rust,
+            origin: None,
         });
-        let sig = module.add_func_type(FuncTy {
-            params: vec![Ty::Struct(outer)],
-            returns: vec![Ty::Ptr],
-            is_vararg: false,
-        });
+        let sig = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Struct(outer)],
+                returns: vec![Ty::Ptr],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut function =
             Function::new(FuncId::new(0), "ptr_leaf", sig, trust_ir::BlockId::new(0));
         let mut block = Block::new(trust_ir::BlockId::new(0));
@@ -13977,7 +15932,7 @@ mod tests {
         );
         use_leaf(&mut block, v(3));
         function.blocks.push(block);
-        module.add_function(function);
+        module.try_add_function(function).expect("Module::try_add_function: test fixture");
         module
     }
 

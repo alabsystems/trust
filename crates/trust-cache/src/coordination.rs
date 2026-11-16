@@ -77,10 +77,16 @@ impl Default for CoordinationConfig {
 /// The lock is released when this guard is dropped.
 ///
 /// Uses `fs2::FileExt` for cross-platform flock support (works on macOS, Linux,
-/// and Windows). The lock is process-scoped and automatically released if the
-/// process crashes.
+/// and Windows). On Unix that is `flock(2)`, and an flock belongs to the OPEN
+/// FILE DESCRIPTION, not to this process or this descriptor: every descriptor
+/// that shares the description (a `dup`, or the copy a `fork`ed child holds
+/// until it execs or exits) holds the same lock. Closing one descriptor
+/// releases the lock only when it was the description's last reference;
+/// `LOCK_UN` releases it whatever the references. That is why `Drop` below
+/// unlocks explicitly. A crash closes this process's descriptors, so the lock
+/// is released unless a descendant still holds a copy of the description.
 pub struct CacheLockGuard {
-    /// The lock file handle. Lock is released on drop (via fs2).
+    /// The lock file handle. `Drop` unlocks it before it is closed.
     _file: File,
     /// Path to the lock file (for diagnostics).
     lock_path: PathBuf,
@@ -96,8 +102,11 @@ impl CacheLockGuard {
 
 impl Drop for CacheLockGuard {
     fn drop(&mut self) {
-        // fs2 automatically releases the flock when the File is dropped,
-        // but we explicitly unlock for clarity and to handle edge cases.
+        // Load-bearing, not a nicety. Dropping the File closes one descriptor,
+        // which releases the flock only if no other descriptor shares its open
+        // file description. A concurrently forked child that has not yet exec'd
+        // holds such a copy (O_CLOEXEC drops it only at exec). `LOCK_UN` acts
+        // on the description itself, so it releases the lock at once.
         let _ = Fs2FileExt::unlock(&self._file);
     }
 }
@@ -324,51 +333,6 @@ pub(crate) fn atomic_write_replace(path: &Path, data: &[u8]) -> io::Result<()> {
     replace_path(&temporary, path)?;
     drop(cleanup);
     Ok(())
-}
-
-/// Atomically publish `path` only if no directory entry already exists there.
-///
-/// This is used for immutable content-addressed records. A hard link publishes
-/// the fully-written temp inode with create-if-absent semantics; unlike
-/// `Path::exists` followed by `rename`, it cannot overwrite a winning writer or
-/// an attacker-supplied symlink in the intervening race.
-pub(crate) fn atomic_write_create_new(path: &Path, data: &[u8]) -> io::Result<bool> {
-    ensure_parent_directory(path)?;
-
-    // Avoid a temp write for the overwhelmingly common idempotent case. This
-    // check is only an optimization: if the path is absent here, `hard_link`
-    // below still makes the authoritative atomic no-clobber decision.
-    match fs::symlink_metadata(path) {
-        Ok(_) => return Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let temporary = write_secure_temporary(path, data)?;
-    let cleanup = TemporaryPath::new(temporary.clone());
-
-    match fs::hard_link(&temporary, path) {
-        Ok(()) => {
-            // Publication succeeded. Removing the redundant temp name is only
-            // cleanup; failure cannot undo the already-durable destination.
-            let _ = fs::remove_file(&temporary);
-            drop(cleanup);
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => {
-            // Some platforms/filesystems report an existing destination using
-            // a less specific error kind. Treat any extant directory entry as
-            // the no-clobber outcome, including dangling symlinks.
-            match fs::symlink_metadata(path) {
-                Ok(_) => Ok(false),
-                Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
-                    Err(error)
-                }
-                Err(metadata_error) => Err(metadata_error),
-            }
-        }
-    }
 }
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);

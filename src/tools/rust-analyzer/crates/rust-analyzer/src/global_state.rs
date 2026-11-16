@@ -14,7 +14,7 @@ use hir::ChangeWithProcMacros;
 use ide::{Analysis, AnalysisHost, Cancellable, FileId, SourceRootId};
 use ide_db::{
     MiniCore,
-    base_db::{Crate, ProcMacroPaths, SourceDatabase, salsa::Revision},
+    base_db::{Crate, ProcMacroPaths, SourceDatabase, TargetKind, all_crates, salsa::Revision},
 };
 use itertools::Itertools;
 use load_cargo::SourceRootConfig;
@@ -42,7 +42,7 @@ use crate::{
     main_loop::Task,
     mem_docs::MemDocs,
     op_queue::{Cause, OpQueue},
-    reload,
+    priming_scope, reload,
     target_spec::{CargoTargetSpec, ProjectJsonTargetSpec, TargetSpec},
     task_pool::{DeferredTaskQueue, TaskPool},
     test_runner::{CargoTestHandle, CargoTestMessage},
@@ -103,8 +103,13 @@ pub(crate) struct GlobalState {
     pub(crate) shutdown_requested: bool,
     pub(crate) last_reported_status: lsp_ext::ServerStatusParams,
 
-    // proc macros
+    /// Clients of the proc-macro server.
+    ///
+    /// One client per workspace, in the same order as `self.workspaces`. We don't store
+    /// the client in `self.workspaces` so that we can reload workspaces without
+    /// restarting the proc-macro server.
     pub(crate) proc_macro_clients: Arc<[Option<anyhow::Result<ProcMacroClient>>]>,
+
     pub(crate) build_deps_changed: bool,
 
     // Flycheck
@@ -661,17 +666,28 @@ impl GlobalState {
 
                 // See https://github.com/rust-lang/rust-analyzer/issues/11404
                 // See https://github.com/rust-lang/rust-analyzer/issues/13130
-                let patch_empty = |message: &mut String| {
-                    if message.is_empty() {
-                        " ".clone_into(message);
+                let patch_empty = |message: &mut lsp_types::Message| match message {
+                    lsp_types::Message::String(m) if m.is_empty() => {
+                        " ".clone_into(m);
                     }
+                    lsp_types::Message::MarkupContent(lsp_types::MarkupContent {
+                        value,
+                        kind: _,
+                    }) if value.is_empty() => {
+                        " ".clone_into(value);
+                    }
+                    _ => {}
                 };
 
                 for d in &mut diagnostics {
                     patch_empty(&mut d.message);
                     if let Some(dri) = &mut d.related_information {
                         for dri in dri {
-                            patch_empty(&mut dri.message);
+                            // The LSP does not (yet?) specify that related diagnostic messages can
+                            // be in Markdown format (in addition to plain text).
+                            if dri.message.is_empty() {
+                                " ".clone_into(&mut dri.message);
+                            }
                         }
                     }
                 }
@@ -726,6 +742,75 @@ impl GlobalState {
         if let Some((fetch_receiver, _)) = &mut self.fetch_ws_receiver {
             *fetch_receiver = crossbeam_channel::after(Duration::from_millis(100));
         }
+    }
+
+    /// Set of crates to prime: the transitive-dependency closure of every
+    /// local Cargo workspace `lib`/`bin` target, `rust-project.json` workspace
+    /// member, and detached file. Computed once when the server becomes
+    /// quiescent.
+    ///
+    /// Test, example, and benchmark members are deliberately excluded — they're
+    /// leaves, so not priming them costs no parallelism on dependency work.
+    /// `bin` targets are kept because they're the crate the user is most likely
+    /// editing.
+    pub(crate) fn compute_priming_scope(&self) -> Arc<[Crate]> {
+        let db = self.analysis_host.raw_database();
+        let all = all_crates(db);
+
+        // Map each crate-root path to its crate(s) so target roots resolve to
+        // `Crate` ids. The vfs read lock is held only for this build.
+        let root_to_crate: FxHashMap<AbsPathBuf, Vec<Crate>> = {
+            let vfs = self.vfs.read();
+            let mut root_to_crate: FxHashMap<AbsPathBuf, Vec<Crate>> = FxHashMap::default();
+            for &krate in &*all {
+                let root_file = krate.data(db).root_file_id;
+                let path = vfs.0.file_path(root_file);
+                let Some(path) = path.as_path() else {
+                    continue;
+                };
+                root_to_crate.entry(path.to_path_buf()).or_default().push(krate);
+            }
+            root_to_crate
+        };
+
+        let mut seed: FxHashSet<Crate> = FxHashSet::default();
+        for workspace in self.workspaces.iter() {
+            match &workspace.kind {
+                ProjectWorkspaceKind::Cargo { cargo, .. }
+                | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => {
+                    for pkg in cargo.packages() {
+                        if !cargo[pkg].is_local {
+                            continue;
+                        }
+                        for &target in &cargo[pkg].targets {
+                            if !matches!(
+                                cargo[target].kind,
+                                TargetKind::Lib { .. } | TargetKind::Bin
+                            ) {
+                                continue;
+                            }
+                            if let Some(krates) = root_to_crate.get(&*cargo[target].root) {
+                                seed.extend(krates.iter().copied());
+                            }
+                        }
+                    }
+                }
+                ProjectWorkspaceKind::Json(project_json) => seed.extend(
+                    project_json
+                        .crates()
+                        .filter(|(_, krate)| krate.is_workspace_member)
+                        .filter_map(|(_, krate)| root_to_crate.get(&krate.root_module))
+                        .flat_map(|it| it.iter().copied()),
+                ),
+                ProjectWorkspaceKind::DetachedFile { file, cargo: None } => {
+                    if let Some(krates) = root_to_crate.get(&**file) {
+                        seed.extend(krates.iter().copied());
+                    }
+                }
+            }
+        }
+
+        priming_scope::compute(db, seed)
     }
 }
 

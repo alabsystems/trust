@@ -1,5 +1,4 @@
-use rustc_hir::attrs::RustcMirKind;
-use rustc_hir::find_attr;
+use rustc_attr_ir::{RustcMirKind, find_attr};
 use rustc_middle::mir::{self, Body, Local, Location};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{Span, sym};
@@ -163,6 +162,8 @@ impl PeekCall {
             &terminator.kind
             && let ty::FnDef(def_id, fn_args) = *func.const_.ty().kind()
         {
+            let fn_args = fn_args.no_bound_vars().unwrap();
+
             if tcx.intrinsic(def_id)?.name != sym::rustc_peek {
                 return None;
             }

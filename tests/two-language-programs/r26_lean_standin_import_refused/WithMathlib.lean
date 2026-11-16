@@ -1,0 +1,21 @@
+-- `import Mathlib` is served by Clean's BUILT-IN prelude stand-in, not by
+-- Mathlib: no Trust lane resolves an external `.olean`. `targo trust check`
+-- REFUSES such a file — the declarations would be kernel-checked only relative
+-- to that stand-in, and the real library's axiom closure was never seen.
+--
+-- POLICY CHANGED 2026-09-24 (`d10a6eeb2eb`, "Fail closed on Lean check stand-in
+-- imports", `targo-trust/src/lean_cli.rs::refuse_standin_imports_for_check`).
+-- This row used to require `PROVED` PLUS a disclosure note, on the reasoning
+-- that the kernel really did check `sq` and the verdict merely had to say
+-- against what. The check lane now refuses instead, and this row was left
+-- asserting the superseded policy until 2026-09-26.
+--
+-- THE TWO LANES DIFFER ON PURPOSE, and this row pins only one of them. A
+-- `clean { … }` island inside a Rust program still DISCLOSES and stays green
+-- (`tests/ui/trust/clean_island_standin_import_disclosed.rs`): vanilla Lean is
+-- valid input to a Rust build, so the island lane must not break it, and the
+-- note is the honest signal. A `targo trust check FILE.lean` run has no other
+-- product than the verdict on that file, so there is nothing for a note to
+-- qualify — it refuses.
+import Mathlib
+def sq (n : Nat) : Nat := n * n

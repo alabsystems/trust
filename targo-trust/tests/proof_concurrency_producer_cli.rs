@@ -70,6 +70,43 @@ fn proof_concurrency_producer_audit_fails_closed_with_missing_producer_contract(
     let _ = fs::remove_dir_all(&repo);
 }
 
+#[cfg(unix)]
+#[test]
+fn proof_concurrency_producer_rejects_symlinked_artifact_parent() {
+    use std::os::unix::fs::symlink;
+
+    let repo = clean_git_repo("proof-concurrency-producer-symlink-parent");
+    let outside = temp_test_dir("proof-concurrency-producer-outside");
+    let outside_artifacts = outside.join("proof/concurrency-artifacts");
+    fs::create_dir_all(&outside_artifacts).expect("create outside artifact directory");
+    fs::write(outside_artifacts.join("race_free_arc_mutex.source.rs"), "fake source\n")
+        .expect("write outside artifact");
+    symlink(&outside, repo.join("reports")).expect("link reports outside repository");
+    run_git(&repo, &["add", "reports"]);
+    run_git(&repo, &["commit", "-m", "track artifact path symlink"]);
+
+    let output = Command::new(targo_trust_binary())
+        .args([
+            "trust",
+            "proof-concurrency-producer",
+            "audit",
+            "--json",
+            "--repo-root",
+            repo.to_str().expect("temp path should be utf-8"),
+        ])
+        .output()
+        .expect("run proof-concurrency producer audit");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "escaped artifact path must not produce a report");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("symbolic link"), "unexpected error: {stderr}");
+    assert!(stderr.contains("reports"), "unexpected error: {stderr}");
+
+    let _ = fs::remove_dir_all(&repo);
+    let _ = fs::remove_dir_all(&outside);
+}
+
 fn clean_git_repo(label: &str) -> PathBuf {
     let repo = temp_test_dir(label);
     fs::create_dir_all(&repo).expect("create temp repo");

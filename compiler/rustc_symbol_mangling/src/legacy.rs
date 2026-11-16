@@ -1,16 +1,17 @@
 use std::fmt::{self, Write};
-use std::mem::{self, discriminant};
+use std::mem;
 
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
-use rustc_middle::bug;
+use rustc_macros::StableHash;
 use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
 use rustc_middle::ty::{
     self, GenericArg, GenericArgKind, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
+use rustc_span::bug;
 use tracing::debug;
 
 pub(super) fn mangle<'tcx>(
@@ -37,6 +38,11 @@ pub(super) fn mangle<'tcx>(
                 debug!(?instance_ty);
                 break;
             }
+            DefPathData::GlobalAsm => {
+                // `global_asm!` doesn't have a type.
+                instance_ty = tcx.types.unit;
+                break;
+            }
             _ => {
                 // if we're making a symbol for something, there ought
                 // to be a value or type-def or something in there
@@ -60,6 +66,7 @@ pub(super) fn mangle<'tcx>(
     let hash = get_symbol_hash(tcx, instance, instance_ty, instantiating_crate);
 
     let mut p = LegacySymbolMangler { tcx, path: SymbolPath::new(), keep_within_component: false };
+
     p.print_def_path(
         def_id,
         if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, _))
@@ -67,7 +74,7 @@ pub(super) fn mangle<'tcx>(
         | ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(_, _, _)) = instance.def
         {
             // Add the name of the dropped type to the symbol name
-            &*instance.args
+            instance.args
         } else if let ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(_, ty)) = instance.def {
             let ty::Coroutine(_, cor_args) = ty.kind() else {
                 bug!();
@@ -75,7 +82,7 @@ pub(super) fn mangle<'tcx>(
             let drop_ty = cor_args.first().unwrap().expect_ty();
             tcx.mk_args(&[GenericArg::from(drop_ty)])
         } else {
-            &[]
+            ty::GenericArgs::empty()
         },
     )
     .unwrap();
@@ -165,7 +172,22 @@ fn get_symbol_hash<'tcx>(
             // We want to avoid accidental collision between different types of instances.
             // Especially, `VTableShim`s and `ReifyShim`s may overlap with their original
             // instances without this.
-            discriminant(&instance.def).stable_hash(hcx, &mut hasher);
+            #[derive(StableHash)]
+            enum Tag {
+                Item,
+                Intrinsic,
+                LlvmIntrinsic,
+                Virtual,
+                Shim,
+            }
+            match instance.def {
+                ty::InstanceKind::Item(_) => Tag::Item,
+                ty::InstanceKind::Intrinsic(_) => Tag::Intrinsic,
+                ty::InstanceKind::LlvmIntrinsic(_) => Tag::LlvmIntrinsic,
+                ty::InstanceKind::Virtual(_, _) => Tag::Virtual,
+                ty::InstanceKind::Shim(_) => Tag::Shim,
+            }
+            .stable_hash(hcx, &mut hasher);
         });
 
         // 64 bits should be enough to avoid collisions.
@@ -245,8 +267,7 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
     fn print_type(&mut self, ty: Ty<'tcx>) -> Result<(), PrintError> {
         match *ty.kind() {
             // Print all nominal types as paths (unlike `pretty_print_type`).
-            ty::FnDef(def_id, args)
-            | ty::Alias(
+            ty::Alias(
                 _,
                 ty::AliasTy {
                     kind: ty::Projection { def_id } | ty::Opaque { def_id }, args, ..
@@ -255,6 +276,8 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
             | ty::Closure(def_id, args)
             | ty::CoroutineClosure(def_id, args)
             | ty::Coroutine(def_id, args) => self.print_def_path(def_id, args),
+
+            ty::FnDef(def_id, args) => self.print_def_path(def_id, args.no_bound_vars().unwrap()),
 
             // The `pretty_print_type` formatting of array size depends on
             // -Zverbose-internals flag, so we cannot reuse it here.
@@ -393,12 +416,11 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
     fn print_path_with_generic_args(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
-        args: &[GenericArg<'tcx>],
+        args: ty::GenericArgs<'tcx>,
     ) -> Result<(), PrintError> {
         print_prefix(self)?;
 
-        let args =
-            args.iter().cloned().filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
+        let args = args.iter().filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
         if args.clone().next().is_some() {
             self.generic_delimiters(|cx| cx.comma_sep(args))
         } else {
@@ -409,7 +431,7 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
     fn print_impl_path(
         &mut self,
         impl_def_id: DefId,
-        args: &'tcx [GenericArg<'tcx>],
+        args: ty::GenericArgs<'tcx>,
     ) -> Result<(), PrintError> {
         let self_ty = self.tcx.type_of(impl_def_id);
         let impl_trait_ref = self.tcx.impl_opt_trait_ref(impl_def_id);
@@ -428,7 +450,7 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
         // NOTE: We don't support mangling partially substituted but still polymorphic
         // instances, like `impl<A> Tr<A> for ()` where `A` is substituted w/ `(T,)`.
         let (typing_env, mut self_ty, mut impl_trait_ref) = if generics.count() > args.len()
-            || &args[..generics.count()]
+            || &args.as_slice()[..generics.count()]
                 == self
                     .tcx
                     .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
@@ -481,19 +503,9 @@ impl<'tcx> PrettyPrinter<'tcx> for LegacySymbolMangler<'tcx> {
         false
     }
 
-    // Identical to `PrettyPrinter::comma_sep` except there is no space after each comma.
-    fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
-    where
-        T: Print<Self>,
-    {
-        if let Some(first) = elems.next() {
-            first.print(self)?;
-            for elem in elems {
-                self.write_str(",")?;
-                elem.print(self)?;
-            }
-        }
-        Ok(())
+    // In symbol mangling, there is no space after the commas in a comma-separated list.
+    fn comma_sep_has_space(&self) -> bool {
+        false
     }
 
     fn generic_delimiters(

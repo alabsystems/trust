@@ -68,6 +68,9 @@ impl QuantifierEliminator {
     /// Eliminate quantifiers in a formula, recursively processing sub-formulas.
     #[must_use]
     pub fn eliminate(&mut self, formula: &Formula) -> Formula {
+        if !has_quantifiers(formula) {
+            return formula.clone();
+        }
         match formula {
             Formula::Forall(bindings, body) => {
                 // First, recursively eliminate in the body.
@@ -215,6 +218,7 @@ pub fn has_quantifiers(formula: &Formula) -> bool {
             has_quantifiers(c) || has_quantifiers(t) || has_quantifiers(e)
         }
         Formula::Select(a, i) => has_quantifiers(a) || has_quantifiers(i),
+        Formula::ConstArray { value, .. } => has_quantifiers(value),
         _ => false,
     }
 }
@@ -235,9 +239,14 @@ fn worst_tier_strategy(formula: &Formula, elim: &QuantifierEliminator) -> Solver
         }
         Formula::Not(inner) | Formula::Neg(inner) => worst_tier_strategy(inner, elim),
         Formula::And(cs) | Formula::Or(cs) => {
-            cs.iter().fold(SolverStrategy::QuantifierFree, |acc, c| {
-                worse_strategy(acc, worst_tier_strategy(c, elim))
-            })
+            let mut acc = SolverStrategy::QuantifierFree;
+            for c in cs {
+                acc = worse_strategy(acc, worst_tier_strategy(c, elim));
+                if acc == SolverStrategy::FullQuantifier {
+                    break;
+                }
+            }
+            acc
         }
         Formula::Implies(a, b)
         | Formula::Eq(a, b)
@@ -259,6 +268,7 @@ fn worst_tier_strategy(formula: &Formula, elim: &QuantifierEliminator) -> Solver
         Formula::Select(a, i) => {
             worse_strategy(worst_tier_strategy(a, elim), worst_tier_strategy(i, elim))
         }
+        Formula::ConstArray { value, .. } => worst_tier_strategy(value, elim),
         _ => SolverStrategy::QuantifierFree,
     }
 }

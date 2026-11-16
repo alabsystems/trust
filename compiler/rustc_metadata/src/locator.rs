@@ -213,11 +213,12 @@
 //! metadata::locator or metadata::creader for all the juicy details!
 
 use std::borrow::Cow;
-use std::io::{self, Result as IoResult, Write};
+use std::io::{self, Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::{cmp, fmt};
 
+use rustc_crate_store::CrateSource;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::owned_slice::{OwnedSlice, slice_owned};
@@ -225,7 +226,6 @@ use rustc_data_structures::svh::Svh;
 use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_fs_util::try_canonicalize;
 use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
-use rustc_session::cstore::CrateSource;
 use rustc_session::filesearch::FileSearch;
 use rustc_session::search_paths::PathKind;
 use rustc_session::utils::CanonicalizedPath;
@@ -360,6 +360,14 @@ impl<'a> CrateLocator<'a> {
         self.path_kind = path_kind;
     }
 
+    pub(crate) fn for_wasm_proc_macro(&mut self, sess: &'a Session, path_kind: PathKind) {
+        self.is_proc_macro = true;
+        self.target = &sess.wasm_proc_macro_target;
+        self.tuple = sess.wasm_proc_macro_tuple.clone();
+        self.filesearch = sess.wasm_proc_macro_filesearch();
+        self.path_kind = path_kind;
+    }
+
     pub(crate) fn maybe_load_library_crate(
         &self,
         crate_rejections: &mut CrateRejections,
@@ -422,60 +430,52 @@ impl<'a> CrateLocator<'a> {
         // given that `extra_filename` comes from the `-C extra-filename`
         // option and thus can be anything, and the incorrect match will be
         // handled safely in `extract_one`.
-        for search_path in self.filesearch.search_paths(self.path_kind) {
-            debug!("searching {}", search_path.dir.display());
-            let spf = &search_path.files;
-
-            let mut should_check_staticlibs = true;
-            for (prefix, suffix, kind) in [
-                (rlib_prefix.as_str(), rlib_suffix, CrateFlavor::Rlib),
-                (rmeta_prefix.as_str(), rmeta_suffix, CrateFlavor::Rmeta),
-                (dylib_prefix, dylib_suffix, CrateFlavor::Dylib),
-                (interface_prefix, interface_suffix, CrateFlavor::SDylib),
-            ] {
-                if prefix == staticlib_prefix && suffix == staticlib_suffix {
-                    should_check_staticlibs = false;
-                }
-                if let Some(matches) = spf.query(prefix, suffix) {
-                    for (hash, spf) in matches {
-                        let spf_path = spf.path(&search_path.dir);
-                        info!("lib candidate: {}", spf_path.display());
-
-                        let (rlibs, rmetas, dylibs, interfaces) =
-                            candidates.entry(hash).or_default();
-                        {
-                            // As a performance optimisation we canonicalize the path and skip
-                            // ones we've already seen. This allows us to ignore crates
-                            // we know are exactual equal to ones we've already found.
-                            // Going to the same crate through different symlinks does not change the result.
-                            let path =
-                                try_canonicalize(&spf_path).unwrap_or_else(|_| spf_path.clone());
-                            if seen_paths.contains(&path) {
-                                continue;
-                            };
-                            seen_paths.insert(path);
-                        }
-                        // Use the original path (potentially with unresolved symlinks),
-                        // filesystem code should not care, but this is nicer for diagnostics.
-                        match kind {
-                            CrateFlavor::Rlib => rlibs.insert(spf_path),
-                            CrateFlavor::Rmeta => rmetas.insert(spf_path),
-                            CrateFlavor::Dylib => dylibs.insert(spf_path),
-                            CrateFlavor::SDylib => interfaces.insert(spf_path),
-                        };
-                    }
-                }
+        let mut should_check_staticlibs = true;
+        for (prefix, suffix, kind) in [
+            (rlib_prefix.as_str(), rlib_suffix, CrateFlavor::Rlib),
+            (rmeta_prefix.as_str(), rmeta_suffix, CrateFlavor::Rmeta),
+            (dylib_prefix, dylib_suffix, CrateFlavor::Dylib),
+            (interface_prefix, interface_suffix, CrateFlavor::SDylib),
+        ] {
+            if prefix == staticlib_prefix && suffix == staticlib_suffix {
+                should_check_staticlibs = false;
             }
-            if let Some(static_matches) = should_check_staticlibs
-                .then(|| spf.query(staticlib_prefix, staticlib_suffix))
-                .flatten()
+
+            for (hash, spf_path) in
+                self.filesearch.get_library_candidates(prefix, suffix, self.path_kind)
             {
-                for (_, spf) in static_matches {
-                    crate_rejections.via_kind.push(CrateMismatch {
-                        path: spf.path(&search_path.dir),
-                        got: "static".to_string(),
-                    });
+                info!("lib candidate: {}", spf_path.display());
+
+                let (rlibs, rmetas, dylibs, interfaces) = candidates.entry(hash).or_default();
+                {
+                    // As a performance optimisation we canonicalize the path and skip
+                    // ones we've already seen. This allows us to ignore crates
+                    // we know are exactual equal to ones we've already found.
+                    // Going to the same crate through different symlinks does not change the result.
+                    let path = try_canonicalize(&spf_path).unwrap_or_else(|_| spf_path.clone());
+                    if seen_paths.contains(&path) {
+                        continue;
+                    };
+                    seen_paths.insert(path);
                 }
+                // Use the original path (potentially with unresolved symlinks),
+                // filesystem code should not care, but this is nicer for diagnostics.
+                match kind {
+                    CrateFlavor::Rlib => rlibs.insert(spf_path),
+                    CrateFlavor::Rmeta => rmetas.insert(spf_path),
+                    CrateFlavor::Dylib => dylibs.insert(spf_path),
+                    CrateFlavor::SDylib => interfaces.insert(spf_path),
+                };
+            }
+        }
+
+        if should_check_staticlibs {
+            for (_, path) in self.filesearch.get_library_candidates(
+                staticlib_prefix,
+                staticlib_suffix,
+                self.path_kind,
+            ) {
+                crate_rejections.via_kind.push(CrateMismatch { path, got: "static".to_string() });
             }
         }
 
@@ -724,7 +724,7 @@ impl<'a> CrateLocator<'a> {
             return None;
         }
 
-        let hash = header.hash;
+        let hash = metadata.get_crate_hash();
         if let Some(expected_hash) = self.hash {
             if hash != expected_hash {
                 info!("Rejecting via hash: expected {} got {}", expected_hash, hash);
@@ -742,6 +742,8 @@ impl<'a> CrateLocator<'a> {
         &self,
         crate_rejections: &mut CrateRejections,
     ) -> Result<Option<Library>, CrateError> {
+        debug!("find_commandline_library {}", self.crate_name);
+
         // First, filter out all libraries that look suspicious. We only accept
         // files which actually exist that have the correct naming scheme for
         // rlibs/dylibs.
@@ -812,6 +814,38 @@ impl<'a> CrateLocator<'a> {
     }
 }
 
+/// Trust: describe what a dylib on disk actually *is*, for diagnostics only.
+///
+/// Used when a proc-macro declarations `dlsym` misses, to say whether the file
+/// is a different crate, a different revision's build of the same crate, or not
+/// Rust metadata at all. Never consulted on a success path.
+pub(crate) fn describe_dylib_identity(
+    target: &Target,
+    filename: &Path,
+    loader: &dyn MetadataLoader,
+    cfg_version: &'static str,
+) -> String {
+    match get_metadata_section(target, CrateFlavor::Dylib, filename, loader, cfg_version, None) {
+        Ok(blob) => {
+            let header = blob.get_header();
+            if header.is_stub {
+                format!("`{}`, carrying only stub metadata", header.name)
+            } else {
+                let id = blob.get_root().stable_crate_id();
+                format!(
+                    "`{}`, which declares `{}`",
+                    header.name,
+                    rustc_session::generate_proc_macro_decls_symbol(id),
+                )
+            }
+        }
+        Err(MetadataError::VersionMismatch { expected_version, found_version }) => format!(
+            "a crate built by rustc {found_version}, while this is rustc {expected_version}"
+        ),
+        Err(err) => format!("not readable as Rust metadata ({err})"),
+    }
+}
+
 fn get_metadata_section<'p>(
     target: &Target,
     flavor: CrateFlavor,
@@ -828,6 +862,13 @@ fn get_metadata_section<'p>(
             loader.get_rlib_metadata(target, filename).map_err(MetadataError::LoadFailure)?
         }
         CrateFlavor::SDylib => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if rustc_data_structures::jobserver::native_v3_context().is_some() {
+                return Err(MetadataError::LoadFailure(
+                    "native v3 SDylib interface generation requires a retained hosted execution loan"
+                        .into(),
+                ));
+            }
             let compiler = std::env::current_exe().map_err(|_err| {
                 MetadataError::LoadFailure(
                     "couldn't obtain current compiler binary when loading sdylib interface"
@@ -962,7 +1003,7 @@ pub fn list_file_metadata(
     let flavor = get_flavor_from_path(path);
     match get_metadata_section(target, flavor, path, metadata_loader, cfg_version, None) {
         Ok(metadata) => metadata.list_crate_metadata(out, ls_kinds),
-        Err(msg) => write!(out, "{msg}\n"),
+        Err(msg) => Err(IoError::new(IoErrorKind::Other, msg.to_string())),
     }
 }
 
@@ -978,17 +1019,19 @@ fn get_flavor_from_path(path: &Path) -> CrateFlavor {
     }
 }
 
-/// A function to fetch about all macros inside a proc-macro crate.
+/// A function to fetch all macros inside a proc-macro crate.
 ///
 /// Used by rust-analyzer-proc-macro-srv.
 pub fn get_proc_macros(
-    target: &Target,
     path: &Path,
     metadata_loader: &dyn MetadataLoader,
     cfg_version: &'static str,
 ) -> IoResult<Vec<(ProcMacroClient, ProcMacroKind)>> {
+    let host_tuple = TargetTuple::from_tuple(config::host_tuple());
+    let (host, _) = Target::search(&host_tuple, Path::new(""), false).unwrap();
+
     let metadata =
-        get_metadata_section(target, CrateFlavor::Dylib, path, metadata_loader, cfg_version, None)
+        get_metadata_section(&host, CrateFlavor::Dylib, path, metadata_loader, cfg_version, None)
             .map_err(|err| io::Error::other(err.to_string()))?;
     let stable_crate_id = metadata.get_root().stable_crate_id();
 
@@ -1045,8 +1088,38 @@ pub(crate) enum CrateError {
     StableCrateIdCollision(Symbol, Symbol),
     DlOpen(String, String),
     DlSym(String, String),
+    // Trust: a proc-macro dylib was found and opened, but it does not carry the
+    // declarations symbol the metadata asked for. See `ProcMacroDeclsMissingInfo`.
+    ProcMacroDeclsMissing(Box<ProcMacroDeclsMissingInfo>),
     LocatorCombined(Box<CombinedLocatorError>),
-    NotFound(Symbol),
+    // Trust: upstream's `NotFound` variant was constructed in exactly one place —
+    // `intern_stable_crate_id`'s claimed-but-empty crate slot — and it rendered
+    // there as a note-free `can't find crate` for a crate that had in fact been
+    // found, read and interned. That slot is now reclaimed rather than reported
+    // (see `reclaim_crate_num`), so nothing constructs the variant and it is
+    // removed instead of left as dead code. A genuine missing crate still
+    // reaches `CannotFindCrate` through `LocatorCombined`, which carries the
+    // per-candidate rejection reasons this variant never had.
+}
+
+/// Trust: everything needed to explain a proc-macro declarations `dlsym` miss.
+///
+/// A proc-macro crate's identity is spread across two files: the metadata blob
+/// that named it (usually an `.rmeta`) and the dylib the declarations symbol
+/// lives in. The locator finds those separately, by globbing
+/// `lib<name>-*.<dylib-suffix>` over the library search path — and
+/// `-Cextra-filename` does **not** incorporate the compiler version while
+/// [`StableCrateId`] **does**. So a build tree that has held artifacts from more
+/// than one compiler revision can offer a dylib whose file name is right and
+/// whose identity is stale, and the bare symptom is `dlsym: symbol not found`
+/// against a file that is, by every other measure, a valid proc-macro dylib.
+#[derive(Debug)]
+pub(crate) struct ProcMacroDeclsMissingInfo {
+    pub(crate) path: String,
+    pub(crate) crate_name: Symbol,
+    pub(crate) expected_symbol: String,
+    pub(crate) metadata_path: String,
+    pub(crate) dylib_identity: String,
 }
 
 #[derive(Debug)]
@@ -1120,6 +1193,25 @@ impl CrateError {
             }
             CrateError::DlOpen(path, err) | CrateError::DlSym(path, err) => {
                 dcx.emit_err(diagnostics::DlError { span, path, err });
+            }
+            // Trust: name the two files whose identities disagree, rather than
+            // leaving a bare `symbol not found` for the reader to reverse engineer.
+            CrateError::ProcMacroDeclsMissing(info) => {
+                let ProcMacroDeclsMissingInfo {
+                    path,
+                    crate_name,
+                    expected_symbol,
+                    metadata_path,
+                    dylib_identity,
+                } = *info;
+                dcx.emit_err(diagnostics::ProcMacroDeclsMissing {
+                    span,
+                    path,
+                    crate_name,
+                    expected_symbol,
+                    metadata_path,
+                    dylib_identity,
+                });
             }
             CrateError::LocatorCombined(locator) => {
                 let crate_name = locator.crate_name;
@@ -1251,31 +1343,6 @@ impl CrateError {
                     } else {
                         dcx.emit_err(error);
                     }
-                }
-            }
-            CrateError::NotFound(crate_name) => {
-                let error = diagnostics::CannotFindCrate {
-                    span,
-                    crate_name,
-                    add_info: String::new(),
-                    missing_core,
-                    current_crate: sess
-                        .opts
-                        .crate_name
-                        .clone()
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    is_nightly_build: sess.is_nightly_build(),
-                    profiler_runtime: Symbol::intern(&sess.opts.unstable_opts.profiler_runtime),
-                    locator_triple: sess.opts.target_triple.clone(),
-                    is_ui_testing: sess.opts.unstable_opts.ui_testing,
-                    is_tier_3: sess.target.metadata.tier == Some(3),
-                };
-                // The diagnostic for missing core is very good, but it is followed by a lot of
-                // other diagnostics that do not add information.
-                if missing_core {
-                    dcx.emit_fatal(error);
-                } else {
-                    dcx.emit_err(error);
                 }
             }
         }

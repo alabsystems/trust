@@ -1,11 +1,14 @@
-//! ANTI-VACUITY guards for the two path-guard COLLAPSE repairs.
+//! ANTI-VACUITY guards for the path-guard COLLAPSE repairs.
 //!
-//! `v2_build_path_guard_map` degrades in two ways, and each one leaves a block
+//! `v2_build_path_guard_map` degrades in three ways, and each one leaves a block
 //! with a single UNGUARDED path — no reachability condition at all:
 //!
 //!  * MODE 1, `MAX_PATHS_PER_BLOCK`: the block itself was reached by too many
 //!    routes;
-//!  * MODE 2, the global step budget: EVERY block of the function at once.
+//!  * MODE 2, the global step budget: EVERY block of the function at once;
+//!  * MODE 3, the FRONTIER budget (`MAX_PATH_WALK_STEPS` / `MAX_PATH_WALK_QUEUE`):
+//!    the same whole-function degradation as mode 2, tripped on a constant pop
+//!    or live-queue bound rather than on `16n^2` pops.
 //!
 //! `v2_reachability_for_collapsed` answers both with the weakest still-valid
 //! condition (the disjunction of the block's in-edge guards), and the COLLAPSE
@@ -24,6 +27,7 @@
 
 use trust_types::{BlockId, Terminator, VerifiableFunction};
 
+use super::safety::{MAX_PATH_WALK_QUEUE, MAX_PATH_WALK_STEPS};
 use super::{PathGuardCollapse, ReachSummary, v2_analyze_path_guards};
 
 fn load(name: &str) -> VerifiableFunction {
@@ -32,6 +36,239 @@ fn load(name: &str) -> VerifiableFunction {
         .unwrap_or_else(|e| panic!("MIR fixture {path} must be readable: {e}"));
     serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("MIR fixture {path} must deserialize: {e}"))
+}
+
+/// MODE 3 — the FRONTIER budget, and the two things that must be true of it.
+///
+/// Mode 2's cap counts POPS (`16n^2 + 16n + 4096`) and grows with the square of
+/// the block count; every pop also charges one step of the ambient per-function
+/// budget. MEASURED on the 2026-10-16 candidate gate (trust 7f3690ed73, without
+/// this mode): `astream_broker::broker::serve_conn` (1202 blocks) spent its whole
+/// 64,000,000-step budget in VC generation and lost every row, where the seal
+/// (321aaeda75, with this mode) collapsed at 2,000,000 pops and kept its rows.
+///
+/// # What the test pins
+///
+/// 1. The degradation is the SAME one mode 2 performs — every block reduced to a
+///    single unguarded path and marked `degraded`, with the in-edge summary
+///    restored for every block — because that is the state the collapse
+///    invariant (and every test in this file) is written against. A mode that
+///    degraded a DIFFERENT set would need its own invariant.
+/// 2. The mode carries its OWN name out of the walk, so a reader can tell the
+///    frontier bound from the pop bound.
+#[test]
+fn the_frontier_budget_degrades_exactly_as_the_step_budget_does_and_says_so() {
+    // 400 blocks of two-way diamonds: `2^stage` routes reach stage `stage`, so
+    // the BFS frontier passes `MAX_PATH_WALK_QUEUE` within ~20 stages while
+    // mode 2's cap (16*400^2 + 16*400 + 4096 = 2_570_496 pops) is still far off.
+    let func = diamond_chain(400);
+    let analysis = v2_analyze_path_guards(&func);
+
+    assert_eq!(
+        analysis.collapse,
+        PathGuardCollapse::FrontierBudgetTripped,
+        "a body whose frontier outruns the frontier budget before its pop budget \
+         must report the FRONTIER cause; reporting BudgetTripped here would hide \
+         which cap fired"
+    );
+    assert_eq!(
+        analysis.degraded.len(),
+        func.body.blocks.len(),
+        "mode 3 degrades the WHOLE function, exactly as mode 2 does"
+    );
+    for block in &func.body.blocks {
+        let paths = analysis.paths.get(&block.id).expect("every block is in the collapsed map");
+        assert!(
+            paths.len() == 1 && paths[0].is_empty(),
+            "bb{}: one unguarded path, not {paths:?}",
+            block.id.0
+        );
+        assert!(
+            analysis.reachability.contains_key(&block.id),
+            "bb{}: the in-edge summary is restored for every degraded block, which \
+             is what stops the collapse from becoming a false REFUTATION",
+            block.id.0
+        );
+    }
+}
+
+/// NEGATIVE CONTROL for the mode-3 tests: the same diamond shape, small enough to
+/// finish, must keep its guards. Without it the test above would pass for a walk
+/// that collapsed every function. 12 blocks are five diamonds, so the exit block is
+/// reached by 32 routes — under `MAX_PATHS_PER_BLOCK` (64), so not even mode 1 fires
+/// (20 blocks, nine diamonds and 512 routes, saturate: MEASURED, mode 1).
+#[test]
+fn a_small_diamond_chain_completes_the_walk_and_keeps_its_guards() {
+    let func = diamond_chain(12);
+    let analysis = v2_analyze_path_guards(&func);
+    assert_eq!(analysis.collapse, PathGuardCollapse::None, "12 blocks finish the walk");
+    assert!(analysis.degraded.is_empty(), "nothing is degraded when the walk finishes");
+    let last = BlockId(func.body.blocks.len() - 1);
+    let paths = analysis.paths.get(&last).expect("the exit block was reached");
+    assert!(
+        paths.iter().any(|path| !path.is_empty()),
+        "the exit block keeps guarded paths when no budget trips: {paths:?}"
+    );
+}
+
+/// The frontier budget is a MEASURED number. It was chosen (seal-line 28aee49dd8)
+/// from a census of the 1269 `VerifiableFunction`s `-Ztrust-dump=mir` extracts
+/// from `ay-arrays`: the heaviest body that COMPLETES the walk spends 389_003
+/// pops with a peak queue of 21_799 entries (`check_self_store`, 165 blocks).
+/// Both budgets must stay clear of those by a wide margin or mode 3 starts
+/// degrading bodies that used to keep their guards.
+///
+/// The margin assertions are arithmetic over two `const`s; the test also WALKS
+/// every extracted-MIR fixture in `tests/data` and requires that none of them
+/// reaches mode 3 — the property the margin is FOR, stated over real bodies.
+#[test]
+fn the_frontier_budget_keeps_its_measured_margin_over_real_bodies() {
+    const CENSUS_MAX_POPS: usize = 389_003;
+    const CENSUS_MAX_QUEUE: usize = 21_799;
+    assert!(
+        MAX_PATH_WALK_STEPS >= CENSUS_MAX_POPS * 4,
+        "MAX_PATH_WALK_STEPS ({MAX_PATH_WALK_STEPS}) must keep a wide margin over \
+         the {CENSUS_MAX_POPS} pops the heaviest COMPLETING body in the ay-arrays \
+         census spends. Re-run the census before changing it."
+    );
+    assert!(
+        MAX_PATH_WALK_QUEUE >= CENSUS_MAX_QUEUE * 4,
+        "MAX_PATH_WALK_QUEUE ({MAX_PATH_WALK_QUEUE}) must keep a wide margin over \
+         the {CENSUS_MAX_QUEUE}-entry peak queue of the heaviest COMPLETING body"
+    );
+
+    let dir = format!("{}/tests/data", env!("CARGO_MANIFEST_DIR"));
+    let mut walked = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("the extracted-MIR fixture directory") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a readable fixture");
+        // Not every file under tests/data is a VerifiableFunction; skip the rest
+        // rather than pinning the directory's exact contents.
+        let Ok(func) = serde_json::from_str::<VerifiableFunction>(&text) else { continue };
+        walked += 1;
+        assert_ne!(
+            v2_analyze_path_guards(&func).collapse,
+            PathGuardCollapse::FrontierBudgetTripped,
+            "{}: a real extracted body reached the FRONTIER budget. Either the \
+             constants were lowered below what real MIR needs, or the traversal \
+             now visits far more than it did",
+            path.display(),
+        );
+    }
+    assert!(
+        walked >= 50,
+        "the corpus half of this test must actually walk the fixtures; only {walked} \
+         parsed, so a path or format change has made it vacuous"
+    );
+}
+
+/// THE REPORTING PIN for mode 3: one named row, once per collapsed function,
+/// through the safety walk AND through the public `generate_vcs`, with the seal's
+/// kind tag. A memory/step bound that reports nothing makes every row of the
+/// function look like a row that never had a path condition.
+#[test]
+fn the_frontier_budget_leaves_one_named_row_a_reader_can_see() {
+    let func = diamond_chain(400);
+    assert_eq!(
+        v2_analyze_path_guards(&func).collapse,
+        PathGuardCollapse::FrontierBudgetTripped,
+        "the fixture must actually trip mode 3, or this test proves nothing"
+    );
+    let is_frontier_row = |vc: &trust_types::VerificationCondition| {
+        matches!(&vc.kind, trust_types::VcKind::UnsupportedMir { kind, .. }
+            if kind == crate::VCGEN_PATH_GUARD_FRONTIER_BUDGET_KIND)
+    };
+    assert_eq!(crate::VCGEN_PATH_GUARD_FRONTIER_BUDGET_KIND, "TrustPathGuardFrontierBudgetTripped");
+
+    let vcs = super::generate_v2_safety_vcs(&func);
+    let named: Vec<&trust_types::VerificationCondition> =
+        vcs.iter().filter(|vc| is_frontier_row(vc)).collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "exactly one row must name the frontier budget for this function; got kinds {:?}",
+        vcs.iter().map(|vc| vc.kind.description()).collect::<Vec<_>>(),
+    );
+    // Fail-closed in the one direction that matters: VCs are VIOLATION formulas,
+    // so a `Bool(false)` here would report the degraded function as PROVED.
+    assert_eq!(
+        named[0].formula,
+        trust_types::Formula::Bool(true),
+        "the frontier row's violation formula must be SAT, so no direct solver \
+         caller can read the bound as a proof"
+    );
+    assert!(
+        matches!(&named[0].kind, trust_types::VcKind::UnsupportedMir { detail, .. }
+            if detail.contains(&func.name) && detail.contains("FRONTIER")
+                && detail.contains("400 blocks")),
+        "the detail must name the function, its size and the bound; got {:?}",
+        named[0].kind,
+    );
+    let public = crate::generate_vcs(&func);
+    assert_eq!(
+        public.iter().filter(|vc| is_frontier_row(vc)).count(),
+        1,
+        "the row must survive the whole generation, not just the safety walk; got kinds {:?}",
+        public.iter().map(|vc| vc.kind.description()).collect::<Vec<_>>(),
+    );
+
+    // THE DISCRIMINATOR: a body that does NOT trip mode 3 must carry no such row,
+    // or the assertions above would pass for a generator that emitted it always —
+    // which would turn every compilation Unknown.
+    let small = diamond_chain(20);
+    assert!(
+        !super::generate_v2_safety_vcs(&small).iter().any(|vc| is_frontier_row(vc))
+            && !crate::generate_vcs(&small).iter().any(|vc| is_frontier_row(vc)),
+        "a function whose walk completed must never claim a frontier-budget overrun"
+    );
+}
+
+/// `blocks` blocks wired as a chain of two-way diamonds: `bb2i` switches to
+/// `bb2i+1` and `bb2i+2`, and `bb2i+1` gotos `bb2i+2`. Every stage doubles the
+/// number of acyclic routes, which is the cheapest shape that makes a BFS
+/// frontier grow exponentially.
+fn diamond_chain(blocks: usize) -> VerifiableFunction {
+    use trust_types::{BasicBlock, LocalDecl, Operand, Place, SourceSpan, Ty, VerifiableBody};
+    let mut body_blocks: Vec<BasicBlock> = Vec::with_capacity(blocks);
+    for index in 0..blocks {
+        let terminator = if index + 2 < blocks && index % 2 == 0 {
+            Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(1)),
+                targets: vec![(index as u128, BlockId(index + 1))],
+                otherwise: BlockId(index + 2),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::default(),
+            }
+        } else if index + 1 < blocks {
+            Terminator::Goto(BlockId(index + 1))
+        } else {
+            Terminator::Return
+        };
+        body_blocks.push(BasicBlock { id: BlockId(index), stmts: vec![], terminator });
+    }
+    VerifiableFunction {
+        name: "diamond_chain".to_string(),
+        def_path: "diamond_chain".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("x".into()) },
+            ],
+            blocks: body_blocks,
+            arg_count: 1,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    }
 }
 
 /// MODE 2 — the global step budget, on a NON-coroutine body. This return path is
@@ -415,6 +652,7 @@ mod the_collapse_invariant {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -439,6 +677,7 @@ mod the_collapse_invariant {
             span: SourceSpan::default(),
             atomic: None,
             callee_identity: None,
+            callee_key: crate::sep_engine::tests::fixture_key("core::panicking::panic_fmt"),
         };
         func
     }
@@ -494,6 +733,7 @@ mod the_collapse_invariant {
             preconditions: vec![],
             postconditions: vec![],
             spec: Default::default(),
+            tuple_layouts: Default::default(),
         }
     }
 
@@ -680,6 +920,88 @@ mod the_collapse_invariant {
              declining here would bless real UB: {kinds:?}"
         );
         assert!(!kinds.iter().any(is_degraded_decline), "{kinds:?}");
+    }
+
+    /// S1 control (2026-10-16): the splice's marking rule
+    /// ([`super::super::v2_mark_lost_guards`]), on the four inputs it decides. THIS is
+    /// the control for the `Unconditional` exclusion: drop the
+    /// `!(is_content_free && Unconditional)` clause and the first assertion fails.
+    /// A degraded content-free row with an `Unconditional` summary keeps `Raw` (its
+    /// empty path is the in-edge disjunction `true`, not lost guards); a degraded
+    /// row with a violation of its own, or a content-free one whose summary is not
+    /// `Unconditional`, is marked; a block that kept its path list is not.
+    #[test]
+    fn the_unconditional_exclusion_keeps_a_content_free_row_raw() {
+        use trust_types::PathGuardTerm;
+        let mark = |degraded, content_free, reach: Option<&ReachSummary>| {
+            super::super::v2_mark_lost_guards(
+                vec![PathGuardTerm::Raw],
+                degraded,
+                content_free,
+                reach,
+            )
+        };
+        assert_eq!(
+            mark(true, true, Some(&ReachSummary::Unconditional)),
+            vec![PathGuardTerm::Raw],
+            "a reachable content-free row's unconditional path is information"
+        );
+        assert_eq!(
+            mark(true, false, Some(&ReachSummary::Unconditional)),
+            vec![PathGuardTerm::Collapsed],
+            "a row with its own violation lost its guards"
+        );
+        assert_eq!(
+            mark(true, true, Some(&ReachSummary::Unavailable)),
+            vec![PathGuardTerm::Collapsed]
+        );
+        assert_eq!(mark(true, true, None), vec![PathGuardTerm::Collapsed]);
+        assert_eq!(
+            mark(false, false, None),
+            vec![PathGuardTerm::Raw],
+            "a block that kept its path list"
+        );
+    }
+
+    /// S1, end to end on the generator's own rows: a reachable `unreachable!()` /
+    /// panic call in a DEGRADED block whose summary is `Unconditional` still
+    /// refutes at the generic refutation scope. NOT the control for the
+    /// `Unconditional` exclusion (that is
+    /// [`the_unconditional_exclusion_keeps_a_content_free_row_raw`]): measured
+    /// 2026-10-16, neither the `Unreachable` row nor the panic call's content-free
+    /// `Assertion` row carries an obligation record, so neither could be marked
+    /// with or without the exclusion.
+    #[test]
+    fn an_unconditional_degraded_row_still_refutes_at_the_scope() {
+        use trust_types::{ObligationWrapper, PathGuardTerm};
+        for mut func in [unreachable_target(65), panic_call_target(65)] {
+            func.body.blocks.push(BasicBlock {
+                id: BlockId(3),
+                stmts: vec![],
+                terminator: Terminator::Goto(BlockId(1)),
+            });
+            let vcs = super::super::generate_v2_safety_vcs(&func);
+            let rows: Vec<_> = vcs
+                .iter()
+                .filter(|vc| matches!(vc.kind, VcKind::Unreachable | VcKind::Assertion { .. }))
+                .collect();
+            assert!(!rows.is_empty(), "{}: the reachable content-free row: {vcs:?}", func.name);
+            let scope =
+                crate::refutation_scope::GenericRefutationScope::for_function(&func, &vcs, &[]);
+            for row in rows {
+                let collapsed = row.obligation.as_ref().is_some_and(|record| {
+                    record.wrappers.iter().any(|w| {
+                        matches!(w, ObligationWrapper::PathGuardOr { paths }
+                            if paths.iter().any(|t| matches!(t, PathGuardTerm::Collapsed)))
+                    })
+                });
+                assert!(
+                    !collapsed,
+                    "an unconditional path is information, not a collapse: {row:?}"
+                );
+                assert_eq!(scope.rejection_reason(row), None, "a reachable row still refutes");
+            }
+        }
     }
 
     /// SCOPE. The invariant touches ONLY rows with no violation condition of

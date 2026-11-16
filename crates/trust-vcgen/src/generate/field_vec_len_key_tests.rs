@@ -11,9 +11,18 @@ fn vec_u32() -> Ty {
 }
 
 /// `struct T { history: Vec<u32>, other: Vec<u32> }` — field 0 is `history`,
-/// field 1 is `other`.
+/// field 1 is `other`. Stamped `Struct`, as every real dump stamps its ADTs: an ADT of
+/// unrecorded kind may be a union, and a field of a union behind `&self` is not
+/// body-stable when the union may hold a cell byte (INTERIOR-MUT-CHANNEL-2, 2026-10-16).
 fn t_struct() -> Ty {
-    Ty::adt("test::T", vec![("history".to_string(), vec_u32()), ("other".to_string(), vec_u32())])
+    let mut ty = Ty::adt(
+        "test::T",
+        vec![("history".to_string(), vec_u32()), ("other".to_string(), vec_u32())],
+    );
+    if let Ty::Adt { adt_kind, .. } = &mut ty {
+        *adt_kind = Some(trust_types::AdtKind::Struct);
+    }
+    ty
 }
 
 /// `&((*_1).<f>)` — the field place a reborrow temp borrows.
@@ -52,6 +61,7 @@ fn field_vec_func(
         atomic: None,
         is_unsafe_sig: false,
         callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(&callee.to_string()),
         is_foreign: false,
     };
     VerifiableFunction {
@@ -119,6 +129,7 @@ fn field_vec_func(
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -221,4 +232,153 @@ fn mut_self_root_fails_closed_to_per_temp_vars() {
         "under &mut self the guard var must NOT unify with the index var \
          (guard {gname:?}, index {bname:?})"
     );
+}
+
+/// The container-length recognizer GRANTS a stable length (`coll_len`) to std's
+/// `Vec` and `String` by their exact authenticated paths, never by the path's tail:
+/// a user type named `Vec` or `String` has its own `len` and `Index` (see
+/// `tests/data/user_type_named_vec.rs`, whose `Vec` got std `Vec`'s index/value tie
+/// through the same tail test and was a certified false proof).
+#[test]
+fn only_std_vec_and_string_have_a_container_length() {
+    let func_with = |name: &str| VerifiableFunction {
+        name: "len_of".to_string(),
+        def_path: "test::len_of".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::u32(), name: Some("ret".into()) },
+                LocalDecl {
+                    index: 1,
+                    ty: Ty::Ref { mutable: false, inner: Box::new(Ty::adt(name, vec![])) },
+                    name: Some("v".into()),
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![],
+                terminator: Terminator::Return,
+            }],
+            arg_count: 1,
+            return_ty: Ty::u32(),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+        tuple_layouts: Default::default(),
+    };
+    let len_of = |name: &str| {
+        guards::owned_container_len_var(&func_with(name), &Operand::Copy(Place::local(1)))
+    };
+    for name in ["alloc::vec::Vec<u32>", "std::vec::Vec<u32>", "alloc::string::String"] {
+        assert!(len_of(name).is_some(), "std's `{name}` keeps its container length");
+    }
+    for name in ["mycrate::Vec<u32>", "Vec<u32>", "mycrate::String", "string::String"] {
+        assert!(len_of(name).is_none(), "a user `{name}` must not get a container length");
+    }
+}
+
+/// IDX-TIE-1 (2026-10-03) fixture for `build_len_guard_field_map`: a dominating
+/// field-length guard and a scalar field index whose callee is `index_callee`.
+/// ```text
+/// fn f(self: &T, i: usize) -> u32 {
+///   b0: _5 = &((*_1).0); _6 = Vec::len(move _5)             -> b1
+///   b1: _9 = Ge(copy _6, const 4); switchInt(move _9) [0: b3, otherwise: b2]
+///   b2: _7 = &((*_1).0); _8 = <index_callee>(move _7, copy _2) -> b4
+///   b3: return            b4: return
+/// }
+/// ```
+fn guarded_field_index_func(index_callee: &str) -> VerifiableFunction {
+    let mut func = field_vec_func(false, 0, 0);
+    let call = |callee: &str, args: Vec<Operand>, dest: usize, target: usize| Terminator::Call {
+        unwind: UnwindEdge::Unreachable,
+        func: callee.to_string(),
+        args,
+        dest: Place::local(dest),
+        target: Some(BlockId(target)),
+        span: SourceSpan::default(),
+        atomic: None,
+        is_unsafe_sig: false,
+        callee_identity: None,
+        callee_key: crate::sep_engine::tests::fixture_key(callee),
+        is_foreign: false,
+    };
+    let reborrow = |dest: usize| Statement::Assign {
+        place: Place::local(dest),
+        rvalue: Rvalue::Ref { mutable: false, place: field_place(0) },
+        span: SourceSpan::default(),
+    };
+    func.body.locals.push(LocalDecl { index: 9, ty: Ty::Bool, name: None });
+    func.body.blocks = vec![
+        BasicBlock {
+            id: BlockId(0),
+            stmts: vec![reborrow(5)],
+            terminator: call(
+                "alloc::vec::Vec::<u32>::len",
+                vec![Operand::Move(Place::local(5))],
+                6,
+                1,
+            ),
+        },
+        BasicBlock {
+            id: BlockId(1),
+            stmts: vec![Statement::Assign {
+                place: Place::local(9),
+                rvalue: Rvalue::BinaryOp(
+                    trust_types::BinOp::Ge,
+                    Operand::Copy(Place::local(6)),
+                    Operand::Constant(trust_types::ConstValue::Uint(4, 64)),
+                ),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Move(Place::local(9)),
+                targets: vec![(0, BlockId(3))],
+                otherwise: BlockId(2),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::default(),
+            },
+        },
+        BasicBlock {
+            id: BlockId(2),
+            stmts: vec![reborrow(7)],
+            terminator: call(
+                index_callee,
+                vec![Operand::Move(Place::local(7)), Operand::Copy(Place::local(2))],
+                8,
+                4,
+            ),
+        },
+        BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
+        BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+    ];
+    func
+}
+
+fn field_guard_facts(func: &VerifiableFunction) -> usize {
+    super::build_len_guard_field_map(func).values().map(Vec::len).sum()
+}
+
+/// POSITIVE: std's `Vec` `Index<usize>`, in the extractor's spelling, gets the
+/// dominating-guard field-length fact.
+#[test]
+fn std_field_index_gets_the_guard_fact() {
+    let func =
+        guarded_field_index_func("<alloc::vec::Vec<u32> as core::ops::index::Index<usize>>::index");
+    assert_eq!(field_guard_facts(&func), 1);
+}
+
+/// IDX-TIE-1: a method that is merely NAMED `index` gets no fact from this lane
+/// (uniformity with the value tie; the fact is meant for std's scalar index).
+#[test]
+fn a_user_method_named_index_gets_no_guard_fact() {
+    for user in [
+        "<alloc::vec::Vec<u32> as lenf::Pick>::index",
+        "<alloc::vec::Vec<u32> as core::ops::index::Index<lenf::K>>::index",
+        "core::ops::index::Index::index",
+    ] {
+        assert_eq!(field_guard_facts(&guarded_field_index_func(user)), 0, "{user}");
+    }
 }

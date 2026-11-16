@@ -31,11 +31,12 @@ from typing import Any, Iterable
 SCHEMA = "trust.realcode-coverage-evidence.v1"
 ATTEMPT_SCHEMA = "trust.realcode-coverage-attempt.v1"
 IDENTITY_SCHEMA = "trustc.coverage-function-identities.v1"
+MEMORY_SCHEMA = "trust-memory-summary/v1"
 PROVENANCE_SCHEMA = "trust.stage-tool-provenance.v2"
 PROVE_SCHEMA = "trust.prove-scorecard.v1"
 ACCEPTED_PROVENANCE = {"release-ready", "internal-release-ready"}
-CORPUS_REL = Path("reports/2026-06-29-honest-real-code-coverage/corpus/realcode.rs")
-ANALYZER_REL = Path("reports/2026-06-29-honest-real-code-coverage/analyze.py")
+CORPUS_REL = Path("scripts/realcode-coverage/corpus/realcode.rs")
+ANALYZER_REL = Path("scripts/realcode-coverage/analyze.py")
 PROVENANCE_VERIFIER_REL = Path("scripts/recreate_bootstrap.py")
 CORPUS_CLASSIFICATION = {
     "kind": "curated-hand-authored-synthetic-fixture",
@@ -529,6 +530,14 @@ def parse_transport(capture: Capture, session: str, label: str) -> dict[str, Any
     )
     if len(eligible_functions) != eligible or eligible_functions != processed_functions:
         raise EvidenceError(f"{label} function identities do not prove exact complete coverage")
+    # T3 L4 C09w: the compiler's coverage row carries a required memory summary.
+    memory = coverage.get("memory")
+    if (
+        not isinstance(memory, dict)
+        or memory.get("schema") != MEMORY_SCHEMA
+        or not isinstance(memory.get("counters"), dict)
+    ):
+        raise EvidenceError(f"{label} coverage_summary lacks its {MEMORY_SCHEMA} memory summary")
 
     by_function: dict[str, dict[str, Any]] = {}
     totals = collections.Counter({outcome: 0 for outcome in OUTCOMES})
@@ -707,8 +716,12 @@ def validate_analysis(value: Any, expected_functions: list[str]) -> dict[str, An
 def validate_proof_population(value: Any, population: int, budget: int) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != PROVE_SCHEMA:
         raise EvidenceError("prove output does not use trust.prove-scorecard.v1")
-    if value.get("status") not in {"measured", "rejected"}:
-        raise EvidenceError("prove output status is neither measured nor rejected")
+    # "incomplete": a bridge-gate step spent the wall-clock step budget that
+    # --budget-secs sets (a TIMEOUT). It is a well-formed producer outcome with no
+    # bridge claim, so it is recorded as a zero-credit attempt below
+    # (validate_proof accepts only "measured").
+    if value.get("status") not in {"measured", "rejected", "incomplete"}:
+        raise EvidenceError("prove output status is not measured, rejected, or incomplete")
     if value.get("budget_secs_per_function") != budget:
         raise EvidenceError("prove output budget differs from requested budget")
     scorecard = value.get("scorecard")

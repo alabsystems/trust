@@ -51,10 +51,7 @@
         "null"
       ],
       "additionalProperties": {
-        "type": "array",
-        "items": {
-          "type": "string"
-        }
+        "$ref": "#/$defs/FeatureDefinition"
       }
     },
     "lib": {
@@ -636,6 +633,45 @@
       ]
     },
     "TomlValue": true,
+    "FeatureDefinition": {
+      "description": "Definition of a feature.",
+      "anyOf": [
+        {
+          "description": "Features that this feature enables.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "Unstable feature `feature-metadata`. Metadata of this feature.",
+          "$ref": "#/$defs/FeatureMetadata"
+        }
+      ]
+    },
+    "FeatureMetadata": {
+      "description": "Unstable feature `feature-metadata`. Metadata of a feature.",
+      "type": "object",
+      "properties": {
+        "enables": {
+          "description": "Features that this feature enables.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "doc": {
+          "description": "Documentation for the feature.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "enables"
+      ]
+    },
     "TomlTarget": {
       "type": "object",
       "properties": {
@@ -772,6 +808,10 @@
             "string",
             "null"
           ]
+        },
+        "builtin": {
+          "type": "boolean",
+          "const": true
         },
         "registry": {
           "type": [
@@ -1040,6 +1080,16 @@
     "Hints": {
       "type": "object",
       "properties": {
+        "min-opt-level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TomlValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mostly-unused": {
           "anyOf": [
             {
@@ -1053,7 +1103,7 @@
       }
     },
     "TomlTrust": {
-      "description": "Trust: the `[trust]` table. Verification level, budgets, and backend choice\nare properties of the project, so they live in the manifest the project\nalready has rather than in a second policy file the toolchain would have to\ndiscover separately (DESIGN_PHILOSOPHY.md §3).\n\nKeys stay snake_case: `targo trust` has shipped `timeout_ms`,\n`function_budget_ms`, `skip_functions`, `codegen_backend`, and\n`trust_profile` since before the table existed, and the surrounding\n`kebab-case` rename is cargo's convention for cargo's own keys.\n\n`deny_unknown_fields` is the point of typing this at all: a misspelled key\nis a policy the author believed they had set. It must stop the build, not\nbe dropped into the unused-key warning stream. This list is the same\nsurface `targo-trust`'s own loader accepts; the two must be changed together.",
+      "description": "Trust: the `[trust]` table. Verification level, budgets, and backend choice\nare properties of the project, so they live in the manifest the project\nalready has rather than in a second policy file the toolchain would have to\ndiscover separately (DESIGN_PHILOSOPHY.md §3).\n\nKeys stay snake_case: `targo trust` has shipped `skip_functions`,\n`codegen_backend`, and `trust_profile` since before the table existed, and\nthe surrounding `kebab-case` rename is cargo's convention for cargo's own\nkeys.\n\n`deny_unknown_fields` is the point of typing this at all: a misspelled key\nis a policy the author believed they had set. It must stop the build, not\nbe dropped into the unused-key warning stream. This list is the same\nsurface `targo-trust`'s own loader accepts (`known_config_keys` in\n`targo-trust/src/config.rs`); the two must be changed together. A retired\nkey, such as the old clock budgets `timeout_ms` and `function_budget_ms`,\nfails here as an unknown field, as it does there; one in\n[`TomlTrust::RETIRED_KEYS`] (`compiler_timeout_secs`) is refused naming\nits replacement, in both, by [`TomlTrustRetiredKeys`], which every policy\nread deserializes first.\n\nA manifest carries the table as written ([`TomlTrustTable`]); this type is\nwhat [`TomlTrustTable::policy`] reads it into, for a manifest whose table\nis policy.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1068,7 +1118,8 @@
             "null"
           ]
         },
-        "timeout_ms": {
+        "effort": {
+          "description": "The one solver-effort count's scale `k`, SAT conflicts per distinct\nquery term (plan §3.2a). Workspace-root only: a member's table that\nnames it is refused, by targo's `Workspace` and by `targo trust`, and a\nmember runs at the root's. `targo trust` validates the range.",
           "type": [
             "integer",
             "null"
@@ -1076,12 +1127,13 @@
           "format": "uint64",
           "minimum": 0
         },
-        "function_budget_ms": {
+        "backstop": {
+          "description": "The wall-clock backstop, per mille of the reference clocks (plan\n§3.6): the per-query and per-function clocks and, above 1000, the\nbounds of each verified compiler process, which `targo trust` derives\nfrom it. Workspace-root only, like `effort`.",
           "type": [
             "integer",
             "null"
           ],
-          "format": "uint64",
+          "format": "uint32",
           "minimum": 0
         },
         "skip_functions": {
@@ -1112,6 +1164,13 @@
           ]
         },
         "intent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "require_dep_evidence": {
+          "description": "What a dependency must ship as proof evidence: `none`, `present` or\n`verified`. `targo trust` validates the name.",
           "type": [
             "string",
             "null"
@@ -1497,7 +1556,7 @@
           "default": null
         },
         "trim-paths": {
-          "description": "Unstable feature `-Ztrim-paths`.",
+          "description": "Controls the scope of path sanitization in build outputs.",
           "anyOf": [
             {
               "$ref": "#/$defs/TomlTrimPaths"
@@ -1522,37 +1581,33 @@
       "type": "string"
     },
     "TomlDebugInfo": {
-      "type": "string",
+      "type": [
+        "string",
+        "integer",
+        "boolean"
+      ],
       "enum": [
-        "None",
-        "LineDirectivesOnly",
-        "LineTablesOnly",
-        "Limited",
-        "Full"
+        "none",
+        "line-directives-only",
+        "line-tables-only",
+        "limited",
+        "full",
+        0,
+        1,
+        2,
+        false,
+        true
       ]
     },
     "PackageIdSpec": {
       "type": "string"
     },
     "TomlTrimPaths": {
-      "anyOf": [
-        {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/TomlTrimPathsValue"
-          }
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "TomlTrimPathsValue": {
       "type": "string",
       "enum": [
-        "diagnostics",
-        "macro",
-        "object"
+        "none",
+        "object",
+        "all"
       ]
     }
   }

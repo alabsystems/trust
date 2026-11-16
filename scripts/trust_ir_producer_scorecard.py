@@ -21,8 +21,9 @@ parsed into per-body `reasons` and the `reason_tag_histogram` /
 be0ef04fdc baseline) those aggregates are simply empty.
 
 Honesty rules baked in:
-  * A file that fails to compile WITHOUT the flag is "excluded (does not compile
-    standalone)" and leaves the denominator entirely.
+  * Inputs and expected outcomes are fixed before compiling. Every file gets
+    metadata and codegen control/subject pairs; a control failure cannot change
+    the expected outcome or silently remove a file from the input census.
   * A file that compiles WITHOUT the flag but fails WITH it (today: the closure
     `item_name` ICE, crates/trust-thir-lower/src/lib.rs:728) is a PRODUCER FAILURE,
     reported first-class ("flag_induced_*" outcomes), never silently excluded.
@@ -36,24 +37,27 @@ Honesty rules baked in:
     population moves ~180-230 of the 2000 sampled files, which silently destroys
     comparability with every recorded sweep; that manifest replaces the hand-move
     procedure that used to be needed before each run. An eligible tests/ui/trust
-    file classified in NEITHER manifest section is a HARD ERROR, so the next slice
-    cannot forget. Audit it in ~1s without sweeping:
+    file listed in NEITHER manifest section is held out exactly as an [excluded]
+    entry is (2026-09-23): only [in-pool] admits a tests/ui/trust file, so a new
+    regression test can never reshuffle the sample and needs no registration.
+    Audit the manifest in ~1s without sweeping:
 
         python3 scripts/trust_ir_producer_scorecard.py --check-ui-pins
         python3 scripts/trust_ir_producer_scorecard.py --selftest-ui-pins
 
-Usage (defaults reproduce the 2026-07-01 baseline):
+Usage (the flags of the 2026-07-01 baseline, which also ran a closure-free
+variant of realcode.rs; that variant worked around a -Z trust-ir-lower ICE on
+closure bodies and was retired once closure bodies lowered cleanly):
   python3 scripts/trust_ir_producer_scorecard.py \
       --trustc build/aarch64-apple-darwin/stage1/bin/trustc \
       --out-dir reports/trust-ir-producer-baseline-2026-07-01 \
       --seed 20260701 --sample-size 2000 --jobs 8 \
-      --corpus realcode=reports/2026-06-29-honest-real-code-coverage/corpus/realcode.rs \
-      --corpus realcode_no_closure_bodies=reports/trust-ir-producer-baseline-2026-07-01/corpus-variant/realcode_no_closure_bodies.rs
+      --corpus realcode=scripts/realcode-coverage/corpus/realcode.rs
 
 Check the conjunctive corpus-local instrumented-row zero-residue gate on an existing artifact:
 
   python3 scripts/trust_ir_producer_scorecard.py \
-      --check-completion reports/trust-ir-producer-baseline-2026-07-01/wave-b0-subject-0831
+      --check-completion <sweep-dir>
 
 Author: Andrew Yates | Copyright 2026 | License: Apache-2.0 OR MIT
 """
@@ -63,6 +67,7 @@ import collections
 import concurrent.futures
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -74,6 +79,22 @@ import subprocess
 import sys
 import tempfile
 import threading
+
+_mono_parser_spec = importlib.util.spec_from_file_location(
+    "rust_instance_census", os.path.join(os.path.dirname(__file__), "rust_instance_census.py"))
+if _mono_parser_spec is None or _mono_parser_spec.loader is None:
+    raise ImportError("cannot load local rust_instance_census parser")
+rust_instance_census = importlib.util.module_from_spec(_mono_parser_spec)
+_mono_parser_spec.loader.exec_module(rust_instance_census)
+
+# Trust: preserve only the maintained caller's advertised original descriptors.
+# Native owners still authenticate them; this grants no scheduling/admission credit.
+_resource_transport_spec = importlib.util.spec_from_file_location(
+    "census_resource_transport", os.path.join(os.path.dirname(__file__), "lib/landing_targo.py"))
+if _resource_transport_spec is None or _resource_transport_spec.loader is None:
+    raise ImportError("cannot load local resource descriptor transport")
+_resource_transport = importlib.util.module_from_spec(_resource_transport_spec)
+_resource_transport_spec.loader.exec_module(_resource_transport)
 
 try:
     import resource
@@ -123,15 +144,46 @@ def guarded_compile(argv, cwd, env, timeout, poll=2.0):
     """`subprocess.run` replacement for a single corpus compile that CANNOT OOM the host or orphan a
     runaway. Runs the child in its own session, caps its total group RSS via a watchdog (the real cap
     on macOS, where RLIMIT_AS is unenforced) AND via RLIMIT_AS (the cap on Linux), and reaps the whole
-    group on timeout. Returns (returncode_or_None, stderr_bytes); None means timeout or OOM-kill."""
+    group on timeout. Returns (returncode_or_None, stderr_bytes); None also covers overflow."""
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         preexec_fn=_guard_preexec,
+        # Keep the direct compiler as watchdog group leader. A native serial
+        # owner, when used for sequential qualification, stays outside this group.
+        pass_fds=_resource_transport.resource_fds(env),
     )
     cap_kb = GUARD_MEM_CAP_BYTES // 1024
     oom_killed = threading.Event()
+    stderr_overflow = threading.Event()
+    stderr_read_error = threading.Event()
     stop = threading.Event()
+    chunks = []
+
+    def _capture_stderr():
+        size = 0
+        try:
+            while chunk := os.read(proc.stderr.fileno(), 64 * 1024):
+                remaining = MAX_STDERR_BYTES - size
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    chunks.append(kept)
+                    size += len(kept)
+                if len(chunk) > remaining and not stderr_overflow.is_set():
+                    stderr_overflow.set()
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+        except (OSError, ValueError):
+            stderr_read_error.set()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+    reader = threading.Thread(target=_capture_stderr, daemon=True)
+    reader.start()
 
     def _watchdog():
         # setsid made pgid == pid; poll the WHOLE group's RSS so a runaway trustc is killed BEFORE it
@@ -149,22 +201,37 @@ def guarded_compile(argv, cwd, env, timeout, poll=2.0):
     wd = threading.Thread(target=_watchdog, daemon=True)
     wd.start()
     try:
-        _, stderr = proc.communicate(timeout=timeout)
-        if oom_killed.is_set():
-            return None, b""  # RSS watchdog reaped it — treat as a failed compile
-        return proc.returncode, stderr
-    except subprocess.TimeoutExpired:
+        code = None
         try:
-            os.killpg(proc.pid, signal.SIGKILL)  # reap the whole group — no orphan
-        except (ProcessLookupError, OSError):
-            proc.kill()
-        try:
-            proc.communicate(timeout=10)
+            code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            pass
-        return None, b""
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        reader.join(timeout=10)
+        if reader.is_alive():
+            stderr_read_error.set()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            proc.stderr.close()
+            reader.join(timeout=1)
+        stderr = b"".join(chunks)
+        if stderr_overflow.is_set():
+            stderr = stderr[:MAX_STDERR_BYTES - len(STDERR_OVERFLOW_MARKER)] + STDERR_OVERFLOW_MARKER
+        if oom_killed.is_set() or stderr_overflow.is_set() or stderr_read_error.is_set():
+            code = None
+        return code, stderr
     finally:
         stop.set()
+        proc.stderr.close()
 
 # Exact-event filter: the two trust-ir-lower events live in module
 # rustc_mir_build::builder (builder/mod.rs); the noisy sub-modules are forced off.
@@ -258,6 +325,20 @@ CLASS_RE = re.compile(
     r"opaque=(?P<opaque>true|false), clean=(?P<clean>true|false)\s*$",
     re.MULTILINE,
 )
+# Trust (2026-10-01): the EFFECT-CONSERVATION verdict, one event per body the mainline lowering
+# recorded (`rustc_mir_build::trust_ir_crate_finalize`, target `rustc_mir_build::builder`). The
+# gate compares the body's trust-ir effects with rustc's built MIR and tags every value
+# abstraction (D28); `classes` is `+`-joined `not-conserved(<effect>)` / `abstracted(<lane>)`,
+# empty when conserved.
+#   trust-ir-lower: effect conservation, def=DefId(0:N ~ path), conserved=<bool>, clean=<bool>,
+#     spliced=<bool>, classes=<..>, equivalences={..}, detail=<n tag(s): ..>
+EFFCONS_RE = re.compile(
+    r"trust-ir-lower: effect conservation, "
+    r"def=DefId\([^~]*~\s*(?P<path>.+?)\), conserved=(?P<conserved>true|false), "
+    r"clean=(?P<clean>true|false), spliced=(?P<spliced>true|false), classes=(?P<classes>\S*), "
+    r"equivalences=\{(?P<equivalences>[^}]*)\}(?:, detail=(?P<detail>.*?))?\s*$",
+    re.MULTILINE,
+)
 # Trust (#181): the producer's SELF-VALIDATION tripwire. `validate_module` runs on the assembled
 # crate module and emits one event per error CLASS plus a total. This is the ONLY instrument that
 # answers "is the emitted module well-formed?" — the coverage ratchet answers "did the body lower
@@ -328,6 +409,20 @@ ROW1_UC_RE = re.compile(
 # that would have read as "the probe found nothing".
 DEFIDX_RE = re.compile(
     r'trust-ir-lower: differential, def=DefId\(\d+:(?P<index>\d+)\s*~\s*(?P<path>[^)]+)\)'
+)
+# Trust (attribution gap, 2026-08-20): the per-ERROR detail event, on its own message so it can
+# never be picked up as a class row by VALERR_RE above. The producer has emitted this since the
+# #197 follow-up (`crate_module.rs`, `tracing::debug!(detail = ?e, ...)`) and the scorecard threw
+# it away, so the artifact recorded that a module was ill-formed without recording WHICH struct,
+# enum or constant the validator objected to — the one fact attribution actually needs.
+#
+#   trust-ir-lower: module validation detail, detail=<Variant> { .. }
+#
+# The payload is a Rust `Debug` rendering containing commas and braces, so it is captured to end
+# of line rather than field-parsed. Absent (older binary) stays distinguishable from empty.
+VALDETAIL_RE = re.compile(
+    r"trust-ir-lower: module validation detail,\s*detail=(?P<detail>.+?)\s*$",
+    re.MULTILINE,
 )
 DIFF_RE = re.compile(
     r"trust-ir-lower: differential, "
@@ -428,9 +523,11 @@ def load_ui_pin_manifest(path=UI_PIN_MANIFEST):
 def audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool):
     """Cross-check the manifest against the tree. Returns (errors, notes).
 
-    The load-bearing check is the LAST one: an eligible tests/ui/trust file in
-    neither section would silently join the sampling population and reshuffle the
-    seeded sample, which is the defect this whole mechanism exists to prevent."""
+    An eligible tests/ui/trust file in neither section is NOT an error: the sampler
+    admits a file under that directory only when [in-pool] lists it, so an
+    unclassified file is held out exactly like an [excluded] one and the seeded
+    sample cannot move. (Until 2026-09-23 it was a hard error, which made every new
+    regression test a manifest edit and left this audit red for weeks.)"""
     errors, notes = [], []
     seen = {}
     for sect, paths in (("excluded", excluded), ("in-pool", in_pool)):
@@ -445,19 +542,6 @@ def audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool):
                     f"{p}: listed in [{sect}] but does not exist —"
                     f" delete the stale line from {os.path.relpath(UI_PIN_MANIFEST, repo)}"
                 )
-    pin_prefix = UI_PIN_DIR + os.sep
-    for p in eligible_rel:
-        if not p.startswith(pin_prefix):
-            continue
-        if p not in seen:
-            errors.append(
-                f"{p}: eligible for the ui sample but classified in NEITHER section of"
-                f" {os.path.relpath(UI_PIN_MANIFEST, repo)}. Admitting it would reshuffle the"
-                " seeded sample and make this sweep incomparable to every recorded one."
-                " Add it to [excluded] if it is a campaign pin minted after the baseline"
-                " (the default for a slice regression test), or to [in-pool] only if it is"
-                " genuinely part of the measured corpus."
-            )
     eligible_set = set(eligible_rel)
     for p in in_pool:
         if p not in eligible_set and os.path.isfile(os.path.join(repo, p)):
@@ -484,6 +568,44 @@ SEAM_BLOCKER_KINDS = ["extern", "unknown", "havoc", "ambiguous", "local-unlowere
 SEAM_BLOCKER_UNCLASSIFIED = "unclassified"
 
 _SEAM_BLOCKERS_RE = re.compile(r"\[blockers: ([^\]]+)\]")
+
+
+def effect_conservation_census(clean):
+    """The effect-conservation verdicts over lowered-clean bodies (see EFFCONS_RE)."""
+    measured = [b for b in clean if b.get("effect_conservation") is not None]
+    refused = [b for b in measured if not b["effect_conservation"]["conserved"]]
+    classes = collections.Counter(
+        c for b in refused for c in b["effect_conservation"]["classes"]
+    )
+    combos = collections.Counter(
+        "+".join(b["effect_conservation"]["classes"]) for b in refused
+    )
+    return {
+        "measured": len(measured),
+        "unmeasured": len(clean) - len(measured),
+        "conserved": len(measured) - len(refused),
+        "refused": len(refused),
+        "refused_spliced": sum(1 for b in refused if b["effect_conservation"]["spliced"]),
+        "refused_not_conserved": sum(
+            1 for b in refused
+            if any(c.startswith("not-conserved(") for c in b["effect_conservation"]["classes"])
+        ),
+        "refused_abstracted_only": sum(
+            1 for b in refused
+            if all(c.startswith("abstracted(") for c in b["effect_conservation"]["classes"])
+        ),
+        "refused_agreed": sum(1 for b in refused if b["mode"] == "Agreed"),
+        "refused_modelled": sum(
+            1 for b in refused
+            if b.get("symbolic") is False and b.get("opaque_collapse") is False
+        ),
+        "class_histogram": dict(classes.most_common()),
+        "combination_histogram": dict(combos.most_common(20)),
+        "not_conserved_defs": sorted(
+            b["def"] for b in refused
+            if any(c.startswith("not-conserved(") for c in b["effect_conservation"]["classes"])
+        )[:200],
+    }
 
 
 def parse_seam_blockers(note: str) -> dict:
@@ -778,6 +900,14 @@ def classify_note(mode: str, note: str, blockers=None) -> str:
     # that says whether the lane's ceiling is the gate or the evaluator.
     if "finalizer const resolution failed" in note:
         return "clean-skip-pending-const-unresolved"
+    # Trust (decision 2026-09-17(b)): the per-body refusal of a call edge to a Rust-ABI
+    # declaration the producer cannot sign. Its OWN class, and deliberately not folded into
+    # the pending-const row above: that row is "how often finalizer const evaluation does not
+    # deliver", and this population has nothing to do with const evaluation. Leaving it in
+    # `clean-skip-other` would make the coverage the owner traded for honest refusals
+    # invisible in the one instrument that reports it.
+    if "minting an unsignable Rust-ABI call edge" in note:
+        return "clean-skip-unsignable-rust-abi-edge"
     if "could not build sample argument" in note:
         return "clean-skip-sample-arg"
     # Wave-5 documented model split: producer-canonical first-class Ty::Enum vs the oracle's
@@ -809,7 +939,14 @@ def parse_validation(stderr: str):
     classes = {}
     for e in VALERR_RE.finditer(stderr):
         classes[e.group("class")] = classes.get(e.group("class"), 0) + int(e.group("n"))
-    return {"total": int(m.group("total")), "classes": classes}
+    out = {"total": int(m.group("total")), "classes": classes}
+    # Trust (attribution gap): the per-error Debug renderings, which name the ids and types. Only
+    # attached when the total is non-zero — a clean module would otherwise carry an empty list on
+    # every one of ~1800 rows for no information. `[]` on an invalid row is itself a finding: it
+    # means the binary emits the summary but not the detail event.
+    if out["total"]:
+        out["details"] = [d.group("detail") for d in VALDETAIL_RE.finditer(stderr)]
+    return out
 
 
 def parse_bodies(stderr: str):
@@ -843,6 +980,16 @@ def parse_bodies(stderr: str):
         # span-less tag; conflating it with "no detail recorded" would make the absent case
         # invisible in exactly the artifact built to make it visible.
         reason_details[m.group("path")].append(at if at else None)
+    effcons = {}
+    for m in EFFCONS_RE.finditer(stderr):
+        effcons.setdefault(m.group("path"), {
+            "conserved": m.group("conserved") == "true",
+            "clean": m.group("clean") == "true",
+            "spliced": m.group("spliced") == "true",
+            "classes": [c for c in m.group("classes").split("+") if c],
+            # The rendered tags (sites), capped: the census reads the classes, a reader the sites.
+            **({"detail": m.group("detail")[:400]} if m.group("detail") else {}),
+        })
     symbolic = {}
     opaque = {}
     for m in CLASS_RE.finditer(stderr):
@@ -934,6 +1081,9 @@ def parse_bodies(stderr: str):
             # None, NOT as False — "not measured" must stay distinguishable from "modelled".
             "symbolic": symbolic.get(p),
             "opaque_collapse": opaque.get(p),
+            # Trust (2026-10-01): the effect-conservation verdict. None = no event (an older
+            # compiler, or a body the mainline lowering did not record), never "conserved".
+            "effect_conservation": effcons.get(p),
             # Trust (2026-09-02): the DERIVED-MIR channel. Absent (None) means the producer
             # emitted no derived event for this body and must stay distinguishable from
             # `DerivedUnsupported`, which means it emitted one and refused — the same
@@ -976,21 +1126,347 @@ def parse_bodies(stderr: str):
     return list(bodies.values()), anomalies
 
 
-def run_one(trustc: str, src: str, edition: str, timeout: int, with_flag: bool, scratch: str):
-    """Compile one file; returns (exit_code_or_None_on_timeout, stderr)."""
+CENSUS_SCHEMA = "trust.rust.hir-body-census.v1"
+# Trust (2026-09-29): v2 adds compiler-independent identity to each body row
+# (crate_name, def_path_no_crate, source); rustc_interface trust_body_census.rs.
+# v1 stays accepted: retained artifacts were written by v1 compilers.
+CENSUS_SCHEMA_V2 = "trust.rust.hir-body-census.v2"
+CENSUS_SCHEMAS = (CENSUS_SCHEMA, CENSUS_SCHEMA_V2)
+CENSUS_V1_BODY_KEYS = frozenset({"def", "kind", "def_kind", "def_index", "def_path_hash"})
+CENSUS_V2_BODY_KEYS = CENSUS_V1_BODY_KEYS | {"crate_name", "def_path_no_crate", "source"}  # gitleaks:allow (field names, not a credential)
+
+
+def census_v2_identity_error(body):
+    """Why a v2 body row's identity fields are malformed, or None.
+
+    `def` is `def_path_debug_str`: `<crate>[<4 hex>]<def_path_no_crate>`, so the
+    two spellings must agree exactly.  `source` is all-null (disclosed as
+    unmeasured: not one local SHA-256-checksummed file) or fully measured.
+    """
+    crate, path, source = body["crate_name"], body["def_path_no_crate"], body["source"]
+    if not (isinstance(crate, str) and crate and "[" not in crate
+            and isinstance(path, str) and path.startswith("::")):
+        return "malformed v2 crate name or crate-free def path"
+    if not re.fullmatch(re.escape(crate) + r"\[[0-9a-f]{4}\]" + re.escape(path), body["def"]):
+        return "v2 def differs from crate name + crate-free def path"
+    if not isinstance(source, dict) or set(source) != {"file", "sha256", "lo", "hi"}:
+        return "malformed v2 source identity"
+    if all(source[key] is None for key in source):
+        return None
+    def position(value):
+        return (type(value) is list and len(value) == 2 and all(type(v) is int for v in value)
+                and value[0] >= 1 and value[1] >= 0)
+    if (not isinstance(source["file"], str) or not os.path.isabs(source["file"])
+            or not isinstance(source["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+            or not position(source["lo"]) or not position(source["hi"])
+            or source["lo"] > source["hi"]):
+        return "malformed or partially measured v2 source identity"
+    return None
+BODY_CENSUS_SOURCE = "independent-hir-and-typeck-generated-body-census/v1"
+INPUT_MANIFEST_SCHEMA = "trust.rust.measurement-input-manifest.v1"
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+STAGE_CLOSURE_SCHEMA = "trust.rust.compiler-stage-closure.v1"
+MAX_HIR_CENSUS_BYTES = 32 * 1024 * 1024
+MAX_STDERR_BYTES = 16 * 1024 * 1024
+STDERR_OVERFLOW_MARKER = b"\nscorecard: stderr capture exceeded limit\n"
+LOADER_OVERRIDE_VARS = (
+    "LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
+)
+
+
+def stage_closure_digest(closure):
+    payload = {key: value for key, value in closure.items() if key != "sha256"}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def compiler_stage_closure(trustc):
+    """Hash the stage executable and full adjacent lib tree, not just the driver binary."""
+    compiler = os.path.realpath(trustc)
+    if os.path.basename(os.path.dirname(compiler)) != "bin" or os.path.basename(compiler) != "trustc":
+        raise ValueError("compiler is not a stage bin/trustc")
+    stage_root = os.path.dirname(os.path.dirname(compiler))
+    lib_root = os.path.join(stage_root, "lib")
+    if not os.path.isdir(lib_root) or os.path.islink(lib_root):
+        raise ValueError("compiler stage lib directory is unavailable or symlinked")
+    files = []
+    for directory, subdirs, names in os.walk(lib_root, followlinks=False):
+        subdirs.sort()
+        if any(os.path.islink(os.path.join(directory, name)) for name in subdirs):
+            raise ValueError("compiler stage contains a symlinked lib directory")
+        for name in sorted(names):
+            path = os.path.join(directory, name)
+            resolved = os.path.realpath(path)
+            if os.path.commonpath((lib_root, resolved)) != lib_root or not os.path.isfile(path):
+                raise ValueError(f"compiler stage lib escapes closure: {path}")
+            files.append({"path": os.path.relpath(path, stage_root),
+                          "target": os.path.relpath(resolved, stage_root),
+                          "sha256": file_sha256(path)})
+    files.sort(key=lambda row: row["path"])
+    drivers = [row for row in files if os.path.basename(row["path"]).startswith("librustc_driver")
+               and row["path"].endswith((".dylib", ".so", ".dll"))]
+    if len(drivers) != 1:
+        raise ValueError("compiler stage needs exactly one identifiable rustc_driver library")
+    closure = {"schema": STAGE_CLOSURE_SCHEMA, "stage_root": stage_root,
+               "compiler": compiler, "compiler_sha256": file_sha256(compiler), "files": files}
+    closure["sha256"] = stage_closure_digest(closure)
+    return closure
+
+
+def capture_stage_closure(trustc):
+    try:
+        return compiler_stage_closure(trustc), []
+    except (OSError, ValueError) as error:
+        return None, [f"compiler stage closure unmeasured: {error}"]
+
+
+def validate_stage_closure(closure):
+    if (not isinstance(closure, dict)
+            or set(closure) != {"schema", "stage_root", "compiler", "compiler_sha256", "files", "sha256"}
+            or closure["schema"] != STAGE_CLOSURE_SCHEMA
+            or not isinstance(closure["stage_root"], str) or not os.path.isabs(closure["stage_root"])
+            or os.path.normpath(closure["stage_root"]) != closure["stage_root"]
+            or not isinstance(closure["compiler"], str)
+            or closure["compiler"] != os.path.join(closure["stage_root"], "bin", "trustc")
+            or not isinstance(closure["compiler_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", closure["compiler_sha256"])
+            or not isinstance(closure["files"], list) or not closure["files"]
+            or not isinstance(closure["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", closure["sha256"])):
+        raise ValueError("missing or malformed compiler stage closure")
+    paths = []
+    for row in closure["files"]:
+        if (not isinstance(row, dict) or set(row) != {"path", "target", "sha256"}
+                or not all(isinstance(row[key], str) for key in row)
+                or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])):
+            raise ValueError("malformed compiler stage library row")
+        for field in ("path", "target"):
+            value = row[field]
+            if (os.path.isabs(value) or os.path.normpath(value) != value
+                    or not value.startswith("lib" + os.sep) or "\x00" in value):
+                raise ValueError("compiler stage library path escapes lib tree")
+        paths.append(row["path"])
+    if paths != sorted(set(paths)):
+        raise ValueError("duplicate or unordered compiler stage libraries")
+    if any(row["target"] not in paths for row in closure["files"]):
+        raise ValueError("compiler stage symlink target omitted from closure")
+    drivers = [path for path in paths if os.path.basename(path).startswith("librustc_driver")
+               and path.endswith((".dylib", ".so", ".dll"))]
+    if len(drivers) != 1:
+        raise ValueError("compiler stage closure needs exactly one rustc_driver")
+    if closure["sha256"] != stage_closure_digest(closure):
+        raise ValueError("compiler stage closure digest mismatch")
+    return closure
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_json(raw):
+    def reject_constant(value):
+        raise ValueError(f"nonstandard JSON constant {value}")
+    try:
+        return json.loads(raw, object_pairs_hook=_unique_json_object,
+                          parse_constant=reject_constant)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds parser capacity") from error
+
+
+def parse_compiler_census(raw, *, input_path, lowering, exit_code,
+                          expected_crate_types=("Rlib",)):
+    """Validate actual compiler JSONL, retaining partial rows without crediting them.
+
+    HIR completeness is not instance/runtime completeness. A complete footer
+    attests analysis completion only; the separate process status must also pass.
+    Crate types are caller-authored expectations, never inferred from this census.
+    Existing rlib corpus callers keep their exact default contract.
+    """
+    result = {"status": "missing", "errors": [], "bodies": [], "sources": []}
+    known_crate_types = {"Executable", "Dylib", "Rlib", "StaticLib", "Cdylib", "ProcMacro", "Sdylib"}
+    if (type(expected_crate_types) not in (tuple, list) or not expected_crate_types
+            or not all(type(kind) is str and kind in known_crate_types
+                       for kind in expected_crate_types)
+            or len(set(expected_crate_types)) != len(expected_crate_types)):
+        result.update(status="malformed", errors=["expected crate types must be a nonempty unique list of compiler crate types"])
+        return result
+    if not (exit_code is None or type(exit_code) is int):
+        result.update(status="malformed", errors=["compiler exit status must be integer or null"])
+        return result
+    if raw is None or raw == "":
+        result["errors"].append("compiler census missing")
+        return result
+    if not isinstance(raw, str):
+        result.update(status="malformed", errors=["compiler census must be UTF-8 JSONL text"])
+        return result
+    try:
+        if len(raw) > MAX_HIR_CENSUS_BYTES or len(raw.encode("utf-8")) > MAX_HIR_CENSUS_BYTES:
+            raise ValueError("compiler census exceeds bounded capture limit")
+        if not raw.endswith("\n"):
+            raise ValueError("census is truncated or has an unexpected record count")
+        # JSONL separates on LF, not on every Unicode line separator that may
+        # legitimately occur inside a source filename or JSON string.
+        lines = [line + "\n" for line in raw[:-1].split("\n")]
+        if not 1 <= len(lines) <= 3:
+            raise ValueError("census is truncated or has an unexpected record count")
+        records = [_strict_json(line) for line in lines]
+        if (any(not isinstance(record, dict) or record.get("schema") not in CENSUS_SCHEMAS
+                for record in records)
+                or len({record["schema"] for record in records}) != 1):
+            raise ValueError("malformed compiler census schema")
+        schema = records[0]["schema"]
+        result["schema"] = schema
+        header = records[0]
+        if (set(header) != {"schema", "event", "input", "compiler_version", "target", "edition", "crate_types",
+                           "direct_lowering", "verification_enabled", "scope", "generated_scope", "reachable_instances"}
+                or header["event"] != "begin" or header["input"] != input_path
+                or header["direct_lowering"] is not lowering
+                or header["verification_enabled"] is not False
+                or header["scope"] != "local-hir-body-owners-after-typeck"
+                or header["generated_scope"] != "local-typeck-synthetic-coroutine-bodies"
+                or header["reachable_instances"] != "unmeasured"
+                or header["edition"] not in {"2015", "2018", "2021", "2024"}
+                or header["crate_types"] != list(expected_crate_types)
+                or not all(isinstance(header[key], str) and header[key]
+                           for key in ("compiler_version", "target"))):
+            raise ValueError("census begin does not bind this input and compiler lane")
+        result["header"] = header
+        if len(records) >= 2:
+            snapshot = records[1]
+            if (set(snapshot) != {"schema", "event", "body_count", "bodies", "generated_body_count", "generated_bodies", "sources"}
+                    or snapshot["event"] != "hir_snapshot"
+                    or not isinstance(snapshot["bodies"], list)
+                    or type(snapshot["body_count"]) is not int
+                    or snapshot["body_count"] != len(snapshot["bodies"])
+                    or not isinstance(snapshot["generated_bodies"], list)
+                    or type(snapshot["generated_body_count"]) is not int
+                    or snapshot["generated_body_count"] != len(snapshot["generated_bodies"])):
+                raise ValueError("malformed HIR snapshot/count")
+            identities, indices, paths = set(), set(), set()
+            for body in snapshot["bodies"] + snapshot["generated_bodies"]:
+                if (not isinstance(body, dict)
+                        or set(body) != (CENSUS_V2_BODY_KEYS if schema == CENSUS_SCHEMA_V2
+                                         else CENSUS_V1_BODY_KEYS)
+                        or not all(isinstance(body.get(key), str) and body[key]
+                                   for key in ("def", "kind", "def_kind", "def_path_hash"))
+                        or type(body["def_index"]) is not int or body["def_index"] < 0
+                        or body["kind"] != body_kind(body["def"])):
+                    raise ValueError("malformed HIR body identity/class")
+                if body["def_kind"].split(" ", 1)[0] not in {
+                        "Fn", "AssocFn", "Closure", "Const", "AssocConst", "AnonConst",
+                        "InlineConst", "Static", "SyntheticCoroutineBody"}:
+                    raise ValueError(f"unknown HIR body class: {body['def_kind']}")
+                if schema == CENSUS_SCHEMA_V2 and (error := census_v2_identity_error(body)):
+                    raise ValueError(error)
+                if (body["def_path_hash"] in identities or body["def_index"] in indices
+                        or body["def"] in paths):
+                    raise ValueError("duplicate HIR body identity")
+                identities.add(body["def_path_hash"])
+                indices.add(body["def_index"])
+                paths.add(body["def"])
+            if (any(body["def_kind"] != "SyntheticCoroutineBody" for body in snapshot["generated_bodies"])
+                    or any(body["def_kind"] == "SyntheticCoroutineBody" for body in snapshot["bodies"])):
+                raise ValueError("HIR and typeck-generated body classes are not correctly partitioned")
+            result["bodies"] = snapshot["bodies"] + snapshot["generated_bodies"]
+            result["generated_bodies"] = snapshot["generated_bodies"]
+            result["snapshot_sources"] = snapshot["sources"]
+            result["sources"] = snapshot["sources"]
+        if len(records) != 3:
+            result["status"] = "incomplete"
+            result["errors"].append("compiler census missing complete footer")
+            return result
+        footer = records[2]
+        if (set(footer) != {"schema", "event", "status", "body_count", "generated_body_count", "snapshot_sha256", "sources", "other_inputs"}
+                or footer["event"] != "complete" or footer["status"] != "complete"
+                or type(footer["body_count"]) is not int
+                or footer["body_count"] != snapshot["body_count"]
+                or type(footer["generated_body_count"]) is not int
+                or footer["generated_body_count"] != snapshot["generated_body_count"]
+                or footer["snapshot_sha256"] != hashlib.sha256(lines[1].encode("utf-8")).hexdigest()):
+            raise ValueError("census complete footer/count/digest mismatch")
+        for source_rows in (result["sources"], footer["sources"]):
+            if not isinstance(source_rows, list):
+                raise ValueError("malformed loaded-source list")
+            source_paths = set()
+            for source in source_rows:
+                if (not isinstance(source, dict) or set(source) != {"file", "sha256"}
+                        or not isinstance(source["file"], str) or not source["file"]
+                        or not isinstance(source["sha256"], str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+                        or source["file"] in source_paths):
+                    raise ValueError("malformed or duplicate loaded-source hash")
+                source_paths.add(source["file"])
+        later_sources = {source["file"]: source["sha256"] for source in footer["sources"]}
+        if any(later_sources.get(source["file"]) != source["sha256"]
+               for source in result["sources"]):
+            raise ValueError("loaded sources changed between HIR snapshot and footer")
+        if input_path not in later_sources:
+            raise ValueError("compiler census omitted its root input hash")
+        result["sources"] = footer["sources"]
+        other = footer["other_inputs"]
+        if (not isinstance(other, dict)
+                or set(other) != {"tracked_files", "environment_variables", "proc_macro_io", "build_environment", "external_dependency_closure"}
+                or any(other[key] != "unmeasured" for key in ("proc_macro_io", "build_environment", "external_dependency_closure"))
+                or any(not isinstance(other[key], list)
+                       or not all(isinstance(value, str) and value for value in other[key])
+                       or len(other[key]) != len(set(other[key]))
+                       for key in ("tracked_files", "environment_variables"))):
+            raise ValueError("malformed non-source input disclosure")
+        result["other_inputs"] = other
+        result["status"] = "complete" if exit_code == 0 else "compiler_failed"
+        if exit_code != 0:
+            result["errors"].append("compiler did not exit successfully after census")
+        if other["tracked_files"] or other["environment_variables"]:
+            result["status"] = "input_closure_incomplete"
+            result["errors"].append("consumption-time hashes are unmeasured for tracked files/environment: "
+                                    + repr(other["tracked_files"] + other["environment_variables"]))
+    except (ValueError, TypeError, KeyError, UnicodeError) as error:
+        result["status"] = "malformed"
+        result["errors"].append(str(error))
+    return result
+
+
+def run_one(trustc: str, src: str, edition: str, timeout: int, with_flag: bool, scratch: str,
+            *, codegen: bool = False):
+    """Compile one file, preserving diagnostics and any census bytes on failure."""
+    trustc = os.path.realpath(trustc)
     tmpdir = tempfile.mkdtemp(dir=scratch)
     env = dict(os.environ)
+    for name in LOADER_OVERRIDE_VARS:
+        env.pop(name, None)
     env["RUSTC_LOG"] = RUSTC_LOG_FILTER
     env["RUST_BACKTRACE"] = "0"
     env["RUSTC_ICE"] = "0"
-    argv = [trustc]
-    if with_flag:
-        argv += ["-Z", "trust-ir-lower"]
+    census_path = os.path.join(tmpdir, "hir-census.jsonl")
+    mono_path = os.path.join(tmpdir, "mono-census.jsonl")
+    argv = [trustc, "-Z", "trust-ir-lower=" + ("on" if with_flag else "off")]
     argv += [
         "-Z", "trust-verify=off",  # producer-only measurement; hook is independent
+        "-Z", "checksum-hash-algorithm=sha256",
+        "-Z", "trust-body-census=" + census_path,
+    ]
+    if codegen:
+        argv += ["-Z", "trust-instance-census=" + mono_path]
+    argv += [
         "--edition", edition,
         "--crate-type", "lib",
-        "--emit=metadata",
+        "--emit=link" if codegen else "--emit=metadata",
         "--out-dir", tmpdir,
         "--cap-lints", "allow",
         src,
@@ -998,19 +1474,88 @@ def run_one(trustc: str, src: str, edition: str, timeout: int, with_flag: bool, 
     try:
         # Trust: memory-capped, session-group-reaped compile (see `guarded_compile`) so a
         # trait-solver-overflow torture body can neither OOM the host nor orphan a runaway trustc.
-        code, stderr = guarded_compile(argv, tmpdir, env, timeout)
-        if code is None:
-            return None, ""
-        return code, stderr.decode("utf-8", errors="replace")
+        error = None
+        try:
+            compiler_before = file_sha256(trustc)
+        except OSError:
+            compiler_before = None
+        try:
+            code, stderr = guarded_compile(argv, tmpdir, env, timeout)
+        except OSError as exception:
+            code, stderr, error = None, b"", str(exception)
+        try:
+            compiler_after = file_sha256(trustc)
+        except OSError:
+            compiler_after = None
+        if len(stderr) > MAX_STDERR_BYTES:
+            code = None
+            stderr = stderr[:MAX_STDERR_BYTES - len(STDERR_OVERFLOW_MARKER)] + STDERR_OVERFLOW_MARKER
+        if stderr.endswith(STDERR_OVERFLOW_MARKER):
+            code = None
+            error = "stderr capture exceeded bounded limit"
+        try:
+            with open(census_path, "rb") as census_file:
+                census_bytes = census_file.read(MAX_HIR_CENSUS_BYTES + 1)
+            if len(census_bytes) > MAX_HIR_CENSUS_BYTES:
+                raise ValueError("HIR census exceeds bounded capture limit")
+            census_raw = census_bytes.decode("utf-8")
+        except FileNotFoundError:
+            census_raw = None
+        except (OSError, UnicodeError, ValueError) as exception:
+            census_raw = None
+            error = "; ".join(filter(None, (error, f"cannot read compiler census: {exception}")))
+        result = {
+            "exit_code": code,
+            "stderr": stderr.decode("utf-8", errors="replace"),
+            "error": error,
+            "argv": argv,
+            "input": src,
+            "census_raw": census_raw,
+            "compiler_sha256_before": compiler_before,
+            "compiler_sha256_after": compiler_after,
+        }
+        if codegen:
+            try:
+                with open(mono_path, "rb") as census_file:
+                    result["mono_raw"] = census_file.read(rust_instance_census.MAX_BYTES + 1).decode("utf-8")
+            except FileNotFoundError:
+                result["mono_raw"] = None
+            except (OSError, UnicodeError) as exception:
+                result["mono_raw"] = None
+                result["error"] = "; ".join(filter(None, (result["error"],
+                    f"cannot read mono census: {exception}")))
+        return result
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def measure_file(trustc: str, src: str, edition: str, timeout: int, scratch: str):
-    """Full outcome for one source file (control-run on failure)."""
-    code, stderr = run_one(trustc, src, edition, timeout, True, scratch)
-    if code == 0:
+    """Both compiler lanes and both flag modes for every predeclared input."""
+    control = run_one(trustc, src, edition, timeout, False, scratch)
+    subject = run_one(trustc, src, edition, timeout, True, scratch)
+    codegen_control = run_one(trustc, src, edition, timeout, False, scratch, codegen=True)
+    codegen_subject = run_one(trustc, src, edition, timeout, True, scratch, codegen=True)
+    code, stderr, ctl_code = subject["exit_code"], subject["stderr"], control["exit_code"]
+    measurement = {"control": control, "subject": subject,
+                   "codegen_control": codegen_control, "codegen_subject": codegen_subject}
+    if code == 0 and ctl_code == 0:
         bodies, anomalies = parse_bodies(stderr)
+        cg_ctl, cg_sub = codegen_control["exit_code"], codegen_subject["exit_code"]
+        if cg_ctl != 0 or cg_sub != 0:
+            if cg_ctl == 0:
+                cg_stderr = codegen_subject["stderr"]
+                ice = cg_sub == 101 or "internal compiler error" in cg_stderr
+                outcome = ("flag_induced_codegen_timeout" if cg_sub is None else
+                           "flag_induced_codegen_ice" if ice else "flag_induced_codegen_fail")
+                signature = re.search(r"internal compiler error: [^\n]*", cg_stderr)
+                return {"file": src, "outcome": outcome, "bodies": [],
+                        "partial_bodies": bodies, "anomalies": anomalies,
+                        "ice_signature": signature.group(0)[:200] if signature else "",
+                        "measurement": measurement}
+            outcome = ("codegen_timeout" if cg_ctl is None or cg_sub is None else
+                       "codegen_control_fail" if cg_sub == 0 else "codegen_compile_fail")
+            return {"file": src, "outcome": outcome, "bodies": [],
+                    "measurement": measurement}
         return {
             "file": src,
             "outcome": "ok",
@@ -1021,12 +1566,11 @@ def measure_file(trustc: str, src: str, edition: str, timeout: int, scratch: str
             # and must stay distinguishable from a measured zero, exactly as the body-class
             # `symbolic` field does.
             "validation": parse_validation(stderr),
+            "measurement": measurement,
         }
     if code is None:
-        return {"file": src, "outcome": "timeout", "bodies": []}
+        return {"file": src, "outcome": "timeout", "bodies": [], "measurement": measurement}
     ice = code == 101 or "internal compiler error" in stderr
-    # Control: does it compile standalone WITHOUT the producer flag?
-    ctl_code, _ = run_one(trustc, src, edition, timeout, False, scratch)
     if ctl_code == 0:
         partial, anomalies = parse_bodies(stderr)
         outcome = "flag_induced_ice" if ice else "flag_induced_fail"
@@ -1044,10 +1588,369 @@ def measure_file(trustc: str, src: str, edition: str, timeout: int, scratch: str
         return {
             "file": src, "outcome": outcome, "ice_signature": sig,
             "partial_bodies": partial, "bodies": [], "anomalies": anomalies,
+            "measurement": measurement,
         }
     if ctl_code is None:
-        return {"file": src, "outcome": "timeout_control", "bodies": []}
-    return {"file": src, "outcome": "compile_fail", "bodies": []}
+        return {"file": src, "outcome": "timeout_control", "bodies": [], "measurement": measurement}
+    return {"file": src, "outcome": "control_fail" if code == 0 else "compile_fail",
+            "bodies": [], "measurement": measurement}
+
+
+def prepare_input_manifest(corpora, repo, extra_sources=()):
+    """Snapshot before ANY compiler run. Defaults admit every selected root as ok.
+
+    Explicit expected compile failures must be supplied by an existing manifest;
+    compilation results never edit this inventory. Extra sources are explicit
+    because guessing imports from producer success would not be independent.
+    """
+    manifest = {"schema": INPUT_MANIFEST_SCHEMA, "corpora": {}}
+    for name, files, _meta in corpora:
+        if not name or name in manifest["corpora"]:
+            raise ValueError(f"empty or duplicate corpus name: {name!r}")
+        if not files or len(files) != len(set(files)):
+            raise ValueError(f"corpus {name!r} has no inputs or duplicate inputs")
+        source_paths = sorted(set(files) | {os.path.abspath(path) for path in extra_sources})
+        sources = [{"file": os.path.relpath(path, repo), "sha256": file_sha256(path)}
+                   for path in source_paths]
+        hashes = {source["file"]: source["sha256"] for source in sources}
+        manifest["corpora"][name] = {
+            "files": [{"file": os.path.relpath(path, repo),
+                       "sha256": hashes[os.path.relpath(path, repo)], "expected_outcome": "ok"}
+                      for path in sorted(files)],
+            "sources": sources,
+        }
+    return manifest
+
+
+def validate_input_manifest(manifest):
+    if (not isinstance(manifest, dict) or set(manifest) != {"schema", "corpora"}
+            or manifest["schema"] != INPUT_MANIFEST_SCHEMA
+            or not isinstance(manifest["corpora"], dict) or not manifest["corpora"]):
+        raise ValueError("malformed precompile input manifest")
+    for name, corpus in manifest["corpora"].items():
+        if (not isinstance(name, str) or not name or not isinstance(corpus, dict)
+                or set(corpus) != {"files", "sources"}
+                or not isinstance(corpus["files"], list) or not corpus["files"]
+                or not isinstance(corpus["sources"], list)):
+            raise ValueError(f"malformed precompile corpus: {name!r}")
+        for table in ("files", "sources"):
+            seen = set()
+            fields = {"file", "sha256", "expected_outcome"} if table == "files" else {"file", "sha256"}
+            for row in corpus[table]:
+                if (not isinstance(row, dict) or set(row) != fields
+                        or not isinstance(row["file"], str) or not row["file"]
+                        or os.path.isabs(row["file"]) or os.path.normpath(row["file"]) != row["file"]
+                        or not isinstance(row["sha256"], str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
+                        or row["file"] in seen
+                        or (table == "files" and row["expected_outcome"] not in {"ok", "compile_fail"})):
+                    raise ValueError(f"malformed or duplicate {name}.{table} row")
+                seen.add(row["file"])
+        hashes = {row["file"]: row["sha256"] for row in corpus["sources"]}
+        if any(hashes.get(row["file"]) != row["sha256"] for row in corpus["files"]):
+            raise ValueError(f"{name}: input roots must be in the source manifest with identical hashes")
+    return manifest
+
+
+def current_source_errors(sources, repo):
+    errors = []
+    for source in sources:
+        try:
+            digest = file_sha256(os.path.join(repo, source["file"]))
+        except OSError as error:
+            errors.append(f"input unavailable: {source['file']}: {error}")
+        else:
+            if digest != source["sha256"]:
+                errors.append(f"precompile source hash mismatch: {source['file']}")
+    return errors
+
+
+def _census_argv_ok(argv, path, edition, lowering, codegen):
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return False
+    expected_len = 21 if codegen else 19
+    if len(argv) != expected_len or not argv[0]:
+        return False
+    if argv[1:8] != ["-Z", "trust-ir-lower=" + ("on" if lowering else "off"),
+                      "-Z", "trust-verify=off", "-Z", "checksum-hash-algorithm=sha256", "-Z"]:
+        return False
+    if not argv[8].startswith("trust-body-census=") or not argv[8].split("=", 1)[1]:
+        return False
+    offset = 2 if codegen else 0
+    if codegen and (argv[9] != "-Z" or not argv[10].startswith("trust-instance-census=")
+                    or not argv[10].split("=", 1)[1] or argv[8].split("=", 1)[1] == argv[10].split("=", 1)[1]):
+        return False
+    return (argv[9 + offset:15 + offset] ==
+            ["--edition", edition, "--crate-type", "lib",
+             "--emit=link" if codegen else "--emit=metadata", "--out-dir"]
+            and bool(argv[15 + offset])
+            and argv[16 + offset:] == ["--cap-lints", "allow", path])
+
+
+def reconcile_compiler_censuses(corpus):
+    """Recompute census status from retained compiler bytes, never authored totals."""
+    errors, bodies, states = [], [], []
+    mono_unrepresented = collections.Counter()
+    mono_item_count = 0
+    mono_matched_count = 0
+    observed_codegen_files = 0
+    residual = {"whole_program_complete": False, "g1_g3_status": "red",
+                "unmeasured": list(rust_instance_census.UNMEASURED_V2),
+                "reachable_instances": "unmeasured", "runtime_roots": "unmeasured",
+                "external_dependency_closure": "unmeasured", "proc_macro_io": "unmeasured",
+                "build_environment": "unmeasured"}
+    evidence = corpus.get("census_evidence")
+    if not isinstance(evidence, dict) or evidence.get("schema") != "trust.rust.producer-census-evidence.v2":
+        return {"status": "unverified", "errors": ["missing compiler census evidence"],
+                "bodies": [], "files": [], "mono_item_count": None,
+                "mono_matched_count": None, "mono_unrepresented": {}, **residual}
+    try:
+        if set(evidence) != {"schema", "repo", "input_manifest", "target", "edition", "compiler_sha256_before",
+                             "compiler_sha256_after", "stage_closure_before", "stage_closure_after",
+                             "precompile_errors", "postcompile_errors"}:
+            raise ValueError("malformed compiler census evidence fields")
+        repo = evidence["repo"]
+        if not isinstance(repo, str) or not os.path.isabs(repo):
+            raise ValueError("census evidence requires an absolute repository identity")
+        manifest = validate_input_manifest(evidence["input_manifest"])
+        if set(manifest["corpora"]) != {"corpus"}:
+            raise ValueError("per-corpus evidence must contain exactly its corpus manifest")
+        inputs = manifest["corpora"]["corpus"]
+        before, after = evidence["compiler_sha256_before"], evidence["compiler_sha256_after"]
+        if (not isinstance(before, str) or not re.fullmatch(r"[0-9a-f]{64}", before)
+                or before != after):
+            raise ValueError("compiler executable identity missing or changed during measurement")
+        stage_closure = None
+        try:
+            before_closure = validate_stage_closure(evidence["stage_closure_before"])
+            after_closure = validate_stage_closure(evidence["stage_closure_after"])
+            if before_closure != after_closure:
+                errors.append("compiler stage driver/library closure changed during measurement")
+            elif before_closure["compiler_sha256"] != before:
+                errors.append("compiler executable differs from stage closure")
+            else:
+                stage_closure = before_closure
+        except ValueError as error:
+            errors.append(str(error))
+        if (not isinstance(evidence["target"], str) or not evidence["target"]
+                or evidence["edition"] not in {"2015", "2018", "2021", "2024"}):
+            raise ValueError("missing compiler target or measurement edition")
+        for field in ("precompile_errors", "postcompile_errors"):
+            if not isinstance(evidence[field], list) or not all(isinstance(e, str) for e in evidence[field]):
+                raise ValueError(f"malformed {field}")
+            errors.extend(evidence[field])
+        expected_input = {"schema": "trust.trust-ir.producer-input-census.v1",
+                          "source": "precompile-content-manifest/v1", "files": inputs["files"]}
+        if corpus.get("input_census") != expected_input:
+            raise ValueError("input census differs from retained precompile manifest")
+        files = corpus.get("files")
+        if not isinstance(files, list):
+            raise ValueError("missing measured input results")
+        expected = {row["file"]: row["expected_outcome"] for row in inputs["files"]}
+        if (not all(isinstance(row, dict) and isinstance(row.get("file"), str) for row in files)
+                or sorted(row["file"] for row in files) != sorted(expected)):
+            raise ValueError("measured file population differs from precompile manifest")
+        source_hashes = {os.path.abspath(os.path.join(repo, row["file"])): row["sha256"]
+                         for row in inputs["sources"]}
+        for row in files:
+            path = os.path.abspath(os.path.join(repo, row["file"]))
+            measurement = row.get("measurement")
+            if not isinstance(measurement, dict) or set(measurement) != {
+                    "control", "subject", "codegen_control", "codegen_subject"}:
+                errors.append(f"{row['file']}: missing metadata or codegen control/subject compiler run")
+                continue
+            completed_censuses = {}
+            completed_mono = {}
+            compiler_versions = {}
+            for role, lowering, codegen in (("control", False, False), ("subject", True, False),
+                                            ("codegen_control", False, True),
+                                            ("codegen_subject", True, True)):
+                run = measurement[role]
+                fields = {"exit_code", "stderr", "error", "argv", "input", "census_raw",
+                          "compiler_sha256_before", "compiler_sha256_after"}
+                if codegen:
+                    fields.add("mono_raw")
+                if (not isinstance(run, dict) or set(run) != fields
+                        or run["input"] != path
+                        or not (run["exit_code"] is None or type(run["exit_code"]) is int)
+                        or not isinstance(run["argv"], list)
+                        or not all(isinstance(arg, str) for arg in run["argv"])
+                        or not isinstance(run["stderr"], str)
+                        or len(run["stderr"]) > MAX_STDERR_BYTES
+                        or len(run["stderr"].encode("utf-8")) > MAX_STDERR_BYTES
+                        or not (run["census_raw"] is None or isinstance(run["census_raw"], str))
+                        or (codegen and not (run["mono_raw"] is None or isinstance(run["mono_raw"], str)))
+                        or not (run["error"] is None or isinstance(run["error"], str))):
+                    errors.append(f"{row['file']}: malformed {role} compiler run")
+                    continue
+                argv = run["argv"]
+                if not _census_argv_ok(argv, path, evidence["edition"], lowering, codegen):
+                    errors.append(f"{row['file']}: {role} argv does not describe its census lane")
+                if stage_closure is None or not argv or argv[0] != stage_closure["compiler"]:
+                    errors.append(f"{row['file']}: {role} compiler is not bound to the stage closure")
+                if (run["compiler_sha256_before"] != before
+                        or run["compiler_sha256_after"] != before):
+                    errors.append(f"{row['file']}: {role} compiler executable changed or unmeasured around compiler run")
+                if expected[row["file"]] == "compile_fail" and run["exit_code"] == 0:
+                    errors.append(f"{row['file']}: predeclared compile-failure {role} run succeeded")
+                census = parse_compiler_census(run["census_raw"], input_path=path,
+                                               lowering=lowering, exit_code=run["exit_code"])
+                if "header" in census:
+                    compiler_versions[role] = census["header"]["compiler_version"]
+                    for field in ("target", "edition"):
+                        if census["header"][field] != evidence[field]:
+                            errors.append(f"{row['file']}: {role} compiler {field} differs from the pinned measurement")
+                state = {"file": row["file"], "role": role, "status": census["status"]}
+                states.append(state)
+                expected_failure = (expected[row["file"]] == "compile_fail"
+                                    and type(run["exit_code"]) is int and run["exit_code"] == 1
+                                    and census["status"] in {"incomplete", "compiler_failed"}
+                                    and "header" in census and run["error"] is None)
+                if expected_failure:
+                    state["status"] = "expected_compile_failure"
+                else:
+                    errors.extend(f"{row['file']} {role}: {error}" for error in census["errors"])
+                if run["error"]:
+                    errors.append(f"{row['file']} {role}: {run['error']}")
+                if census["status"] == "complete":
+                    completed_censuses[role] = census
+                    for source in census["sources"]:
+                        if source_hashes.get(source["file"]) != source["sha256"]:
+                            errors.append(f"{row['file']} {role}: loaded source absent or changed from "
+                                          f"precompile manifest: {source['file']} (declare auxiliary inputs with --input-source)")
+                    if role == "control" and expected[row["file"]] == "ok":
+                        bodies.extend({"file": row["file"], "def": body["def"], "kind": body["kind"]}
+                                      for body in census["bodies"])
+                if codegen:
+                    mono = rust_instance_census.parse_census(
+                        run["mono_raw"].encode("utf-8") if run["mono_raw"] is not None else None,
+                        input_path=path, exit_code=run["exit_code"], lowering=lowering)
+                    states.append({"file": row["file"], "role": role + "_mono",
+                                   "status": "expected_compile_failure" if expected_failure else mono["status"]})
+                    if not expected_failure:
+                        errors.extend(f"{row['file']} {role} mono: {error}" for error in mono["errors"])
+                    if mono["status"] == "collector_observed":
+                        completed_mono[role] = mono
+                        header = mono["header"]
+                        if (header["schema"] != rust_instance_census.SCHEMA_V3
+                                or header["codegen_requested"] is not True
+                                or header["incremental"] is not False
+                                or header["collection_strategy"] != "lazy"):
+                            errors.append(f"{row['file']} {role}: mono collector lane is not bounded codegen v3")
+                        for field in ("target", "edition", "compiler_version"):
+                            expected_value = (evidence[field] if field != "compiler_version"
+                                              else census.get("header", {}).get(field))
+                            if header[field] != expected_value:
+                                errors.append(f"{row['file']} {role}: mono {field} differs from HIR/measurement")
+                        for source, digest in mono["sources"].items():
+                            if source_hashes.get(source) != digest.removeprefix("sha256="):
+                                errors.append(f"{row['file']} {role}: mono loaded source absent or changed from "
+                                              f"precompile manifest: {source}")
+                        if census["status"] == "complete":
+                            hir_sources = {source["file"]: source["sha256"] for source in census["sources"]}
+                            mono_sources = {source: digest.removeprefix("sha256=")
+                                            for source, digest in mono["sources"].items()}
+                            if hir_sources != mono_sources:
+                                errors.append(f"{row['file']} {role}: codegen HIR/mono loaded sources differ")
+            if len(compiler_versions) != 4:
+                errors.append(f"{row['file']}: compiler version missing from one or more runs")
+            elif len(set(compiler_versions.values())) != 1:
+                errors.append(f"{row['file']}: compiler versions differ across metadata/codegen runs")
+            if all(role in completed_censuses for role in ("control", "subject")):
+                control, subject = completed_censuses["control"], completed_censuses["subject"]
+                if control["bodies"] != subject["bodies"]:
+                    errors.append(f"{row['file']}: subject HIR census differs from lowering-disabled control")
+                for field in ("compiler_version", "target"):
+                    if control["header"][field] != subject["header"][field]:
+                        errors.append(f"{row['file']}: control/subject {field} differs")
+            available = [(role, completed_censuses[role]) for role in (
+                "control", "subject", "codegen_control", "codegen_subject")
+                if role in completed_censuses]
+            for source_field in ("snapshot_sources", "sources"):
+                if available:
+                    first_role, first = available[0]
+                    baseline = {source["file"]: source["sha256"] for source in first[source_field]}
+                    for role, census in available[1:]:
+                        observed_sources = {source["file"]: source["sha256"]
+                                            for source in census[source_field]}
+                        if observed_sources != baseline:
+                            errors.append(f"{row['file']}: {role} HIR {source_field} differs from {first_role}")
+            subject_run = measurement["subject"]
+            if (isinstance(subject_run, dict) and isinstance(subject_run.get("stderr"), str)
+                    and len(subject_run["stderr"]) <= MAX_STDERR_BYTES
+                    and len(subject_run["stderr"].encode("utf-8")) <= MAX_STDERR_BYTES):
+                parsed_bodies, parsed_anomalies = parse_bodies(subject_run["stderr"])
+                if row.get("outcome") == "ok":
+                    if row.get("bodies") != parsed_bodies:
+                        errors.append(f"{row['file']}: producer body rows differ from saved subject stderr")
+                    if row.get("anomalies") != parsed_anomalies:
+                        errors.append(f"{row['file']}: producer anomalies differ from saved subject stderr")
+                    if row.get("validation") != parse_validation(subject_run["stderr"]):
+                        errors.append(f"{row['file']}: producer validation differs from saved subject stderr")
+                elif isinstance(row.get("outcome"), str) and row["outcome"].startswith("flag_induced_"):
+                    if row.get("partial_bodies") != parsed_bodies:
+                        errors.append(f"{row['file']}: partial producer rows differ from saved subject stderr")
+                    if row.get("anomalies") != parsed_anomalies:
+                        errors.append(f"{row['file']}: producer anomalies differ from saved subject stderr")
+            for role in ("control", "subject"):
+                codegen_role = "codegen_" + role
+                if role in completed_censuses and codegen_role in completed_censuses:
+                    if completed_censuses[role]["bodies"] != completed_censuses[codegen_role]["bodies"]:
+                        errors.append(f"{row['file']}: {codegen_role} HIR/generated roster differs from metadata {role}")
+            if all(role in completed_censuses for role in ("codegen_control", "codegen_subject")):
+                if completed_censuses["codegen_control"]["bodies"] != completed_censuses["codegen_subject"]["bodies"]:
+                    errors.append(f"{row['file']}: codegen subject HIR roster differs from control")
+            if all(role in completed_mono for role in ("codegen_control", "codegen_subject")):
+                control, subject = completed_mono["codegen_control"], completed_mono["codegen_subject"]
+                if expected[row["file"]] == "ok":
+                    observed_codegen_files += 1
+                for field in control["snapshot"]:
+                    if control["snapshot"][field] != subject["snapshot"][field]:
+                        errors.append(f"{row['file']}: codegen subject mono {field} differs from control")
+                for field in control["header"]:
+                    if field != "direct_lowering" and control["header"][field] != subject["header"][field]:
+                        errors.append(f"{row['file']}: codegen subject mono {field} differs from control")
+                if control["sources"] != subject["sources"]:
+                    errors.append(f"{row['file']}: codegen subject mono sources differ from control")
+                if expected[row["file"]] == "ok" and "codegen_control" in completed_censuses:
+                    hir = {body["def_path_hash"]: body for body in completed_censuses["codegen_control"]["bodies"]}
+                    producer = {(body["def"], body["kind"]) for body in row.get("bodies", [])
+                                if isinstance(body, dict) and isinstance(body.get("def"), str)
+                                and isinstance(body.get("kind"), str)}
+                    for item in control["snapshot"]["items"]:
+                        mono_item_count += 1
+                        if not item["definition_is_local"]:
+                            mono_unrepresented["external-" + item["kind"]] += 1
+                            continue
+                        if item["kind"] not in {"item", "static"}:
+                            mono_unrepresented[item["kind"]] += 1
+                            continue
+                        owner = hir.get(item["def_path_hash"])
+                        if (owner is None or owner["def"] != item["def"]
+                                or owner["def_kind"] != item["def_kind"]):
+                            mono_unrepresented["missing-local-hir"] += 1
+                            errors.append(f"{row['file']}: local mono item {item['id']} absent from HIR/generated roster")
+                        elif (owner["def"], owner["kind"]) not in producer:
+                            mono_unrepresented["missing-producer-row"] += 1
+                            errors.append(f"{row['file']}: local mono item {item['id']} absent from producer rows")
+                        else:
+                            mono_matched_count += 1
+        observed = [(row["file"], body.get("def"), body.get("kind"))
+                    for row in files for body in row.get("bodies", []) if isinstance(body, dict)]
+        if sorted(observed, key=repr) != sorted((body["file"], body["def"], body["kind"]) for body in bodies):
+            errors.append("producer body rows differ from independent HIR census")
+        if observed_codegen_files == 0:
+            errors.append("no admitted successful codegen collector observed")
+        return {"status": "incomplete" if errors else "bounded_mono_reconciled",
+                "errors": errors, "bodies": bodies, "files": states,
+                "mono_item_count": mono_item_count, "mono_matched_count": mono_matched_count,
+                "mono_unrepresented": dict(sorted(mono_unrepresented.items())), **residual}
+    except (ValueError, TypeError, KeyError, UnicodeError) as error:
+        errors.append(str(error))
+        return {"status": "incomplete", "errors": errors, "bodies": bodies, "files": states,
+                "mono_item_count": None,
+                "mono_matched_count": None, "mono_unrepresented": dict(sorted(mono_unrepresented.items())),
+                **residual}
 
 
 def _eligible_ui_files(repo: str):
@@ -1168,8 +2071,14 @@ def collect_ui_sample(repo: str, seed: int, size: int):
             f" ({os.path.relpath(UI_PIN_MANIFEST, repo)}):\n  - "
             + "\n  - ".join(errors)
         )
-    pin_set = set(excluded_pins)
-    kept = [p for p, rel in zip(eligible, eligible_rel) if rel not in pin_set]
+    # Only [in-pool] admits a file under the pin directory; everything else there,
+    # listed [excluded] or not listed at all, is held out.
+    pin_prefix = UI_PIN_DIR + os.sep
+    pool_set = set(in_pool_pins)
+    kept = [
+        p for p, rel in zip(eligible, eligible_rel)
+        if not rel.startswith(pin_prefix) or rel in pool_set
+    ]
     pins_removed = len(eligible) - len(kept)
     eligible = kept
 
@@ -1402,10 +2311,11 @@ def check_ui_pins(repo):
     errors, notes = audit_ui_pin_manifest(repo, eligible_rel, excluded, in_pool)
     pin_prefix = UI_PIN_DIR + os.sep
     in_dir = [p for p in eligible_rel if p.startswith(pin_prefix)]
-    removed = sum(1 for p in eligible_rel if p in set(excluded))
+    pool_set = set(in_pool)
+    removed = sum(1 for p in in_dir if p not in pool_set)
     print(f"manifest:  {os.path.relpath(UI_PIN_MANIFEST, repo)}")
     print(f"eligible:  {len(eligible_rel)} total · {len(in_dir)} under {UI_PIN_DIR}")
-    print(f"excluded:  {len(excluded)} listed · {removed} of them in the eligible population")
+    print(f"excluded:  {len(excluded)} listed · {removed} held out (listed or unclassified)")
     print(f"in-pool:   {len(in_pool)} classified")
     print(f"sampling population after exclusion: {len(eligible_rel) - removed}")
     for note in notes:
@@ -1431,10 +2341,7 @@ def selftest_ui_pins(repo):
     if not excluded:
         print("SELFTEST: FAIL — [excluded] is empty, nothing to mutate", file=sys.stderr)
         return 1
-    victim = excluded[-1]
     cases = [
-        ("a pin dropped from [excluded]",
-         [p for p in excluded if p != victim], in_pool),
         ("a stale entry naming a file that does not exist",
          excluded + [os.path.join(UI_PIN_DIR, "__selftest_absent__.rs")], in_pool),
         ("one file listed in both sections",
@@ -1556,6 +2463,11 @@ def aggregate(results):
                 1 for b in bs if b.get("opaque_collapse") is True and b["mode"] == "Agreed"
             ),
             "lowered_clean_class_unmeasured": sum(1 for b in clean if b.get("symbolic") is None),
+            # Trust (2026-10-01): the effect-conservation gate over the LOWERED-CLEAN bodies — the
+            # bodies strict's tag arm passes and the splice may take. `refused` is the gate's
+            # coverage cost: each is now a strict error and never codegen. `unmeasured` = no
+            # event (a pre-gate compiler reports every clean body here).
+            "effect_conservation": effect_conservation_census(clean),
             "by_kind": dict(collections.Counter(b["kind"] for b in bs)),
             "clean_by_kind": dict(collections.Counter(b["kind"] for b in clean)),
             "note_class_histogram": dict(collections.Counter(b["note_class"] for b in bs)),
@@ -1639,6 +2551,32 @@ def aggregate(results):
             _cls[k] += c
 
     validation["class_histogram"] = dict(_cls.most_common())
+
+    # Trust (attribution gap, 2026-08-20): WHICH FILES were invalid, not just how many.
+    #
+    # The histogram above is an aggregate over an anonymous population, and a class name cannot
+    # localize a defect. Measured cost of that omission: `INVALID` moved 0 -> 2 between two
+    # control artifacts and NO ONE could name the two files from the artifacts — attribution
+    # required re-running the producer over the corpus against a stage1 binary that a concurrent
+    # build was rewriting. The per-file `validation` block was already stored on every row, so
+    # the missing piece was never the measurement; it was that nothing surfaced it.
+    #
+    # Derived purely from `results`, exactly like every other aggregate key, so `--rerender`
+    # backfills it onto EVERY artifact already on disk at zero compile cost. `details` is
+    # forwarded when the row carries it (binaries emitting the `module validation detail` event);
+    # an older row simply has no such key, which must stay distinguishable from an empty one.
+    _invalid_files = []
+    for r in results:
+        if r.get("outcome") != "ok":
+            continue
+        v = r.get("validation")
+        if v is None or not v["total"]:
+            continue
+        row = {"file": r["file"], "total": v["total"], "classes": v["classes"]}
+        if v.get("details") is not None:
+            row["details"] = v["details"]
+        _invalid_files.append(row)
+    validation["invalid_files"] = _invalid_files
 
     ices = collections.Counter(
         r.get("ice_signature", "") for r in results
@@ -1917,6 +2855,9 @@ def evaluate_scorecard_completion(data, *, recompute_from_files=False):
                 if not isinstance(files, list):
                     raw_error = "missing or malformed files list"
                 else:
+                    retained_census = reconcile_compiler_censuses(corpus)
+                    if retained_census["errors"]:
+                        raw_error = "independent compiler census: " + "; ".join(retained_census["errors"])
                     input_census = corpus.get("input_census")
                     body_census = corpus.get("body_census")
                     census_rows = (
@@ -1966,11 +2907,13 @@ def evaluate_scorecard_completion(data, *, recompute_from_files=False):
                         and body_census.get("schema")
                         == "trust.trust-ir.producer-body-census.v1"
                         and body_census.get("source")
-                        == "independent-hir-body-owner-census/v1"
+                        == BODY_CENSUS_SOURCE
                         and isinstance(body_census_rows, list)
                     )
                     if raw_error is None and not body_census_ok:
                         raw_error = "missing or malformed independent reachable-body census"
+                    if (raw_error is None and body_census_rows != retained_census["bodies"]):
+                        raw_error = "body census rows do not equal retained independent compiler output"
                     expected_bodies = []
                     if raw_error is None:
                         for census_index, census_row in enumerate(body_census_rows):
@@ -2139,6 +3082,7 @@ def evaluate_scorecard_completion(data, *, recompute_from_files=False):
         "complete": complete,
         "does_not_establish": [
             "G1",
+            "G3",
             "independence of the supplied census",
             "G4",
             "universal semantic equivalence",
@@ -2167,6 +3111,7 @@ def check_completion_artifact(out_dir):
             "complete": False,
             "does_not_establish": [
                 "G1",
+                "G3",
                 "independence of the supplied census",
                 "G4",
                 "universal semantic equivalence",
@@ -2190,7 +3135,10 @@ def provenance(trustc: str, repo: str, args):
                               capture_output=True, text=True).stdout.strip()
     return {
         "trustc": trustc,
+        "trustc_sha256": file_sha256(trustc),
         "trustc_version_verbose": ver,
+        "target": next((line.removeprefix("host: ") for line in ver.splitlines()
+                        if line.startswith("host: ")), None),
         "repo_head": git("rev-parse", "HEAD"),
         "repo_describe": git("describe", "--always", "--dirty"),
         "date_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -2198,12 +3146,17 @@ def provenance(trustc: str, repo: str, args):
         "rustc_log_filter": RUSTC_LOG_FILTER,
         "compile_flags": [
             "-Z trust-ir-lower", "-Z trust-verify=off", f"--edition {args.edition}",
-            "--crate-type lib", "--emit=metadata", "--cap-lints allow",
+            "-Z checksum-hash-algorithm=sha256", "-Z trust-body-census=<new-per-run-path>",
+            "-Z trust-instance-census=<new-codegen-run-path> (codegen pair)", "--crate-type lib",
+            "--emit=metadata (producer/HIR pair)", "--emit=link (bounded mono pair)",
+            "--cap-lints allow",
         ],
+        "loader_override_policy": "remove listed loader path, preload, audit, and framework overrides",
         "seed": args.seed,
         "sample_size_requested": args.sample_size,
         "timeout_per_file_s": args.timeout,
         "jobs": args.jobs,
+        "control_policy": "every input; explicit -Ztrust-ir-lower=off; expected outcomes fixed before compilation",
     }
 
 
@@ -2217,6 +3170,17 @@ def render_markdown(data):
         agg = corpus["aggregate"]
         b = agg["bodies"]
         out.append(f"\n## corpus: {name}\n")
+        census = reconcile_compiler_censuses(corpus)
+        out.append(f"- independent HIR + bounded local-codegen mono census: **{census['status']}**; "
+                   f"observed mono items {census['mono_item_count']}, matched local HIR/producer "
+                   f"{census['mono_matched_count']}; G1/G3 **RED**")
+        if census["mono_unrepresented"]:
+            out.append(f"  - mono items without a local HIR/producer match: {census['mono_unrepresented']}")
+        out.append(f"  - still unmeasured: {', '.join(census['unmeasured'])}; "
+                   "reachable instances, runtime roots, proc-macro I/O, build environment, "
+                   "and external dependency closure")
+        for error in census["errors"][:10]:
+            out.append(f"  - {error}")
         completion = evaluate_producer_completion(agg)
         failed_completion_checks = [
             check["id"] for check in completion["checks"] if not check["passed"]
@@ -2224,13 +3188,13 @@ def render_markdown(data):
         if completion["complete"]:
             out.append(
                 "- corpus-local instrumented-row zero-residue gate: **PASS**"
-                " (does not establish G1, census independence, G4, universal semantic"
+                " (does not establish G1, G3, census independence, G4, universal semantic"
                 " equivalence, or product completion)"
             )
         else:
             out.append(
                 "- corpus-local instrumented-row zero-residue gate: **INCOMPLETE**"
-                " (does not establish G1, census independence, G4, universal semantic"
+                " (does not establish G1, G3, census independence, G4, universal semantic"
                 " equivalence, or product completion);"
                 " failed conjuncts: "
                 + ", ".join(failed_completion_checks)
@@ -2313,6 +3277,15 @@ def render_markdown(data):
             )
             if v["class_histogram"]:
                 out.append(f"  - by class: {v['class_histogram']}")
+            # Trust (attribution gap): NAME the invalid files. `.get` because artifacts predating
+            # this key must keep re-rendering rather than KeyError.
+            for row in (v.get("invalid_files") or [])[:20]:
+                out.append(f"  - INVALID `{row['file']}`: {row['classes']}")
+                for det in (row.get("details") or [])[:8]:
+                    out.append(f"    - {det}")
+            _extra = len(v.get("invalid_files") or []) - 20
+            if _extra > 0:
+                out.append(f"  - ... +{_extra} more invalid file(s); full list in data.json")
         out.append(f"- by kind: {b['by_kind']} (clean: {b['clean_by_kind']})")
         out.append(f"- note-class histogram: {b['note_class_histogram']}")
         # Trust (absent-callee Stage 2 disclosure): the UNINTERPRETED-CALLEE adjudication
@@ -2364,6 +3337,18 @@ def render_markdown(data):
             out.append(f"- single-missing-shape tag histogram (top 20): "
                        f"{dict(list(b['single_missing_shape_tag_histogram'].items())[:20])}")
         out.append(f"- unsupported-count-per-body: {b['unsupported_count_per_body_histogram']}")
+        ec = b.get("effect_conservation")
+        if ec is not None:
+            out.append(
+                f"- effect conservation (gate verdicts on lowered-clean bodies): measured "
+                f"{ec['measured']} (unmeasured {ec['unmeasured']}); conserved {ec['conserved']}; "
+                f"REFUSED {ec['refused']} (spliced {ec['refused_spliced']}; with a lost effect "
+                f"{ec['refused_not_conserved']}; abstraction only {ec['refused_abstracted_only']}; "
+                f"of them sampled-Agreed {ec['refused_agreed']}, MODELLED {ec['refused_modelled']})"
+            )
+            if ec["class_histogram"]:
+                out.append(f"  - refusal classes: {ec['class_histogram']}")
+                out.append(f"  - refusal combinations (top 20): {ec['combination_histogram']}")
         div = b["divergences"]
         div_shown = div[:10] + ([f"... +{len(div) - 10} more"] if len(div) > 10 else [])
         out.append(
@@ -2455,6 +3440,13 @@ def main():
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--edition", default="2021")
     ap.add_argument("--no-ui-sample", action="store_true")
+    ap.add_argument("--input-manifest", metavar="PATH",
+                    help="pre-authored trust.rust.measurement-input-manifest.v1 JSON; selects exact "
+                         "corpora, source hashes and expected outcomes instead of sampling; never "
+                         "generated from compiler failures")
+    ap.add_argument("--input-source", action="append", default=[], metavar="PATH",
+                    help="additional local module/include source to hash before compilation "
+                         "(repeatable); undeclared loaded sources remain incomplete")
     ap.add_argument(
         "--corpus-lock", metavar="PATH", default=None,
         help="measure the corpus PINNED BY CONTENT in PATH (see "
@@ -2485,7 +3477,7 @@ def main():
                          "zero-residue gate from an EXISTING artifact's raw file rows and "
                          "explicit input/body censuses, print structured JSON, and exit "
                          "nonzero unless every listed corpus passes; does not establish G1, "
-                         "census independence, G4, or product completion; no --trustc needed")
+                         "G3, census independence, G4, or product completion; no --trustc needed")
     ap.add_argument("--rerender", metavar="DIR",
                     help="recompute `aggregate` and rewrite SCORECARD.md from an EXISTING "
                          "postbuild dir's data.json per-body rows. No compiler, no corpus "
@@ -2516,12 +3508,19 @@ def main():
         ap.error("the following arguments are required: --trustc")
     if not args.out_dir:
         ap.error("the following arguments are required: --out-dir")
+    if args.jobs < 1 or args.timeout < 1:
+        ap.error("--jobs and --timeout must be positive")
+    if args.input_manifest and (args.corpus or args.corpus_lock or args.input_source):
+        ap.error("--input-manifest selects exact inputs; do not combine it with --corpus, --corpus-lock or --input-source")
 
-    trustc = os.path.abspath(args.trustc)
+    trustc = os.path.realpath(os.path.abspath(args.trustc))
     repo = os.path.abspath(args.repo)
+    if os.path.exists(args.out_dir) and (not os.path.isdir(args.out_dir) or os.listdir(args.out_dir)):
+        ap.error("--out-dir must be new or empty; existing measurement artifacts are preserved")
     os.makedirs(args.out_dir, exist_ok=True)
-    scratch = args.scratch or tempfile.mkdtemp(prefix="trust-ir-scorecard-")
-    os.makedirs(scratch, exist_ok=True)
+    if args.scratch:
+        os.makedirs(args.scratch, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix="trust-ir-scorecard-", dir=args.scratch)
 
     data = {
         "schema": "trust.trust-ir.producer-scorecard.v1",
@@ -2533,7 +3532,7 @@ def main():
     for spec in args.corpus:
         name, _, path = spec.partition("=")
         corpora.append((name, [os.path.abspath(path)], None))
-    if not args.no_ui_sample:
+    if not args.no_ui_sample and not args.input_manifest:
         if args.corpus_lock:
             sample, sample_meta = collect_locked_corpus(repo, args.corpus_lock)
         else:
@@ -2564,7 +3563,28 @@ def main():
             print(f"[ui_sample] note: {note}", flush=True)
         corpora.append(("ui_sample", sample, sample_meta))
 
+    try:
+        if args.input_manifest:
+            with open(args.input_manifest, encoding="utf-8") as source:
+                manifest = validate_input_manifest(_strict_json(source.read()))
+            corpora = [(name, [os.path.abspath(os.path.join(repo, row["file"]))
+                               for row in corpus["files"]], {"selection": "precompile-input-manifest"})
+                       for name, corpus in manifest["corpora"].items()]
+        else:
+            manifest = validate_input_manifest(prepare_input_manifest(corpora, repo, args.input_source))
+    except (OSError, ValueError) as error:
+        shutil.rmtree(scratch)
+        ap.error(str(error))
+    # Persist the denominator BEFORE any compiler run, independent of success.
+    with open(os.path.join(args.out_dir, "input-manifest.json"), "x", encoding="utf-8") as source:
+        json.dump(manifest, source, indent=2, sort_keys=True)
+        source.write("\n")
+
     for name, files, meta in corpora:
+        corpus_manifest = manifest["corpora"][name]
+        compiler_before = file_sha256(trustc)
+        stage_before, stage_before_errors = capture_stage_closure(trustc)
+        precompile_errors = current_source_errors(corpus_manifest["sources"], repo) + stage_before_errors
         print(f"[{name}] compiling {len(files)} file(s) with -P{args.jobs} ...", flush=True)
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
@@ -2575,13 +3595,46 @@ def main():
                 if (i + 1) % 200 == 0:
                     print(f"  {i + 1}/{len(files)}", flush=True)
         results.sort(key=lambda r: r["file"])
+        compiler_after = file_sha256(trustc)
+        stage_after, stage_after_errors = capture_stage_closure(trustc)
         for r in results:  # store repo-relative paths
             r["file"] = os.path.relpath(r["file"], repo)
         data["corpora"][name] = {
             "sample_meta": meta,
             "aggregate": aggregate(results),
             "files": results,
+            "input_census": {
+                "schema": "trust.trust-ir.producer-input-census.v1",
+                "source": "precompile-content-manifest/v1",
+                "files": corpus_manifest["files"],
+            },
+            "census_evidence": {
+                "schema": "trust.rust.producer-census-evidence.v2",
+                "repo": repo,
+                "target": data["provenance"]["target"],
+                "edition": args.edition,
+                "input_manifest": {"schema": INPUT_MANIFEST_SCHEMA,
+                                   "corpora": {"corpus": corpus_manifest}},
+                "compiler_sha256_before": compiler_before,
+                "compiler_sha256_after": compiler_after,
+                "stage_closure_before": stage_before,
+                "stage_closure_after": stage_after,
+                "precompile_errors": precompile_errors,
+                "postcompile_errors": (current_source_errors(corpus_manifest["sources"], repo)
+                                       + stage_after_errors),
+            },
         }
+        census = reconcile_compiler_censuses(data["corpora"][name])
+        data["corpora"][name]["body_census"] = {
+            "schema": "trust.trust-ir.producer-body-census.v1",
+            "source": BODY_CENSUS_SOURCE,
+            "bodies": census["bodies"],
+        }
+        data["corpora"][name]["census_status"] = census
+        print(f"[{name}] bounded HIR/mono census {census['status']}; "
+              f"mono items {census['mono_item_count']}; G1/G3 red", flush=True)
+        for error in census["errors"][:10]:
+            print(f"WARN: [{name}] {error}", flush=True)
         print(f"[{name}] {data['corpora'][name]['aggregate']['file_outcomes']}", flush=True)
 
     with open(os.path.join(args.out_dir, "data.json"), "w") as fh:

@@ -432,6 +432,7 @@ fn real_checked_add_function(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -483,6 +484,7 @@ fn real_division_function(name: &str) -> VerifiableFunction {
         )))],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -569,6 +571,7 @@ fn real_contract_function(name: &str) -> VerifiableFunction {
             ),
         ],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -616,6 +619,7 @@ fn real_array_index_function(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 
@@ -647,6 +651,7 @@ fn real_noop_function(name: &str) -> VerifiableFunction {
         preconditions: vec![],
         postconditions: vec![],
         spec: Default::default(),
+        tuple_layouts: Default::default(),
     }
 }
 

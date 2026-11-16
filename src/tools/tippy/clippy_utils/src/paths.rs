@@ -9,9 +9,9 @@ use crate::sym;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::Namespace::{MacroNS, TypeNS, ValueNS};
-use rustc_hir::def::{DefKind, Namespace, Res};
+use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
-use rustc_hir::{ItemKind, Node, UseKind};
+use rustc_hir::{ItemKind, Node, UseKind, UseTree};
 use rustc_lint::LateContext;
 use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::layout::HasTyCtxt;
@@ -23,9 +23,13 @@ use std::sync::OnceLock;
 /// arbitrary namespace
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PathNS {
+    /// The [type namespace](TypeNS)
     Type,
+    /// The [value namespace](ValueNS)
     Value,
+    /// The [macro namespace](MacroNS)
     Macro,
+    /// A struct or enum-variant field. Not a real name resolution namespace
     Field,
 
     /// Resolves to the name in the first available namespace, e.g. for `std::vec` this would return
@@ -54,8 +58,7 @@ impl PathNS {
 ///
 /// Typically it will contain one [`DefId`] or none, but in some situations there can be multiple:
 /// - `memchr::memchr` could return the functions from both memchr 1.0 and memchr 2.0
-/// - `alloc::boxed::Box::downcast` would return a function for each of the different inherent impls
-///   ([1], [2], [3])
+/// - `alloc::boxed::Box::downcast` would return a function for each of the different inherent impls ([1], [2], [3])
 ///
 /// [1]: https://doc.rust-lang.org/std/boxed/struct.Box.html#method.downcast
 /// [2]: https://doc.rust-lang.org/std/boxed/struct.Box.html#method.downcast-1
@@ -175,8 +178,7 @@ pub fn lookup_path_str(tcx: TyCtxt<'_>, ns: PathNS, path: &str) -> Vec<DefId> {
 ///
 /// Typically it will return one [`DefId`] or none, but in some situations there can be multiple:
 /// - `memchr::memchr` could return the functions from both memchr 1.0 and memchr 2.0
-/// - `alloc::boxed::Box::downcast` would return a function for each of the different inherent impls
-///   ([1], [2], [3])
+/// - `alloc::boxed::Box::downcast` would return a function for each of the different inherent impls ([1], [2], [3])
 ///
 /// This function is expensive and should be used sparingly.
 ///
@@ -310,19 +312,8 @@ fn local_item_child_by_name(tcx: TyCtxt<'_>, local_id: LocalDefId, ns: PathNS, n
     match item_kind {
         ItemKind::Mod(_, r#mod) => r#mod.item_ids.iter().find_map(|&item_id| {
             let item = tcx.hir_item(item_id);
-            if let ItemKind::Use(path, UseKind::Single(ident)) = item.kind {
-                if ident.name == name {
-                    let opt_def_id = |ns: Option<Res>| ns.and_then(|res| res.opt_def_id());
-                    match ns {
-                        PathNS::Type => opt_def_id(path.res.type_ns),
-                        PathNS::Value => opt_def_id(path.res.value_ns),
-                        PathNS::Macro => opt_def_id(path.res.macro_ns),
-                        PathNS::Field => None,
-                        PathNS::Arbitrary => unreachable!(),
-                    }
-                } else {
-                    None
-                }
+            if let ItemKind::Use(tree) = item.kind {
+                imported_item_by_name(&tree, ns, name)
             } else if let Some(ident) = item.kind.ident()
                 && ident.name == name
                 && ns.matches(tcx.def_kind(item.owner_id).ns())
@@ -356,6 +347,35 @@ fn local_item_child_by_name(tcx: TyCtxt<'_>, local_id: LocalDefId, ns: PathNS, n
             })
         },
         _ => None,
+    }
+}
+
+/// Trust: read named imports from their resolved HIR leaves, including grouped and
+/// nested imports. The leaf identifier is the name introduced by an alias;
+/// its namespace resolution is the imported definition, not a textual path.
+fn imported_item_by_name(tree: &UseTree<'_>, ns: PathNS, name: Symbol) -> Option<DefId> {
+    let mut pending = Vec::new();
+    let mut tree = tree;
+    loop {
+        match tree.kind {
+            UseKind::Single(ident) if ident.name == name => {
+                let definition = match ns {
+                    PathNS::Type => tree.prefix.res.type_ns.and_then(|res| res.opt_def_id()),
+                    PathNS::Value => tree.prefix.res.value_ns.and_then(|res| res.opt_def_id()),
+                    PathNS::Macro => tree.prefix.res.macro_ns.and_then(|res| res.opt_def_id()),
+                    PathNS::Field => None,
+                    PathNS::Arbitrary => tree.prefix.res.present_items().find_map(|res| res.opt_def_id()),
+                };
+                if let Some(def_id) = definition {
+                    return Some(def_id);
+                }
+            },
+            UseKind::Nested { items } => {
+                pending.extend(items.iter().rev().map(|(tree, _, _)| tree));
+            },
+            UseKind::Single(_) | UseKind::Glob => {},
+        }
+        tree = pending.pop()?;
     }
 }
 

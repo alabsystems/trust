@@ -396,6 +396,12 @@ fn extend_operand_locals(locals: &mut Vec<usize>, op: &Operand) {
 
 /// Best-effort type hint for an operand by looking up locals.
 fn operand_ty_hint(body: &VerifiableBody, op: &Operand) -> crate::model::Ty {
+    if op.contains_memory_image() {
+        return crate::model::Ty::Unsupported {
+            kind: "ConstValue::MemoryImage".into(),
+            detail: "constant storage images have no admitted value semantics".into(),
+        };
+    }
     match op {
         Operand::Copy(place) | Operand::Move(place) => {
             body.locals.get(place.local).map(|l| l.ty.clone()).unwrap_or(crate::model::Ty::Unit)
@@ -418,19 +424,27 @@ fn operand_ty_hint(body: &VerifiableBody, op: &Operand) -> crate::model::Ty {
         Operand::Constant(crate::model::ConstValue::Str { .. }) => crate::model::Ty::Unit,
         // An opaque `&[…]` table constant: no numeric type, never feeds an
         // arithmetic/bounds VC; neutral `Unit` hint (modeled as an opaque slice).
-        Operand::Constant(crate::model::ConstValue::OpaqueConst) => crate::model::Ty::Unit,
-        // A `UnitVariantRef` / `StructScalarFieldsRef` reference constant: same
-        // neutral `Unit` hint as `OpaqueConst` above (modeled as an opaque
-        // fresh-symbolic ref; the variant/field payload is syntactic-only).
+        Operand::Constant(crate::model::ConstValue::OpaqueConst(_)) => crate::model::Ty::Unit,
+        Operand::Constant(crate::model::ConstValue::MemoryImage(_)) => {
+            crate::model::Ty::Unsupported {
+                kind: "ConstValue::MemoryImage".into(),
+                detail: "constant storage images have no admitted value semantics".into(),
+            }
+        }
+        // A `UnitVariantRef` / `EmptyClosureRef` / `StructScalarFieldsRef`
+        // reference constant: same neutral `Unit` hint as `OpaqueConst` above
+        // (modeled as an opaque fresh-symbolic ref; the variant/closure/field
+        // payload is syntactic-only).
         Operand::Constant(
             crate::model::ConstValue::UnitVariantRef { .. }
+            | crate::model::ConstValue::EmptyClosureRef { .. }
             | crate::model::ConstValue::StructScalarFieldsRef { .. },
         ) => crate::model::Ty::Unit,
         // A typed opaque integer constant (const-generic `N`, associated const,
         // `size_of::<T>()` in a generic body): carries its declared integer type so
         // sort selection stays correct for the arithmetic/bounds VCs it DOES feed.
         // Its value is a fresh unconstrained symbol minted by the lowering bridge.
-        Operand::Constant(crate::model::ConstValue::OpaqueScalar { width, signed }) => {
+        Operand::Constant(crate::model::ConstValue::OpaqueScalar { width, signed, .. }) => {
             crate::model::Ty::Int { width: *width, signed: *signed }
         }
         // Trust: piece #7a — a const-generic PARAM value carries its declared

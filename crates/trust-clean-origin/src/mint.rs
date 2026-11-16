@@ -105,6 +105,72 @@ pub enum MintRefusal {
         /// here would lose it.
         explanation: String,
     },
+    /// The certified re-admission of this declaration was ATTEMPTED and
+    /// refused, for a reason the admitter stated.
+    ///
+    /// Distinct from [`Self::NotKernelChecked`] on purpose. That variant is
+    /// what a status that never reached the audit produces, and its note says
+    /// so ("a `parsed` symbol … remove any `sorry`"). The mint site used to
+    /// map EVERY admission error onto it by fabricating a `Parsed` status
+    /// (`Err(_) => KernelStatus::Parsed`), so a declaration the batch had
+    /// accepted — measured 2026-09-16: `def sfst (a : Int64) (b : Int64) :
+    /// Int64 := a`, registered and reported "kernel-checked" by the very same
+    /// build — was described as merely parsed and the user was told to remove
+    /// a `sorry` that was not there. None of the options offered could fix the
+    /// situation, which ruling v7/D3 calls a defect outright. The admitter's
+    /// own reason is carried verbatim instead.
+    ///
+    /// Exactly as fail-closed as the variant it replaces: a refusal mints
+    /// nothing, whatever it is called.
+    CertifiedAdmissionRefused {
+        /// The declaration name.
+        name: String,
+        /// `trust_certify::clean_island::admit_certified_island_definition`'s
+        /// `Err`, verbatim.
+        reason: String,
+        /// The carrier refusal for the declaration's signature, rendered, when
+        /// its type ALSO has no total Rust carrier. The admitter's reasons are
+        /// stated in kernel terms ("is universe-polymorphic"), and the usual
+        /// cause is a signature type — so when the carrier lane has something
+        /// to say about that signature, the user is shown both rather than
+        /// fixing one refusal to meet the next. `None` when the signature
+        /// carries, or when the mint site had no constant to read it from.
+        carrier: Option<String>,
+        /// [`leading_type_variable_binders`] of the declaration's kernel type.
+        ///
+        /// Measured 2026-09-16 on the repro this variant exists for: the type
+        /// the kernel holds for `def sfst (a : Int64) (b : Int64) : Int64 := a`
+        /// is `Sort -> #0 -> #1 -> #2`. The Clean prelude declares no `Int64`,
+        /// so Lean's auto-bound-implicit rule made the NAME a type VARIABLE —
+        /// `sfst` is a projection polymorphic over an arbitrary type that
+        /// happens to be called `Int64`, which is why it is universe-polymorphic
+        /// and why its signature is dependent. Neither refusal says that, and
+        /// kernel binders carry no names, so the note says the one thing that
+        /// can be said truthfully from a count: check the type names.
+        type_variable_binders: usize,
+    },
+    /// The declaration is a `def`, but it is not a TOP-LEVEL declaration of
+    /// its island, so it is given no Rust path at all.
+    ///
+    /// The island's Rust-side payload is the island's top-level declarations;
+    /// a `def` inside `namespace N … end N` (registered as `N.f`), inside a
+    /// `section`, or inside a `mutual` block is kernel-checked with the rest of
+    /// the batch and is visible to every Clean declaration in the crate, but
+    /// nothing mints a `DefId` for it. Until this variant existed the call
+    /// site got a bare `E0425`/`E0433` (measured 2026-09-16, probe 24:
+    /// `m::Geo::area` and `m::area` over `namespace Geo def area … end Geo`).
+    /// Existing Lean libraries are namespaced throughout, so this is the first
+    /// refusal a converted crate meets.
+    NotTopLevel {
+        /// The bare final component — the name a Rust call site spells.
+        name: String,
+        /// The name the Clean environment holds it under (`Geo.area`).
+        clean_name: String,
+        /// The enclosing Clean namespace (`Geo`), or `None` when the
+        /// declaration is nested in a block that does not qualify its name
+        /// (`section`, `mutual`).
+        namespace: Option<String>,
+    },
     /// The producing pipeline did not record axiom-closure information at all.
     ///
     /// Distinct from [`Self::AxiomClosureNonEmpty`] on purpose: "we did not
@@ -137,6 +203,8 @@ impl MintRefusal {
     pub fn name(&self) -> &str {
         match self {
             Self::NotKernelChecked { name, .. }
+            | Self::CertifiedAdmissionRefused { name, .. }
+            | Self::NotTopLevel { name, .. }
             | Self::AxiomClosureUnrecorded { name }
             | Self::AxiomClosureNonEmpty { name, .. }
             | Self::NoTotalCarrier { name, .. } => name,
@@ -166,6 +234,92 @@ impl MintRefusal {
                  - if you meant to call a Rust function, define it as a Rust `fn`; a \
                    `clean {{ … }}` island declares Clean, not Rust."
             ),
+            // The admitter's reason, VERBATIM — never a paraphrase, and never
+            // the `parsed`/`sorry` story a fabricated status used to produce.
+            // The options are the ones that hold for EVERY reason the admitter
+            // can state (trust provenance, a failed audit, a non-Definition, a
+            // universe-polymorphic or partial/unsafe declaration, a facet-key
+            // collision): none of them tells the user to remove something the
+            // reason does not name.
+            Self::CertifiedAdmissionRefused { name, reason, carrier, type_variable_binders } => {
+                format!(
+                    "`{name}` is declared in this island and the crate's Clean batch accepted \
+                 it, but it is not callable from Rust: the certified re-admission of THIS \
+                 declaration — the audit of its own type, body and complete dependency \
+                 closure that a callable declaration must pass — refused it: {reason}.\n\
+                 {carrier}\
+                 {type_variables}\
+                 This is not a parse or elaboration failure, and nothing here says `{name}` \
+                 contains a `sorry`: what is stated above is the whole reason. A refused \
+                 admission mints no Rust function, fail-closed, so the call site cannot \
+                 resolve.\n\
+                 options:\n\
+                 - restate `{name}` so that the refusal above no longer applies — a \
+                   monomorphic, total `def` over `Bool`/`UInt8`/`UInt16`/`UInt32`/`UInt64`/\
+                   `Nat` whose dependencies are all kernel-checked definitions passes this \
+                   audit and is callable from Rust today;\n\
+                 - keep `{name}` as it is and use it from CLEAN only — other island \
+                   declarations and theorems can name it, because the batch accepted it; \
+                   only the Rust call is refused;\n\
+                 - write the function in Rust instead, and state the correspondence you \
+                   need as a Clean `theorem`.",
+                    carrier = carrier.as_deref().map_or_else(String::new, |refusal| format!(
+                        "Its signature ALSO has no total Rust carrier, which would refuse the \
+                     call on its own:\n{refusal}\n"
+                    )),
+                    // Conditional on purpose: a binder the author wrote (`{{α : Type}}`)
+                    // and one the elaborator auto-bound look the same to the kernel.
+                    type_variables = if *type_variable_binders == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "LIKELY CAUSE: the type the kernel holds for `{name}` begins with \
+                         {type_variable_binders} type-VARIABLE binder(s) (`{{_ : Sort _}}`). If \
+                         you did not write them, a type NAME in `{name}`'s signature is not \
+                         declared by the Clean prelude this island is checked against, and \
+                         Lean's auto-bound-implicit rule silently made that name a type \
+                         variable — so `{name}` was kernel-checked as a function polymorphic \
+                         over an ARBITRARY type, not over the type you meant. Check every type \
+                         name in the signature against the fixed-width types listed below.\n"
+                        )
+                    },
+                )
+            }
+            // A Clean namespace is not a Rust module. Say which of the two the
+            // declaration is in, and give the wrapper that works today
+            // (measured 2026-09-16, probe 24c: a root-level
+            // `def area_w … := Geo.area w h` mints and runs).
+            Self::NotTopLevel { name, clean_name, namespace } => {
+                let placement = match namespace {
+                    Some(namespace) => format!(
+                        "`{clean_name}` is declared inside the Clean `namespace {namespace}` \
+                         of this island. A Clean namespace is not a Rust module: no Rust path \
+                         — not `{name}`, and not `{rust_path}` — names it",
+                        rust_path = format!("{namespace}.{name}").replace('.', "::"),
+                    ),
+                    None => format!(
+                        "`{clean_name}` is declared inside a `section`/`mutual` block of this \
+                         island, not at the island's top level"
+                    ),
+                };
+                format!(
+                    "{placement}.\n\
+                     Only a TOP-LEVEL island `def` is given a Rust function: the island's \
+                     Rust-side payload is its top-level declarations, and a declaration \
+                     nested in a block is kernel-checked with the rest of the crate's Clean \
+                     but mints nothing. `{clean_name}` is still visible to every Clean \
+                     declaration in the crate.\n\
+                     options:\n\
+                     - add a top-level wrapper to the island and call that from Rust — \
+                       `def {wrapper} <the same binders> : <the same type> := {clean_name} \
+                       <the same arguments>` mints `{wrapper}` in the island's Rust module;\n\
+                     - move `def {name}` out of the block to the island's top level, if it \
+                       is meant to be called from Rust;\n\
+                     - keep `{clean_name}` specification-only and name it from other Clean \
+                       declarations and theorems, which resolve it directly.",
+                    wrapper = format!("{}_w", name),
+                )
+            }
             Self::AxiomClosureUnrecorded { name } => format!(
                 "`{name}` is kernel-checked, but its axiom closure was never RECORDED, \
                  so the compiler cannot show it rests on nothing.\n\
@@ -215,7 +369,11 @@ impl MintRefusal {
                  carrier is a separate obligation.\n\
                  options:\n\
                  - restate `{name}` at a fixed-width Clean type (`UInt8`/`UInt16`/\
-                   `UInt32`/`UInt64`/`BitVec w`), which carries exactly;\n\
+                   `UInt32`/`UInt64`), which carries exactly AND is callable from Rust \
+                   today. A LITERAL-width `BitVec 8/16/32/64` also carries exactly, but it \
+                   is refused one step later at the reflection, so it is a fix for a \
+                   proof-position use and not for a call \
+                   (`docs/design/2026-09-14-bitvec-return-direction.md`);\n\
                  - keep the unbounded type and cite `{name}` from proof position, where \
                    no carrier is needed;\n\
                  - introduce a bounded wrapper in Clean with the bound as part of its \
@@ -223,6 +381,90 @@ impl MintRefusal {
             ),
         }
     }
+}
+
+/// How many leading binders of a declaration's kernel type range over a
+/// `Sort` — i.e. bind a TYPE variable.
+///
+/// Diagnostics only ([`MintRefusal::CertifiedAdmissionRefused`]). Zero for
+/// every declaration this lane can call: a callable signature is monomorphic.
+/// Non-zero means the declaration is polymorphic over a type, whether the
+/// author wrote the binder or the elaborator auto-bound an undeclared type
+/// name; the kernel term cannot tell the two apart and neither does this.
+#[must_use]
+pub fn leading_type_variable_binders(ty: &clean_kernel::Expr) -> usize {
+    use clean_kernel::ExprKind;
+
+    let mut count = 0;
+    let mut cursor = ty;
+    while let ExprKind::Pi(_, domain, body) = cursor.kind() {
+        if !matches!(domain.kind(), ExprKind::Sort(_)) {
+            break;
+        }
+        count += 1;
+        cursor = body;
+    }
+    count
+}
+
+/// The `def`s an island REGISTERED that are not among its top-level
+/// declarations — each as the [`MintRefusal::NotTopLevel`] its call site must
+/// be told about.
+///
+/// `registered` is the island's `CleanIslandOutcome::registered` list (kernel
+/// names as the batch reports them, `Geo.area`), and `top_level_defs` the
+/// source spellings of the island's top-level `def`s — the only declarations
+/// the mint decision ever considers. Whatever is registered, IS a kernel
+/// `Definition`, and is not top-level was declared inside a `namespace`,
+/// `section` or `mutual` block.
+///
+/// Diagnostics only, and deliberately so: nothing here mints, and nothing here
+/// un-mints. A registered name the environment does not hold as a
+/// `Definition` (a theorem, a structure, an inductive) is skipped — those are
+/// not callable from any position, so a note promising a wrapper would be
+/// false. Order follows `registered`, which is authored order.
+#[must_use]
+pub fn nested_island_definitions(
+    env: &clean_kernel::Environment,
+    registered: &[String],
+    top_level_defs: &[&str],
+) -> Vec<MintRefusal> {
+    use clean_kernel::name::NameInner;
+
+    let mut nested = Vec::new();
+    for clean_name in registered {
+        if top_level_defs.contains(&clean_name.as_str()) {
+            continue;
+        }
+        let kernel_name = clean_kernel::Name::from_string(clean_name);
+        let Some(info) = env.get_const(&kernel_name) else { continue };
+        if info.kind != clean_kernel::ConstantKind::Definition {
+            continue;
+        }
+        // Only a final STRING component is a name a Rust call site could have
+        // spelled; a generated numeric component never is.
+        let NameInner::Str(parent, bare) = kernel_name.inner() else { continue };
+        // A name qualified by a DEFINITION is not a `def` the author nested in
+        // a namespace: it is that definition's `where` helper or an auxiliary
+        // the elaborator generated for it (`f.go`, `f.match_1`). Promising a
+        // wrapper for one of those would be a guess about source the user did
+        // not write that way. (A namespace that is also a TYPE — `structure
+        // Point` beside `namespace Point` — is the ordinary Lean idiom and is
+        // kept: `Point` is not a `Definition`.)
+        if env
+            .get_const(parent)
+            .is_some_and(|owner| owner.kind == clean_kernel::ConstantKind::Definition)
+        {
+            continue;
+        }
+        let namespace = (!parent.is_anon()).then(|| parent.to_string());
+        nested.push(MintRefusal::NotTopLevel {
+            name: bare.to_string(),
+            clean_name: clean_name.clone(),
+            namespace,
+        });
+    }
+    nested
 }
 
 /// Decide whether a Clean island declaration may acquire a `DefId`.

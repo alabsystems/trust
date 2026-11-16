@@ -27,7 +27,17 @@ prototype-infoflow = []
 # Forward binary parser/lifter support for reusable relift APIs.
 elf = ["trust-lift/elf"]
 macho = ["trust-lift/macho"]
+# Test-only differential: build the RETIRED dense-map statement-version oracle
+# (two whole-CFG reaching-version fixpoints) beside the SSA oracle that replaced
+# it, and assert every version-token answer is byte-identical. Unit tests always
+# run it; enable this to run it under the integration tests too
+# (`targo --unverified test -p trust-vcgen --features version-oracle-differential`).
+# Never enabled by anything that ships.
+version-oracle-differential = []
 [dependencies]
+# Canonical integer bounds used by both VC construction and the kernel-facing
+# overflow model. This was a test-only cross-check of duplicated definitions.
+trust-semantics = { workspace = true }
 trust-floatbits = { workspace = true }
 # trust-types is consumed as a pure data layer here (VerifiableFunction,
 # VerificationCondition, Formula, ...). We deliberately do NOT pull its
@@ -70,12 +80,5 @@ thiserror = { workspace = true }
 trust-certify = { workspace = true }
 trust-router = { workspace = true, features = ["ay-backend"] }
 trust-report = { workspace = true }
-# range.rs's bound helpers are duplicated verbatim in trust-semantics, which
-# needs them to state the kernel `noOverflow` denotation without depending on
-# the generator. A copy that nothing compares is a false-proof hazard: the
-# kernel definition and the emitted VC would silently come to mean different
-# things. The dev-dependency exists so `range.rs`'s own tests are the thing
-# that compares them.
-trust-semantics = { workspace = true }
 # trust #475: Property-based testing for Formula simplification correctness.
 proptest = { workspace = true }
